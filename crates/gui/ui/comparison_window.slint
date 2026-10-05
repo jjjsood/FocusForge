@@ -28,6 +28,11 @@ export component ComparisonWindow inherits Window {
     in property <length> crop-y;
     in property <length> crop-w;
     in property <length> crop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     in property <bool> pixelated: false;
     in property <bool> editor-mode: false;
     in property <length> cursor-extent;
@@ -133,6 +138,11 @@ export component ComparisonWindow inherits Window {
         crop-y: root.crop-y;
         crop-w: root.crop-w;
         crop-h: root.crop-h;
+        backdrop: root.backdrop;
+        backdrop-x: root.backdrop-x;
+        backdrop-y: root.backdrop-y;
+        backdrop-w: root.backdrop-w;
+        backdrop-h: root.backdrop-h;
         pixelated: root.pixelated;
         undock-requested => { root.dock-requested(); }
         dock-back: true;

@@ -183,6 +183,12 @@ pub enum ShellEvent {
     /// A `Locate frames…` verification ([`AppController::locate_frames`]) is
     /// ready to settle ([`AppController::settle_locate`]).
     LocateReady,
+    /// A save's worker has parked its outcome
+    /// ([`AppController::settle_save`]).
+    SaveReady,
+    /// A recomposite worker has parked its gathered regions
+    /// ([`AppController::settle_recomposites`]).
+    RecompositeReady,
 }
 
 /// The native window that owns a chrome operation.
@@ -477,12 +483,15 @@ struct ProjectTab {
     /// Existence and capture time per source path, read when the path joins
     /// the tab and refreshed only by an explicit relink or a refused use.
     meta: HashMap<PathBuf, images::FrameMeta>,
-    /// This tab's own card picture -- primed once, right here for a fresh
-    /// tab and again in [`AppController::settle_job`] from each fused
-    /// composite. `Arc`-shared rather than cloned per
-    /// push, since [`AppController::project_cards`] rebuilds far more often
-    /// than a picture actually changes.
+    /// This tab's own card picture, decoded off the UI thread: by the load
+    /// worker for an opened project, by [`AppController::request_thumbnail`]
+    /// for a new tab and each fused composite. `Arc`-shared rather than
+    /// cloned per push, since [`AppController::project_cards`] rebuilds far
+    /// more often than a picture actually changes.
     thumbnail: Option<Arc<overlay::Thumbnail>>,
+    /// The newest decode requested for [`Self::thumbnail`]; a result for an
+    /// earlier one is dropped.
+    thumbnail_generation: u64,
     /// This tab's own run: `Idle` until a fuse starts on it, and whatever it
     /// last settled to afterward -- read by every bottom-bar and card
     /// surface for the tab that owns it, regardless of which tab is active.
@@ -490,10 +499,15 @@ struct ProjectTab {
     /// The request behind this tab's own last run, kept for `Retry` --
     /// `None` until a run is started on this tab.
     request: Option<job::JobRequest>,
-    /// This tab's own editor session, opened over its fused Z-Map on first
-    /// entry into editor mode -- `None` until then, and cleared whenever a
-    /// newer checkpoint replaces the planes it was opened over.
+    /// This tab's own editor session, opened on a worker over the selected
+    /// row's Z-Map and stroke chain when editor mode is entered or an
+    /// op-bearing row is selected -- `None` until it lands, and cleared
+    /// whenever the selected row or planes are replaced (a restore, a new
+    /// checkpoint).
     edit: Option<job::EditState>,
+    /// Bumped whenever the session this tab holds, or is opening, is dropped:
+    /// an opening session lands only while its generation is still this one.
+    session_generation: u64,
     /// This tab's own failed, cancelled or sources-missing run, if its most
     /// recent attempt did not succeed -- `None` once a later success clears
     /// it. Keyed by tab rather than by path so it survives an Unsaved ->
@@ -521,8 +535,8 @@ struct SourcesNotice {
 
 /// A saved row's planes, as far as they have got.
 enum RowPlanes {
-    /// An op-bearing row rendering on a worker; the canvas keeps what it
-    /// showed until it settles.
+    /// A saved row whose planes are not cached yet; the canvas keeps what
+    /// it showed until they are.
     Pending,
     Ready(PathBuf, PathBuf),
     /// The right pane's refusal text, one entry per line.
@@ -536,8 +550,8 @@ enum TabPlanes {
     None,
 }
 
-/// The one op-bearing checkpoint render in flight, if any, and where its
-/// worker parks the result -- [`LoadSlot`]'s shape.
+/// The one checkpoint render in flight, op-bearing or fused, if any, and
+/// where its worker parks the result -- [`LoadSlot`]'s shape.
 #[derive(Default)]
 struct RenderSlot {
     /// The tab (by id) and row the running worker renders.
@@ -548,6 +562,46 @@ struct RenderSlot {
 }
 
 type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
+
+/// The card-picture decodes in flight and where their workers park the
+/// results: tab id, the generation the decode was requested for, and the
+/// picture (`None` for a failed decode).
+#[derive(Default)]
+struct ThumbnailSlot {
+    in_flight: usize,
+    /// Set when a worker starts, until [`AppController::take_thumbnails_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedPicture>>>,
+}
+
+type ParkedPicture = (u64, u64, Option<overlay::Thumbnail>);
+
+/// The editor sessions being opened and where their workers park the
+/// results: tab id, the session generation each was started for, and the
+/// opened session or why it failed. Two tabs may open at once.
+#[derive(Default)]
+struct EditSlot {
+    in_flight: Vec<(u64, u64)>,
+    /// Set when a worker starts, until [`AppController::take_session_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedSession>>>,
+}
+
+type ParkedSession = (u64, u64, Result<job::EditState, String>);
+
+impl EditSlot {
+    fn opening(&self, tab_id: u64, generation: u64) -> bool {
+        self.in_flight.contains(&(tab_id, generation))
+    }
+}
+
+/// Whether the active tab has an editor session, is opening one, or cannot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionOpen {
+    Open,
+    Opening,
+    Unavailable,
+}
 
 /// The export modal's own state: which tab it names, the context/what
 /// lines already composed for its row (per-kind prose, not a separate
@@ -648,25 +702,13 @@ struct ParkedRun {
     diverged: Vec<String>,
 }
 
-/// Whether a project's own load worker attempted to decode its thumbnail --
-/// [`ProjectTab::new`] must tell "no worker ran" from "a worker ran and the
-/// decode failed" apart, since only the first retries synchronously.
-enum ThumbnailSource {
-    /// No worker ran for this project's own load.
-    NotAttempted,
-    /// A worker ran; `None` is a failed decode, not a missing attempt.
-    Decoded(Option<Arc<overlay::Thumbnail>>),
-}
-
 impl ProjectTab {
-    /// `thumbnail` reports what the load's own worker already did for this
-    /// project. [`ThumbnailSource::NotAttempted`] falls back to decoding it
-    /// right here; a worker's own failed decode opens the tab with none.
+    /// `thumbnail` is the picture the load worker already decoded, if any.
     /// `meta` is the frames' metadata when already read; `None` reads it here.
     fn new(
-        mut project: GuiProject,
+        project: GuiProject,
         id: u64,
-        thumbnail: ThumbnailSource,
+        thumbnail: Option<Arc<overlay::Thumbnail>>,
         meta: Option<HashMap<PathBuf, images::FrameMeta>>,
     ) -> Self {
         let title = entry::tab_title(&project);
@@ -682,12 +724,6 @@ impl ProjectTab {
         let frames = entry::project_frames(&project);
         let excluded = vec![false; frames.len()];
         let selected = images::first_included(&excluded);
-        let thumbnail = match thumbnail {
-            ThumbnailSource::Decoded(thumbnail) => thumbnail,
-            ThumbnailSource::NotAttempted => {
-                overlay::render_thumbnail(&mut project, &frames).map(Arc::new)
-            }
-        };
         let meta = meta.unwrap_or_else(|| images::read_metadata(&frames));
         ProjectTab {
             id,
@@ -719,9 +755,11 @@ impl ProjectTab {
             frame_sort: None,
             meta,
             thumbnail,
+            thumbnail_generation: 0,
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            session_generation: 0,
             failure: None,
         }
     }
@@ -919,6 +957,14 @@ impl ProjectTab {
             Some(RowBase::Saved(id)) if on_entry => Some(id),
             _ => Some(key.to_string()),
         }
+    }
+
+    /// Drops the installed session, if any, and starts a new session
+    /// generation so one still opening for the old state is dropped when it
+    /// lands. Returns whether an installed session was dropped.
+    fn drop_session(&mut self) -> bool {
+        self.session_generation += 1;
+        self.edit.take().is_some()
     }
 
     /// Whether the selected row is an in-memory entry holding ops.
@@ -1241,6 +1287,8 @@ struct ShellState {
     /// The in-flight background load, if any.
     load: LoadSlot,
     render: RenderSlot,
+    thumbnails: ThumbnailSlot,
+    edits: EditSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
     /// The last confirmed export format and settings, which the next modal
@@ -1252,9 +1300,56 @@ struct ShellState {
     import: ImportSlot,
     /// The in-flight `Locate frames…` verification, if any.
     locate: LocateSlot,
+    /// The running and queued saves, and what follows the last one.
+    save: SaveSlot,
     /// The `Composite` pane's rainbow overlay -- window-wide (see
     /// [`OverlayState`]).
     overlay: OverlayState,
+}
+
+/// The one save worker allowed at a time, the saves waiting behind it and
+/// the step that follows the last of them.
+#[derive(Default)]
+struct SaveSlot {
+    running: Option<RunningSave>,
+    /// Tabs (by id) to save next, each with its target, in order.
+    queue: VecDeque<(u64, PathBuf)>,
+    then: AfterSave,
+    /// The running worker's result, parked until
+    /// [`AppController::settle_save`] applies it.
+    outcome: Arc<Mutex<Option<SaveResult>>>,
+}
+
+/// A save worker's result: the written project, opened, with the id written
+/// per kept entry -- or why it could not be written.
+type SaveResult = Result<job::SavedProject, String>;
+
+/// A save on its worker: the tab it belongs to, where it writes and the
+/// current row the write keeps stored.
+struct RunningSave {
+    tab_id: u64,
+    target: PathBuf,
+    keep: Option<job::ParentRef>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What happens once every queued save has written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AfterSave {
+    #[default]
+    Nothing,
+    /// Close the tab with this id.
+    CloseTab(u64),
+    Quit,
+}
+
+/// How [`AppController::begin_save`] ended.
+enum SaveStart {
+    Started,
+    /// The tab is gone or has nothing to write.
+    Skipped,
+    /// The tab's unsaved edits could not be kept; the failure is reported.
+    Failed,
 }
 
 /// One load's worker result, parked here until
@@ -1545,6 +1640,9 @@ struct JobSlot {
     /// Tab ids waiting for the live run to settle, in press order. The live
     /// run itself is position 1; the head of this queue is position 2.
     queue: VecDeque<u64>,
+    /// When the canvas last acted; the interactive admission cap lifts only
+    /// [`job::INTERACTION_QUIET`] after it.
+    last_canvas_action: Option<Instant>,
 }
 
 /// The toolbar/bottom-bar surfaces' plain-Rust view of the active run --
@@ -1596,9 +1694,41 @@ impl AppController {
         self.resident_tile_size_for_test = Some(size);
     }
 
-    /// Drains the active tab's log of every region recomposited into its
-    /// resident display tiles since the last call; empty with no edit
-    /// session.
+    /// Test-only: the active tab's live editor state, to swap its frame
+    /// reader.
+    pub fn edit_state_mut_for_test(&mut self) -> Option<&mut job::EditState> {
+        self.state.active_mut()?.edit.as_mut()
+    }
+
+    /// Installs the regions recomposite workers have parked, on the tab each
+    /// was queued for -- active or not -- and dispatches what queued behind
+    /// them. Returns `true` once no tab has a recomposite in flight.
+    pub fn settle_recomposites(&mut self) -> bool {
+        let wake = self.recomposite_wake();
+        let mut idle = true;
+        for tab in &mut self.state.projects {
+            if let Some(edit) = tab.edit.as_mut() {
+                idle &= edit.settle_recomposite(&wake);
+            }
+        }
+        idle
+    }
+
+    /// What a recomposite worker runs once it has parked a batch: the
+    /// [`ShellEvent::RecompositeReady`] on this controller's sink.
+    fn recomposite_wake(&self) -> job::RecompositeWake {
+        let sink = self.sink.clone();
+        Arc::new(move || {
+            if let Some(sink) = &sink {
+                sink(ShellEvent::RecompositeReady);
+            }
+        })
+    }
+
+    /// Drains the active tab's log of every region installed into its
+    /// resident display tiles since the last call -- a queued region is
+    /// logged once [`Self::settle_recomposites`] installs it; empty with no
+    /// edit session.
     pub fn take_recomposited(&mut self) -> Vec<job::Rect> {
         self.state
             .active_mut()
@@ -1638,12 +1768,16 @@ impl AppController {
     }
 
     /// Returns `false` and emits nothing for [`ShellMode::Editor`] unless
-    /// [`Self::editor_enabled`] is `true`. Entering editor mode opens the
-    /// active tab's own edit session on first entry -- a failure to
-    /// materialize or open its Z-Map also returns `false` and emits nothing,
-    /// leaving the mode unchanged.
+    /// [`Self::editor_enabled`] is `true` and the active tab's Z-Map has
+    /// planes to open over. Entering editor mode switches at once and starts
+    /// opening the session on a worker when the tab has none, as after a
+    /// restore dropped it: strokes do nothing until
+    /// [`Self::settle_edit_session`] installs it, and a session that fails to
+    /// open drops the window back to stacking with one more `ModeChanged`.
     pub fn set_mode(&mut self, mode: ShellMode) -> bool {
-        if mode == ShellMode::Editor && !(self.editor_enabled() && self.ensure_edit_session()) {
+        if mode == ShellMode::Editor
+            && !(self.editor_enabled() && self.ensure_edit_session() != SessionOpen::Unavailable)
+        {
             return false;
         }
         if mode != ShellMode::Editor {
@@ -1654,61 +1788,117 @@ impl AppController {
         true
     }
 
-    /// Opens the active tab's edit session over its whole Z-Map and its own
-    /// frames unless the tab already holds one. `false` with no active tab,
-    /// or when its Z-Map or its frames fail to materialize or open.
-    fn ensure_edit_session(&mut self) -> bool {
-        if self.state.active().is_some_and(|tab| tab.edit.is_some()) {
-            return true;
+    /// Opens the active tab's edit session over its row's Z-Map and its own
+    /// frames on a worker unless the tab already holds or is opening one,
+    /// replaying an op-bearing row's stroke chain there. `Opening` also
+    /// while the row's planes still render, in which case the render's
+    /// settle asks again; `Unavailable` with no active tab, no fused row or
+    /// no planes to open over.
+    fn ensure_edit_session(&mut self) -> SessionOpen {
+        let Some(tab) = self.state.active() else {
+            return SessionOpen::Unavailable;
+        };
+        if tab.edit.is_some() {
+            return SessionOpen::Open;
         }
-        let Some((_, zmap)) = self.materialize_active_tab_planes() else {
-            return false;
+        if self.state.edits.opening(tab.id, tab.session_generation) {
+            return SessionOpen::Opening;
+        }
+        let zmap = match self.active_tab_planes() {
+            TabPlanes::Ready(_, zmap) => zmap,
+            TabPlanes::Pending => return SessionOpen::Opening,
+            TabPlanes::None => return SessionOpen::Unavailable,
         };
         let Some(tab) = self.state.active() else {
-            return false;
+            return SessionOpen::Unavailable;
         };
-        let frames = tab.frames.clone();
         // `can_edit` guarantees `tab.frames` equals the fused sources, in
         // the same order, by the time editor mode is entered -- so indexing
         // `registration`'s per-frame transforms by position here matches.
         let Some((_, registration)) = tab.fused() else {
-            return false;
+            return SessionOpen::Unavailable;
         };
-        let tile_size = self
-            .resident_tile_size_for_test
-            .unwrap_or(job::RESIDENT_TILE_SIZE);
-        let Ok(mut edit) =
-            job::open_edit_session(&zmap, &frames, registration, tile_size, job::host_budget())
-        else {
-            return false;
-        };
-        let Some(tab) = self.state.active_mut() else {
-            return false;
-        };
-        if let Some(chain) = tab
+        let frames = tab.frames.clone();
+        let chain = tab
             .selected_checkpoint
             .as_deref()
             .and_then(checkpoints::held_index)
             .and_then(|index| checkpoints::stroke_chain(&tab.held, index))
-        {
-            for op in chain {
-                match edit.session.append(op) {
-                    Ok(Some(region)) => {
-                        if let Err(err) = edit.recomposite(region) {
-                            tracing::error!(error = %err, "restored stroke recomposite failed");
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::error!(error = %err, "restored stroke could not be applied");
-                        break;
+            .unwrap_or_default();
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let tile_size = self
+            .resident_tile_size_for_test
+            .unwrap_or(job::RESIDENT_TILE_SIZE);
+        let slot = &mut self.state.edits;
+        slot.in_flight.push((tab_id, generation));
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                job::open_edit_session(
+                    &zmap,
+                    &frames,
+                    registration,
+                    tile_size,
+                    job::host_budget(),
+                    chain,
+                )
+            })
+            .map_err(|_| "the session worker panicked".to_string())
+            .and_then(|opened| opened.map_err(|err| err.to_string()));
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked sessions")
+                .push((tab_id, generation, result));
+        });
+        SessionOpen::Opening
+    }
+
+    /// Installs the parked sessions without waiting on a worker. A session
+    /// lands, with `EditorChanged`, only on a tab that still exists at the
+    /// generation it was started for; a failed open is logged and, in the
+    /// active tab in editor mode, drops the window to stacking. Returns
+    /// `true` once no session is being opened -- the poll's cue to stop.
+    pub fn settle_edit_session(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .edits
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked sessions"),
+        );
+        for (tab_id, generation, result) in parked {
+            let started = (tab_id, generation);
+            self.state.edits.in_flight.retain(|open| *open != started);
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            self.state.canvas_dirty = true;
+            match result {
+                Ok(edit) => {
+                    tab.edit = Some(edit);
+                    self.emit(ShellEvent::EditorChanged);
+                }
+                Err(reason) => {
+                    tracing::error!(error = %reason, "the editor session could not be opened");
+                    if self.state.active == Some(index) && self.state.mode == ShellMode::Editor {
+                        self.drop_to_stacking();
                     }
                 }
             }
-            edit.session.rebase();
         }
-        tab.edit = Some(edit);
-        true
+        self.state.edits.in_flight.is_empty()
+    }
+
+    /// Whether an editor session started opening since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_edit_session`].
+    pub fn take_session_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.edits.started)
     }
 
     /// Discards the active tab's own in-progress stroke, if any: restores
@@ -1734,7 +1924,8 @@ impl AppController {
         self.state.active().is_some_and(ProjectTab::can_edit)
     }
 
-    /// The active tab's own edit session, once editor mode has opened one.
+    /// The active tab's own edit session, once its worker has opened and
+    /// [`Self::settle_edit_session`] installed it.
     pub fn edit_session(&self) -> Option<&job::EditSession> {
         Some(&self.state.active()?.edit.as_ref()?.session)
     }
@@ -1800,20 +1991,24 @@ impl AppController {
     /// In editor mode, gives a newly active editable tab its own edit
     /// session; drops the window back to stacking, with exactly one
     /// `ModeChanged(Stacking)`, when the active tab no longer satisfies
-    /// [`Self::editor_enabled`] or its session cannot open -- a switch away
-    /// from a fused tab, that tab's own run starting or being promoted, or a
-    /// confirmed frame-set change. A tab whose current row still renders
-    /// keeps editor mode; its session opens once the render settles.
+    /// [`Self::editor_enabled`] or has no planes its session could open over
+    /// -- a switch away from a fused tab, that tab's own run starting or
+    /// being promoted, a confirmed frame-set change or a refused render. A
+    /// tab whose current row still renders keeps editor mode; its session
+    /// opens once the render settles.
     fn leave_editor_if_unfit(&mut self) {
         if self.state.mode == ShellMode::Editor
-            && !(self.editor_enabled()
-                && (self.ensure_edit_session()
-                    || matches!(self.active_tab_planes(), TabPlanes::Pending)))
+            && !(self.editor_enabled() && self.ensure_edit_session() != SessionOpen::Unavailable)
         {
-            self.discard_live_stroke();
-            self.state.mode = ShellMode::Stacking;
-            self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
+            self.drop_to_stacking();
         }
+    }
+
+    /// Leaves editor mode for stacking with one `ModeChanged(Stacking)`.
+    fn drop_to_stacking(&mut self) {
+        self.discard_live_stroke();
+        self.state.mode = ShellMode::Stacking;
+        self.emit(ShellEvent::ModeChanged(ShellMode::Stacking));
     }
 
     /// The brush's source index: the active tab's `selected` position, or
@@ -1869,7 +2064,7 @@ impl AppController {
     /// end, while a dialog is open, and on the current row when live has no
     /// ops (unless its planes were refused).
     pub fn select_checkpoint_row(&mut self, index: usize) {
-        if self.modal_open() {
+        if self.modal_open() || self.active_history_frozen() {
             return;
         }
         let Some(id) = self
@@ -1913,7 +2108,7 @@ impl AppController {
             return;
         };
         let unchanged = tab.selected_checkpoint.as_deref() == Some(key.as_str());
-        let dropped_session = tab.edit.take().is_some();
+        let dropped_session = tab.drop_session();
         tab.selected_checkpoint = Some(key);
         tab.free_unneeded_held();
         let on_ops_row = tab.on_ops_row();
@@ -1962,11 +2157,92 @@ impl AppController {
             });
         }
         self.state.canvas_dirty = true;
-        let on_ops_row = self.state.active().is_some_and(ProjectTab::on_ops_row);
-        if self.state.mode == ShellMode::Editor || on_ops_row {
+        if self.state.mode == ShellMode::Editor {
+            self.leave_editor_if_unfit();
+        } else if self.state.active().is_some_and(ProjectTab::on_ops_row) {
             self.ensure_edit_session();
         }
         true
+    }
+
+    /// Decodes the picture of tab `index` with `render` on a spawned worker,
+    /// parking the result for [`Self::settle_thumbnails`]. A decode requested
+    /// later for the same tab supersedes this one.
+    fn request_thumbnail(
+        &mut self,
+        index: usize,
+        render: impl FnOnce() -> Option<overlay::Thumbnail> + Send + 'static,
+    ) {
+        let tab = &mut self.state.projects[index];
+        tab.thumbnail_generation += 1;
+        let (tab_id, generation) = (tab.id, tab.thumbnail_generation);
+        let slot = &mut self.state.thumbnails;
+        slot.in_flight += 1;
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let picture =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(render)).unwrap_or(None);
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked pictures")
+                .push((tab_id, generation, picture));
+        });
+    }
+
+    /// Requests the picture of tab `index` from its own project: the stored
+    /// composite of an opened one, the first frame of an unsaved one.
+    fn request_tab_thumbnail(&mut self, index: usize) {
+        let tab = &self.state.projects[index];
+        match &tab.project {
+            GuiProject::Opened(project) => {
+                let path = project.path().to_path_buf();
+                self.request_thumbnail(index, move || overlay::render_thumbnail_from_file(&path));
+            }
+            GuiProject::Unsaved(_) => {
+                let first = tab.frames.first().cloned();
+                self.request_thumbnail(index, move || {
+                    overlay::render_thumbnail_from_frame(&first?)
+                });
+            }
+        }
+    }
+
+    /// Applies the decoded pictures workers have parked: a picture lands only
+    /// on a tab that still exists and whose newest request it answers; a
+    /// failed decode keeps the previous picture and is not retried. Returns
+    /// `true` once no decode is in flight -- the poll's cue to stop. Never
+    /// waits on a worker.
+    pub fn settle_thumbnails(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .thumbnails
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked pictures"),
+        );
+        self.state.thumbnails.in_flight -= parked.len();
+        let mut stored = false;
+        for (tab_id, generation, picture) in parked {
+            if let Some(tab) = self.state.projects.iter_mut().find(|tab| tab.id == tab_id)
+                && tab.thumbnail_generation == generation
+                && let Some(picture) = picture
+            {
+                tab.thumbnail = Some(Arc::new(picture));
+                stored = true;
+            }
+        }
+        if stored {
+            self.emit(ShellEvent::OverlayChanged);
+        }
+        self.state.thumbnails.in_flight == 0
+    }
+
+    /// Whether a picture decode started since the last call -- the bridge's
+    /// cue to start polling [`Self::settle_thumbnails`].
+    pub fn take_thumbnails_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.thumbnails.started)
     }
 
     /// Whether a checkpoint render started since the last call -- the
@@ -2029,9 +2305,10 @@ impl AppController {
     /// Quits the window: with no tab holding unsaved work or a parked run
     /// waiting for Keep or Discard, closes it at once. Otherwise raises
     /// [`Self::pending_quit_copy`] and touches no tab. A no-op while a close,
-    /// fuse or restore question is open.
+    /// fuse or restore question is open or a `Save all and quit` is writing.
     pub fn window_close(&mut self) {
         if self.state.pending_close.is_some()
+            || self.state.save.then == AfterSave::Quit
             || self.state.pending_fuse.is_some()
             || self.state.pending_restore.is_some()
             || self.state.pending_checkpoint_delete.is_some()
@@ -2433,6 +2710,10 @@ impl AppController {
     /// Applies `event` ([`Self::apply_action`]) and raises
     /// [`ShellEvent::Input`].
     fn emit_action(&mut self, event: ActionEvent) {
+        self.job.last_canvas_action = Some(Instant::now());
+        if let Some(control) = &self.job.control {
+            control.set_admission_cap(Some(job::interactive_cap()));
+        }
         self.apply_action(&event);
         self.emit(ShellEvent::Input(event));
     }
@@ -2705,13 +2986,15 @@ impl AppController {
     }
 
     /// `Ctrl + Z`: steps the active tab's edit session back one op and
-    /// recomposites the region it returns. Ignored while a stroke is live.
+    /// queues the region it returns for recompositing. Ignored while a
+    /// stroke is live.
     pub fn undo(&mut self) {
         self.undo_or_redo(job::EditSession::undo);
     }
 
     /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
-    /// recomposites the region it returns. Ignored while a stroke is live.
+    /// queues the region it returns for recompositing. Ignored while a
+    /// stroke is live.
     pub fn redo(&mut self) {
         self.undo_or_redo(job::EditSession::redo);
     }
@@ -2721,6 +3004,7 @@ impl AppController {
     /// `None` when there was nothing to step. A no-op while a stroke is
     /// live.
     fn undo_or_redo(&mut self, step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>) {
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -2734,10 +3018,8 @@ impl AppController {
         let Some(region) = step(&mut edit.session) else {
             return;
         };
-        if let Some(region) = region
-            && let Err(err) = edit.recomposite(region)
-        {
-            tracing::error!(error = %err, "undo/redo recomposite failed");
+        if let Some(region) = region {
+            edit.queue_recomposite(region, &wake);
         }
         if tab.unsaved() != was_unsaved {
             self.emit(ShellEvent::ProjectsChanged);
@@ -2789,9 +3071,10 @@ impl AppController {
     /// `Paint`'s `Start`. With the pipette armed, this is a pick that also
     /// disarms it, and the rest of the drag is ignored (no
     /// [`job::EditState::stroke`] is opened, so [`Self::paint_update`] has
-    /// nothing to push into). Otherwise, inside
-    /// the right pane only, opens a stroke at the pointer's source position,
-    /// freezing the brush's source, radius and softness for the stroke.
+    /// nothing to push into). Otherwise, over either pane, opens a stroke at
+    /// the pointer's source position, freezing the brush's source, radius and
+    /// softness for the stroke. Both panes share one viewport, so the stroke
+    /// is the same whichever pane the press lands in.
     fn paint_start(&mut self, x: f32, y: f32) {
         if self.state.brush.picking {
             let (pane, local) = self.anchor_pane();
@@ -2800,21 +3083,19 @@ impl AppController {
             self.emit(ShellEvent::EditorChanged);
             return;
         }
-        let Some((_, right)) = self.state.panes else {
-            return;
+        let hit = match self.state.input.explicit_pane {
+            Some(pane) => self
+                .pane_rect(pane)
+                .is_some_and(|rect| x >= 0.0 && x <= rect.width && y >= 0.0 && y <= rect.height),
+            None => self.pane_at(x, y).is_some(),
         };
-        let hit_zmap = match self.state.input.explicit_pane {
-            Some(PaneSource::ZMap) => x >= 0.0 && x <= right.width && y >= 0.0 && y <= right.height,
-            Some(PaneSource::Composite) => false,
-            None => pane_contains(right, x, y),
-        };
-        if !hit_zmap {
+        if !hit {
             return;
         }
         let (pane, local) = self.anchor_pane();
-        if pane != PaneSource::ZMap {
+        let Some(rect) = self.pane_rect(pane) else {
             return;
-        }
+        };
         let Some(source) = self.brush_source() else {
             return;
         };
@@ -2825,7 +3106,7 @@ impl AppController {
         let Some(viewport) = tab.viewport.as_ref() else {
             return;
         };
-        let (sx, sy) = viewport.to_source_in(local, right);
+        let (sx, sy) = viewport.to_source_in(local, rect);
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
@@ -2840,7 +3121,7 @@ impl AppController {
 
     /// `Paint`'s `Update`: integrates a screen-space delta into the live
     /// stroke's image-space trace. A no-op with no live stroke (a pipette
-    /// pick's drag, or a stroke that started outside the right pane).
+    /// pick's drag, or a stroke that started outside both panes).
     fn paint_update(&mut self, dx: f32, dy: f32) {
         let Some(tab) = self.state.active_mut() else {
             return;
@@ -2857,10 +3138,11 @@ impl AppController {
 
     /// Called by every repaint before it reads anything else: takes the
     /// active tab's live stroke's newest segment, if any, previews it and
-    /// recomposites exactly that segment's footprint into the resident
-    /// tiles -- one tick per repaint, never per motion event. A no-op with
-    /// no live stroke or no motion since the last flush.
+    /// queues exactly that segment's footprint for recompositing into the
+    /// resident tiles -- one tick per repaint, never per motion event. A
+    /// no-op with no live stroke or no motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -2886,10 +3168,7 @@ impl AppController {
         let Some(region) = region else {
             return;
         };
-        if let Err(err) = edit.recomposite(region) {
-            tracing::error!(error = %err, "live-stroke preview recomposite failed");
-            return;
-        }
+        edit.queue_recomposite(region, &wake);
         edit.stroke
             .as_mut()
             .expect("the stroke that produced this tick is still live")
@@ -2899,10 +3178,12 @@ impl AppController {
 
     /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
     /// appends the stroke's resampled path unless its footprint is empty or
-    /// off-image. Recomposites the tick rects (dilated), or the appended
-    /// region itself when no tick fired (a press-release with no motion).
+    /// off-image. Queues the tick rects (dilated) for recompositing, or the
+    /// appended region itself when no tick fired (a press-release with no
+    /// motion).
     fn paint_end(&mut self) {
         self.flush_live_stroke();
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -2944,16 +3225,12 @@ impl AppController {
         };
         let map = edit.session.tile();
         if tick_rects.is_empty() {
-            if let Err(err) = edit.recomposite(region) {
-                tracing::error!(error = %err, "brush-stroke commit recomposite failed");
-            }
+            edit.queue_recomposite(region, &wake);
         } else {
             let margin = (radius / 8.0).ceil() as u32 + 2;
             for rect in tick_rects {
                 let dilated = dilate_rect(rect, margin, map.width, map.height);
-                if let Err(err) = edit.recomposite(dilated) {
-                    tracing::error!(error = %err, "brush-stroke commit recomposite failed");
-                }
+                edit.queue_recomposite(dilated, &wake);
             }
         }
         if lit {
@@ -3018,6 +3295,15 @@ impl AppController {
                 y.clamp(pane.y, pane.y + pane.height) - pane.y,
             ),
         )
+    }
+
+    /// The pane whose rect contains `(x, y)`, left first; `None` over the
+    /// gutter, the divider, outside both, or with no panes installed.
+    fn pane_at(&self, x: f32, y: f32) -> Option<PaneRect> {
+        let (left, right) = self.state.panes?;
+        [left, right]
+            .into_iter()
+            .find(|&pane| pane_contains(pane, x, y))
     }
 
     fn pane_rect(&self, pane: PaneSource) -> Option<PaneRect> {
@@ -3197,6 +3483,57 @@ impl AppController {
         let image = display_image(tab)?;
         let (_, right) = self.state.panes?;
         tab.viewport.as_ref()?.draw(image, right)
+    }
+
+    /// The low-detail whole-image draw behind the left pane's exact
+    /// texture, over the same image and pane as [`Self::frame_draw`].
+    pub fn frame_backdrop_draw(&self) -> Option<PaneDraw> {
+        let image = display_image(self.state.active()?)?;
+        let (left, _) = self.state.panes?;
+        crate::viewport::backdrop_draw(image, left)
+    }
+
+    /// The right pane's counterpart of [`Self::frame_backdrop_draw`], over
+    /// the image [`Self::plane_draw`] draws.
+    pub fn plane_backdrop_draw(&self) -> Option<PaneDraw> {
+        let image = display_image(self.state.active()?)?;
+        let (_, right) = self.state.panes?;
+        crate::viewport::backdrop_draw(image, right)
+    }
+
+    /// Whether the active tab's edits have settled: no live stroke and no
+    /// recomposite queued or in flight. `true` with no edit session.
+    pub fn edits_settled(&self) -> bool {
+        self.state
+            .active()
+            .and_then(|tab| tab.edit.as_ref())
+            .is_none_or(job::EditState::is_settled)
+    }
+
+    /// Lifts the live run's interactive admission cap once the canvas has
+    /// seen no action for [`job::INTERACTION_QUIET`] as of `now`, the exact
+    /// read is idle (`exact_idle`) and the edits have settled.
+    pub fn relax_admission(&mut self, exact_idle: bool, now: Instant) {
+        let quiet = self
+            .job
+            .last_canvas_action
+            .is_none_or(|acted| now.saturating_duration_since(acted) >= job::INTERACTION_QUIET);
+        if quiet
+            && exact_idle
+            && self.edits_settled()
+            && let Some(control) = &self.job.control
+        {
+            control.set_admission_cap(None);
+        }
+    }
+
+    /// The live run's admission cap; `None` without a run, `usize::MAX`
+    /// uncapped.
+    pub fn admission_cap_for_test(&self) -> Option<usize> {
+        self.job
+            .control
+            .as_ref()
+            .map(|control| control.admission_cap())
     }
 
     /// The one wheel entry point. Axis normalisation first: an unmodified
@@ -3757,20 +4094,11 @@ impl AppController {
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
             self.close_projects_overlay();
-            let opened_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
                 self.clear_failure(&project_identity_path(&project));
-                self.record_recent(
-                    entry::tab_title(&project),
-                    recent_folder(&project),
-                    project_identity_path(&project),
-                    opened_at,
-                );
                 let missing = if let GuiProject::Opened(p) = &project {
+                    self.record_saved_project(p.path());
                     let (missing, total) = entry::missing_sources(p);
                     (missing > 0)
                         .then(|| (missing, total, p.validation().accepted_mismatch.is_some()))
@@ -3778,13 +4106,15 @@ impl AppController {
                     None
                 };
                 let file_name = entry::tab_title(&project);
-                let (source, meta) = match thumbnails.next() {
-                    Some((decoded, meta)) => (ThumbnailSource::Decoded(decoded), Some(meta)),
-                    None => (ThumbnailSource::NotAttempted, None),
+                let preloaded = thumbnails.next();
+                let decode = preloaded.is_none();
+                let (picture, meta) = match preloaded {
+                    Some((decoded, meta)) => (decoded, Some(meta)),
+                    None => (None, None),
                 };
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
-                let mut tab = ProjectTab::new(project, id, source, meta);
+                let mut tab = ProjectTab::new(project, id, picture, meta);
                 if let Some((missing, total, accepted_mismatch)) = missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
@@ -3804,6 +4134,9 @@ impl AppController {
                     }
                 }
                 self.state.projects.push(tab);
+                if decode {
+                    self.request_tab_thumbnail(self.state.projects.len() - 1);
+                }
             }
         }
         self.settle_tab_scroll();
@@ -3928,10 +4261,14 @@ impl AppController {
     }
 
     /// Closes tab `index` as of `now` without asking, unless a close was
-    /// acted on less than [`Self::CLOSE_DEBOUNCE`] before. `now` is a
-    /// parameter so tests step the clock without sleeping.
+    /// acted on less than [`Self::CLOSE_DEBOUNCE`] before or the tab's save
+    /// is running or queued. `now` is a parameter so tests step the clock
+    /// without sleeping.
     pub fn close_project_at(&mut self, index: usize, now: Instant) {
-        if index < self.state.projects.len() && !self.close_debounced(now) {
+        if let Some(tab) = self.state.projects.get(index)
+            && !self.saving_tab(tab.id)
+            && !self.close_debounced(now)
+        {
             self.remove_tab(index, now);
         }
     }
@@ -3945,8 +4282,8 @@ impl AppController {
     /// Asks to close tab `index` as of `now`: a tab with a modified live, an
     /// in-memory checkpoint or a queued delete raises [`Self::pending_close`]
     /// and stays open; any other tab closes at once. A no-op out of range,
-    /// inside [`Self::CLOSE_DEBOUNCE`], or while a quit, fuse or restore
-    /// question is open.
+    /// inside [`Self::CLOSE_DEBOUNCE`], while a quit, fuse or restore
+    /// question is open, or for a tab whose save is running or queued.
     pub fn request_close_at(&mut self, index: usize, now: Instant) {
         if self.state.pending_quit
             || self.state.pending_fuse.is_some()
@@ -3958,7 +4295,7 @@ impl AppController {
         let Some(tab) = self.state.projects.get(index) else {
             return;
         };
-        if self.close_debounced(now) {
+        if self.close_debounced(now) || self.saving_tab(tab.id) {
             return;
         }
         if !tab.loses_on_close() {
@@ -4074,7 +4411,7 @@ impl AppController {
 
     /// Records `name`/`folder`/`path` at the front of the `Recent` list and
     /// persists it, if a config directory resolved at startup. A write
-    /// failure is logged but never a reason to interrupt an open: the
+    /// failure is logged but never a reason to interrupt an open or a save: the
     /// `Recent` list stays correct in memory for the rest of the session.
     fn record_recent(&mut self, name: String, folder: PathBuf, path: PathBuf, opened_at: i64) {
         recent::record(&mut self.state.recent, name, folder, path, opened_at);
@@ -4083,6 +4420,22 @@ impl AppController {
         {
             tracing::warn!(error = %e, "the Recent list could not be saved");
         }
+    }
+
+    /// Records the saved project at `path` as opened now: its stem for a
+    /// name, its parent directory for a folder. Shared by an open of a
+    /// `.ffp` and a save that wrote one.
+    fn record_saved_project(&mut self, path: &Path) {
+        let opened_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.record_recent(
+            entry::project_title(path),
+            path.parent().unwrap_or(path).to_path_buf(),
+            path.to_path_buf(),
+            opened_at,
+        );
     }
 
     /// Test-only wrapper to exercise a save failure without driving a
@@ -4127,20 +4480,9 @@ impl AppController {
     }
 
     /// Opens the overlay, or closes it if it is already open -- the
-    /// four-square button's own toggle, and `Esc`'s. Opening also primes any
-    /// tab whose picture never got a chance to (a fresh tab and a fuse
-    /// settling already prime their own), the exception rather than the
-    /// rule.
+    /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
-        if self.state.overlay_open {
-            for tab in &mut self.state.projects {
-                if tab.thumbnail.is_none() {
-                    tab.thumbnail =
-                        overlay::render_thumbnail(&mut tab.project, &tab.frames).map(Arc::new);
-                }
-            }
-        }
         self.set_gallery_scroll(self.state.gallery_scroll_y);
         self.emit(ShellEvent::OverlayChanged);
     }
@@ -5537,10 +5879,16 @@ impl AppController {
         }
     }
 
-    /// `Save and close`: saves the asking tab as `save_project_at`
-    /// does, then closes it only if the save wrote. Returns whether it wrote;
-    /// the question is cleared either way.
-    pub fn save_and_close(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+    /// `Save and close`: clears the question and starts saving the asking
+    /// tab as `save_project_at` does. The tab closes once that write
+    /// has settled and nothing is unsaved on it -- otherwise the question is
+    /// raised again; a failed write leaves the tab open. Returns whether a
+    /// save started; with another save running nothing happens and the
+    /// question stays.
+    pub fn start_save_and_close(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        if self.save_in_flight() {
+            return false;
+        }
         let Some(index) = self.take_pending_close() else {
             self.emit(ShellEvent::ProjectsChanged);
             return false;
@@ -5549,8 +5897,16 @@ impl AppController {
             self.emit(ShellEvent::ProjectsChanged);
             return false;
         }
-        self.remove_tab(index, Instant::now());
+        self.state.save.then = AfterSave::CloseTab(self.state.projects[index].id);
         true
+    }
+
+    /// [`Self::start_save_and_close`] run to completion on the calling
+    /// thread: the entry for headless runs and tests. Returns whether the
+    /// save started and wrote.
+    pub fn save_and_close(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        let started = self.start_save_and_close(pick);
+        self.finish_saves() && started
     }
 
     /// The quit question still open, if any: how many tabs hold unsaved work
@@ -5603,30 +5959,48 @@ impl AppController {
         self.request_window_close();
     }
 
-    /// `Save all and quit`: saves every tab that would lose work on close, in
-    /// order, as `save_project_at` does. The first save
-    /// that does not write stops the loop and cancels the quit -- whatever
-    /// already saved stays saved. Returns whether every save wrote.
-    pub fn save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
-        let indices: Vec<usize> = self
+    /// `Save all and quit`: asks `pick` now for each tab that would lose work
+    /// on close, then saves them in turn. The window closes after the last
+    /// write unless a tab holds unsaved work, then the quit question
+    /// returns. A declined pick or failed write cancels the quit, keeping
+    /// what saved. Returns whether every pick was answered and the first
+    /// save started.
+    pub fn start_save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+        if self.save_in_flight() {
+            return false;
+        }
+        let mut queue = VecDeque::new();
+        let mut declined = false;
+        for tab in self
             .state
             .projects
             .iter()
-            .enumerate()
-            .filter(|(_, tab)| tab.loses_on_close())
-            .map(|(index, _)| index)
-            .collect();
-        for index in indices {
-            if !self.save_project_at(index, &pick) {
-                self.state.pending_quit = false;
-                self.emit(ShellEvent::ProjectsChanged);
-                return false;
+            .filter(|tab| tab.loses_on_close())
+        {
+            match save_target(tab, &pick) {
+                Some(target) => queue.push_back((tab.id, target)),
+                None => {
+                    declined = true;
+                    break;
+                }
             }
         }
         self.state.pending_quit = false;
-        self.remove_parked_runs();
-        self.request_window_close();
-        true
+        self.state.save.queue = queue;
+        if !declined {
+            self.state.save.then = AfterSave::Quit;
+        }
+        let advanced = self.advance_saves();
+        self.emit(ShellEvent::ProjectsChanged);
+        !declined && advanced
+    }
+
+    /// [`Self::start_save_all_and_quit`] run to completion on the calling
+    /// thread: the entry for headless runs and tests. Returns whether every
+    /// save started and wrote.
+    pub fn save_all_and_quit(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+        let started = self.start_save_all_and_quit(pick);
+        self.finish_saves() && started
     }
 
     /// The close guard's `Cancel`, whichever question is open -- the fuse or
@@ -5644,15 +6018,22 @@ impl AppController {
         }
     }
 
-    /// The close guard's secondary answer, whichever question is open --
-    /// [`Self::snapshot_live`] then the interrupted fuse for the fuse
-    /// question, [`Self::save_and_close`] for a close question,
-    /// [`Self::save_all_and_quit`] for a quit question. `false` with none
-    /// open, and for a fuse question when no run started or was queued.
+    /// [`Self::start_close_guard_secondary`] run to completion on the calling
+    /// thread: the entry for headless runs and tests.
     pub fn close_guard_secondary_pressed(
         &mut self,
         pick: impl Fn(&Path) -> Option<PathBuf>,
     ) -> bool {
+        let started = self.start_close_guard_secondary(pick);
+        self.finish_saves() && started
+    }
+
+    /// The close guard's secondary answer, whichever question is open --
+    /// [`Self::snapshot_live`] then the interrupted fuse for the fuse
+    /// question, [`Self::start_save_and_close`] for a close question,
+    /// [`Self::start_save_all_and_quit`] for a quit question. `false` with
+    /// none open, and for a fuse question when no run started or was queued.
+    pub fn start_close_guard_secondary(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
         if let Some((index, entry)) = self.take_pending_fuse() {
             match index {
                 Some(index) if self.snapshot_live(index) => self.resume_fuse(index, entry),
@@ -5666,9 +6047,9 @@ impl AppController {
             }
             false
         } else if self.state.pending_close.is_some() {
-            self.save_and_close(pick)
+            self.start_save_and_close(pick)
         } else if self.state.pending_quit {
-            self.save_all_and_quit(pick)
+            self.start_save_all_and_quit(pick)
         } else {
             false
         }
@@ -5794,7 +6175,7 @@ impl AppController {
         let mut new_tab = ProjectTab::new(
             entry::duplicate_as_unsaved(dir, name, tab.frames.clone()),
             id,
-            ThumbnailSource::NotAttempted,
+            None,
             Some(tab.meta.clone()),
         );
         new_tab.fuse_id = tab.fuse_id.clone();
@@ -5804,7 +6185,9 @@ impl AppController {
         new_tab.project_values = tab.project_values.clone();
         new_tab.remembered = tab.remembered.clone();
         self.state.projects.push(new_tab);
-        self.set_active_tab(Some(self.state.projects.len() - 1));
+        let index = self.state.projects.len() - 1;
+        self.request_tab_thumbnail(index);
+        self.set_active_tab(Some(index));
         self.emit(ShellEvent::ProjectsChanged);
         true
     }
@@ -6408,7 +6791,9 @@ impl AppController {
     /// other outcome. Never blocks.
     pub fn settle_job(&mut self) -> Option<(PathBuf, PathBuf)> {
         let handle = self.job.handle.take()?;
-        if !handle.is_finished() {
+        // A run finished on the tab being saved commits once the save settles.
+        let saving = self.job.tab_id.is_some_and(|id| self.is_saving(id));
+        if saving || !handle.is_finished() {
             self.job.handle = Some(handle);
             return None;
         }
@@ -6553,8 +6938,7 @@ impl AppController {
         tab.selected = images::first_included(&tab.excluded);
         tab.frame_sort = None;
         tab.read_missing_meta();
-        tab.edit = None;
-        tab.thumbnail = overlay::render_thumbnail_from_frame(&held.composite).map(Arc::new);
+        tab.drop_session();
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
@@ -6571,6 +6955,10 @@ impl AppController {
         tab.viewport = None;
         self.mark_fresh_checkpoint(index);
         self.enter_editor_if_viewing(index);
+        let composite = planes.0.clone();
+        self.request_thumbnail(index, move || {
+            overlay::render_thumbnail_from_frame(&composite)
+        });
         planes
     }
 
@@ -6637,6 +7025,9 @@ impl AppController {
     /// from. `None` with nothing parked.
     pub fn keep_fused(&mut self) -> Option<(PathBuf, PathBuf)> {
         let index = self.state.active?;
+        if self.history_frozen(index) {
+            return None;
+        }
         let parked = self.state.projects.get_mut(index)?.parked.take()?;
         let at = checkpoints::local_hhmm(parked.held.created_at);
         let unaligned = parked.diverged.len();
@@ -6650,6 +7041,9 @@ impl AppController {
     /// `Discard` on the active tab's parked run: deletes its held files and
     /// leaves the tab `Idle` with its checkpoint count unchanged.
     pub fn discard_fused(&mut self) {
+        if self.active_history_frozen() {
+            return;
+        }
         let Some(parked) = self.state.active_mut().and_then(|tab| tab.parked.take()) else {
             return;
         };
@@ -6669,7 +7063,8 @@ impl AppController {
 
     /// The active tab's current row's composite and Z-Map paths: a held
     /// row's own files, a saved row's pair in the plane cache. `None` with
-    /// no current row, while an op-bearing row renders, or once it refused.
+    /// no current row, while a saved row's cache is not fresh, or once it
+    /// refused.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
         match self.active_tab_planes() {
             TabPlanes::Ready(composite, zmap) => Some((composite, zmap)),
@@ -6678,9 +7073,9 @@ impl AppController {
     }
 
     /// [`Self::materialize_active_tab_planes`], telling a pending render
-    /// apart. A fused row is written synchronously -- a stored-composite
-    /// read. An op-bearing row starts the one background render, or waits
-    /// for the running one to settle first.
+    /// apart. A saved row whose cache pair is fresh answers at once; any
+    /// other starts the one background render, or waits for the running one
+    /// to settle first. Never writes a plane.
     fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
         let render_free = self.state.render.in_flight.is_none();
@@ -6727,7 +7122,7 @@ impl AppController {
         let GuiProject::Opened(project) = &mut tab.project else {
             return TabPlanes::None;
         };
-        match job::fused_checkpoint_planes(project, &scratch_root, &key) {
+        match job::cached_checkpoint_planes(project, &scratch_root, &key) {
             Ok(job::CheckpointPlanes::Ready(composite, zmap)) => {
                 tab.note_viewed(&scratch_root, &key);
                 tab.row_planes = Some(RowPlanes::Ready(composite.clone(), zmap.clone()));
@@ -6781,13 +7176,57 @@ impl AppController {
             })
     }
 
-    /// Whether the active tab has something a project save would write: an
-    /// in-memory checkpoint, a pending delete or a modified live -- what
-    /// enables `Save project` and its `Ctrl+S`.
+    /// Whether the active tab has something a project save would write -- an
+    /// in-memory checkpoint, a pending delete or a modified live -- and no
+    /// save is running: what enables `Save project` and its `Ctrl+S`.
     pub fn save_enabled(&self) -> bool {
-        self.active_project()
-            .and_then(|i| self.state.projects.get(i))
-            .is_some_and(ProjectTab::has_unsaved_write)
+        !self.save_in_flight()
+            && self
+                .active_project()
+                .and_then(|i| self.state.projects.get(i))
+                .is_some_and(ProjectTab::has_unsaved_write)
+    }
+
+    /// Whether a save worker is running. Saves run one at a time; a second
+    /// waits in the queue only for `Save all and quit`.
+    pub fn save_in_flight(&self) -> bool {
+        self.state.save.running.is_some()
+    }
+
+    /// Whether tab `id` has a save running.
+    fn is_saving(&self, id: u64) -> bool {
+        self.state
+            .save
+            .running
+            .as_ref()
+            .is_some_and(|running| running.tab_id == id)
+    }
+
+    /// Whether tab `id` is being saved or waits for its save.
+    fn saving_tab(&self, id: u64) -> bool {
+        self.is_saving(id)
+            || self
+                .state
+                .save
+                .queue
+                .iter()
+                .any(|&(queued, _)| queued == id)
+    }
+
+    /// Whether tab `index` is being saved: its checkpoint list, pending
+    /// deletes and parked run stay as the worker reads them until the save
+    /// settles.
+    fn history_frozen(&self, index: usize) -> bool {
+        self.state
+            .projects
+            .get(index)
+            .is_some_and(|tab| self.is_saving(tab.id))
+    }
+
+    fn active_history_frozen(&self) -> bool {
+        self.state
+            .active
+            .is_some_and(|index| self.history_frozen(index))
     }
 
     /// Keeps tab `index`'s live -- its origin's Z-Map with the session's ops
@@ -6796,6 +7235,9 @@ impl AppController {
     /// changing nothing, when live is unmodified or the checkpoint cannot be
     /// taken.
     pub fn snapshot_live(&mut self, index: usize) -> bool {
+        if self.history_frozen(index) {
+            return false;
+        }
         let shown = if self.state.active == Some(index) {
             match self.active_tab_planes() {
                 TabPlanes::Ready(composite, zmap) => Some(RowPlanes::Ready(composite, zmap)),
@@ -6841,6 +7283,9 @@ impl AppController {
     /// does not show (unknown, hidden or already queued) and for the last
     /// listed row.
     pub fn queue_checkpoint_delete(&mut self, id: &str) -> bool {
+        if self.active_history_frozen() {
+            return false;
+        }
         let panel = self.checkpoints_panel();
         if panel.row_count <= 1 || !panel.entries.iter().any(|e| e.id.as_deref() == Some(id)) {
             return false;
@@ -6860,7 +7305,7 @@ impl AppController {
     /// [`Self::checkpoints_panel`]. A no-op on a separator, past the end,
     /// with one row listed and while a dialog is open.
     pub fn request_checkpoint_delete(&mut self, index: usize) {
-        if self.modal_open() {
+        if self.modal_open() || self.active_history_frozen() {
             return;
         }
         let panel = self.checkpoints_panel();
@@ -6936,86 +7381,253 @@ impl AppController {
     }
 
     /// `save_project_at` on the active tab; `false` with none active.
-    pub fn save_active_project(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+    pub fn start_save_active_project(
+        &mut self,
+        pick: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) -> bool {
         self.active_project()
             .is_some_and(|index| self.save_project_at(index, pick))
     }
 
-    /// Writes tab `index`'s in-memory checkpoints and pending deletes into
-    /// one `.ffp`, after keeping a modified live as a checkpoint. A never-saved
-    /// tab asks `pick` (proposing `<frames dir>/<group name>.ffp`); an opened
-    /// one rewrites its own file. The edit session survives, rebased, and the
-    /// current row stays stored even when it was deleted. A failed write keeps
-    /// everything in memory and leaves [`Self::take_settled_failure`] a
-    /// message. Returns whether it wrote.
+    /// [`Self::start_save_active_project`] run to completion on the calling
+    /// thread: the entry for headless runs and tests. Returns whether the
+    /// save started and wrote.
+    pub fn save_active_project(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        let started = self.start_save_active_project(pick);
+        self.finish_saves() && started
+    }
+
+    /// Starts writing tab `index`'s in-memory checkpoints and pending deletes
+    /// into one `.ffp` on a worker, after keeping a modified live as a
+    /// checkpoint. A never-saved tab asks `pick` (proposing
+    /// `<frames dir>/<group name>.ffp`); an opened one rewrites its own file.
+    /// [`Self::settle_save`] applies the result. `false` with nothing to
+    /// write, a declined pick, a refused snapshot or another save running.
     fn save_project_at(
         &mut self,
         index: usize,
         pick: impl FnOnce(&Path) -> Option<PathBuf>,
     ) -> bool {
         let _scope = measurement_scope("gui_save_project");
+        if self.save_in_flight() {
+            return false;
+        }
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
         if !tab.has_unsaved_write() {
             return false;
         }
-        let (target, onto_existing) = match &tab.project {
-            GuiProject::Opened(project) => (project.path().to_path_buf(), true),
-            GuiProject::Unsaved(group) => {
-                match pick(&group.dir.join(format!("{}.ffp", group.name))) {
-                    Some(path) => (path, false),
-                    None => return false,
-                }
-            }
+        let Some(target) = save_target(tab, pick) else {
+            return false;
         };
+        let id = tab.id;
+        matches!(self.begin_save(id, target), SaveStart::Started)
+    }
+
+    /// Spawns the worker that writes tab `id` to `target` over a snapshot
+    /// taken now. The tab counts as saving from here on, so its history
+    /// stays as the worker reads it.
+    fn begin_save(&mut self, id: u64, target: PathBuf) -> SaveStart {
+        let Some(index) = self.tab_index(id) else {
+            return SaveStart::Skipped;
+        };
+        let tab = &self.state.projects[index];
+        if !tab.has_unsaved_write() {
+            return SaveStart::Skipped;
+        }
         if tab.live_modified() && !self.snapshot_live(index) {
             self.report_failed_save(
                 index,
                 &target,
                 "the unsaved edits could not be kept as a checkpoint".to_string(),
             );
-            return false;
+            return SaveStart::Failed;
         }
         let tab = &self.state.projects[index];
+        let held = tab.held.clone();
+        let deletes = tab.pending_deletes.clone();
         let keep = tab.row_parent();
-        let (project, ids) = match job::save_in_memory(
-            &target,
-            &tab.held,
-            &tab.pending_deletes,
-            keep.as_ref(),
-            onto_existing,
-        ) {
-            Ok(saved) => saved,
-            Err(err) => {
-                self.report_failed_save(index, &target, err.to_string());
-                self.emit(ShellEvent::CheckpointsChanged);
+        let onto_existing = matches!(tab.project, GuiProject::Opened(_));
+        let outcome = Arc::clone(&self.state.save.outcome);
+        let sink = self.sink.clone();
+        let (path, worker_keep) = (target.clone(), keep.clone());
+        let worker = std::thread::spawn(move || {
+            let result =
+                job::save_in_memory(&path, &held, &deletes, worker_keep.as_ref(), onto_existing)
+                    .map_err(|err| err.to_string());
+            *outcome
+                .lock()
+                .expect("no thread panicked while holding the save outcome") = Some(result);
+            if let Some(sink) = &sink {
+                sink(ShellEvent::SaveReady);
+            }
+        });
+        self.state.save.running = Some(RunningSave {
+            tab_id: id,
+            target,
+            keep,
+            worker: Some(worker),
+        });
+        SaveStart::Started
+    }
+
+    /// Starts the next queued save that has something to write; `Skipped`
+    /// when none is left.
+    fn start_next_save(&mut self) -> SaveStart {
+        while let Some((id, target)) = self.state.save.queue.pop_front() {
+            match self.begin_save(id, target) {
+                SaveStart::Skipped => {}
+                started_or_failed => return started_or_failed,
+            }
+        }
+        SaveStart::Skipped
+    }
+
+    /// Starts the next queued save or -- with none left -- carries out what
+    /// the last save was for. `false` when a queued save could not start; the
+    /// rest of the queue and the close or quit that waited are dropped.
+    fn advance_saves(&mut self) -> bool {
+        match self.start_next_save() {
+            SaveStart::Started => return true,
+            SaveStart::Failed => {
+                self.drop_pending_saves();
                 return false;
             }
-        };
-        let tab = &mut self.state.projects[index];
-        let next = tab
-            .selected_checkpoint
-            .as_deref()
-            .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
-        if let Some((row, generation)) = tab.fresh_checkpoint.clone()
-            && let Some(saved) = tab.saved_row_key(&row, &ids, keep.as_ref())
-        {
-            tab.fresh_checkpoint = Some((saved, generation));
+            SaveStart::Skipped => {}
         }
-        tab.selected_checkpoint =
-            next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
-        tab.row_planes = None;
-        tab.project = GuiProject::Opened(Box::new(project));
-        tab.title = entry::tab_title(&tab.project);
-        remove_in_memory(&tab.held);
-        tab.held.clear();
-        tab.pending_deletes.clear();
-        if tab.edit.is_none() {
-            self.state.canvas_dirty = true;
+        match std::mem::take(&mut self.state.save.then) {
+            AfterSave::Nothing => {}
+            AfterSave::CloseTab(id) => {
+                let Some(index) = self.tab_index(id) else {
+                    return true;
+                };
+                if self.state.projects[index].loses_on_close() {
+                    if !self.state.pending_quit {
+                        self.state.pending_close = Some(id);
+                    }
+                    self.emit(ShellEvent::ProjectsChanged);
+                } else {
+                    self.remove_tab(index, Instant::now());
+                }
+            }
+            AfterSave::Quit => {
+                if self.state.projects.iter().any(ProjectTab::loses_on_close) {
+                    if self.state.pending_close.is_none() {
+                        self.state.pending_quit = true;
+                    }
+                    self.emit(ShellEvent::ProjectsChanged);
+                } else {
+                    self.remove_parked_runs();
+                    self.request_window_close();
+                }
+            }
         }
-        self.emit(ShellEvent::ProjectsChanged);
         true
+    }
+
+    /// Forgets the queued saves and the close or quit that waited on them.
+    fn drop_pending_saves(&mut self) {
+        self.state.save.queue.clear();
+        self.state.save.then = AfterSave::Nothing;
+    }
+
+    /// Waits for the running save's worker to finish, without applying its
+    /// result. The event loop never calls it: [`Self::finish_saves`] and
+    /// tests do.
+    pub fn join_save(&mut self) {
+        if let Some(worker) = self
+            .state
+            .save
+            .running
+            .as_mut()
+            .and_then(|running| running.worker.take())
+        {
+            worker.join().expect("the save worker did not panic");
+        }
+    }
+
+    /// Joins and settles the running save and every save queued behind it,
+    /// then returns whether each one wrote. Blocks: the way headless runs,
+    /// tests and the end of a session wait out a write.
+    pub fn finish_saves(&mut self) -> bool {
+        let mut wrote = true;
+        while self.save_in_flight() {
+            self.join_save();
+            wrote &= self
+                .settle_save()
+                .expect("a joined save worker parked its outcome")
+        }
+        wrote
+    }
+
+    /// Applies the result a save worker parked, never blocking: a write that
+    /// succeeded records the file in `Recent`, opens the tab on it and clears
+    /// what it wrote; a failed one leaves everything in memory, notes why, and
+    /// drops the saves and the close or quit that waited on it. `None` while
+    /// no result is parked; otherwise whether the write succeeded and the save
+    /// queued behind it, if any, started.
+    pub fn settle_save(&mut self) -> Option<bool> {
+        let result = self
+            .state
+            .save
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the save outcome")
+            .take()?;
+        let running = self
+            .state
+            .save
+            .running
+            .take()
+            .expect("a parked save result belongs to a running save");
+        let index = self.tab_index(running.tab_id);
+        let (project, ids) = match result {
+            Ok(saved) => saved,
+            Err(reason) => {
+                if let Some(index) = index {
+                    self.report_failed_save(index, &running.target, reason);
+                    self.emit(ShellEvent::CheckpointsChanged);
+                }
+                self.drop_pending_saves();
+                return Some(false);
+            }
+        };
+        self.record_saved_project(project.path());
+        if let Some(index) = index {
+            let keep = running.keep;
+            let tab = &mut self.state.projects[index];
+            let next = tab
+                .selected_checkpoint
+                .as_deref()
+                .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
+            if let Some((row, generation)) = tab.fresh_checkpoint.clone()
+                && let Some(saved) = tab.saved_row_key(&row, &ids, keep.as_ref())
+            {
+                tab.fresh_checkpoint = Some((saved, generation));
+            }
+            tab.selected_checkpoint =
+                next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
+            tab.row_planes = None;
+            tab.project = GuiProject::Opened(Box::new(project));
+            tab.title = entry::tab_title(&tab.project);
+            remove_in_memory(&tab.held);
+            tab.held.clear();
+            tab.pending_deletes.clear();
+            if tab.edit.is_none() {
+                self.state.canvas_dirty = true;
+            }
+            // A session still opening read held files this save removed.
+            let reopen = self.state.edits.opening(tab.id, tab.session_generation);
+            if reopen {
+                tab.session_generation += 1;
+            }
+            self.emit(ShellEvent::ProjectsChanged);
+            if reopen && self.state.active == Some(index) {
+                self.leave_editor_if_unfit();
+            }
+        }
+        Some(self.advance_saves())
     }
 
     /// Records a failed save of tab `index` to `target` as a notification
@@ -7036,11 +7648,13 @@ impl AppController {
     /// What the open renderer cell should do for the frame about to draw,
     /// given which tab it currently holds (`None` before anything has
     /// loaded). `Keep` when the owner already matches the active tab and
-    /// nothing changed underneath it since; otherwise materializes the
-    /// active tab's own planes and answers `Load`; `Keep` too while the
-    /// active tab's current row renders over that tab's previous image, or
-    /// `Clear` when it has none (no tab active, `+` selected, nothing fused
-    /// yet, or its current row refused).
+    /// nothing changed underneath it since; otherwise `Load` at once when
+    /// the active row's cached planes are fresh. A saved row not cached yet
+    /// renders on the `RenderSlot` worker meanwhile, and an op-bearing row
+    /// waits for its session the same way: `Keep` over that tab's previous
+    /// image, or `Clear` when it has none (no tab active, `+` selected,
+    /// nothing fused yet, or its current row refused). The feed never writes
+    /// planes.
     pub fn canvas_feed(&mut self, loaded: Option<usize>) -> crate::canvas::CanvasFeed {
         let _scope = measurement_scope("gui_canvas_feed");
         if loaded == self.state.active && !self.state.canvas_dirty {
@@ -7050,7 +7664,17 @@ impl AppController {
         let Some(tab) = self.state.active else {
             return crate::canvas::CanvasFeed::Clear;
         };
-        match self.active_tab_planes() {
+        // An op-bearing row's pane waits for its session, so the base
+        // pictures never show under the edited row's label.
+        let opening_ops_row = self.state.active().is_some_and(|tab| {
+            tab.on_ops_row() && self.state.edits.opening(tab.id, tab.session_generation)
+        });
+        let planes = if opening_ops_row {
+            TabPlanes::Pending
+        } else {
+            self.active_tab_planes()
+        };
+        match planes {
             TabPlanes::Ready(composite, zmap) => crate::canvas::CanvasFeed::Load {
                 tab,
                 composite,
@@ -7921,6 +8545,15 @@ fn export_proposed_path(tab: &ProjectTab, format: ExportFormat) -> PathBuf {
     ))
 }
 
+/// Where tab `tab` saves to: an opened project's own file, or for a
+/// never-saved one whatever `pick` answers to the proposed path.
+fn save_target(tab: &ProjectTab, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
+    match &tab.project {
+        GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+        GuiProject::Unsaved(group) => pick(&group.dir.join(format!("{}.ffp", group.name))),
+    }
+}
+
 /// A path's own identity for a project or a card: an `Unsaved` tab's own
 /// source folder, a sealed one's `.ffp` file -- what a later successful open
 /// of the same path clears a failure card by.
@@ -7928,20 +8561,6 @@ fn project_identity_path(project: &GuiProject) -> PathBuf {
     match project {
         GuiProject::Unsaved(group) => group.dir.clone(),
         GuiProject::Opened(project) => project.path().to_path_buf(),
-    }
-}
-
-/// The folder a `Recent` entry names for `project`: the source folder for
-/// an `Unsaved` group, the sealed `.ffp`'s own parent directory once opened
-/// -- a folder either way, never a file path.
-fn recent_folder(project: &GuiProject) -> PathBuf {
-    match project {
-        GuiProject::Unsaved(group) => group.dir.clone(),
-        GuiProject::Opened(project) => project
-            .path()
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| project.path().to_path_buf()),
     }
 }
 

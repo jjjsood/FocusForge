@@ -7,6 +7,7 @@ import { FFLoadingPanel } from "../components/ff_loading_panel.slint";
 
 export component FFLoadingIndicator inherits Rectangle {
     in property <bool> load-active: false;
+    in property <string> caption: "Loading…";
     // Mirrored so a headless test can read whether the threshold has
     // let the indicator become visible, with no running window.
     out property <bool> load-visible: gate.shown;
@@ -38,7 +39,7 @@ export component FFLoadingIndicator inherits Rectangle {
     panel := FFLoadingPanel {
         x: (root.width - self.width) / 2;
         y: (root.height - self.height) / 2;
-        caption: "Loading…";
+        caption: root.caption;
         opacity: (root.load-active && gate.shown) ? 1.0 : 0.0;
         animate opacity { duration: Theme.motion-slow; easing: ease-in-out; }
     }

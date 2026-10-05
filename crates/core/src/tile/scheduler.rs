@@ -550,7 +550,7 @@ impl<'a> TileScheduler<'a> {
                     // `pool_threads`. Acquiring first keeps admission itself
                     // the bound: at most one further unit per outstanding
                     // permit completes after a stop is requested.
-                    let _permit = gate.acquire();
+                    let _permit = gate.acquire(control);
 
                     // The control check is the first statement after
                     // admission, above `live.fetch_add` below, so a skipped
