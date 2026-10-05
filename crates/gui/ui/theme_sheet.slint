@@ -37,6 +37,10 @@ import { FFStatusGlyph } from "components/ff_status_glyph.slint";
 import { FFHeading } from "components/ff_heading.slint";
 import { FFDivider } from "components/ff_divider.slint";
 import { FFSegmented } from "components/ff_segmented.slint";
+import { FFPane } from "components/ff_pane.slint";
+import { FFPaneLabel } from "components/ff_pane_label.slint";
+import { FFUndockControl } from "components/ff_undock_control.slint";
+import { FFWindowBar } from "components/ff_window_bar.slint";
 import { FFToast, FFCheckpointDelete } from "shell/dialogs.slint";
 
 component ColourSwatch inherits Rectangle {
@@ -146,6 +150,44 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "Pane chrome: default, hover, disabled"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFPaneLabel { label: "Composite"; }
+            FFUndockControl { }
+            FFUndockControl { hovered: true; }
+            FFUndockControl { enabled: false; }
+            FFUndockControl { dock-back: true; }
+            FFPane {
+                width: 220px;
+                height: 72px;
+                label: "Selected frame";
+                project-loaded: true;
+                undock-enabled: false;
+            }
+        }
+
+        GroupHeading { text: "Comparison window bar: default, hover, maximized, disabled"; }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+        }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+            hovered-control: "close";
+        }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+            maximized: true;
+        }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+            controls-enabled: false;
+        }
 
         GroupHeading { text: "Export dialog: format settings"; }
         FFSegmented { width: 252px; segments: ["TIFF", "PNG", "JPEG"]; selected: "PNG"; }

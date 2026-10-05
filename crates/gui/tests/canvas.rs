@@ -205,6 +205,192 @@ fn a_read_past_the_composite_draws_nothing_instead_of_panicking() {
     );
 }
 
+#[test]
+fn renderer_refuses_invalid_visible_draw_before_guarding() {
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, zmap) = golden_plane_files();
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite, &zmap).unwrap();
+    let draw = PaneDraw {
+        src: (0, 0, 16, 16),
+        dst: (0.0, 0.0, 16.0, 16.0),
+        crop: (0.0, 0.0, 16.0, 16.0),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+
+    for src in [(0, 0, 0, 16), (0, 0, 16, 0), (600, 0, 10, 10)] {
+        assert!(
+            renderer
+                .request_planes(&PaneDraw { src, ..draw }, None, None)
+                .is_none(),
+            "invalid visible draw {src:?} must be refused before guard expansion"
+        );
+    }
+}
+
+#[test]
+fn cached_redraw_refuses_invalid_visible_draw_without_losing_coverage() {
+    use focusforge_gui::canvas::Pane;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, zmap) = golden_plane_files();
+    let frame = common::fixture_frame("mantis-64", 0);
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer
+        .set_frame(&frame, None, job::host_budget())
+        .expect("fixture frame opens");
+    let plane = PaneDraw {
+        src: (128, 128, 16, 16),
+        dst: (0.0, 0.0, 16.0, 16.0),
+        crop: (0.0, 0.0, 16.0, 16.0),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+    let frame = PaneDraw {
+        src: (8, 8, 16, 16),
+        ..plane
+    };
+    renderer
+        .redraw_planes(&plane, None, None)
+        .expect("valid plane coverage publishes");
+    renderer
+        .redraw_frame(&frame)
+        .expect("valid frame coverage publishes");
+    let plane_placement = renderer
+        .placement(Pane::Composite, &plane)
+        .expect("plane coverage is present")
+        .1;
+    let frame_placement = renderer
+        .placement(Pane::Frame, &frame)
+        .expect("frame coverage is present")
+        .1;
+
+    for src in [(128, 128, 0, 16), (512, 128, 1, 1)] {
+        assert!(
+            renderer
+                .redraw_planes(&PaneDraw { src, ..plane }, None, None)
+                .is_none(),
+            "invalid plane draw {src:?} must never use cached coverage"
+        );
+    }
+    for src in [(8, 8, 0, 16), (64, 8, 1, 1)] {
+        assert!(
+            renderer.redraw_frame(&PaneDraw { src, ..frame }).is_none(),
+            "invalid frame draw {src:?} must never use cached coverage"
+        );
+    }
+    assert_eq!(
+        renderer.placement(Pane::Composite, &plane).unwrap().1,
+        plane_placement,
+        "invalid plane redraw leaves valid coverage intact"
+    );
+    assert_eq!(
+        renderer.placement(Pane::Frame, &frame).unwrap().1,
+        frame_placement,
+        "invalid frame redraw leaves valid coverage intact"
+    );
+}
+
+#[test]
+fn pending_pan_keeps_retained_coverage_inside_current_crop_until_latest_publish() {
+    use focusforge_gui::canvas::Pane;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::num::NonZeroU32;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, zmap) = golden_plane_files();
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite, &zmap).unwrap();
+    let first = PaneDraw {
+        src: (128, 128, 128, 128),
+        dst: (0.0, 0.0, 128.0, 128.0),
+        crop: (0.0, 0.0, 128.0, 128.0),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+    renderer
+        .redraw_planes(&first, None, None)
+        .expect("the initial coverage publishes");
+
+    // This leaves 20 source pixels inside the retained texture and asks the
+    // preparer for the rest. Keep that job unpublished to model its worker
+    // read being in flight while Slint renders the last texture.
+    let current = PaneDraw {
+        src: (300, 128, 128, 128),
+        ..first
+    };
+    let pending = renderer
+        .request_planes(&current, None, None)
+        .expect("a pan beyond retained coverage requires a latest job");
+    let (_, retained) = renderer
+        .placement(Pane::Composite, &current)
+        .expect("the previous texture remains available while the job is pending");
+    let crop = current.crop;
+    assert!(
+        retained.0 < crop.0 && retained.0 + retained.2 > crop.0,
+        "old coverage overlaps only the left edge of the current crop"
+    );
+    assert!(
+        retained.0 + retained.2 < crop.0 + crop.2,
+        "without the current-crop clip, old pixels would leave a stale edge and black surplus"
+    );
+
+    let (texture_width, texture_height) = pending.draw.extent();
+    let mut samples = vec![
+        0;
+        texture_width as usize
+            * texture_height as usize
+            * pending.reader.samples_per_pixel() as usize
+    ];
+    let (x, y, width, height) = pending.draw.src;
+    pending
+        .reader
+        .read_step_into(
+            focusforge_core::tile::Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            pending.draw.step,
+            &mut samples,
+        )
+        .expect("the latest job reads");
+    renderer
+        .publish(&pending, &samples)
+        .expect("the latest job publishes");
+    let (_, latest) = renderer
+        .placement(Pane::Composite, &current)
+        .expect("the latest coverage replaces retained coverage");
+    assert_eq!(latest, current.place(pending.draw.src));
+    assert!(
+        latest.0 <= crop.0
+            && latest.1 <= crop.1
+            && latest.0 + latest.2 >= crop.0 + crop.2
+            && latest.1 + latest.3 >= crop.1 + crop.3,
+        "the current crop clips the guarded latest texture to the exact visible draw"
+    );
+}
+
 // ---------------------------------------------------------------------
 // The renderer cell follows the active tab: routing tests over two real
 // projects of different sizes (`fixtures/mantis-64`, `fixtures/mantis-512`),
@@ -996,6 +1182,58 @@ fn pane_chrome_hidden_without_a_project() {
     }
 }
 
+#[test]
+fn current_crop_bounds_each_main_pane() {
+    thread_local! {
+        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_frame_crop_x(21.0);
+    app.set_frame_crop_y(34.0);
+    app.set_frame_crop_w(300.0);
+    app.set_frame_crop_h(200.0);
+    app.set_crop_x(15.0);
+    app.set_crop_y(27.0);
+    app.set_crop_w(280.0);
+    app.set_crop_h(180.0);
+
+    let pane = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(format!("FFCanvas::{id}"))
+            .find_first()
+            .unwrap_or_else(|| panic!("missing {id}"))
+    };
+    let crops = ElementQuery::from_root(&app)
+        .match_id("FFPane::image-crop")
+        .find_all();
+    let assert_crop = |pane_id: &str, local: (f32, f32), size: (f32, f32)| {
+        let pane = pane(pane_id);
+        let pane_pos = pane.absolute_position();
+        let crop = crops
+            .iter()
+            .find(|crop| {
+                let pos = crop.absolute_position();
+                (pos.x - (pane_pos.x + local.0)).abs() < GEOMETRY_EPS
+                    && (pos.y - (pane_pos.y + local.1)).abs() < GEOMETRY_EPS
+            })
+            .unwrap_or_else(|| panic!("{pane_id}: missing current crop"));
+        let got = crop.size();
+        assert!(
+            (got.width - size.0).abs() < GEOMETRY_EPS && (got.height - size.1).abs() < GEOMETRY_EPS,
+            "{pane_id}: crop {got:?}, expected {size:?}"
+        );
+    };
+    assert_crop("pane-left", (21.0, 34.0), (300.0, 200.0));
+    assert_crop("pane-right", (15.0, 27.0), (280.0, 180.0));
+}
+
 /// The not-yet-fused placeholder is on screen exactly while a project is
 /// loaded and the active tab has no composite yet, 220 px wide and centred
 /// on `pane-right`'s own rect without covering its label, at both the base
@@ -1120,7 +1358,7 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
 
 /// In Editor mode, hovering either pane shows both `FFBrushCursor`s at the
 /// expected centre -- the one under the pointer at the raw hover point, the
-/// other shifted by `cursor-mirror-dx` -- neither shows over the gutter or
+/// other at the projected pane-local point -- neither shows over the gutter or
 /// outside Editor mode, and each cursor's clip container matches its own
 /// pane's rect exactly.
 #[test]
@@ -1139,6 +1377,7 @@ fn both_brush_cursors_follow_either_pane() {
     app.set_project_loaded(true);
     app.set_mode("editor".into());
     app.set_cursor_extent(20.0);
+    app.set_cursor_visible(true);
 
     let rect = |id: &str| {
         let handle = ElementQuery::from_root(&app)
@@ -1149,8 +1388,10 @@ fn both_brush_cursors_follow_either_pane() {
     };
     let (left_pos, left_size) = rect("pane-left");
     let (right_pos, _right_size) = rect("pane-right");
-    let mirror_dx = right_pos.x - left_pos.x;
-    app.set_cursor_mirror_dx(mirror_dx);
+    app.set_cursor_composite_x(40.0);
+    app.set_cursor_composite_y(left_size.height / 2.0);
+    app.set_cursor_zmap_x(40.0);
+    app.set_cursor_zmap_y(left_size.height / 2.0);
 
     // Each clip container matches its own pane's rect exactly.
     for (clip_id, pane_id) in [
@@ -1187,10 +1428,11 @@ fn both_brush_cursors_follow_either_pane() {
     };
 
     // Hovering the left pane: the home cursor sits at the raw pointer, the
-    // mirrored one on the right pane at the pointer plus `mirror_dx`.
+    // mirrored one on the right pane at the same local point.
     let left_point =
         slint::LogicalPosition::new(left_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
     move_to(left_point);
+    assert!(app.get_canvas_pane_hovered());
     let home = find_cursor("brush-cursor-left").expect("shows while hovering its own pane");
     let mirrored = find_cursor("brush-cursor-right").expect("mirrors onto the other pane");
     let (hx, hy) = center(&home);
@@ -1200,15 +1442,16 @@ fn both_brush_cursors_follow_either_pane() {
     );
     let (mx, my) = center(&mirrored);
     assert!(
-        (mx - (left_point.x + mirror_dx)).abs() < GEOMETRY_EPS
+        (mx - (right_pos.x + 40.0)).abs() < GEOMETRY_EPS
             && (my - left_point.y).abs() < GEOMETRY_EPS,
-        "right cursor shifted by mirror_dx, got ({mx}, {my})"
+        "right cursor at the projected point, got ({mx}, {my})"
     );
 
     // Hovering the right pane: the roles (and the sign of the shift) flip.
     let right_point =
         slint::LogicalPosition::new(right_pos.x + 40.0, left_pos.y + left_size.height / 2.0);
     move_to(right_point);
+    assert!(app.get_canvas_pane_hovered());
     let home = find_cursor("brush-cursor-right").expect("shows while hovering its own pane");
     let mirrored = find_cursor("brush-cursor-left").expect("mirrors onto the other pane");
     let (hx, hy) = center(&home);
@@ -1218,17 +1461,19 @@ fn both_brush_cursors_follow_either_pane() {
     );
     let (mx, my) = center(&mirrored);
     assert!(
-        (mx - (right_point.x - mirror_dx)).abs() < GEOMETRY_EPS
+        (mx - (left_pos.x + 40.0)).abs() < GEOMETRY_EPS
             && (my - right_point.y).abs() < GEOMETRY_EPS,
-        "left cursor shifted by -mirror_dx, got ({mx}, {my})"
+        "left cursor at the projected point, got ({mx}, {my})"
     );
 
-    // Over the gutter, neither cursor shows.
+    // The bridge hides both cursors when the pointer leaves either pane.
     let gutter_point = slint::LogicalPosition::new(
         (left_pos.x + left_size.width + right_pos.x) / 2.0,
         left_pos.y + left_size.height / 2.0,
     );
     move_to(gutter_point);
+    assert!(!app.get_canvas_pane_hovered());
+    app.set_cursor_visible(false);
     assert!(
         find_cursor("brush-cursor-left").is_none() && find_cursor("brush-cursor-right").is_none(),
         "both cursors hidden over the gutter"
@@ -1316,7 +1561,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
     use focusforge_gui::canvas::PaneSource;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
-    use focusforge_gui::viewport::PaneDraw;
+    use focusforge_gui::viewport::{ImageSize, PaneDraw};
     use std::num::NonZeroU32;
 
     // Timing accounting is process-global, so this runs alone in a child.
@@ -1360,6 +1605,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     let golden = PaneDraw {
         src: (3, 5, 37, 23),
         dst: (0.0, 0.0, 37.0, 23.0),
+        crop: (0.0, 0.0, 37.0, 23.0),
         pixelated: false,
         step: NonZeroU32::new(2).unwrap(),
     };
@@ -1373,9 +1619,20 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
             .expect("fixture TIFF opens");
         u64::from(stack.header(0).samples_per_pixel)
     };
+    let image_size = |path: &Path| {
+        let stack = focusforge_core::io::TiffStack::open_files(&[path.to_path_buf()])
+            .expect("fixture TIFF opens");
+        let header = stack.header(0);
+        ImageSize {
+            width: header.width,
+            height: header.height,
+        }
+    };
     let composite_spp = samples_per_pixel(&composite_path);
     let frame_spp = samples_per_pixel(&frame_path);
     let zmap_spp = 1;
+    let plane_image = image_size(&composite_path);
+    let frame_image = image_size(&frame_path);
 
     let counters = || {
         let s = timing_snapshot().expect("trace accounting is enabled");
@@ -1459,8 +1716,8 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     assert_steady(before, after, "dst-only shift");
     assert_nothing_read(before, after, "dst-only shift");
 
-    // 3. A pan to a different src of the same extent: reads and uploads
-    // exactly the selected (composite) plane, then exactly the frame.
+    // 3. A small pan remains inside the retained guard, so it changes
+    // placement without reading or uploading either pane.
     let panned = PaneDraw {
         src: (4, 6, 37, 23),
         dst: golden.dst,
@@ -1469,12 +1726,14 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     let before = counters();
     assert!(renderer.redraw_planes(&panned, None, None).is_some());
     let after = counters();
-    assert_one_plane(before, after, &panned, composite_spp, "pan");
+    assert_steady(before, after, "guarded plane pan");
+    assert_nothing_read(before, after, "guarded plane pan");
 
     let before = counters();
     assert!(renderer.redraw_frame(&panned).is_some());
     let after = counters();
-    assert_one_plane(before, after, &panned, frame_spp, "pan (frame)");
+    assert_steady(before, after, "guarded frame pan");
+    assert_nothing_read(before, after, "guarded frame pan");
 
     // 4. A zoom to a different step: reads and uploads again.
     let zoomed = PaneDraw {
@@ -1484,7 +1743,15 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     let before = counters();
     assert!(renderer.redraw_planes(&zoomed, None, None).is_some());
     let after = counters();
-    assert_one_plane(before, after, &zoomed, composite_spp, "zoom");
+    assert_one_plane(
+        before,
+        after,
+        &zoomed
+            .guarded(plane_image, u32::MAX)
+            .expect("an unbounded test texture fits"),
+        composite_spp,
+        "zoom",
+    );
 
     // 5. Selecting the Z-Map plane for the first time at this content reads
     // and uploads exactly it.
@@ -1495,7 +1762,15 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         .expect("Z-Map plane draws");
     assert_eq!(plane, PaneSource::ZMap);
     let after = counters();
-    assert_one_plane(before, after, &zoomed, zmap_spp, "first Z-Map select");
+    assert_one_plane(
+        before,
+        after,
+        &zoomed
+            .guarded(plane_image, u32::MAX)
+            .expect("an unbounded test texture fits"),
+        zmap_spp,
+        "first Z-Map select",
+    );
 
     // Selecting back to Composite at the same content is a no-op: its own
     // coverage is still current, and the Z-Map is not touched either.
@@ -1521,7 +1796,15 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         .expect("composite plane draws again");
     assert_eq!(plane, PaneSource::Composite);
     let after = counters();
-    assert_one_plane(before, after, &zoomed, composite_spp, "post set_planes");
+    assert_one_plane(
+        before,
+        after,
+        &zoomed
+            .guarded(plane_image, u32::MAX)
+            .expect("an unbounded test texture fits"),
+        composite_spp,
+        "post set_planes",
+    );
 
     // 7. `set_frame` on the frame's unchanged draw invalidates its coverage;
     // the next frame draw re-reads exactly the frame.
@@ -1531,7 +1814,15 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     let before = counters();
     assert!(renderer.redraw_frame(&panned).is_some());
     let after = counters();
-    assert_one_plane(before, after, &panned, frame_spp, "post set_frame");
+    assert_one_plane(
+        before,
+        after,
+        &panned
+            .guarded(frame_image, u32::MAX)
+            .expect("an unbounded test texture fits"),
+        frame_spp,
+        "post set_frame",
+    );
 }
 
 #[test]
@@ -1641,6 +1932,7 @@ mod preparing {
             draw: PaneDraw {
                 src: (0, 0, width, 8),
                 dst: (0.0, 0.0, width as f32, 8.0),
+                crop: (0.0, 0.0, width as f32, 8.0),
                 pixelated: false,
                 step: NonZeroU32::MIN,
             },
@@ -2094,6 +2386,7 @@ fn prepared_samples_match_a_direct_read() {
                 let draw = PaneDraw {
                     src: (x, y, width, height),
                     dst: (0.0, 0.0, width as f32, height as f32),
+                    crop: (0.0, 0.0, width as f32, height as f32),
                     pixelated: false,
                     step,
                 };
@@ -2202,6 +2495,7 @@ fn stale_results_render_nothing() {
     let draw = |x: u32| PaneDraw {
         src: (x, 5, 37, 23),
         dst: (0.0, 0.0, 37.0, 23.0),
+        crop: (0.0, 0.0, 37.0, 23.0),
         pixelated: false,
         step: NonZeroU32::new(2).unwrap(),
     };
@@ -2244,14 +2538,23 @@ fn stale_results_render_nothing() {
     };
 
     // Older than a published view.
-    let older = renderer.request_frame(&draw(4)).expect("frame job");
-    let newer = renderer.request_frame(&draw(5)).expect("frame job");
+    let older = renderer
+        .request_planes(&draw(4), None, None)
+        .expect("plane job");
+    let newer = renderer
+        .request_planes(&draw(200), None, None)
+        .expect("plane job outside retained coverage");
     accepted(&mut renderer, &newer, "newer frame view");
     refused(&mut renderer, &older, "older frame view");
 
     // Requesting a view the pane already shows retires work in flight.
-    let in_flight = renderer.request_frame(&draw(6)).expect("frame job");
-    assert!(renderer.request_frame(&draw(5)).is_none(), "already shown");
+    let in_flight = renderer
+        .request_planes(&draw(350), None, None)
+        .expect("plane job outside retained coverage");
+    assert!(
+        renderer.request_planes(&draw(200), None, None).is_none(),
+        "already shown"
+    );
     refused(
         &mut renderer,
         &in_flight,
@@ -2295,9 +2598,10 @@ fn stale_results_render_nothing() {
     accepted(&mut renderer, &zmap_job, "Z-Map after the selection");
 
     // A device change.
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
     let before_device = renderer
-        .request_planes(&draw(8), None, None)
-        .expect("plane job");
+        .request_planes(&draw(7), None, None)
+        .expect("plane job after reset");
     renderer.detach_device();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     refused(&mut renderer, &before_device, "detach and attach");
