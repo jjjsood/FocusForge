@@ -616,10 +616,13 @@ by construction) -- always numbers here, since every `align` run computes.
 modes. `status` is `"converged"`, `"hit-cap"`, `"stalled"` or `"diverged"`; only a
 diverged frame carries `reason`: `singular-hessian`, `lemma-one-region`,
 `non-invertible-increment`, `correlation-decreased`, `too-few-valid-samples`,
-`non-finite-update` or `validation-failed` (the fit converged but its
-transform leaves a large residual at patches away from the fit region).
+`non-finite-update`, `validation-failed` (the fit converged but its
+transform leaves a large residual at patches away from the fit region) or
+`weak-match` (the final correlation is below 0.2, the floor a correct
+registration reaches; the fit is kept).
 `stalled` means the iteration cap was reached with flat or oscillating steps
-and the best-correlation transform is kept; only `diverged` counts as a
+and the best-correlation transform is kept, or that a middle pyramid level
+lost correlation and handed its best fit to the next finer level; only `diverged` counts as a
 failure, so a `stalled` frame neither fails a strict run nor adds to
 `failure_count`. In the text report a diverged row
 reads `diverged(<Reason>)`. `align_backend` is `"cpu"`, or the GPU adapter's

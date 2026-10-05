@@ -59,15 +59,33 @@ Each frame's row ends in the status its solve reached:
 - `converged` — the step size fell below `epsilon-px`.
 - `hit-cap` — `max-iterations` ran out while the steps were still shrinking.
 - `stalled` — `max-iterations` ran out with the steps flat or oscillating; the
-  best-correlation transform is kept.
+  best-correlation transform is kept. A middle pyramid level that loses
+  correlation (typical of a defocused frame) also counts as `stalled`: it
+  hands its best fit to the next finer level, which refines it.
 - `diverged(<reason>)` — the frame did not register. `validation-failed`
   (JSON) is one reason: the fit converged, but the same transform leaves a
   large residual at most of the usable patches away from the fit region, so
-  it is rejected rather than trusted. The other reasons are in
+  it is rejected rather than trusted. `weak-match` is another: the final
+  correlation is below 0.2, so the best match found is a wrong optimum and is
+  rejected. The other reasons are in
   [`reference/cli.md`](../reference/cli.md#align).
 
 A pyramid level whose status is worse than the others sets the frame's
 status.
+
+## Accuracy
+
+Before the final solve, the finest pyramid level of both the reference and the
+frame is smoothed with three light low-pass passes, so depth-varying defocus
+between two frames does not bias the fit. Coarser levels are not smoothed, and
+a solve region that lies within the smoothing reach of the frame edge reads
+the finest level unsmoothed.
+
+Each frame's solve starts from a feature-based estimate when one is reliable.
+That seed is accepted when its matches agree over enough of the frame: spread
+across at least 6 cells of a 4x4 grid, or, when clustered in as few as 2
+cells, when at least 75% of the matches support it. Otherwise the solve starts
+from the identity.
 
 ## Failure is strict by default
 
@@ -84,13 +102,13 @@ that says so; `--no-crop` keeps the full frame extent instead.
 Some inputs still defeat the solver:
 
 - Heavy defocus and long series (on the order of 64 frames) can leave frames
-  `diverged` (`correlation-decreased`). On the same stacks a frame can also
-  end `converged` with a wrong transform and no warning, off by anything from
-  a pixel to over a hundred, so `converged` does not prove correctness there.
-  Check such a stack with `--write-warped` and look at the result, or compare
+  `diverged` (`correlation-decreased`). A fit whose final correlation stays
+  below 0.2 is reported as `diverged` (`weak-match`), which catches the clear
+  wrong fits, but `converged` still does not prove correctness on such
+  stacks. Check them with `--write-warped` and look at the result, or compare
   each frame's transform with its neighbours'.
-- Strongly periodic scenes (repeating patterns) can register to the wrong
-  period.
+- Strongly periodic scenes (repeating patterns) can fail to align. Such
+  frames normally end `diverged` rather than as a converged wrong fit.
 
 Only `diverged` is a failure: `stalled`, `hit-cap` and `converged` frames
 never fail a strict run. For a stack with `diverged` frames, use `--no-align`
