@@ -27,3 +27,18 @@ path = "junit.xml"
 [[profile.gpu.overrides]]
 filter = 'binary(harness) & test(/_budget$/)'
 slow-timeout = { period = "60s", terminate-after = 120 }
+
+# The fast workspace run `tools/check-all.sh --quick` uses: everything except
+# the binaries that measure memory peaks, the hit cap and the reference cache
+# over real stacks. Each of those runs for minutes and sets the wall time of
+# the whole suite on its own; the full gate still runs them.
+[profile.quick]
+default-filter = '''
+not (
+  binary_id(focusforge-core::hit_cap_behaviour)
+  | binary_id(focusforge-core::align_parallel_memory)
+  | binary_id(focusforge-core::align_reference_cache)
+  | binary_id(focusforge-core::tile_scheduler_memory)
+  | binary_id(focusforge-core::checkpoint_render_memory)
+)
+'''
