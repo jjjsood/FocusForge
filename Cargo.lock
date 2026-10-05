@@ -1705,6 +1705,7 @@ dependencies = [
  "focusforge-core",
  "inventory",
  "jpeg-encoder",
+ "libc",
  "memmap2",
  "png",
  "proptest",
