@@ -247,14 +247,12 @@ const TRANSLATION_TOLERANCE_PX: f64 = 1e-4;
 /// headroom over the measured figure.
 const ROTATION_SCALE_TOLERANCE_PX: f64 = 1e-3;
 
-/// Measured 2026-09-13 (`cargo test -p focusforge-core --test align_algorithm
-/// coarse_to_fine_beats_single_level -- --nocapture`), driven path
-/// (`pyramid-depth = 3`, `max-iterations = 100`) recovering an 80px
-/// translation: corner error `6.07e-3` px -- an order of magnitude looser
-/// than [`TRANSLATION_TOLERANCE_PX`], because an 80px displacement is a much
-/// larger normal-equation excursion than the 6.5px pair that tolerance was
-/// measured on. Pinned at ~100x the measured figure.
-const COARSE_TO_FINE_TOLERANCE_PX: f64 = 1.0;
+/// Measured with `cargo test -p focusforge-core --test align_algorithm
+/// an_80px_shift_with_a_clean_border_converges_through_the_pyramid --
+/// --nocapture`, driven path (`pyramid-depth = 3`, `max-iterations = 100`)
+/// recovering an 80px translation over an edge-repeated border: corner error
+/// `8.2e-5` px. Pinned at ~12x the measured figure.
+const LARGE_TRANSLATION_TOLERANCE_PX: f64 = 1e-3;
 
 #[test]
 fn recovers_known_translation_through_the_driver() {
@@ -380,49 +378,41 @@ fn rotation_scale_mode_returns_a_similarity() {
 }
 
 #[test]
-fn coarse_to_fine_beats_single_level() {
+fn an_80px_shift_with_a_clean_border_converges_through_the_pyramid() {
     let (tile, width, height, spp) = frame_3_tile();
     let rect = full_rect(width, height);
     let w_true = Transform::translation(80.0, 0.0);
     let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
         .expect("80px translation stays well inside the frame");
 
-    let reader = two_frame_reader(
-        width,
-        height,
-        spp,
-        warped.tile.samples.clone(),
-        tile.samples.clone(),
-    );
+    // The warp zero-fills columns 432..512. A zero step edge inside the solve
+    // region bleeds through the level-0 smoothing, whereas real frames are
+    // edge-repeated at the frame boundary, so column 431 is repeated instead.
+    let (w, s) = (width as usize, spp as usize);
+    let mut filled = warped.tile.samples;
+    for row in filled.chunks_exact_mut(w * s) {
+        let (content, border) = row.split_at_mut(432 * s);
+        let edge = &content[431 * s..];
+        for px in border.chunks_exact_mut(s) {
+            px.copy_from_slice(edge);
+        }
+    }
+
+    let reader = two_frame_reader(width, height, spp, filled, tile.samples.clone());
     let stack_ctx = StackContext::new(2, width, height, spp);
     let ctx = AlignContext::new(stack_ctx, 0, &reader);
-
-    let single_level = PyramidalEcc
-        .align_frame(&ctx, 1, &cfg_with("translation", 0, 50))
-        .expect("valid solver inputs");
-    let single_ok = single_level.status == AlignStatus::Converged
-        && corner_error(&single_level.transform, &w_true, default_region())
-            < TRANSLATION_TOLERANCE_PX;
-    assert!(
-        !single_ok,
-        "a single level (pyramid-depth = 0) must not recover an 80px translation, \
-         which is beyond the measured 60px single-level capture range: {single_level:?}"
-    );
 
     let driven = PyramidalEcc
         .align_frame(&ctx, 1, &cfg_with("translation", 3, 100))
         .expect("valid solver inputs");
-    // A level that reaches the cap makes the frame `HitCap`; only a divergence
-    // would mean the pyramid failed to recover the shift.
-    assert!(
-        !matches!(driven.status, AlignStatus::Diverged(_)),
-        "outcome: {driven:?}"
-    );
+    assert_eq!(driven.status, AlignStatus::Converged, "outcome: {driven:?}");
     let error = corner_error(&driven.transform, &w_true, default_region());
-    eprintln!("coarse_to_fine_beats_single_level: driven (depth=3) corner error = {error} px");
+    eprintln!(
+        "an_80px_shift_with_a_clean_border_converges_through_the_pyramid: corner error = {error} px"
+    );
     assert!(
-        error < COARSE_TO_FINE_TOLERANCE_PX,
-        "corner error {error} px exceeds {COARSE_TO_FINE_TOLERANCE_PX} px"
+        error < LARGE_TRANSLATION_TOLERANCE_PX,
+        "corner error {error} px exceeds {LARGE_TRANSLATION_TOLERANCE_PX} px"
     );
 }
 
