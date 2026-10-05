@@ -492,6 +492,24 @@ fn show_comparison_pane(
             window.set_cursor_visible(false);
         }
         let renderer = canvas.renderer.as_ref();
+        // The backdrop of whichever pane is detached, placed by that pane's
+        // draw; none clears it.
+        let (backdrop, rect) = match detached {
+            PaneSource::Composite => {
+                frame_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
+            }
+            PaneSource::ZMap => plane_draw.and_then(|draw| {
+                let renderer = renderer?;
+                (renderer.plane() == PaneSource::Composite)
+                    .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
+            }),
+        }
+        .unwrap_or_default();
+        window.set_backdrop(backdrop);
+        window.set_backdrop_x(rect.0);
+        window.set_backdrop_y(rect.1);
+        window.set_backdrop_w(rect.2);
+        window.set_backdrop_h(rect.3);
         match detached {
             // Historical `Composite` names the selected-frame pane.
             PaneSource::Composite => {

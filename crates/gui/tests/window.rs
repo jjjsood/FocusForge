@@ -75,6 +75,52 @@ fn comparison_current_crop_matches_the_visible_draw() {
 }
 
 #[test]
+fn comparison_backdrop_sits_under_the_exact_image_outside_its_crop() {
+    use focusforge_gui::ComparisonWindow;
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    i_slint_backend_testing::init_no_event_loop();
+    let window = ComparisonWindow::new().unwrap();
+    window.window().set_size(slint::PhysicalSize::new(820, 600));
+    let images = |window: &ComparisonWindow| {
+        ElementQuery::from_root(window)
+            .match_type_name("Image")
+            .find_all()
+            .into_iter()
+            .map(|image| {
+                let position = image.absolute_position();
+                let size = image.size();
+                (position.x, position.y, size.width, size.height)
+            })
+            .collect::<Vec<_>>()
+    };
+    let backdrop_rect = (-40.0, 12.0, 700.0, 333.0);
+    let at = |rect: (f32, f32, f32, f32)| (1.0 + rect.0, 29.0 + rect.1, rect.2, rect.3);
+    assert!(
+        !images(&window).contains(&at(backdrop_rect)),
+        "no backdrop is drawn before one is set"
+    );
+
+    window.set_crop_x(18.0);
+    window.set_crop_y(31.0);
+    window.set_crop_w(400.0);
+    window.set_crop_h(250.0);
+    window.set_backdrop(slint::Image::from_rgba8(slint::SharedPixelBuffer::<
+        slint::Rgba8Pixel,
+    >::new(4, 3)));
+    window.set_backdrop_x(backdrop_rect.0);
+    window.set_backdrop_y(backdrop_rect.1);
+    window.set_backdrop_w(backdrop_rect.2);
+    window.set_backdrop_h(backdrop_rect.3);
+    assert!(
+        images(&window).contains(&at(backdrop_rect)),
+        "the backdrop keeps its own placement, not the crop's: {:?}",
+        images(&window)
+    );
+}
+
+#[test]
 fn comparison_window_forwards_focused_keys_and_focus_loss() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
