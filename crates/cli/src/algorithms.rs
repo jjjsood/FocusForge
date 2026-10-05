@@ -20,10 +20,8 @@ use serde::Serialize;
 
 use crate::set::{SetArgs, parse_settings};
 
-/// The frozen `algorithms --json` schema: one envelope for the listing and
-/// the single-id form (a one-element `algorithms` array). Additive only: a
-/// field added to `ParamDesc` appears in `params` without an edit here,
-/// because the descriptor is `#[serde(flatten)]`ed. `project_params` lists
+/// The `algorithms --json` report has one envelope for the listing and the
+/// single-id form (a one-element `algorithms` array). `project_params` lists
 /// the run-level settings `stack --set` accepts beside an algorithm's own,
 /// with the default that holds unless a fusion method declares its own
 /// (`project_defaults` on that method's entry).

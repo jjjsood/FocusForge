@@ -79,14 +79,6 @@ pub enum ResumeError {
     /// disagreement or a changed algorithm/parameter/geometry field.
     #[error("{0}")]
     Mismatch(FingerprintMismatch),
-
-    /// A ledger whose `format` this build does not recognise. Never
-    /// propagated by [`ResumeStore::find`] itself (an unrecognised format
-    /// means "no resumable state", handled by returning [`Resumable::None`]
-    /// rather than an error) -- named here for a caller that reads a
-    /// `job.json` directly and wants the same vocabulary.
-    #[error("{}: unrecognised ledger format {found}", path.display())]
-    UnknownFormat { path: PathBuf, found: u32 },
 }
 
 /// What [`ResumeStore::find`] returns for one freshly computed [`JobRecord`].
@@ -402,10 +394,9 @@ impl ResumeStore {
     /// module's own docs, "The resume path, end to end".
     ///
     /// **No key string, no hash**: lists `<scratch_base>/resume/*/job.json`,
-    /// parses each, skips any
-    /// whose `format` it does not know or whose `composite_output` no
-    /// longer exists (a stale ledger from an already-finished, deleted
-    /// run), and compares the first remaining candidate's identity against
+    /// parses each, skips any whose `composite_output` no longer exists (a
+    /// stale ledger from an already-finished, deleted run), and compares the
+    /// first remaining candidate's identity against
     /// `record` field by field.
     pub fn find(&self, record: &JobRecord) -> Result<Resumable, ResumeError> {
         let entries = match fs::read_dir(&self.root) {
@@ -439,9 +430,6 @@ impl ResumeStore {
                 Ok(candidate) => candidate,
                 Err(_) => continue,
             };
-            if candidate.format != super::record::JOB_RECORD_FORMAT {
-                continue;
-            }
             if !candidate.composite_output.exists() {
                 continue;
             }
@@ -569,7 +557,6 @@ mod tests {
         // resumable at all (the stale-ledger guard).
         fs::write(&output, b"x").unwrap();
         JobRecord {
-            format: super::super::record::JOB_RECORD_FORMAT,
             fingerprint: StackFingerprint { frames: Vec::new() },
             width: 100,
             height: 100,
@@ -716,48 +703,6 @@ mod tests {
                 );
             }
             other => panic!("expected Resumable::Ledger, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn an_unrecognised_format_is_no_resumable_state() {
-        let scratch = tmp_dir("unknown-format");
-        let store = ResumeStore::open(&scratch).unwrap();
-        let mut record = sample_record(&scratch, "out.tif");
-        // Write a job.json with a format this build does not know.
-        let mut foreign = record.clone();
-        foreign.format = u32::MAX;
-        let dir = scratch.join("resume").join("foreign-dir");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("job.json"), serde_json::to_vec(&foreign).unwrap()).unwrap();
-
-        record.format = super::super::record::JOB_RECORD_FORMAT;
-        match store.find(&record).unwrap() {
-            Resumable::None => {}
-            other => panic!("expected Resumable::None for an unrecognised format, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&scratch);
-    }
-
-    #[test]
-    fn a_record_written_under_the_previous_margin_is_not_resumed() {
-        // Format 2 recorded `tile_size` and `levels` only; the Laplacian
-        // margin is derived, so such a record's tiles were fused at a
-        // narrower overlap than the plan this build derives.
-        let scratch = tmp_dir("previous-margin-format");
-        let store = ResumeStore::open(&scratch).unwrap();
-        let mut record = sample_record(&scratch, "out.tif");
-        let mut previous = record.clone();
-        previous.format = 2;
-        let dir = scratch.join("resume").join("previous-dir");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("job.json"), serde_json::to_vec(&previous).unwrap()).unwrap();
-
-        record.format = super::super::record::JOB_RECORD_FORMAT;
-        match store.find(&record).unwrap() {
-            Resumable::None => {}
-            other => panic!("expected Resumable::None for a format-2 record, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&scratch);
     }

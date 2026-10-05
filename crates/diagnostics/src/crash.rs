@@ -12,10 +12,6 @@ use std::sync::Mutex;
 
 use crate::ring::Ring;
 
-/// The crash report's schema version. Additive-only: a later field must not
-/// break a reader written against this one.
-pub(crate) const CRASH_REPORT_FORMAT: u32 = 1;
-
 /// The path of the last report this process wrote, so a caught panic can
 /// point at it.
 static LAST_REPORT: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -81,7 +77,6 @@ fn write_report(
     let seconds = focusforge_core::project::seal::now_unix();
     let location = info.location();
     let report = serde_json::json!({
-        "format": CRASH_REPORT_FORMAT,
         "timestamp": rfc3339(seconds),
         "payload": crate::panic_payload(info.payload()),
         "file": location.map(|l| l.file()),

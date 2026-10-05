@@ -54,7 +54,7 @@ fn a_panic_on_a_named_pool_thread_is_reported_with_that_thread_name() {
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&reports[0]).unwrap())
             .expect("the report is one JSON object");
-    assert_eq!(report["format"], 1);
+    assert!(report.get("format").is_none());
     assert_eq!(report["thread"], "focusforge-tile-0");
     assert_eq!(report["payload"], "tile worker gave up");
     assert_eq!(report["file"], "crates/diagnostics/tests/panic_report.rs");

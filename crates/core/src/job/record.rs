@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! [`JobRecord`]: what a resume must agree with, written once by
-//! [`super::ledger::ResumeStore::begin`] and compared field by field by
-//! [`super::ledger::ResumeStore::find`].
-//!
-//! `format` is a version constant, never a value a caller infers or
-//! chooses: any value this build does not recognise means "no resumable
-//! state, start over" -- returned as `None`, never treated as an error and
-//! never read optimistically.
+//! [`JobRecord`]: the input and run facts a resume must agree with.
+//! [`super::ledger::ResumeStore::begin`] writes it and
+//! [`super::ledger::ResumeStore::find`] compares each record field by field.
+//! A record that cannot deserialize is skipped as non-resumable state.
 
 use std::path::PathBuf;
 
@@ -19,18 +15,12 @@ use crate::job::fingerprint::StackFingerprint;
 use crate::params::ParamValues;
 use crate::tile::Rect;
 
-/// The current on-disk record format. A record whose format number differs is
-/// discarded and a resume starts over; bump it when the meaning of a recorded
-/// tile changes.
-pub const JOB_RECORD_FORMAT: u32 = 4;
-
 /// Everything a resume must agree with before it is allowed to continue: the
 /// stack's identity, the geometry that gives a `PlannedTile::index()` its
 /// meaning, and the resolved algorithm/parameter values that shaped the
 /// units already recorded complete.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
-    pub format: u32,
     pub fingerprint: StackFingerprint,
     pub width: u32,
     pub height: u32,
@@ -115,7 +105,6 @@ mod tests {
 
     fn sample_record() -> JobRecord {
         JobRecord {
-            format: JOB_RECORD_FORMAT,
             fingerprint: StackFingerprint { frames: Vec::new() },
             width: 512,
             height: 512,
@@ -138,6 +127,7 @@ mod tests {
     fn job_record_round_trips_through_json() {
         let record = sample_record();
         let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("\"format\""));
         let back: JobRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, back);
     }

@@ -22,8 +22,7 @@ use serde::Serialize;
 /// map's height.
 const ROWS_PER_PASS: u32 = 256;
 
-/// The frozen `retouch --json` schema, additive-only -- the same contract
-/// `ExportReport` and `StackReport` carry.
+/// The `retouch --json` report.
 #[derive(Serialize)]
 pub struct RetouchReport {
     pub zmap: String,

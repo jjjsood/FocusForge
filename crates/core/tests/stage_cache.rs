@@ -5,7 +5,7 @@
 //! parameter, the failure policy, the solver revision, or a frame's
 //! fingerprint changing it),
 //! the path-free projection, the bit-exact round trip, and the four miss
-//! cases: absent, truncated, unrecognised format, digest mismatch.
+//! cases: absent, truncated, missing required field, digest mismatch.
 
 mod common;
 
@@ -250,6 +250,29 @@ fn the_key_bytes_carry_every_identity_field() {
         );
     }
     assert_eq!(json["solver_version"], ALIGN_SOLVER_VERSION);
+    assert!(json.get("format").is_none());
+    for frame in json["frames"]
+        .as_array()
+        .expect("canonical key bytes carry frames")
+    {
+        assert_eq!(frame["raw_identity"], serde_json::Value::Null);
+    }
+    for frame_count in [1, 3] {
+        let key = StageKey::align(
+            &sample_fingerprint(frame_count),
+            &sample_identity("ecc", FailurePolicy::Strict),
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&key.canonical_bytes()).expect("canonical bytes are JSON");
+        assert!(json.get("format").is_none());
+        assert!(
+            json["frames"]
+                .as_array()
+                .expect("canonical key bytes carry frames")
+                .iter()
+                .all(|frame| frame["raw_identity"] == serde_json::Value::Null)
+        );
+    }
 }
 
 #[test]
@@ -438,8 +461,8 @@ fn truncated_entry_is_a_miss() {
 }
 
 #[test]
-fn unrecognised_entry_format_is_a_miss() {
-    let scratch = tmp_dir("unrecognised-format");
+fn entry_missing_a_required_field_is_a_miss() {
+    let scratch = tmp_dir("missing-required-field");
     let cache = StageCache::open(scratch.path()).unwrap();
     let fingerprint = sample_fingerprint(2);
     let identity = sample_identity("ecc", FailurePolicy::Strict);
@@ -447,11 +470,37 @@ fn unrecognised_entry_format_is_a_miss() {
     cache
         .put_alignment(&key, &[], &sample_alignment(2))
         .unwrap();
+    assert!(cache.get_alignment(&key).is_some());
 
     let path = cache.entry_path(&key);
     let text = fs::read_to_string(&path).unwrap();
     let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
-    value["format"] = serde_json::json!(9999);
+    assert!(value.get("format").is_none());
+    value
+        .as_object_mut()
+        .expect("cached entry is an object")
+        .remove("reference");
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    assert!(cache.get_alignment(&key).is_none());
+}
+
+#[test]
+fn entry_with_changed_frame_count_is_a_miss() {
+    let scratch = tmp_dir("changed-frame-count");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    let fingerprint = sample_fingerprint(2);
+    let identity = sample_identity("ecc", FailurePolicy::Strict);
+    let key = StageKey::align(&fingerprint, &identity);
+    cache
+        .put_alignment(&key, &[], &sample_alignment(2))
+        .unwrap();
+    assert!(cache.get_alignment(&key).is_some());
+
+    let path = cache.entry_path(&key);
+    let text = fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["frame_count"] = serde_json::json!(3);
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
     assert!(cache.get_alignment(&key).is_none());

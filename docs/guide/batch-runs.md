@@ -30,8 +30,6 @@ Writes the proposal to `groups.toml` in a plain TOML format — one
 to the directory the run was pointed at:
 
 ```toml
-format = 1
-
 [[group]]
 name = "session-a"
 frames = ["IMG_9801.tif", "IMG_9802.tif"]
