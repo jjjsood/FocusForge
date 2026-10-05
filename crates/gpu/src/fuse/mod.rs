@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::fuse::laplacian::{EligibleMasks, score_radius};
 use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::timing::{TimingCounter, gpu_tile_scope, gpu_tile_stage};
 use focusforge_core::zmap::{NO_SOURCE, validate_tile};
 
 use crate::device::SharedDevice;
@@ -29,7 +30,7 @@ use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{download_buffer, upload_tile};
+use crate::transfer::{download_buffer, upload_storage, upload_tile};
 
 /// Shape A: one storage buffer read, one storage buffer read/write, one
 /// uniform -- `plane_from_u16`, `plane_to_u16`, `reduce::{horizontal,
@@ -240,10 +241,7 @@ fn zeroed_f32_buffer(
     len: usize,
     label: &str,
 ) -> wgpu::Buffer {
-    let buffer = crate::transfer::create_storage_buffer(device, (len * 4) as u64, label);
-    let bytes = vec![0u8; len * 4];
-    queue.write_buffer(&buffer, 0, &bytes);
-    buffer
+    upload_storage(device, queue, &vec![0u8; len * 4], label)
 }
 
 /// Converts an already-resident packed-`u32` buffer (`packed_len(width *
@@ -262,6 +260,7 @@ pub(crate) fn plane_from_packed(
     height: u32,
     spp: u32,
 ) -> GpuPlane {
+    let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
     let sample_count = width as usize * height as usize * spp as usize;
     let word_count = (packed_len(sample_count) / 4) as u32;
     let buffer = convert::plane_from_u16(
@@ -339,14 +338,8 @@ fn gaussian_levels_gpu(
 pub(crate) type FrameSource = (GpuPlane, Option<Vec<bool>>);
 
 fn upload_u32(device: &wgpu::Device, queue: &wgpu::Queue, values: &[u32]) -> wgpu::Buffer {
-    let buffer = crate::transfer::create_storage_buffer(
-        device,
-        (values.len() * 4) as u64,
-        "focusforge-gpu-fuse-eligibility",
-    );
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    queue.write_buffer(&buffer, 0, &bytes);
-    buffer
+    upload_storage(device, queue, &bytes, "focusforge-gpu-fuse-eligibility")
 }
 
 /// Whether `mask` excludes no pixel, so the exclude pass would change nothing.
@@ -383,6 +376,7 @@ pub(crate) fn fuse_planes_gpu(
     levels: u32,
     source: &mut dyn FnMut(usize) -> Result<FrameSource, AlgorithmError>,
 ) -> Result<TileOutput, AlgorithmError> {
+    let _tile = gpu_tile_scope();
     let device = shared.device();
     let queue = shared.queue();
     let spp = samples_per_pixel;
@@ -406,7 +400,10 @@ pub(crate) fn fuse_planes_gpu(
                 !masks.levels.iter().all(|m| all_true(m)) || !all_true(&masks.residual)
             });
         any_masked |= masks.is_some();
-        let gaussians = gaussian_levels_gpu(device, queue, pipelines, base, levels);
+        let gaussians = {
+            let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
+            gaussian_levels_gpu(device, queue, pipelines, base, levels)
+        };
 
         for k in 0..levels as usize {
             let (g_k1_buffer, g_k1_width, g_k1_height, g_k1_spp) = {
@@ -417,27 +414,31 @@ pub(crate) fn fuse_planes_gpu(
                 let g = &gaussians[k];
                 (g.width, g.height, g.spp)
             };
-            let expanded = pyramid::expand(
-                device,
-                queue,
-                pipelines,
-                g_k1_buffer,
-                g_k1_width,
-                g_k1_height,
-                g_k1_spp,
-                g_k_width,
-                g_k_height,
-            );
             let laplacian_len = g_k_width * g_k_height * g_k_spp;
-            let laplacian = pyramid::sub(
-                device,
-                queue,
-                pipelines,
-                &gaussians[k].buffer,
-                &expanded,
-                laplacian_len,
-            );
+            let laplacian = {
+                let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
+                let expanded = pyramid::expand(
+                    device,
+                    queue,
+                    pipelines,
+                    g_k1_buffer,
+                    g_k1_width,
+                    g_k1_height,
+                    g_k1_spp,
+                    g_k_width,
+                    g_k_height,
+                );
+                pyramid::sub(
+                    device,
+                    queue,
+                    pipelines,
+                    &gaussians[k].buffer,
+                    &expanded,
+                    laplacian_len,
+                )
+            };
 
+            let _select = gpu_tile_stage(TimingCounter::GpuTileSelectNs);
             let radius = score_radius(levels, k as u32);
             let score = select::score(
                 device, queue, pipelines, &laplacian, g_k_width, g_k_height, g_k_spp, radius,
@@ -464,18 +465,12 @@ pub(crate) fn fuse_planes_gpu(
                 ),
                 best: {
                     let count = (g_k_width as usize) * (g_k_height as usize);
-                    let buffer = crate::transfer::create_storage_buffer(
-                        device,
-                        (count * 8) as u64,
-                        "focusforge-gpu-fuse-best",
-                    );
                     let mut bytes = Vec::with_capacity(count * 8);
                     for _ in 0..count {
                         bytes.extend_from_slice(&f32::NEG_INFINITY.to_le_bytes());
                         bytes.extend_from_slice(&u32::from(NO_SOURCE).to_le_bytes());
                     }
-                    queue.write_buffer(&buffer, 0, &bytes);
-                    buffer
+                    upload_storage(device, queue, &bytes, "focusforge-gpu-fuse-best")
                 },
                 width: g_k_width,
                 height: g_k_height,
@@ -496,6 +491,7 @@ pub(crate) fn fuse_planes_gpu(
             );
         }
 
+        let _residual = gpu_tile_stage(TimingCounter::GpuTileSelectNs);
         let residual_idx = levels as usize;
         let (residual_buffer, residual_width, residual_height, residual_spp) = {
             let g = &gaussians[residual_idx];
@@ -535,6 +531,7 @@ pub(crate) fn fuse_planes_gpu(
         select::accumulate(device, queue, pipelines, sum, residual_buffer, residual_len);
     }
 
+    let reconstruct = gpu_tile_stage(TimingCounter::GpuTileReconstructNs);
     let sum_buffer =
         residual_sum.expect("frame_count >= 1 guarantees at least one residual accumulated");
     let residual_len = residual_dims.0 * residual_dims.1 * spp;
@@ -606,6 +603,9 @@ pub(crate) fn fuse_planes_gpu(
         word_count,
         sample_count as u32,
     );
+    drop(reconstruct);
+
+    let readback = gpu_tile_stage(TimingCounter::GpuTileReadbackNs);
     let packed_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4)?;
     let samples = unpack_samples(&packed_bytes, sample_count);
 
@@ -617,6 +617,7 @@ pub(crate) fn fuse_planes_gpu(
         let winner = u32::from_le_bytes(chunk[4..8].try_into().expect("4 bytes"));
         zmap[i] = winner as u16;
     }
+    drop(readback);
 
     validate_tile(&zmap, frame_count as u32).map_err(|source| AlgorithmError::Failed {
         algorithm: "laplacian-gpu".to_string(),
@@ -658,7 +659,10 @@ pub fn fuse_tile_gpu(
 
     let mut source = |frame: usize| -> Result<FrameSource, AlgorithmError> {
         let mut samples = vec![0u16; pixel_count * samples_per_pixel as usize];
-        reader.read_tile_into(frame, rect, &mut samples)?;
+        {
+            let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+            reader.read_tile_into(frame, rect, &mut samples)?;
+        }
         let tile = Tile {
             rect,
             samples_per_pixel,

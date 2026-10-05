@@ -485,6 +485,18 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
         height: 256,
     };
 
+    let stage_ns = |snapshot: &focusforge_core::timing::TimingSnapshot| {
+        [
+            snapshot.gpu_tile_read_ns,
+            snapshot.gpu_tile_warp_ns,
+            snapshot.gpu_tile_upload_ns,
+            snapshot.gpu_tile_pyramid_ns,
+            snapshot.gpu_tile_select_ns,
+            snapshot.gpu_tile_reconstruct_ns,
+            snapshot.gpu_tile_readback_ns,
+            snapshot.gpu_tile_wait_ns,
+        ]
+    };
     let mut deltas = Vec::new();
     for _ in 0..2 {
         let before = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
@@ -492,6 +504,9 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
             .warp_fuse_tile(&stack, (width, height), &transforms, rect, spp, LEVELS)
             .expect("warp_fuse_tile must succeed");
         let after = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+        for (stage, (then, now)) in stage_ns(&before).iter().zip(stage_ns(&after)).enumerate() {
+            assert!(now > *then, "stage counter {stage} did not grow: {after:?}");
+        }
         deltas.push((
             after.buffer_creations - before.buffer_creations,
             after.upload_bytes - before.upload_bytes,
@@ -503,6 +518,14 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
     let (creations, uploads, readbacks) = deltas[0];
     assert!(creations > 0 && uploads > 0);
     let pixels = u64::from(rect.width) * u64::from(rect.height);
+    let warped_frames = transforms
+        .iter()
+        .filter(|t| **t != Transform::identity())
+        .count() as u64;
+    assert!(
+        uploads >= 24 * pixels * warped_frames,
+        "{uploads} uploaded bytes do not cover the warp coordinates of {warped_frames} frames"
+    );
     let composite = focusforge_gpu::pack::packed_len(pixels as usize * spp as usize) as u64;
     assert_eq!(
         readbacks,

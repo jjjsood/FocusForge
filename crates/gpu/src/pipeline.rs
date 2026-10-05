@@ -4,7 +4,7 @@
 //! `Pipeline` type, bind-group-layout-entry helpers, the pipeline builder,
 //! the dispatch-and-submit helpers and the uniform-buffer upload helper.
 
-use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
+use focusforge_core::timing::{TimingCounter, gpu_tile_stage, measurement_scope, record_timing};
 
 /// One compute pipeline plus the bind group layout it was built with.
 pub(crate) struct Pipeline {
@@ -194,6 +194,7 @@ pub(crate) fn upload_params(
     bytes: &[u8],
 ) -> wgpu::Buffer {
     let _scope = measurement_scope("gpu_param_upload");
+    let _stage = gpu_tile_stage(TimingCounter::GpuTileUploadNs);
     record_timing(TimingCounter::BufferCreations, 1);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("focusforge-gpu-params"),

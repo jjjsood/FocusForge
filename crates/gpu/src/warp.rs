@@ -13,21 +13,24 @@ use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, SourceFootprint, Transform};
 use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::timing::{TimingCounter, gpu_tile_stage};
 
 use crate::device::SharedDevice;
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{create_storage_buffer, download_buffer, upload_tile};
+use crate::transfer::{create_storage_buffer, download_buffer, upload_storage, upload_tile};
 use crate::warp_coords::{coords_bytes, map_coords};
 
 /// A packed-`u32` buffer of `byte_len` bytes, explicitly written to zero.
 fn zeroed_packed_buffer(device: &wgpu::Device, queue: &wgpu::Queue, byte_len: u64) -> wgpu::Buffer {
-    let buffer = create_storage_buffer(device, byte_len, "focusforge-gpu-warp-dst-zeroed");
-    let bytes = vec![0u8; byte_len as usize];
-    queue.write_buffer(&buffer, 0, &bytes);
-    buffer
+    upload_storage(
+        device,
+        queue,
+        &vec![0u8; byte_len as usize],
+        "focusforge-gpu-warp-dst-zeroed",
+    )
 }
 
 /// The bicubic warp kernel's pipeline, built on first use: 3 storage + 1
@@ -129,6 +132,7 @@ pub(crate) fn warp_dispatch(
     dst: Rect,
     t: &Transform,
 ) -> Result<(wgpu::Buffer, Vec<bool>), AlignError> {
+    let _stage = gpu_tile_stage(TimingCounter::GpuTileWarpNs);
     let mapped = map_coords(src.rect, frame, dst, t)?;
 
     let device = shared.device();
@@ -140,12 +144,7 @@ pub(crate) fn warp_dispatch(
 
     let src_buffer = upload_tile(device, queue, src);
     let coord_bytes = coords_bytes(&mapped.coords);
-    let coords_buffer = create_storage_buffer(
-        device,
-        coord_bytes.len() as u64,
-        "focusforge-gpu-warp-coords",
-    );
-    queue.write_buffer(&coords_buffer, 0, &coord_bytes);
+    let coords_buffer = upload_storage(device, queue, &coord_bytes, "focusforge-gpu-warp-coords");
     let dst_buffer =
         create_storage_buffer(device, u64::from(word_count) * 4, "focusforge-gpu-warp-dst");
 
@@ -256,13 +255,16 @@ pub(crate) fn warp_tile_dispatch(
         SourceFootprint::Covers { read, .. } => {
             let mut buf =
                 vec![0u16; read.width as usize * read.height as usize * samples_per_pixel as usize];
-            reader
-                .read_tile_into(frame_index, read, &mut buf)
-                .map_err(|source| AlignError::Read {
-                    frame: frame_index,
-                    rect: read,
-                    source,
-                })?;
+            {
+                let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+                reader
+                    .read_tile_into(frame_index, read, &mut buf)
+                    .map_err(|source| AlignError::Read {
+                        frame: frame_index,
+                        rect: read,
+                        source,
+                    })?;
+            }
             let src = Tile {
                 rect: read,
                 samples_per_pixel,
