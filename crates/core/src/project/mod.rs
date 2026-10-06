@@ -70,7 +70,7 @@ pub use append::{
     append, append_at, append_ops, append_ops_at, append_ops_onto, delete_checkpoint,
     replay_ops_to,
 };
-pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
+pub use blob::{FileStamp, Plane, StagedBlob, short_hash, source_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::{ProjectWriter, partial_path};
 pub use error::ProjectError;

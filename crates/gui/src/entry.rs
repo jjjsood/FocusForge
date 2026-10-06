@@ -20,7 +20,7 @@ use focusforge_core::io::{
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{
     Opened as CoreOpened, PROJECT_EXTENSION, PendingProject, Project, ProjectError, SourceRef,
-    check_sources, hash_file,
+    check_sources, source_hash,
 };
 // Re-exported so `controller.rs` can carry a `Proposal` in its own
 // pending-question state without naming `focusforge_core` itself.
@@ -310,7 +310,7 @@ pub fn diff_import(
 ) -> (Vec<PathBuf>, Vec<(usize, PathBuf)>) {
     let mut existing_by_hash: HashMap<String, usize> = HashMap::new();
     for (i, frame) in existing.iter().enumerate() {
-        if let Ok(hash) = hash_file(frame) {
+        if let Ok((_, hash)) = source_hash(frame, None) {
             existing_by_hash.entry(hash).or_insert(i);
         }
     }
@@ -318,8 +318,8 @@ pub fn diff_import(
     let mut replace = Vec::new();
     let mut seen = HashSet::new();
     for path in incoming {
-        match hash_file(&path) {
-            Ok(hash) if seen.insert(hash.clone()) => match existing_by_hash.get(&hash) {
+        match source_hash(&path, None) {
+            Ok((_, hash)) if seen.insert(hash.clone()) => match existing_by_hash.get(&hash) {
                 Some(&position) => replace.push((position, path)),
                 None => add.push(path),
             },

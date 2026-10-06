@@ -20,7 +20,7 @@ use focusforge_core::pipeline::{
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, Opened, ParentRef,
-    Point, Project,
+    Plane, Point, Project,
 };
 use focusforge_core::registry;
 
@@ -335,21 +335,56 @@ fn timings_on_fixture() {
     assert!(figures.iter().all(|f| f.warm > 0.0));
 }
 
+/// Prints the multithreaded compression time and ratio of the reference
+/// stack's fused composite at levels 1, 2 and 3.
+#[test]
+#[ignore = "reads the full reference stack; minutes"]
+fn composite_compression_by_level() {
+    let Some(frames) = reference_frames() else {
+        return;
+    };
+    let held = held_result(&frames);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("save_timing_levels");
+    let _ = std::fs::remove_dir_all(&out);
+    for level in 1..=3 {
+        let dir = out.join(level.to_string());
+        std::fs::create_dir_all(&dir).expect("the output directory must be creatable");
+        let start = Instant::now();
+        let staged = project::blob::stage_plane(&held.composite, Plane::Composite, level, &dir)
+            .expect("the held composite must compress");
+        let seconds = start.elapsed().as_secs_f64();
+        println!(
+            "level {level}: {seconds:.3} s, {} -> {} bytes, ratio {:.4}",
+            staged.uncompressed_len,
+            staged.compressed_len,
+            staged.uncompressed_len as f64 / staged.compressed_len as f64
+        );
+        staged.remove();
+    }
+}
+
+/// The reference stack's frames, or `None` when it is not configured.
+fn reference_frames() -> Option<Vec<PathBuf>> {
+    let dir = common::reference_stack_dir()?;
+    Some(
+        frame_paths(&dir)
+            .expect("the reference stack directory must enumerate")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("IMG_"))
+            })
+            .collect(),
+    )
+}
+
 #[test]
 #[ignore = "reads the full reference stack; minutes"]
 fn timings_on_reference_stack() {
-    let Some(dir) = common::reference_stack_dir() else {
+    let Some(frames) = reference_frames() else {
         return;
     };
-    let frames: Vec<PathBuf> = frame_paths(&dir)
-        .expect("the reference stack directory must enumerate")
-        .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("IMG_"))
-        })
-        .collect();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("save_timing_reference");
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).expect("the output directory must be creatable");

@@ -15,9 +15,12 @@
 //! compressed temp file is then copied into the container under
 //! `blobs/<hash>.zst`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::UNIX_EPOCH;
 
 use super::error::ProjectError;
 use super::manifest::SourceRef;
@@ -47,11 +50,30 @@ impl Plane {
 /// the same discipline the read path uses.
 const BAND_BYTES: usize = 4 << 20;
 
-/// The default zstd level. Level 3 is zstd's own default: the Z-Map is
-/// piecewise-constant and compresses by orders of magnitude at any level,
-/// and the composite is photographic and compresses by very little at any
-/// level, so buying seconds of CPU for a higher level buys nothing here.
-pub const ZSTD_LEVEL: i32 = 3;
+/// The zstd level every blob is written at. The Z-Map is piecewise-constant
+/// and compresses by orders of magnitude at any level; the composite is
+/// photographic and barely compresses. On a 61-frame 7795x5208 composite
+/// (243.6 MB) multithreaded level 1 took 0.218 s for ratio 1.150, level 2
+/// 0.242 s for 1.150 and level 3 0.255 s for 1.171: level 1 is the fastest
+/// and within 2 % of level 3's size.
+pub const ZSTD_LEVEL: i32 = 1;
+
+/// A zstd encoder writing to a new file at `path`, one worker per available
+/// core. The worker count never changes the entry name: the hash is over the
+/// uncompressed bytes.
+fn encoder(
+    path: &Path,
+    level: i32,
+) -> Result<zstd::stream::write::Encoder<'static, File>, ProjectError> {
+    let file = File::create(path).map_err(|source| ProjectError::io(path, source))?;
+    let mut encoder = zstd::stream::write::Encoder::new(file, level)
+        .map_err(|source| ProjectError::io(path, source))?;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    encoder
+        .multithread(workers)
+        .map_err(|source| ProjectError::io(path, source))?;
+    Ok(encoder)
+}
 
 /// One compressed plane sitting in a temp file, ready to be copied into a
 /// container under `blobs/<hash>.zst`.
@@ -75,15 +97,77 @@ impl StagedBlob {
     }
 }
 
+/// What identifies one version of a file without reading it: size,
+/// modification time and, where the platform has one, the device and inode.
+///
+/// An in-place edit that keeps all three goes unnoticed; that is the price
+/// of not reading every source on every open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub bytes: u64,
+    /// Nanoseconds since the Unix epoch; `0` for a time before it.
+    pub modified_ns: u64,
+    /// `[device, inode]` on Unix, `None` elsewhere.
+    pub file_id: Option<[u64; 2]>,
+}
+
+impl FileStamp {
+    pub fn of(path: &Path) -> Result<Self, ProjectError> {
+        let io = |source| ProjectError::io(path, source);
+        let metadata = std::fs::metadata(path).map_err(io)?;
+        let modified = metadata.modified().map_err(io)?;
+        #[cfg(unix)]
+        let file_id = {
+            use std::os::unix::fs::MetadataExt;
+            Some([metadata.dev(), metadata.ino()])
+        };
+        #[cfg(not(unix))]
+        let file_id = None;
+        Ok(FileStamp {
+            bytes: metadata.len(),
+            modified_ns: modified
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64),
+            file_id,
+        })
+    }
+}
+
+/// Every source hashed in this process, by the path it was hashed at.
+static SOURCE_HASHES: LazyLock<Mutex<HashMap<PathBuf, (FileStamp, String)>>> =
+    LazyLock::new(Mutex::default);
+
+/// The current stamp of the file at `path` and its blake3 content hash, hex.
+///
+/// The hash comes from `recorded` when its stamp matches, else from this
+/// process's memo at the same stamp, else from reading the file. The memo
+/// lock is held through that read: sources are hashed one at a time
+/// process-wide, and never twice by two racing callers.
+pub fn source_hash(
+    path: &Path,
+    recorded: Option<&SourceRef>,
+) -> Result<(FileStamp, String), ProjectError> {
+    let stamp = FileStamp::of(path)?;
+    if let Some(recorded) = recorded.filter(|r| r.stamp() == stamp) {
+        return Ok((stamp, recorded.hash.clone()));
+    }
+    let mut memo = SOURCE_HASHES.lock().unwrap_or_else(PoisonError::into_inner);
+    let hash = match memo.get(path) {
+        Some((memoised, hash)) if *memoised == stamp => hash.clone(),
+        _ => hash_file(path)?,
+    };
+    memo.insert(path.to_path_buf(), (stamp, hash.clone()));
+    Ok((stamp, hash))
+}
+
 /// blake3 of a whole file, hex.
 ///
-/// `update_mmap_rayon` maps the **whole** file, so this must be called
-/// sequentially over a source list and never inside a `par_iter`: 61
-/// reference frames hashed concurrently would map up to 16 GB at once,
-/// well past an 8 GB memory ceiling. One file at a time is one 268 MB
-/// mapping, and the hashing of that one file is already rayon-parallel
-/// internally.
-pub fn hash_file(path: &Path) -> Result<String, ProjectError> {
+/// `update_mmap_rayon` maps the **whole** file, so this must never run
+/// inside a `par_iter`: 61 reference frames hashed concurrently would map up
+/// to 16 GB at once, well past an 8 GB memory ceiling. One file at a time is
+/// one 268 MB mapping, and the hashing of that one file is already
+/// rayon-parallel internally.
+fn hash_file(path: &Path) -> Result<String, ProjectError> {
     let mut hasher = blake3::Hasher::new();
     hasher
         .update_mmap_rayon(path)
@@ -140,9 +224,7 @@ pub fn stage_plane(
     let rows = (BAND_BYTES / (row_samples * 2)).clamp(1, height as usize) as u32;
 
     let temp = out_dir.join(format!("{}.zst", plane.stem()));
-    let file = File::create(&temp).map_err(|source| ProjectError::io(&temp, source))?;
-    let mut encoder = zstd::stream::write::Encoder::new(file, level)
-        .map_err(|source| ProjectError::io(&temp, source))?;
+    let mut encoder = encoder(&temp, level)?;
 
     let mut hasher = blake3::Hasher::new();
     let mut samples = vec![0u16; row_samples * rows as usize];
@@ -299,9 +381,7 @@ pub fn stage_delta(
     out_dir: &Path,
 ) -> Result<StagedBlob, ProjectError> {
     let temp = out_dir.join("zmap-delta.zst");
-    let file = File::create(&temp).map_err(|source| ProjectError::io(&temp, source))?;
-    let mut encoder = zstd::stream::write::Encoder::new(file, level)
-        .map_err(|source| ProjectError::io(&temp, source))?;
+    let mut encoder = encoder(&temp, level)?;
     let mut hasher = blake3::Hasher::new();
 
     let mut header = [0u8; DELTA_HEADER_LEN];
@@ -445,6 +525,8 @@ mod tests {
             resolution: super::super::manifest::SourceResolution::Relative,
             hash: hash.to_string(),
             bytes: 1,
+            modified_ns: 0,
+            file_id: None,
         }
     }
 

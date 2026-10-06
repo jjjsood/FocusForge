@@ -54,4 +54,4 @@ serde_json = "1"
 # entry gets the default DOS timestamp, so two seals of the same inputs
 # produce identical container bytes (`the_container_is_reproducible`).
 zip = { version = "8.6.0", default-features = false }
-zstd = "0.14"
+zstd = { version = "0.14", features = ["zstdmt"] }

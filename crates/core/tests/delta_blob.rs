@@ -744,3 +744,62 @@ fn whole_map_change_falls_back_to_full() {
         "every pixel must have been repainted"
     );
 }
+
+#[test]
+fn multithreaded_blobs_round_trip() {
+    let (dir, project_path) = sealed_mantis("delta_blob_multithreaded");
+    let golden = common::mantis_512_dir().join("golden");
+    project::append_ops(&project_path, vec![small_stroke(4, 256, 256)], None)
+        .expect("append_ops must succeed");
+
+    // Every blob the project holds -- composite, Z-Map and the stroke's
+    // delta -- decodes to bytes that hash to its own entry name.
+    let project = Project::open(&project_path).unwrap();
+    let records = &project.manifest().blobs;
+    assert!(
+        records.iter().any(|b| b.kind == BlobKind::SparseDelta),
+        "the stroke must have written a delta"
+    );
+    for record in records {
+        let stored = read_entry_bytes(&project_path, &format!("blobs/{}.zst", record.hash));
+        let bytes = zstd::stream::decode_all(&stored[..]).unwrap();
+        assert_eq!(bytes.len() as u64, record.uncompressed_len);
+        assert_eq!(blake3::hash(&bytes).to_hex().to_string(), record.hash);
+    }
+
+    // The same plane staged at two levels: one entry name, and the plane's
+    // own little-endian bytes back from either file.
+    let le =
+        |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+    let composite_path = golden.join("laplacian.tif");
+    let stack =
+        focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&composite_path)).unwrap();
+    let (w, h) = stack.dimensions();
+    let mut composite = vec![0u16; w as usize * h as usize * SPP as usize];
+    stack.read_tile_into(0, full(w, h), &mut composite).unwrap();
+    let zmap_path = golden.join("laplacian-zmap.tif");
+    let planes = [
+        (Plane::Composite, composite_path, le(&composite)),
+        (
+            Plane::ZMap,
+            zmap_path.clone(),
+            le(&read_zmap_pixels(&zmap_path)),
+        ),
+    ];
+    for (plane, source, expected) in planes {
+        let mut hashes = Vec::new();
+        for level in [1, blob::ZSTD_LEVEL] {
+            let out = dir.join(format!("staged-{plane:?}-{level}"));
+            std::fs::create_dir_all(&out).unwrap();
+            let staged = blob::stage_plane(&source, plane, level, &out).unwrap();
+            let stored = std::fs::read(&staged.path).unwrap();
+            assert_eq!(zstd::stream::decode_all(&stored[..]).unwrap(), expected);
+            hashes.push(staged.hash);
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "{plane:?}: the level moved the entry name"
+        );
+        assert_eq!(hashes[0], blake3::hash(&expected).to_hex().to_string());
+    }
+}

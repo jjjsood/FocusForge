@@ -100,8 +100,6 @@ fn seal_staged(
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
-    // The sources, hashed **sequentially**: `hash_file` maps the whole file,
-    // so 61 reference frames hashed concurrently would map 16 GB at once.
     let project_dir = request
         .project_path
         .parent()
@@ -519,10 +517,7 @@ pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
 /// therefore routinely produces `AsGiven` projects -- that is the intended
 /// behaviour, not a defect.
 pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, ProjectError> {
-    let hash = blob::hash_file(path)?;
-    let bytes = std::fs::metadata(path)
-        .map_err(|source| ProjectError::io(path, source))?
-        .len();
+    let (stamp, hash) = blob::source_hash(path, None)?;
     let absolute = std::path::absolute(path).map_err(|source| ProjectError::io(path, source))?;
     let base =
         std::path::absolute(project_dir).map_err(|source| ProjectError::io(project_dir, source))?;
@@ -540,7 +535,9 @@ pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, P
         path,
         resolution,
         hash,
-        bytes,
+        bytes: stamp.bytes,
+        modified_ns: stamp.modified_ns,
+        file_id: stamp.file_id,
     })
 }
 

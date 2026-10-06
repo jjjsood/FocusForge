@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::blob::FileStamp;
 use crate::align::Registration;
 use crate::params::ParamValues;
 use crate::tile::Rect;
@@ -139,6 +140,23 @@ pub struct SourceRef {
     /// blake3 of the whole file.
     pub hash: String,
     pub bytes: u64,
+    /// Modification time when the hash was taken, nanoseconds since the Unix
+    /// epoch.
+    pub modified_ns: u64,
+    /// `[device, inode]` when the hash was taken; `None` where the platform
+    /// has no stable file id.
+    pub file_id: Option<[u64; 2]>,
+}
+
+impl SourceRef {
+    /// The file stamp this record's hash was taken at.
+    pub fn stamp(&self) -> FileStamp {
+        FileStamp {
+            bytes: self.bytes,
+            modified_ns: self.modified_ns,
+            file_id: self.file_id,
+        }
+    }
 }
 
 /// How [`SourceRef::path`] should be read. "Relative" means **descendant of

@@ -1060,3 +1060,262 @@ fn relocated_sources_are_read_from_the_located_folder() {
         ".ffp bytes must be unchanged by relocation"
     );
 }
+
+/// A sealed project whose frames live in a sibling directory, so every
+/// source is recorded `AsGiven`.
+fn sealed_as_given(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
+    let dir = tmp_dir(name);
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, w, h, frames);
+    let frames_dir = dir.join("frames");
+    std::fs::create_dir_all(&frames_dir).unwrap();
+    let sources = write_sources(&frames_dir, frames as usize, w, h);
+    let project_dir = dir.join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_path = project_dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
+    let values = params();
+    project::seal(seal_request(
+        &project_path,
+        &composite,
+        &zmap,
+        &sources,
+        &values,
+    ))
+    .expect("seal must succeed");
+    (dir, project_path)
+}
+
+/// Where each of the project's recorded sources lives on disk.
+fn source_paths(project_path: &Path) -> Vec<PathBuf> {
+    let project = Project::open(project_path).unwrap();
+    project
+        .manifest()
+        .sources
+        .iter()
+        .map(|source| project.source_path(source))
+        .collect()
+}
+
+/// Flips the last byte of `path` through the same inode and puts its
+/// modification time back, so size, mtime and file id all stay as they were.
+fn alter_in_place(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let metadata = file.metadata().unwrap();
+    file.seek(SeekFrom::Start(metadata.len() - 1)).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Start(metadata.len() - 1)).unwrap();
+    file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+        .unwrap();
+}
+
+fn set_mtime(path: &Path, modified: std::time::SystemTime) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+}
+
+/// Moves `path`'s modification time forward without touching its bytes.
+fn bump_mtime(path: &Path) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    set_mtime(path, modified + std::time::Duration::from_secs(60));
+}
+
+#[test]
+fn unchanged_stamp_skips_rehash() {
+    for frames in [3u32, 5] {
+        for (label, (_dir, project_path)) in [
+            (
+                "relative",
+                sealed(
+                    &format!("import_validation_stamp_rel_{frames}"),
+                    32,
+                    24,
+                    frames,
+                ),
+            ),
+            (
+                "as-given",
+                sealed_as_given(
+                    &format!("import_validation_stamp_abs_{frames}"),
+                    32,
+                    24,
+                    frames,
+                ),
+            ),
+        ] {
+            let recorded = Project::open(&project_path)
+                .unwrap()
+                .manifest()
+                .sources
+                .clone();
+            let paths = source_paths(&project_path);
+            // Push the process memo off the recorded stamp: a touch that an
+            // open re-hashes and remembers, then the mtime put back. Only
+            // the recorded stamp can vouch for the frame after that.
+            let original = std::fs::metadata(&paths[1]).unwrap().modified().unwrap();
+            bump_mtime(&paths[1]);
+            assert!(matches!(
+                Project::open_checked(&project_path).unwrap(),
+                Opened::Ready(_)
+            ));
+            set_mtime(&paths[1], original);
+            alter_in_place(&paths[1]);
+            assert_ne!(
+                blake3::hash(&std::fs::read(&paths[1]).unwrap())
+                    .to_hex()
+                    .to_string(),
+                recorded[1].hash,
+                "{label}/{frames}: the test must really have changed the bytes"
+            );
+            match Project::open_checked(&project_path).unwrap() {
+                Opened::Ready(_) => {}
+                Opened::NeedsChoice(_) => {
+                    panic!("{label}/{frames}: an unchanged stamp must not be re-hashed")
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn touched_source_rehashes_once_and_stays_ready() {
+    let (dir, project_path) = sealed("import_validation_touched", 32, 24, 3);
+    let paths = source_paths(&project_path);
+    let project_bytes = std::fs::read(&project_path).unwrap();
+    let ready = |label: &str| match Project::open_checked(&project_path).unwrap() {
+        Opened::Ready(_) => {}
+        Opened::NeedsChoice(_) => panic!("{label}: expected Ready"),
+    };
+
+    // A bumped mtime: re-hashed, found unchanged.
+    bump_mtime(&paths[0]);
+    ready("touched frame");
+    // The fresh stamp is now remembered, so an edit that keeps it is not seen.
+    alter_in_place(&paths[0]);
+    ready("remembered stamp");
+
+    // A byte-identical copy in a new file (new inode).
+    let copy = dir.join("copy.tif");
+    std::fs::copy(&paths[1], &copy).unwrap();
+    std::fs::rename(&copy, &paths[1]).unwrap();
+    ready("identical copy");
+
+    assert_eq!(
+        std::fs::read(&project_path).unwrap(),
+        project_bytes,
+        "open must not write the project"
+    );
+
+    // A later append records each frame's current stamp.
+    let staging = dir.join("staging-append");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, 32, 24, 3);
+    let values = params();
+    project::append(AppendRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &paths,
+        algorithm: "laplacian",
+        params: &values,
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("append must succeed");
+    let appended = Project::open(&project_path).unwrap();
+    for (source, path) in appended.manifest().sources.iter().zip(&paths) {
+        assert_eq!(source.stamp(), blob::FileStamp::of(path).unwrap());
+    }
+}
+
+#[test]
+fn missing_and_changed_sources_are_reported() {
+    let (dir, project_path) = sealed("import_validation_missing_changed", 32, 24, 3);
+    let paths = source_paths(&project_path);
+
+    std::fs::remove_file(&paths[0]).unwrap();
+    match Project::open_checked(&project_path).unwrap() {
+        Opened::Ready(project) => assert_eq!(project.validation().unresolved_sources, 1),
+        Opened::NeedsChoice(_) => panic!("a missing frame warns, it does not block"),
+    }
+
+    std::fs::copy(&paths[2], &paths[1]).unwrap();
+    let pending = match Project::open_checked(&project_path).unwrap() {
+        Opened::NeedsChoice(pending) => pending,
+        Opened::Ready(_) => panic!("a frame with other content must block"),
+    };
+    assert_eq!(pending.changed(), &[(1, dir.join("frame-01.tif"))]);
+
+    let project = pending.proceed();
+    let head = project.checkpoint().id.clone();
+    let refusal = match project::CheckpointImage::prepare_export(&project, &head) {
+        Err(refusal) => refusal.to_string(),
+        Ok(_) => panic!("a render over missing and changed frames must be refused"),
+    };
+    assert!(refusal.contains("missing: frame-00.tif"), "{refusal}");
+    assert!(
+        refusal.contains(&format!(
+            "changed: frame-01.tif (found at {})",
+            dir.join("frame-01.tif").display()
+        )),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn append_reuses_source_hashes() {
+    let (dir, project_path) = sealed("import_validation_append_memo", 32, 24, 3);
+    let paths = source_paths(&project_path);
+    let original: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            blake3::hash(&std::fs::read(path).unwrap())
+                .to_hex()
+                .to_string()
+        })
+        .collect();
+
+    // A hash that ran again would see this byte.
+    alter_in_place(&paths[1]);
+
+    let staging = dir.join("staging-append");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, 32, 24, 3);
+    let values = params();
+    project::append(AppendRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &paths,
+        algorithm: "laplacian",
+        params: &values,
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("append must succeed");
+
+    let manifest = Project::open(&project_path).unwrap().manifest().clone();
+    let mut expected = manifest.sources.clone();
+    for (source, hash) in expected.iter_mut().zip(&original) {
+        source.hash = hash.clone();
+    }
+    assert_eq!(manifest.sources, expected);
+    assert_eq!(
+        manifest.stack_fingerprint,
+        blob::stack_fingerprint(&expected)
+    );
+}
