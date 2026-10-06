@@ -3,8 +3,8 @@
 //! Random op sequences over synthetic Z-Maps are sealed, branched and deleted
 //! through both project writers; after reopening the file, every checkpoint
 //! must materialize to the map an in-memory model computed. The model replays
-//! over plain `Vec<u16>` maps and shares nothing with the container. A failing case prints its shrunk action
-//! list; no failure file is kept.
+//! over plain `Vec<u16>` maps and shares nothing with the container. A failing
+//! case prints its shrunk action list; no failure file is kept.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

@@ -866,7 +866,7 @@ fn unrecorded_fuse_is_refused_by_name() {
         .unwrap()
         .checkpoint()
         .created_at;
-    append_bounded(
+    append_ops(
         &project_path2,
         vec![stroke(1, 5, 5, 1.0)],
         root_created_at + 10,
@@ -945,7 +945,7 @@ fn refuse_onto_head(dir: &Path, project_path: &Path, salt: u32, created_at: i64)
     .checkpoint
 }
 
-fn append_bounded(project_path: &Path, ops: Vec<Op>, created_at: i64) -> project::SealedProject {
+fn append_ops(project_path: &Path, ops: Vec<Op>, created_at: i64) -> project::SealedProject {
     project::append_ops_at(project_path, ops, None, created_at).unwrap()
 }
 
@@ -967,7 +967,7 @@ fn deleting_a_leaf_stops_indexing_it_and_leaves_its_bytes_as_dead_data() {
         .checkpoint()
         .id
         .clone();
-    let leaf = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000);
+    let leaf = append_ops(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000);
 
     let size_before = read_whole_file(&project_path).len();
     let index_before = Index::read(&project_path).unwrap();
@@ -1015,7 +1015,7 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
         .checkpoint()
         .created_at;
     let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
-    let child = append_bounded(
+    let child = append_ops(
         &project_path,
         vec![stroke(2, 6, 6, 1.0)],
         root_created_at + 20,
@@ -1102,7 +1102,7 @@ fn the_last_visible_checkpoint_cannot_be_deleted() {
     assert!(e.to_string().contains(&root_id));
     assert_eq!(before, read_whole_file(&project_path));
 
-    let child = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000).checkpoint;
+    let child = append_ops(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000).checkpoint;
     let deleted = project::delete_checkpoint(&project_path, &root_id).unwrap();
     assert_eq!(deleted.hidden, root_id);
     assert!(deleted.removed.is_empty(), "the child is built on the root");
@@ -1138,12 +1138,12 @@ fn the_head_moves_to_the_newest_visible_checkpoint() {
         .composite
         .blob
         .clone();
-    let child = append_bounded(
+    let child = append_ops(
         &project_path,
         vec![stroke(1, 5, 5, 1.0)],
         root_created_at + 20,
     );
-    let head = append_bounded(
+    let head = append_ops(
         &project_path,
         vec![stroke(2, 6, 6, 1.0)],
         root_created_at + 30,
@@ -1190,7 +1190,7 @@ fn hidden_checkpoints_survive_a_reopen() {
         .checkpoint()
         .created_at;
     let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
-    let child = append_bounded(
+    let child = append_ops(
         &project_path,
         vec![stroke(1, 5, 5, 1.0)],
         root_created_at + 20,
