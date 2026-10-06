@@ -4,9 +4,8 @@
 //! accumulation -- the GPU twins of `score_plane` and the selection/residual
 //! loop in `Laplacian::fuse`.
 
-use crate::fuse::{FusionPipelines, run_pass, upload_params};
+use crate::fuse::{FusionPipelines, TileBatch};
 use crate::pipeline::Pipeline;
-use crate::transfer::create_storage_buffer;
 
 fn score_params(width: u32, height: u32, spp: u32, radius: u32) -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -22,8 +21,7 @@ fn score_params(width: u32, height: u32, spp: u32, radius: u32) -> [u8; 16] {
 /// `score_plane` uses.
 #[allow(clippy::too_many_arguments)]
 pub fn score(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     level: &wgpu::Buffer,
     width: u32,
@@ -31,11 +29,12 @@ pub fn score(
     spp: u32,
     radius: u32,
 ) -> wgpu::Buffer {
+    let device = batch.device();
     let pixel_count = (width as u64) * (height as u64);
-    let row_sums = create_storage_buffer(device, pixel_count * 4, "focusforge-gpu-fuse-score-rows");
+    let row_sums = batch.scratch(pixel_count * 4, "focusforge-gpu-fuse-score-rows");
     {
         let pipeline = pipelines.score_rows(device);
-        let params_buffer = upload_params(device, queue, &score_params(width, height, spp, radius));
+        let params_buffer = batch.params(&score_params(width, height, spp, radius));
         let entries = [
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -50,9 +49,7 @@ pub fn score(
                 resource: params_buffer.as_entire_binding(),
             },
         ];
-        run_pass(
-            device,
-            queue,
+        batch.record(
             pipeline,
             &entries,
             pixel_count as u32,
@@ -60,10 +57,10 @@ pub fn score(
         );
     }
 
-    let scores = create_storage_buffer(device, pixel_count * 4, "focusforge-gpu-fuse-score-cols");
+    let scores = batch.scratch(pixel_count * 4, "focusforge-gpu-fuse-score-cols");
     {
         let pipeline = pipelines.score_cols(device);
-        let params_buffer = upload_params(device, queue, &score_params(width, height, spp, radius));
+        let params_buffer = batch.params(&score_params(width, height, spp, radius));
         let entries = [
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -78,9 +75,7 @@ pub fn score(
                 resource: params_buffer.as_entire_binding(),
             },
         ];
-        run_pass(
-            device,
-            queue,
+        batch.record(
             pipeline,
             &entries,
             pixel_count as u32,
@@ -107,8 +102,7 @@ fn select_params(width: u32, height: u32, spp: u32, frame: u32) -> [u8; 16] {
 /// floor, unraised.
 #[allow(clippy::too_many_arguments)]
 pub fn select(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     current_level: &wgpu::Buffer,
     current_score: &wgpu::Buffer,
@@ -119,8 +113,8 @@ pub fn select(
     spp: u32,
     frame: u32,
 ) {
-    let pipeline = pipelines.select_main(device);
-    let params_buffer = upload_params(device, queue, &select_params(width, height, spp, frame));
+    let pipeline = pipelines.select_main(batch.device());
+    let params_buffer = batch.params_once(&select_params(width, height, spp, frame));
     let entries = [
         wgpu::BindGroupEntry {
             binding: 0,
@@ -143,9 +137,7 @@ pub fn select(
             resource: params_buffer.as_entire_binding(),
         },
     ];
-    run_pass(
-        device,
-        queue,
+    batch.record(
         pipeline,
         &entries,
         width * height,
@@ -165,15 +157,14 @@ fn residual_params(len: u32, frame_count: f32) -> [u8; 16] {
 /// module docs of `crate::fuse` for why that is bit-identical to the CPU
 /// twin's "seed from frame 0, then fold in the rest".
 pub fn accumulate(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     sum: &wgpu::Buffer,
     value: &wgpu::Buffer,
     len: u32,
 ) {
-    let pipeline = pipelines.residual_accumulate(device);
-    let params_buffer = upload_params(device, queue, &residual_params(len, 0.0));
+    let pipeline = pipelines.residual_accumulate(batch.device());
+    let params_buffer = batch.params(&residual_params(len, 0.0));
     let entries = [
         wgpu::BindGroupEntry {
             binding: 0,
@@ -188,9 +179,7 @@ pub fn accumulate(
             resource: params_buffer.as_entire_binding(),
         },
     ];
-    run_pass(
-        device,
-        queue,
+    batch.record(
         pipeline,
         &entries,
         len,
@@ -202,15 +191,14 @@ pub fn accumulate(
 /// residual mean. Binds only `sum` (1) and `params` (2) via
 /// `crate::fuse::shape_d`, whose doc covers why `value` (0) stays unbound.
 pub fn mean(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     sum: &wgpu::Buffer,
     len: u32,
     frame_count: f32,
 ) {
-    let pipeline = pipelines.residual_mean(device);
-    let params_buffer = upload_params(device, queue, &residual_params(len, frame_count));
+    let pipeline = pipelines.residual_mean(batch.device());
+    let params_buffer = batch.params(&residual_params(len, frame_count));
     let entries = [
         wgpu::BindGroupEntry {
             binding: 1,
@@ -221,9 +209,7 @@ pub fn mean(
             resource: params_buffer.as_entire_binding(),
         },
     ];
-    run_pass(
-        device,
-        queue,
+    batch.record(
         pipeline,
         &entries,
         len,
@@ -244,8 +230,7 @@ fn eligibility_params(len: u32, spp: u32, fill: f32) -> [u8; 16] {
 /// The GPU twin of skipping an ineligible frame in `Laplacian::fuse`.
 #[allow(clippy::too_many_arguments)]
 pub fn exclude(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     data: &wgpu::Buffer,
     mask: &wgpu::Buffer,
@@ -253,9 +238,9 @@ pub fn exclude(
     spp: u32,
     fill: f32,
 ) {
+    let device = batch.device();
     run_eligibility(
-        device,
-        queue,
+        batch,
         pipelines.eligibility_exclude(device),
         data,
         mask,
@@ -268,17 +253,16 @@ pub fn exclude(
 /// `sum /= count` per pixel, in place, 0 where `count` (one `u32` per pixel)
 /// is 0 -- the GPU twin of the masked residual mean in `Laplacian::fuse`.
 pub fn mean_by_count(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     sum: &wgpu::Buffer,
     count: &wgpu::Buffer,
     len: u32,
     spp: u32,
 ) {
+    let device = batch.device();
     run_eligibility(
-        device,
-        queue,
+        batch,
         pipelines.eligibility_mean_by_count(device),
         sum,
         count,
@@ -290,8 +274,7 @@ pub fn mean_by_count(
 
 #[allow(clippy::too_many_arguments)]
 fn run_eligibility(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipeline: &Pipeline,
     data: &wgpu::Buffer,
     per_pixel: &wgpu::Buffer,
@@ -299,7 +282,7 @@ fn run_eligibility(
     len: u32,
     label: &str,
 ) {
-    let params_buffer = upload_params(device, queue, &params);
+    let params_buffer = batch.params(&params);
     let entries = [
         wgpu::BindGroupEntry {
             binding: 0,
@@ -314,5 +297,5 @@ fn run_eligibility(
             resource: params_buffer.as_entire_binding(),
         },
     ];
-    run_pass(device, queue, pipeline, &entries, len, label);
+    batch.record(pipeline, &entries, len, label);
 }

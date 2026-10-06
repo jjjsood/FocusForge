@@ -35,7 +35,9 @@ pub fn readback_count() -> u64 {
 
 /// Creates a `STORAGE | COPY_DST | COPY_SRC` buffer of exactly `byte_len`
 /// bytes, labelled `label`, with the same usage flags as [`upload_tile`].
-/// Callers that need zeros write them explicitly.
+/// The device zero-initialises a fresh buffer before its first use, so a
+/// caller that needs zeros takes a new buffer and writes none; a buffer that
+/// is reused is not zeroed again.
 pub fn create_storage_buffer(device: &wgpu::Device, byte_len: u64, label: &str) -> wgpu::Buffer {
     record_timing(TimingCounter::BufferCreations, 1);
     device.create_buffer(&wgpu::BufferDescriptor {

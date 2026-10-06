@@ -37,20 +37,37 @@ const UNCOVERED: Coord = Coord {
     _pad: 0,
 };
 
-/// The host-computed coordinate pass for one destination tile: one [`Coord`]
-/// per destination pixel plus the same coverage the caller returns as
+/// The host-computed coordinate pass for one destination tile: the
+/// destination's [`Coord`]s already encoded as the kernel reads them, 24
+/// bytes per pixel, plus the same coverage the caller returns as
 /// [`focusforge_core::align::warp::WarpedTile`]'s own `covered` vector --
 /// `covered` here is never re-derived from a GPU readback, it is the host's
 /// own decision.
 #[derive(Debug)]
 pub struct WarpCoords {
-    pub coords: Vec<Coord>,
+    pub bytes: Vec<u8>,
     pub covered: Vec<bool>,
+}
+
+impl Coord {
+    /// Explicit `to_le_bytes` per field, never a `bytemuck` transmute -- the
+    /// workspace denies `unsafe_code`, the same reason `crate::pack` gives.
+    fn to_bytes(self) -> [u8; 24] {
+        let mut out = [0u8; 24];
+        out[0..4].copy_from_slice(&self.ix.to_le_bytes());
+        out[4..8].copy_from_slice(&self.iy.to_le_bytes());
+        out[8..12].copy_from_slice(&self.tx.to_le_bytes());
+        out[12..16].copy_from_slice(&self.ty.to_le_bytes());
+        out[16..20].copy_from_slice(&self.covered.to_le_bytes());
+        out[20..24].copy_from_slice(&self._pad.to_le_bytes());
+        out
+    }
 }
 
 /// `warp_from_tile_into`'s per-pixel head, stopping short of sampling: per
 /// destination pixel in raster order, decides coverage via `t.map_point`,
-/// floors the source coordinate, forms the `f32` fraction once, and returns
+/// floors the source coordinate, forms the `f32` fraction once, encodes the
+/// [`Coord`] straight into one buffer (no intermediate `Coord` vector), and returns
 /// the CPU twin's [`AlignError::SourceTileTooSmall`] (same `needed`, same
 /// `have`) on the first covered pixel whose taps do not fit `src_rect`.
 pub fn map_coords(
@@ -61,7 +78,7 @@ pub fn map_coords(
 ) -> Result<WarpCoords, AlignError> {
     let (frame_w, frame_h) = frame;
     let pixel_count = dst.width as usize * dst.height as usize;
-    let mut coords = Vec::with_capacity(pixel_count);
+    let mut bytes = Vec::with_capacity(pixel_count * 24);
     let mut covered = Vec::with_capacity(pixel_count);
 
     for dy in 0..dst.height {
@@ -75,7 +92,7 @@ pub fn map_coords(
             });
 
             if !covered_centre {
-                coords.push(UNCOVERED);
+                bytes.extend_from_slice(&UNCOVERED.to_bytes());
                 covered.push(false);
                 continue;
             }
@@ -107,34 +124,42 @@ pub fn map_coords(
                 });
             }
 
-            coords.push(Coord {
-                ix: ix as i32,
-                iy: iy as i32,
-                tx,
-                ty,
-                covered: 1,
-                _pad: 0,
-            });
+            bytes.extend_from_slice(
+                &Coord {
+                    ix: ix as i32,
+                    iy: iy as i32,
+                    tx,
+                    ty,
+                    covered: 1,
+                    _pad: 0,
+                }
+                .to_bytes(),
+            );
             covered.push(true);
         }
     }
 
-    Ok(WarpCoords { coords, covered })
+    Ok(WarpCoords { bytes, covered })
 }
 
-/// Explicit `to_le_bytes` per field, never a `bytemuck` transmute -- the
-/// workspace denies `unsafe_code`, the same reason `crate::pack` gives.
-pub fn coords_bytes(coords: &[Coord]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(coords.len() * 24);
-    for c in coords {
-        out.extend_from_slice(&c.ix.to_le_bytes());
-        out.extend_from_slice(&c.iy.to_le_bytes());
-        out.extend_from_slice(&c.tx.to_le_bytes());
-        out.extend_from_slice(&c.ty.to_le_bytes());
-        out.extend_from_slice(&c.covered.to_le_bytes());
-        out.extend_from_slice(&c._pad.to_le_bytes());
+#[cfg(test)]
+impl WarpCoords {
+    /// Decodes pixel `index`'s coordinate from the encoded buffer.
+    fn coord(&self, index: usize) -> Coord {
+        let word = |at: usize| -> [u8; 4] {
+            self.bytes[index * 24 + at..index * 24 + at + 4]
+                .try_into()
+                .expect("4 bytes")
+        };
+        Coord {
+            ix: i32::from_le_bytes(word(0)),
+            iy: i32::from_le_bytes(word(4)),
+            tx: f32::from_le_bytes(word(8)),
+            ty: f32::from_le_bytes(word(12)),
+            covered: u32::from_le_bytes(word(16)),
+            _pad: u32::from_le_bytes(word(20)),
+        }
     }
-    out
 }
 
 #[cfg(test)]
@@ -142,7 +167,7 @@ mod tests {
     use focusforge_core::align::{AlignError, Transform};
     use focusforge_core::tile::{Rect, Tile};
 
-    use super::{Coord, coords_bytes, map_coords};
+    use super::{Coord, map_coords};
 
     #[test]
     fn identity_transform_gives_t_zero_and_covered() {
@@ -163,9 +188,9 @@ mod tests {
 
         let result = map_coords(src_rect, frame, dst, &t).expect("identity always fits");
 
-        assert_eq!(result.coords.len(), 1);
+        assert_eq!(result.bytes.len(), 24);
         assert_eq!(result.covered, vec![true]);
-        let c = &result.coords[0];
+        let c = result.coord(0);
         assert_eq!(c.ix, 5);
         assert_eq!(c.iy, 5);
         assert_eq!(c.tx, 0.0);
@@ -199,13 +224,13 @@ mod tests {
                 let idx = dy * 4 + dx;
                 if dx == 0 {
                     assert!(result.covered[idx], "dx=0 dy={dy} must be covered");
-                    let c = &result.coords[idx];
+                    let c = result.coord(idx);
                     assert_eq!(c.ix, 0);
                     assert_eq!(c.iy, dy as i32);
                     assert_eq!(c.covered, 1);
                 } else {
                     assert!(!result.covered[idx], "dx={dx} dy={dy} must be uncovered");
-                    assert_eq!(result.coords[idx].covered, 0);
+                    assert_eq!(result.coord(idx).covered, 0);
                 }
             }
         }
@@ -257,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn coords_bytes_stride_is_24_bytes_per_coord() {
+    fn the_coordinate_buffer_has_a_24_byte_stride() {
         let t = Transform::identity();
         let src_rect = Rect {
             x: 0,
@@ -274,9 +299,7 @@ mod tests {
         let frame = (10, 10);
         let result = map_coords(src_rect, frame, dst, &t).expect("identity always fits");
 
-        let bytes = coords_bytes(&result.coords);
-
-        assert_eq!(bytes.len(), 24);
+        assert_eq!(result.bytes.len(), 24);
         assert_eq!(std::mem::size_of::<Coord>(), 24);
     }
 }

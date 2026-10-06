@@ -128,6 +128,29 @@ pub(crate) fn run_pass(
     );
 }
 
+/// [`run_pass`] into a caller's `encoder`: the same workgroup count, no
+/// submit. Zero dispatches nothing.
+pub(crate) fn record_pass(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &Pipeline,
+    entries: &[wgpu::BindGroupEntry],
+    invocation_count: u32,
+    label: &str,
+) {
+    if invocation_count == 0 {
+        return;
+    }
+    record_dispatch(
+        device,
+        encoder,
+        pipeline,
+        entries,
+        [invocation_count.div_ceil(64), 1, 1],
+        label,
+    );
+}
+
 /// [`run_pass`] for a kernel with an 8 x 8 workgroup indexing
 /// `(global_id.x, global_id.y)`: dispatches `ceil(width / 8) x ceil(height / 8)`
 /// workgroups, so the ceiling is per axis rather than on the product. A zero
@@ -160,6 +183,23 @@ fn dispatch(
     queue: &wgpu::Queue,
     pipeline: &Pipeline,
     entries: &[wgpu::BindGroupEntry],
+    groups: [u32; 3],
+    label: &str,
+) {
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+    record_dispatch(device, &mut encoder, pipeline, entries, groups, label);
+    queue.submit(Some(encoder.finish()));
+    record_timing(TimingCounter::CpuSubmissions, 1);
+}
+
+/// Records one compute pass of `pipeline` over `entries` into `encoder`
+/// without submitting it.
+fn record_dispatch(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &Pipeline,
+    entries: &[wgpu::BindGroupEntry],
     [x, y, z]: [u32; 3],
     label: &str,
 ) {
@@ -169,19 +209,13 @@ fn dispatch(
         layout: &pipeline.bind_group_layout,
         entries,
     });
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(label),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline.compute);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(x, y, z);
-    }
-    queue.submit(Some(encoder.finish()));
-    record_timing(TimingCounter::CpuSubmissions, 1);
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&pipeline.compute);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.dispatch_workgroups(x, y, z);
 }
 
 /// A uniform buffer of exactly `bytes.len()` bytes: `create_buffer` +
