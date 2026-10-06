@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The soft brush stroke: a mask over a disc of `radius` image pixels around
-//! the stroke's path and `out = mix(out, source, alpha)` over it, in integer
-//! fixed point.
+//! The soft brush stroke: `out = mix(out, source, alpha)` over a disc of
+//! `radius` pixels around the stroke's path, in integer fixed point.
 //!
-//! The mask is full inside the hard core, `radius * (1 - softness)`, and falls
-//! linearly in distance to zero at `radius`. Distances are measured in
-//! sixteenths of a pixel from the exact point-to-segment distance of the
-//! integer path, so the mask is a pure function of the stroke's stored fields
-//! and the pixel's coordinate. Alpha is Q16 (`0..=65536`); the blend rounds
-//! to nearest and returns `out` at alpha 0 and `source` at 65536 exactly.
+//! The mask is full inside the core, `radius * (1 - softness)`, and falls
+//! linearly to zero at `radius`, measured in sixteenths of a pixel from the
+//! exact point-to-segment distance, so it is a pure function of the stroke and
+//! the pixel. Alpha is Q16 (`0..=65536`); the blend rounds to nearest.
 
 use crate::project::{Op, Point};
 use crate::tile::Rect;
