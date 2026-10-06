@@ -11,6 +11,9 @@ Subcommands (run from the repository root, workspace built):
     reach    measure the prototype's filter support with an impulse
     scale    memory/read scaling over N frames, prototype and baselines
     montage  side-by-side 8-bit crop of composites as PNG
+    stored   a project's own stored composite (what the fusion produced) as a TIFF
+    crop     integer slice of a 16-bit TIFF, optionally through a fitted transform
+    residue  source share, Z-Map patch measures and glow of cropped images
     --self-check   detector controls on a tiny constructed stack
 
 Requires numpy; reads the large reference stack only through
@@ -422,13 +425,52 @@ def stored_composite(project, out):
 
     `focusforge-cli export` renders from the Z-Map, so a blending method's export is a hard pick;
     the stored blob is the zstd-compressed row-major little-endian samples named by the manifest.
+    A project without that plane, or whose blob does not match it, exits naming the project.
     """
     with zipfile.ZipFile(project) as z:
-        plane = json.loads(z.read("manifest.json"))["composite"]
+        plane = json.loads(z.read("manifest.json")).get("composite")
+        if plane is None:
+            sys.exit(f"{project}: the manifest has no composite plane")
+        if plane["byte_order"] != "little":
+            sys.exit(f"{project}: composite byte order is {plane['byte_order']}, not little")
         raw = zstd.decompress(z.read(f"blobs/{plane['blob']}.zst"))
-    assert plane["byte_order"] == "little" and len(raw) == plane["width"] * plane["height"] * plane["samples_per_pixel"] * 2
+    want = plane["width"] * plane["height"] * plane["samples_per_pixel"] * 2
+    if len(raw) != want:
+        sys.exit(f"{project}: composite blob length {len(raw)} is not {plane['width']}x{plane['height']}x{plane['samples_per_pixel']}x2 = {want}")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     rawtiff.write_tiff(out, plane["width"], plane["height"], raw, bits=16, spp=plane["samples_per_pixel"])
+
+
+def own_rect(rect, transform):
+    """Integer bounding box (x, y, w, h) of the rect X,Y,W,H of another image, seen through `transform`.
+
+    `transform` is A,B,TX,TY with x' = A x - B y + TX, y' = B x + A y + TY (a similarity fitted
+    between two outputs); the mapped corners are rounded to the nearest integer.
+    """
+    x, y, w, h = rect
+    a, b, tx, ty = transform
+    cx, cy = np.array([x, x + w, x, x + w], float), np.array([y, y, y + h, y + h], float)
+    xs, ys = a * cx - b * cy + tx, b * cx + a * cy + ty
+    x0, y0, x1, y1 = (int(np.rint(v)) for v in (xs.min(), ys.min(), xs.max(), ys.max()))
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def crop_image(src, rect, out, transform=None):
+    """Writes the integer slice X,Y,W,H of a 16-bit TIFF (no resampling) and returns it as (x, y, w, h).
+
+    With `transform` the rect names the same area in the other image's coordinates and is first
+    replaced by `own_rect`. A rect that leaves the image exits naming the file.
+    """
+    info = rawtiff.read_info(src)
+    if info.bits_per_sample[0] != 16:
+        sys.exit(f"{src}: crop reads 16-bit TIFFs, found {info.bits_per_sample[0]}-bit")
+    x, y, w, h = own_rect(rect, transform) if transform else rect
+    if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > info.width or y + h > info.height:
+        sys.exit(f"{src}: rect {x},{y},{w},{h} is outside the {info.width}x{info.height} image")
+    pixels = rawtiff.read_rect(src, x, y, w, h, info)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    rawtiff.write_tiff(out, w, h, pixels, bits=16, spp=info.samples_per_pixel)
+    return x, y, w, h
 
 
 def source_share(comp, frame_paths):
@@ -438,6 +480,27 @@ def source_share(comp, frame_paths):
     for p in frame_paths:
         hit |= read_u16(p) == c
     return float(hit.mean())
+
+
+def residue_measures(image, zmap=None, mask_from=None, ref=None, frames=()):
+    """The background-residue figures of one crop: source share, Z-Map patch measures, glow against `ref`.
+
+    `frames` are crops of the as-fused frames (`source_share`); `zmap` adds the whole-crop islands
+    and patch measures, and with `mask_from` also the `head_` ones over that image's background pixels.
+    """
+    m = {}
+    if frames:
+        m["source_share"] = source_share(image, frames)
+    luma = read_u16(image).mean(2)
+    if zmap:
+        z = read_zmap(zmap)
+        m.update(islands_per_mp=islands_per_mp(z), **patch_measures(z, luma))
+        if mask_from:
+            keep = background_mask(read_u16(mask_from).mean(2), (0, z.shape[0]))
+            m.update(patch_measures(z, luma, keep, prefix="head_"))
+    if ref:
+        m["glow"] = glow_measures(read_u16(image), read_u16(ref))
+    return m
 
 
 def equalize(d, out_dir, brk=None):
@@ -772,6 +835,33 @@ def self_check_zmap():
         stored_composite(project, os.path.join(t, "stored.tif"))
         stored = read_u16(os.path.join(t, "stored.tif"))
         pick_share, blend_share = source_share(frames[0], frames), source_share(os.path.join(t, "stored.tif"), frames)
+
+        def stored_refusal(name, manifest, blob):
+            """The message `stored_composite` exits with for a project that differs from the one above only in `manifest` or `blob`."""
+            p = os.path.join(t, name)
+            with zipfile.ZipFile(p, "w") as z:
+                z.writestr("manifest.json", json.dumps(manifest))
+                z.writestr("blobs/ab.zst", zstd.compress(blob))
+            try:
+                stored_composite(p, os.path.join(t, f"{name}.tif"))
+            except SystemExit as e:
+                return p, str(e)
+            return p, None
+
+        cropped = crop_image(frames[0], (1, 1, 2, 2), os.path.join(t, "crop.tif"))
+        sliced = read_u16(os.path.join(t, "crop.tif"))
+        rawtiff.write_tiff(zm, 4, 4, np.zeros((4, 4), "<u2").tobytes(), bits=16, spp=1)
+        res = residue_measures(frames[0], zmap=zm, mask_from=frames[0], ref=frames[1], frames=frames)
+        outside = [None, None]
+        for k, rect in enumerate(((3, 3, 2, 2), (0, 0, 5, 1))):
+            try:
+                crop_image(frames[0], rect, os.path.join(t, "outside.tif"))
+            except SystemExit as e:
+                outside[k] = str(e)
+        plane = dict(blob="ab", width=4, height=4, samples_per_pixel=3, byte_order="little")
+        missing = stored_refusal("missing.ffp", {}, blend.tobytes())
+        short = stored_refusal("short.ffp", dict(composite=plane), blend.tobytes()[:-2])
+        big = stored_refusal("big.ffp", dict(composite=dict(plane, byte_order="big")), blend.tobytes())
     exact, mae = index_scores(off, uniform, np.ones((h, w), bool))
     checks = dict(
         islands_uniform=components(uniform)[1] == 1,
@@ -791,6 +881,14 @@ def self_check_zmap():
         truth_glints=glints[230, 40] == 3,
         export_zmap_only="--zmap" in zmap_export_cmd("p", "z.tif") and "-o" not in zmap_export_cmd("p", "z.tif"),
         stored_composite=np.allclose(stored, blend, atol=1e-6),
+        stored_refuses_missing=missing[1] is not None and missing[0] in missing[1] and "composite" in missing[1],
+        stored_refuses_short_blob=short[1] is not None and short[0] in short[1] and "length" in short[1],
+        stored_refuses_byte_order=big[1] is not None and big[0] in big[1] and "byte order" in big[1],
+        residue_keys=res["source_share"] == 1.0 and res["islands_per_mp"] == 1e6 / 16 and "head_visible_patches" in res and "glow" in res["glow"],
+        crop_slice=cropped == (1, 1, 2, 2) and np.array_equal(sliced, a[1:3, 1:3]),
+        crop_refuses_outside=all(m is not None and frames[0] in m and "outside" in m for m in outside),
+        crop_transform_rect=own_rect((100, 100, 200, 200), (0.5, 0.0, 10.0, 0.0)) == (60, 50, 100, 100)
+        and own_rect((10, 10, 20, 10), (0.0, 1.0, 0.0, 0.0)) == (-20, 10, 10, 20),
         source_share=pick_share == 1.0 and blend_share < 0.2,
         montage_rows=sheet.shape == (4 * 3 + 4 * 2, 4 * 2 + 4, 3) and sheet[:4, 4 + 4:].max() < 20 and sheet[8:12, :4].max() == 255)
     for k, v in checks.items():
@@ -1282,6 +1380,24 @@ def cmd_montage(a):
     print(json.dumps(dict(cmd=sys.argv, out=a.out, order=a.files, rect=list(rect), columns=a.columns)))
 
 
+def cmd_stored(a):
+    stored_composite(a.project, a.out)
+    print(json.dumps(dict(cmd=sys.argv, project=a.project, out=a.out)))
+
+
+def cmd_crop(a):
+    rect = tuple(int(x) for x in a.rect.split(","))
+    transform = tuple(float(x) for x in a.transform.split(",")) if a.transform else None
+    if len(rect) != 4 or transform is not None and len(transform) != 4:
+        sys.exit("--rect takes X,Y,W,H and --transform A,B,TX,TY")
+    own = crop_image(a.src, rect, a.out, transform)
+    print(json.dumps(dict(cmd=sys.argv, out=a.out, rect=list(own))))
+
+
+def cmd_residue(a):
+    print(json.dumps(dict(cmd=sys.argv, images={im: residue_measures(im, a.zmap, a.mask_from, a.ref, a.frames) for im in a.images}), indent=1))
+
+
 # ---------------------------------------------------------------- reach / scale
 
 
@@ -1363,6 +1479,20 @@ def main():
     m.add_argument("--rect", required=True, help="Y0,Y1,X0,X1")
     m.add_argument("--columns", type=int, help="panels per row; the files wrap into rows (default: one row)")
     m.add_argument("files", nargs="+")
+    st = sub.add_parser("stored", help="a project's stored composite as a 16-bit TIFF")
+    st.add_argument("project")
+    st.add_argument("-o", "--out", required=True)
+    cr = sub.add_parser("crop", help="integer slice of a 16-bit TIFF")
+    cr.add_argument("src")
+    cr.add_argument("-o", "--out", required=True)
+    cr.add_argument("--rect", required=True, help="X,Y,W,H")
+    cr.add_argument("--transform", help="A,B,TX,TY: --rect is in the other image's coordinates, mapped by x'=Ax-By+TX, y'=Bx+Ay+TY")
+    rs = sub.add_parser("residue", help="source share, patch measures and glow of cropped images")
+    rs.add_argument("images", nargs="+")
+    rs.add_argument("--zmap", help="Z-Map crop of the images (islands and patch measures)")
+    rs.add_argument("--mask-from", help="image whose background pixels give the head_ measures (needs --zmap)")
+    rs.add_argument("--ref", help="image the glow is measured against")
+    rs.add_argument("--frames", nargs="+", default=[], help="as-fused frame crops for source_share")
     r = sub.add_parser("reach", help="measure the weight support with an impulse")
     r.add_argument("--size", type=int, default=512)
     r.add_argument("--scale", type=float, default=1.0)
@@ -1377,7 +1507,7 @@ def main():
         p.error("a subcommand or --self-check is required")
     if a.cmd in ("cases", "scale") and not os.path.exists(CLI):
         sys.exit(f"{CLI} not found: build the workspace first")
-    {"cases": cmd_cases, "fuse": cmd_fuse, "score": cmd_score, "montage": cmd_montage, "reach": cmd_reach, "scale": cmd_scale}[a.cmd](a)
+    {"cases": cmd_cases, "fuse": cmd_fuse, "score": cmd_score, "montage": cmd_montage, "stored": cmd_stored, "crop": cmd_crop, "residue": cmd_residue, "reach": cmd_reach, "scale": cmd_scale}[a.cmd](a)
 
 
 if __name__ == "__main__":

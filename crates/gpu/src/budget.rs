@@ -156,9 +156,10 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
 /// warped tile peaks at 29.0 MB over the allocator baseline; the model says
 /// 53.1 MB. `warped` is one flag for the whole tile, in the conservative direction.
 ///
-/// Two exclusions: the 16-32 B uniform params buffer each dispatch allocates
-/// (`crate::pipeline::upload_params`, roughly 13 per level per frame) is
-/// under 0.1% of the sum, and the warped-source term is a model, not a bound,
+/// Two exclusions: the 16-32 B uniform params buffers
+/// (`crate::pipeline::upload_params`; a tile shares one per distinct content,
+/// so a frame adds only its select uniform per level) are under 0.1% of the
+/// sum, and the warped-source term is a model, not a bound,
 /// for the reason named there. Every other term dominates both by orders of
 /// magnitude.
 pub fn device_bytes_per_tile(width: u32, height: u32, spp: u32, levels: u32, warped: bool) -> u64 {

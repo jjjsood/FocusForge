@@ -40,7 +40,7 @@ use crate::project::{
     self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
 };
 use crate::tile::{NoopPreprocess, TileConsumer, TileError, TileScheduler, TileSchedulerOptions};
-use crate::timing::{Stage, StageTimer, StageTimings};
+use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope};
 
 /// An alignment request: which algorithm, its explicit parameters, and
 /// whether a frame that fails to converge is refused (`Strict`) or falls
@@ -530,14 +530,17 @@ pub fn run(
                 .as_ref()
                 .map_or((frame_reader.len() - 1) / 2, |(_, _, _, a)| a.reference);
             let warped = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
-            let frames = equalize::estimate(
-                &warped,
-                frame_reader.len(),
-                (width, height),
-                spp,
-                reference,
-                max_gain,
-            )?;
+            let frames = {
+                let _equalize = equalize_scope();
+                equalize::estimate(
+                    &warped,
+                    frame_reader.len(),
+                    (width, height),
+                    spp,
+                    reference,
+                    max_gain,
+                )?
+            };
             for (index, estimate) in frames.iter().enumerate() {
                 if let Some(message) = estimate.notice(index, max_gain) {
                     observer.notice(&message);

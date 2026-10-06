@@ -13,22 +13,15 @@ use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, SourceFootprint, Transform};
 use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::timing::{TimingCounter, gpu_tile_stage};
 
 use crate::device::SharedDevice;
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{create_storage_buffer, download_buffer, upload_tile};
-use crate::warp_coords::{coords_bytes, map_coords};
-
-/// A packed-`u32` buffer of `byte_len` bytes, explicitly written to zero.
-fn zeroed_packed_buffer(device: &wgpu::Device, queue: &wgpu::Queue, byte_len: u64) -> wgpu::Buffer {
-    let buffer = create_storage_buffer(device, byte_len, "focusforge-gpu-warp-dst-zeroed");
-    let bytes = vec![0u8; byte_len as usize];
-    queue.write_buffer(&buffer, 0, &bytes);
-    buffer
-}
+use crate::transfer::{create_storage_buffer, download_buffer, upload_storage, upload_tile};
+use crate::warp_coords::map_coords;
 
 /// The bicubic warp kernel's pipeline, built on first use: 3 storage + 1
 /// uniform binding. At a 512x512x3 destination the coord buffer is
@@ -129,6 +122,7 @@ pub(crate) fn warp_dispatch(
     dst: Rect,
     t: &Transform,
 ) -> Result<(wgpu::Buffer, Vec<bool>), AlignError> {
+    let _stage = gpu_tile_stage(TimingCounter::GpuTileWarpNs);
     let mapped = map_coords(src.rect, frame, dst, t)?;
 
     let device = shared.device();
@@ -139,13 +133,7 @@ pub(crate) fn warp_dispatch(
     let word_count = (packed_len(sample_count) / 4) as u32;
 
     let src_buffer = upload_tile(device, queue, src);
-    let coord_bytes = coords_bytes(&mapped.coords);
-    let coords_buffer = create_storage_buffer(
-        device,
-        coord_bytes.len() as u64,
-        "focusforge-gpu-warp-coords",
-    );
-    queue.write_buffer(&coords_buffer, 0, &coord_bytes);
+    let coords_buffer = upload_storage(device, queue, &mapped.bytes, "focusforge-gpu-warp-coords");
     let dst_buffer =
         create_storage_buffer(device, u64::from(word_count) * 4, "focusforge-gpu-warp-dst");
 
@@ -229,9 +217,9 @@ pub fn warp_tile_gpu(
 }
 
 /// The dispatch half of [`warp_tile_gpu`], split off for the same reason as
-/// [`warp_dispatch`]. On [`SourceFootprint::Outside`], returns a
-/// [`zeroed_packed_buffer`] and `covered: vec![false; ..]`, with no read and
-/// no dispatch.
+/// [`warp_dispatch`]. On [`SourceFootprint::Outside`], returns
+/// a fresh, device-zero-initialised [`create_storage_buffer`] and `covered:
+/// vec![false; ..]`, with no read and no dispatch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn warp_tile_dispatch(
     shared: &SharedDevice,
@@ -248,21 +236,26 @@ pub(crate) fn warp_tile_dispatch(
             let pixel_count = dst.width as usize * dst.height as usize;
             let sample_count = pixel_count * samples_per_pixel as usize;
             let word_count = (packed_len(sample_count) / 4) as u64;
-            let device = shared.device();
-            let queue = shared.queue();
-            let buffer = zeroed_packed_buffer(device, queue, word_count * 4);
+            let buffer = create_storage_buffer(
+                shared.device(),
+                word_count * 4,
+                "focusforge-gpu-warp-dst-zeroed",
+            );
             Ok((buffer, vec![false; pixel_count]))
         }
         SourceFootprint::Covers { read, .. } => {
             let mut buf =
                 vec![0u16; read.width as usize * read.height as usize * samples_per_pixel as usize];
-            reader
-                .read_tile_into(frame_index, read, &mut buf)
-                .map_err(|source| AlignError::Read {
-                    frame: frame_index,
-                    rect: read,
-                    source,
-                })?;
+            {
+                let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+                reader
+                    .read_tile_into(frame_index, read, &mut buf)
+                    .map_err(|source| AlignError::Read {
+                        frame: frame_index,
+                        rect: read,
+                        source,
+                    })?;
+            }
             let src = Tile {
                 rect: read,
                 samples_per_pixel,

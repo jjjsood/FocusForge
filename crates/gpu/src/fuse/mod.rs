@@ -17,19 +17,23 @@ pub mod convert;
 pub mod pyramid;
 pub mod select;
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::fuse::laplacian::{EligibleMasks, score_radius};
 use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::timing::{
+    TimingCounter, gpu_tile_scope, gpu_tile_stage, measurement_scope, record_timing,
+};
 use focusforge_core::zmap::{NO_SOURCE, validate_tile};
 
 use crate::device::SharedDevice;
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
-    Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
+    Pipeline, build_pipeline, record_pass, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{download_buffer, upload_tile};
+use crate::transfer::{create_storage_buffer, download_buffer, upload_storage, upload_tile};
 
 /// Shape A: one storage buffer read, one storage buffer read/write, one
 /// uniform -- `plane_from_u16`, `plane_to_u16`, `reduce::{horizontal,
@@ -234,16 +238,106 @@ pub(crate) struct GpuPlane {
     spp: u32,
 }
 
-fn zeroed_f32_buffer(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    len: usize,
-    label: &str,
-) -> wgpu::Buffer {
-    let buffer = crate::transfer::create_storage_buffer(device, (len * 4) as u64, label);
-    let bytes = vec![0u8; len * 4];
-    queue.write_buffer(&buffer, 0, &bytes);
-    buffer
+type ScratchKey = (&'static str, u64);
+
+/// One tile frame's commands, recorded into one encoder and submitted once.
+/// [`scratch`](Self::scratch) pools storage buffers by label and size, reused
+/// by each later batch and never zeroed; a buffer that must start at zero is a
+/// fresh [`create_storage_buffer`]. The host never writes a pooled buffer.
+pub struct TileBatch<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    encoder: Option<wgpu::CommandEncoder>,
+    scratch: HashMap<ScratchKey, Vec<wgpu::Buffer>>,
+    taken: HashMap<ScratchKey, usize>,
+    params: HashMap<Vec<u8>, wgpu::Buffer>,
+    retained: Vec<wgpu::Buffer>,
+}
+
+impl<'a> TileBatch<'a> {
+    pub fn new(device: &'a wgpu::Device, queue: &'a wgpu::Queue) -> Self {
+        Self {
+            device,
+            queue,
+            encoder: None,
+            scratch: HashMap::new(),
+            taken: HashMap::new(),
+            params: HashMap::new(),
+            retained: Vec::new(),
+        }
+    }
+
+    pub fn device(&self) -> &'a wgpu::Device {
+        self.device
+    }
+
+    /// A pooled storage buffer of `byte_len` bytes, distinct from every other
+    /// buffer handed out since the last [`submit`](Self::submit).
+    pub(crate) fn scratch(&mut self, byte_len: u64, label: &'static str) -> wgpu::Buffer {
+        let key = (label, byte_len);
+        let taken = self.taken.entry(key).or_default();
+        let pool = self.scratch.entry(key).or_default();
+        if *taken == pool.len() {
+            pool.push(create_storage_buffer(self.device, byte_len, label));
+        }
+        let buffer = pool[*taken].clone();
+        *taken += 1;
+        buffer
+    }
+
+    /// A uniform buffer holding `bytes`, created once per distinct content and
+    /// shared by every dispatch that binds it.
+    pub(crate) fn params(&mut self, bytes: &[u8]) -> wgpu::Buffer {
+        if let Some(buffer) = self.params.get(bytes) {
+            return buffer.clone();
+        }
+        let buffer = upload_params(self.device, self.queue, bytes);
+        self.params.insert(bytes.to_vec(), buffer.clone());
+        buffer
+    }
+
+    /// A uniform buffer for contents that do not repeat, held only until the
+    /// next [`submit`](Self::submit), never cached.
+    pub(crate) fn params_once(&mut self, bytes: &[u8]) -> wgpu::Buffer {
+        let buffer = upload_params(self.device, self.queue, bytes);
+        self.retain(buffer)
+    }
+
+    /// Keeps `buffer` alive until the next [`submit`](Self::submit), for a
+    /// buffer the host wrote that this batch's commands read.
+    pub(crate) fn retain(&mut self, buffer: wgpu::Buffer) -> wgpu::Buffer {
+        self.retained.push(buffer.clone());
+        buffer
+    }
+
+    /// Records one 1-D dispatch; see [`record_pass`].
+    pub(crate) fn record(
+        &mut self,
+        pipeline: &Pipeline,
+        entries: &[wgpu::BindGroupEntry],
+        invocation_count: u32,
+        label: &str,
+    ) {
+        let device = self.device;
+        let encoder = self.encoder.get_or_insert_with(|| {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("focusforge-gpu-fuse-batch"),
+            })
+        });
+        record_pass(device, encoder, pipeline, entries, invocation_count, label);
+    }
+
+    /// Submits everything recorded since the last submit as one command
+    /// buffer; a batch with nothing recorded submits nothing.
+    pub fn submit(&mut self) {
+        let _scope = measurement_scope("gpu_cpu_submit");
+        if let Some(encoder) = self.encoder.take() {
+            self.queue.submit(Some(encoder.finish()));
+            record_timing(TimingCounter::CpuSubmissions, 1);
+        }
+        self.retained.clear();
+        self.taken.clear();
+    }
 }
 
 /// Converts an already-resident packed-`u32` buffer (`packed_len(width *
@@ -262,6 +356,7 @@ pub(crate) fn plane_from_packed(
     height: u32,
     spp: u32,
 ) -> GpuPlane {
+    let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
     let sample_count = width as usize * height as usize * spp as usize;
     let word_count = (packed_len(sample_count) / 4) as u32;
     let buffer = convert::plane_from_u16(
@@ -307,8 +402,7 @@ fn upload_plane(
 /// [`pyramid::reduce`] dispatches, `G_0` being `base` itself (no dispatch),
 /// mirroring `focusforge_core::fuse::pyramid::gaussian_levels`.
 fn gaussian_levels_gpu(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    batch: &mut TileBatch,
     pipelines: &FusionPipelines,
     base: GpuPlane,
     levels: u32,
@@ -321,9 +415,8 @@ fn gaussian_levels_gpu(
             (src.width, src.height, src.spp)
         };
         let src_buffer = &gaussians.last().expect("gaussians is never empty").buffer;
-        let (buffer, out_width, out_height) = pyramid::reduce(
-            device, queue, pipelines, src_buffer, src_width, src_height, spp,
-        );
+        let (buffer, out_width, out_height) =
+            pyramid::reduce(batch, pipelines, src_buffer, src_width, src_height, spp);
         gaussians.push(GpuPlane {
             buffer,
             width: out_width,
@@ -339,14 +432,8 @@ fn gaussian_levels_gpu(
 pub(crate) type FrameSource = (GpuPlane, Option<Vec<bool>>);
 
 fn upload_u32(device: &wgpu::Device, queue: &wgpu::Queue, values: &[u32]) -> wgpu::Buffer {
-    let buffer = crate::transfer::create_storage_buffer(
-        device,
-        (values.len() * 4) as u64,
-        "focusforge-gpu-fuse-eligibility",
-    );
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    queue.write_buffer(&buffer, 0, &bytes);
-    buffer
+    upload_storage(device, queue, &bytes, "focusforge-gpu-fuse-eligibility")
 }
 
 /// Whether `mask` excludes no pixel, so the exclude pass would change nothing.
@@ -383,9 +470,11 @@ pub(crate) fn fuse_planes_gpu(
     levels: u32,
     source: &mut dyn FnMut(usize) -> Result<FrameSource, AlgorithmError>,
 ) -> Result<TileOutput, AlgorithmError> {
+    let _tile = gpu_tile_scope();
     let device = shared.device();
     let queue = shared.queue();
     let spp = samples_per_pixel;
+    let mut batch = TileBatch::new(device, queue);
 
     let mut best_levels: Vec<Option<BestLevel>> = (0..levels).map(|_| None).collect();
     let mut residual_sum: Option<wgpu::Buffer> = None;
@@ -406,7 +495,10 @@ pub(crate) fn fuse_planes_gpu(
                 !masks.levels.iter().all(|m| all_true(m)) || !all_true(&masks.residual)
             });
         any_masked |= masks.is_some();
-        let gaussians = gaussian_levels_gpu(device, queue, pipelines, base, levels);
+        let gaussians = {
+            let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
+            gaussian_levels_gpu(&mut batch, pipelines, base, levels)
+        };
 
         for k in 0..levels as usize {
             let (g_k1_buffer, g_k1_width, g_k1_height, g_k1_spp) = {
@@ -417,38 +509,40 @@ pub(crate) fn fuse_planes_gpu(
                 let g = &gaussians[k];
                 (g.width, g.height, g.spp)
             };
-            let expanded = pyramid::expand(
-                device,
-                queue,
-                pipelines,
-                g_k1_buffer,
-                g_k1_width,
-                g_k1_height,
-                g_k1_spp,
-                g_k_width,
-                g_k_height,
-            );
             let laplacian_len = g_k_width * g_k_height * g_k_spp;
-            let laplacian = pyramid::sub(
-                device,
-                queue,
-                pipelines,
-                &gaussians[k].buffer,
-                &expanded,
-                laplacian_len,
-            );
+            let laplacian = {
+                let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
+                let expanded = pyramid::expand(
+                    &mut batch,
+                    pipelines,
+                    g_k1_buffer,
+                    g_k1_width,
+                    g_k1_height,
+                    g_k1_spp,
+                    g_k_width,
+                    g_k_height,
+                );
+                pyramid::sub(
+                    &mut batch,
+                    pipelines,
+                    &gaussians[k].buffer,
+                    &expanded,
+                    laplacian_len,
+                )
+            };
 
+            let _select = gpu_tile_stage(TimingCounter::GpuTileSelectNs);
             let radius = score_radius(levels, k as u32);
             let score = select::score(
-                device, queue, pipelines, &laplacian, g_k_width, g_k_height, g_k_spp, radius,
+                &mut batch, pipelines, &laplacian, g_k_width, g_k_height, g_k_spp, radius,
             );
             if let Some(masks) = masks.as_ref().filter(|masks| !all_true(&masks.levels[k])) {
+                let mask = batch.retain(upload_mask(device, queue, &masks.levels[k]));
                 select::exclude(
-                    device,
-                    queue,
+                    &mut batch,
                     pipelines,
                     &score,
-                    &upload_mask(device, queue, &masks.levels[k]),
+                    &mask,
                     g_k_width * g_k_height,
                     1,
                     f32::NEG_INFINITY,
@@ -456,34 +550,26 @@ pub(crate) fn fuse_planes_gpu(
             }
 
             let slot = best_levels[k].get_or_insert_with(|| BestLevel {
-                level: zeroed_f32_buffer(
+                level: create_storage_buffer(
                     device,
-                    queue,
-                    laplacian_len as usize,
+                    u64::from(laplacian_len) * 4,
                     "focusforge-gpu-fuse-best-level",
                 ),
                 best: {
                     let count = (g_k_width as usize) * (g_k_height as usize);
-                    let buffer = crate::transfer::create_storage_buffer(
-                        device,
-                        (count * 8) as u64,
-                        "focusforge-gpu-fuse-best",
-                    );
                     let mut bytes = Vec::with_capacity(count * 8);
                     for _ in 0..count {
                         bytes.extend_from_slice(&f32::NEG_INFINITY.to_le_bytes());
                         bytes.extend_from_slice(&u32::from(NO_SOURCE).to_le_bytes());
                     }
-                    queue.write_buffer(&buffer, 0, &bytes);
-                    buffer
+                    upload_storage(device, queue, &bytes, "focusforge-gpu-fuse-best")
                 },
                 width: g_k_width,
                 height: g_k_height,
             });
 
             select::select(
-                device,
-                queue,
+                &mut batch,
                 pipelines,
                 &laplacian,
                 &score,
@@ -496,6 +582,7 @@ pub(crate) fn fuse_planes_gpu(
             );
         }
 
+        let _residual = gpu_tile_stage(TimingCounter::GpuTileSelectNs);
         let residual_idx = levels as usize;
         let (residual_buffer, residual_width, residual_height, residual_spp) = {
             let g = &gaussians[residual_idx];
@@ -504,10 +591,9 @@ pub(crate) fn fuse_planes_gpu(
         residual_dims = (residual_width, residual_height);
         let residual_len = residual_width * residual_height * residual_spp;
         let sum = residual_sum.get_or_insert_with(|| {
-            zeroed_f32_buffer(
+            create_storage_buffer(
                 device,
-                queue,
-                residual_len as usize,
+                u64::from(residual_len) * 4,
                 "focusforge-gpu-fuse-residual-sum",
             )
         });
@@ -516,12 +602,12 @@ pub(crate) fn fuse_planes_gpu(
         }
         match masks.as_ref().filter(|masks| !all_true(&masks.residual)) {
             Some(masks) => {
+                let mask = batch.retain(upload_mask(device, queue, &masks.residual));
                 select::exclude(
-                    device,
-                    queue,
+                    &mut batch,
                     pipelines,
                     residual_buffer,
-                    &upload_mask(device, queue, &masks.residual),
+                    &mask,
                     residual_len,
                     residual_spp,
                     0.0,
@@ -532,17 +618,18 @@ pub(crate) fn fuse_planes_gpu(
             }
             None => residual_counts.iter_mut().for_each(|count| *count += 1),
         }
-        select::accumulate(device, queue, pipelines, sum, residual_buffer, residual_len);
+        select::accumulate(&mut batch, pipelines, sum, residual_buffer, residual_len);
+        batch.submit();
     }
 
+    let reconstruct = gpu_tile_stage(TimingCounter::GpuTileReconstructNs);
     let sum_buffer =
         residual_sum.expect("frame_count >= 1 guarantees at least one residual accumulated");
     let residual_len = residual_dims.0 * residual_dims.1 * spp;
     if any_masked {
-        let counts = upload_u32(device, queue, &residual_counts);
+        let counts = batch.retain(upload_u32(device, queue, &residual_counts));
         select::mean_by_count(
-            device,
-            queue,
+            &mut batch,
             pipelines,
             &sum_buffer,
             &counts,
@@ -551,8 +638,7 @@ pub(crate) fn fuse_planes_gpu(
         );
     } else {
         select::mean(
-            device,
-            queue,
+            &mut batch,
             pipelines,
             &sum_buffer,
             residual_len,
@@ -573,8 +659,7 @@ pub(crate) fn fuse_planes_gpu(
             winner_buffer = Some((slot.best, slot.width, slot.height));
         }
         let expanded = pyramid::expand(
-            device,
-            queue,
+            &mut batch,
             pipelines,
             &current_buffer,
             current_width,
@@ -584,17 +669,12 @@ pub(crate) fn fuse_planes_gpu(
             slot.height,
         );
         let combined_len = slot.width * slot.height * spp;
-        current_buffer = pyramid::add(
-            device,
-            queue,
-            pipelines,
-            &slot.level,
-            &expanded,
-            combined_len,
-        );
+        current_buffer = pyramid::add(&mut batch, pipelines, &slot.level, &expanded, combined_len);
         current_width = slot.width;
         current_height = slot.height;
     }
+
+    batch.submit();
 
     let sample_count = current_width as usize * current_height as usize * spp as usize;
     let word_count = (packed_len(sample_count) / 4) as u32;
@@ -606,6 +686,9 @@ pub(crate) fn fuse_planes_gpu(
         word_count,
         sample_count as u32,
     );
+    drop(reconstruct);
+
+    let readback = gpu_tile_stage(TimingCounter::GpuTileReadbackNs);
     let packed_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4)?;
     let samples = unpack_samples(&packed_bytes, sample_count);
 
@@ -617,6 +700,7 @@ pub(crate) fn fuse_planes_gpu(
         let winner = u32::from_le_bytes(chunk[4..8].try_into().expect("4 bytes"));
         zmap[i] = winner as u16;
     }
+    drop(readback);
 
     validate_tile(&zmap, frame_count as u32).map_err(|source| AlgorithmError::Failed {
         algorithm: "laplacian-gpu".to_string(),
@@ -658,7 +742,10 @@ pub fn fuse_tile_gpu(
 
     let mut source = |frame: usize| -> Result<FrameSource, AlgorithmError> {
         let mut samples = vec![0u16; pixel_count * samples_per_pixel as usize];
-        reader.read_tile_into(frame, rect, &mut samples)?;
+        {
+            let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+            reader.read_tile_into(frame, rect, &mut samples)?;
+        }
         let tile = Tile {
             rect,
             samples_per_pixel,

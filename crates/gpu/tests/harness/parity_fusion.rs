@@ -17,7 +17,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::tile::{Rect, Tile};
 use focusforge_core::zmap::NO_SOURCE;
 use focusforge_gpu::fuse::{
-    FusionPipelines, convert, fuse_tile_gpu, pyramid as gpu_pyramid, select,
+    FusionPipelines, TileBatch, convert, fuse_tile_gpu, pyramid as gpu_pyramid, select,
 };
 use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::pack::{packed_len, unpack_samples};
@@ -148,8 +148,10 @@ fn gaussian_reduce_matches_cpu() {
         let cpu_reduced = pyramid::reduce(&cpu_plane);
 
         let src_buffer = upload_plane_f32(device, queue, &cpu_plane);
+        let mut batch = TileBatch::new(device, queue);
         let (gpu_buffer, out_width, out_height) =
-            gpu_pyramid::reduce(device, queue, &pipelines, &src_buffer, width, height, spp);
+            gpu_pyramid::reduce(&mut batch, &pipelines, &src_buffer, width, height, spp);
+        batch.submit();
         assert_eq!(out_width, cpu_reduced.width());
         assert_eq!(out_height, cpu_reduced.height());
         let gpu_data = download_f32(device, queue, &gpu_buffer, cpu_reduced.data().len())
@@ -190,9 +192,9 @@ fn laplacian_expand_matches_cpu() {
     let cpu_expanded = pyramid::expand(&cpu_plane, out_width, out_height);
 
     let src_buffer = upload_plane_f32(device, queue, &cpu_plane);
+    let mut batch = TileBatch::new(device, queue);
     let gpu_buffer = gpu_pyramid::expand(
-        device,
-        queue,
+        &mut batch,
         &pipelines,
         &src_buffer,
         src_width,
@@ -201,6 +203,7 @@ fn laplacian_expand_matches_cpu() {
         out_width,
         out_height,
     );
+    batch.submit();
     let gpu_data =
         download_f32(device, queue, &gpu_buffer, cpu_expanded.data().len()).expect("download_f32");
 
@@ -238,9 +241,9 @@ fn score_plane_matches_cpu() {
     let cpu_scores = score_plane(level0, radius);
 
     let level_buffer = upload_f32(device, queue, level0.data());
+    let mut batch = TileBatch::new(device, queue);
     let gpu_scores_buffer = select::score(
-        device,
-        queue,
+        &mut batch,
         &pipelines,
         &level_buffer,
         level0.width(),
@@ -248,6 +251,7 @@ fn score_plane_matches_cpu() {
         level0.samples_per_pixel(),
         radius,
     );
+    batch.submit();
     let gpu_scores =
         download_f32(device, queue, &gpu_scores_buffer, cpu_scores.len()).expect("download_f32");
 

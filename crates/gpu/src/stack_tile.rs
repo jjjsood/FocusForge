@@ -9,6 +9,7 @@
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::Transform;
 use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::timing::{TimingCounter, gpu_tile_stage};
 
 use crate::device::SharedDevice;
 use crate::fuse::{FrameSource, FusionPipelines, fuse_planes_gpu, plane_from_packed};
@@ -47,7 +48,10 @@ pub fn warp_fuse_tile_gpu(
         let (packed, covered) = if *t == Transform::identity() {
             let mut samples =
                 vec![0u16; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
-            reader.read_tile_into(i, rect, &mut samples)?;
+            {
+                let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+                reader.read_tile_into(i, rect, &mut samples)?;
+            }
             let tile = Tile {
                 rect,
                 samples_per_pixel,

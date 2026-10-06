@@ -158,6 +158,16 @@ spans nest inside the stack span, and each tile span sits on the pool
 thread that ran it. A path that cannot be opened is one warning on stderr,
 not a failed run.
 
+The trace ends in a `timing_summary` span whose fields are run totals:
+bytes uploaded, read back and copied, buffer and pipeline creations, and
+nanosecond counters. `fuse_equalize_ns` is the time spent estimating the
+per-frame brightness gains before any tile is fused. On the GPU tile path,
+nine `gpu_tile_*_ns` counters (`read`, `warp`, `upload`, `pyramid`, `select`,
+`reconstruct`, `readback`, `wait`, `other`) split each tile's time so the
+stages sum to the tile's time; they are thread-seconds summed over
+concurrent tiles and stay 0 on a CPU run. `upload_bytes` counts every
+host-to-device buffer write the tile path makes, parameters included.
+
 The same build serves the Tracy profiler, which collects nothing until one
 attaches: start the binary, then connect Tracy from the same machine — the
 client listens on localhost and announces itself nowhere. Stage and tile
