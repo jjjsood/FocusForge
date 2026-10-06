@@ -67,8 +67,7 @@ impl Coord {
 /// `warp_from_tile_into`'s per-pixel head, stopping short of sampling: per
 /// destination pixel in raster order, decides coverage via `t.map_point`,
 /// floors the source coordinate, forms the `f32` fraction once, encodes the
-/// [`Coord`] straight into one buffer (no intermediate `Coord` vector), and returns
-/// the CPU twin's [`AlignError::SourceTileTooSmall`] (same `needed`, same
+/// [`Coord`] into the output buffer, and returns the CPU twin's [`AlignError::SourceTileTooSmall`] (same `needed`, same
 /// `have`) on the first covered pixel whose taps do not fit `src_rect`.
 pub fn map_coords(
     src_rect: Rect,

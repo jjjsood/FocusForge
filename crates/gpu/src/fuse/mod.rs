@@ -297,7 +297,7 @@ impl<'a> TileBatch<'a> {
     }
 
     /// A uniform buffer for contents that do not repeat, held only until the
-    /// next [`submit`](Self::submit) instead of cached.
+    /// next [`submit`](Self::submit), never cached.
     pub(crate) fn params_once(&mut self, bytes: &[u8]) -> wgpu::Buffer {
         let buffer = upload_params(self.device, self.queue, bytes);
         self.retain(buffer)
