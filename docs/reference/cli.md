@@ -110,8 +110,7 @@ parse.
 `--json` emits the same information as one JSON document instead. The shape
 is the same whether `PATH` is a file or a directory — a single-file
 invocation reports `"is_directory": false`, `"frame_count": 1` and a
-one-element `"files"` array. This schema is a compatibility promise: a field
-is added, never renamed or removed, in later versions.
+one-element `"files"` array.
 
 ```json
 {
@@ -241,7 +240,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
 | `--algo <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
 | `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`align`, `auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
-| `--json` | emit the frozen JSON report instead of human-readable text |
+| `--json` | emit a JSON report instead of human-readable text |
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
@@ -364,10 +363,9 @@ its parameters (value and provenance — whether each came from its default,
 an explicit `--set`, an `auto` hook, or a host-derived default, with
 `HostFallback` when host facts were unavailable and the descriptor's own
 default was used instead), the tile geometry the scheduler planned, and the
-paths written. Like `info --json` and `algorithms --json`, this is a frozen
-shape: a field is added, never renamed or removed, in later versions.
+paths written.
 
-Additive fields from alignment: `output_width`/`output_height` (the actual
+Alignment fields: `output_width`/`output_height` (the actual
 output extent — equal to `width`/`height` unless a crop was applied),
 `crop` (`null` under `--no-crop`, otherwise `{x, y, width, height}`),
 `description` (the `ImageDescription` string written to the composite, or
@@ -375,16 +373,16 @@ output extent — equal to `width`/`height` unless a crop was applied),
 otherwise the alignment algorithm's id, display name, parameters,
 reference frame, reference policy, failure policy, failure count and every
 frame's transform, in the same shape `align --json` reports (see below).
-Additive field from brightness equalization: `equalization` — `null` unless
+Brightness equalization field: `equalization` — `null` unless
 `equalize` is on, otherwise `{max_gain, reference, frames}`, where
 `reference` is the frame the others are matched to and `frames` holds, per
 frame, `estimated` (the gain that would match the reference), `applied` (the
 gain used, after the bound), `clamped`, `thin` and `samples` (the number of
 samples the estimate used).
-Additive field from the GPU path: `backend` — `"cpu"`, or the selected
+GPU field: `backend` — `"cpu"`, or the selected
 adapter's name and driver info.
 
-Additive fields from the host-memory budget: `max_bytes_in_flight` (the
+Host-memory budget fields: `max_bytes_in_flight` (the
 in-flight byte budget actually in force), `budget_provenance` (`"Host"` —
 derived from the host's currently reported available memory;
 `"HostFallback"` — the host probe was unavailable and the stated default was
@@ -398,7 +396,7 @@ group's *configured* host in-flight-tile limit, not a measured high-water
 mark — the engine this command drives does not expose the real observed
 concurrency, so the configured bound is reported instead.
 
-Additive fields from the device (VRAM) budget, GPU path only:
+Device (VRAM) budget fields, GPU path only:
 `max_device_bytes_in_flight` (the in-flight device-byte budget actually in
 force), `device_budget_provenance` (`"Host"` — a startup probe settled on
 this value; `"HostFallback"` — no probe ran and the stated default was used
@@ -412,7 +410,7 @@ same process. It is `0` for a group that admitted no tile through the device
 gate (fully served from the stage cache, say), and `null` only when there was
 no GPU backend at all. All three fields are `null` on the CPU path.
 
-Additive field `stages`: a per-stage wall-clock breakdown of `wall_seconds`
+The `stages` field is a per-stage wall-clock breakdown of `wall_seconds`
 — `setup`, `align`, `fuse` and `finalize`, each seconds as a float or `null`
 when that stage was never entered (`--no-align` leaves `align` null;
 `warp_write` is always `null` here, `stack` has no such stage). The four
@@ -420,12 +418,12 @@ non-null numbers sum to `wall_seconds` exactly: the spans are contiguous and
 disjoint, produced by one monotonic timer. `fuse` is the wall clock of a
 parallel fan-out (the tile scheduler's own rayon pool), not CPU time — read
 it beside `in_flight_limit`/`peak_in_flight`, not as a claim about how much
-work happened. Additive field `align_source`: how the `align` stage's number
+work happened. The `align_source` field states how the `align` stage's number
 was produced — `"computed"` (a real solve), `"cached"` (a stage-cache hit),
 `"resumed"` (a `--resume` ledger peek) or `"skipped"` (`--no-align`) — because
 a cache hit or a resume enters the stage and reports a small real number that
-is not "alignment took 10ms". Additive fields `align_workers`/`peak_align_workers`:
-the anchor arm's worker bound and the peak it actually reached -- numbers only
+is not "alignment took 10ms". The `align_workers` and `peak_align_workers`
+fields give the anchor arm's worker bound and the peak it actually reached -- numbers only
 when `align_source == "computed"`, `null` otherwise. A `"cached"`, `"resumed"`
 or `"skipped"` run never runs the alignment driver itself, so it has no
 worker count of its own; reporting one from a previous run's cache entry
@@ -516,7 +514,7 @@ Options:
 | flag | meaning |
 |---|---|
 | `--algo <ALGO>` | registered alignment algorithm id; optional, defaults to the sole registered one |
-| `--json` | emit the frozen JSON report instead of human-readable text |
+| `--json` | emit a JSON report instead of human-readable text |
 | `--write-warped <DIR>` | write one warped TIFF per frame into `<DIR>`, at source dimensions, uncropped |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
 | `--quiet` | print no progress at all (`align` has one stage line to suppress; it has no per-tile units to count) |
@@ -551,22 +549,19 @@ footprints share no common region.
 
 ### `--json`
 
-Frozen, additive-only, the same discipline as every other `--json` shape in
-this reference.
-
-Additive field `stages`: the same per-stage wall-clock breakdown `stack
+The `stages` field is the same per-stage wall-clock breakdown `stack
 --json` carries, but with `align`'s own stage set — `setup`, `align`,
 `warp_write` and `finalize`, each seconds or `null` when never entered.
 `fuse` is always `null` here (`align` never fuses). `warp_write` is `null`
 unless `--write-warped` was given — a run without the flag never enters
 that stage, which is not the same as it taking zero time. The non-null
 stages sum to `wall_seconds` exactly, the same contiguous-and-disjoint
-contract `stack --json` documents. Additive field `align_source`: always
+timing relationship `stack --json` documents. The `align_source` field is always
 `"computed"` for `align` (no `--resume`, no stage cache, no `--no-align`
 here), carried so a consumer reading both reports' `align` stage does not
-need to know which command produced it. Additive fields
-`align_workers`/`peak_align_workers`: the anchor arm's worker bound and the
-peak it actually reached (chain mode always reports `1`/`1` -- it is serial
+need to know which command produced it. The `align_workers` and
+`peak_align_workers` fields give the anchor arm's worker bound and the peak
+it actually reached (chain mode always reports `1`/`1` -- it is serial
 by construction) -- always numbers here, since every `align` run computes.
 
 ```json
@@ -616,10 +611,13 @@ by construction) -- always numbers here, since every `align` run computes.
 modes. `status` is `"converged"`, `"hit-cap"`, `"stalled"` or `"diverged"`; only a
 diverged frame carries `reason`: `singular-hessian`, `lemma-one-region`,
 `non-invertible-increment`, `correlation-decreased`, `too-few-valid-samples`,
-`non-finite-update` or `validation-failed` (the fit converged but its
-transform leaves a large residual at patches away from the fit region).
+`non-finite-update`, `validation-failed` (the fit converged but its
+transform leaves a large residual at patches away from the fit region) or
+`weak-match` (the final correlation is below 0.2, the floor a correct
+registration reaches; the fit is kept).
 `stalled` means the iteration cap was reached with flat or oscillating steps
-and the best-correlation transform is kept; only `diverged` counts as a
+and the best-correlation transform is kept, or that a middle pyramid level
+lost correlation and handed its best fit to the next finer level; only `diverged` counts as a
 failure, so a `stalled` frame neither fails a strict run nor adds to
 `failure_count`. In the text report a diverged row
 reads `diverged(<Reason>)`. `align_backend` is `"cpu"`, or the GPU adapter's
@@ -702,10 +700,8 @@ variants, or text that does not parse as the parameter's kind, is reported
 by name — every violation across every `--set` pair, not only the first —
 and the command exits without printing a schema.
 
-`--json` emits the same per-parameter facts as the frozen schema described
-above, one element in `{"algorithms": [...]}`. This is the frozen
-`algorithms --json` schema: a field is added, never renamed or removed, in
-later versions, matching `info --json`'s own compatibility promise.
+`--json` emits the same per-parameter facts described above, one element in
+`{"algorithms": [...]}`.
 
 ## `export`
 
@@ -743,7 +739,7 @@ project. See
 | `--iptc <on\|off>` | carry the source frame's IPTC block verbatim (default `off`; never written to PNG) |
 | `--frame <INDEX>` | write this 0-based source frame "as fused" — warped by its recorded alignment transform and offset by the applied crop, at the checkpoint's composite width and height. Requires `--frame-output` |
 | `--frame-output <FILE>` | where to write the frame `--frame` names |
-| `--json` | emit the frozen JSON report instead of human-readable text |
+| `--json` | emit a JSON report instead of human-readable text |
 
 A format option that belongs to another format (`--png-bits` with a JPEG
 output) is refused by name, and a value outside its range is refused with the
@@ -764,8 +760,7 @@ completes.
 
 ### `--json`
 
-Frozen, additive-only, the same discipline as every other `--json` shape in
-this reference: `project`, `wrote` (final paths only), `unresolved_sources`
+`--json` reports `project`, `wrote` (final paths only), `unresolved_sources`
 (present and empty when every source resolved, not an omission), `width`,
 `height`, `samples_per_pixel`, `frame_count`, `algorithm`, `checkpoint` (the
 resolved checkpoint id), `format` (`null` without `-o`), `format_options`
@@ -838,7 +833,7 @@ JSON shape and a full walkthrough.
 | `--overlay <FILE>` | blend the rainbow overlay over the recomposited image and write it as an 8-bit RGBA PNG |
 | `--opacity <FLOAT>` | the overlay's blend opacity, `0.0`–`1.0` (default `0.65`) |
 | `--solo <INDEX>` | highlight this 0-based source index in the overlay — the numbering an op's `source_id` uses — and desaturate every other source |
-| `--json` | emit the frozen JSON report instead of human-readable text |
+| `--json` | emit a JSON report instead of human-readable text |
 
 ```
 $ focusforge-cli retouch --zmap zmap.tif --ops stroke-list.json --out edited.tif
@@ -857,7 +852,7 @@ source frame.
 
 ### `--json`
 
-Frozen, additive-only: `zmap`, `ops`, `ops_in_list`, `ops_applied`,
+`--json` reports `zmap`, `ops`, `ops_in_list`, `ops_applied`,
 `pixels_changed`, `wrote`, `wall_seconds`, `rendered` (the `--render` path
 written, `null` when omitted) and `overlay` (the `--overlay` path written,
 `null` when omitted).
@@ -891,7 +886,7 @@ walkthrough.
 
 ### `--json`
 
-Emits `{"format": 1, "results": [...]}`. Each result carries the same
+Emits `{"results": [...]}`. Each result carries the same
 identity/outcome/error fields the `--status` NDJSON stream uses, plus
 `metrics` (`{"sharpness_ratio": ..., "distinct_sources": ..., "coherence":
 ...}` or `null`), `metrics_reason` (why `metrics` is `null`, or `null`
@@ -915,7 +910,7 @@ $ focusforge-cli cache
 removed 1 stage cache entry
 ```
 
-`--json` emits `{"format": 1, "removed": <count>}`.
+`--json` emits `{"removed": <count>}`.
 
 ## `diagnostics`
 

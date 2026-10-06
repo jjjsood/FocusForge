@@ -31,16 +31,16 @@ use crate::io::{
     open_frame_set,
 };
 use crate::job::{
-    AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
-    JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
-    StageCache, StageKey, read_alignment,
+    AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
+    JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache,
+    StageKey, read_alignment,
 };
 use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
     self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
 };
 use crate::tile::{NoopPreprocess, TileConsumer, TileError, TileScheduler, TileSchedulerOptions};
-use crate::timing::{Stage, StageTimer, StageTimings};
+use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope};
 
 /// An alignment request: which algorithm, its explicit parameters, and
 /// whether a frame that fails to converge is refused (`Strict`) or falls
@@ -530,14 +530,17 @@ pub fn run(
                 .as_ref()
                 .map_or((frame_reader.len() - 1) / 2, |(_, _, _, a)| a.reference);
             let warped = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
-            let frames = equalize::estimate(
-                &warped,
-                frame_reader.len(),
-                (width, height),
-                spp,
-                reference,
-                max_gain,
-            )?;
+            let frames = {
+                let _equalize = equalize_scope();
+                equalize::estimate(
+                    &warped,
+                    frame_reader.len(),
+                    (width, height),
+                    spp,
+                    reference,
+                    max_gain,
+                )?
+            };
             for (index, estimate) in frames.iter().enumerate() {
                 if let Some(message) = estimate.notice(index, max_gain) {
                     observer.notice(&message);
@@ -611,7 +614,6 @@ pub fn run(
         .unwrap_or_else(|| "cpu".to_string());
 
     let record = JobRecord {
-        format: JOB_RECORD_FORMAT,
         fingerprint,
         width,
         height,
@@ -1016,6 +1018,7 @@ fn divergence_phrase(reason: crate::align::DivergenceReason) -> &'static str {
         DivergenceReason::ValidationFailed => {
             "the alignment does not hold away from the centre of the frame"
         }
+        DivergenceReason::WeakMatch => "the best match found is too weak to be the right one",
     }
 }
 
@@ -1070,9 +1073,6 @@ fn peek_resumable_alignment(
         let Ok(candidate) = serde_json::from_str::<JobRecord>(&text) else {
             continue;
         };
-        if candidate.format != JOB_RECORD_FORMAT {
-            continue;
-        }
         if !candidate.composite_output.exists() {
             continue;
         }
@@ -1238,6 +1238,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peek_resumable_alignment_skips_a_ledger_missing_raw_identity() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let composite = scratch.path().join("out.tif");
+        std::fs::write(&composite, []).expect("output marker");
+        let fingerprint = StackFingerprint {
+            frames: vec![FrameFingerprint {
+                path: PathBuf::from("frame.tif"),
+                file_size: 1,
+                image_description: None,
+                width: 1,
+                height: 1,
+                samples_per_pixel: 3,
+                strip_offsets: vec![8],
+                strip_byte_counts: vec![3],
+                raw_identity: None,
+            }],
+        };
+        let record = JobRecord {
+            fingerprint: fingerprint.clone(),
+            width: 1,
+            height: 1,
+            samples_per_pixel: 3,
+            frame_count: 1,
+            tile_size: 64,
+            levels: 1,
+            stack_algorithm: "test".to_string(),
+            stack_params: ParamValues::new(),
+            backend: "cpu".to_string(),
+            align: None,
+            crop: None,
+            equalization: None,
+            composite_output: composite,
+            zmap_output: None,
+        };
+        let ledger = scratch.path().join("resume").join("candidate");
+        std::fs::create_dir_all(&ledger).expect("ledger directory");
+        std::fs::write(
+            ledger.join("job.json"),
+            serde_json::to_vec(&record).expect("record serializes"),
+        )
+        .expect("job record writes");
+
+        assert_eq!(
+            peek_resumable_alignment(
+                scratch.path(),
+                &fingerprint,
+                64,
+                1,
+                "test",
+                &ParamValues::new(),
+                None,
+            ),
+            Some(None)
+        );
+
+        let path = ledger.join("job.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("job record reads"))
+                .expect("job record is JSON");
+        value["fingerprint"]["frames"][0]
+            .as_object_mut()
+            .expect("frame is an object")
+            .remove("raw_identity");
+        std::fs::write(path, serde_json::to_vec(&value).expect("record serializes"))
+            .expect("job record writes");
+
+        assert_eq!(
+            peek_resumable_alignment(
+                scratch.path(),
+                &fingerprint,
+                64,
+                1,
+                "test",
+                &ParamValues::new(),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn working_space_names_the_transfer_each_reader_delivers() {
         for (kind, expected) in [
             (ReaderKind::Raw, "encoded-srgb"),
@@ -1252,18 +1333,25 @@ mod tests {
     fn validation_failed_has_its_own_phrase() {
         use crate::align::DivergenceReason;
 
-        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
-        for other in [
+        let reasons = [
             DivergenceReason::SingularHessian,
             DivergenceReason::LemmaOneRegion,
             DivergenceReason::NonInvertibleIncrement,
             DivergenceReason::CorrelationDecreased,
             DivergenceReason::TooFewValidSamples,
             DivergenceReason::NonFiniteUpdate,
-        ] {
-            assert_ne!(phrase, divergence_phrase(other));
+            DivergenceReason::ValidationFailed,
+            DivergenceReason::WeakMatch,
+        ];
+        for (i, &a) in reasons.iter().enumerate() {
+            for &b in &reasons[i + 1..] {
+                assert_ne!(divergence_phrase(a), divergence_phrase(b), "{a:?} {b:?}");
+            }
         }
+        let phrase = divergence_phrase(DivergenceReason::ValidationFailed);
         assert!(phrase.contains("away from the centre"), "{phrase}");
+        let weak = divergence_phrase(DivergenceReason::WeakMatch);
+        assert!(weak.contains("too weak"), "{weak}");
     }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {

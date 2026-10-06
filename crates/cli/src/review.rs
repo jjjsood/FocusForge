@@ -19,10 +19,7 @@ use focusforge_core::project::{PROJECT_EXTENSION, Project, ReviewMetrics};
 use serde::{Deserialize, Serialize};
 
 use crate::groups;
-use crate::status::{STATUS_RECORD_FORMAT, StatusRecord};
-
-/// `review`'s wrapped-document schema version: fields are only ever added.
-pub const REVIEW_FORMAT: u32 = 1;
+use crate::status::StatusRecord;
 
 /// One result's review record: identity, outcome and error through the same
 /// type the `--status` stream uses, plus the two fields this command adds.
@@ -46,12 +43,10 @@ pub struct ReviewRecord {
     pub unresolved_sources: Vec<String>,
 }
 
-/// One wrapped `--json` document: `{"format":1,"results":[…]}`, matching
-/// `stack --json`'s "a document on stdout means a completed run"
-/// convention.
+/// One wrapped `--json` document, matching `stack --json`'s convention that
+/// a document on stdout means a completed run.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ReviewDocument {
-    pub format: u32,
     pub results: Vec<ReviewRecord>,
 }
 
@@ -74,10 +69,7 @@ pub fn run(dir: &Path, json: bool) -> ExitCode {
         Err(message) => return crate::fail(message),
     };
 
-    let document = ReviewDocument {
-        format: REVIEW_FORMAT,
-        results: records,
-    };
+    let document = ReviewDocument { results: records };
     if json {
         match serde_json::to_string_pretty(&document) {
             Ok(text) => println!("{text}"),
@@ -147,14 +139,6 @@ fn load_manifest(path: &Path) -> Result<groups::RunManifest, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let manifest: groups::RunManifest =
         serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
-    if manifest.format != groups::MANIFEST_FORMAT {
-        return Err(format!(
-            "{}: unsupported manifest format {} (this build reads {})",
-            path.display(),
-            manifest.format,
-            groups::MANIFEST_FORMAT
-        ));
-    }
     Ok(manifest)
 }
 
@@ -193,7 +177,6 @@ fn base_record(
     error: Option<String>,
 ) -> StatusRecord {
     StatusRecord {
-        format: STATUS_RECORD_FORMAT,
         identity,
         command: "review".to_string(),
         outcome: outcome.to_string(),
@@ -224,7 +207,7 @@ fn no_metrics_record(
 /// from the manifest entry itself -- a `failed` group is a record because
 /// the manifest lists it.
 fn record_from_manifest_entry(reviewed_dir: &Path, entry: &groups::ManifestEntry) -> ReviewRecord {
-    let identity = entry.identity().to_string();
+    let identity = entry.identity.clone();
     if entry.outcome != "completed" {
         return no_metrics_record(
             base_record(
@@ -416,7 +399,6 @@ mod tests {
     #[test]
     fn render_names_the_source_the_count_and_every_field_or_a_dash() {
         let document = ReviewDocument {
-            format: REVIEW_FORMAT,
             results: vec![
                 ReviewRecord {
                     base: base_record(
@@ -492,7 +474,6 @@ mod tests {
     #[test]
     fn review_record_decodes_a_status_line() {
         let status = StatusRecord {
-            format: STATUS_RECORD_FORMAT,
             identity: "fixtures/mantis-512".to_string(),
             command: "stack".to_string(),
             outcome: "completed".to_string(),

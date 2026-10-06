@@ -488,7 +488,7 @@ fn refused_codec_fails_only_its_group() {
     let groups = cwd.join("groups.toml");
     std::fs::write(
         &groups,
-        "format = 1\n\n[[group]]\nname = \"valid\"\nframes = [\"00.tif\", \"01.tif\", \"02.tif\"]\n\n[[group]]\nname = \"refused\"\nframes = [\"refused.tif\"]\n",
+        "[[group]]\nname = \"valid\"\nframes = [\"00.tif\", \"01.tif\", \"02.tif\"]\n\n[[group]]\nname = \"refused\"\nframes = [\"refused.tif\"]\n",
     )
     .unwrap();
     std::fs::create_dir_all(&output).unwrap();

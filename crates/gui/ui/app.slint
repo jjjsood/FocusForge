@@ -294,6 +294,18 @@ export component AppWindow inherits Window {
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    // Each pane's low-detail whole-image backdrop and its placement, set
+    // from Rust like the sources above.
+    in property <image> frame-backdrop;
+    in property <length> frame-backdrop-x;
+    in property <length> frame-backdrop-y;
+    in property <length> frame-backdrop-w;
+    in property <length> frame-backdrop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     in property <length> frame-crop-x;
     in property <length> frame-crop-y;
     in property <length> frame-crop-w;
@@ -357,6 +369,16 @@ export component AppWindow inherits Window {
             frame-image-y: root.frame-image-y;
             frame-image-w: root.frame-image-w;
             frame-image-h: root.frame-image-h;
+            frame-backdrop: root.frame-backdrop;
+            frame-backdrop-x: root.frame-backdrop-x;
+            frame-backdrop-y: root.frame-backdrop-y;
+            frame-backdrop-w: root.frame-backdrop-w;
+            frame-backdrop-h: root.frame-backdrop-h;
+            backdrop: root.backdrop;
+            backdrop-x: root.backdrop-x;
+            backdrop-y: root.backdrop-y;
+            backdrop-w: root.backdrop-w;
+            backdrop-h: root.backdrop-h;
             frame-crop-x: root.frame-crop-x;
             frame-crop-y: root.frame-crop-y;
             frame-crop-w: root.frame-crop-w;
@@ -575,6 +597,8 @@ export component AppWindow inherits Window {
     // Whether a background stack load is in flight
     // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
     in property <bool> load-active: false;
+    // The loading indicator's wording: "Loading…" for a load, "Saving…" for a save.
+    in property <string> load-caption: "Loading…";
     // Whether the loading indicator's own show threshold has let it become
     // visible -- read by a headless test, with no running window.
     out property <bool> load-indicator-visible: loading-indicator.load-visible;
@@ -962,6 +986,7 @@ export component AppWindow inherits Window {
         width: canvas-ground.width;
         height: canvas-ground.height;
         load-active: root.load-active;
+        caption: root.load-caption;
     }
 
     // `no-frame: true` above means the compositor draws no OS chrome, so

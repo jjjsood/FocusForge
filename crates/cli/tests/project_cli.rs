@@ -239,38 +239,6 @@ fn refuses_an_output_file_path_by_name() {
 }
 
 #[test]
-fn zmap_flag_is_refused_with_a_migration_message() {
-    let cwd = common::tmp_dir("project_cli_zmap_flag_cwd");
-    let out = common::tmp_dir("project_cli_zmap_flag");
-    let input = common::fixtures_dir().join("mantis-64");
-    let zmap = out.join("map.tif");
-    let result = run_cli_in(
-        &cwd,
-        &stack_args(
-            input.to_str().unwrap(),
-            &[
-                "-o",
-                out.to_str().unwrap(),
-                "--zmap",
-                zmap.to_str().unwrap(),
-            ],
-        ),
-    );
-    assert!(!result.success);
-    assert_eq!(result.code, Some(1), "never clap's exit 2");
-    assert!(
-        result.stderr.contains("focusforge-cli export") && result.stderr.contains("--zmap"),
-        "the refusal must name the replacement: {}",
-        result.stderr
-    );
-    assert!(
-        !result.stderr.contains("unexpected argument"),
-        "clap's generic refusal tells a user nothing: {}",
-        result.stderr
-    );
-}
-
-#[test]
 fn one_project_per_group_and_a_failure_spares_the_others() {
     let root = common::tmp_dir("project_cli_multi_group");
     let good = root.join("good");

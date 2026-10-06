@@ -38,6 +38,8 @@
 //! `#[serde(skip_serializing_if)]` for exactly this reason: every key is
 //! always present on the wire, `null` or a number, never absent.
 
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -46,6 +48,12 @@ use serde::Serialize;
 
 /// The fixed number of detailed trace-span admissions one process may emit.
 const RECORD_BUDGET: usize = 262_144;
+
+/// The fixed number of trace-span admissions one process may emit for spans
+/// whose kind starts with `gui_`, counted apart from the processing budget.
+/// About 371 such spans per second in the busiest measured 1 s window, over a
+/// 490 s fusion, is 181,790; the next power of two is 262,144.
+const GUI_RECORD_BUDGET: usize = 262_144;
 
 /// A measured quantity produced at a named allocation, copy, or processing
 /// boundary. These counters describe only the sites that report them.
@@ -95,6 +103,27 @@ pub enum TimingCounter {
     FeatureSeedAttempts,
     /// Feature-seeded re-runs whose outcome replaced the identity-start one.
     FeatureSeedsAccepted,
+    /// Nanoseconds of GPU tile time spent supplying source frames.
+    GpuTileReadNs,
+    /// Nanoseconds of GPU tile time spent building warp coordinates and dispatching the warp.
+    GpuTileWarpNs,
+    /// Nanoseconds of GPU tile time spent in host-to-device buffer writes.
+    GpuTileUploadNs,
+    /// Nanoseconds of GPU tile time spent building pyramids and extracting planes.
+    GpuTilePyramidNs,
+    /// Nanoseconds of GPU tile time spent in score and select passes.
+    GpuTileSelectNs,
+    /// Nanoseconds of GPU tile time spent reconstructing pyramids.
+    GpuTileReconstructNs,
+    /// Nanoseconds of GPU tile time spent copying results to the host and decoding them, excluding the device wait.
+    GpuTileReadbackNs,
+    /// Nanoseconds of GPU tile time spent blocked polling the device.
+    GpuTileWaitNs,
+    /// Nanoseconds of GPU tile time outside every other stage.
+    GpuTileOtherNs,
+    /// Nanoseconds the fuse stage spent estimating per-frame brightness gains
+    /// before any tile is fused.
+    FuseEqualizeNs,
 }
 
 impl TimingCounter {
@@ -125,6 +154,16 @@ impl TimingCounter {
             Self::Level0WindowMisses => "level0_window_misses",
             Self::FeatureSeedAttempts => "feature_seed_attempts",
             Self::FeatureSeedsAccepted => "feature_seeds_accepted",
+            Self::GpuTileReadNs => "gpu_tile_read_ns",
+            Self::GpuTileWarpNs => "gpu_tile_warp_ns",
+            Self::GpuTileUploadNs => "gpu_tile_upload_ns",
+            Self::GpuTilePyramidNs => "gpu_tile_pyramid_ns",
+            Self::GpuTileSelectNs => "gpu_tile_select_ns",
+            Self::GpuTileReconstructNs => "gpu_tile_reconstruct_ns",
+            Self::GpuTileReadbackNs => "gpu_tile_readback_ns",
+            Self::GpuTileWaitNs => "gpu_tile_wait_ns",
+            Self::GpuTileOtherNs => "gpu_tile_other_ns",
+            Self::FuseEqualizeNs => "fuse_equalize_ns",
         }
     }
 }
@@ -134,6 +173,8 @@ impl TimingCounter {
 pub struct TimingSnapshot {
     pub admitted: u64,
     pub exhausted: u64,
+    pub gui_admitted: u64,
+    pub gui_exhausted: u64,
     pub converted_bytes: u64,
     pub warp_bytes: u64,
     pub allocation_bytes: u64,
@@ -159,15 +200,56 @@ pub struct TimingSnapshot {
     pub level0_window_misses: u64,
     pub feature_seed_attempts: u64,
     pub feature_seeds_accepted: u64,
+    pub gpu_tile_read_ns: u64,
+    pub gpu_tile_warp_ns: u64,
+    pub gpu_tile_upload_ns: u64,
+    pub gpu_tile_pyramid_ns: u64,
+    pub gpu_tile_select_ns: u64,
+    pub gpu_tile_reconstruct_ns: u64,
+    pub gpu_tile_readback_ns: u64,
+    pub gpu_tile_wait_ns: u64,
+    pub gpu_tile_other_ns: u64,
+    pub fuse_equalize_ns: u64,
     pub gpu_execution_available: bool,
     pub presentation_available: bool,
     pub saturated: bool,
 }
 
-struct TimingState {
+struct AdmissionBudget {
     remaining: AtomicUsize,
     admitted: AtomicU64,
     exhausted: AtomicU64,
+}
+
+impl AdmissionBudget {
+    fn new(budget: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(budget),
+            admitted: AtomicU64::new(0),
+            exhausted: AtomicU64::new(0),
+        }
+    }
+
+    fn admit(&self, saturated: &AtomicBool) -> bool {
+        if self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            saturating_add(&self.admitted, 1, saturated);
+            true
+        } else {
+            saturating_add(&self.exhausted, 1, saturated);
+            false
+        }
+    }
+}
+
+struct TimingState {
+    processing: AdmissionBudget,
+    gui: AdmissionBudget,
     converted_bytes: AtomicU64,
     warp_bytes: AtomicU64,
     allocation_bytes: AtomicU64,
@@ -193,16 +275,25 @@ struct TimingState {
     level0_window_misses: AtomicU64,
     feature_seed_attempts: AtomicU64,
     feature_seeds_accepted: AtomicU64,
+    gpu_tile_read_ns: AtomicU64,
+    gpu_tile_warp_ns: AtomicU64,
+    gpu_tile_upload_ns: AtomicU64,
+    gpu_tile_pyramid_ns: AtomicU64,
+    gpu_tile_select_ns: AtomicU64,
+    gpu_tile_reconstruct_ns: AtomicU64,
+    gpu_tile_readback_ns: AtomicU64,
+    gpu_tile_wait_ns: AtomicU64,
+    gpu_tile_other_ns: AtomicU64,
+    fuse_equalize_ns: AtomicU64,
     saturated: AtomicBool,
     summary_emitted: AtomicBool,
 }
 
 impl TimingState {
-    fn new(budget: usize) -> Self {
+    fn new(processing: usize, gui: usize) -> Self {
         Self {
-            remaining: AtomicUsize::new(budget),
-            admitted: AtomicU64::new(0),
-            exhausted: AtomicU64::new(0),
+            processing: AdmissionBudget::new(processing),
+            gui: AdmissionBudget::new(gui),
             converted_bytes: AtomicU64::new(0),
             warp_bytes: AtomicU64::new(0),
             allocation_bytes: AtomicU64::new(0),
@@ -228,24 +319,32 @@ impl TimingState {
             level0_window_misses: AtomicU64::new(0),
             feature_seed_attempts: AtomicU64::new(0),
             feature_seeds_accepted: AtomicU64::new(0),
+            gpu_tile_read_ns: AtomicU64::new(0),
+            gpu_tile_warp_ns: AtomicU64::new(0),
+            gpu_tile_upload_ns: AtomicU64::new(0),
+            gpu_tile_pyramid_ns: AtomicU64::new(0),
+            gpu_tile_select_ns: AtomicU64::new(0),
+            gpu_tile_reconstruct_ns: AtomicU64::new(0),
+            gpu_tile_readback_ns: AtomicU64::new(0),
+            gpu_tile_wait_ns: AtomicU64::new(0),
+            gpu_tile_other_ns: AtomicU64::new(0),
+            fuse_equalize_ns: AtomicU64::new(0),
             saturated: AtomicBool::new(false),
             summary_emitted: AtomicBool::new(false),
         }
     }
 
     fn admit(&self) -> bool {
-        if self
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
-            saturating_add(&self.admitted, 1, &self.saturated);
-            true
+        self.processing.admit(&self.saturated)
+    }
+
+    /// Admits a span of `kind`: `gui_` kinds draw on the graphical budget,
+    /// every other kind on the processing budget.
+    fn admit_kind(&self, kind: &str) -> bool {
+        if kind.starts_with("gui_") {
+            self.gui.admit(&self.saturated)
         } else {
-            saturating_add(&self.exhausted, 1, &self.saturated);
-            false
+            self.admit()
         }
     }
 
@@ -276,6 +375,16 @@ impl TimingState {
             TimingCounter::Level0WindowMisses => &self.level0_window_misses,
             TimingCounter::FeatureSeedAttempts => &self.feature_seed_attempts,
             TimingCounter::FeatureSeedsAccepted => &self.feature_seeds_accepted,
+            TimingCounter::GpuTileReadNs => &self.gpu_tile_read_ns,
+            TimingCounter::GpuTileWarpNs => &self.gpu_tile_warp_ns,
+            TimingCounter::GpuTileUploadNs => &self.gpu_tile_upload_ns,
+            TimingCounter::GpuTilePyramidNs => &self.gpu_tile_pyramid_ns,
+            TimingCounter::GpuTileSelectNs => &self.gpu_tile_select_ns,
+            TimingCounter::GpuTileReconstructNs => &self.gpu_tile_reconstruct_ns,
+            TimingCounter::GpuTileReadbackNs => &self.gpu_tile_readback_ns,
+            TimingCounter::GpuTileWaitNs => &self.gpu_tile_wait_ns,
+            TimingCounter::GpuTileOtherNs => &self.gpu_tile_other_ns,
+            TimingCounter::FuseEqualizeNs => &self.fuse_equalize_ns,
         };
         saturating_add(slot, value, &self.saturated);
     }
@@ -294,8 +403,10 @@ impl TimingState {
 
     fn snapshot(&self) -> TimingSnapshot {
         TimingSnapshot {
-            admitted: self.admitted.load(Ordering::Relaxed),
-            exhausted: self.exhausted.load(Ordering::Relaxed),
+            admitted: self.processing.admitted.load(Ordering::Relaxed),
+            exhausted: self.processing.exhausted.load(Ordering::Relaxed),
+            gui_admitted: self.gui.admitted.load(Ordering::Relaxed),
+            gui_exhausted: self.gui.exhausted.load(Ordering::Relaxed),
             converted_bytes: self.converted_bytes.load(Ordering::Relaxed),
             warp_bytes: self.warp_bytes.load(Ordering::Relaxed),
             allocation_bytes: self.allocation_bytes.load(Ordering::Relaxed),
@@ -321,6 +432,16 @@ impl TimingState {
             level0_window_misses: self.level0_window_misses.load(Ordering::Relaxed),
             feature_seed_attempts: self.feature_seed_attempts.load(Ordering::Relaxed),
             feature_seeds_accepted: self.feature_seeds_accepted.load(Ordering::Relaxed),
+            gpu_tile_read_ns: self.gpu_tile_read_ns.load(Ordering::Relaxed),
+            gpu_tile_warp_ns: self.gpu_tile_warp_ns.load(Ordering::Relaxed),
+            gpu_tile_upload_ns: self.gpu_tile_upload_ns.load(Ordering::Relaxed),
+            gpu_tile_pyramid_ns: self.gpu_tile_pyramid_ns.load(Ordering::Relaxed),
+            gpu_tile_select_ns: self.gpu_tile_select_ns.load(Ordering::Relaxed),
+            gpu_tile_reconstruct_ns: self.gpu_tile_reconstruct_ns.load(Ordering::Relaxed),
+            gpu_tile_readback_ns: self.gpu_tile_readback_ns.load(Ordering::Relaxed),
+            gpu_tile_wait_ns: self.gpu_tile_wait_ns.load(Ordering::Relaxed),
+            gpu_tile_other_ns: self.gpu_tile_other_ns.load(Ordering::Relaxed),
+            fuse_equalize_ns: self.fuse_equalize_ns.load(Ordering::Relaxed),
             gpu_execution_available: false,
             presentation_available: false,
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -347,7 +468,7 @@ static TIMING: OnceLock<TimingState> = OnceLock::new();
 
 /// Enables bounded timing records after a diagnostics trace sink is ready.
 pub fn enable_trace_accounting() {
-    let _ = TIMING.get_or_init(|| TimingState::new(RECORD_BUDGET));
+    let _ = TIMING.get_or_init(|| TimingState::new(RECORD_BUDGET, GUI_RECORD_BUDGET));
 }
 
 fn timing() -> Option<&'static TimingState> {
@@ -374,7 +495,7 @@ pub fn measurement_scope(kind: &'static str) -> MeasurementScope {
     let Some(state) = timing() else {
         return MeasurementScope(None);
     };
-    if !state.admit() {
+    if !state.admit_kind(kind) {
         return MeasurementScope(None);
     }
     MeasurementScope(Some(tracing::debug_span!("timing", kind).entered()))
@@ -393,7 +514,7 @@ pub fn measurement_scope_with_fields(
     let Some(state) = timing() else {
         return MeasurementScope(None);
     };
-    if !state.admit() {
+    if !state.admit_kind(kind) {
         return MeasurementScope(None);
     }
     MeasurementScope(Some(
@@ -409,6 +530,116 @@ pub fn measurement_scope_with_fields(
         )
         .entered(),
     ))
+}
+
+struct GpuTileClock {
+    stages: Vec<TimingCounter>,
+    since: Option<Instant>,
+}
+
+impl GpuTileClock {
+    /// Charges the time since the last stage change to the innermost stage.
+    fn charge(&mut self, state: &TimingState) {
+        let now = Instant::now();
+        if let (Some(stage), Some(since)) = (self.stages.last(), self.since) {
+            let nanos = now.saturating_duration_since(since).as_nanos();
+            state.add(*stage, u64::try_from(nanos).unwrap_or(u64::MAX));
+        }
+        self.since = Some(now);
+    }
+}
+
+thread_local! {
+    static GPU_TILE_CLOCK: RefCell<GpuTileClock> =
+        const { RefCell::new(GpuTileClock { stages: Vec::new(), since: None }) };
+}
+
+/// Opens `stage` on this thread's stopwatch. With `needs_root` and no stage
+/// open, nothing opens and `false` returns.
+fn clock_enter(state: &TimingState, stage: TimingCounter, needs_root: bool) -> bool {
+    GPU_TILE_CLOCK.with_borrow_mut(|clock| {
+        if needs_root && clock.stages.is_empty() {
+            return false;
+        }
+        clock.charge(state);
+        clock.stages.push(stage);
+        true
+    })
+}
+
+fn clock_leave(state: &TimingState) {
+    GPU_TILE_CLOCK.with_borrow_mut(|clock| {
+        clock.charge(state);
+        clock.stages.pop();
+    });
+}
+
+/// One open stage of the GPU tile stopwatch; dropping it closes the stage.
+#[must_use]
+pub struct GpuTileGuard {
+    state: Option<&'static TimingState>,
+    // The stopwatch is per thread, so the guard must drop where it opened.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for GpuTileGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state {
+            clock_leave(state);
+        }
+    }
+}
+
+fn gpu_tile_guard(stage: TimingCounter, needs_root: bool) -> GpuTileGuard {
+    let state = timing().filter(|state| clock_enter(state, stage, needs_root));
+    GpuTileGuard {
+        state,
+        _not_send: PhantomData,
+    }
+}
+
+/// Opens the GPU tile stopwatch for one tile, charging time to
+/// [`TimingCounter::GpuTileOtherNs`] until a [`gpu_tile_stage`] guard takes
+/// over. A root opened under another guard nests like a stage. Counts nothing
+/// unless trace accounting is active.
+pub fn gpu_tile_scope() -> GpuTileGuard {
+    gpu_tile_guard(TimingCounter::GpuTileOtherNs, false)
+}
+
+/// Charges the time until the guard drops to `stage`, taking it from the
+/// enclosing stage, so one tile's stages sum to its time in
+/// [`gpu_tile_scope`]. Does nothing outside a [`gpu_tile_scope`] on this
+/// thread. `stage` is one of the `GpuTile*Ns` counters; the totals are
+/// thread-seconds, summed over concurrent tiles.
+pub fn gpu_tile_stage(stage: TimingCounter) -> GpuTileGuard {
+    gpu_tile_guard(stage, true)
+}
+
+/// Charges the time between its creation and its drop to one counter.
+#[must_use]
+pub struct ElapsedGuard {
+    running: Option<(&'static TimingState, TimingCounter, Instant)>,
+}
+
+impl Drop for ElapsedGuard {
+    fn drop(&mut self) {
+        if let Some((state, counter, since)) = self.running {
+            let nanos = since.elapsed().as_nanos();
+            state.add(counter, u64::try_from(nanos).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+fn elapsed_guard(state: Option<&'static TimingState>, counter: TimingCounter) -> ElapsedGuard {
+    ElapsedGuard {
+        running: state.map(|state| (state, counter, Instant::now())),
+    }
+}
+
+/// Charges the time until the guard drops to [`TimingCounter::FuseEqualizeNs`].
+/// Admits no span and reads the clock only when trace accounting is active.
+pub(crate) fn equalize_scope() -> ElapsedGuard {
+    elapsed_guard(timing(), TimingCounter::FuseEqualizeNs)
 }
 
 /// Adds an actual count at a named processing boundary.
@@ -472,6 +703,9 @@ pub fn emit_timing_summary() {
         admission_budget = RECORD_BUDGET,
         admitted_spans = snapshot.admitted,
         exhausted_admissions = snapshot.exhausted,
+        gui_admission_budget = GUI_RECORD_BUDGET,
+        gui_admitted_spans = snapshot.gui_admitted,
+        gui_exhausted_admissions = snapshot.gui_exhausted,
         converted_bytes = snapshot.converted_bytes,
         warp_bytes = snapshot.warp_bytes,
         allocation_bytes = snapshot.allocation_bytes,
@@ -497,6 +731,16 @@ pub fn emit_timing_summary() {
         level0_window_misses = snapshot.level0_window_misses,
         feature_seed_attempts = snapshot.feature_seed_attempts,
         feature_seeds_accepted = snapshot.feature_seeds_accepted,
+        gpu_tile_read_ns = snapshot.gpu_tile_read_ns,
+        gpu_tile_warp_ns = snapshot.gpu_tile_warp_ns,
+        gpu_tile_upload_ns = snapshot.gpu_tile_upload_ns,
+        gpu_tile_pyramid_ns = snapshot.gpu_tile_pyramid_ns,
+        gpu_tile_select_ns = snapshot.gpu_tile_select_ns,
+        gpu_tile_reconstruct_ns = snapshot.gpu_tile_reconstruct_ns,
+        gpu_tile_readback_ns = snapshot.gpu_tile_readback_ns,
+        gpu_tile_wait_ns = snapshot.gpu_tile_wait_ns,
+        gpu_tile_other_ns = snapshot.gpu_tile_other_ns,
+        fuse_equalize_ns = snapshot.fuse_equalize_ns,
         gpu_execution_available = snapshot.gpu_execution_available,
         presentation_available = snapshot.presentation_available,
         saturated = snapshot.saturated,
@@ -688,12 +932,15 @@ impl Default for StageTimer {
 
 #[cfg(test)]
 mod accounting_tests {
-    use super::{RECORD_BUDGET, TimingCounter, TimingState};
+    use super::{
+        GUI_RECORD_BUDGET, RECORD_BUDGET, TimingCounter, TimingState, clock_enter, clock_leave,
+        elapsed_guard,
+    };
 
     #[test]
     fn recording_budget_admits_observed_capture_demand() {
         const OBSERVED_CAPTURE_DEMAND: usize = 220_018;
-        let state = TimingState::new(RECORD_BUDGET);
+        let state = TimingState::new(RECORD_BUDGET, GUI_RECORD_BUDGET);
 
         for _ in 0..OBSERVED_CAPTURE_DEMAND {
             assert!(state.admit());
@@ -707,7 +954,7 @@ mod accounting_tests {
 
     #[test]
     fn finite_admission_reports_exhaustion_without_wrapping_counters() {
-        let state = TimingState::new(2);
+        let state = TimingState::new(2, 2);
 
         assert!(state.admit());
         state.add(TimingCounter::ConvertedBytes, u64::MAX);
@@ -726,9 +973,126 @@ mod accounting_tests {
         assert!(!state.begin_summary());
     }
 
+    const GPU_TILE_COUNTERS: [(TimingCounter, &str); 9] = [
+        (TimingCounter::GpuTileReadNs, "gpu_tile_read_ns"),
+        (TimingCounter::GpuTileWarpNs, "gpu_tile_warp_ns"),
+        (TimingCounter::GpuTileUploadNs, "gpu_tile_upload_ns"),
+        (TimingCounter::GpuTilePyramidNs, "gpu_tile_pyramid_ns"),
+        (TimingCounter::GpuTileSelectNs, "gpu_tile_select_ns"),
+        (
+            TimingCounter::GpuTileReconstructNs,
+            "gpu_tile_reconstruct_ns",
+        ),
+        (TimingCounter::GpuTileReadbackNs, "gpu_tile_readback_ns"),
+        (TimingCounter::GpuTileWaitNs, "gpu_tile_wait_ns"),
+        (TimingCounter::GpuTileOtherNs, "gpu_tile_other_ns"),
+    ];
+
+    #[test]
+    fn gpu_tile_counters_stay_exact_after_admission_exhausted() {
+        let state = TimingState::new(1, 1);
+        assert!(state.admit());
+        assert!(!state.admit());
+
+        for (index, (counter, name)) in GPU_TILE_COUNTERS.iter().enumerate() {
+            assert_eq!(counter.name(), *name);
+            state.add(*counter, index as u64 + 1);
+        }
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.exhausted, 1);
+        assert_eq!(
+            [
+                snapshot.gpu_tile_read_ns,
+                snapshot.gpu_tile_warp_ns,
+                snapshot.gpu_tile_upload_ns,
+                snapshot.gpu_tile_pyramid_ns,
+                snapshot.gpu_tile_select_ns,
+                snapshot.gpu_tile_reconstruct_ns,
+                snapshot.gpu_tile_readback_ns,
+                snapshot.gpu_tile_wait_ns,
+                snapshot.gpu_tile_other_ns,
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert!(!snapshot.saturated);
+    }
+
+    #[test]
+    fn nested_gpu_tile_stages_charge_time_once() {
+        let state = TimingState::new(1, 1);
+        let nap = std::time::Duration::from_millis(20);
+
+        let started = std::time::Instant::now();
+        assert!(clock_enter(&state, TimingCounter::GpuTileOtherNs, false));
+        std::thread::sleep(nap);
+        assert!(clock_enter(&state, TimingCounter::GpuTileUploadNs, true));
+        std::thread::sleep(nap);
+        clock_leave(&state);
+        clock_leave(&state);
+        let measured = started.elapsed().as_nanos() as u64;
+
+        let snapshot = state.snapshot();
+        let nap_ns = nap.as_nanos() as u64;
+        assert!(snapshot.gpu_tile_upload_ns >= nap_ns, "{snapshot:?}");
+        assert!(snapshot.gpu_tile_other_ns >= nap_ns, "{snapshot:?}");
+        assert!(
+            snapshot.gpu_tile_upload_ns + snapshot.gpu_tile_other_ns <= measured,
+            "{snapshot:?} measured {measured}"
+        );
+    }
+
+    #[test]
+    fn a_gpu_tile_switch_without_a_root_records_nothing() {
+        let state = TimingState::new(1, 1);
+
+        assert!(!clock_enter(&state, TimingCounter::GpuTileUploadNs, true));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(clock_enter(&state, TimingCounter::GpuTileOtherNs, false));
+        clock_leave(&state);
+
+        assert_eq!(state.snapshot().gpu_tile_upload_ns, 0);
+    }
+
+    #[test]
+    fn the_equalize_counter_stays_exact_after_admission_exhausted() {
+        let state = TimingState::new(1, 1);
+        assert!(state.admit());
+        assert!(!state.admit());
+
+        assert_eq!(TimingCounter::FuseEqualizeNs.name(), "fuse_equalize_ns");
+        state.add(TimingCounter::FuseEqualizeNs, 7);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.exhausted, 1);
+        assert_eq!(snapshot.fuse_equalize_ns, 7);
+    }
+
+    #[test]
+    fn an_elapsed_guard_charges_its_counter_without_admitting_a_span() {
+        let state: &'static TimingState = Box::leak(Box::new(TimingState::new(1, 1)));
+        let nap = std::time::Duration::from_millis(5);
+
+        let started = std::time::Instant::now();
+        drop(elapsed_guard(Some(state), TimingCounter::FuseEqualizeNs));
+        let guard = elapsed_guard(Some(state), TimingCounter::FuseEqualizeNs);
+        std::thread::sleep(nap);
+        drop(guard);
+        let measured = started.elapsed().as_nanos() as u64;
+        drop(elapsed_guard(None, TimingCounter::FuseEqualizeNs));
+
+        let snapshot = state.snapshot();
+        assert!(
+            snapshot.fuse_equalize_ns >= nap.as_nanos() as u64,
+            "{snapshot:?}"
+        );
+        assert!(snapshot.fuse_equalize_ns <= measured, "{snapshot:?}");
+        assert_eq!(snapshot.admitted, 0);
+    }
+
     #[test]
     fn the_feature_seed_counters_accumulate_and_snapshot() {
-        let state = TimingState::new(2);
+        let state = TimingState::new(2, 2);
 
         state.add(TimingCounter::FeatureSeedAttempts, 3);
         state.add(TimingCounter::FeatureSeedAttempts, 1);
@@ -748,7 +1112,7 @@ mod accounting_tests {
 
     #[test]
     fn buffer_creations_and_readback_bytes_accumulate_and_saturate() {
-        let state = TimingState::new(2);
+        let state = TimingState::new(2, 2);
 
         state.add(TimingCounter::BufferCreations, 2);
         state.add(TimingCounter::BufferCreations, 3);
@@ -767,13 +1131,48 @@ mod accounting_tests {
         assert_eq!(snapshot.buffer_creations, 5);
         assert!(snapshot.saturated);
     }
+
+    #[test]
+    fn gui_kinds_keep_their_own_budget_after_processing_refuses() {
+        let state = TimingState::new(2, 2);
+
+        assert!(state.admit_kind("gpu_cpu_submit"));
+        assert!(state.admit_kind("gpu_cpu_submit"));
+        assert!(!state.admit_kind("gpu_cpu_submit"));
+        assert!(!state.admit_kind("guide_probe"));
+        assert!(state.admit_kind("gui_frame_rendered"));
+        assert!(state.admit_kind("gui_input"));
+        assert!(!state.admit_kind("gui_input"));
+
+        let snapshot = state.snapshot();
+        assert_eq!((snapshot.admitted, snapshot.exhausted), (2, 2));
+        assert_eq!((snapshot.gui_admitted, snapshot.gui_exhausted), (2, 1));
+    }
+
+    #[test]
+    fn each_budget_counts_only_its_own_refusals() {
+        let state = TimingState::new(3, 2);
+
+        for _ in 0..5 {
+            state.admit_kind("gpu_cpu_submit");
+        }
+        let snapshot = state.snapshot();
+        assert_eq!((snapshot.admitted, snapshot.exhausted), (3, 2));
+        assert_eq!((snapshot.gui_admitted, snapshot.gui_exhausted), (0, 0));
+
+        for _ in 0..5 {
+            state.admit_kind("gui_input");
+        }
+        let snapshot = state.snapshot();
+        assert_eq!((snapshot.admitted, snapshot.exhausted), (3, 2));
+        assert_eq!((snapshot.gui_admitted, snapshot.gui_exhausted), (2, 3));
+        assert!(!snapshot.saturated);
+    }
 }
 
 /// One run's stage breakdown, wall-clock seconds -- see the module
 /// documentation for the unit, the disjoint-contiguous contract and what
-/// `None` means. Additive-only on every schema that carries it
-/// (`StackReport`, `AlignReport`): a future stage is a new field, never a
-/// reinterpretation of one of these five.
+/// `None` means.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct StageTimings {
     pub setup: Option<f64>,

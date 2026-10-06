@@ -264,7 +264,7 @@ fn json_carries_help_and_advanced_per_parameter() {
     }
 }
 
-/// The project-level descriptors reach `algorithms --json` as an additive
+/// The project-level descriptors reach `algorithms --json` in the
 /// `project_params` array, help included.
 #[test]
 fn project_params_json_lists_every_project_descriptor() {

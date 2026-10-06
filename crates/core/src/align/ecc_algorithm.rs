@@ -20,7 +20,11 @@
 //! level ends the loop there (the seed for finer levels would be
 //! worthless), but the best-ρ transform that level found is still rescaled
 //! all the way to level-0 coordinates, so a caller always gets a level-0
-//! answer.
+//! answer. The exception is a `CorrelationDecreased` divergence at a middle
+//! level (`0 < k < pyramid-depth`, a coarser level having finished): its
+//! best-ρ transform seeds level `k - 1` and the level counts as `Stalled`,
+//! since a defocused frame loses correlation there on noise, not on a wrong
+//! seed. The coarsest level and every other reason still end the loop.
 //!
 //! # The solve region
 //!
@@ -41,7 +45,12 @@
 //! window `Transform::source_footprint` names for the seed, grown by
 //! [`LEVEL0_WINDOW_MARGIN_PX`] and held within [`LEVEL0_WINDOW_LIMIT_PX`] of
 //! the region. Coordinates stay full-frame, so a solve whose samples all fall
-//! inside the window is bit-identical to one over the whole plane. A result
+//! inside the window is bit-identical to one over the whole plane. Level 0
+//! is low-passed with [`LEVEL0_SMOOTHING_PASSES`] binomial passes, template
+//! and frame alike, over a window grown by the smoothing reach and cropped
+//! back, so windowed and whole-plane smoothing agree; a solve region within
+//! that reach of an edge reads level 0 unsmoothed. Coarse levels, the
+//! off-centre patches and the feature seed are never smoothed. A result
 //! whose footprint leaves the window counts one
 //! [`TimingCounter::Level0WindowMisses`] and is solved again over a window
 //! regrown to cover seed and result (counted again if still capped).
@@ -51,7 +60,10 @@
 //! After a frame that did not diverge, `PyramidalEcc::validate`
 //! evaluates the fit at up to eight off-centre patches; a frame where most
 //! usable ones exceed [`VALIDATION_TOLERANCE_PX`] is reported
-//! [`crate::align::DivergenceReason::ValidationFailed`], fit kept.
+//! [`crate::align::DivergenceReason::ValidationFailed`], fit kept. A frame
+//! whose final correlation lies below [`MIN_FINAL_CORRELATION`] is reported
+//! [`crate::align::DivergenceReason::WeakMatch`] instead, fit kept, without
+//! the patch evaluation.
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -64,7 +76,7 @@ use crate::align::{
     EccStatus, Features, KERNEL_RADIUS, LumaAssembler, SeedFit, SourceFootprint, Transform,
     fit_between,
 };
-use crate::fuse::pyramid::Plane;
+use crate::fuse::pyramid::{KERNEL, Plane};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
@@ -81,9 +93,30 @@ const LEVEL0_WINDOW_MARGIN_PX: u32 = 64;
 /// the accounting reserves.
 const LEVEL0_WINDOW_LIMIT_PX: u32 = 256;
 
+/// Binomial passes ([`KERNEL`], the filter pyramid level 1 is reduced with)
+/// applied to the reference template and every level-0 frame read. Depth-varying
+/// defocus blurs the frames of a pair differently and biases the finest-detail
+/// optimum; on a 64-frame 512x512 synthetic stack with it, 21 frames end over
+/// their error budget unsmoothed, 5 after one pass, 2 after two, none after
+/// three (the worst at 0.96 of its budget).
+const LEVEL0_SMOOTHING_PASSES: u32 = 3;
+
+/// Pixels one smoothing pass reads past the sample it produces.
+const SMOOTHING_PASS_RADIUS_PX: u32 = (KERNEL.len() / 2) as u32;
+
+/// Pixels a smoothed level-0 read extends past the window it returns.
+const LEVEL0_SMOOTHING_RADIUS_PX: u32 = LEVEL0_SMOOTHING_PASSES * SMOOTHING_PASS_RADIUS_PX;
+
 /// The largest per-patch residual, in level-0 pixels, a fit may leave at an
 /// off-centre patch and still count as holding there.
 const VALIDATION_TOLERANCE_PX: f64 = 1.0;
+
+/// The lowest final correlation a frame may end on and still count as
+/// registered. A solver-robustness floor for gross wrong optima, not a
+/// quality measure: a wrong fit on a 64-frame synthetic stack ended at 0.061
+/// while the lowest correct synthetic frame reached 0.355 and real frames
+/// 0.7 and above.
+const MIN_FINAL_CORRELATION: f64 = 0.2;
 
 /// Usable patches a frame needs before the off-centre check may flag it.
 const MIN_USABLE_PATCHES: usize = 3;
@@ -401,19 +434,22 @@ pub(crate) fn seed_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
 
 /// Bytes one solve allocates besides the templates: three 8-byte-per-pixel
 /// vectors over the level-0 solve region, plus the largest level-0 frame
-/// window (the region grown by [`LEVEL0_WINDOW_LIMIT_PX`] per side, clamped
-/// to the frame: `f32` luma plus the `u16` samples it was read from) and the
-/// largest off-centre patch window, each at `4 + 2 * spp` bytes per pixel.
+/// read (the region grown by [`LEVEL0_WINDOW_LIMIT_PX`] and the smoothing
+/// reach per side, clamped to the frame: the larger of `4 + 2 * spp` bytes per
+/// pixel for the `f32` luma and the `u16` samples it was read from and 8 for
+/// the luma plus the scratch plane smoothing works in) and the largest
+/// off-centre patch window at `4 + 2 * spp` bytes per pixel.
 pub(crate) fn solve_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
     let region = PyramidalEcc::solve_region(width, height);
     let per_px = 4 + 2 * spp as u64;
-    let window_w = (region.width + 2 * LEVEL0_WINDOW_LIMIT_PX).min(width) as u64;
-    let window_h = (region.height + 2 * LEVEL0_WINDOW_LIMIT_PX).min(height) as u64;
+    let reach = LEVEL0_WINDOW_LIMIT_PX + LEVEL0_SMOOTHING_RADIUS_PX;
+    let window_w = (region.width + 2 * reach).min(width) as u64;
+    let window_h = (region.height + 2 * reach).min(height) as u64;
     let patch_extent = patch_window_extent(patch_side(width, height));
     let patch_w = patch_extent.min(width) as u64;
     let patch_h = patch_extent.min(height) as u64;
     region.width as u64 * region.height as u64 * 24
-        + window_w * window_h * per_px
+        + window_w * window_h * per_px.max(8)
         + patch_w * patch_h * per_px
 }
 
@@ -799,10 +835,18 @@ impl PyramidalEcc {
                 at_level0 = up.compose(&at_level0).compose(&down);
             }
             final_transform = at_level0;
-            final_status = worse_status(final_status, result.status.into());
+            let handed_on = k > 0
+                && k < depth
+                && result.status == EccStatus::Diverged(DivergenceReason::CorrelationDecreased);
+            let level_status = if handed_on {
+                AlignStatus::Stalled
+            } else {
+                result.status.into()
+            };
+            final_status = worse_status(final_status, level_status);
 
             match result.status {
-                EccStatus::Diverged(_) => break,
+                EccStatus::Diverged(_) if !handed_on => break,
                 _ => {
                     if k > 0 {
                         seed = up.compose(&result.transform).compose(&down);
@@ -815,10 +859,14 @@ impl PyramidalEcc {
         }
 
         if !matches!(final_status, AlignStatus::Diverged(_)) {
-            let _scope = measurement_scope("ecc_validate");
-            let check = reference.validate(ctx, frame, &final_transform, params)?;
-            if check.flagged() {
-                final_status = AlignStatus::Diverged(DivergenceReason::ValidationFailed);
+            if final_residual < MIN_FINAL_CORRELATION {
+                final_status = AlignStatus::Diverged(DivergenceReason::WeakMatch);
+            } else {
+                let _scope = measurement_scope("ecc_validate");
+                let check = reference.validate(ctx, frame, &final_transform, params)?;
+                if check.flagged() {
+                    final_status = AlignStatus::Diverged(DivergenceReason::ValidationFailed);
+                }
             }
         }
 
@@ -993,6 +1041,81 @@ fn level0_window(fp: Option<Rect>, region: Rect, margin: u32, frame: (u32, u32))
     })
 }
 
+/// Whether level 0 is smoothed on a `frame`-sized stack solved over `region`:
+/// only when the template window (the region grown by one pixel) and its
+/// smoothing reach all lie inside the frame. Template and frame reads share
+/// the answer, so both are smoothed or neither is.
+fn smooths_level0(region: Rect, (width, height): (u32, u32)) -> bool {
+    let by = LEVEL0_SMOOTHING_RADIUS_PX + 1;
+    region.x >= by
+        && region.y >= by
+        && region.x + region.width + by <= width
+        && region.y + region.height + by <= height
+}
+
+/// [`LEVEL0_SMOOTHING_PASSES`] separable binomial passes over `plane` in place,
+/// the edge sample repeated past the border.
+fn smooth_level0(plane: &mut Plane) {
+    let (w, h) = (plane.width() as usize, plane.height() as usize);
+    let tap = |i: usize, d: usize, n: usize| {
+        (i + d)
+            .saturating_sub(SMOOTHING_PASS_RADIUS_PX as usize)
+            .min(n - 1)
+    };
+    let cur = plane.data_mut();
+    let mut next = vec![0f32; cur.len()];
+    for _ in 0..LEVEL0_SMOOTHING_PASSES {
+        for y in 0..h {
+            for x in 0..w {
+                next[y * w + x] = KERNEL
+                    .iter()
+                    .enumerate()
+                    .map(|(d, k)| k * cur[y * w + tap(x, d, w)])
+                    .sum();
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                cur[y * w + x] = KERNEL
+                    .iter()
+                    .enumerate()
+                    .map(|(d, k)| k * next[tap(y, d, h) * w + x])
+                    .sum();
+            }
+        }
+    }
+}
+
+/// Reads `rect` of `frame` as a level-0 luma plane, smoothed when `smooth`
+/// (see [`smooths_level0`]). The smoothing reads the window grown by
+/// [`LEVEL0_SMOOTHING_RADIUS_PX`] and crops back, so every returned sample
+/// equals the one a whole-plane smoothing gives.
+fn read_level0_luma(
+    ctx: &AlignContext<'_>,
+    frame: usize,
+    rect: Rect,
+    smooth: bool,
+) -> Result<Plane, AlgorithmError> {
+    if !smooth {
+        return read_luma_window(ctx, frame, rect);
+    }
+    let stack = ctx.stack();
+    let grown = grown_clamped(
+        rect,
+        LEVEL0_SMOOTHING_RADIUS_PX,
+        (stack.width, stack.height),
+    );
+    let mut smoothed = read_luma_window(ctx, frame, grown)?;
+    smooth_level0(&mut smoothed);
+    let (dx, dy) = ((rect.x - grown.x) as usize, (rect.y - grown.y) as usize);
+    let mut out = Vec::with_capacity(rect.width as usize * rect.height as usize);
+    for row in 0..rect.height as usize {
+        let start = (dy + row) * grown.width as usize + dx;
+        out.extend_from_slice(&smoothed.data()[start..start + rect.width as usize]);
+    }
+    Plane::from_f32_vec(out, rect.width, rect.height, 1).map_err(wrap_error)
+}
+
 /// Reads `rect` of `frame` and converts it to a luma plane.
 fn read_luma_window(
     ctx: &AlignContext<'_>,
@@ -1085,9 +1208,10 @@ fn solve_level0(
         footprint(t, region, dims).is_some_and(|fp| !contains(window, fp))
     };
 
+    let smooth = smooths_level0(region, dims);
     let seed_fp = footprint(seed, region, dims);
     let window = level0_window(seed_fp, region, margin, dims);
-    let plane = read_luma_window(ctx, frame, window)?;
+    let plane = read_level0_luma(ctx, frame, window, smooth)?;
     let mut first_trace = trace.is_some().then(Vec::new);
     let result = solve_routed(
         ctx,
@@ -1107,7 +1231,7 @@ fn solve_level0(
         let covered = seed_fp.map_or(fp, |s| bounding_union(s, fp));
         let regrown = level0_window(Some(covered), region, margin, dims);
         if regrown != window {
-            let plane = read_luma_window(ctx, frame, regrown)?;
+            let plane = read_level0_luma(ctx, frame, regrown, smooth)?;
             let mut second_trace = trace.is_some().then(Vec::new);
             let result = solve_routed(
                 ctx,
@@ -1186,7 +1310,7 @@ impl PreparedReference {
         let mut templates = Vec::with_capacity(depth as usize + 1);
         let region = PyramidalEcc::solve_region(dims.0, dims.1);
         let window = grown_clamped(region, 1, dims);
-        let plane = read_luma_window(ctx, reference, window)?;
+        let plane = read_level0_luma(ctx, reference, window, smooths_level0(region, dims))?;
         templates.push(EccTemplate::prepare(
             &plane,
             (window.x, window.y),
@@ -1467,19 +1591,22 @@ mod tests {
 
     #[test]
     fn solve_scratch_adds_the_capped_windows_to_the_solve_vectors() {
-        // Per-pixel bytes of a window: f32 luma plus the u16 samples read
-        // into it, `4 + 2 * spp`.
+        // Per-pixel bytes of a level-0 read: f32 luma plus the u16 samples
+        // read into it, `4 + 2 * spp`, or 8 for the luma and the scratch
+        // plane smoothing works in, whichever is larger; the window is the
+        // region grown by 256 + 6 px a side. An off-centre patch window costs
+        // `4 + 2 * spp`.
         assert_eq!(
             solve_scratch_bytes(512, 512, 3),
             24 * 384 * 384 + 512 * 512 * 10 + 260 * 260 * 10
         );
         assert_eq!(
             solve_scratch_bytes(8192, 5464, 3),
-            24 * 1253 * 836 + 1765 * 1348 * 10 + 772 * 772 * 10
+            24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10
         );
         assert_eq!(
             solve_scratch_bytes(8192, 5464, 1),
-            24 * 1253 * 836 + 1765 * 1348 * 6 + 772 * 772 * 6
+            24 * 1253 * 836 + 1777 * 1360 * 8 + 772 * 772 * 6
         );
     }
 
@@ -1550,19 +1677,22 @@ mod tests {
         }
     }
 
+    /// The scene's sinusoids: spatial frequency per pixel (x, y), phase,
+    /// amplitude and whether it is fine detail.
+    const RIPPLES: [(f64, f64, f64, f64, bool); 8] = [
+        (1.0 / 97.0, 1.0 / 131.0, 0.3, 1.0, false),
+        (1.0 / 61.0, -1.0 / 83.0, 1.7, 0.8, false),
+        (-1.0 / 47.0, 1.0 / 71.0, 4.1, 0.6, false),
+        (1.0 / 113.0, 1.0 / 37.0, 2.4, 0.7, false),
+        (1.0 / 23.0, 1.0 / 29.0, 0.9, 0.5, true),
+        (-1.0 / 19.0, 1.0 / 17.0, 5.0, 0.4, true),
+        (1.0 / 31.0, 1.0 / 43.0, 3.3, 0.5, true),
+        (-1.0 / 41.0, -1.0 / 27.0, 1.1, 0.4, true),
+    ];
+
     /// A smooth textured scene: sinusoids of 17 to 131 px wavelength. With
     /// `detail` off only the long ones remain, a defocused view of it.
     fn scene(x: f64, y: f64, detail: bool) -> f64 {
-        const RIPPLES: [(f64, f64, f64, f64, bool); 8] = [
-            (1.0 / 97.0, 1.0 / 131.0, 0.3, 1.0, false),
-            (1.0 / 61.0, -1.0 / 83.0, 1.7, 0.8, false),
-            (-1.0 / 47.0, 1.0 / 71.0, 4.1, 0.6, false),
-            (1.0 / 113.0, 1.0 / 37.0, 2.4, 0.7, false),
-            (1.0 / 23.0, 1.0 / 29.0, 0.9, 0.5, true),
-            (-1.0 / 19.0, 1.0 / 17.0, 5.0, 0.4, true),
-            (1.0 / 31.0, 1.0 / 43.0, 3.3, 0.5, true),
-            (-1.0 / 41.0, -1.0 / 27.0, 1.1, 0.4, true),
-        ];
         RIPPLES
             .iter()
             .filter(|w| detail || !w.4)
@@ -1620,12 +1750,66 @@ mod tests {
     const W: u32 = 1031;
     const H: u32 = 777;
 
+    /// `plane` smoothed whole, the reference the windowed reads must match.
+    fn smoothed(plane: &Plane) -> Plane {
+        let mut copy =
+            Plane::from_f32_vec(plane.data().to_vec(), plane.width(), plane.height(), 1).unwrap();
+        smooth_level0(&mut copy);
+        copy
+    }
+
+    #[test]
+    fn a_smoothed_level0_read_equals_the_whole_plane_smoothing() {
+        let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0)], false);
+        let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
+        let whole = smoothed(&whole_plane(&ctx, 1));
+        let inside = Rect {
+            x: 200,
+            y: 120,
+            width: 300,
+            height: 200,
+        };
+        let at_the_corner = Rect {
+            x: W - 90,
+            y: H - 60,
+            width: 90,
+            height: 60,
+        };
+        for rect in [inside, at_the_corner] {
+            let read = read_level0_luma(&ctx, 1, rect, true).unwrap();
+            for row in 0..rect.height {
+                let from = ((rect.y + row) * W + rect.x) as usize;
+                assert_eq!(
+                    &read.data()[(row * rect.width) as usize..][..rect.width as usize],
+                    &whole.data()[from..from + rect.width as usize],
+                    "{rect:?} row {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_solve_region_within_the_smoothing_reach_of_an_edge_reads_level_zero_unsmoothed() {
+        // 40 px: the region starts 5 px in, short of the 7 px the smoothing
+        // and the template's extra pixel need.
+        let region = PyramidalEcc::solve_region(40, 40);
+        assert_eq!(region.x, 5);
+        assert!(!smooths_level0(region, (40, 40)));
+        assert!(smooths_level0(PyramidalEcc::solve_region(W, H), (W, H)));
+
+        let mem = reader(40, 40, &[(0.0, 0.0), (1.0, 0.0)], false);
+        let ctx = AlignContext::new(StackContext::new(2, 40, 40, 1), 0, &mem);
+        let rect = grown_clamped(region, 1, (40, 40));
+        let read = read_level0_luma(&ctx, 1, rect, smooths_level0(region, (40, 40))).unwrap();
+        assert_eq!(read, read_luma_window(&ctx, 1, rect).unwrap());
+    }
+
     #[test]
     fn a_windowed_level0_solve_equals_the_whole_plane_solve() {
         // Frame 1 is the reference moved by (3, 2), frame 2 by (80, 3).
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0), (80.0, 3.0)], false);
         let ctx = AlignContext::new(StackContext::new(3, W, H, 1), 0, &mem);
-        let reference = whole_plane(&ctx, 0);
+        let reference = smoothed(&whole_plane(&ctx, 0));
         let region = PyramidalEcc::solve_region(W, H);
         let params = test_params(6);
 
@@ -1635,7 +1819,7 @@ mod tests {
                 (1usize, Transform::translation(2.0, 1.0)),
                 (2, Transform::translation(78.0, 2.0)),
             ] {
-                let moving = whole_plane(&ctx, frame);
+                let moving = smoothed(&whole_plane(&ctx, frame));
                 let whole = solve_prepared(&template, &moving, (0, 0), &seed, &params, None);
 
                 let window = level0_window(
@@ -1671,7 +1855,7 @@ mod tests {
     fn a_seed_outside_the_frame_reads_as_too_few_valid_samples() {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0)], false);
         let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
-        let reference = whole_plane(&ctx, 0);
+        let reference = smoothed(&whole_plane(&ctx, 0));
         let region = PyramidalEcc::solve_region(W, H);
         let template =
             EccTemplate::prepare(&reference, (0, 0), region, EccMode::Translation).unwrap();
@@ -1680,7 +1864,7 @@ mod tests {
 
         let whole = solve_prepared(
             &template,
-            &whole_plane(&ctx, 1),
+            &smoothed(&whole_plane(&ctx, 1)),
             (0, 0),
             &seed,
             &params,
@@ -1699,14 +1883,14 @@ mod tests {
     fn an_iterate_leaving_the_window_is_counted_and_regrown() {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0)], false);
         let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
-        let reference = whole_plane(&ctx, 0);
+        let reference = smoothed(&whole_plane(&ctx, 0));
         let region = PyramidalEcc::solve_region(W, H);
         let template =
             EccTemplate::prepare(&reference, (0, 0), region, EccMode::Translation).unwrap();
         let params = test_params(8);
         let whole = solve_prepared(
             &template,
-            &whole_plane(&ctx, 1),
+            &smoothed(&whole_plane(&ctx, 1)),
             (0, 0),
             &Transform::identity(),
             &params,
@@ -1893,8 +2077,15 @@ mod tests {
         (reference, attempt, escalation)
     }
 
-    /// The identity-start attempt alone: what a frame gets with no escalation.
-    fn unseeded(mem: &MemReader, mode: EccMode, depth: u32, frame: usize) -> Attempt {
+    /// One attempt on frame `frame` from `start`, a transform in the coarsest
+    /// level's pixels, with no escalation.
+    fn attempt_from(
+        mem: &MemReader,
+        mode: EccMode,
+        depth: u32,
+        frame: usize,
+        start: Transform,
+    ) -> Attempt {
         let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
         let reference = PreparedReference::build(&ctx, 0, mode, depth).unwrap();
         let pyramid = PyramidalEcc::build_pyramid(&ctx, frame, depth).unwrap();
@@ -1905,10 +2096,214 @@ mod tests {
             &pyramid,
             depth,
             &test_params(400),
-            Transform::identity(),
-            false,
+            start,
+            true,
         )
         .unwrap()
+    }
+
+    /// The identity-start attempt alone: what a frame gets with no escalation.
+    fn unseeded(mem: &MemReader, mode: EccMode, depth: u32, frame: usize) -> Attempt {
+        attempt_from(mem, mode, depth, frame, Transform::identity())
+    }
+
+    #[test]
+    fn a_fit_that_settles_in_a_wrong_basin_below_the_floor_is_flagged_with_its_fit_kept() {
+        // Frame 1 equals the reference; the start is 15 degrees and 8.5 % off
+        // about the coarsest level's centre, inside a basin the solver settles
+        // in with a correlation near 0.1.
+        let mem = blob_reader(&[(0.0, 0.0), (0.0, 0.0)]);
+        let (cx, cy) = (f64::from(W / 4 - 1) / 2.0, f64::from(H / 4 - 1) / 2.0);
+        let start = Transform::translation(cx, cy)
+            .compose(&Transform::similarity(
+                1.085,
+                (-15.0f64).to_radians(),
+                0.0,
+                0.0,
+            ))
+            .compose(&Transform::translation(-cx, -cy));
+
+        let attempt = attempt_from(&mem, EccMode::Similarity, 2, 1, start);
+
+        assert!(attempt.residual < MIN_FINAL_CORRELATION, "{attempt:?}");
+        assert_eq!(
+            attempt.status,
+            AlignStatus::Diverged(DivergenceReason::WeakMatch),
+            "{attempt:?}"
+        );
+        let (scale, radians, _, _) = attempt.transform.similarity_parts();
+        assert!(
+            (radians.to_degrees() + 15.0).abs() < 3.0 && scale > 1.05,
+            "the wrong fit is kept, not the identity: scale {scale}, {} deg",
+            radians.to_degrees()
+        );
+    }
+
+    /// Uniform-sum noise of unit variance, a pure function of the pixel and a
+    /// per-frame salt.
+    fn noise(x: u32, y: u32, salt: u64) -> f64 {
+        let mut h = (u64::from(x) << 32 | u64::from(y)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        let mut sum = 0.0;
+        for _ in 0..4 {
+            h ^= h >> 29;
+            h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h ^= h >> 32;
+            sum += (h >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+        }
+        sum * 3.0f64.sqrt()
+    }
+
+    /// Two frames of the defocused scene (long ripples only) at `amplitude`
+    /// times the usual contrast, the second moved by `shift`, each with its
+    /// own sensor noise of standard deviation `noise_sd` grey levels.
+    fn defocused_noisy_reader(shift: (f64, f64), amplitude: f64, noise_sd: f64) -> MemReader {
+        let frame = |shift: (f64, f64), salt: u64| -> Vec<u16> {
+            let mut out = Vec::with_capacity(W as usize * H as usize);
+            for y in 0..H {
+                for x in 0..W {
+                    let v = scene(f64::from(x) - shift.0, f64::from(y) - shift.1, false);
+                    let grey = 32768.0 + 6000.0 * amplitude * v + noise_sd * noise(x, y, salt);
+                    out.push(grey.clamp(0.0, 65535.0) as u16);
+                }
+            }
+            out
+        };
+        MemReader {
+            width: W,
+            frames: vec![frame((0.0, 0.0), 1), frame(shift, 2)],
+        }
+    }
+
+    /// Pixel-scale ripples the defocused scene adds to [`RIPPLES`]: the detail
+    /// a mismatched blur biases the finest level with.
+    const FINE_RIPPLES: [(f64, f64, f64, f64, bool); 3] = [
+        (1.0 / 7.0, 1.0 / 9.0, 0.6, 1.5, true),
+        (-1.0 / 6.0, 1.0 / 11.0, 2.2, 1.5, true),
+        (1.0 / 5.5, 1.0 / 5.0, 4.0, 1.2, true),
+    ];
+    /// The scene as a lens focused at depth `focus` renders it at `(x, y)`:
+    /// the depth tilts across the frame and every ripple is attenuated by the
+    /// Gaussian of sigma `DEFOCUS_PX_PER_DEPTH * |depth - focus|`.
+    fn defocused_scene(x: f64, y: f64, focus: f64) -> f64 {
+        const DEFOCUS_PX_PER_DEPTH: f64 = 2.0;
+        let depth = 4.0 * x / f64::from(W) + 1.0 * y / f64::from(H);
+        let sigma = DEFOCUS_PX_PER_DEPTH * (depth - focus).abs();
+        RIPPLES
+            .iter()
+            .chain(FINE_RIPPLES.iter())
+            .map(|&(fx, fy, phase, amp, _)| {
+                let tau = std::f64::consts::TAU;
+                let attenuation = (-0.5 * tau * tau * sigma * sigma * (fx * fx + fy * fy)).exp();
+                amp * attenuation * (tau * (fx * x + fy * y) + phase).sin()
+            })
+            .sum()
+    }
+
+    /// The reference (focused at depth 1) and a frame focused at depth 3
+    /// that sees the scene through `truth`.
+    fn depth_defocused_reader(truth: &Transform) -> MemReader {
+        let back = truth.inverse().expect("the truth is invertible");
+        let frame = |focus: f64, to_scene: Option<&Transform>| -> Vec<u16> {
+            let mut out = Vec::with_capacity(W as usize * H as usize);
+            for y in 0..H {
+                for x in 0..W {
+                    let (qx, qy) = match to_scene {
+                        Some(t) => t
+                            .map_point(f64::from(x), f64::from(y))
+                            .expect("an affine map"),
+                        None => (f64::from(x), f64::from(y)),
+                    };
+                    let v = defocused_scene(qx, qy, focus);
+                    out.push((32768.0 + 6000.0 * v).clamp(0.0, 65535.0) as u16);
+                }
+            }
+            out
+        };
+        MemReader {
+            width: W,
+            frames: vec![frame(1.0, None), frame(3.0, Some(&back))],
+        }
+    }
+
+    /// The largest distance between where `fit` and `truth` send the corners
+    /// of the level-0 solve region.
+    fn corner_error_px(fit: &Transform, truth: &Transform) -> f64 {
+        let region = PyramidalEcc::solve_region(W, H);
+        let (x0, y0) = (f64::from(region.x), f64::from(region.y));
+        let (x1, y1) = (x0 + f64::from(region.width), y0 + f64::from(region.height));
+        [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+            .iter()
+            .map(|&(x, y)| {
+                let a = fit.map_point(x, y).expect("an affine map");
+                let b = truth.map_point(x, y).expect("an affine map");
+                (a.0 - b.0).hypot(a.1 - b.1)
+            })
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn level_zero_stays_within_budget_under_depth_varying_defocus() {
+        let (cx, cy) = (f64::from(W - 1) / 2.0, f64::from(H - 1) / 2.0);
+        let truth = Transform::translation(cx + 3.5, cy - 2.5)
+            .compose(&Transform::similarity(1.002, 0.004, 0.0, 0.0))
+            .compose(&Transform::translation(-cx, -cy));
+        let mem = depth_defocused_reader(&truth);
+
+        let attempt = unseeded(&mem, EccMode::Similarity, 3, 1);
+
+        let error = corner_error_px(&attempt.transform, &truth);
+        assert!(error < 0.03, "{error} px; {attempt:?}");
+    }
+
+    #[test]
+    fn a_correlation_decrease_at_a_middle_level_hands_its_fit_to_the_next_level() {
+        // Levels 3 and 2 converge; level 1 then diverges after a few
+        // iterations on the noise, with its best-correlation fit kept.
+        let mem = defocused_noisy_reader((9.0, 6.0), 0.01, 250.0);
+        let attempt = unseeded(&mem, EccMode::Similarity, 3, 1);
+
+        let solved: Vec<_> = attempt
+            .records
+            .iter()
+            .map(|r| (r.level, r.result.status))
+            .collect();
+        assert_eq!(
+            solved[..3],
+            [
+                (3, EccStatus::Converged),
+                (2, EccStatus::Converged),
+                (
+                    1,
+                    EccStatus::Diverged(DivergenceReason::CorrelationDecreased)
+                ),
+            ],
+            "{solved:?}"
+        );
+        assert_eq!(
+            solved.last().map(|&(level, _)| level),
+            Some(0),
+            "level 0 is solved from the level-1 fit: {solved:?}"
+        );
+        assert_ne!(attempt.status, AlignStatus::Converged, "{attempt:?}");
+    }
+
+    #[test]
+    fn a_correlation_decrease_at_the_coarsest_level_stops_the_pass() {
+        let mem = defocused_noisy_reader((9.0, 6.0), 0.004, 500.0);
+        let attempt = unseeded(&mem, EccMode::Similarity, 3, 1);
+
+        assert_eq!(
+            attempt.status,
+            AlignStatus::Diverged(DivergenceReason::CorrelationDecreased),
+            "{attempt:?}"
+        );
+        let levels: Vec<u32> = attempt.records.iter().map(|r| r.level).collect();
+        assert_eq!(
+            levels,
+            [3],
+            "no finer level follows a diverged coarsest level"
+        );
     }
 
     #[test]
@@ -2016,6 +2411,72 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_whose_features_cluster_converges_seeded() {
+        // Texture only inside one rectangle of the reference (and the same
+        // content, moved by the shift, in the frame): the matches fall in a
+        // few grid cells but are nearly all right.
+        let shift = (150.0, -90.0);
+        let keep = |x0: u32, y0: u32| {
+            move |i: usize| {
+                let (x, y) = (i as u32 % W, i as u32 / W);
+                (x0..x0 + 400).contains(&x) && (y0..y0 + 300).contains(&y)
+            }
+        };
+        let mut mem = blob_reader(&[(0.0, 0.0), shift]);
+        for (frame, (x0, y0)) in mem.frames.iter_mut().zip([(300, 200), (450, 110)]) {
+            let inside = keep(x0, y0);
+            for (i, v) in frame.iter_mut().enumerate() {
+                if !inside(i) {
+                    *v = 32768;
+                }
+            }
+        }
+        let depth = 3;
+
+        let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
+        let reference = PreparedReference::build(&ctx, 0, EccMode::Similarity, depth).unwrap();
+        let frame_pyramid = PyramidalEcc::build_pyramid(&ctx, 1, depth).unwrap();
+        let level = seed_level(W, H, depth).expect("a seed level");
+        let frame_features = detect_level(&ctx, 1, &frame_pyramid, level)
+            .unwrap()
+            .expect("features");
+        let reference_features = detect_level(&ctx, 0, &reference.pyramid, level)
+            .unwrap()
+            .expect("features");
+        let dims = (W.div_ceil(1 << level), H.div_ceil(1 << level));
+        let fit = fit_between(&reference_features, &frame_features, dims).expect("a fit");
+        assert!(
+            (2..6).contains(&fit.occupied_cells),
+            "the matches must cluster: {fit:?}"
+        );
+
+        let first = unseeded(&mem, EccMode::Similarity, depth, 1);
+        assert!(
+            matches!(first.status, AlignStatus::Diverged(_)),
+            "{first:?}"
+        );
+        let (_, attempt, escalation) = registered(&mem, EccMode::Similarity, depth, 1);
+        assert_eq!(
+            escalation,
+            Escalation {
+                attempted: true,
+                rerun: true,
+                accepted: true
+            },
+            "{fit:?}"
+        );
+        assert!(
+            !matches!(attempt.status, AlignStatus::Diverged(_)),
+            "{attempt:?}"
+        );
+        let (_, _, tx, ty) = attempt.transform.similarity_parts();
+        assert!(
+            (tx - shift.0).abs() < 0.05 && (ty - shift.1).abs() < 0.05,
+            "({tx}, {ty})"
+        );
+    }
+
+    #[test]
     fn a_quasi_periodic_scene_keeps_its_identity_start_outcome() {
         // The smooth sinusoid scene matches a half-turn of itself on a
         // fifth of the matches: not a seed.
@@ -2069,6 +2530,123 @@ mod tests {
                 first.residual
             )
         );
+    }
+
+    /// Frames of the reference stack solved from their own feature seed with
+    /// the default parameters must end within a pixel of the transform their
+    /// identity-start solve ends at.
+    #[test]
+    #[ignore = "reads the 16 GB reference stack"]
+    fn reference_stack_frames_solved_from_their_feature_seed_match_the_shipped_fit() {
+        let Some(dir) = std::env::var_os("FOCUSFORGE_REFERENCE_STACK")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+        else {
+            println!("FOCUSFORGE_REFERENCE_STACK does not name a directory; skipped");
+            return;
+        };
+        let paths: Vec<_> = crate::io::frame_paths(&dir)
+            .expect("the stack directory enumerates")
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("IMG_"))
+            })
+            .collect();
+        let stack = crate::io::TiffStack::open_files(&paths).expect("the stack opens");
+        let (width, height) = stack.dimensions();
+        let stack_ctx = StackContext::new(
+            stack.len(),
+            width,
+            height,
+            stack.header(0).samples_per_pixel,
+        );
+        let algo = crate::registry::find_align("pyramidal-ecc").expect("registered");
+        let resolved = crate::params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
+            .expect("the defaults resolve");
+        let cfg = crate::params::resolved_values(&resolved);
+        let reference_frame = (stack.len() - 1) / 2;
+        let ctx = AlignContext::new(stack_ctx, reference_frame, &stack);
+
+        let mode = PyramidalEcc::mode(&cfg).unwrap();
+        let depth = cfg
+            .get("pyramid-depth")
+            .and_then(ParamValue::as_i64)
+            .unwrap() as u32;
+        let params = EccParams {
+            max_iterations: cfg
+                .get("max-iterations")
+                .and_then(ParamValue::as_i64)
+                .unwrap() as u32,
+            epsilon_px: cfg.get("epsilon-px").and_then(ParamValue::as_f64).unwrap(),
+            min_valid_fraction: MIN_VALID_FRACTION,
+        };
+        let reference = PreparedReference::build(&ctx, reference_frame, mode, depth).unwrap();
+        let level = seed_level(width, height, depth).expect("a seed level");
+        let dims = (width.div_ceil(1 << level), height.div_ceil(1 << level));
+        let (w, h) = (f64::from(width), f64::from(height));
+        let spots = [[0.0, 0.0], [w, 0.0], [0.0, h], [w, h], [w / 2.0, h / 2.0]];
+        let moved = |a: &Transform, b: &Transform| {
+            spots
+                .iter()
+                .map(|p| {
+                    let at = |t: &Transform| {
+                        [
+                            t.m[0][0] * p[0] + t.m[0][1] * p[1] + t.m[0][2],
+                            t.m[1][0] * p[0] + t.m[1][1] * p[1] + t.m[1][2],
+                        ]
+                    };
+                    let (x, y) = (at(a), at(b));
+                    (x[0] - y[0]).hypot(x[1] - y[1])
+                })
+                .fold(0.0, f64::max)
+        };
+
+        for frame in [0usize, 15, 45, 60] {
+            let shipped = PyramidalEcc.align_frame(&ctx, frame, &cfg).unwrap();
+            let pyramid = PyramidalEcc::build_pyramid(&ctx, frame, depth).unwrap();
+            let mut escalation = Escalation::default();
+            let seed = PyramidalEcc::feature_seed(
+                &ctx,
+                frame,
+                &reference,
+                &pyramid,
+                depth,
+                &mut escalation,
+            )
+            .unwrap();
+            let fit = {
+                let r = reference.features.get().unwrap().as_ref().unwrap().as_ref();
+                let f = detect_level(&ctx, frame, &pyramid, level).unwrap();
+                r.zip(f.as_ref()).and_then(|(r, f)| fit_between(r, f, dims))
+            };
+            let Some(seed) = seed else {
+                panic!("frame {frame}: no accepted seed, fit={fit:?}");
+            };
+            let started = std::time::Instant::now();
+            let attempt = PyramidalEcc::solve_from(
+                &ctx, frame, &reference, &pyramid, depth, &params, seed, false,
+            )
+            .unwrap();
+            let off = moved(&attempt.transform, &shipped.transform);
+            println!(
+                "seeded frame={frame} level={level} fit={fit:?} shipped={:?} shipped_corr={:.4} \
+                 seeded={:?} seeded_corr={:.4} floor={MIN_FINAL_CORRELATION} iterations={} \
+                 moved_from_shipped_px={off:.3} secs={:.1}",
+                shipped.status,
+                shipped.residual,
+                attempt.status,
+                attempt.residual,
+                attempt.iterations,
+                started.elapsed().as_secs_f64(),
+            );
+            assert!(
+                !matches!(attempt.status, AlignStatus::Diverged(_)) && off < 1.0,
+                "frame {frame}: {:?}, {off} px from the shipped fit",
+                attempt.status
+            );
+        }
     }
 
     #[test]

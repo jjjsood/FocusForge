@@ -166,9 +166,11 @@ pub fn wait_for_settle(
     let start = Instant::now();
     loop {
         if let Some(planes) = controller.settle_job() {
+            settle_session(controller);
             return Some(planes);
         }
         if !controller.work_pending() {
+            settle_session(controller);
             return None;
         }
         assert!(
@@ -234,6 +236,27 @@ pub fn open_and_settle(controller: &mut AppController, paths: &[PathBuf]) -> Ope
     controller
         .settle_open()
         .expect("a load was started, so one outcome is parked")
+}
+
+/// Starts the active tab's save, blocks until its worker finishes and
+/// settles it -- `AppController::start_save_active_project` writes
+/// off-thread, so a test that needs the outcome synchronously waits for it
+/// here. A save that keeps a modified live as a checkpoint may start the
+/// row's background render; it is waited out too, so no render outlives the
+/// test. `true` when the save started and wrote.
+#[allow(dead_code)]
+pub fn save_and_settle(
+    controller: &mut AppController,
+    pick: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> bool {
+    let wrote = controller.start_save_active_project(pick) && {
+        controller.join_save();
+        controller.settle_save() == Some(true)
+    };
+    while !controller.settle_checkpoint_render() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wrote
 }
 
 /// Answers the pending grouping question, blocks until its worker finishes,
@@ -383,16 +406,79 @@ pub fn paint(controller: &mut AppController, op: Op) {
         .expect("a stroke inside the map applies");
 }
 
-/// `set_mode(Editor)`, waiting out the render an op-bearing row needs first.
+/// Polls `settle_checkpoint_render` until the checkpoint render has settled.
 #[allow(dead_code)]
-pub fn enter_editor(controller: &mut AppController) {
+pub fn settle_render(controller: &mut AppController) {
     let start = Instant::now();
-    while !controller.set_mode(ShellMode::Editor) {
+    while !controller.settle_checkpoint_render() {
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "the editor did not open"
+            "the checkpoint render did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Polls `settle_edit_session` until no editor session is being opened.
+#[allow(dead_code)]
+pub fn settle_session(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.settle_edit_session() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the editor session did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Polls `settle_recomposites` until no stroke, undo or redo is recompositing.
+#[allow(dead_code)]
+pub fn settle_recomposites(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.settle_recomposites() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the recomposites did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Polls `settle_thumbnails` until every picture decode has been applied.
+#[allow(dead_code)]
+pub fn settle_thumbnails(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.settle_thumbnails() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the thumbnail decodes did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `set_mode(Editor)`, then waits out the render an op-bearing row needs and
+/// the session's open.
+#[allow(dead_code)]
+pub fn enter_editor(controller: &mut AppController) {
+    assert!(
+        controller.set_mode(ShellMode::Editor),
+        "the editor did not open"
+    );
+    let start = Instant::now();
+    while controller.edit_session().is_none() {
+        assert_eq!(
+            controller.mode(),
+            ShellMode::Editor,
+            "the session failed to open"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the editor session did not open"
         );
         controller.settle_checkpoint_render();
+        controller.settle_edit_session();
         std::thread::sleep(Duration::from_millis(5));
     }
 }

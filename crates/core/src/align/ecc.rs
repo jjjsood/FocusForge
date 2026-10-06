@@ -175,6 +175,9 @@ pub enum DivergenceReason {
     /// The fit converged, but the same transform leaves a residual above the
     /// tolerance at most of the usable patches away from the solve region.
     ValidationFailed,
+    /// The fit finished, but its final correlation lies below the floor a
+    /// correct registration reaches: the best match found is a wrong optimum.
+    WeakMatch,
 }
 
 /// How a [`solve_level`] run ended.
@@ -1497,6 +1500,14 @@ mod tests {
         assert_eq!(json, "\"validation-failed\"");
         let back: DivergenceReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, DivergenceReason::ValidationFailed);
+    }
+
+    #[test]
+    fn weak_match_round_trips_as_kebab_case() {
+        let json = serde_json::to_string(&DivergenceReason::WeakMatch).unwrap();
+        assert_eq!(json, "\"weak-match\"");
+        let back: DivergenceReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, DivergenceReason::WeakMatch);
     }
 
     #[test]

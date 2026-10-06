@@ -63,12 +63,9 @@ pub use control::{ControlState, JobControl};
 pub use fingerprint::{FingerprintMismatch, FrameCount, FrameFingerprint, StackFingerprint};
 pub use ledger::{Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore, read_alignment};
 pub use progress::JobProgress;
-pub use record::{
-    ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JOB_RECORD_FORMAT, JobRecord,
-};
+pub use record::{ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JobRecord};
 pub use stage_cache::{
-    CachedAlignment, CachedStage, FrameKey, STAGE_CACHE_FORMAT, StageCache, StageCacheError,
-    StageKey,
+    CachedAlignment, CachedStage, FrameKey, StageCache, StageCacheError, StageKey,
 };
 
 use std::collections::HashSet;
@@ -77,8 +74,7 @@ use std::sync::Arc;
 use crate::tile::plan::PlannedTile;
 use crate::tile::{FramePreprocess, TileConsumer, TileError, TileScheduler};
 
-/// A job's current phase, reported as data. `#[non_exhaustive]` so a finer
-/// future breakdown of the fuse stage is additive rather than breaking.
+/// A job's current phase, reported as data.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStage {

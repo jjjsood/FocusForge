@@ -8,7 +8,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
@@ -447,10 +447,21 @@ fn two_sealed_tabs(name: &str) -> AppController {
 /// Calls `canvas_feed(loaded)`, panicking with the actual answer unless it
 /// is `Load`, and returns the composite path it carries -- what most of
 /// these tests use to confirm which tab's own planes just got loaded.
+/// A saved row answers `Clear` or `Keep` until its render settles, so the
+/// feed is repeated after each settle for up to a minute.
 fn load_path(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
-    match controller.canvas_feed(loaded) {
-        CanvasFeed::Load { composite, .. } => composite,
-        other => panic!("expected CanvasFeed::Load, got {other:?}"),
+    let start = Instant::now();
+    loop {
+        match controller.canvas_feed(loaded) {
+            CanvasFeed::Load { composite, .. } => return composite,
+            other if start.elapsed() > Duration::from_secs(60) => {
+                panic!("expected CanvasFeed::Load, got {other:?}")
+            }
+            _ => {
+                controller.settle_checkpoint_render();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 }
 
@@ -733,15 +744,139 @@ fn opening_a_saved_project_feeds_its_own_planes() {
         OpenOutcome::Opened(_)
     ));
     assert_eq!(controller.active_project(), Some(2));
-    match controller.canvas_feed(Some(1)) {
-        CanvasFeed::Load { tab, composite, .. } => {
-            assert_eq!(tab, 2);
-            assert!(composite.is_file());
-        }
-        other => {
-            panic!("opening a saved project mid-session must load its own planes, got {other:?}")
-        }
+    let composite = load_path(&mut controller, Some(1));
+    assert!(composite.is_file());
+    assert!(matches!(
+        controller.canvas_feed(Some(1)),
+        CanvasFeed::Load { tab: 2, .. }
+    ));
+}
+
+/// A fused and saved `.ffp` of `set`'s first `count` frames, written by a
+/// throwaway controller whose scratch root nobody else reads.
+fn sealed_project(name: &str, set: &str, count: usize) -> PathBuf {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_{set}_writer")));
+    open_fixture_tab(&mut controller, name, set, count);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120))
+        .expect("the fixture must fuse");
+    let mut target = None;
+    assert!(common::save_and_settle(&mut controller, |proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
+}
+
+fn head_of(ffp: &Path) -> String {
+    focusforge_core::project::Project::open(ffp)
+        .unwrap()
+        .checkpoint()
+        .id
+        .clone()
+}
+
+/// A controller over its own scratch root, with `ffps` opened in order.
+fn controller_over(scratch: &Path, ffps: &[&Path]) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.to_path_buf());
+    for ffp in ffps {
+        assert!(matches!(
+            common::open_and_settle(&mut controller, &[ffp.to_path_buf()]),
+            OpenOutcome::Opened(_)
+        ));
     }
+    controller
+}
+
+#[test]
+fn an_opened_project_feeds_its_planes_once_the_render_settles() {
+    let ffp = sealed_project("render_settles", "mantis-512", 3);
+    let scratch = common::tree("render_settles_scratch");
+    let mut controller = controller_over(&scratch, &[&ffp]);
+
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    assert!(controller.materialize_active_tab_planes().is_none());
+    common::settle_render(&mut controller);
+    let dir = job::checkpoint_plane_dir(&scratch, &ffp, &head_of(&ffp));
+    match controller.canvas_feed(None) {
+        CanvasFeed::Load {
+            composite, zmap, ..
+        } => {
+            assert!(composite.starts_with(&dir) && zmap.starts_with(&dir));
+            assert!(composite.is_file() && zmap.is_file());
+        }
+        other => panic!("the settled render must load, got {other:?}"),
+    }
+
+    let mut second = controller_over(&scratch, &[&ffp]);
+    assert!(matches!(
+        second.canvas_feed(None),
+        CanvasFeed::Load { tab: 0, .. }
+    ));
+    assert!(
+        !second.take_render_started(),
+        "a fresh cache needs no render"
+    );
+}
+
+#[test]
+fn a_saved_rows_planes_never_feed_a_tab_switched_to_meanwhile() {
+    let small = sealed_project("switched_meanwhile", "mantis-64", 3);
+    let large = sealed_project("switched_meanwhile", "mantis-512", 3);
+    let scratch = common::tree("switched_meanwhile_scratch");
+    let mut controller = controller_over(&scratch, &[&small, &large]);
+
+    controller.select_project(0);
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    controller.select_project(1);
+    assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
+    assert!(!controller.take_render_started(), "the one slot is busy");
+
+    common::settle_render(&mut controller);
+    assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    common::settle_render(&mut controller);
+    match controller.canvas_feed(Some(0)) {
+        CanvasFeed::Load { tab, composite, .. } => {
+            assert_eq!(tab, 1);
+            let dir = job::checkpoint_plane_dir(&scratch, &large, &head_of(&large));
+            assert!(composite.starts_with(dir));
+        }
+        other => panic!("the active tab's own render must load, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_refused_saved_row_is_not_rendered_again() {
+    let ffp = sealed_project("refused_row", "mantis-64", 3);
+    let scratch = common::tree("refused_row_scratch");
+    let blocked = job::checkpoint_plane_dir(&scratch, &ffp, &head_of(&ffp));
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    fs::write(&blocked, b"not a directory").unwrap();
+    let mut controller = controller_over(&scratch, &[&ffp]);
+
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started());
+    common::settle_render(&mut controller);
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(!controller.composite_message_lines().is_empty());
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(!controller.take_render_started(), "a refusal is final");
+
+    let row = controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.is_some())
+        .expect("the project lists its checkpoint");
+    controller.select_checkpoint_row(row);
+    assert!(matches!(controller.canvas_feed(None), CanvasFeed::Clear));
+    assert!(controller.take_render_started(), "re-selecting tries again");
+    common::settle_render(&mut controller);
 }
 
 /// Both panes draw at the sealed composite's own extent once a tab holds
@@ -1941,6 +2076,7 @@ mod preparing {
             index_scale: 0,
             indices: None,
             state: Default::default(),
+            backdrop: false,
         }
     }
 
@@ -2102,9 +2238,9 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
     assert!(tiles.take_recomposited().is_empty(), "the log drains");
 
     // Every index differs from the sealed one, so the overlay shows each
-    // texel's resident pixel wherever a tile exists: the gather inside the
-    // region, the zeroed allocation elsewhere in the four tiles, and the
-    // sealed sentinel outside them.
+    // texel's resident pixel wherever one was installed: the gather inside
+    // the region, and the sealed sentinel everywhere else, including the
+    // rest of the four tiles the region met.
     const SENTINEL: u16 = 7777;
     let mut samples = vec![SENTINEL; (MAP * MAP * 3) as usize];
     overlay_edited(
@@ -2116,24 +2252,123 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
         3,
         &tiles,
     );
-    let four_tiles = Rect {
-        x: 0,
-        y: 13,
-        width: 26,
-        height: 26,
-    };
     for y in 0..MAP {
         for x in 0..MAP {
             let i = ((y * MAP + x) * 3) as usize;
             let expected: &[u16] = if contains(region, x, y) {
                 &planes[1][i..i + 3]
-            } else if contains(four_tiles, x, y) {
-                &[0, 0, 0]
             } else {
                 &[SENTINEL; 3]
             };
             assert_eq!(&samples[i..i + 3], expected, "({x}, {y})");
         }
+    }
+}
+
+#[test]
+fn a_pending_region_never_shows_unfilled_tile_samples() {
+    let stack = mantis64_stack();
+    let planes = frame_planes(&stack);
+    // A 13 px grid: `first` spans tiles (0..=1, 1..=2); `pending` reaches
+    // untouched texels of tiles (1, 1) and (1, 2) and the fresh tiles (2, 1)
+    // and (2, 2).
+    let mut tiles = ResidentTiles::new(13, MAP, MAP, 3);
+    let sealed = vec![0u16; (MAP * MAP) as usize];
+    let first = Rect {
+        x: 10,
+        y: 20,
+        width: 10,
+        height: 10,
+    };
+    let pending = Rect {
+        x: 18,
+        y: 24,
+        width: 14,
+        height: 10,
+    };
+    let mut edited = sealed.clone();
+    for y in first.y..first.y + first.height {
+        for x in first.x..first.x + first.width {
+            edited[(y * MAP + x) as usize] = 1;
+        }
+    }
+    tiles.recomposite(first, &edited, &sources(&stack)).unwrap();
+    for y in pending.y..pending.y + pending.height {
+        for x in pending.x..pending.x + pending.width {
+            edited[(y * MAP + x) as usize] = 2;
+        }
+    }
+    let generation = tiles.generation();
+    tiles.touch();
+    assert_eq!(
+        tiles.generation(),
+        generation + 1,
+        "touch is the renderer's cue"
+    );
+
+    const SENTINEL: u16 = 7777;
+    let shown = |step: u32, tiles: &ResidentTiles| {
+        let step = NonZeroU32::new(step).unwrap();
+        let out_w = MAP.div_ceil(step.get());
+        let texels = (out_w * out_w) as usize;
+        let mut sealed_step = vec![0u16; texels];
+        let mut edited_step = vec![0u16; texels];
+        step_copy(&sealed, MAP, whole_map(), step, &mut sealed_step);
+        step_copy(&edited, MAP, whole_map(), step, &mut edited_step);
+        let mut samples = vec![SENTINEL; texels * 3];
+        overlay_edited(
+            &mut samples,
+            &sealed_step,
+            &edited_step,
+            whole_map(),
+            step,
+            3,
+            tiles,
+        );
+        (step.get(), out_w, samples)
+    };
+    let check = |step: u32, tiles: &ResidentTiles, expected: &dyn Fn(u32, u32) -> Vec<u16>| {
+        let (step, out_w, samples) = shown(step, tiles);
+        for ty in 0..out_w {
+            for tx in 0..out_w {
+                let (x, y) = (tx * step, ty * step);
+                let t = ((ty * out_w + tx) * 3) as usize;
+                assert_eq!(
+                    &samples[t..t + 3],
+                    &expected(x, y)[..],
+                    "step {step} ({x}, {y})"
+                );
+            }
+        }
+    };
+    let plane_pixel = |frame: usize, x: u32, y: u32| {
+        let i = ((y * MAP + x) * 3) as usize;
+        planes[frame][i..i + 3].to_vec()
+    };
+
+    let before = |x: u32, y: u32| {
+        if contains(first, x, y) {
+            plane_pixel(1, x, y)
+        } else {
+            vec![SENTINEL; 3]
+        }
+    };
+    for step in [1, 2] {
+        check(step, &tiles, &before);
+    }
+
+    tiles
+        .recomposite(pending, &edited, &sources(&stack))
+        .unwrap();
+    let after = |x: u32, y: u32| {
+        if contains(pending, x, y) {
+            plane_pixel(2, x, y)
+        } else {
+            before(x, y)
+        }
+    };
+    for step in [1, 2] {
+        check(step, &tiles, &after);
     }
 }
 
@@ -2412,6 +2647,7 @@ fn prepared_samples_match_a_direct_read() {
                     index_scale,
                     indices: None,
                     state: Default::default(),
+                    backdrop: false,
                 }]);
                 let done = take_stamp(&preparer, stamp);
                 assert_eq!(
@@ -2605,6 +2841,648 @@ fn stale_results_render_nothing() {
     renderer.detach_device();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     refused(&mut renderer, &before_device, "detach and attach");
+}
+
+// ---------------------------------------------------------------------
+// The backdrop: the whole image at a coarse step beneath a pane's exact view.
+// ---------------------------------------------------------------------
+
+/// The samples a worker would read for `job`.
+fn job_samples(job: &focusforge_gui::canvas::PaneJob) -> Vec<u16> {
+    let (width, height) = job.draw.extent();
+    let mut samples =
+        vec![0u16; width as usize * height as usize * job.reader.samples_per_pixel() as usize];
+    let (x, y, w, h) = job.draw.src;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    job.reader
+        .read_step_into(rect, job.draw.step, &mut samples)
+        .expect("the fixture reads");
+    samples
+}
+
+fn backdrop_of(width: u32, height: u32, pane: f32) -> focusforge_gui::viewport::PaneDraw {
+    focusforge_gui::viewport::backdrop_draw(
+        focusforge_gui::viewport::ImageSize { width, height },
+        PaneRect {
+            x: 0.0,
+            y: 0.0,
+            width: pane,
+            height: pane,
+        },
+    )
+    .expect("a non-empty image and pane draw a backdrop")
+}
+
+/// The backdrop queue keeps one job per pane: a later submit for another
+/// pane leaves a pending job alone, and one for the same pane replaces it.
+/// Per pane and per content change the renderer issues one job: not again
+/// while it is in flight or published, and not for any burst of pan or zoom
+/// reads.
+#[test]
+fn backdrop_is_read_once_per_content_change() {
+    use focusforge_gui::canvas::{OverlayDraw, Pane, PaneSource, Preparer};
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use preparing::*;
+
+    // Worker queue, no device needed.
+    let (reader, release) = FakeReader::new(1);
+    let preparer = Preparer::new(|| {});
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the blocking read to start", || reader.reads() == 1);
+    let backdrop = |pane: Pane, stamp: u64| {
+        let mut queued = job(&reader, 8 + stamp as u32, stamp);
+        queued.pane = pane;
+        queued.backdrop = true;
+        queued
+    };
+    preparer.submit_backdrop(vec![backdrop(Pane::Frame, 10)]);
+    preparer.submit_backdrop(vec![backdrop(Pane::Frame, 11)]);
+    preparer.submit_backdrop(vec![backdrop(Pane::Composite, 12)]);
+    for _ in 0..3 {
+        release.send(()).unwrap();
+    }
+    let mut stamps = Vec::new();
+    wait_for("both panes' backdrops", || {
+        if let Some(done) = preparer.take() {
+            stamps.extend(done.iter().map(|p| (p.job.stamp, p.job.backdrop)));
+            preparer.recycle(done);
+        }
+        stamps.iter().filter(|(_, backdrop)| *backdrop).count() == 2
+    });
+    stamps.sort();
+    assert_eq!(
+        stamps.into_iter().filter(|(_, b)| *b).collect::<Vec<_>>(),
+        [(11, true), (12, true)],
+        "the newer frame job replaced the older; the composite job kept the frame's"
+    );
+    assert_eq!(reader.reads(), 3, "the blocker plus one read per pane");
+
+    // Renderer job issue.
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    let frame_back = backdrop_of(64, 64, 32.0);
+    let plane_back = backdrop_of(512, 512, 128.0);
+    let view = |x: u32| focusforge_gui::viewport::PaneDraw {
+        src: (x, 5, 37, 23),
+        dst: (0.0, 0.0, 37.0, 23.0),
+        crop: (0.0, 0.0, 37.0, 23.0),
+        pixelated: false,
+        step: NonZeroU32::new(2).unwrap(),
+    };
+
+    let first = renderer
+        .request_frame_backdrop(&frame_back)
+        .expect("the first frame backdrop job");
+    assert!(
+        renderer.request_frame_backdrop(&frame_back).is_none(),
+        "no second job while one is in flight"
+    );
+    assert!(renderer.publish(&first, &job_samples(&first)).is_some());
+    for x in 0..20 {
+        assert!(renderer.request_frame(&view(x)).is_some(), "exact view {x}");
+        assert!(
+            renderer.request_frame_backdrop(&frame_back).is_none(),
+            "a pan or zoom repaint issues no frame backdrop job"
+        );
+    }
+
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    let switched = renderer
+        .request_frame_backdrop(&frame_back)
+        .expect("a frame switch issues one job");
+    assert!(renderer.request_frame_backdrop(&frame_back).is_none());
+    assert!(
+        renderer
+            .publish(&switched, &job_samples(&switched))
+            .is_some()
+    );
+    assert!(renderer.request_frame_backdrop(&frame_back).is_none());
+
+    let plane = |renderer: &mut CanvasRenderer,
+                 generation: Option<u64>,
+                 overlay: Option<&OverlayDraw>,
+                 label: &str| {
+        let issued = renderer
+            .request_plane_backdrop(&plane_back, generation, overlay)
+            .unwrap_or_else(|| panic!("{label}: one new composite backdrop job"));
+        assert!(
+            renderer
+                .request_plane_backdrop(&plane_back, generation, overlay)
+                .is_none(),
+            "{label}: not again while in flight"
+        );
+        assert!(
+            renderer.publish(&issued, &job_samples(&issued)).is_some(),
+            "{label}: the job publishes"
+        );
+        assert!(
+            renderer
+                .request_plane_backdrop(&plane_back, generation, overlay)
+                .is_none(),
+            "{label}: not again once published"
+        );
+    };
+    plane(&mut renderer, None, None, "first");
+    for x in 0..20 {
+        assert!(
+            renderer.request_planes(&view(x), None, None).is_some(),
+            "exact plane view {x}"
+        );
+        assert!(
+            renderer
+                .request_plane_backdrop(&plane_back, None, None)
+                .is_none(),
+            "a pan or zoom repaint issues no composite backdrop job"
+        );
+    }
+    plane(&mut renderer, Some(1), None, "an edit generation");
+    plane(&mut renderer, Some(2), None, "the next edit generation");
+    let overlay = OverlayDraw::for_opacity(8, 0.5);
+    plane(&mut renderer, Some(2), Some(&overlay), "an overlay toggle");
+
+    renderer.select_plane(PaneSource::ZMap);
+    let selected = renderer
+        .request_plane_backdrop(&plane_back, None, None)
+        .expect("a plane selection issues one job for the Z-Map");
+    assert_eq!(selected.pane, Pane::ZMap);
+    assert!(
+        renderer
+            .request_plane_backdrop(&plane_back, None, None)
+            .is_none()
+    );
+}
+
+/// A backdrop job issued before a source, frame, plane, device or newer
+/// publish renders and uploads nothing, whichever of it and the exact
+/// results arrives first. Upload accounting is process-global, so this runs
+/// alone in a child.
+#[test]
+fn backdrop_from_a_previous_content_is_refused() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    const CHILD: &str = "FOCUSFORGE_GUI_STALE_BACKDROP_ACCOUNTING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args([
+            "--exact",
+            "backdrop_from_a_previous_content_is_refused",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated accounting test starts");
+        assert!(
+            status.success(),
+            "the isolated accounting test passes: {status}"
+        );
+        return;
+    }
+
+    enable_trace_accounting();
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    let frame_back = backdrop_of(64, 64, 32.0);
+    let plane_back = backdrop_of(512, 512, 128.0);
+    let exact = focusforge_gui::viewport::PaneDraw {
+        src: (4, 5, 37, 23),
+        dst: (0.0, 0.0, 37.0, 23.0),
+        crop: (0.0, 0.0, 37.0, 23.0),
+        pixelated: false,
+        step: NonZeroU32::new(2).unwrap(),
+    };
+    let uploaded = || {
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .upload_bytes
+    };
+    let refused = |renderer: &mut CanvasRenderer, job: &PaneJob, label: &str| {
+        let before = uploaded();
+        assert!(
+            renderer.publish(job, &job_samples(job)).is_none(),
+            "{label}: the stale backdrop is refused"
+        );
+        assert_eq!(uploaded(), before, "{label}: nothing is uploaded");
+    };
+    let accepted = |renderer: &mut CanvasRenderer, job: &PaneJob, label: &str| {
+        let before = uploaded();
+        assert!(
+            renderer.publish(job, &job_samples(job)).is_some(),
+            "{label}: the fresh backdrop is accepted"
+        );
+        assert!(uploaded() > before, "{label}: the accepted job uploads");
+    };
+
+    // Every reset, each with an exact result landing before or after.
+    for exact_first in [false, true] {
+        let order = if exact_first {
+            "exact first"
+        } else {
+            "exact last"
+        };
+        let old = renderer.request_frame_backdrop(&frame_back).expect("job");
+        renderer
+            .set_frame(&frame_path, None, job::host_budget())
+            .unwrap();
+        let fresh_exact = renderer.request_frame(&exact).expect("exact job");
+        if exact_first {
+            accepted(&mut renderer, &fresh_exact, "the exact result");
+        }
+        refused(&mut renderer, &old, &format!("set_frame, {order}"));
+        if !exact_first {
+            accepted(&mut renderer, &fresh_exact, "the exact result");
+        }
+    }
+    let old = renderer.request_frame_backdrop(&frame_back).expect("job");
+    renderer.clear_frame();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    refused(&mut renderer, &old, "clear_frame");
+
+    let old = renderer
+        .request_plane_backdrop(&plane_back, None, None)
+        .expect("job");
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    refused(&mut renderer, &old, "set_planes");
+    let old = renderer
+        .request_plane_backdrop(&plane_back, None, None)
+        .expect("job");
+    renderer.clear_planes();
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    refused(&mut renderer, &old, "clear_planes");
+    let old = renderer
+        .request_plane_backdrop(&plane_back, None, None)
+        .expect("job");
+    renderer.select_plane(PaneSource::ZMap);
+    refused(&mut renderer, &old, "select_plane");
+    let zmap_job = renderer
+        .request_plane_backdrop(&plane_back, None, None)
+        .expect("Z-Map job");
+    accepted(&mut renderer, &zmap_job, "the Z-Map after the selection");
+
+    let old = renderer
+        .request_plane_backdrop(&plane_back, Some(1), None)
+        .expect("job");
+    renderer.detach_device();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    refused(&mut renderer, &old, "detach and attach");
+
+    // An older backdrop job behind a newer published one.
+    let older = renderer.request_frame_backdrop(&frame_back).expect("job");
+    let newer = renderer
+        .request_frame_backdrop(&backdrop_of(64, 64, 16.0))
+        .expect("job");
+    accepted(&mut renderer, &newer, "the newer backdrop");
+    refused(&mut renderer, &older, "behind a newer backdrop");
+}
+
+/// Without a device no backdrop is requested or shown; losing the device
+/// drops the published one and a late job; attaching one asks again.
+#[test]
+fn backdrop_follows_device_detach_and_attach() {
+    use focusforge_gui::canvas::Pane;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame_path = common::fixture_frame("mantis-64", 0);
+    let frame_back = backdrop_of(64, 64, 32.0);
+    let plane_back = backdrop_of(512, 512, 128.0);
+
+    let mut renderer = CanvasRenderer::new();
+    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_frame(&frame_path, None, job::host_budget())
+        .unwrap();
+    assert!(renderer.request_frame_backdrop(&frame_back).is_none());
+    assert!(
+        renderer
+            .request_plane_backdrop(&plane_back, None, None)
+            .is_none()
+    );
+    assert!(
+        renderer
+            .backdrop_placement(Pane::Frame, &frame_back)
+            .is_none()
+    );
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    let first = renderer.request_frame_backdrop(&frame_back).expect("job");
+    assert!(renderer.publish(&first, &job_samples(&first)).is_some());
+    assert!(
+        renderer
+            .backdrop_placement(Pane::Frame, &frame_back)
+            .is_some()
+    );
+    let plane = renderer
+        .request_plane_backdrop(&plane_back, None, None)
+        .expect("job");
+    assert!(renderer.publish(&plane, &job_samples(&plane)).is_some());
+    assert!(
+        renderer
+            .backdrop_placement(Pane::Composite, &plane_back)
+            .is_some()
+    );
+
+    let late = renderer
+        .request_frame_backdrop(&backdrop_of(64, 64, 16.0))
+        .expect("job");
+    renderer.detach_device();
+    assert!(
+        renderer
+            .backdrop_placement(Pane::Frame, &frame_back)
+            .is_none(),
+        "the frame backdrop is gone with the device"
+    );
+    assert!(
+        renderer
+            .backdrop_placement(Pane::Composite, &plane_back)
+            .is_none(),
+        "the composite backdrop is gone with the device"
+    );
+    assert!(renderer.request_frame_backdrop(&frame_back).is_none());
+    assert!(renderer.publish(&late, &job_samples(&late)).is_none());
+
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    assert!(
+        renderer
+            .backdrop_placement(Pane::Frame, &frame_back)
+            .is_none(),
+        "an attached device starts with no backdrop"
+    );
+    let again = renderer
+        .request_frame_backdrop(&frame_back)
+        .expect("the backdrop is requested again");
+    assert!(renderer.publish(&again, &job_samples(&again)).is_some());
+    assert!(
+        renderer
+            .request_plane_backdrop(&plane_back, None, None)
+            .is_some(),
+        "the composite backdrop is requested again"
+    );
+}
+
+/// The backdrop reads the same samples a direct stepped read of its source
+/// does, at the step `backdrop_draw` chose.
+#[test]
+fn backdrop_samples_match_a_direct_read() {
+    use focusforge_core::zmap::ZMapReader;
+    use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
+    use preparing::take_stamp;
+    use std::sync::Arc;
+
+    let (composite_path, zmap_path) = golden_plane_files();
+    let frame = Arc::new(
+        TiffStack::open_files(&[common::fixture_frame("mantis-64", 0)]).expect("frame opens"),
+    );
+    let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
+    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
+
+    let (width, height) = (1u32, 40u32);
+    let column: Vec<u16> = (0..height).map(|i| (i * 311 % 1009) as u16).collect();
+    let column_path = common::tree("backdrop_one_pixel_wide").join("column.tif");
+    let mut writer = TiffWriter::create(
+        &column_path,
+        TiffSpec {
+            width,
+            height,
+            samples_per_pixel: 1,
+            description: None,
+        },
+    )
+    .unwrap();
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            &column,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    let thin = Arc::new(TiffStack::open_files(&[column_path]).expect("column opens"));
+
+    let preparer = Preparer::new(|| {});
+    let mut stamp = 0;
+    let mut check = |label: &str,
+                     pane: Pane,
+                     reader: Arc<dyn PaneReader>,
+                     size: (u32, u32),
+                     index_scale: u32,
+                     direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
+        // An image smaller than the pane, then panes it needs coarser reads for.
+        for pane_side in [4.0 * size.0.max(size.1) as f32, 16.0, 7.0, 3.0] {
+            let draw = focusforge_gui::viewport::backdrop_draw(
+                focusforge_gui::viewport::ImageSize {
+                    width: size.0,
+                    height: size.1,
+                },
+                PaneRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: pane_side,
+                    height: pane_side,
+                },
+            )
+            .expect("a backdrop draw");
+            let (tex_w, tex_h) = draw.extent();
+            let mut expected =
+                vec![0u16; tex_w as usize * tex_h as usize * reader.samples_per_pixel() as usize];
+            let (x, y, w, h) = draw.src;
+            direct(
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+                draw.step,
+                &mut expected,
+            );
+            stamp += 1;
+            preparer.submit_backdrop(vec![PaneJob {
+                pane,
+                draw,
+                stamp,
+                reader: reader.clone(),
+                index_scale,
+                indices: None,
+                state: Default::default(),
+                backdrop: true,
+            }]);
+            let done = take_stamp(&preparer, stamp);
+            let got = done
+                .iter()
+                .find(|p| p.job.stamp == stamp)
+                .expect("the backdrop completes");
+            assert_eq!(
+                got.samples, expected,
+                "{label} in a pane of {pane_side}: step {} extent {tex_w}x{tex_h}",
+                draw.step
+            );
+            preparer.recycle(done);
+        }
+    };
+
+    check(
+        "mantis-64 frame",
+        Pane::Frame,
+        frame.clone(),
+        frame.dimensions(),
+        0,
+        &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+    let size = composite.dimensions();
+    check(
+        "mantis-512 composite",
+        Pane::Composite,
+        composite.clone(),
+        size,
+        0,
+        &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+    check(
+        "mantis-512 Z-Map",
+        Pane::ZMap,
+        zmap.clone(),
+        size,
+        1,
+        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
+    );
+    check(
+        "one-pixel-wide image",
+        Pane::Frame,
+        thin.clone(),
+        (width, height),
+        0,
+        &|rect, step, out| thin.read_tile_step_into(0, rect, step, out).unwrap(),
+    );
+}
+
+/// With a request of each kind pending, the worker reads the exact one
+/// first, and a newer exact request submitted over a pending backdrop still
+/// runs before it; neither result replaces the other.
+#[test]
+fn preparer_serves_exact_before_backdrop() {
+    use focusforge_gui::canvas::Preparer;
+    use preparing::*;
+
+    let widths_read = |reader: &FakeReader| -> Vec<u32> {
+        reader
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|served| served.rect.width)
+            .collect()
+    };
+    for newer_exact in [false, true] {
+        let (reader, release) = FakeReader::new(1);
+        let preparer = Preparer::new(|| {});
+        preparer.submit(vec![job(&reader, 1, 1)]);
+        wait_for("the blocking read to start", || reader.reads() == 1);
+
+        let mut fill = job(&reader, 22, 2);
+        fill.backdrop = true;
+        preparer.submit_backdrop(vec![fill]);
+        preparer.submit(vec![job(&reader, 33, 3)]);
+        let last_exact = if newer_exact {
+            preparer.submit(vec![job(&reader, 44, 4)]);
+            4
+        } else {
+            3
+        };
+        for _ in 0..3 {
+            release.send(()).unwrap();
+        }
+        wait_for("the last read", || reader.finished() == 3);
+        let order = widths_read(&reader);
+        assert_eq!(
+            order,
+            [1, 11 * last_exact as u32, 22],
+            "the exact read runs before the pending backdrop (newer exact: {newer_exact})"
+        );
+        let mut done = Vec::new();
+        wait_for("both results", || {
+            if let Some(batch) = preparer.take() {
+                done.extend(batch.iter().map(|p| (p.job.stamp, p.job.backdrop)));
+                preparer.recycle(batch);
+            }
+            done.iter().any(|(_, backdrop)| *backdrop) && done.iter().any(|(_, b)| !*b)
+        });
+        done.retain(|(stamp, _)| *stamp != 1);
+        assert_eq!(
+            done,
+            [(last_exact, false), (2, true)],
+            "exact result first, the backdrop result beside it"
+        );
+    }
+}
+
+/// Exact reads are idle only once nothing is queued, none is running and the
+/// result has been taken; a backdrop read does not count.
+#[test]
+fn preparer_is_exact_idle_only_once_the_exact_read_is_taken() {
+    use focusforge_gui::canvas::Preparer;
+    use preparing::*;
+
+    let (reader, release) = FakeReader::new(1);
+    let preparer = Preparer::new(|| {});
+    assert!(preparer.exact_idle(), "a fresh preparer has no exact work");
+
+    preparer.submit(vec![job(&reader, 1, 1)]);
+    wait_for("the exact read to start", || reader.reads() == 1);
+    assert!(!preparer.exact_idle(), "an exact read is running");
+
+    release.send(()).unwrap();
+    wait_for("the exact read to finish", || reader.finished() == 1);
+    assert!(!preparer.exact_idle(), "the result is not taken yet");
+
+    take_stamp(&preparer, 1);
+    assert!(preparer.exact_idle(), "taken: nothing exact is left");
+
+    let (reader, release) = FakeReader::new(1);
+    let preparer = Preparer::new(|| {});
+    let mut fill = job(&reader, 22, 2);
+    fill.backdrop = true;
+    preparer.submit_backdrop(vec![fill]);
+    wait_for("the backdrop read to start", || reader.reads() == 1);
+    assert!(preparer.exact_idle(), "a backdrop read never holds the cap");
+    release.send(()).unwrap();
 }
 
 #[test]

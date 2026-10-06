@@ -67,7 +67,7 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
 /// and returns that path.
 fn save_to_proposed(controller: &mut AppController) -> PathBuf {
     let mut target = None;
-    assert!(controller.save_active_project(|proposed| {
+    assert!(common::save_and_settle(controller, |proposed| {
         target = Some(proposed.to_path_buf());
         target.clone()
     }));

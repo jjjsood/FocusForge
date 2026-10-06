@@ -23,7 +23,7 @@ use focusforge_core::equalize::GainReader;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
 use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::timing::{TimingCounter, record_timing};
+use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
 
 use crate::viewport::PaneDraw;
@@ -425,6 +425,9 @@ pub struct PaneJob {
     pub indices: Option<Arc<dyn PaneReader>>,
     /// The edit generation and overlay this job's result is drawn under.
     pub state: EditState,
+    /// Whether this is the low-detail whole-image read behind the pane's
+    /// exact texture rather than the exact view.
+    pub backdrop: bool,
 }
 
 /// What besides `src`/`step` a pane's content depends on: the edit session's
@@ -508,7 +511,14 @@ const POOLED_BUFFERS: usize = 6;
 #[derive(Default)]
 struct PreparerState {
     pending: Option<Vec<PaneJob>>,
+    /// Backdrop reads, served only while `pending` is empty.
+    pending_backdrop: Vec<PaneJob>,
+    /// An exact read is running: set when the worker takes `pending`, cleared
+    /// under the lock that stores its result.
+    reading_exact: bool,
     done: Option<Vec<Prepared>>,
+    /// Finished backdrop reads, one per pane at most; never replaces `done`.
+    done_backdrop: Vec<Prepared>,
     pool: Vec<Vec<u16>>,
     shutdown: bool,
     spawned: bool,
@@ -561,6 +571,24 @@ impl Preparer {
     pub fn submit(&self, jobs: Vec<PaneJob>) {
         let mut state = self.shared.lock();
         state.pending = Some(jobs);
+        self.start_worker(&mut state);
+    }
+
+    /// Queues low-priority backdrop reads: the worker takes them only while
+    /// no exact request is pending. A job replaces a pending one for the
+    /// same pane and leaves the other panes' alone; never blocks on a read.
+    pub fn submit_backdrop(&self, jobs: Vec<PaneJob>) {
+        let mut state = self.shared.lock();
+        for job in jobs {
+            state
+                .pending_backdrop
+                .retain(|queued| queued.pane != job.pane);
+            state.pending_backdrop.push(job);
+        }
+        self.start_worker(&mut state);
+    }
+
+    fn start_worker(&self, state: &mut PreparerState) {
         if !state.spawned {
             state.spawned = true;
             let shared = self.shared.clone();
@@ -573,9 +601,20 @@ impl Preparer {
         self.shared.wakeup.notify_one();
     }
 
-    /// The newest completed request, if one landed since the last call.
+    /// The newest completed exact request, then any completed backdrop
+    /// reads, if some landed since the last call.
     pub fn take(&self) -> Option<Vec<Prepared>> {
-        self.shared.lock().done.take()
+        let mut state = self.shared.lock();
+        let mut done = state.done.take().unwrap_or_default();
+        done.append(&mut state.done_backdrop);
+        (!done.is_empty()).then_some(done)
+    }
+
+    /// Whether no exact work is left: nothing queued, no exact read running
+    /// and its result taken. Backdrop reads are ignored.
+    pub fn exact_idle(&self) -> bool {
+        let state = self.shared.lock();
+        state.pending.is_none() && !state.reading_exact && state.done.is_none()
     }
 
     /// Hands consumed buffers back for the next request to read into.
@@ -599,14 +638,18 @@ impl Drop for Preparer {
 
 fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
     loop {
-        let (jobs, mut buffers) = {
+        let (jobs, backdrop, mut buffers) = {
             let mut state = shared.lock();
-            let jobs = loop {
+            let (jobs, backdrop) = loop {
                 if state.shutdown {
                     return;
                 }
                 if let Some(jobs) = state.pending.take() {
-                    break jobs;
+                    state.reading_exact = true;
+                    break (jobs, false);
+                }
+                if !state.pending_backdrop.is_empty() {
+                    break (std::mem::take(&mut state.pending_backdrop), true);
                 }
                 state = shared
                     .wakeup
@@ -619,7 +662,7 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                 .sum();
             let keep = state.pool.len().saturating_sub(wanted);
             let buffers = state.pool.split_off(keep);
-            (jobs, buffers)
+            (jobs, backdrop, buffers)
         };
         let prepared: Vec<Prepared> = jobs
             .into_iter()
@@ -630,29 +673,40 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                 } else {
                     Vec::new()
                 };
+                let _scope = backdrop.then(|| measurement_scope("gui_canvas_backdrop_read"));
                 read_job(job, samples, indices)
             })
             .collect();
 
         let mut state = shared.lock();
+        if !backdrop {
+            state.reading_exact = false;
+        }
         if state.shutdown {
             return;
         }
         if prepared.is_empty() {
             continue;
         }
-        let was_empty = match state.done.replace(prepared) {
-            Some(replaced) => {
-                for stale in replaced {
-                    state.pool_buffer(stale.samples);
-                    if stale.indices.capacity() > 0 {
-                        state.pool_buffer(stale.indices);
-                    }
+        let was_empty = state.done.is_none() && state.done_backdrop.is_empty();
+        let mut stale = Vec::new();
+        if backdrop {
+            for fresh in prepared {
+                let parked = &mut state.done_backdrop;
+                if let Some(at) = parked.iter().position(|p| p.job.pane == fresh.job.pane) {
+                    stale.push(parked.swap_remove(at));
                 }
-                false
+                parked.push(fresh);
             }
-            None => true,
-        };
+        } else {
+            stale.extend(state.done.replace(prepared).into_iter().flatten());
+        }
+        for spent in stale {
+            state.pool_buffer(spent.samples);
+            if spent.indices.capacity() > 0 {
+                state.pool_buffer(spent.indices);
+            }
+        }
         drop(state);
         if was_empty {
             wake();
@@ -683,7 +737,7 @@ fn rect_intersect(a: Rect, b: Rect) -> Option<Rect> {
 /// indices use.
 ///
 /// [`EditSession`]: focusforge_core::retouch::EditSession
-fn gather_rect(indices: &[u16], map_width: u32, rect: Rect) -> Vec<u16> {
+pub(crate) fn gather_rect(indices: &[u16], map_width: u32, rect: Rect) -> Vec<u16> {
     let mut out = Vec::with_capacity(rect.width as usize * rect.height as usize);
     for y in rect.y..rect.y + rect.height {
         let start = y as usize * map_width as usize + rect.x as usize;
@@ -692,10 +746,30 @@ fn gather_rect(indices: &[u16], map_width: u32, rect: Rect) -> Vec<u16> {
     out
 }
 
+/// The composite of `region` -- `region_indices` is the region's own rows of
+/// the edited map, as [`gather_rect`] copies them -- read through `sources`
+/// into one buffer, `samples_per_pixel` samples per texel, row-major.
+pub(crate) fn gather(
+    region: Rect,
+    region_indices: &[u16],
+    sources: &Sources,
+) -> Result<Vec<u16>, RetouchError> {
+    let texels = region.width as usize * region.height as usize;
+    let mut out = vec![0u16; texels * sources.samples_per_pixel as usize];
+    recomposite_region(region_indices, region, sources, &mut out)?;
+    Ok(out)
+}
+
+/// One resident tile: its samples, and which texels hold a gathered pixel.
+struct Tile {
+    samples: Vec<u16>,
+    filled: Vec<bool>,
+}
+
 /// A resident cache of recomposited pixels over a fixed grid of tiles,
 /// gathered only where a stroke has touched them -- a tile is allocated
-/// zeroed on first touch and never seeded from the sealed composite, so a
-/// pixel outside every touched tile carries no gathered sample at all
+/// empty on first install and never seeded from the sealed composite, so a
+/// texel no install has covered carries no gathered sample at all
 /// ([`overlay_edited`] falls back to the sealed pixel there). Memory is
 /// proportional to the edited area, never to the image.
 pub struct ResidentTiles {
@@ -703,9 +777,9 @@ pub struct ResidentTiles {
     width: u32,
     height: u32,
     samples_per_pixel: u32,
-    tiles: HashMap<(u32, u32), Vec<u16>>,
+    tiles: HashMap<(u32, u32), Tile>,
     generation: u64,
-    /// Every region recomposited since the last [`Self::take_recomposited`]
+    /// Every region installed since the last [`Self::take_recomposited`]
     /// -- a test's own window onto what actually redrew.
     recomposited: Vec<Rect>,
 }
@@ -724,39 +798,57 @@ impl ResidentTiles {
         }
     }
 
-    /// Bumped once per [`Self::recomposite`] call -- the renderer's own cue
-    /// that the resident cache changed since the last frame it drew.
+    /// Bumped once per [`Self::install`] and per [`Self::touch`] -- the
+    /// renderer's own cue that the resident cache or the edited indices over
+    /// it changed since the last frame it drew.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// Drains the log of every region recomposited since the last call.
+    /// Bumps [`Self::generation`] without changing a pixel: the edited
+    /// indices changed, so the overlay over these tiles must redraw.
+    pub fn touch(&mut self) {
+        self.generation += 1;
+    }
+
+    /// Drains the log of every region installed since the last call.
     pub fn take_recomposited(&mut self) -> Vec<Rect> {
         std::mem::take(&mut self.recomposited)
     }
 
-    /// The gathered pixel at `(x, y)`, if its tile has ever been touched --
-    /// `None` outside every touched tile.
+    /// The gathered pixel at `(x, y)`, if an install has covered it --
+    /// `None` outside every installed region.
     fn pixel_at(&self, x: u32, y: u32) -> Option<&[u16]> {
         let key = (x / self.tile_size, y / self.tile_size);
         let tile = self.tiles.get(&key)?;
         let local_x = (x % self.tile_size) as usize;
         let local_y = (y % self.tile_size) as usize;
+        let texel = local_y * self.tile_size as usize + local_x;
+        if !*tile.filled.get(texel)? {
+            return None;
+        }
         let spp = self.samples_per_pixel as usize;
-        let idx = (local_y * self.tile_size as usize + local_x) * spp;
-        tile.get(idx..idx + spp)
+        tile.samples.get(texel * spp..texel * spp + spp)
     }
 
-    /// Gathers `region`'s composite from the whole map's `indices` into
-    /// every grid tile it meets, allocating a tile zeroed on first touch.
-    /// Bumps [`Self::generation`] once and logs `region`, regardless of how
-    /// many tiles it spans.
+    /// Gathers `region`'s composite from the whole map's `indices` through
+    /// `sources` and installs it: `gather` then [`Self::install`].
     pub fn recomposite(
         &mut self,
         region: Rect,
         indices: &[u16],
         sources: &Sources,
     ) -> Result<(), RetouchError> {
+        let samples = gather(region, &gather_rect(indices, self.width, region), sources)?;
+        self.install(region, &samples);
+        Ok(())
+    }
+
+    /// Splices `samples` -- `region`'s gathered composite, row-major --
+    /// into every grid tile `region` meets, allocating a tile empty on first
+    /// touch and marking the texels filled. Bumps [`Self::generation`] once
+    /// and logs `region`, regardless of how many tiles it spans.
+    pub fn install(&mut self, region: Rect, samples: &[u16]) {
         let ts = self.tile_size;
         let spp = self.samples_per_pixel as usize;
         let x0 = region.x / ts;
@@ -774,32 +866,32 @@ impl ResidentTiles {
                 let Some(part) = rect_intersect(region, tile_rect) else {
                     continue;
                 };
-                let part_indices = gather_rect(indices, self.width, part);
-                let mut out = vec![0u16; part.width as usize * part.height as usize * spp];
-                recomposite_region(&part_indices, part, sources, &mut out)?;
-                let tile = self
-                    .tiles
-                    .entry((tx, ty))
-                    .or_insert_with(|| vec![0u16; ts as usize * ts as usize * spp]);
+                let tile = self.tiles.entry((tx, ty)).or_insert_with(|| Tile {
+                    samples: vec![0u16; ts as usize * ts as usize * spp],
+                    filled: vec![false; ts as usize * ts as usize],
+                });
                 let local_x0 = (part.x - tile_rect.x) as usize;
                 let local_y0 = (part.y - tile_rect.y) as usize;
+                let row_len = part.width as usize;
                 for row in 0..part.height as usize {
-                    let src = row * part.width as usize * spp;
-                    let dst = ((local_y0 + row) * ts as usize + local_x0) * spp;
-                    tile[dst..dst + part.width as usize * spp]
-                        .copy_from_slice(&out[src..src + part.width as usize * spp]);
+                    let src_row = (part.y - region.y) as usize + row;
+                    let src =
+                        (src_row * region.width as usize + (part.x - region.x) as usize) * spp;
+                    let texel = (local_y0 + row) * ts as usize + local_x0;
+                    tile.samples[texel * spp..(texel + row_len) * spp]
+                        .copy_from_slice(&samples[src..src + row_len * spp]);
+                    tile.filled[texel..texel + row_len].fill(true);
                 }
             }
         }
         self.generation += 1;
         self.recomposited.push(region);
-        Ok(())
     }
 }
 
 /// The renderer's view of an open edit session: the whole map's edited
 /// indices, the map's width (for indexing them), and the resident cache
-/// [`ResidentTiles::recomposite`] filled.
+/// [`ResidentTiles::install`] filled.
 #[derive(Clone, Copy)]
 pub struct EditedView<'a> {
     pub indices: &'a [u16],
@@ -871,7 +963,7 @@ pub fn step_copy(plane: &[u16], plane_width: u32, rect: Rect, step: NonZeroU32, 
 /// at `step`) with `tiles`' gathered pixel at every texel whose edited index
 /// (`edited_indices`, the same decimation) differs from its sealed index
 /// (`sealed_indices`) -- left as the sealed pixel everywhere else, including
-/// a texel whose tile was never touched.
+/// a texel no install has covered yet.
 pub fn overlay_edited(
     samples: &mut [u16],
     sealed_indices: &[u16],

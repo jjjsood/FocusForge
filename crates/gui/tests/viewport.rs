@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use focusforge_gui::AppController;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
-use focusforge_gui::viewport::{ImageSize, PaneRect, fit, fit_two, stops};
+use focusforge_gui::viewport::{ImageSize, PaneRect, backdrop_draw, fit, fit_two, stops};
 
 const NONE: Modifiers = Modifiers::NONE;
 
@@ -994,6 +994,65 @@ fn place_matches_dst_for_its_own_src() {
             );
             vp.zoom_steps(1, (p.width / 3.0, p.height / 3.0), img, p);
             vp.pan_by(13.0, -9.0, img, p);
+        }
+    }
+}
+
+/// The backdrop is the whole image placed through the live view: at every
+/// ladder stop and at each pan limit it covers the exact texture's rect and
+/// every pane pixel inside the image, and its texture never outgrows the pane.
+#[test]
+fn backdrop_covers_the_visible_image_at_every_stop() {
+    let cases = [
+        (image(8192, 5464), pane(566.0, 748.0)),
+        (image(300, 200), pane(566.0, 748.0)),
+        (image(1, 4000), pane(566.0, 748.0)),
+    ];
+    for (img, p) in cases {
+        let back = backdrop_draw(img, p).expect("a non-empty image and pane draw a backdrop");
+        assert_eq!(back.src, (0, 0, img.width, img.height), "the whole image");
+        let (ew, eh) = back.extent();
+        assert!(
+            ew as f32 <= p.width && eh as f32 <= p.height,
+            "{img:?} {p:?}: the backdrop texture {ew}x{eh} fits the pane"
+        );
+
+        let mut views = Vec::new();
+        let mut vp = fit(img, p);
+        for _ in stops(img, p) {
+            views.push((vp, "stop"));
+            for (dx, dy) in [(1.0e6, 0.0), (-1.0e6, 0.0), (0.0, 1.0e6), (0.0, -1.0e6)] {
+                let mut panned = vp;
+                panned.pan_by(dx, dy, img, p);
+                views.push((panned, "pan limit"));
+            }
+            vp.zoom_steps(1, (p.width / 3.0, p.height / 3.0), img, p);
+        }
+        for (vp, what) in views {
+            let draw = vp.draw(img, p).expect("a fitted viewport draws");
+            assert_eq!(draw.place(draw.src), draw.dst, "the exact placement holds");
+            let placed = draw.place(back.src);
+            let (ox, oy) = vp.origin();
+            let s = vp.scale();
+            close(
+                placed,
+                (
+                    (-ox * s) as f32,
+                    (-oy * s) as f32,
+                    (f64::from(img.width) * s) as f32,
+                    (f64::from(img.height) * s) as f32,
+                ),
+                &format!("{img:?} {what} at {}: the whole image's rect", vp.readout()),
+            );
+            let (x, y, w, h) = draw.dst;
+            let (bx, by, bw, bh) = placed;
+            let eps = 0.01;
+            assert!(
+                bx <= x + eps && by <= y + eps && bx + bw >= x + w - eps && by + bh >= y + h - eps,
+                "{img:?} {what} at {}: {placed:?} covers the exact rect {:?}",
+                vp.readout(),
+                draw.dst
+            );
         }
     }
 }

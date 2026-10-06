@@ -28,6 +28,10 @@ const CANCEL_REQUESTED: u8 = 2;
 /// [`JobControl::progress`].
 const NO_SEGMENT: u64 = u64::MAX;
 
+/// `admission_cap`'s "no cap" value, the one [`TileControl::admission_cap`]
+/// defaults to.
+const NO_CAP: usize = usize::MAX;
+
 /// The three states one job's control flag can be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlState {
@@ -74,6 +78,8 @@ pub struct JobControl {
     /// The frame count a computed align stage started with; `0` until
     /// [`Self::begin_align`] is called.
     align_total: AtomicUsize,
+    /// The live admission cap; [`NO_CAP`] when none is set.
+    admission_cap: AtomicUsize,
 }
 
 impl JobControl {
@@ -95,7 +101,22 @@ impl JobControl {
             segment_start_nanos: AtomicU64::new(NO_SEGMENT),
             align_done: Arc::new(AtomicUsize::new(0)),
             align_total: AtomicUsize::new(0),
+            admission_cap: AtomicUsize::new(NO_CAP),
         })
+    }
+
+    /// Caps the units this job may hold in flight (fusion tiles and
+    /// alignment registrations alike), floored at one so a capped run still
+    /// progresses; `None` lifts the cap. Takes effect at the next admission
+    /// check of either stage.
+    pub fn set_admission_cap(&self, cap: Option<usize>) {
+        self.admission_cap
+            .store(cap.map_or(NO_CAP, |c| c.max(1)), Ordering::SeqCst);
+    }
+
+    /// The live admission cap; `usize::MAX` when none is set.
+    pub fn admission_cap(&self) -> usize {
+        self.admission_cap.load(Ordering::SeqCst)
     }
 
     pub fn state(&self) -> ControlState {
@@ -250,6 +271,10 @@ impl TileControl for JobControl {
         self.pixels_done.fetch_add(pixels, Ordering::SeqCst);
         self.units_done.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn admission_cap(&self) -> usize {
+        self.admission_cap.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +289,18 @@ mod tests {
         assert_eq!(p.units_done, 0);
         assert_eq!(p.unit_total, 0);
         assert_eq!(p.eta, None);
+    }
+
+    #[test]
+    fn an_admission_cap_floors_at_one_and_none_lifts_it() {
+        let control = JobControl::new();
+        assert_eq!(control.admission_cap(), usize::MAX);
+        control.set_admission_cap(Some(0));
+        assert_eq!(control.admission_cap(), 1);
+        control.set_admission_cap(Some(8));
+        assert_eq!(control.admission_cap(), 8);
+        control.set_admission_cap(None);
+        assert_eq!(control.admission_cap(), usize::MAX);
     }
 
     #[test]

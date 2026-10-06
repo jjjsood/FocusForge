@@ -57,6 +57,9 @@ pub struct PaneTexture {
     spec: Option<TextureSpec>,
     image: Option<slint::Image>,
     coverage: Option<Coverage>,
+    /// The content last requested for a backdrop texture, so one still in
+    /// flight is not requested again; unused by exact textures.
+    requested: Option<Coverage>,
     floor: StampFloor,
 }
 
@@ -80,6 +83,13 @@ impl PaneTexture {
         self.coverage
             .as_ref()
             .is_some_and(|(s, t, e)| rect_contains(*s, src) && *t == step && e == state)
+    }
+
+    /// Whether a backdrop read of exactly this content was already issued.
+    fn requested(&self, src: (u32, u32, u32, u32), step: NonZeroU32, state: &EditState) -> bool {
+        self.requested
+            .as_ref()
+            .is_some_and(|(s, t, e)| *s == src && *t == step && e == state)
     }
 
     fn mark_covered(&mut self, src: (u32, u32, u32, u32), step: NonZeroU32, state: EditState) {
@@ -609,6 +619,11 @@ pub struct CanvasRenderer {
     plane: PaneSource,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
+    /// The low-detail whole-image textures drawn beneath each pane's exact
+    /// one.
+    frame_backdrop: PaneTexture,
+    composite_backdrop: PaneTexture,
+    zmap_backdrop: PaneTexture,
     /// The last stamp issued: every job takes the next one, and a reset
     /// refuses everything up to the current value.
     stamp: u64,
@@ -636,6 +651,9 @@ impl CanvasRenderer {
             plane: PaneSource::Composite,
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
+            frame_backdrop: PaneTexture::default(),
+            composite_backdrop: PaneTexture::default(),
+            zmap_backdrop: PaneTexture::default(),
             stamp: 0,
         }
     }
@@ -650,12 +668,24 @@ impl CanvasRenderer {
         let stamp = self.next_stamp();
         self.composite_pane = PaneTexture::fresh(stamp);
         self.zmap_pane = PaneTexture::fresh(stamp);
+        self.composite_backdrop = PaneTexture::fresh(stamp);
+        self.zmap_backdrop = PaneTexture::fresh(stamp);
     }
 
     /// Empties the frame pane and refuses every job issued so far for it.
     fn reset_frame(&mut self) {
         let stamp = self.next_stamp();
         self.frame_pane = PaneTexture::fresh(stamp);
+        self.frame_backdrop = PaneTexture::fresh(stamp);
+    }
+
+    fn texture_mut(&mut self, pane: Pane, backdrop: bool) -> &mut PaneTexture {
+        match (pane, backdrop) {
+            (Pane::Frame, true) => &mut self.frame_backdrop,
+            (Pane::Composite, true) => &mut self.composite_backdrop,
+            (Pane::ZMap, true) => &mut self.zmap_backdrop,
+            (pane, false) => self.pane_mut(pane),
+        }
     }
 
     fn pane_mut(&mut self, pane: Pane) -> &mut PaneTexture {
@@ -695,6 +725,10 @@ impl CanvasRenderer {
         let stamp = self.next_stamp();
         self.composite_pane.floor.reset(stamp);
         self.zmap_pane.floor.reset(stamp);
+        for backdrop in [&mut self.composite_backdrop, &mut self.zmap_backdrop] {
+            backdrop.floor.reset(stamp);
+            backdrop.requested = None;
+        }
         self.plane = plane;
     }
 
@@ -797,6 +831,29 @@ impl CanvasRenderer {
         generation: Option<u64>,
         overlay: Option<&OverlayDraw>,
     ) -> Option<PaneJob> {
+        self.plane_job(draw, generation, overlay, false)
+    }
+
+    /// The job that brings the selected plane's backdrop to `draw`, the
+    /// whole image at a coarse step. `None` when the backdrop covers that
+    /// content or a job for it was already issued -- a pan or zoom never
+    /// asks again -- and otherwise as [`Self::request_planes`].
+    pub fn request_plane_backdrop(
+        &mut self,
+        draw: &PaneDraw,
+        generation: Option<u64>,
+        overlay: Option<&OverlayDraw>,
+    ) -> Option<PaneJob> {
+        self.plane_job(draw, generation, overlay, true)
+    }
+
+    fn plane_job(
+        &mut self,
+        draw: &PaneDraw,
+        generation: Option<u64>,
+        overlay: Option<&OverlayDraw>,
+        backdrop: bool,
+    ) -> Option<PaneJob> {
         self.device.as_ref()?;
         let composite = self.composite.as_ref()?.clone();
         let zmap = self.zmap.as_ref()?.clone();
@@ -809,7 +866,7 @@ impl CanvasRenderer {
                 overlay: None,
             };
             let index_scale = self.index_scale?;
-            return self.request(pane, draw, size, zmap, index_scale, None, state);
+            return self.request(pane, backdrop, draw, size, zmap, index_scale, None, state);
         }
         let overlay = overlay.filter(|_| header.samples_per_pixel == 3);
         let indices =
@@ -818,17 +875,28 @@ impl CanvasRenderer {
             generation,
             overlay: overlay.cloned(),
         };
-        self.request(pane, draw, size, composite, 0, indices, state)
+        self.request(pane, backdrop, draw, size, composite, 0, indices, state)
     }
 
     /// The job that brings the frame pane to `draw`; `None` as
     /// [`Self::request_planes`], with no frame open in place of no planes.
     pub fn request_frame(&mut self, draw: &PaneDraw) -> Option<PaneJob> {
+        self.frame_job(draw, false)
+    }
+
+    /// The frame pane's backdrop job; `None` as
+    /// [`Self::request_plane_backdrop`].
+    pub fn request_frame_backdrop(&mut self, draw: &PaneDraw) -> Option<PaneJob> {
+        self.frame_job(draw, true)
+    }
+
+    fn frame_job(&mut self, draw: &PaneDraw, backdrop: bool) -> Option<PaneJob> {
         self.device.as_ref()?;
         let frame_size = self.frame.dimensions()?;
         let reader = self.frame.reader()?;
         self.request(
             Pane::Frame,
+            backdrop,
             draw,
             frame_size,
             reader,
@@ -842,6 +910,7 @@ impl CanvasRenderer {
     fn request(
         &mut self,
         pane: Pane,
+        backdrop: bool,
         draw: &PaneDraw,
         source_size: (u32, u32),
         reader: Arc<dyn PaneReader>,
@@ -853,8 +922,15 @@ impl CanvasRenderer {
         if !visible_draw_fits(source_size, draw) {
             return None;
         }
+        let texture = self.texture_mut(pane, backdrop);
+        if backdrop
+            && (texture.covers(draw.src, draw.step, &state)
+                || texture.requested(draw.src, draw.step, &state))
+        {
+            return None;
+        }
         let stamp = self.next_stamp();
-        let texture = self.pane_mut(pane);
+        let texture = self.texture_mut(pane, backdrop);
         if texture.covers(draw.src, draw.step, &state) {
             texture.floor.reset(stamp);
             return None;
@@ -869,6 +945,9 @@ impl CanvasRenderer {
         if !visible_draw_fits(source_size, &guarded) {
             return None;
         }
+        if backdrop {
+            texture.requested = Some((draw.src, draw.step, state.clone()));
+        }
         Some(PaneJob {
             pane,
             draw: guarded,
@@ -877,6 +956,7 @@ impl CanvasRenderer {
             index_scale,
             indices,
             state,
+            backdrop,
         })
     }
 
@@ -904,15 +984,22 @@ impl CanvasRenderer {
         edited: Option<&EditedView>,
     ) -> Option<slint::Image> {
         let (device, queue) = self.device_queue()?;
-        if !self.pane_mut(job.pane).floor.accept(job.stamp) {
+        if !self
+            .texture_mut(job.pane, job.backdrop)
+            .floor
+            .accept(job.stamp)
+        {
             return None;
         }
         let renderer = self.display_renderer.as_mut()?;
         let (width, height) = job.draw.extent();
-        let texture = match job.pane {
-            Pane::Frame => &mut self.frame_pane,
-            Pane::Composite => &mut self.composite_pane,
-            Pane::ZMap => &mut self.zmap_pane,
+        let texture = match (job.pane, job.backdrop) {
+            (Pane::Frame, false) => &mut self.frame_pane,
+            (Pane::Composite, false) => &mut self.composite_pane,
+            (Pane::ZMap, false) => &mut self.zmap_pane,
+            (Pane::Frame, true) => &mut self.frame_backdrop,
+            (Pane::Composite, true) => &mut self.composite_backdrop,
+            (Pane::ZMap, true) => &mut self.zmap_backdrop,
         };
         if texture.covers(job.draw.src, job.draw.step, &job.state) {
             return Some(texture.image());
@@ -1015,7 +1102,28 @@ impl CanvasRenderer {
         if !visible_draw_fits(self.source_size(pane)?, draw) {
             return None;
         }
-        let texture = self.pane_ref(pane);
+        Self::placed(self.pane_ref(pane), draw)
+    }
+
+    /// [`Self::placement`] for `pane`'s backdrop: the whole-image texture at
+    /// the rect `draw`'s view gives the whole image.
+    pub fn backdrop_placement(
+        &self,
+        pane: Pane,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let backdrop = match pane {
+            Pane::Frame => &self.frame_backdrop,
+            Pane::Composite => &self.composite_backdrop,
+            Pane::ZMap => &self.zmap_backdrop,
+        };
+        Self::placed(backdrop, draw)
+    }
+
+    fn placed(
+        texture: &PaneTexture,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
         let (src, ..) = texture.coverage.as_ref()?;
         texture.image.as_ref()?;
         Some((texture.image(), draw.place(*src)))

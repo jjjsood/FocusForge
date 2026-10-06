@@ -485,6 +485,18 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
         height: 256,
     };
 
+    let stage_ns = |snapshot: &focusforge_core::timing::TimingSnapshot| {
+        [
+            snapshot.gpu_tile_read_ns,
+            snapshot.gpu_tile_warp_ns,
+            snapshot.gpu_tile_upload_ns,
+            snapshot.gpu_tile_pyramid_ns,
+            snapshot.gpu_tile_select_ns,
+            snapshot.gpu_tile_reconstruct_ns,
+            snapshot.gpu_tile_readback_ns,
+            snapshot.gpu_tile_wait_ns,
+        ]
+    };
     let mut deltas = Vec::new();
     for _ in 0..2 {
         let before = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
@@ -492,7 +504,11 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
             .warp_fuse_tile(&stack, (width, height), &transforms, rect, spp, LEVELS)
             .expect("warp_fuse_tile must succeed");
         let after = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+        for (stage, (then, now)) in stage_ns(&before).iter().zip(stage_ns(&after)).enumerate() {
+            assert!(now > *then, "stage counter {stage} did not grow: {after:?}");
+        }
         deltas.push((
+            after.cpu_submissions - before.cpu_submissions,
             after.buffer_creations - before.buffer_creations,
             after.upload_bytes - before.upload_bytes,
             after.readback_bytes - before.readback_bytes,
@@ -500,14 +516,91 @@ fn identical_tiles_cost_identical_transfers_and_allocations() {
     }
 
     assert_eq!(deltas[0], deltas[1], "the same tile must cost the same");
-    let (creations, uploads, readbacks) = deltas[0];
-    assert!(creations > 0 && uploads > 0);
+    let (submits, creations, uploads, readbacks) = deltas[0];
+    assert!(submits > 0 && creations > 0 && uploads > 0);
     let pixels = u64::from(rect.width) * u64::from(rect.height);
+    let warped_frames = transforms
+        .iter()
+        .filter(|t| **t != Transform::identity())
+        .count() as u64;
+    assert!(
+        uploads >= 24 * pixels * warped_frames,
+        "{uploads} uploaded bytes do not cover the warp coordinates of {warped_frames} frames"
+    );
     let composite = focusforge_gpu::pack::packed_len(pixels as usize * spp as usize) as u64;
     assert_eq!(
         readbacks,
         composite + 8 * pixels,
         "a tile reads back its packed composite and its Z-Map"
+    );
+}
+
+/// The submits and buffer creations one more frame adds to a warped 256x256
+/// tile do not depend on the pyramid depth: a frame costs its warp, its
+/// base-plane convert and one batch for the pyramid and select passes, however
+/// many levels the batch records. Counts are taken at 4 and 8 frames so the
+/// per-tile fixed cost cancels.
+#[test]
+fn submits_per_frame_do_not_grow_with_pyramid_depth() {
+    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    focusforge_core::timing::enable_trace_accounting();
+    let backend = gpu_backend().expect("gpu backend");
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let reader = CyclingReader { stack: &stack };
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 256,
+        height: 256,
+    };
+
+    let mut increments = Vec::new();
+    for levels in [3u32, 5] {
+        let cost = |frame_count: usize| {
+            let transforms = non_identity_transforms(frame_count);
+            let before = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+            backend
+                .warp_fuse_tile(&reader, (width, height), &transforms, rect, spp, levels)
+                .expect("warp_fuse_tile must succeed");
+            let after = focusforge_core::timing::timing_snapshot().expect("accounting is enabled");
+            (
+                after.cpu_submissions - before.cpu_submissions,
+                after.buffer_creations - before.buffer_creations,
+            )
+        };
+        let (submits_4, creations_4) = cost(4);
+        let (submits_8, creations_8) = cost(8);
+        let (extra_submits, extra_creations) = (submits_8 - submits_4, creations_8 - creations_4);
+        assert_eq!(
+            extra_submits % 4,
+            0,
+            "levels {levels}: {extra_submits} submits"
+        );
+        assert_eq!(
+            extra_creations % 4,
+            0,
+            "levels {levels}: {extra_creations} creations"
+        );
+        let (per_frame_submits, per_frame_creations) = (extra_submits / 4, extra_creations / 4);
+        assert!(
+            per_frame_submits <= 3,
+            "levels {levels}: {per_frame_submits} submits per frame; warp, convert and one batch allow 3"
+        );
+        // Warp 4, convert 2, one select uniform per level, one coverage mask per
+        // level plus one for the residual.
+        assert!(
+            per_frame_creations <= 7 + 2 * u64::from(levels),
+            "levels {levels}: {per_frame_creations} buffer creations per frame"
+        );
+        increments.push(per_frame_submits);
+    }
+    assert_eq!(
+        increments[0], increments[1],
+        "per-frame submits must not depend on the pyramid depth"
     );
 }
 

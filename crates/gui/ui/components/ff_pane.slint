@@ -22,6 +22,13 @@ export component FFPane inherits Rectangle {
     in property <length> crop-w;
     in property <length> crop-h;
     in property <bool> pixelated;
+    // A low-detail view of the whole image, drawn beneath `source` so that
+    // part of the pane `source` does not cover still shows image content.
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     in property <bool> accent-border: false;
     out property <bool> crop-clips: image-crop.clip;
     callback undock-requested();
@@ -31,6 +38,16 @@ export component FFPane inherits Rectangle {
     border-width: root.accent-border ? 1px : 0px;
     border-color: Theme.accent-default;
     clip: true;
+
+    Image {
+        source: root.backdrop;
+        x: root.backdrop-x;
+        y: root.backdrop-y;
+        width: root.backdrop-w;
+        height: root.backdrop-h;
+        image-fit: fill;
+        image-rendering: ImageRendering.smooth;
+    }
 
     image-crop := Rectangle {
         x: root.crop-x;

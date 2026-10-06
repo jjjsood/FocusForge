@@ -272,6 +272,18 @@ fn chrome_trace_nesting() {
         summary_u64(summary[0], "admitted_spans") <= budget,
         "the detailed span count remains bounded: {summary:?}"
     );
+    assert_eq!(
+        summary_u64(summary[0], "gui_admission_budget"),
+        262_144,
+        "the graphical front end's admission budget is fixed"
+    );
+    for field in ["gui_admitted_spans", "gui_exhausted_admissions"] {
+        assert_eq!(
+            summary_u64(summary[0], field),
+            0,
+            "a command-line run opens no graphical span: {field}"
+        );
+    }
     for field in [
         "exhausted_admissions",
         "converted_bytes",
@@ -296,9 +308,31 @@ fn chrome_trace_nesting() {
         "cpu_submissions",
         "buffer_creations",
         "readback_bytes",
+        "fuse_equalize_ns",
     ] {
         let _ = summary_u64(summary[0], field);
     }
+    for field in [
+        "gpu_tile_read_ns",
+        "gpu_tile_warp_ns",
+        "gpu_tile_upload_ns",
+        "gpu_tile_pyramid_ns",
+        "gpu_tile_select_ns",
+        "gpu_tile_reconstruct_ns",
+        "gpu_tile_readback_ns",
+        "gpu_tile_wait_ns",
+        "gpu_tile_other_ns",
+    ] {
+        assert_eq!(
+            summary_u64(summary[0], field),
+            0,
+            "a CPU run charges no GPU tile time to {field}"
+        );
+    }
+    assert!(
+        summary_u64(summary[0], "fuse_equalize_ns") > 0,
+        "the default brightness equalization is charged to fuse_equalize_ns: {summary:?}"
+    );
     for capability in [
         "gpu_execution_available",
         "presentation_available",

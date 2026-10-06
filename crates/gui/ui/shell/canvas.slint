@@ -45,6 +45,17 @@ export component FFCanvas inherits Rectangle {
     in property <length> frame-image-y;
     in property <length> frame-image-w;
     in property <length> frame-image-h;
+    // Each pane's low-detail backdrop -- see `FFPane::backdrop`.
+    in property <image> frame-backdrop;
+    in property <length> frame-backdrop-x;
+    in property <length> frame-backdrop-y;
+    in property <length> frame-backdrop-w;
+    in property <length> frame-backdrop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
     in property <length> frame-crop-x;
     in property <length> frame-crop-y;
     in property <length> frame-crop-w;
@@ -174,6 +185,11 @@ export component FFCanvas inherits Rectangle {
         image-y: root.frame-image-y;
         image-w: root.frame-image-w;
         image-h: root.frame-image-h;
+        backdrop: root.frame-backdrop;
+        backdrop-x: root.frame-backdrop-x;
+        backdrop-y: root.frame-backdrop-y;
+        backdrop-w: root.frame-backdrop-w;
+        backdrop-h: root.frame-backdrop-h;
         crop-x: root.frame-crop-x;
         crop-y: root.frame-crop-y;
         crop-w: root.frame-crop-w;
@@ -212,6 +228,11 @@ export component FFCanvas inherits Rectangle {
         image-y: root.image-y;
         image-w: root.image-w;
         image-h: root.image-h;
+        backdrop: root.backdrop;
+        backdrop-x: root.backdrop-x;
+        backdrop-y: root.backdrop-y;
+        backdrop-w: root.backdrop-w;
+        backdrop-h: root.backdrop-h;
         crop-x: root.crop-x;
         crop-y: root.crop-y;
         crop-w: root.crop-w;

@@ -30,10 +30,10 @@
 //!
 //! # Every read failure is a miss
 //!
-//! Absent file, unparsable or truncated JSON, a `format` this build does not
-//! recognise, a `key_digest` that does not equal the requested key's, or a
-//! `frame_count` that disagrees with the key's frame list: every one of
-//! these is [`Option::None`] from [`StageCache::get_alignment`], never an
+//! Absent file, unparsable or truncated JSON, a `key_digest` that does not
+//! equal the requested key's, or a `frame_count` that disagrees with the key's
+//! frame list: every one of these is [`Option::None`] from
+//! [`StageCache::get_alignment`], never an
 //! `Err`. A cache read that could not be trusted must behave exactly like a
 //! cache that never had the entry -- the caller falls back to recomputing,
 //! nothing more.
@@ -51,12 +51,6 @@ use super::fingerprint::{FrameFingerprint, StackFingerprint};
 use super::ledger::{ResumeError, write_atomic};
 use super::record::AlignIdentity;
 use crate::io::RawIdentity;
-
-/// The current on-disk entry format. Bump this, never the field shapes
-/// below, when an entry's meaning changes in a way an older reader must not
-/// interpret optimistically -- the same rule [`super::record::JOB_RECORD_FORMAT`]
-/// follows.
-pub const STAGE_CACHE_FORMAT: u32 = 1;
 
 /// One variant per cacheable [`super::JobStage`]. `Fuse` is deliberately
 /// absent: whether a fusion intermediate is worth caching is a measurement,
@@ -98,14 +92,14 @@ pub enum StageCacheError {
 
 impl From<ResumeError> for StageCacheError {
     /// `write_atomic` only ever constructs `ResumeError::Io` or
-    /// `ResumeError::Json`; `Mismatch` and `UnknownFormat` are
+    /// `ResumeError::Json`; `Mismatch` is
     /// `ResumeStore::find` outcomes this conversion never sees.
     fn from(err: ResumeError) -> Self {
         match err {
             ResumeError::Io { path, source } => StageCacheError::Io { path, source },
             ResumeError::Json { path, source } => StageCacheError::Json { path, source },
-            ResumeError::Mismatch(_) | ResumeError::UnknownFormat { .. } => {
-                unreachable!("write_atomic never returns Mismatch or UnknownFormat")
+            ResumeError::Mismatch(_) => {
+                unreachable!("write_atomic never returns Mismatch")
             }
         }
     }
@@ -115,7 +109,7 @@ impl From<ResumeError> for StageCacheError {
 /// a [`FrameFingerprint`]: every field except `path`, so a moved or renamed
 /// input directory still hits. `mtime` is already absent upstream
 /// (`FrameFingerprint`'s own field set); nothing here re-adds it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FrameKey {
     pub file_size: u64,
     pub image_description: Option<String>,
@@ -124,7 +118,6 @@ pub struct FrameKey {
     pub samples_per_pixel: u32,
     pub strip_offsets: Vec<u64>,
     pub strip_byte_counts: Vec<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_identity: Option<RawIdentity>,
 }
 
@@ -169,7 +162,6 @@ fn key_param_value(value: &ParamValue) -> KeyParamValue {
 /// `serde_json::to_vec` can never emit a JSON float.
 #[derive(Serialize)]
 struct KeyMirror<'a> {
-    format: u32,
     stage: CachedStage,
     frames: &'a [FrameKey],
     algorithm: &'a str,
@@ -199,9 +191,8 @@ struct KeyMirror<'a> {
 /// a run without the cache recomputes); the stacking algorithm and its parameters (a
 /// fusion-only parameter change stays cheap this way); and the output path (not part of what a
 /// result is computed from).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StageKey {
-    pub format: u32,
     pub stage: CachedStage,
     pub frames: Vec<FrameKey>,
     pub align: AlignIdentity,
@@ -213,7 +204,6 @@ impl StageKey {
     /// fields).
     pub fn align(fingerprint: &StackFingerprint, identity: &AlignIdentity) -> Self {
         StageKey {
-            format: STAGE_CACHE_FORMAT,
             stage: CachedStage::Align,
             frames: fingerprint.frames.iter().map(FrameKey::from).collect(),
             align: identity.clone(),
@@ -233,7 +223,6 @@ impl StageKey {
             .map(|(id, value)| (id.clone(), key_param_value(value)))
             .collect();
         let mirror = KeyMirror {
-            format: self.format,
             stage: self.stage,
             frames: &self.frames,
             algorithm: &self.align.algorithm,
@@ -325,7 +314,6 @@ impl CachedFrameAlignment {
 /// compared.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedAlignment {
-    pub format: u32,
     pub key_digest: String,
     pub frame_count: usize,
     pub paths: Vec<PathBuf>,
@@ -337,7 +325,6 @@ pub struct CachedAlignment {
 impl CachedAlignment {
     fn new(key: &StageKey, paths: &[PathBuf], alignment: &StackAlignment) -> Self {
         CachedAlignment {
-            format: STAGE_CACHE_FORMAT,
             key_digest: key.digest(),
             frame_count: key.frames.len(),
             paths: paths.to_vec(),
@@ -400,9 +387,6 @@ impl StageCache {
         let path = self.entry_path(key);
         let text = fs::read_to_string(&path).ok()?;
         let cached: CachedAlignment = serde_json::from_str(&text).ok()?;
-        if cached.format != STAGE_CACHE_FORMAT {
-            return None;
-        }
         if cached.key_digest != key.digest() {
             return None;
         }

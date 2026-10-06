@@ -32,7 +32,7 @@ retouching the result.
   reviewing the results
 - [`guide/diagnostics.md`](guide/diagnostics.md) — the log every run keeps,
   what a crash leaves behind, the notice on the next start, and packaging a
-  diagnostics bundle
+  diagnostics bundle, and tracing the window
 
 ## Reference
 

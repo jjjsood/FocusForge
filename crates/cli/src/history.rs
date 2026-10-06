@@ -38,7 +38,7 @@ pub enum HistoryCommand {
 pub struct ListArgs {
     /// The project to list.
     project: PathBuf,
-    /// Emit the frozen JSON document instead of human-readable text.
+    /// Emit the JSON document instead of human-readable text.
     #[arg(long)]
     json: bool,
 }
@@ -53,7 +53,7 @@ pub struct MaterializeArgs {
     /// Where to write the Z-Map.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: PathBuf,
-    /// Emit the frozen JSON report instead of human-readable text.
+    /// Emit the JSON report instead of human-readable text.
     #[arg(long)]
     json: bool,
 }
@@ -76,7 +76,7 @@ pub struct ApplyArgs {
     /// is the sealed checkpoint's own; alone, the map is never sealed.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
-    /// Emit the frozen JSON report instead of human-readable text.
+    /// Emit the JSON report instead of human-readable text.
     #[arg(long)]
     json: bool,
 }
@@ -88,7 +88,7 @@ pub struct DeleteArgs {
     /// The checkpoint to delete -- any unique prefix of its id.
     #[arg(long)]
     checkpoint: String,
-    /// Emit the frozen JSON report instead of human-readable text.
+    /// Emit the JSON report instead of human-readable text.
     #[arg(long)]
     json: bool,
 }

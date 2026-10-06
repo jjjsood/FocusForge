@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use focusforge_core::tile::Tile;
-use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
+use focusforge_core::timing::{TimingCounter, gpu_tile_stage, measurement_scope, record_timing};
 
 use crate::device::GpuError;
 use crate::pack::{pack_samples, packed_len};
@@ -35,7 +35,9 @@ pub fn readback_count() -> u64 {
 
 /// Creates a `STORAGE | COPY_DST | COPY_SRC` buffer of exactly `byte_len`
 /// bytes, labelled `label`, with the same usage flags as [`upload_tile`].
-/// Callers that need zeros write them explicitly.
+/// The device zero-initialises a fresh buffer before its first use, so a
+/// caller that needs zeros takes a new buffer and writes none; a buffer that
+/// is reused is not zeroed again.
 pub fn create_storage_buffer(device: &wgpu::Device, byte_len: u64, label: &str) -> wgpu::Buffer {
     record_timing(TimingCounter::BufferCreations, 1);
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -48,8 +50,24 @@ pub fn create_storage_buffer(device: &wgpu::Device, byte_len: u64, label: &str) 
     })
 }
 
+/// Writes `bytes` into a new [`create_storage_buffer`] buffer via
+/// `queue.write_buffer` and counts them as uploaded. Every host-to-device
+/// buffer write of a tile goes through here or [`crate::pipeline::upload_params`].
+pub(crate) fn upload_storage(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    bytes: &[u8],
+    label: &str,
+) -> wgpu::Buffer {
+    let _stage = gpu_tile_stage(TimingCounter::GpuTileUploadNs);
+    let buffer = create_storage_buffer(device, bytes.len() as u64, label);
+    queue.write_buffer(&buffer, 0, bytes);
+    record_timing(TimingCounter::UploadBytes, bytes.len() as u64);
+    buffer
+}
+
 /// Uploads `data` into a new [`create_storage_buffer`] buffer via
-/// `queue.write_buffer`, as explicit `f32::to_le_bytes` (the workspace
+/// [`upload_storage`], as explicit `f32::to_le_bytes` (the workspace
 /// denies `unsafe_code`). Pyramid levels stay `f32` on both sides: packing
 /// them to `u16` would lose the working precision parity rests on.
 pub fn upload_f32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> wgpu::Buffer {
@@ -57,11 +75,7 @@ pub fn upload_f32(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> w
     for value in data {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    let buffer =
-        create_storage_buffer(device, bytes.len() as u64, "focusforge-gpu-fuse-f32-upload");
-    queue.write_buffer(&buffer, 0, &bytes);
-    record_timing(TimingCounter::UploadBytes, bytes.len() as u64);
-    buffer
+    upload_storage(device, queue, &bytes, "focusforge-gpu-fuse-f32-upload")
 }
 
 /// The `f32` counterpart of [`download_buffer`]: reads back exactly `len`
@@ -93,10 +107,7 @@ pub fn upload_tile(device: &wgpu::Device, queue: &wgpu::Queue, tile: &Tile) -> w
     let packed = pack_samples(&tile.samples);
     debug_assert_eq!(packed.len(), packed_len(tile.samples.len()));
 
-    let buffer = create_storage_buffer(device, packed.len() as u64, "focusforge-gpu-tile-upload");
-    queue.write_buffer(&buffer, 0, &packed);
-    record_timing(TimingCounter::UploadBytes, packed.len() as u64);
-    buffer
+    upload_storage(device, queue, &packed, "focusforge-gpu-tile-upload")
 }
 
 /// Copies `byte_len` bytes of `src` back to the host through a
@@ -131,6 +142,7 @@ pub fn download_buffer(
     });
     {
         let _wait = measurement_scope("gpu_readback_wait");
+        let _stage = gpu_tile_stage(TimingCounter::GpuTileWaitNs);
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|err| GpuError::Readback {

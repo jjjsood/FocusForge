@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: tools/check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]
+# Usage: tools/check-all.sh [--static|--quick] [--verbose] [--tail N] [--log-dir DIR]
 #
 # Every gate this repository has, in one command, with a pass/fail summary at
 # the end. There is no hosted CI and no remote, so this script *is* the build:
@@ -8,6 +8,10 @@
 #   --static     only the fast, read-only checks -- no builds, no test suites.
 #                This is the set .githooks/pre-commit runs, so running it by
 #                hand tells you whether a commit will pass.
+#   --quick      every gate except the minutes-long ones: the nextest
+#                `quick` profile (.config/nextest.toml) instead of the whole
+#                workspace, and no `trace feature` or `advisories` stage. A
+#                change's working check; the full run stays the build.
 #   --verbose    also stream every gate's output to the terminal. Unbounded:
 #                a caller with a fixed output budget will lose the summary.
 #   --tail N     lines of a failing gate's log to print inline (default 40,
@@ -28,24 +32,28 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 STATIC_ONLY=0
+QUICK=0
 VERBOSE=0
 TAIL_LINES=40
 LOG_DIR=""
 
 usage() {
-  echo "usage: tools/check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]" >&2
+  echo "usage: tools/check-all.sh [--static|--quick] [--verbose] [--tail N] [--log-dir DIR]" >&2
   exit 2
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --static) STATIC_ONLY=1; shift ;;
+    --quick) QUICK=1; shift ;;
     --verbose|-v) VERBOSE=1; shift ;;
     --tail) [ "$#" -ge 2 ] || usage; TAIL_LINES="$2"; shift 2 ;;
     --log-dir) [ "$#" -ge 2 ] || usage; LOG_DIR="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
+
+[ "$STATIC_ONLY" -eq 1 ] && [ "$QUICK" -eq 1 ] && usage
 
 case "$TAIL_LINES" in
   ''|*[!0-9]*) usage ;;
@@ -139,9 +147,12 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   TEST_TMP="$REPO/.scratch/test-tmp"
   rm -rf "$TEST_TMP"
   mkdir -p "$TEST_TMP"
+  NEXTEST_PROFILE=default
+  [ "$QUICK" -eq 1 ] && NEXTEST_PROFILE=quick
   run_gate "cargo nextest"  tools/with-lock.sh build -- \
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" TMPDIR="$TEST_TMP" \
-                              cargo nextest run --workspace --no-fail-fast
+                              cargo nextest run --workspace --no-fail-fast \
+                              --profile "$NEXTEST_PROFILE"
   run_gate "test tmp residue" test_tmp_residue "$TEST_TMP"
   run_gate "cargo test --doc" tools/with-lock.sh build -- \
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --doc --workspace
@@ -149,7 +160,7 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # no profiling crate at all, and the clippy stage compiles the feature
   # without running anything. ~13.5s on an already-compiled tree, most of it
   # one real stack run over fixtures/mantis-512.
-  run_gate "trace feature"  tools/with-lock.sh build -- \
+  [ "$QUICK" -eq 1 ] || run_gate "trace feature"  tools/with-lock.sh build -- \
                               cargo test -p focusforge-cli --features trace --test trace_cli
   run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
@@ -157,7 +168,7 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # Separate from `licenses` on purpose: an advisory is a fact about the world
   # that can turn red without this repository changing, so it must not be able
   # to block a commit through the pre-commit hook.
-  run_gate "advisories"     tools/check-licenses.sh --advisories
+  [ "$QUICK" -eq 1 ] || run_gate "advisories"     tools/check-licenses.sh --advisories
 
   runlog_join || true
 fi

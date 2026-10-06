@@ -53,8 +53,9 @@ use crate::align::ecc_algorithm::{
 use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
-use crate::tile::HostBudget;
+use crate::tile::control::ADMISSION_RECHECK;
 use crate::tile::plan::DEFAULT_TILE_SIZE;
+use crate::tile::{HostBudget, TileControl};
 use crate::timing::{TimingCounter, measurement_scope, observe_timing_max, record_timing};
 
 /// Whether every frame registers against one anchor frame, or chains
@@ -354,6 +355,30 @@ fn wait_at_boundary(options: &AlignDriverOptions<'_>) -> Result<(), AlgorithmErr
                 None => return Ok(()),
             },
             ControlState::Running => return Ok(()),
+        }
+    }
+}
+
+/// Takes one slot of `live` and returns the new count, waiting while the
+/// control's admission cap is full. The wait ends early, taking the slot past
+/// the cap, once the control is not `Running`, so a pause or cancel is seen
+/// without waiting for the cap to lift; the caller releases the slot on those
+/// paths.
+fn reserve_live(live: &AtomicUsize, control: Option<&JobControl>) -> usize {
+    loop {
+        let now = live.load(Ordering::SeqCst);
+        let cap = control.map_or(usize::MAX, TileControl::admission_cap);
+        if now < cap {
+            if live
+                .compare_exchange(now, now + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return now + 1;
+            }
+        } else if control.is_some_and(|c| c.state() != ControlState::Running) {
+            return live.fetch_add(1, Ordering::SeqCst) + 1;
+        } else {
+            std::thread::sleep(ADMISSION_RECHECK);
         }
     }
 }
@@ -675,14 +700,17 @@ fn align_stack_once(
                         .install(|| {
                             pending
                                 .par_iter()
-                                .map(
-                                    |&i| match options.control.as_deref().map(JobControl::state) {
+                                .map(|&i| {
+                                    let cur = reserve_live(&live, options.control.as_deref());
+                                    match options.control.as_deref().map(JobControl::state) {
                                         Some(ControlState::CancelRequested) => {
+                                            live.fetch_sub(1, Ordering::SeqCst);
                                             Some(Err(AlgorithmError::Cancelled))
                                         }
                                         Some(ControlState::PauseRequested)
                                             if options.on_pause.is_some() =>
                                         {
+                                            live.fetch_sub(1, Ordering::SeqCst);
                                             None
                                         }
                                         _ => {
@@ -692,7 +720,6 @@ fn align_stack_once(
                                                 index = i
                                             );
                                             let _frame = frame_span.enter();
-                                            let cur = live.fetch_add(1, Ordering::SeqCst) + 1;
                                             peak.fetch_max(cur, Ordering::SeqCst);
                                             let _solve = measurement_scope("align_solve");
                                             let result = algorithm.align_frame(&ctx, i, cfg).map(
@@ -702,8 +729,8 @@ fn align_stack_once(
                                             credit_frame_done(options.frames_done.as_deref());
                                             Some(result)
                                         }
-                                    },
-                                )
+                                    }
+                                })
                                 .collect()
                         });
 
@@ -1021,13 +1048,16 @@ mod tests {
     fn the_split_sums_to_369_mb_at_the_reference_scale() {
         // Shared: the reference's coarse pyramid, the retained level
         // templates, the patch templates and the feature set. Per registration: the frame's
-        // coarse pyramid plus the streaming band, which outweighs the solve
-        // scratch and windows (54.9 MB).
+        // coarse pyramid plus the solve scratch and windows (55.3 MB), which
+        // just outweigh the streaming band (55.1 MB).
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         assert_eq!(shared, 59_681_450 + 161_361_640 + 33_030_144 + 2000 * 72);
-        assert_eq!(per_registration, 59_681_450 + 8192 * 517 * 13);
+        assert_eq!(
+            per_registration,
+            59_681_450 + 24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10
+        );
         let ratio = (shared + per_registration) as f64 / 369_000_000f64;
         assert!(
             (ratio - 1.0).abs() < 0.01,
@@ -1057,14 +1087,14 @@ mod tests {
     #[test]
     fn single_sample_stacks_are_priced_by_templates_and_pyramids() {
         // At 6000x4000x1 the 1254x836 solve region costs 25.2 MB of scratch,
-        // on top of its window (14.3 MB) and a patch window (6.0 MB); the
+        // on top of its window (19.3 MB) and a patch window (3.6 MB); the
         // 9 B per pixel stream term is 28.0 MB.
         let stack = StackContext::new(20, 6000, 4000, 1);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let patches = 8 * 384 * 384 * 28;
         assert_eq!(shared, 32_000_000 + 141_772_400 + patches + 2000 * 72);
-        let solve = 24 * 1254 * 836 + 1766 * 1348 * 6 + 772 * 772 * 6;
+        let solve = 24 * 1254 * 836 + 1778 * 1360 * 8 + 772 * 772 * 6;
         let stream = 6000 * (DEFAULT_TILE_SIZE as u64 + 5) * 9;
         assert!(solve > stream);
         assert_eq!(per_registration, 32_000_000 + solve);
@@ -1075,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn full_colour_frames_are_priced_by_their_streaming_band() {
+    fn full_colour_frames_are_priced_by_the_larger_of_streaming_band_and_solve() {
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
@@ -1083,9 +1113,9 @@ mod tests {
         let patches = 8 * 384 * 384 * 28;
         assert_eq!(shared, plane / 3 + 161_361_640 + patches + 2000 * 72);
         let stream = 8192 * (DEFAULT_TILE_SIZE as u64 + 5) * 13;
-        let solve = 24 * 1253 * 836 + 1765 * 1348 * 10 + 772 * 772 * 10;
-        assert!(stream > solve);
-        assert_eq!(per_registration, plane / 3 + stream);
+        let solve = 24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10;
+        assert!(solve > stream);
+        assert_eq!(per_registration, plane / 3 + solve);
         assert!(shared < 400_100_000, "shared {shared} B");
         assert!(
             per_registration < 263_900_000,
@@ -1419,6 +1449,72 @@ mod tests {
         }
     }
 
+    /// Converges every frame after a short solve, counting how often each
+    /// frame was registered.
+    struct CountingAlign {
+        registrations: Mutex<Vec<usize>>,
+    }
+
+    impl AlignAlgorithm for CountingAlign {
+        fn id(&self) -> &str {
+            "counting-align"
+        }
+        fn display_name(&self) -> &str {
+            "Counting Align"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            _ctx: &AlignContext<'_>,
+            frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            std::thread::sleep(Duration::from_millis(3));
+            self.registrations.lock().expect("no panic while counting")[frame] += 1;
+            Ok(converged(Transform::identity()))
+        }
+    }
+
+    #[test]
+    fn a_cap_bounds_live_registrations_and_skips_no_frame() {
+        const FRAMES: usize = 13;
+        let stack = StackContext::new(FRAMES, 8, 8, 1);
+        let four_workers =
+            bytes_shared_reference(stack) + 4 * bytes_per_registration(stack, DEFAULT_TILE_SIZE);
+        let algo = CountingAlign {
+            registrations: Mutex::new(vec![0; FRAMES]),
+        };
+        let control = JobControl::new();
+        control.set_admission_cap(Some(1));
+        let options = AlignDriverOptions {
+            budget: HostBudget::explicit(four_workers),
+            control: Some(control),
+            ..Default::default()
+        };
+        let run = align_stack_with(
+            &algo,
+            stack,
+            &NullReader,
+            &cfg_with("anchor", "middle"),
+            FailurePolicy::Strict,
+            &options,
+        )
+        .unwrap();
+        assert!(
+            run.worker_limit >= 2,
+            "the parallel arm needs at least two workers, got {}",
+            run.worker_limit
+        );
+        assert_eq!(run.peak_workers, 1, "a cap of 1 admits one registration");
+        let reference = (FRAMES - 1) / 2;
+        for (frame, count) in algo.registrations.lock().unwrap().iter().enumerate() {
+            let expected = usize::from(frame != reference);
+            assert_eq!(*count, expected, "frame {frame} registered {count} times");
+        }
+    }
+
     #[test]
     fn pause_holds_at_a_frame_boundary_in_every_arm() {
         const PAUSE_ON: usize = 2;
@@ -1436,6 +1532,8 @@ mod tests {
         ];
         for (policy, max_bytes_in_flight, bound) in arms {
             let control = JobControl::new();
+            // Two admitted registrations leave the pooled arm's bound as is.
+            control.set_admission_cap(Some(2));
             let algo = PausingAlign {
                 control: Arc::clone(&control),
                 pause_on: PAUSE_ON,

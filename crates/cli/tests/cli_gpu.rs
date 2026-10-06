@@ -703,7 +703,7 @@ fn device_peak_in_flight_is_scoped_to_its_own_group() {
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let doc: serde_json::Value = serde_json::from_str(&output.stdout).expect("--json must parse");
-    assert_eq!(doc["format"], 1, "doc: {doc}");
+    assert!(doc.get("format").is_none(), "doc: {doc}");
     let groups = doc["groups"].as_array().expect("groups must be an array");
 
     if groups[0]["backend"] == "cpu" {
