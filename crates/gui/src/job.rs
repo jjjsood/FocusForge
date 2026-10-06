@@ -1225,9 +1225,9 @@ impl EditState {
     }
 
     /// Queues `job` for a worker and bumps the tiles' generation, so the
-    /// repaint picks the region up. Jobs queued while a
-    /// worker holds a batch go out together when it is installed, rendered
-    /// in queue order; `wake` runs on the worker once a batch is parked.
+    /// repaint picks the region up. Jobs queued while a worker holds a batch
+    /// go out together when it is installed, rendered in queue order; `wake`
+    /// runs on the worker once a batch is parked.
     pub fn queue_recomposite(&mut self, job: Recomposite, wake: &RecompositeWake) {
         self.enqueue(job);
         if !self.recomposites.in_flight {

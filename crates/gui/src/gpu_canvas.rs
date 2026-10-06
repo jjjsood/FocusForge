@@ -972,10 +972,10 @@ impl CanvasRenderer {
     /// issued under an edit generation, overlays the composite with the
     /// resident tiles' gathered pixel wherever its index differs; the Z-Map
     /// pane and the job's own overlay draw the stored map, the overlay
-    /// blending the rainbow over a three-sample composite. `None`, with nothing
-    /// rendered or uploaded, when the job is stale -- issued before a source,
-    /// plane or device change or before a newer job for the pane published --
-    /// or when there is no device.
+    /// blending the rainbow over a three-sample composite. `None`, with
+    /// nothing rendered or uploaded, when the job is stale -- issued before a
+    /// source, plane or device change or before a newer job for the pane
+    /// published -- or when there is no device.
     pub fn publish_edited(
         &mut self,
         job: &PaneJob,

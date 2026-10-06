@@ -3139,9 +3139,10 @@ impl AppController {
 
     /// Called by every repaint before it reads anything else: takes the
     /// active tab's live stroke's newest segment, if any, and queues exactly
-    /// that segment's footprint for rendering into the resident tiles -- the whole path so far blended over the pre-stroke
-    /// samples -- one tick per repaint, never per motion event. A no-op with
-    /// no live stroke or no motion since the last flush.
+    /// that segment's footprint for rendering into the resident tiles -- the
+    /// whole path so far blended over the pre-stroke samples -- one tick per
+    /// repaint, never per motion event. A no-op with no live stroke or no
+    /// motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
         let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
@@ -3188,10 +3189,10 @@ impl AppController {
             .push(region);
     }
 
-    /// `Paint`'s `End`: flushes remaining motion, then appends the stroke's resampled path unless its footprint is empty or
-    /// off-image. Re-renders every resident tile the ticks or the appended
-    /// stroke touched from its pre-stroke samples with the resampled path
-    /// blended over them.
+    /// `Paint`'s `End`: flushes remaining motion, then appends the stroke's
+    /// resampled path unless its footprint is empty or off-image. Re-renders
+    /// every resident tile the ticks or the appended stroke touched from its
+    /// pre-stroke samples with the resampled path blended over them.
     fn paint_end(&mut self) {
         self.flush_live_stroke();
         let wake = self.recomposite_wake();
