@@ -109,6 +109,31 @@ fn seal_fixture_ex(
     let (out_width, out_height) = crop.map_or((FRAME_W, FRAME_H), |r| (r.width, r.height));
     let staging = dir.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
+    let registration = Registration {
+        transforms,
+        crop,
+        equalization: None,
+    };
+    let zmap: Vec<u16> = (0..(out_width * out_height) as usize)
+        .map(|i| (i % frame_count) as u16)
+        .collect();
+    // The stored composite is the gather of the Z-Map, so an export from the
+    // stored image and an export gathered from the Z-Map agree.
+    let stack = TiffStack::open_files(&source_paths).unwrap();
+    let warping = WarpingReader::new(
+        &stack,
+        (FRAME_W, FRAME_H),
+        SPP,
+        registration.transforms(frame_count),
+    );
+    let sources = Sources {
+        reader: &warping,
+        frame_count: frame_count as u32,
+        samples_per_pixel: SPP,
+        origin: registration.origin(),
+    };
+    let mut gathered = vec![0u16; zmap.len()];
+    recomposite(&zmap, full(out_width, out_height), &sources, &mut gathered).unwrap();
     let composite_path = staging.join("composite.tif");
     let mut writer = TiffWriter::create(
         &composite_path,
@@ -121,17 +146,11 @@ fn seal_fixture_ex(
     )
     .unwrap();
     writer
-        .write_tile(
-            full(out_width, out_height),
-            &vec![9000u16; (out_width * out_height) as usize],
-        )
+        .write_tile(full(out_width, out_height), &gathered)
         .unwrap();
     writer.finish().unwrap();
 
     let zmap_path = staging.join("zmap.tif");
-    let zmap: Vec<u16> = (0..(out_width * out_height) as usize)
-        .map(|i| (i % frame_count) as u16)
-        .collect();
     let mut map = ZMapWriter::create(
         &zmap_path,
         ZMapInfo::new(out_width, out_height, frame_count as u32).unwrap(),
@@ -140,11 +159,6 @@ fn seal_fixture_ex(
     map.write_tile(full(out_width, out_height), &zmap).unwrap();
     map.finish().unwrap();
 
-    let registration = Registration {
-        transforms,
-        crop,
-        equalization: None,
-    };
     let project_path = dir.join(format!("fixture.{}", project::PROJECT_EXTENSION));
     let sealed = project::seal(SealRequest {
         project_path: &project_path,

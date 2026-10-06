@@ -12,11 +12,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use focusforge_core::io::frame_paths;
-use focusforge_core::job::JobControl;
-use focusforge_core::params::ParamValues;
-use focusforge_core::pipeline::{
-    AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, StageObserver,
-};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, Opened, ParentRef,
@@ -44,9 +39,6 @@ struct Figure {
     scenario: &'static str,
     warm: f64,
 }
-
-struct NoopObserver;
-impl StageObserver for NoopObserver {}
 
 /// Drops `paths` from the page cache, returning how many files it handled.
 #[cfg(target_os = "linux")]
@@ -137,39 +129,8 @@ fn held_result(frames: &[PathBuf]) -> HeldCheckpoint {
 
     println!("fusing {} frames", frames.len());
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&hold).expect("the held directory must be creatable");
     let algorithm = registry::default_stack().expect("a default stack algorithm is registered");
-    let request = FuseRequest {
-        frames: frames.to_vec(),
-        output: FuseOutput::Hold(hold),
-        scratch_root: dir.join("scratch"),
-        staging_key: "save_timing".to_string(),
-        algorithm,
-        explicit: ParamValues::new(),
-        align: Some(AlignRequest {
-            algorithm: registry::default_align().expect("a default aligner is registered"),
-            explicit: ParamValues::new(),
-            // The fixture's frames do not converge; a failed frame keeps the identity.
-            lax: true,
-        }),
-        crop: true,
-        equalize: project::equalization_bound(&project::params_for(algorithm), &ParamValues::new()),
-        tile_size: None,
-        max_host_memory: None,
-        backend: None,
-        align_backend: None,
-        resume: false,
-        cache: true,
-        poll: Duration::from_millis(50),
-    };
-    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
-        .expect("the fusion must complete");
-    let FuseOutcome::Completed(report) = outcome else {
-        panic!("the fusion was cancelled");
-    };
-    let FuseProduct::Held(held) = report.product else {
-        panic!("a hold request must report a held checkpoint");
-    };
+    let held = common::fuse_held(frames, algorithm.id(), true, &dir);
     // Written last: a fusion that stopped early leaves nothing a rerun trusts.
     std::fs::write(
         &record,
@@ -268,7 +229,7 @@ fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
             let image = CheckpointImage::prepare(&project, &head_id).expect("the head prepares");
             let mut first = None;
             image
-                .render(&mut project, &mut |_, _| {
+                .render(Some(&mut project), image.full(), &mut |_, _| {
                     first.get_or_insert_with(Instant::now);
                     Ok(())
                 })

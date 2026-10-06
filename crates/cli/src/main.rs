@@ -249,9 +249,10 @@ enum Command {
         /// Write the Z-Map to this path.
         #[arg(long, value_name = "FILE")]
         zmap: Option<PathBuf>,
-        /// A checkpoint id or unique id prefix. Defaults to the head. Every
-        /// image export re-reads and verifies the nearest fused ancestor's
-        /// source frames; `--zmap` alone needs none.
+        /// A checkpoint id or unique id prefix. Defaults to the head. An
+        /// unedited image export needs no source frames; an edited one
+        /// re-reads and verifies the nearest fused ancestor's. `--zmap`
+        /// alone needs none.
         #[arg(long, value_name = "ID")]
         checkpoint: Option<String>,
         /// `--format` and its per-format flags: what `-o`'s image is

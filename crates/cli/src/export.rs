@@ -8,11 +8,12 @@
 //!
 //! Two properties this module exists to keep:
 //!
-//! - **The Z-Map gathers the image.** `-o` writes a per-pixel gather of the
-//!   checkpoint's own Z-Map over its verified source frames, encoded as
-//!   `--format` and its per-format flags say. The default
-//!   (`--format tiff --tiff-bits 16 --tiff-compression none`, which an
-//!   extension-less or `.tif`/`.tiff` `-o` also selects) writes a
+//! - **The stored image is exported.** `-o` writes the checkpoint's own
+//!   image, the one the viewer shows, encoded as `--format` and its
+//!   per-format flags say. An unedited checkpoint reads no source frame; an
+//!   edited one re-reads and verifies its fused ancestor's frames. The
+//!   default (`--format tiff --tiff-bits 16 --tiff-compression none`, which
+//!   an extension-less or `.tif`/`.tiff` `-o` also selects) writes a
 //!   twelve-tag uncompressed IFD.
 //! - **A warning, never a silence.** A project whose sources cannot be
 //!   resolved relatively names every one of them on stderr and still writes
@@ -350,8 +351,9 @@ pub fn run(
     if !unresolved.is_empty() {
         let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
-             because the path was recorded as given or because it is no longer there. An image \
-             export re-reads every source frame and fails below if one is missing or changed:",
+             because the path was recorded as given or because it is no longer there. An unedited image \
+             export reads no source frame; an edited one re-reads its fused ancestor's frames \
+             and fails below if one is missing or changed:",
             unresolved.len()
         );
         eprintln!("{warning}");

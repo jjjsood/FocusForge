@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Renders any checkpoint's image, fused or op-bearing, band by band.
+//! Renders a checkpoint's or a held result's image, band by band.
 //!
-//! The view render ([`CheckpointImage::prepare`], [`render_checkpoint`])
-//! streams a fused checkpoint's own composite, splicing an op-bearing one's
-//! replayed-Z-Map edits over its nearest fused ancestor's composite. The
-//! export render ([`CheckpointImage::prepare_export`],
-//! [`super::export::export_checkpoint`]) reads no stored composite: every
-//! checkpoint, fused included, gathers its own Z-Map over that ancestor's
-//! aligned, cropped sources.
+//! One render serves the view ([`render_checkpoint`]), the export
+//! ([`super::export::export_checkpoint`], [`super::export::export_held`])
+//! and any tile of either. A fused checkpoint streams its stored composite
+//! and a held result its composite TIFF, reading no source frame; an
+//! op-bearing checkpoint splices its replayed-Z-Map edits over its nearest
+//! fused ancestor's composite.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::align::{Registration, WarpingReader};
 use crate::equalize::GainReader;
-use crate::io::{FrameSet, TiffSpec, TiffWriter, open_frame_set};
+use crate::io::{FrameSet, TiffSpec, TiffStack, TiffWriter, open_frame_set};
 use crate::retouch::{RetouchError, Sources, recomposite, recomposite_bands};
 use crate::tile::{HostBudget, Rect};
 use crate::zmap::{NO_SOURCE, ZMapReader};
@@ -24,14 +23,15 @@ use super::checkpoint::{Checkpoint, FuseRecord};
 use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::PlaneRef;
+use super::seal::HeldCheckpoint;
 use super::validate::check_sources;
-use super::{Project, materialize_zmap};
+use super::{Project, READ_BAND_BYTES, materialize_zmap};
 
 /// Rows per band of the export gather.
 const GATHER_ROWS: u32 = 256;
 
 /// A checkpoint's rendered image, resolved and shape-checked but not yet
-/// streamed: every refusal [`Self::prepare`] or [`Self::prepare_export`] can
+/// streamed: every refusal [`Self::prepare`] or [`Self::prepare_held`] can
 /// produce has already happened by the time this exists, so a caller can
 /// allocate an output from [`Self::width`]/[`Self::height`] before
 /// [`Self::render`] reads or writes a single sample.
@@ -52,12 +52,8 @@ enum Body {
         ancestor_checkpoint: Box<Checkpoint>,
         ancestor: Box<FuseRecord>,
     },
-    /// Gathers `checkpoint`'s own Z-Map over `record`'s sources; no stored
-    /// composite is read.
-    Gather {
-        checkpoint: Box<Checkpoint>,
-        record: Box<FuseRecord>,
-    },
+    /// Streams a held result's composite TIFF; no project is read.
+    Held(PathBuf),
     /// Gathers a caller-supplied Z-Map file over `source`'s sources -- no
     /// project is read at all. Only [`CheckpointImage::prepare_zmap`]
     /// produces this variant, and only [`CheckpointImage::render_external`]
@@ -104,7 +100,7 @@ impl CheckpointImage {
         }
     }
 
-    /// The view render. Resolves `id` against `project`, refusing an unknown
+    /// The render of a saved checkpoint. Resolves `id` against `project`, refusing an unknown
     /// id ([`ProjectError::UnknownCheckpoint`]). A fused
     /// checkpoint needs no source frames; an op-bearing one is also refused
     /// for unrecorded alignment ([`ProjectError::RenderAlignmentUnrecorded`])
@@ -131,22 +127,28 @@ impl CheckpointImage {
         ))
     }
 
-    /// The export render. Resolves `id` like [`Self::prepare`], but refuses
-    /// unrecorded alignment and missing or changed sources for every
-    /// checkpoint, fused included, since each one is gathered from its own
-    /// Z-Map.
-    pub fn prepare_export(project: &Project, id: &str) -> Result<Self, ProjectError> {
-        let checkpoint = project.history().get(id)?.clone();
-        let record = project.fuse_state(id)?;
-        check_renderable(project, &checkpoint, &record)?;
-        let composite = record.composite.clone();
-        Ok(Self::shaped(
-            &composite,
-            Body::Gather {
-                checkpoint: Box::new(checkpoint),
-                record: Box::new(record),
-            },
-        ))
+    /// The render of a held result: its composite TIFF, with no project and
+    /// no source frame.
+    pub fn prepare_held(held: &HeldCheckpoint) -> Result<Self, ProjectError> {
+        let stack = TiffStack::open_files(std::slice::from_ref(&held.composite))
+            .map_err(|err| ProjectError::container(&held.composite, err))?;
+        if stack.dimensions() != (held.width, held.height) {
+            let (width, height) = stack.dimensions();
+            return Err(ProjectError::container(
+                &held.composite,
+                format!(
+                    "the held composite is {width}x{height}, not the recorded {}x{}",
+                    held.width, held.height
+                ),
+            ));
+        }
+        Ok(CheckpointImage {
+            width: held.width,
+            height: held.height,
+            samples_per_pixel: stack.header(0).samples_per_pixel,
+            description: held.composite_description.clone(),
+            body: Body::Held(held.composite.clone()),
+        })
     }
 
     /// The live export render, over a Z-Map file the caller already has
@@ -174,24 +176,56 @@ impl CheckpointImage {
         })
     }
 
-    /// Streams the image top-to-bottom, full-width band by band. `sink`
+    /// The whole image as one tile.
+    pub fn full(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// Streams `tile` of the image top-to-bottom, band by band. `sink`
     /// receives each band's samples and the rect they cover, in image
-    /// coordinates. Only for an image [`Self::prepare`] or
-    /// [`Self::prepare_export`] produced; [`Self::render_external`] is
-    /// [`Self::prepare_zmap`]'s counterpart.
+    /// coordinates, always inside `tile`. A saved image reads its whole
+    /// plane even for a small tile, so its stored hash is still verified;
+    /// a held image reads only the rows `tile` covers. `project` is needed
+    /// for a saved image and unused for a held one. Only for an image
+    /// [`Self::prepare`] or [`Self::prepare_held`] produced;
+    /// [`Self::render_external`] is [`Self::prepare_zmap`]'s counterpart.
     pub fn render(
         &self,
-        project: &mut Project,
+        project: Option<&mut Project>,
+        tile: Rect,
         sink: &mut RenderSink<'_>,
     ) -> Result<(), ProjectError> {
+        assert_eq!(
+            self.full().intersect(tile),
+            Some(tile),
+            "the tile must be a non-empty rectangle inside the image"
+        );
+        let spp = self.samples_per_pixel;
         match &self.body {
-            Body::Fused(composite) => stream_plane_to_sink(project, composite, sink),
+            Body::Fused(composite) => {
+                let project = project.expect("a saved checkpoint renders against its project");
+                stream_plane_to_sink(project, composite, &mut crop_bands(tile, spp, sink))
+            }
             Body::OpBearing {
                 checkpoint,
                 ancestor_checkpoint,
                 ancestor,
-            } => render_op_bearing(project, checkpoint, ancestor_checkpoint, ancestor, sink),
-            Body::Gather { checkpoint, record } => render_gather(project, checkpoint, record, sink),
+            } => {
+                let project = project.expect("a saved checkpoint renders against its project");
+                render_op_bearing(
+                    project,
+                    checkpoint,
+                    ancestor_checkpoint,
+                    ancestor,
+                    &mut crop_bands(tile, spp, sink),
+                )
+            }
+            Body::Held(composite) => render_held(composite, spp, tile, sink),
             Body::External { .. } => {
                 unreachable!(
                     "only prepare_zmap produces an External body, rendered through render_external"
@@ -333,6 +367,66 @@ fn gather_sources<'a>(
     }
 }
 
+/// A sink handing `sink` only the part of each band that lies inside `tile`.
+fn crop_bands<'a, 'b>(
+    tile: Rect,
+    samples_per_pixel: u32,
+    sink: &'a mut RenderSink<'b>,
+) -> impl FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a {
+    let spp = samples_per_pixel as usize;
+    let mut scratch: Vec<u16> = Vec::new();
+    move |band, rect| {
+        let Some(part) = tile.intersect(rect) else {
+            return Ok(());
+        };
+        let row = rect.width as usize * spp;
+        let first = (part.y - rect.y) as usize * row;
+        if part.x == rect.x && part.width == rect.width {
+            return sink(&band[first..first + part.height as usize * row], part);
+        }
+        let len = part.width as usize * spp;
+        let column = (part.x - rect.x) as usize * spp;
+        scratch.clear();
+        for r in 0..part.height as usize {
+            let start = first + r * row + column;
+            scratch.extend_from_slice(&band[start..start + len]);
+        }
+        sink(&scratch, part)
+    }
+}
+
+/// Streams `tile` of the TIFF at `path` in bands of at most
+/// [`READ_BAND_BYTES`], reading only the rows the tile covers.
+fn render_held(
+    path: &Path,
+    samples_per_pixel: u32,
+    tile: Rect,
+    sink: &mut RenderSink<'_>,
+) -> Result<(), ProjectError> {
+    let stack = TiffStack::open_files(&[path.to_path_buf()])
+        .map_err(|err| ProjectError::container(path, err))?;
+    let row_samples = tile.width as usize * samples_per_pixel as usize;
+    let rows = (READ_BAND_BYTES / (row_samples * 2)).clamp(1, tile.height as usize) as u32;
+    let mut band = vec![0u16; row_samples * rows as usize];
+    let end = tile.y + tile.height;
+    let mut y = tile.y;
+    while y < end {
+        let rect = Rect {
+            x: tile.x,
+            y,
+            width: tile.width,
+            height: rows.min(end - y),
+        };
+        let samples = &mut band[..row_samples * rect.height as usize];
+        stack
+            .read_tile_into(0, rect, samples)
+            .map_err(|err| ProjectError::container(path, err))?;
+        sink(samples, rect)?;
+        y += rect.height;
+    }
+    Ok(())
+}
+
 /// [`Project::read_plane_ref_into`], with a sink that can fail -- what the
 /// fused body streams into, and what the op-bearing body reads the
 /// ancestor's composite bands through.
@@ -380,55 +474,7 @@ impl From<RetouchError> for GatherError {
     }
 }
 
-/// `checkpoint`'s own materialized Z-Map, gathered band by band over
-/// `record`'s aligned, cropped sources.
-fn render_gather(
-    project: &mut Project,
-    checkpoint: &Checkpoint,
-    record: &FuseRecord,
-    sink: &mut RenderSink<'_>,
-) -> Result<(), ProjectError> {
-    let zmap_path = temp_zmap_path(&checkpoint.zmap_blob);
-    let outcome = (|| -> Result<(), ProjectError> {
-        materialize_zmap(project, checkpoint, &zmap_path)?;
-        let zmap =
-            ZMapReader::open(&zmap_path).map_err(|err| ProjectError::container(&zmap_path, err))?;
-        let paths: Vec<PathBuf> = record
-            .sources
-            .iter()
-            .map(|s| project.source_path(s))
-            .collect();
-        let set = open_checkpoint_sources(project, checkpoint, &paths, record)?;
-        let gained = GainReader::new(&*set.reader, record.registration.gains());
-        let warping = warp(
-            &set,
-            &gained,
-            &record.registration,
-            record.sources.len(),
-            record.composite.samples_per_pixel,
-        );
-        let sources = gather_sources(
-            &warping,
-            record.sources.len() as u32,
-            record.composite.samples_per_pixel,
-            &record.registration,
-        );
-        recomposite_bands(&zmap, &sources, GATHER_ROWS, |rect, _, samples| {
-            sink(samples, rect).map_err(GatherError::Sink)
-        })
-        .map_err(|err| match err {
-            GatherError::Retouch(err) => ProjectError::container(project.path(), err),
-            GatherError::Sink(err) => err,
-        })
-    })();
-    let _ = std::fs::remove_file(&zmap_path);
-    outcome
-}
-
-/// `zmap_path`'s Z-Map, gathered band by band over `source`'s sources --
-/// [`render_gather`]'s counterpart for a Z-Map that is not a checkpoint's
-/// own materialized one, so there is no temp file of this function's own to
-/// clean up.
+/// `zmap_path`'s Z-Map, gathered band by band over `source`'s sources.
 fn render_external_body(
     zmap_path: &Path,
     source: &ZmapSource,
@@ -562,13 +608,17 @@ fn render_op_bearing(
     outcome
 }
 
-/// The view render as a TIFF: [`CheckpointImage::prepare`] then
+/// A saved checkpoint's image as a TIFF: [`CheckpointImage::prepare`] then
 /// [`CheckpointImage::render`] into a `.partial` sibling of `path`, renamed
 /// onto it only once every band has been written; removed instead on any
 /// error, so a refused or interrupted render leaves nothing behind.
 pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
     let image = CheckpointImage::prepare(project, id)?;
-    write_tiff(&image, &mut |sink| image.render(project, sink), path)
+    write_tiff(
+        &image,
+        &mut |sink| image.render(Some(&mut *project), image.full(), sink),
+        path,
+    )
 }
 
 /// The default 16-bit uncompressed TIFF encoder: the view render's only

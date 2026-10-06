@@ -197,23 +197,22 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
     (project_path, sealed.checkpoint, child.checkpoint)
 }
 
-type Prepare = fn(&Project, &str) -> Result<CheckpointImage, ProjectError>;
-
-/// Peak live-heap growth across `prepare` plus [`CheckpointImage::render`]
-/// into a discarding sink, at `height`, of the root (`fused`) or its
-/// op-bearing child. Asserts the image spans more than one band, the case
-/// that exercises band-bounded memory rather than a single-shot allocation.
-fn peak_growth_for(height: u32, prepare: Prepare, fused: bool) -> usize {
+/// Peak live-heap growth across [`CheckpointImage::prepare`] plus
+/// [`CheckpointImage::render`] of the whole image into a discarding sink, at
+/// `height`, of the root (`fused`) or its op-bearing child. Asserts the image
+/// spans more than one band, the case that exercises band-bounded memory
+/// rather than a single-shot allocation.
+fn peak_growth_for(height: u32, fused: bool) -> usize {
     let (project_path, root_id, child_id) =
         seal_op_bearing(&format!("checkpoint_render_memory_{height}"), height);
     let checkpoint_id = if fused { root_id } else { child_id };
     let mut project = Project::open(&project_path).unwrap();
 
     reset_peak();
-    let image = prepare(&project, &checkpoint_id).expect("prepare must succeed");
+    let image = CheckpointImage::prepare(&project, &checkpoint_id).expect("prepare must succeed");
     let mut bands = 0u32;
     image
-        .render(&mut project, &mut |_samples, _rect| {
+        .render(Some(&mut project), image.full(), &mut |_samples, _rect| {
             bands += 1;
             Ok(())
         })
@@ -225,9 +224,9 @@ fn peak_growth_for(height: u32, prepare: Prepare, fused: bool) -> usize {
     peak_growth_since_reset()
 }
 
-fn assert_independent_of_height(label: &str, prepare: Prepare, fused: bool, short_height: u32) {
-    let short = peak_growth_for(short_height, prepare, fused);
-    let tall = peak_growth_for(5600, prepare, fused);
+fn assert_independent_of_height(label: &str, fused: bool, short_height: u32) {
+    let short = peak_growth_for(short_height, fused);
+    let tall = peak_growth_for(5600, fused);
     let diff = short.abs_diff(tall);
     assert!(
         diff < 1 << 20,
@@ -329,11 +328,8 @@ fn export_growths_at(height: u32) -> Vec<(String, usize)> {
 // allocator count.
 #[test]
 fn peak_growth_is_independent_of_height() {
-    assert_independent_of_height("op-bearing view", CheckpointImage::prepare, false, 1400);
-    // Materializing the Z-Map reads it in 4 MiB bands, 2048 rows at this
-    // width, and dominates the export's peak; both heights span more than
-    // one such band.
-    assert_independent_of_height("fused export", CheckpointImage::prepare_export, true, 2800);
+    assert_independent_of_height("op-bearing render", false, 1400);
+    assert_independent_of_height("fused render", true, 2800);
 
     let short = export_growths_at(2800);
     let tall = export_growths_at(5600);

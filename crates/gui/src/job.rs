@@ -806,7 +806,9 @@ pub enum ExportSource {
     /// A saved checkpoint: reopens `project_path` and calls
     /// [`project::export_checkpoint`].
     Saved { project_path: PathBuf, id: String },
-    /// A held row's own state -- not yet in any `.ffp`.
+    /// A held row's own state -- not yet in any `.ffp`: exports its
+    /// composite through [`project::export_held`], with no project; the
+    /// reference frame is read only for its metadata.
     Held(HeldCheckpoint),
     /// The active tab's edit session applied over its current row: a clone
     /// of `EditSession::indices()`, the map's own shape, and the row's own
@@ -855,13 +857,7 @@ pub fn export_position(
             project::export_checkpoint(&mut project, &id, path, options, metadata)?;
         }
         ExportSource::Held(held) => {
-            let zmap_source = project::ZmapSource {
-                reference: held.align.as_ref().map_or(0, |a| a.reference),
-                sources: held.sources,
-                registration: held.registration,
-                description: held.composite_description,
-            };
-            project::export_zmap(&held.zmap, &zmap_source, path, options, metadata)?;
+            project::export_held(&held, path, options, metadata)?;
         }
         ExportSource::Live {
             width,
@@ -983,7 +979,7 @@ fn export_frame_line(line: &str) -> String {
 }
 
 /// The export modal's own refusal lines: one per source for a missing or
-/// changed frame (a saved checkpoint's own recorded sources, or a held/live
+/// changed frame (a saved checkpoint's own recorded sources, or a live
 /// export's plain paths, which can only ever be `missing`), naming the
 /// underlying cause for anything else -- an unwritable destination above
 /// all.

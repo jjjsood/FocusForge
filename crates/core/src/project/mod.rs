@@ -72,7 +72,7 @@ pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::partial_path;
 use container::{ContainerWriter, Index};
 pub use error::ProjectError;
-pub use export::{export_checkpoint, export_zmap};
+pub use export::{export_checkpoint, export_held, export_zmap};
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,

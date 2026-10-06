@@ -1009,9 +1009,31 @@ fn located_frames_are_checked_by_content() {
     assert_eq!(right.changed.len(), 0);
 }
 
+/// Appends a one-point stroke under the head: an op-bearing head is the only
+/// state whose render reads source frames.
+fn append_stroke(project_path: &Path) {
+    let head = Project::open(project_path).unwrap().checkpoint().id.clone();
+    let stroke = project::Op::BrushStroke {
+        source_id: 1,
+        path: vec![project::Point { x: 4, y: 4 }],
+        radius: 2.0,
+        softness: 0.0,
+    };
+    project::append_ops_onto(
+        project_path,
+        &head,
+        vec![stroke],
+        None,
+        1,
+        project::ZMapStorage::Bounded,
+    )
+    .expect("the stroke must append");
+}
+
 #[test]
 fn relocated_sources_are_read_from_the_located_folder() {
     let (dir, project_path) = sealed("import_validation_relocate_sources", 32, 24, 3);
+    append_stroke(&project_path);
     let copy_dir = tmp_dir("import_validation_relocate_sources_copy");
     let copied_project = copy_dir.join(project_path.file_name().unwrap());
     std::fs::copy(&project_path, &copied_project).unwrap();
@@ -1023,16 +1045,18 @@ fn relocated_sources_are_read_from_the_located_folder() {
     };
     let head_id = project.checkpoint().id.clone();
     assert!(
-        project::CheckpointImage::prepare_export(&project, &head_id).is_err(),
-        "export must refuse sources it cannot find"
+        project::CheckpointImage::prepare(&project, &head_id).is_err(),
+        "an edited render must refuse sources it cannot find"
     );
 
     let before = std::fs::read(&copied_project).unwrap();
     project.relocate_sources(dir.clone());
-    let image = project::CheckpointImage::prepare_export(&project, &head_id)
+    let image = project::CheckpointImage::prepare(&project, &head_id)
         .expect("a located folder must resolve every source");
     image
-        .render(&mut project, &mut |_samples, _rect| Ok(()))
+        .render(Some(&mut project), image.full(), &mut |_samples, _rect| {
+            Ok(())
+        })
         .expect("render must read the located folder's frames");
     assert_eq!(
         std::fs::read(&copied_project).unwrap(),
@@ -1222,6 +1246,7 @@ fn touched_source_rehashes_once_and_stays_ready() {
 #[test]
 fn missing_and_changed_sources_are_reported() {
     let (dir, project_path) = sealed("import_validation_missing_changed", 32, 24, 3);
+    append_stroke(&project_path);
     let paths = source_paths(&project_path);
 
     std::fs::remove_file(&paths[0]).unwrap();
@@ -1239,7 +1264,7 @@ fn missing_and_changed_sources_are_reported() {
 
     let project = pending.proceed();
     let head = project.checkpoint().id.clone();
-    let refusal = match project::CheckpointImage::prepare_export(&project, &head) {
+    let refusal = match project::CheckpointImage::prepare(&project, &head) {
         Err(refusal) => refusal.to_string(),
         Ok(_) => panic!("a render over missing and changed frames must be refused"),
     };
