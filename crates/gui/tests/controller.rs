@@ -4663,8 +4663,8 @@ fn selected_frame_pixel(c: &AppController, x: u32, y: u32) -> Vec<u16> {
 
 /// A drag over the left pane and the same drag shifted to the cursor's
 /// mirrored point over the right pane append equal ops and show equal pixels,
-/// at fit, one zoom step in, after a pan and with a wider gutter; the left pane's frame is
-/// never written.
+/// at fit, one zoom step in, after a pan and with a wider gutter; the left
+/// pane's frame is never written.
 #[test]
 fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
     let (mut c, _) = open_editor("mirrored_brush_either_pane");
