@@ -8,16 +8,17 @@
 //! and a held result its composite TIFF, reading no source frame; an
 //! op-bearing checkpoint blends its brush strokes, in log order, over its
 //! nearest fused ancestor's composite, reading source frames only for a tile
-//! some stroke meets.
+//! some stroke meets. A [`PendingState`] -- a composite plus strokes not yet
+//! saved -- renders the same way, with no project.
 
 use std::path::{Path, PathBuf};
 
 use crate::align::{Registration, WarpingReader};
 use crate::equalize::GainReader;
 use crate::io::{FrameSet, TiffSpec, TiffStack, TiffWriter, open_frame_set};
-use crate::retouch::{RetouchError, Sources, blend, recomposite_bands};
+use crate::retouch::blend;
 use crate::tile::{HostBudget, Rect};
-use crate::zmap::{ZMapInfo, ZMapReader};
+use crate::zmap::ZMapInfo;
 
 use super::checkpoint::{Checkpoint, FuseRecord, Op};
 use super::container::partial_path;
@@ -26,9 +27,6 @@ use super::manifest::PlaneRef;
 use super::seal::HeldCheckpoint;
 use super::validate::check_sources;
 use super::{Project, READ_BAND_BYTES};
-
-/// Rows per band of the export gather.
-const GATHER_ROWS: u32 = 256;
 
 /// A checkpoint's rendered image, resolved and shape-checked but not yet
 /// streamed: every refusal [`Self::prepare`] or [`Self::prepare_held`] can
@@ -56,13 +54,14 @@ enum Body {
     },
     /// Streams a held result's composite TIFF; no project is read.
     Held(PathBuf),
-    /// Gathers a caller-supplied Z-Map file over `source`'s sources -- no
-    /// project is read at all. Only [`CheckpointImage::prepare_zmap`]
-    /// produces this variant, and only [`CheckpointImage::render_external`]
-    /// reads it.
-    External {
-        zmap_path: PathBuf,
-        source: ZmapSource,
+    /// Blends `strokes` over the TIFF at `composite`, reading `sources` only
+    /// for a tile some stroke meets; no project is read.
+    Pending {
+        composite: PathBuf,
+        sources: Vec<PathBuf>,
+        registration: Registration,
+        info: ZMapInfo,
+        strokes: Vec<PlacedStroke>,
     },
 }
 
@@ -74,12 +73,14 @@ struct PlacedStroke {
     footprint: Rect,
 }
 
-/// A Z-Map file's placement: the sources it was gathered from, in frame
-/// order, and their alignment -- the live counterpart of a checkpoint's own
-/// [`FuseRecord`], for a Z-Map that has no project of its own (a held row's
-/// staged map, or an edit session's Z-Map written to a temp file).
+/// An image not yet saved: the TIFF at `composite` with the brush strokes
+/// `ops` applied over it, in order, from `sources`' frames read through
+/// `registration`. It has no project of its own.
 #[derive(Debug, Clone)]
-pub struct ZmapSource {
+pub struct PendingState {
+    pub composite: PathBuf,
+    pub ops: Vec<Op>,
+    /// The source frames, in frame order.
     pub sources: Vec<PathBuf>,
     pub registration: Registration,
     /// Index into `sources` the export's EXIF and ICC are read from.
@@ -94,9 +95,8 @@ pub struct ZmapSource {
 pub(super) type RenderSink<'a> = dyn FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a;
 
 /// Bound to whatever produced the [`CheckpointImage`] being written -- a
-/// live project or a caller-supplied Z-Map file -- so a writer function
-/// need not know which; built once per render/export call as `|sink|
-/// image.render(...)`.
+/// live project or a [`PendingState`] -- so a writer function need not know
+/// which; built once per render/export call as `|sink| image.render(...)`.
 pub(super) type Renderer<'a> = dyn FnMut(&mut RenderSink<'_>) -> Result<(), ProjectError> + 'a;
 
 impl CheckpointImage {
@@ -143,21 +143,7 @@ impl CheckpointImage {
             record.sources.len() as u32,
         )
         .map_err(|err| ProjectError::container(project.path(), err))?;
-        let mut strokes = Vec::new();
-        for (index, op) in ops.into_iter().enumerate() {
-            let footprint = blend::footprint(op, info).map_err(|err| ProjectError::Op {
-                index,
-                source: Box::new(err),
-            })?;
-            let Op::BrushStroke { source_id, .. } = op;
-            if let Some(footprint) = footprint {
-                strokes.push(PlacedStroke {
-                    op: op.clone(),
-                    source: usize::from(*source_id),
-                    footprint,
-                });
-            }
-        }
+        let strokes = place_strokes(ops.into_iter(), info)?;
         Ok(Self::shaped(
             &composite,
             Body::Ops {
@@ -192,27 +178,34 @@ impl CheckpointImage {
         })
     }
 
-    /// The live export render, over a Z-Map file the caller already has
-    /// (a held row's staged map, or an edit session's Z-Map written to a
-    /// temp file) rather than a checkpoint history entry. Refuses a missing
-    /// or unreadable source the way [`open_frame_set`] does; there is no
-    /// stored fingerprint to check against, since `source.sources` are
-    /// plain paths rather than hash-committed [`super::manifest::SourceRef`]s.
-    pub fn prepare_zmap(zmap_path: &Path, source: &ZmapSource) -> Result<Self, ProjectError> {
-        let zmap =
-            ZMapReader::open(zmap_path).map_err(|err| ProjectError::container(zmap_path, err))?;
-        let (width, height) = zmap.dimensions();
-        check_zmap_sources(&source.sources, zmap_path)?;
-        let set = open_sources(&source.sources, zmap_path)?;
-        let samples_per_pixel = set.reader.stack_context().samples_per_pixel;
+    /// The render of a [`PendingState`]: its composite with every stroke
+    /// blended over it. Refuses an op that is no valid brush stroke
+    /// ([`ProjectError::Op`]), a missing source
+    /// ([`ProjectError::ExportSourcesUnavailable`]) and a composite or source
+    /// that cannot be read. A source has no stored fingerprint to check
+    /// against, so a changed file is not detected.
+    pub fn prepare_pending(state: &PendingState) -> Result<Self, ProjectError> {
+        let composite = &state.composite;
+        let stack = TiffStack::open_files(std::slice::from_ref(composite))
+            .map_err(|err| ProjectError::container(composite, err))?;
+        let (width, height) = stack.dimensions();
+        let samples_per_pixel = stack.header(0).samples_per_pixel;
+        check_pending_sources(&state.sources, composite)?;
+        open_pending_sources(&state.sources, composite, samples_per_pixel)?;
+        let info = ZMapInfo::new(width, height, state.sources.len() as u32)
+            .map_err(|err| ProjectError::container(composite, err))?;
+        let strokes = place_strokes(state.ops.iter(), info)?;
         Ok(CheckpointImage {
             width,
             height,
             samples_per_pixel,
-            description: source.description.clone(),
-            body: Body::External {
-                zmap_path: zmap_path.to_path_buf(),
-                source: source.clone(),
+            description: state.description.clone(),
+            body: Body::Pending {
+                composite: composite.clone(),
+                sources: state.sources.clone(),
+                registration: state.registration.clone(),
+                info,
+                strokes,
             },
         })
     }
@@ -231,10 +224,8 @@ impl CheckpointImage {
     /// receives each band's samples and the rect they cover, in image
     /// coordinates, always inside `tile`. A saved image reads its whole
     /// plane even for a small tile, so its stored hash is still verified;
-    /// a held image reads only the rows `tile` covers. `project` is needed
-    /// for a saved image and unused for a held one. Only for an image
-    /// [`Self::prepare`] or [`Self::prepare_held`] produced;
-    /// [`Self::render_external`] is [`Self::prepare_zmap`]'s counterpart.
+    /// a held or pending image reads only the rows `tile` covers. `project`
+    /// is needed for a saved image and unused for the others.
     pub fn render(
         &self,
         project: Option<&mut Project>,
@@ -261,20 +252,21 @@ impl CheckpointImage {
                 render_ops(project, checkpoint, ancestor, strokes, tile, sink)
             }
             Body::Held(composite) => render_held(composite, spp, tile, sink),
-            Body::External { .. } => {
-                unreachable!(
-                    "only prepare_zmap produces an External body, rendered through render_external"
-                )
-            }
-        }
-    }
-
-    /// [`Self::render`]'s counterpart for an image [`Self::prepare_zmap`]
-    /// produced: no project is read.
-    pub fn render_external(&self, sink: &mut RenderSink<'_>) -> Result<(), ProjectError> {
-        match &self.body {
-            Body::External { zmap_path, source } => render_external_body(zmap_path, source, sink),
-            _ => unreachable!("only an External body is rendered through render_external"),
+            Body::Pending {
+                composite,
+                sources,
+                registration,
+                info,
+                strokes,
+            } => render_pending(
+                composite,
+                sources,
+                registration,
+                (*info, spp),
+                strokes,
+                tile,
+                sink,
+            ),
         }
     }
 }
@@ -326,11 +318,11 @@ fn check_sources_available(
     Ok(())
 }
 
-/// Refuses `paths` (a live export's sources, plain paths with no stored
+/// Refuses `paths` (a pending state's sources, plain paths with no stored
 /// fingerprint) when any is missing on disk, one `missing: <path>` line
-/// each -- [`check_sources_available`]'s counterpart for a Z-Map that has no
+/// each -- [`check_sources_available`]'s counterpart for a state that has no
 /// checkpoint of its own to record a `changed` state against.
-fn check_zmap_sources(paths: &[PathBuf], zmap_path: &Path) -> Result<(), ProjectError> {
+fn check_pending_sources(paths: &[PathBuf], composite: &Path) -> Result<(), ProjectError> {
     let detail: Vec<String> = paths
         .iter()
         .filter(|path| !path.is_file())
@@ -340,22 +332,22 @@ fn check_zmap_sources(paths: &[PathBuf], zmap_path: &Path) -> Result<(), Project
         return Ok(());
     }
     Err(ProjectError::ExportSourcesUnavailable {
-        path: zmap_path.to_path_buf(),
+        path: composite.to_path_buf(),
         detail: detail.join("\n"),
     })
 }
 
 /// Opens `paths` with the reader their headers permit (mmap TIFF, decoded
 /// TIFF or RAW). `context_path` names the error when opening fails -- the
-/// project's own path for a checkpoint's sources, the Z-Map file's for a
-/// caller-supplied one, which has no project of its own.
+/// project's own path for a checkpoint's sources, the composite's for a
+/// pending state, which has no project of its own.
 fn open_sources(paths: &[PathBuf], context_path: &Path) -> Result<FrameSet, ProjectError> {
     open_frame_set(paths, HostBudget::host_derived(&crate::host::snapshot()))
         .map_err(|err| ProjectError::container(context_path, err))
 }
 
 /// [`open_sources`] plus the shape check a checkpoint's own recorded fuse
-/// state can make (a caller-supplied Z-Map has no such expectation to check
+/// state can make (a pending state has no such expectation to check
 /// against): the opened stack must hold exactly `record.sources.len()`
 /// frames at `record.composite.samples_per_pixel`.
 fn open_checkpoint_sources(
@@ -379,6 +371,50 @@ fn open_checkpoint_sources(
     Ok(set)
 }
 
+/// [`open_sources`] for a pending state's `paths`, refusing frames whose
+/// samples per pixel differ from `composite`'s `samples_per_pixel`.
+fn open_pending_sources(
+    paths: &[PathBuf],
+    composite: &Path,
+    samples_per_pixel: u32,
+) -> Result<FrameSet, ProjectError> {
+    let set = open_sources(paths, composite)?;
+    let found = set.reader.stack_context().samples_per_pixel;
+    if found != samples_per_pixel {
+        return Err(ProjectError::container(
+            composite,
+            format!(
+                "the source frames hold {found} samples per pixel, the composite {samples_per_pixel}"
+            ),
+        ));
+    }
+    Ok(set)
+}
+
+/// Validates each of `ops` over `info`'s map and places those that change
+/// something, in log order.
+fn place_strokes<'a>(
+    ops: impl Iterator<Item = &'a Op>,
+    info: ZMapInfo,
+) -> Result<Vec<PlacedStroke>, ProjectError> {
+    let mut strokes = Vec::new();
+    for (index, op) in ops.enumerate() {
+        let footprint = blend::footprint(op, info).map_err(|err| ProjectError::Op {
+            index,
+            source: Box::new(err),
+        })?;
+        let Op::BrushStroke { source_id, .. } = op;
+        if let Some(footprint) = footprint {
+            strokes.push(PlacedStroke {
+                op: op.clone(),
+                source: usize::from(*source_id),
+                footprint,
+            });
+        }
+    }
+    Ok(strokes)
+}
+
 /// `set`'s frames, read through `gained` (its brightness gains applied), under
 /// `registration`'s per-frame alignment (identity when there is none), for a
 /// stack of `frame_count` frames each holding `samples_per_pixel` samples.
@@ -396,20 +432,6 @@ fn warp<'a>(
         samples_per_pixel,
         transforms,
     )
-}
-
-fn gather_sources<'a>(
-    warping: &'a WarpingReader<'a>,
-    frame_count: u32,
-    samples_per_pixel: u32,
-    registration: &Registration,
-) -> Sources<'a> {
-    Sources {
-        reader: warping,
-        frame_count,
-        samples_per_pixel,
-        origin: registration.origin(),
-    }
 }
 
 /// A sink handing `sink` only the part of each band that lies inside `tile`.
@@ -495,49 +517,81 @@ fn stream_plane_to_sink(
     }
 }
 
-/// What a gather band can fail with: the gather itself, or the sink.
-enum GatherError {
-    Retouch(RetouchError),
-    Sink(ProjectError),
-}
-
-impl From<RetouchError> for GatherError {
-    fn from(err: RetouchError) -> Self {
-        GatherError::Retouch(err)
+/// A sink blending each of `strokes` that meets a band over it, in log order,
+/// from its frame read through `warping` at the crop `origin`, then handing the
+/// band to `sink`. `context` names the error when a frame read fails.
+fn blend_bands<'a, 'b>(
+    strokes: &'a [&'a PlacedStroke],
+    info: ZMapInfo,
+    warping: &'a WarpingReader<'a>,
+    origin: (u32, u32),
+    samples_per_pixel: usize,
+    context: &'a Path,
+    sink: &'a mut RenderSink<'b>,
+) -> impl FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a {
+    let mut blended: Vec<u16> = Vec::new();
+    move |band, rect| {
+        let placed: Vec<blend::PlacedStroke> = strokes
+            .iter()
+            .filter(|stroke| stroke.footprint.intersect(rect).is_some())
+            .map(|stroke| blend::PlacedStroke {
+                op: &stroke.op,
+                frame: stroke.source,
+                footprint: stroke.footprint,
+            })
+            .collect();
+        if placed.is_empty() {
+            return sink(band, rect);
+        }
+        blended.clear();
+        blended.extend_from_slice(band);
+        blend::apply_strokes(
+            info,
+            rect,
+            &mut blended,
+            &placed,
+            warping,
+            origin,
+            samples_per_pixel,
+        )
+        .map_err(|err| ProjectError::container(context, err))?;
+        sink(&blended, rect)
     }
 }
 
-/// `zmap_path`'s Z-Map, gathered band by band over `source`'s sources.
-fn render_external_body(
-    zmap_path: &Path,
-    source: &ZmapSource,
+/// `tile` of the TIFF at `composite` (`info` its map's shape, `spp` its samples
+/// per pixel), each of `strokes` the tile meets blended in over it in log
+/// order from its frame, read through the gains and alignment of
+/// `registration`.
+fn render_pending(
+    composite: &Path,
+    sources: &[PathBuf],
+    registration: &Registration,
+    (info, spp): (ZMapInfo, u32),
+    strokes: &[PlacedStroke],
+    tile: Rect,
     sink: &mut RenderSink<'_>,
 ) -> Result<(), ProjectError> {
-    let zmap =
-        ZMapReader::open(zmap_path).map_err(|err| ProjectError::container(zmap_path, err))?;
-    let set = open_sources(&source.sources, zmap_path)?;
-    let samples_per_pixel = set.reader.stack_context().samples_per_pixel;
-    let gained = GainReader::new(&*set.reader, source.registration.gains());
-    let warping = warp(
-        &set,
-        &gained,
-        &source.registration,
-        source.sources.len(),
-        samples_per_pixel,
-    );
-    let sources = gather_sources(
+    let touching: Vec<&PlacedStroke> = strokes
+        .iter()
+        .filter(|stroke| stroke.footprint.intersect(tile).is_some())
+        .collect();
+    if touching.is_empty() {
+        return render_held(composite, spp, tile, sink);
+    }
+    let set = open_pending_sources(sources, composite, spp)?;
+    let gained = GainReader::new(&*set.reader, registration.gains());
+    let warping = warp(&set, &gained, registration, sources.len(), spp);
+    let mut blend = blend_bands(
+        &touching,
+        info,
         &warping,
-        source.sources.len() as u32,
-        samples_per_pixel,
-        &source.registration,
+        registration.origin(),
+        spp as usize,
+        composite,
+        sink,
     );
-    recomposite_bands(&zmap, &sources, GATHER_ROWS, |rect, _, samples| {
-        sink(samples, rect).map_err(GatherError::Sink)
-    })
-    .map_err(|err| match err {
-        GatherError::Retouch(err) => ProjectError::container(zmap_path, err),
-        GatherError::Sink(err) => err,
-    })
+    render_held(composite, spp, tile, &mut blend)
 }
 
 /// `ancestor`'s stored composite over `tile`, each stroke the tile meets
@@ -579,44 +633,20 @@ fn render_ops(
         paths.len() as u32,
     )
     .expect("prepare built the same extent");
-    let (origin_x, origin_y) = ancestor.registration.origin();
     let project_path = project.path().to_path_buf();
-
-    let mut blended: Vec<u16> = Vec::new();
-    let mut blend_bands = |band: &[u16], rect: Rect| -> Result<(), ProjectError> {
-        let meeting: Vec<(&PlacedStroke, Rect)> = touching
-            .iter()
-            .filter_map(|&stroke| Some((stroke, stroke.footprint.intersect(rect)?)))
-            .collect();
-        if meeting.is_empty() {
-            return sink(band, rect);
-        }
-        blended.clear();
-        blended.extend_from_slice(band);
-        let placed: Vec<blend::PlacedStroke> = meeting
-            .iter()
-            .map(|&(stroke, _)| blend::PlacedStroke {
-                op: &stroke.op,
-                frame: stroke.source,
-                footprint: stroke.footprint,
-            })
-            .collect();
-        blend::apply_strokes(
-            info,
-            rect,
-            &mut blended,
-            &placed,
-            &warping,
-            (origin_x, origin_y),
-            spp as usize,
-        )
-        .map_err(|err| ProjectError::container(&project_path, err))?;
-        sink(&blended, rect)
-    };
+    let mut blend = blend_bands(
+        &touching,
+        info,
+        &warping,
+        ancestor.registration.origin(),
+        spp as usize,
+        &project_path,
+        sink,
+    );
     stream_plane_to_sink(
         project,
         &ancestor.composite,
-        &mut crop_bands(tile, spp, &mut blend_bands),
+        &mut crop_bands(tile, spp, &mut blend),
     )
 }
 

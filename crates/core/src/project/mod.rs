@@ -71,12 +71,12 @@ pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::partial_path;
 use container::{ContainerWriter, Index};
 pub use error::ProjectError;
-pub use export::{export_checkpoint, export_held, export_zmap};
+pub use export::{export_checkpoint, export_held, export_pending};
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-pub use render::{CheckpointImage, ZmapSource, render_checkpoint};
+pub use render::{CheckpointImage, PendingState, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest, SealedProject,

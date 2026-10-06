@@ -25,6 +25,7 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage, StageObserver,
 };
+pub use focusforge_core::project::PendingState;
 pub use focusforge_core::project::export::{
     ExportFormat, ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression,
     params_for,
@@ -33,7 +34,7 @@ use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
 use focusforge_core::retouch::{RetouchError, Sources, blend};
 pub use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
@@ -810,41 +811,24 @@ pub enum ExportSource {
     /// composite through [`project::export_held`], with no project; the
     /// reference frame is read only for its metadata.
     Held(HeldCheckpoint),
-    /// The active tab's edit session applied over its current row: a clone
-    /// of `EditSession::indices()`, the map's own shape, and the row's own
-    /// sources/registration/reference/description (`ProjectTab::fused()`
-    /// for the first two).
-    Live {
-        width: u32,
-        height: u32,
-        indices: Vec<u16>,
-        sources: Vec<PathBuf>,
-        registration: Registration,
-        reference: usize,
-        description: String,
-    },
+    /// The active tab's strokes not yet saved, over its current row's
+    /// composite: exported through [`project::export_pending`], with no
+    /// project.
+    Pending(project::PendingState),
 }
 
-/// [`export_position`]'s own error: a project/render failure, or writing a
-/// live export's temp Z-Map.
+/// [`export_position`]'s own error: a project or render failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
     #[error(transparent)]
     Project(#[from] ProjectError),
-    #[error(transparent)]
-    ZMap(#[from] ZMapError),
 }
-
-/// A process-wide counter, so two live exports started in the same process
-/// never share a temp Z-Map path.
-static NEXT_EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Writes `source`'s image to `path` as the default TIFF (16-bit
 /// uncompressed, EXIF and ICC on) -- the export modal's own worker body,
-/// run off the UI thread. A held row's or a live edit session's export
-/// changes nothing about the project: no checkpoint is written, no `.ffp`
-/// touched, and a live export's temp Z-Map is removed whether the write
-/// finishes or fails.
+/// run off the UI thread. A held row's or a pending state's export changes
+/// nothing about the project: no checkpoint is written and no `.ffp`
+/// touched.
 pub fn export_position(
     source: ExportSource,
     path: &Path,
@@ -859,59 +843,10 @@ pub fn export_position(
         ExportSource::Held(held) => {
             project::export_held(&held, path, options, metadata)?;
         }
-        ExportSource::Live {
-            width,
-            height,
-            indices,
-            sources,
-            registration,
-            reference,
-            description,
-        } => {
-            let temp = std::env::temp_dir().join(format!(
-                "focusforge-export-{}-{}.tif",
-                std::process::id(),
-                NEXT_EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let write = (|| -> Result<(), ExportError> {
-                write_zmap(&temp, width, height, sources.len() as u32, &indices)?;
-                let zmap_source = project::ZmapSource {
-                    sources,
-                    registration,
-                    reference,
-                    description,
-                };
-                project::export_zmap(&temp, &zmap_source, path, options, metadata)?;
-                Ok(())
-            })();
-            let _ = std::fs::remove_file(&temp);
-            write?;
+        ExportSource::Pending(state) => {
+            project::export_pending(&state, path, options, metadata)?;
         }
     }
-    Ok(())
-}
-
-/// Writes `indices`, a whole `width` x `height` map over `frame_count`
-/// sources, as the Z-Map file at `path`.
-pub fn write_zmap(
-    path: &Path,
-    width: u32,
-    height: u32,
-    frame_count: u32,
-    indices: &[u16],
-) -> Result<(), ZMapError> {
-    let info = ZMapInfo::new(width, height, frame_count)?;
-    let mut writer = ZMapWriter::create(path, info)?;
-    writer.write_tile(
-        Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        },
-        indices,
-    )?;
-    writer.finish()?;
     Ok(())
 }
 
@@ -1103,6 +1038,8 @@ pub struct EditState {
     pub registration: Registration,
     /// The composite the edits are blended over.
     pub base: Arc<TiffStack>,
+    /// The file `base` reads.
+    pub(crate) composite: PathBuf,
     /// The ops the row stacks over `base` before the session's own, oldest
     /// first.
     chain: Vec<Op>,
@@ -1410,6 +1347,7 @@ pub fn open_edit_session(
         sources,
         registration,
         base,
+        composite: composite.to_path_buf(),
         chain: Vec::new(),
         snapshot: tiles.subset(&[]),
         tiles,

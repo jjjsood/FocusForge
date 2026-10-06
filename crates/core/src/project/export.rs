@@ -19,7 +19,7 @@ use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, 
 
 use super::Project;
 use super::error::ProjectError;
-use super::render::{CheckpointImage, Renderer, ZmapSource, write_tiff, write_via_partial};
+use super::render::{CheckpointImage, PendingState, Renderer, write_tiff, write_via_partial};
 use super::seal::HeldCheckpoint;
 
 /// The largest side JPEG can encode: SOF0's width/height fields are 16 bits.
@@ -715,24 +715,22 @@ pub fn export_held(
     )
 }
 
-/// The live export render, over a Z-Map file `zmap` (a held row's staged
-/// map, or an edit session's Z-Map written to a temp file) plus `source`'s
-/// placement, rather than a checkpoint history entry -- otherwise exactly
-/// [`export_checkpoint`]'s own validation, metadata resolution and
-/// `.partial` discipline, through the one shared `encode` path.
-pub fn export_zmap(
-    zmap: &Path,
-    source: &ZmapSource,
+/// [`export_checkpoint`] for a [`PendingState`], strokes not yet saved: the
+/// same render, validation, metadata resolution and `.partial` discipline
+/// through the one shared `encode` path, with no project read or written.
+/// A missing source is [`ProjectError::ExportSourcesUnavailable`].
+pub fn export_pending(
+    state: &PendingState,
     path: &Path,
     options: &ExportOptions,
     metadata_options: &MetadataOptions,
 ) -> Result<MetadataOutcome, ProjectError> {
-    let image = CheckpointImage::prepare_zmap(zmap, source)?;
-    let frame = source.reference;
-    let frame_path = source.sources[frame].clone();
+    let image = CheckpointImage::prepare_pending(state)?;
+    let frame = state.reference;
+    let frame_path = state.sources[frame].clone();
     encode(
         &image,
-        &mut |sink| image.render_external(sink),
+        &mut |sink| image.render(None, image.full(), sink),
         frame,
         &frame_path,
         path,
@@ -745,7 +743,7 @@ pub fn export_zmap(
 /// `.partial` sibling of `path`, renamed onto it only once complete), and
 /// resolves `frame_path`'s metadata into the same file -- a damaged or
 /// missing block is named in the returned [`MetadataOutcome`], never fatal.
-/// Shared by [`export_checkpoint`], [`export_held`] and [`export_zmap`].
+/// Shared by [`export_checkpoint`], [`export_held`] and [`export_pending`].
 fn encode(
     image: &CheckpointImage,
     render: &mut Renderer<'_>,

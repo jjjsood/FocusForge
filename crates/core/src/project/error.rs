@@ -178,8 +178,8 @@ pub enum ProjectError {
         samples_per_pixel: u32,
     },
 
-    /// [`super::render::CheckpointImage::prepare_zmap`] found at least one of
-    /// `source.sources` missing on disk: `detail` names each, one per line,
+    /// [`super::render::CheckpointImage::prepare_pending`] found at least one of
+    /// the state's sources missing on disk: `detail` names each, one per line,
     /// `missing: <path>`. There is no stored fingerprint to compare a
     /// present file against, unlike a checkpoint's own recorded sources, so
     /// this never reports `changed`.

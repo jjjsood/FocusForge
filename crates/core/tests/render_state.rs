@@ -8,13 +8,13 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use focusforge_core::align::Registration;
+use focusforge_core::align::{Registration, Transform};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
-    Project, SealRequest,
+    Project, ProjectError, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -389,4 +389,170 @@ fn unedited_export_needs_no_sources() {
         outcome.warnings
     );
     assert_eq!(read_tiff(&saved_out).3, expected);
+}
+
+const PENDING_FRAME_W: u32 = 10;
+const PENDING_FRAME_H: u32 = 8;
+const PENDING_CROP: Rect = Rect {
+    x: 2,
+    y: 1,
+    width: 6,
+    height: 5,
+};
+
+fn pending_stroke(source_id: u16, path: &[(i32, i32)], radius: f32, softness: f32) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+        radius,
+        softness,
+    }
+}
+
+#[test]
+fn pending_state_export_equals_the_saved_export() {
+    let dir = tmp_dir("render_state_pending");
+    let sources: Vec<PathBuf> = (0..3u32)
+        .map(|i| {
+            let path = dir.join(format!("frame-{i}.tif"));
+            write_tiff(&path, PENDING_FRAME_W, PENDING_FRAME_H, 1, |s| {
+                (s as u32 + i * 1000) as u16
+            });
+            path
+        })
+        .collect();
+    let composite = dir.join("composite.tif");
+    write_tiff(
+        &composite,
+        PENDING_CROP.width,
+        PENDING_CROP.height,
+        1,
+        |s| 500 + s as u16,
+    );
+    let zmap = dir.join("zmap.tif");
+    let mut map = ZMapWriter::create(
+        &zmap,
+        ZMapInfo::new(PENDING_CROP.width, PENDING_CROP.height, 3).unwrap(),
+    )
+    .unwrap();
+    map.write_tile(
+        full(PENDING_CROP.width, PENDING_CROP.height),
+        &vec![0u16; (PENDING_CROP.width * PENDING_CROP.height) as usize],
+    )
+    .unwrap();
+    map.finish().unwrap();
+
+    let project_path = dir.join(format!("pending.{}", project::PROJECT_EXTENSION));
+    let registration = Registration {
+        transforms: vec![
+            Transform::identity(),
+            Transform::translation(1.0, 0.0),
+            Transform::translation(-1.0, 1.0),
+        ],
+        crop: Some(PENDING_CROP),
+        equalization: None,
+    };
+    let root = project::seal(SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &sources,
+        algorithm: "weighted_average",
+        params: &ParamValues::new(),
+        align: Some(project::AlignRecord {
+            algorithm: "identity".to_string(),
+            params: ParamValues::new(),
+            reference: 0,
+        }),
+        registration,
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("seal must succeed")
+    .checkpoint;
+    let saved = project::append_ops_onto(
+        &project_path,
+        &root,
+        vec![pending_stroke(1, &[(0, 0), (2, 1)], 2.0, 0.5)],
+        None,
+        1,
+    )
+    .expect("the saved stroke must append")
+    .checkpoint;
+
+    let mut project = Project::open(&project_path).unwrap();
+    let record = project.fuse_state(&saved).unwrap();
+    let base = dir.join("base.tif");
+    project::render_checkpoint(&mut project, &saved, &base).unwrap();
+    let pending_ops = vec![
+        pending_stroke(2, &[(1, 1), (4, 3)], 1.5, 0.5),
+        pending_stroke(0, &[(3, 0), (3, 4)], 2.0, 0.0),
+    ];
+    let state = project::PendingState {
+        composite: base.clone(),
+        ops: pending_ops.clone(),
+        sources: sources.clone(),
+        registration: record.registration.clone(),
+        reference: 0,
+        description: "staged composite".to_string(),
+    };
+
+    let ffp_before = std::fs::read(&project_path).unwrap();
+    let pending_out = dir.join("pending.tif");
+    project::export_pending(
+        &state,
+        &pending_out,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .expect("the pending state must export");
+    assert_eq!(
+        std::fs::read(&project_path).unwrap(),
+        ffp_before,
+        "exporting a pending state writes nothing into the project"
+    );
+
+    let appended = project::append_ops_onto(&project_path, &saved, pending_ops, None, 2)
+        .expect("the pending strokes must append")
+        .checkpoint;
+    let mut project = Project::open(&project_path).unwrap();
+    let saved_out = dir.join("saved.tif");
+    project::export_checkpoint(
+        &mut project,
+        &appended,
+        &saved_out,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&pending_out).unwrap(),
+        std::fs::read(&saved_out).unwrap(),
+        "the pending export is the saved export"
+    );
+    assert_ne!(
+        read_tiff(&pending_out).3,
+        read_tiff(&base).3,
+        "the pending strokes must change the image"
+    );
+
+    std::fs::remove_file(&sources[1]).unwrap();
+    let refused = dir.join("refused.tif");
+    let err = project::export_pending(
+        &state,
+        &refused,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .expect_err("a missing source must refuse the export");
+    let ProjectError::ExportSourcesUnavailable { detail, .. } = err else {
+        panic!("expected ExportSourcesUnavailable, got {err}");
+    };
+    assert_eq!(
+        detail,
+        format!("missing: {}", sources[1].display()),
+        "one line per missing source"
+    );
+    assert!(!refused.exists(), "a refused export leaves no file");
 }

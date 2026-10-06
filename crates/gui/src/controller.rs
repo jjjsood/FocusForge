@@ -8542,9 +8542,9 @@ fn export_project_label(project: &GuiProject) -> String {
     }
 }
 
-/// The worker's own export source for `tab`'s current position -- unsealed
-/// edits over the selected row's Z-Map when the edit session holds any op,
-/// otherwise the row itself, held or saved.
+/// The worker's own export source for `tab`'s current position -- the
+/// strokes not yet saved over the selected row's composite when the edit
+/// session holds any op, otherwise the row itself, held or saved.
 fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
     let info = row_export_info(tab)?;
     if let Some(edit) = tab
@@ -8553,16 +8553,14 @@ fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
         .filter(|edit| edit.session.op_count() > 0 || info.live)
     {
         let (sources, registration) = tab.fused()?;
-        let tile = edit.session.tile();
-        return Some(job::ExportSource::Live {
-            width: tile.width,
-            height: tile.height,
-            indices: edit.session.indices().to_vec(),
+        return Some(job::ExportSource::Pending(job::PendingState {
+            composite: edit.composite.clone(),
+            ops: edit.stack_ops(),
             sources,
             registration,
             reference: info.reference,
             description: info.description,
-        });
+        }));
     }
     if info.live {
         return None;
