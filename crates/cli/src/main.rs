@@ -281,8 +281,9 @@ enum Command {
         /// The op list: a JSON array of ops in the persisted `Op` shape.
         /// A brush stroke blends frame `source_id` over the image along
         /// its path: fully within `radius * (1 - softness)`, fading
-        /// linearly to nothing at `radius`. Every op is checked before anything is written;
-        /// positions in error messages count from 0 in list order.
+        /// linearly to nothing at `radius`. Every op is checked before
+        /// anything is written; positions in error messages count from 0 in
+        /// list order.
         #[arg(long, value_name = "FILE")]
         ops: PathBuf,
         /// The state to append under -- any unique prefix of its id.
