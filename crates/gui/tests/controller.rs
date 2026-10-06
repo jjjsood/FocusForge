@@ -3288,8 +3288,9 @@ fn post_fuse_frame_uses_identity_at_the_composite_crop() {
 use std::num::NonZeroU32;
 
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter};
+use focusforge_core::retouch::blend;
 use focusforge_core::retouch::{EditSession, apply, footprint};
-use focusforge_core::zmap::{NO_SOURCE, ZMapWriter};
+use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
 use focusforge_gui::brush::LiveStroke;
 use focusforge_gui::canvas::overlay_edited;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
@@ -3387,8 +3388,8 @@ fn open_editor(name: &str) -> (AppController, PathBuf) {
 /// [`open_editor`] over a run of fuse method `method` instead of the default.
 fn open_editor_on(name: &str, method: Option<&str>) -> (AppController, PathBuf) {
     let mut controller = controller_with_scratch(name);
-    let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_resident_tile_size_for_test(16);
+    let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_pane_geometry(LEFT, RIGHT);
     assert!(controller.set_mode(ShellMode::Editor));
     let map = map_rect(&controller);
@@ -3511,51 +3512,104 @@ impl Sealed {
     fn displayed(&self, controller: &AppController) -> Vec<u16> {
         let view = controller.edited_view().unwrap();
         let mut samples = self.composite.clone();
-        overlay_edited(
-            &mut samples,
-            &self.indices,
-            view.indices,
-            self.map,
-            NonZeroU32::MIN,
-            3,
-            view.tiles,
-        );
+        overlay_edited(&mut samples, self.map, NonZeroU32::MIN, 3, view.tiles);
         samples
     }
 
-    /// The reference: the edited index's own frame pixel wherever it differs
-    /// from the sealed index, the sealed composite pixel elsewhere -- each
-    /// frame pixel read at its own registered transform and the crop
-    /// origin, the same view [`focusforge_core::retouch::EditSession`]'s own
-    /// recomposite warps through. `dummy-align`'s shifts are exact integer
-    /// translations, so the mapped point always lands on a source pixel
-    /// centre with no rounding error.
-    fn expected(&self, edited: &[u16]) -> Vec<u16> {
-        let mut out = self.composite.clone();
+    /// Frame `frame` over the whole map, read at its own registered
+    /// transform and the crop origin, the same view a stroke blends from.
+    /// `dummy-align`'s shifts are exact integer translations, so the mapped
+    /// point always lands on a source pixel centre with no rounding error.
+    fn frame_view(&self, frame: usize) -> Vec<u16> {
         let origin = self.registration.origin();
-        for (i, (&e, &s)) in edited.iter().zip(&self.indices).enumerate() {
-            if e != s {
-                let (x, y) = (i as u32 % self.map.width, i as u32 / self.map.width);
-                let (rx, ry) = ((x + origin.0) as f64, (y + origin.1) as f64);
-                let (fx, fy) = self
-                    .registration
-                    .transform(e as usize)
-                    .map_point(rx, ry)
-                    .expect("dummy-align's integer shifts never cross the horizon");
-                let f = ((fy.round() as u32 * FRAME + fx.round() as u32) * 3) as usize;
-                out[i * 3..i * 3 + 3].copy_from_slice(&self.frames[e as usize][f..f + 3]);
-            }
+        let mut out = vec![0u16; (self.map.width * self.map.height * 3) as usize];
+        for i in 0..(self.map.width * self.map.height) as usize {
+            let (x, y) = (i as u32 % self.map.width, i as u32 / self.map.width);
+            let (rx, ry) = ((x + origin.0) as f64, (y + origin.1) as f64);
+            let (fx, fy) = self
+                .registration
+                .transform(frame)
+                .map_point(rx, ry)
+                .expect("dummy-align's integer shifts never cross the horizon");
+            let f = ((fy.round() as u32 * FRAME + fx.round() as u32) * 3) as usize;
+            out[i * 3..i * 3 + 3].copy_from_slice(&self.frames[frame][f..f + 3]);
+        }
+        out
+    }
+
+    /// `op` blended over `out`, a whole-map composite, from its frame.
+    fn blend_over(&self, out: &mut [u16], op: &Op, info: ZMapInfo) {
+        let Op::BrushStroke { source_id, .. } = op else {
+            panic!("only brush strokes are blended");
+        };
+        let src = self.frame_view(usize::from(*source_id));
+        blend::apply(op, info, self.map, out, self.map, &src, 3).unwrap();
+    }
+
+    /// The reference: the sealed composite with each of `ops` blended over
+    /// it in order from its frame.
+    fn expected(&self, ops: &[Op], info: ZMapInfo) -> Vec<u16> {
+        let mut out = self.composite.clone();
+        for op in ops {
+            self.blend_over(&mut out, op, info);
         }
         out
     }
 
     fn assert_shown(&self, controller: &AppController, case: &str) {
-        let edited = indices(controller);
+        let info = controller.edit_session().unwrap().info();
         assert!(
-            self.displayed(controller) == self.expected(&edited),
+            self.displayed(controller) == self.expected(&ops(controller), info),
             "{case}: the displayed composite differs from the reference"
         );
     }
+}
+
+/// What the renderer shows over the whole image: the tab's sealed composite
+/// under the controller's resident tiles.
+fn displayed_whole(controller: &mut AppController) -> Vec<u16> {
+    let map = map_rect(controller);
+    let (composite, _) = controller.materialize_active_tab_planes().unwrap();
+    let mut samples = read_plane(&composite, map);
+    let view = controller.edited_view().unwrap();
+    overlay_edited(&mut samples, map, NonZeroU32::MIN, 3, view.tiles);
+    samples
+}
+
+/// The head checkpoint of the saved project at `path`, rendered whole by the
+/// one function every export and view goes through.
+fn saved_render(path: &Path) -> Vec<u16> {
+    let mut project = saved(path);
+    let id = project.checkpoint().id.clone();
+    let image = project::CheckpointImage::prepare(&project, &id).expect("the checkpoint prepares");
+    let full = image.full();
+    let mut out = vec![0u16; (full.width * full.height * 3) as usize];
+    image
+        .render(Some(&mut project), full, &mut |band: &[u16], rect: Rect| {
+            let row = rect.width as usize * 3;
+            for y in 0..rect.height as usize {
+                let at = ((rect.y as usize + y) * full.width as usize + rect.x as usize) * 3;
+                out[at..at + row].copy_from_slice(&band[y * row..(y + 1) * row]);
+            }
+            Ok(())
+        })
+        .expect("the checkpoint renders");
+    out
+}
+
+/// A drag through image points `path` with a flush and a settle after every
+/// motion, so each segment is a tick of its own.
+fn drag_ticked(controller: &mut AppController, path: &[(f32, f32)]) {
+    press(controller, at(path[0].0, path[0].1));
+    for &(x, y) in &path[1..] {
+        let (sx, sy) = at(x, y);
+        controller.pointer_moved(sx, sy);
+        controller.flush_live_stroke();
+        common::settle_recomposites(controller);
+    }
+    let last = path[path.len() - 1];
+    release(controller, at(last.0, last.1));
+    common::settle_recomposites(controller);
 }
 
 fn rounded(points: &[(f32, f32)]) -> Vec<Point> {
@@ -3570,19 +3624,6 @@ fn rounded(points: &[(f32, f32)]) -> Vec<Point> {
         }
     }
     out
-}
-
-fn dilate(rect: Rect, margin: u32, map: Rect) -> Rect {
-    let x0 = rect.x.saturating_sub(margin);
-    let y0 = rect.y.saturating_sub(margin);
-    let x1 = (rect.x + rect.width + margin).min(map.width);
-    let y1 = (rect.y + rect.height + margin).min(map.height);
-    Rect {
-        x: x0,
-        y: y0,
-        width: x1 - x0,
-        height: y1 - y0,
-    }
 }
 
 /// `corners` joined by straight runs, as `events` motion events spread
@@ -4893,8 +4934,6 @@ fn stroke_commit_recomposites_its_tick_rects() {
     set_size(&mut c, 20.0);
     c.set_brush_softness_fraction(0.3);
     c.select_frame(1);
-    let radius = c.brush_toolbar_view().size / 2.0;
-    let margin = (radius / 8.0).ceil() as u32 + 2;
     let info = c.edit_session().unwrap().info();
 
     // Zig-zag runs of about 1.7 px, shorter than the resample spacing
@@ -4924,10 +4963,26 @@ fn stroke_commit_recomposites_its_tick_rects() {
 
     let commit = c.take_recomposited();
     let map = map_rect(&c);
-    let expected: Vec<Rect> = ticks.iter().map(|&r| dilate(r, margin, map)).collect();
-    assert_eq!(commit, expected, "one pass over the dilated tick rects");
     let op = ops(&c).pop().unwrap();
     let bbox = footprint(&op, info).unwrap().unwrap();
+    let mut cells = std::collections::BTreeSet::new();
+    for r in ticks.iter().chain([&bbox]) {
+        for tx in r.x / 16..=(r.x + r.width - 1) / 16 {
+            for ty in r.y / 16..=(r.y + r.height - 1) / 16 {
+                cells.insert((tx, ty));
+            }
+        }
+    }
+    let expected: Vec<Rect> = cells
+        .into_iter()
+        .map(|(tx, ty)| Rect {
+            x: tx * 16,
+            y: ty * 16,
+            width: 16.min(map.width - tx * 16),
+            height: 16.min(map.height - ty * 16),
+        })
+        .collect();
+    assert_eq!(commit, expected, "one pass over the touched 16 px tiles");
     assert!(!commit.contains(&bbox), "never the stroke's bounding box");
     sealed.assert_shown(&c, "after release");
 
@@ -5068,7 +5123,12 @@ fn live_stroke_previews_each_new_segment() {
             indices(&c) == painted,
             "flush {k}: the preview paints the rounded trace so far"
         );
-        sealed.assert_shown(&c, &format!("flush {k}"));
+        let mut shown = sealed.expected(&before.1, info);
+        sealed.blend_over(&mut shown, &stroke(rounded(&trace[..=end])), info);
+        assert!(
+            sealed.displayed(&c) == shown,
+            "flush {k}: the blended trace so far over the pre-stroke samples"
+        );
         assert_eq!(
             session(&c),
             before,
@@ -5160,13 +5220,13 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     use focusforge_core::params::ParamValue;
 
     let mut controller = controller_with_scratch(name);
+    controller.set_resident_tile_size_for_test(16);
     open_mantis64_tab(&mut controller, name, count);
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     settle_all(&mut controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
-    controller.set_resident_tile_size_for_test(16);
     controller.set_pane_geometry(LEFT, RIGHT);
     assert!(controller.set_mode(ShellMode::Editor));
     controller
@@ -5621,8 +5681,30 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     gate.open();
     common::settle_recomposites(&mut c);
     let log = c.take_recomposited();
-    assert_eq!(log.len(), 3, "tick, dilated tick, undo: {log:?}");
-    assert_eq!(log[2], bbox, "the undo's region comes last");
+    // The tick's region, then the release's re-render of each 16 px tile the
+    // tick and the stroke meet (tile column by tile column), then the undo.
+    let tick = log[0];
+    let (width, height) = (info.width(), info.height());
+    let tiles_of = |regions: [Rect; 2]| {
+        let mut keys = std::collections::BTreeSet::new();
+        for r in regions {
+            for ty in r.y / 16..=(r.y + r.height - 1) / 16 {
+                for tx in r.x / 16..=(r.x + r.width - 1) / 16 {
+                    keys.insert((tx, ty));
+                }
+            }
+        }
+        keys.into_iter().map(|(tx, ty)| Rect {
+            x: tx * 16,
+            y: ty * 16,
+            width: 16.min(width - tx * 16),
+            height: 16.min(height - ty * 16),
+        })
+    };
+    let mut expected = vec![tick];
+    expected.extend(tiles_of([tick, bbox]));
+    expected.push(bbox);
+    assert_eq!(log, expected, "tick, the touched tiles, undo");
     assert!(gate.off_thread_reads() > 0, "the worker read the frames");
     assert_eq!(
         gate.off_thread_reads(),
@@ -5681,7 +5763,7 @@ fn background_recomposite_matches_the_synchronous_one() {
     let name = "recomposite_matches_sync";
     let (mut c, root) = open_editor(name);
     let sealed = Sealed::read(&mut c, &root);
-    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
     let registration = sealed.registration.clone();
     let gate = Gate::install(&mut c);
     set_size(&mut c, 14.0);
@@ -5707,61 +5789,38 @@ fn background_recomposite_matches_the_synchronous_one() {
     common::settle_recomposites(&mut c);
 
     let regions = c.take_recomposited();
-    assert_eq!(
-        regions.len(),
-        11,
-        "a tick and its dilation per stroke: {regions:?}"
-    );
-    assert_eq!(
-        regions[6..9],
-        [bbox(2), bbox(1), bbox(1)],
-        "the undos and the redo follow the three strokes, in order"
+    assert!(
+        regions.windows(3).any(|w| w == [bbox(2), bbox(1), bbox(1)]),
+        "the undos and the redo install their regions in order: {regions:?}"
     );
     sealed.assert_shown(&c, "after every region settled");
 
-    // The same final indices and the same regions, composed synchronously.
+    // The same final ops composed synchronously: opened as a chain over the
+    // same composite and frames.
     let mut fresh = job::open_edit_session(
         &zmap,
+        &composite,
         &(0..3)
             .map(|i| root.join(format!("{i:02}.tif")))
             .collect::<Vec<_>>(),
         registration,
         16,
         job::host_budget(),
-        Vec::new(),
+        ops(&c),
     )
     .expect("a second session over the same frames opens");
-    for op in ops(&c) {
-        fresh.session.append(op).unwrap();
-    }
     assert_eq!(fresh.session.indices(), indices(&c).as_slice());
-    for &region in &regions {
-        fresh.recomposite(region).unwrap();
-    }
-    assert_eq!(fresh.tiles.take_recomposited(), regions);
+    fresh.tiles.take_recomposited();
 
     let view = c.edited_view().unwrap();
-    // An index map that differs from the edited one at every texel, so the
-    // overlay shows each installed texel -- one whose index went back to its
-    // sealed value included -- and the marker at every texel never installed.
-    let differs: Vec<u16> = view.indices.iter().map(|&index| !index).collect();
-    let marker = vec![7777u16; sealed.composite.len()];
     let shown = |tiles: &focusforge_gui::canvas::ResidentTiles| {
-        let mut samples = marker.clone();
-        overlay_edited(
-            &mut samples,
-            &differs,
-            view.indices,
-            sealed.map,
-            NonZeroU32::MIN,
-            3,
-            tiles,
-        );
+        let mut samples = sealed.composite.clone();
+        overlay_edited(&mut samples, sealed.map, NonZeroU32::MIN, 3, tiles);
         samples
     };
     assert!(
         shown(view.tiles) == shown(&fresh.tiles),
-        "every resident texel equals the synchronous recomposite's"
+        "the displayed image equals the synchronous recomposite's"
     );
 }
 
@@ -5881,6 +5940,7 @@ fn a_failed_background_recomposite_keeps_the_edit() {
     c.undo();
     c.undo();
     c.undo();
+    common::settle_recomposites(&mut c);
     sealed.assert_shown(&c, "after the history unwinds");
 }
 
@@ -6710,7 +6770,8 @@ fn an_older_checkpoint_edits_through_its_own_registration() {
     // The head's registration would have drawn something else.
     let wrong = Sealed::read_with(&mut controller, &frames, head_registration);
     assert!(
-        wrong.displayed(&controller) != wrong.expected(&indices(&controller)),
+        wrong.displayed(&controller)
+            != wrong.expected(&ops(&controller), controller.edit_session().unwrap().info()),
         "the check can tell the two registrations apart"
     );
 }
@@ -6975,5 +7036,263 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
         active_fuse_value(&controller, "weight-exponent"),
         "4",
         "editing the copy leaves the original's remembered values alone"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The live view goes through the soft blend: the dithered index brush
+// never paints what the canvas shows.
+// ---------------------------------------------------------------------
+
+#[test]
+fn live_view_after_release_equals_the_saved_render() {
+    for equalized in [false, true] {
+        let name = if equalized {
+            "live_equals_saved_equalized"
+        } else {
+            "live_equals_saved"
+        };
+        let mut c = if equalized {
+            open_equalized_editor(name, 3)
+        } else {
+            open_editor(name).0
+        };
+        set_size(&mut c, 10.0);
+        for (i, softness) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
+            c.set_brush_softness_fraction(softness);
+            c.select_frame((i + 1) % 3);
+            let x = 8.0 + 16.0 * i as f32;
+            drag(&mut c, &[(x, 10.0)]);
+            drag_ticked(
+                &mut c,
+                &[
+                    (x - 4.0, 24.0),
+                    (x + 4.0, 32.0),
+                    (x - 3.0, 40.0),
+                    (x + 5.0, 52.0),
+                ],
+            );
+        }
+        assert_eq!(ops(&c).len(), 6);
+        let shown = displayed_whole(&mut c);
+        let path = save_to_proposed(&mut c);
+        assert!(
+            shown == saved_render(&path),
+            "equalized {equalized}: the live view differs from the saved render"
+        );
+    }
+}
+
+#[test]
+fn live_soft_edge_is_a_blend_not_a_dither() {
+    let (mut c, root) = open_editor("live_soft_edge");
+    let sealed = Sealed::read(&mut c, &root);
+    let info = c.edit_session().unwrap().info();
+    set_size(&mut c, 20.0);
+    c.set_brush_softness_fraction(0.8);
+    c.select_frame(1);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    let softness = c.brush_toolbar_view().soft / 100.0;
+    let stroke = Op::BrushStroke {
+        source_id: 1,
+        path: rounded(&[(20.0, 30.0), (36.0, 30.0)]),
+        radius,
+        softness,
+    };
+    let source = sealed.frame_view(1);
+
+    let check = |c: &AppController, case: &str| {
+        let shown = sealed.displayed(c);
+        let mut between = 0;
+        for y in 0..sealed.map.height {
+            for x in 0..sealed.map.width {
+                let alpha = blend::alpha(&stroke, info, x, y).unwrap();
+                for k in 0..3 {
+                    let i = ((y * sealed.map.width + x) * 3) as usize + k;
+                    let (base, src) = (sealed.composite[i], source[i]);
+                    assert_eq!(
+                        shown[i],
+                        blend::blend_sample(base, src, alpha),
+                        "{case}: sample {k} of ({x}, {y}) at alpha {alpha}"
+                    );
+                    if alpha > 0
+                        && alpha < 65536
+                        && shown[i] > base.min(src)
+                        && shown[i] < base.max(src)
+                    {
+                        between += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            between > 0,
+            "{case}: the soft ring holds intermediate values"
+        );
+    };
+
+    press(&mut c, at(20.0, 30.0));
+    let (sx, sy) = at(36.0, 30.0);
+    c.pointer_moved(sx, sy);
+    c.flush_live_stroke();
+    common::settle_recomposites(&mut c);
+    check(&c, "during the drag");
+    release(&mut c, at(36.0, 30.0));
+    common::settle_recomposites(&mut c);
+    assert_eq!(ops(&c), vec![stroke.clone()]);
+    check(&c, "after release");
+}
+
+#[test]
+fn live_tick_reblends_only_its_segment_footprint() {
+    let (mut c, root) = open_editor("live_tick");
+    let sealed = Sealed::read(&mut c, &root);
+    let info = c.edit_session().unwrap().info();
+    set_size(&mut c, 12.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(2);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    let softness = c.brush_toolbar_view().soft / 100.0;
+    let stroke = |path: Vec<Point>| Op::BrushStroke {
+        source_id: 2,
+        path,
+        radius,
+        softness,
+    };
+
+    // Segments that double back over each other, so alpha would compound
+    // were each segment blended on its own.
+    let trace = [
+        (10.0, 20.0),
+        (30.0, 24.0),
+        (14.0, 28.0),
+        (34.0, 32.0),
+        (12.0, 36.0),
+        (40.0, 40.0),
+    ];
+    let pre = sealed.composite.clone();
+    press(&mut c, at(trace[0].0, trace[0].1));
+    for end in 1..trace.len() {
+        let (sx, sy) = at(trace[end].0, trace[end].1);
+        c.pointer_moved(sx, sy);
+        c.flush_live_stroke();
+        common::settle_recomposites(&mut c);
+        let segment = stroke(rounded(&trace[end - 1..=end]));
+        assert_eq!(
+            c.take_recomposited(),
+            footprint(&segment, info)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "tick {end}: one region, the new segment's footprint"
+        );
+        let mut expected = pre.clone();
+        sealed.blend_over(&mut expected, &stroke(rounded(&trace[..=end])), info);
+        assert!(
+            sealed.displayed(&c) == expected,
+            "tick {end}: the path so far over the pre-stroke samples"
+        );
+    }
+    release(&mut c, at(trace[5].0, trace[5].1));
+    common::settle_recomposites(&mut c);
+    sealed.assert_shown(&c, "after release");
+}
+
+#[test]
+fn undo_redo_restore_the_blended_samples() {
+    let (mut c, root) = open_editor("live_undo_redo");
+    let sealed = Sealed::read(&mut c, &root);
+    let info = c.edit_session().unwrap().info();
+    set_size(&mut c, 16.0);
+    c.set_brush_softness_fraction(0.6);
+    for (frame, from, to) in [
+        (0, (10.0, 20.0), (40.0, 26.0)),
+        (1, (14.0, 30.0), (44.0, 22.0)),
+        (2, (12.0, 24.0), (42.0, 36.0)),
+    ] {
+        c.select_frame(frame);
+        drag(&mut c, &[from, to]);
+    }
+    let all = ops(&c);
+    assert_eq!(all.len(), 3);
+    sealed.assert_shown(&c, "three strokes");
+    let first_two = sealed.expected(&all[..2], info);
+    let last_region = footprint(&all[2], info).unwrap().unwrap();
+
+    c.undo();
+    common::settle_recomposites(&mut c);
+    assert_eq!(c.edit_session().unwrap().op_count(), 2);
+    assert!(
+        sealed.displayed(&c) == first_two,
+        "undo shows the first two"
+    );
+    assert!(c.take_recomposited().ends_with(&[last_region]));
+    c.redo();
+    common::settle_recomposites(&mut c);
+    assert_eq!(c.edit_session().unwrap().op_count(), 3);
+    sealed.assert_shown(&c, "redo restores the third");
+    c.undo();
+    common::settle_recomposites(&mut c);
+    assert!(
+        sealed.displayed(&c) == first_two,
+        "a second undo after the redo"
+    );
+
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the saved render of two strokes"
+    );
+}
+
+#[test]
+fn reopened_soft_checkpoint_shows_the_blend() {
+    // A held op-bearing row replays its chain over the base it was taken from.
+    let mut c = open_editor("reopen_held").0;
+    set_size(&mut c, 14.0);
+    c.set_brush_softness_fraction(0.7);
+    c.select_frame(1);
+    drag(&mut c, &[(12.0, 20.0), (36.0, 26.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(16.0, 34.0), (40.0, 30.0)]);
+    assert!(c.save_checkpoint());
+    let ops_row = row_index(&c, "held:1");
+    c.select_checkpoint_row(row_index(&c, "held:0"));
+    c.select_checkpoint_row(ops_row);
+    common::enter_editor(&mut c);
+    assert_eq!(
+        c.edit_session().unwrap().op_count(),
+        0,
+        "the chain is rebased"
+    );
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the replayed chain differs from the saved render"
+    );
+
+    // A saved soft checkpoint opens on its rendered planes.
+    let mut reopened = reopen(&path, "reopen_saved");
+    common::enter_editor(&mut reopened);
+    assert!(displayed_whole(&mut reopened) == saved_render(&path));
+}
+
+#[test]
+fn live_stroke_at_the_image_edge_matches_the_saved_render() {
+    let (mut c, _) = open_editor("live_edge");
+    set_size(&mut c, 20.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(1);
+    drag_ticked(&mut c, &[(2.0, 2.0), (12.0, 5.0)]);
+    c.select_frame(2);
+    drag_ticked(&mut c, &[(55.0, 57.0), (46.0, 50.0)]);
+    assert_eq!(ops(&c).len(), 2);
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "strokes across the image border"
     );
 }

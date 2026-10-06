@@ -12,7 +12,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::algorithm::TileReader;
 use crate::align::{Registration, WarpingReader};
 use crate::equalize::GainReader;
 use crate::io::{FrameSet, TiffSpec, TiffStack, TiffWriter, open_frame_set};
@@ -586,7 +585,6 @@ fn render_ops(
     let project_path = project.path().to_path_buf();
 
     let mut blended: Vec<u16> = Vec::new();
-    let mut frame: Vec<u16> = Vec::new();
     let mut blend_bands = |band: &[u16], rect: Rect| -> Result<(), ProjectError> {
         let meeting: Vec<(&PlacedStroke, Rect)> = touching
             .iter()
@@ -597,30 +595,24 @@ fn render_ops(
         }
         blended.clear();
         blended.extend_from_slice(band);
-        for (stroke, region) in meeting {
-            frame.resize(
-                region.width as usize * region.height as usize * spp as usize,
-                0,
-            );
-            let at_frame = Rect {
-                x: region.x + origin_x,
-                y: region.y + origin_y,
-                ..region
-            };
-            warping
-                .read_tile_into(stroke.source, at_frame, &mut frame)
-                .map_err(|err| ProjectError::container(&project_path, err))?;
-            blend::apply(
-                &stroke.op,
-                info,
-                rect,
-                &mut blended,
-                region,
-                &frame,
-                spp as usize,
-            )
-            .map_err(|err| ProjectError::container(&project_path, err))?;
-        }
+        let placed: Vec<blend::PlacedStroke> = meeting
+            .iter()
+            .map(|&(stroke, _)| blend::PlacedStroke {
+                op: &stroke.op,
+                frame: stroke.source,
+                footprint: stroke.footprint,
+            })
+            .collect();
+        blend::apply_strokes(
+            info,
+            rect,
+            &mut blended,
+            &placed,
+            &warping,
+            (origin_x, origin_y),
+            spp as usize,
+        )
+        .map_err(|err| ProjectError::container(&project_path, err))?;
         sink(&blended, rect)
     };
     stream_plane_to_sink(

@@ -73,6 +73,12 @@ impl LiveStroke {
         Some(segment)
     }
 
+    /// The rounded, de-duplicated trace from the start to the last point a
+    /// tick consumed: the segments [`Self::take_segment`] returned, joined.
+    pub fn path_so_far(&self) -> Vec<Point> {
+        round_and_dedup(&self.points[..=self.flushed])
+    }
+
     /// The stroke's stored shape: the raw trace resampled at `radius / 4`
     /// arc-length spacing, RDP-simplified at 0.5 px, rounded to whole pixels
     /// with consecutive duplicates dropped. Independent of how many events
@@ -260,7 +266,7 @@ fn rdp(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
 mod tests {
     use super::*;
     use focusforge_core::project::Op;
-    use focusforge_core::retouch::apply;
+    use focusforge_core::retouch::blend::alpha;
     use focusforge_core::zmap::ZMapInfo;
 
     const W: u32 = 48;
@@ -277,21 +283,22 @@ mod tests {
             .collect()
     }
 
-    fn paint(buf: &mut [u16], path: Vec<Point>) {
-        let info = ZMapInfo::new(W, H, 4).unwrap();
-        let tile = Rect {
-            x: 0,
-            y: 0,
-            width: W,
-            height: H,
-        };
-        let op = Op::BrushStroke {
+    fn stroke_op(path: Vec<Point>) -> Op {
+        Op::BrushStroke {
             source_id: 3,
             path,
             radius: 2.5,
             softness: 0.4,
-        };
-        apply(&op, info, tile, buf).unwrap();
+        }
+    }
+
+    /// `alpha` of `path` at every pixel of the test map.
+    fn alphas(path: Vec<Point>) -> Vec<u32> {
+        let info = ZMapInfo::new(W, H, 4).unwrap();
+        let op = stroke_op(path);
+        (0..W * H)
+            .map(|i| alpha(&op, info, i % W, i / W).unwrap())
+            .collect()
     }
 
     #[test]
@@ -304,35 +311,44 @@ mod tests {
     }
 
     #[test]
-    fn segments_join_and_paint_what_the_whole_trace_paints() {
+    fn segments_join_into_the_path_so_far_and_it_covers_each_segment() {
         let trace = deltas(60);
-        let mut whole = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
-        for &(dx, dy) in &trace {
-            whole.push(dx, dy);
-        }
-        let mut expected = vec![0u16; (W * H) as usize];
-        paint(&mut expected, round_and_dedup(&whole.points));
+        let fresh = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
+        assert_eq!(fresh.path_so_far(), vec![Point { x: 6, y: 20 }]);
 
         for flushes in [1usize, 3, 17] {
             let mut stroke = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
-            let mut painted = vec![0u16; (W * H) as usize];
-            let mut previous: Option<Vec<Point>> = None;
+            let mut joined: Vec<Point> = Vec::new();
             for chunk in trace.chunks(trace.len().div_ceil(flushes)) {
                 for &(dx, dy) in chunk {
                     stroke.push(dx, dy);
                 }
                 let segment = stroke.take_segment().expect("motion arrived");
-                if let Some(previous) = &previous {
+                if joined.is_empty() {
+                    joined.extend_from_slice(&segment);
+                } else {
                     assert_eq!(
-                        previous.last(),
+                        joined.last(),
                         segment.first(),
                         "{flushes} flushes: consecutive segments share their joint"
                     );
+                    joined.extend_from_slice(&segment[1..]);
                 }
-                paint(&mut painted, segment.clone());
-                previous = Some(segment);
+                let so_far = stroke.path_so_far();
+                assert_eq!(so_far, joined, "{flushes} flushes");
+                let whole = alphas(so_far);
+                for (pixel, (&all, &part)) in whole.iter().zip(&alphas(segment)).enumerate() {
+                    assert!(
+                        all >= part,
+                        "{flushes} flushes: pixel {pixel}: {all} < {part}"
+                    );
+                }
             }
-            assert_eq!(painted, expected, "{flushes} flushes");
+            let mut whole = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
+            for &(dx, dy) in &trace {
+                whole.push(dx, dy);
+            }
+            assert_eq!(stroke.path_so_far(), round_and_dedup(&whole.points));
         }
     }
 

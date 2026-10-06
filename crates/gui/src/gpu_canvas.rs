@@ -1043,21 +1043,17 @@ impl CanvasRenderer {
                 ),
             },
             Pane::Composite if !sealed_indices.is_empty() => {
-                let merged = edited
-                    .zip(edited_indices.as_deref())
-                    .map(|(view, indices)| {
-                        let mut merged = samples.to_vec();
-                        crate::canvas::overlay_edited(
-                            &mut merged,
-                            sealed_indices,
-                            indices,
-                            rect,
-                            step,
-                            samples_per_pixel,
-                            view.tiles,
-                        );
-                        merged
-                    });
+                let merged = edited.map(|view| {
+                    let mut merged = samples.to_vec();
+                    crate::canvas::overlay_edited(
+                        &mut merged,
+                        rect,
+                        step,
+                        samples_per_pixel,
+                        view.tiles,
+                    );
+                    merged
+                });
                 let composite = merged.as_deref().unwrap_or(samples);
                 let indices = edited_indices.as_deref().unwrap_or(sealed_indices);
                 match &job.state.overlay {

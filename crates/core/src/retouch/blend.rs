@@ -8,6 +8,7 @@
 //! exact point-to-segment distance, so it is a pure function of the stroke and
 //! the pixel. Alpha is Q16 (`0..=65536`); the blend rounds to nearest.
 
+use crate::algorithm::TileReader;
 use crate::project::{Op, Point};
 use crate::tile::Rect;
 use crate::zmap::ZMapInfo;
@@ -333,6 +334,47 @@ pub fn apply(
             *o = blend_sample(*o, s, a);
         }
     });
+    Ok(())
+}
+
+/// One stroke of [`apply_strokes`]: the op, the frame it blends from and the
+/// part of the map it can change ([`footprint`]).
+#[derive(Clone, Copy)]
+pub struct PlacedStroke<'a> {
+    pub op: &'a Op,
+    pub frame: usize,
+    pub footprint: Rect,
+}
+
+/// Blends each of `strokes`, in order, over `out`, the samples of `out_rect`
+/// (row-major, `spp` samples a pixel). A stroke reads its frame from `frames`
+/// over the part of `out_rect` its footprint meets, shifted by `origin` (the
+/// crop offset between map and frame coordinates); a stroke clear of
+/// `out_rect` reads nothing. A failed frame read is [`RetouchError::Source`]
+/// and leaves `out` as the strokes before it made it.
+pub fn apply_strokes(
+    info: ZMapInfo,
+    out_rect: Rect,
+    out: &mut [u16],
+    strokes: &[PlacedStroke<'_>],
+    frames: &dyn TileReader,
+    origin: (u32, u32),
+    spp: usize,
+) -> Result<(), RetouchError> {
+    let mut frame: Vec<u16> = Vec::new();
+    for stroke in strokes {
+        let Some(region) = stroke.footprint.intersect(out_rect) else {
+            continue;
+        };
+        frame.resize(region.width as usize * region.height as usize * spp, 0);
+        let at_frame = Rect {
+            x: region.x + origin.0,
+            y: region.y + origin.1,
+            ..region
+        };
+        frames.read_tile_into(stroke.frame, at_frame, &mut frame)?;
+        apply(stroke.op, info, out_rect, out, region, &frame, spp)?;
+    }
     Ok(())
 }
 
@@ -680,5 +722,115 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "a 1000-point stroke took {elapsed:?}"
         );
+    }
+
+    /// Frames of a `width`-wide plane, one sample a pixel, each a distinct
+    /// ramp; a frame past `frames` is out of range.
+    struct Ramps {
+        width: u32,
+        frames: usize,
+    }
+
+    impl crate::algorithm::TileReader for Ramps {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            r: Rect,
+            out: &mut [u16],
+        ) -> Result<(), crate::algorithm::AlgorithmError> {
+            if frame >= self.frames {
+                return Err(crate::algorithm::AlgorithmError::FrameOutOfRange {
+                    frame,
+                    frame_count: self.frames,
+                });
+            }
+            for (i, o) in out.iter_mut().enumerate() {
+                let x = r.x + i as u32 % r.width;
+                let y = r.y + i as u32 / r.width;
+                *o = ((y * self.width + x) * (frame as u32 + 3) % 65536) as u16;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn strokes_blend_in_order_from_their_frames_at_the_crop_origin() {
+        let info = info(40, 30);
+        let out_rect = rect(5, 4, 30, 20);
+        let frames = Ramps {
+            width: 64,
+            frames: 3,
+        };
+        let origin = (7, 3);
+        let ops = [
+            stroke_op(0, vec![pt(12, 10), pt(24, 14)], 6.0, 0.5),
+            stroke_op(2, vec![pt(20, 8), pt(14, 18)], 5.0, 1.0),
+        ];
+        let placed: Vec<PlacedStroke> = ops
+            .iter()
+            .map(|op| PlacedStroke {
+                op,
+                frame: match op {
+                    Op::BrushStroke { source_id, .. } => usize::from(*source_id),
+                    _ => unreachable!(),
+                },
+                footprint: footprint(op, info).unwrap().unwrap(),
+            })
+            .collect();
+        let base: Vec<u16> = (0..30 * 20).map(|i| (i * 37 % 65536) as u16).collect();
+
+        let mut expected = base.clone();
+        for stroke in &placed {
+            let region = stroke.footprint.intersect(out_rect).unwrap();
+            let mut frame = vec![0u16; (region.width * region.height) as usize];
+            let at_frame = rect(
+                region.x + origin.0,
+                region.y + origin.1,
+                region.width,
+                region.height,
+            );
+            crate::algorithm::TileReader::read_tile_into(
+                &frames,
+                stroke.frame,
+                at_frame,
+                &mut frame,
+            )
+            .unwrap();
+            apply(stroke.op, info, out_rect, &mut expected, region, &frame, 1).unwrap();
+        }
+        assert_ne!(expected, base, "the strokes must blend something");
+
+        let mut out = base.clone();
+        apply_strokes(info, out_rect, &mut out, &placed, &frames, origin, 1).unwrap();
+        assert_eq!(out, expected);
+
+        let mut untouched = base.clone();
+        let far = [PlacedStroke {
+            op: &ops[0],
+            frame: 0,
+            footprint: rect(0, 0, 3, 3),
+        }];
+        apply_strokes(info, out_rect, &mut untouched, &far, &frames, origin, 1).unwrap();
+        assert_eq!(untouched, base, "a stroke off the rect writes nothing");
+    }
+
+    #[test]
+    fn a_failed_frame_read_surfaces_as_a_source_error() {
+        let info = info(40, 30);
+        let out_rect = rect(0, 0, 40, 30);
+        let frames = Ramps {
+            width: 64,
+            frames: 1,
+        };
+        let op = stroke_op(2, vec![pt(10, 10)], 4.0, 0.0);
+        let placed = [PlacedStroke {
+            op: &op,
+            frame: 2,
+            footprint: footprint(&op, info).unwrap().unwrap(),
+        }];
+        let mut out = vec![5u16; 40 * 30];
+        let err = apply_strokes(info, out_rect, &mut out, &placed, &frames, (0, 0), 1).unwrap_err();
+        assert!(matches!(err, RetouchError::Source(_)), "{err:?}");
+        assert!(out.iter().all(|&s| s == 5), "a failed read writes nothing");
     }
 }

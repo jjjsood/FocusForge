@@ -17,7 +17,7 @@ use focusforge_core::align::WarpingReader;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
-    COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
+    COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
 pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
@@ -31,7 +31,7 @@ pub use focusforge_core::project::export::{
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
-use focusforge_core::retouch::{RetouchError, Sources};
+use focusforge_core::retouch::{RetouchError, Sources, blend};
 pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -1031,43 +1031,85 @@ pub fn frame_refusal_lines(path: &Path) -> Vec<String> {
     ]
 }
 
-/// What can go wrong opening a tab's editor state: its Z-Map or the source
-/// frames a stroke recomposites against.
+/// What can go wrong opening a tab's editor state: its Z-Map, the composite
+/// it edits over or the source frames a stroke blends from.
 #[derive(Debug, thiserror::Error)]
 pub enum EditSessionError {
     #[error(transparent)]
     ZMap(#[from] ZMapError),
     #[error(transparent)]
+    Composite(#[from] focusforge_core::TiffError),
+    #[error(transparent)]
     Frames(#[from] FrameError),
 }
 
-/// What a recomposite worker parks: each region it gathered, in dispatch
-/// order, with its samples or the reason its read failed.
-type Gathered = Vec<(Rect, Result<Vec<u16>, String>)>;
+/// What a recomposite starts from before its ops are blended over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreImage {
+    /// The base composite alone.
+    Base,
+    /// The base composite under the resident samples as they were before the
+    /// drag in progress began.
+    Snapshot,
+    /// The base composite under the resident samples as they are.
+    Current,
+}
+
+/// One region of the edited image to render: where, what it starts from, the
+/// ops blended over that in order, and whether it is the last job of a drag,
+/// after which the pre-drag samples are dropped.
+#[derive(Debug, Clone)]
+pub struct Recomposite {
+    pub region: Rect,
+    pub pre: PreImage,
+    pub ops: Vec<Op>,
+    pub ends_drag: bool,
+}
+
+/// What a recomposite worker renders: each region, in dispatch order, with
+/// its samples or the reason it failed.
+type Rendered = Vec<(Rect, Result<Vec<u16>, String>)>;
+
+/// What a worker parks: its regions, the pre-drag tiles it holds once the
+/// batch is done (`None` when it panicked), and whether the batch ended the
+/// drag.
+struct Parked {
+    rendered: Rendered,
+    snapshot: Option<crate::canvas::ResidentTiles>,
+    ends_drag: bool,
+}
 
 /// Wakes the UI thread once a recomposite worker has parked its result.
 pub type RecompositeWake = Arc<dyn Fn() + Send + Sync>;
 
-/// One session's recomposite queue: regions waiting for a worker, whether a
+/// One session's recomposite queue: jobs waiting for a worker, whether a
 /// worker holds a batch, and where it parks the result.
 #[derive(Default)]
 struct Recomposites {
-    queued: Vec<Rect>,
+    queued: Vec<Recomposite>,
     in_flight: bool,
-    parked: Arc<Mutex<Option<Gathered>>>,
+    parked: Arc<Mutex<Option<Parked>>>,
 }
 
-/// One tab's live editor state: its undo/redo session, the frame set a
-/// stroke recomposites against and the registration warping each of its
-/// reads, the resident display cache the renderer overlays, the
-/// in-progress stroke, if any, and the regions whose pixels are still being
-/// gathered. The queue lives here, so a session that is dropped takes its
-/// pending results with it.
+/// One tab's live editor state: its undo/redo session, the composite and the
+/// frame set the edited image is blended from and the registration warping
+/// each frame read, the resident display cache the renderer overlays, the
+/// in-progress stroke, if any, and the regions still being rendered. The
+/// queue lives here, so a session that is dropped takes its pending results
+/// with it.
 pub struct EditState {
     pub session: EditSession,
     pub sources: Arc<dyn FrameReader>,
     pub registration: Registration,
+    /// The composite the edits are blended over.
+    pub base: Arc<TiffStack>,
+    /// The ops the row stacks over `base` before the session's own, oldest
+    /// first.
+    chain: Vec<Op>,
     pub tiles: crate::canvas::ResidentTiles,
+    /// The resident samples as they were when the drag in progress began, a
+    /// tile at a time; empty between drags.
+    snapshot: crate::canvas::ResidentTiles,
     pub stroke: Option<crate::brush::LiveStroke>,
     recomposites: Recomposites,
 }
@@ -1097,26 +1139,149 @@ fn with_registered_sources<R>(
     })
 }
 
+/// What rendering a region reads, apart from the resident samples.
+struct RenderInput {
+    base: Arc<TiffStack>,
+    sources: Arc<dyn FrameReader>,
+    registration: Registration,
+    info: ZMapInfo,
+    samples_per_pixel: usize,
+}
+
+/// Renders `job`: the pre-image's samples over its region with its ops
+/// blended in order from their frames, the same step a saved checkpoint's
+/// render takes. The result is installed in `local`; a job that ends the
+/// drag then empties `snapshot`, whether it rendered or not.
+fn render_region(
+    input: &RenderInput,
+    job: &Recomposite,
+    local: &mut crate::canvas::ResidentTiles,
+    snapshot: &mut crate::canvas::ResidentTiles,
+) -> Result<Vec<u16>, String> {
+    let rendered = blend_region(input, job, local, snapshot);
+    if job.ends_drag {
+        snapshot.clear();
+    }
+    rendered
+}
+
+fn blend_region(
+    input: &RenderInput,
+    job: &Recomposite,
+    local: &mut crate::canvas::ResidentTiles,
+    snapshot: &mut crate::canvas::ResidentTiles,
+) -> Result<Vec<u16>, String> {
+    let region = job.region;
+    let spp = input.samples_per_pixel;
+    let mut out = vec![0u16; region.width as usize * region.height as usize * spp];
+    input
+        .base
+        .read_tile_into(0, region, &mut out)
+        .map_err(|error| error.to_string())?;
+    match job.pre {
+        PreImage::Base => {}
+        PreImage::Current => local.overlay_into(region, &mut out),
+        PreImage::Snapshot => {
+            snapshot.capture(local, region);
+            snapshot.overlay_into(region, &mut out);
+        }
+    }
+    let mut placed = Vec::new();
+    for op in &job.ops {
+        let Op::BrushStroke { source_id, .. } = op else {
+            return Err(RetouchError::Unsupported.to_string());
+        };
+        let footprint = blend::footprint(op, input.info).map_err(|error| error.to_string())?;
+        if let Some(footprint) = footprint {
+            placed.push(blend::PlacedStroke {
+                op,
+                frame: usize::from(*source_id),
+                footprint,
+            });
+        }
+    }
+    with_registered_sources(&*input.sources, &input.registration, |sources| {
+        blend::apply_strokes(
+            input.info,
+            region,
+            &mut out,
+            &placed,
+            sources.reader,
+            sources.origin,
+            spp,
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    local.install(region, &out);
+    Ok(out)
+}
+
 impl EditState {
-    /// Recomposites `region` into this tab's resident display tiles on the
-    /// calling thread, from its own edited indices and the frame-as-fused
-    /// view. The session-open replay uses it; a live edit goes through
-    /// [`Self::queue_recomposite`].
-    pub fn recomposite(&mut self, region: Rect) -> Result<(), RetouchError> {
-        let (tiles, indices) = (&mut self.tiles, self.session.indices());
-        with_registered_sources(&*self.sources, &self.registration, |sources| {
-            tiles.recomposite(region, indices, sources)
-        })
+    fn render_input(&self) -> RenderInput {
+        RenderInput {
+            base: Arc::clone(&self.base),
+            sources: Arc::clone(&self.sources),
+            registration: self.registration.clone(),
+            info: self.session.info(),
+            samples_per_pixel: self.sources.frame(0).samples_per_pixel as usize,
+        }
     }
 
-    /// Queues `region`, whose edited indices already changed, for a worker
-    /// to gather, and bumps the tiles' generation so the overlay shows the
-    /// new indices at once. Regions queued while a worker holds a batch go
-    /// out together when it is installed; `wake` runs on the worker once a
-    /// batch is parked.
-    pub fn queue_recomposite(&mut self, region: Rect, wake: &RecompositeWake) {
-        self.recomposites.queued.push(region);
+    /// Every op the edited image shows over `base`: the row's chain, then the
+    /// session's applied ops, oldest first.
+    pub fn stack_ops(&self) -> Vec<Op> {
+        self.chain
+            .iter()
+            .chain(self.session.ops())
+            .cloned()
+            .collect()
+    }
+
+    /// Makes the session's applied ops part of the chain and forgets them in
+    /// the session, so nothing is left to undo.
+    pub fn rebase(&mut self) {
+        self.chain.extend(self.session.ops().cloned());
+        self.session.rebase();
+    }
+
+    /// Renders `job` on the calling thread straight into the resident tiles.
+    /// The session-open replay uses it; a live edit goes through
+    /// [`Self::queue_recomposite`].
+    pub fn recomposite(&mut self, job: &Recomposite) -> Result<(), String> {
+        let input = self.render_input();
+        render_region(&input, job, &mut self.tiles, &mut self.snapshot).map(|_| ())
+    }
+
+    fn enqueue(&mut self, job: Recomposite) {
+        self.recomposites.queued.push(job);
         self.tiles.touch();
+    }
+
+    /// Queues `job` for a worker and bumps the tiles' generation, so the
+    /// Z-Map pane shows the changed indices at once. Jobs queued while a
+    /// worker holds a batch go out together when it is installed, rendered
+    /// in queue order; `wake` runs on the worker once a batch is parked.
+    pub fn queue_recomposite(&mut self, job: Recomposite, wake: &RecompositeWake) {
+        self.enqueue(job);
+        if !self.recomposites.in_flight {
+            self.dispatch_recomposites(wake);
+        }
+    }
+
+    /// Ends a drag: queues every resident tile `touched` meets, each
+    /// re-rendered from its pre-drag samples with `ops` blended over them;
+    /// the last job drops the pre-drag samples.
+    pub fn end_drag(&mut self, touched: &[Rect], ops: Vec<Op>, wake: &RecompositeWake) {
+        let tiles = self.tiles.tile_rects(touched);
+        let last = tiles.len().saturating_sub(1);
+        for (at, region) in tiles.into_iter().enumerate() {
+            self.enqueue(Recomposite {
+                region,
+                pre: PreImage::Snapshot,
+                ops: ops.clone(),
+                ends_drag: at == last,
+            });
+        }
         if !self.recomposites.in_flight {
             self.dispatch_recomposites(wake);
         }
@@ -1128,9 +1293,9 @@ impl EditState {
         self.stroke.is_none() && self.recomposites.queued.is_empty() && !self.recomposites.in_flight
     }
 
-    /// Installs the batch a worker has parked, in the order its regions were
+    /// Installs the batch a worker has parked, in the order its jobs were
     /// queued, then dispatches whatever queued meanwhile. A region whose
-    /// read failed is logged and leaves its tiles as they were. Returns
+    /// render failed is logged and leaves its tiles as they were. Returns
     /// `true` once nothing is in flight.
     pub fn settle_recomposite(&mut self, wake: &RecompositeWake) -> bool {
         let parked = self
@@ -1139,9 +1304,14 @@ impl EditState {
             .lock()
             .expect("no worker panicked while parking its recomposites")
             .take();
-        if let Some(gathered) = parked {
+        if let Some(parked) = parked {
             self.recomposites.in_flight = false;
-            for (region, result) in gathered {
+            match parked.snapshot {
+                Some(snapshot) => self.snapshot = snapshot,
+                None if parked.ends_drag => self.snapshot.clear(),
+                None => {}
+            }
+            for (region, result) in parked.rendered {
                 match result {
                     Ok(samples) => self.tiles.install(region, &samples),
                     Err(error) => {
@@ -1154,62 +1324,60 @@ impl EditState {
         !self.recomposites.in_flight
     }
 
-    /// Hands every queued region to one worker thread, with the indices as
-    /// they are now, and marks the batch in flight.
+    /// Hands every queued job to one worker thread, with the resident tiles
+    /// they meet as they are now, and marks the batch in flight.
     fn dispatch_recomposites(&mut self, wake: &RecompositeWake) {
         if self.recomposites.queued.is_empty() {
             return;
         }
-        let width = self.session.tile().width;
-        let indices = self.session.indices();
-        let batch: Vec<(Rect, Vec<u16>)> = self
-            .recomposites
-            .queued
-            .drain(..)
-            .map(|region| (region, crate::canvas::gather_rect(indices, width, region)))
-            .collect();
+        let jobs: Vec<Recomposite> = self.recomposites.queued.drain(..).collect();
+        let regions: Vec<Rect> = jobs.iter().map(|job| job.region).collect();
+        let (mut local, mut snapshot) = (self.tiles.subset(&regions), self.snapshot.clone());
+        let ends_drag = jobs.iter().any(|job| job.ends_drag);
+        let input = self.render_input();
         self.recomposites.in_flight = true;
-        let sources = Arc::clone(&self.sources);
-        let registration = self.registration.clone();
         let parked = Arc::clone(&self.recomposites.parked);
         let wake = Arc::clone(wake);
         std::thread::spawn(move || {
-            let gathered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_registered_sources(&*sources, &registration, |sources| {
-                    batch
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                jobs.iter()
+                    .map(|job| {
+                        let samples = render_region(&input, job, &mut local, &mut snapshot);
+                        (job.region, samples)
+                    })
+                    .collect::<Rendered>()
+            }));
+            let parked_result = match result {
+                Ok(rendered) => Parked {
+                    rendered,
+                    snapshot: Some(snapshot),
+                    ends_drag,
+                },
+                Err(_) => Parked {
+                    rendered: jobs
                         .iter()
-                        .map(|(region, indices)| {
-                            let samples = crate::canvas::gather(*region, indices, sources);
-                            (*region, samples.map_err(|error| error.to_string()))
-                        })
-                        .collect::<Gathered>()
-                })
-            }))
-            .unwrap_or_else(|_| {
-                batch
-                    .iter()
-                    .map(|(region, _)| (*region, Err("the recomposite worker panicked".into())))
-                    .collect()
-            });
+                        .map(|job| (job.region, Err("the recomposite worker panicked".into())))
+                        .collect(),
+                    snapshot: None,
+                    ends_drag,
+                },
+            };
             *parked
                 .lock()
-                .expect("no worker panicked while parking its recomposites") = Some(gathered);
+                .expect("no worker panicked while parking its recomposites") = Some(parked_result);
             wake();
         });
     }
 }
 
-/// Opens `zmap` and `frames` and builds an [`EditState`] over the whole
-/// map: an [`EditSession`] seeded from every pixel, `frames` opened through
-/// [`open_frame_set`] as the frame set a stroke recomposites against
-/// (warped by `registration` at recomposite time), and an empty resident
-/// display cache gridded at `tile_size` px. `chain` -- the ops an op-bearing
-/// row stacks over its fused base, oldest first -- is then applied and
-/// recomposited and the session rebased onto it, so it opens with no ops of
-/// its own. A chain op that cannot be applied ends the replay; a region that
-/// cannot be recomposited is skipped.
+/// Builds an [`EditState`] over the whole map: `composite` is the image edits
+/// blend over, the resident cache is gridded at `tile_size` px, and `chain`
+/// (a row's ops, oldest first) is replayed and rebased into the session. An
+/// op that cannot be applied ends the replay; a region that cannot be
+/// rendered is skipped.
 pub fn open_edit_session(
     zmap: &Path,
+    composite: &Path,
     frames: &[PathBuf],
     registration: Registration,
     tile_size: u32,
@@ -1228,6 +1396,7 @@ pub fn open_edit_session(
     reader.read_tile_into(tile, &mut indices)?;
     let session = EditSession::new(info, tile, indices)
         .expect("a whole-map tile always fits its own map and its own tile_len");
+    let base = Arc::new(TiffStack::open_files(&[composite.to_path_buf()])?);
     let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
@@ -1240,15 +1409,24 @@ pub fn open_edit_session(
         session,
         sources,
         registration,
+        base,
+        chain: Vec::new(),
+        snapshot: tiles.subset(&[]),
         tiles,
         stroke: None,
         recomposites: Recomposites::default(),
     };
-    for op in chain {
-        match edit.session.append(op) {
+    for (at, op) in chain.iter().enumerate() {
+        match edit.session.append(op.clone()) {
             Ok(Some(region)) => {
-                if let Err(err) = edit.recomposite(region) {
-                    tracing::error!(error = %err, "restored stroke recomposite failed");
+                let job = Recomposite {
+                    region,
+                    pre: PreImage::Base,
+                    ops: chain[..=at].to_vec(),
+                    ends_drag: false,
+                };
+                if let Err(error) = edit.recomposite(&job) {
+                    tracing::error!(%error, "restored stroke recomposite failed");
                 }
             }
             Ok(None) => {}
@@ -1258,7 +1436,7 @@ pub fn open_edit_session(
             }
         }
     }
-    edit.session.rebase();
+    edit.rebase();
     Ok(edit)
 }
 

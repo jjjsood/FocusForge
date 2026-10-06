@@ -1531,22 +1531,6 @@ fn valid_pane(pane: PaneRect) -> bool {
         && pane.height > 0.0
 }
 
-/// Widens `rect` by `margin` px on every side, clamped to `0..width` /
-/// `0..height` -- the commit pass's bound between a stroke's raw preview
-/// trace and its resampled, RDP'd committed path.
-fn dilate_rect(rect: job::Rect, margin: u32, width: u32, height: u32) -> job::Rect {
-    let x0 = rect.x.saturating_sub(margin);
-    let y0 = rect.y.saturating_sub(margin);
-    let x1 = (rect.x + rect.width + margin).min(width);
-    let y1 = (rect.y + rect.height + margin).min(height);
-    job::Rect {
-        x: x0,
-        y: y0,
-        width: x1.saturating_sub(x0),
-        height: y1.saturating_sub(y0),
-    }
-}
-
 /// The extent of `tab`'s newest composite/Z-Map -- its newest held
 /// checkpoint's, else its opened project's; `None` before any fuse.
 fn fused_image_size(tab: &ProjectTab) -> Option<ImageSize> {
@@ -1810,8 +1794,8 @@ impl AppController {
         if self.state.edits.opening(tab.id, tab.session_generation) {
             return SessionOpen::Opening;
         }
-        let zmap = match self.active_tab_planes() {
-            TabPlanes::Ready(_, zmap) => zmap,
+        let (composite, zmap) = match self.active_tab_planes() {
+            TabPlanes::Ready(composite, zmap) => (composite, zmap),
             TabPlanes::Pending => return SessionOpen::Opening,
             TabPlanes::None => return SessionOpen::Unavailable,
         };
@@ -1843,6 +1827,7 @@ impl AppController {
             let result = std::panic::catch_unwind(|| {
                 job::open_edit_session(
                     &zmap,
+                    &composite,
                     &frames,
                     registration,
                     tile_size,
@@ -1912,14 +1897,16 @@ impl AppController {
     /// mid-drag never leaves a preview outstanding on a tab nobody is
     /// drawing on anymore.
     fn discard_live_stroke(&mut self) {
+        let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
-        if edit.stroke.take().is_some() {
+        if let Some(stroke) = edit.stroke.take() {
             edit.session.discard_preview();
+            edit.end_drag(&stroke.tick_rects, Vec::new(), &wake);
         }
     }
 
@@ -2995,21 +2982,25 @@ impl AppController {
     /// queues the region it returns for recompositing. Ignored while a
     /// stroke is live.
     pub fn undo(&mut self) {
-        self.undo_or_redo(job::EditSession::undo);
+        self.undo_or_redo(job::EditSession::undo, false);
     }
 
     /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
     /// queues the region it returns for recompositing. Ignored while a
     /// stroke is live.
     pub fn redo(&mut self) {
-        self.undo_or_redo(job::EditSession::redo);
+        self.undo_or_redo(job::EditSession::redo, true);
     }
 
     /// Shared by [`Self::undo`]/[`Self::redo`]: `step` is whichever of the
     /// two returns `Some` (`None` inside meaning nothing visibly changed) or
     /// `None` when there was nothing to step. A no-op while a stroke is
     /// live.
-    fn undo_or_redo(&mut self, step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>) {
+    fn undo_or_redo(
+        &mut self,
+        step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>,
+        redo: bool,
+    ) {
         let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
@@ -3025,7 +3016,23 @@ impl AppController {
             return;
         };
         if let Some(region) = region {
-            edit.queue_recomposite(region, &wake);
+            // Undo rebuilds the region from the base and the ops still
+            // applied; redo blends the redone op over what is there.
+            let (pre, ops) = if redo {
+                (
+                    job::PreImage::Current,
+                    edit.session.ops().last().cloned().into_iter().collect(),
+                )
+            } else {
+                (job::PreImage::Base, edit.stack_ops())
+            };
+            let recomposite = job::Recomposite {
+                region,
+                pre,
+                ops,
+                ends_drag: false,
+            };
+            edit.queue_recomposite(recomposite, &wake);
         }
         if tab.unsaved() != was_unsaved {
             self.emit(ShellEvent::ProjectsChanged);
@@ -3143,10 +3150,11 @@ impl AppController {
     }
 
     /// Called by every repaint before it reads anything else: takes the
-    /// active tab's live stroke's newest segment, if any, previews it and
-    /// queues exactly that segment's footprint for recompositing into the
-    /// resident tiles -- one tick per repaint, never per motion event. A
-    /// no-op with no live stroke or no motion since the last flush.
+    /// active tab's live stroke's newest segment, if any, previews it on the
+    /// indices and queues exactly that segment's footprint for rendering into
+    /// the resident tiles -- the whole path so far blended over the pre-stroke
+    /// samples -- one tick per repaint, never per motion event. A no-op with
+    /// no live stroke or no motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
         let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
@@ -3161,11 +3169,18 @@ impl AppController {
         let Some(segment) = stroke.take_segment() else {
             return;
         };
+        let (source_id, radius, softness) = (stroke.source(), stroke.radius(), stroke.softness());
         let op = job::Op::BrushStroke {
-            source_id: stroke.source(),
+            source_id,
             path: segment,
-            radius: stroke.radius(),
-            softness: stroke.softness(),
+            radius,
+            softness,
+        };
+        let so_far = job::Op::BrushStroke {
+            source_id,
+            path: stroke.path_so_far(),
+            radius,
+            softness,
         };
         let region = edit
             .session
@@ -3174,7 +3189,13 @@ impl AppController {
         let Some(region) = region else {
             return;
         };
-        edit.queue_recomposite(region, &wake);
+        let recomposite = job::Recomposite {
+            region,
+            pre: job::PreImage::Snapshot,
+            ops: vec![so_far],
+            ends_drag: false,
+        };
+        edit.queue_recomposite(recomposite, &wake);
         edit.stroke
             .as_mut()
             .expect("the stroke that produced this tick is still live")
@@ -3184,9 +3205,9 @@ impl AppController {
 
     /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
     /// appends the stroke's resampled path unless its footprint is empty or
-    /// off-image. Queues the tick rects (dilated) for recompositing, or the
-    /// appended region itself when no tick fired (a press-release with no
-    /// motion).
+    /// off-image. Re-renders every resident tile the ticks or the appended
+    /// stroke touched from its pre-stroke samples with the resampled path
+    /// blended over them.
     fn paint_end(&mut self) {
         self.flush_live_stroke();
         let wake = self.recomposite_wake();
@@ -3211,34 +3232,20 @@ impl AppController {
             .ok()
             .flatten()
             .is_some();
+        let mut touched = stroke.tick_rects;
         if !has_footprint {
+            edit.end_drag(&touched, Vec::new(), &wake);
             return;
         }
-        let radius = stroke.radius();
-        let tick_rects = stroke.tick_rects;
         let region = edit
             .session
-            .append(op)
+            .append(op.clone())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
         // Only the stroke that lights the unsaved mark changes what the tab
         // strip and the project card show.
         let lit = !was_unsaved;
-        let Some(region) = region else {
-            if lit {
-                self.emit(ShellEvent::ProjectsChanged);
-            }
-            return;
-        };
-        let map = edit.session.tile();
-        if tick_rects.is_empty() {
-            edit.queue_recomposite(region, &wake);
-        } else {
-            let margin = (radius / 8.0).ceil() as u32 + 2;
-            for rect in tick_rects {
-                let dilated = dilate_rect(rect, margin, map.width, map.height);
-                edit.queue_recomposite(dilated, &wake);
-            }
-        }
+        touched.extend(region);
+        edit.end_drag(&touched, vec![op], &wake);
         if lit {
             self.emit(ShellEvent::ProjectsChanged);
         }
@@ -7281,7 +7288,7 @@ impl AppController {
             created_at: job::now_unix(),
         };
         if let Some(edit) = tab.edit.as_mut() {
-            edit.session.rebase();
+            edit.rebase();
         }
         tab.held.push(job::InMemoryCheckpoint {
             kind,
