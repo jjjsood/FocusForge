@@ -478,6 +478,13 @@ fn take_mode_changes(events: &Mutex<Vec<ShellEvent>>) -> Vec<ShellMode> {
         .collect()
 }
 
+/// The shape of the Z-Map at `path`, read straight from disk.
+fn stored_info(path: &Path) -> ZMapInfo {
+    ZMapReader::open(path)
+        .expect("the tab's Z-Map must open")
+        .info()
+}
+
 /// The whole Z-Map at `path`, read straight from disk.
 fn read_whole_zmap(path: &Path) -> Vec<u16> {
     let reader = ZMapReader::open(path).expect("the tab's Z-Map must open");
@@ -693,20 +700,23 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
 
     assert!(controller.set_mode(ShellMode::Editor));
     let (_, zmap_b) = controller.materialize_active_tab_planes().unwrap();
+    let info_b = controller.edit_session().unwrap().info();
     assert_eq!(
-        controller.edit_session().unwrap().indices(),
-        read_whole_zmap(&zmap_b).as_slice(),
-        "tab 1's session is its own whole Z-Map"
+        info_b,
+        stored_info(&zmap_b),
+        "tab 1's session is over its own Z-Map"
     );
 
     controller.select_project(0);
     assert_eq!(controller.mode(), ShellMode::Editor);
     let (_, zmap_a) = controller.materialize_active_tab_planes().unwrap();
+    let info_a = controller.edit_session().unwrap().info();
     assert_eq!(
-        controller.edit_session().unwrap().indices(),
-        read_whole_zmap(&zmap_a).as_slice(),
-        "tab 0's session is its own whole Z-Map"
+        info_a,
+        stored_info(&zmap_a),
+        "tab 0's session is over its own Z-Map"
     );
+    assert_ne!(info_a, info_b, "2 frames against 3");
 
     controller
         .edit_session_mut()
@@ -760,7 +770,8 @@ fn edit_session_follows_the_newest_planes() {
     let newest = controller.held_checkpoints().last().unwrap().zmap.clone();
     let session = controller.edit_session().unwrap();
     assert_eq!(session.op_count(), 0, "a fresh session, not the old one");
-    assert_eq!(session.indices(), read_whole_zmap(&newest).as_slice());
+    assert_eq!(session.info(), stored_info(&newest));
+    assert!(session.stack_ops().is_empty());
 }
 
 #[test]
@@ -3284,7 +3295,7 @@ use std::num::NonZeroU32;
 
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::retouch::blend;
-use focusforge_core::retouch::{EditSession, footprint};
+use focusforge_core::retouch::footprint;
 use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
 use focusforge_gui::brush::LiveStroke;
 use focusforge_gui::canvas::overlay_edited;
@@ -3355,7 +3366,13 @@ fn bind_softness_to_alt_wheel(controller: &mut AppController) {
 
 /// The active tab's whole fused map.
 fn map_rect(controller: &AppController) -> Rect {
-    controller.edit_session().unwrap().tile()
+    let info = controller.edit_session().unwrap().info();
+    Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    }
 }
 
 /// The screen point over the right pane whose paint point is image
@@ -3441,10 +3458,6 @@ fn drag_screen(controller: &mut AppController, screen: &[(f32, f32)]) {
 
 fn ops(controller: &AppController) -> Vec<Op> {
     controller.edit_session().unwrap().ops().cloned().collect()
-}
-
-fn indices(controller: &AppController) -> Vec<u16> {
-    controller.edit_session().unwrap().indices().to_vec()
 }
 
 /// `rect` of the RGB TIFF at `path`.
@@ -3693,7 +3706,8 @@ fn drag_produces_one_brush_stroke() {
         matches!(ops(&c).last(), Some(Op::BrushStroke { source_id: 2, .. })),
         "it paints the selected source"
     );
-    let before = indices(&c);
+    common::settle_recomposites(&mut c);
+    let before = displayed_whole(&mut c);
 
     // In the band above the image, with a 1 px brush.
     set_size(&mut c, 1.0);
@@ -3701,8 +3715,9 @@ fn drag_produces_one_brush_stroke() {
     c.pointer_moved(RIGHT.x + 140.0, 20.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 140.0, 20.0));
+    common::settle_recomposites(&mut c);
     assert_eq!(ops(&c).len(), 3, "a stroke wholly off the image");
-    assert_eq!(indices(&c), before);
+    assert_eq!(displayed_whole(&mut c), before);
 }
 
 #[test]
@@ -4345,18 +4360,17 @@ fn pipette_reads_and_appends_nothing() {
     c.select_frame(2);
     drag(&mut c, &[(20.0, 50.0), (30.0, 55.0)]);
     c.undo();
-    let state = |c: &AppController| (ops(c), indices(c), c.edit_session().unwrap().can_redo());
+    let state = |c: &AppController| (ops(c), c.edit_session().unwrap().can_redo());
     let before = state(&c);
-    assert!(before.2, "one stroke waits on the redo stack");
-    let edited = before.1.clone();
+    assert!(before.1, "one stroke waits on the redo stack");
     let differing = |source: u16| {
         (8..height)
             .flat_map(|y| (8..width).map(move |x| (x, y)))
             .find(|&(x, y)| {
-                let index = edited[(y * width + x) as usize];
+                let index = sealed[(y * width + x) as usize];
                 index != source && index != NO_SOURCE
             })
-            .map(|(x, y)| ((x as f32, y as f32), edited[(y * width + x) as usize]))
+            .map(|(x, y)| ((x as f32, y as f32), sealed[(y * width + x) as usize]))
             .expect("the fused map names more than one source")
     };
     let off_image = (RIGHT.x + 100.0, 8.0);
@@ -4648,8 +4662,8 @@ fn selected_frame_pixel(c: &AppController, x: u32, y: u32) -> Vec<u16> {
 }
 
 /// A drag over the left pane and the same drag shifted to the cursor's
-/// mirrored point over the right pane append equal ops and leave equal indices, at fit, one zoom
-/// step in, after a pan and with a wider gutter; the left pane's frame is
+/// mirrored point over the right pane append equal ops and show equal pixels,
+/// at fit, one zoom step in, after a pan and with a wider gutter; the left pane's frame is
 /// never written.
 #[test]
 fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
@@ -4674,7 +4688,7 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
 
         drag_screen(c, &right_path);
         let right_ops = ops(c);
-        let right_indices = indices(c);
+        let right_image = displayed_whole(c);
         assert_eq!(
             right_ops.len(),
             ops_before + 1,
@@ -4687,10 +4701,9 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
         let frame_before = selected_frame_pixel(c, 29, 30);
         drag_screen(c, &left_path);
         assert_eq!(ops(c), right_ops, "{stage}: the left pane's op");
-        assert_eq!(
-            indices(c),
-            right_indices,
-            "{stage}: the left pane's indices"
+        assert!(
+            displayed_whole(c) == right_image,
+            "{stage}: the left pane's pixels"
         );
         assert_eq!(
             selected_frame_pixel(c, 29, 30),
@@ -4722,7 +4735,6 @@ fn a_press_between_the_panes_opens_no_stroke() {
     set_size(&mut c, 8.0);
     c.select_frame(2);
     let before_ops = ops(&c);
-    let before_indices = indices(&c);
     let inside = at(30.0, 30.0);
 
     for (case, start) in [
@@ -4739,7 +4751,6 @@ fn a_press_between_the_panes_opens_no_stroke() {
         release(&mut c, inside);
         common::settle_recomposites(&mut c);
         assert_eq!(ops(&c), before_ops, "a press in {case}");
-        assert_eq!(indices(&c), before_indices, "a press in {case}");
     }
 }
 
@@ -4926,7 +4937,8 @@ fn undo_redo_bindings_and_silent_discard() {
     c.select_frame(2);
     drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
     let both = ops(&c);
-    let after_both = indices(&c);
+    common::settle_recomposites(&mut c);
+    let after_both = sealed.displayed(&c);
 
     for (undo_key, redo_key) in [("z", "Z"), ("Z", "z")] {
         c.key(true, undo_key, CTRL);
@@ -4934,12 +4946,13 @@ fn undo_redo_bindings_and_silent_discard() {
         assert!(c.brush_toolbar_view().can_redo);
         c.key(true, redo_key, CTRL_SHIFT);
         assert_eq!(ops(&c), both, "redo as {redo_key:?}");
-        assert_eq!(indices(&c), after_both);
+        common::settle_recomposites(&mut c);
+        assert!(sealed.displayed(&c) == after_both, "redo as {redo_key:?}");
     }
 
     c.key(true, "z", CTRL);
     c.key(true, "z", CTRL);
-    assert_eq!(indices(&c), sealed.indices, "undo is exact");
+    assert!(ops(&c).is_empty(), "undo is exact");
     common::settle_recomposites(&mut c);
     assert!(
         sealed.displayed(&c) == sealed.composite,
@@ -4969,9 +4982,9 @@ fn undo_redo_bindings_and_silent_discard() {
         "nothing announces it"
     );
 
-    let now = (ops(&c), indices(&c));
+    let now = ops(&c);
     c.key(true, "z", CTRL_SHIFT);
-    assert_eq!((ops(&c), indices(&c)), now, "nothing left to redo");
+    assert_eq!(ops(&c), now, "nothing left to redo");
     common::settle_recomposites(&mut c);
     sealed.assert_shown(&c, "after the new stroke");
 }
@@ -5056,7 +5069,8 @@ fn stroke_commit_recomposites_its_tick_rects() {
 
 #[test]
 fn every_edit_has_a_cli_equivalent() {
-    let (mut c, _) = open_editor("brush_cli");
+    let (mut c, root) = open_editor("brush_cli");
+    let sealed = Sealed::read(&mut c, &root);
     set_size(&mut c, 6.0);
     c.select_frame(1);
     drag(&mut c, &[(10.0, 10.0), (30.0, 25.0), (12.0, 40.0)]);
@@ -5067,18 +5081,17 @@ fn every_edit_has_a_cli_equivalent() {
     drag(&mut c, &[(50.0, 8.0), (20.0, 58.0)]);
     let ops = ops(&c);
     assert_eq!(ops.len(), 2);
-
-    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
-    let info = ZMapReader::open(&zmap).unwrap().info();
-    let mut replay = EditSession::new(info, map_rect(&c), read_whole_zmap(&zmap)).unwrap();
-    for op in &ops {
-        replay.append(op.clone()).unwrap();
-    }
-    assert_eq!(replay.indices(), c.edit_session().unwrap().indices());
+    common::settle_recomposites(&mut c);
 
     let json = serde_json::to_string(&ops).unwrap();
     let parsed: Vec<Op> = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, ops);
+
+    let info = c.edit_session().unwrap().info();
+    assert!(
+        sealed.displayed(&c) == sealed.expected(&parsed, info),
+        "the serialized ops replay to the displayed image"
+    );
 }
 
 #[test]
@@ -5555,7 +5568,7 @@ impl Gate {
     /// Swaps the active session's frame reader for a closed gate over it.
     fn install(controller: &mut AppController) -> Gate {
         let edit = controller
-            .edit_state_mut_for_test()
+            .edit_session_mut()
             .expect("the tab has an edit session");
         let gate = Gate {
             gate: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
@@ -5876,7 +5889,10 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     assert!(c.save_checkpoint());
     c.select_checkpoint_row(row_index(&c, "held:0"));
     common::settle_session(&mut c);
-    assert_eq!(indices(&c), sealed.indices, "the restored row's own map");
+    assert!(
+        c.edit_session().unwrap().stack_ops().is_empty(),
+        "the restored row's own chain"
+    );
     gate.open();
     wait_for_recomposite_ready(&events);
     common::settle_recomposites(&mut c);
@@ -5902,8 +5918,7 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
 
     // (c) A plain save is not a replacement: its regions land.
     let name = "recomposite_saved";
-    let (mut c, root) = open_editor(name);
-    let sealed = Sealed::read(&mut c, &root);
+    let (mut c, _) = open_editor(name);
     let gate = Gate::install(&mut c);
     set_size(&mut c, 8.0);
     c.select_frame(1);
@@ -5915,7 +5930,7 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
         !c.take_recomposited().is_empty(),
         "the save kept the session, so its regions land"
     );
-    assert_ne!(indices(&c), sealed.indices);
+    assert!(!c.edit_session().unwrap().stack_ops().is_empty());
 
     // (d) A result for a switched-away tab lands on its own tab.
     let name = "recomposite_switched";
@@ -5964,7 +5979,6 @@ fn a_failed_background_recomposite_keeps_the_edit() {
         );
     }
     assert_eq!(ops(&c).len(), 2);
-    assert_ne!(indices(&c), sealed.indices);
 
     c.undo();
     assert_eq!(ops(&c).len(), 1, "undo still steps the history");
@@ -6203,12 +6217,11 @@ fn assert_wheel_key_pipette_blocked(c: &mut AppController, case: &str) {
 }
 
 /// A brush drag over either pane, blocked: neither pane's press starts a
-/// stroke, so the edit session's own op count and index buffer -- the
-/// in-memory twin of the Z-Map a commit would write -- stay exactly as
-/// they were.
+/// stroke, so the edit session's op list and the displayed image stay exactly
+/// as they were.
 fn assert_drag_blocked(c: &mut AppController, case: &str) {
     let before_ops = ops(c);
-    let before_indices = indices(c);
+    let before_image = displayed_whole(c);
     press(c, at_pane(LEFT, 10.0, 10.0));
     c.pointer_moved(at_pane(LEFT, 20.0, 15.0).0, at_pane(LEFT, 20.0, 15.0).1);
     release(c, at_pane(LEFT, 20.0, 15.0));
@@ -6216,10 +6229,10 @@ fn assert_drag_blocked(c: &mut AppController, case: &str) {
     c.pointer_moved(at(20.0, 15.0).0, at(20.0, 15.0).1);
     release(c, at(20.0, 15.0));
     assert_eq!(ops(c), before_ops, "{case}: a blocked drag must add no op");
-    assert_eq!(
-        indices(c),
-        before_indices,
-        "{case}: a blocked drag must not touch the Z-Map"
+    common::settle_recomposites(c);
+    assert!(
+        displayed_whole(c) == before_image,
+        "{case}: a blocked drag must not touch the image"
     );
 }
 
@@ -6373,8 +6386,9 @@ fn paint(controller: &mut AppController, x: i32) {
     let session = controller
         .edit_session_mut()
         .expect("the tab has an edit session");
-    let width = session.tile().width as usize;
-    let shown = session.indices()[20 * width + x as usize];
+    let shown = session
+        .stored_source(x as u32, 20)
+        .expect("the column lies inside the map");
     session
         .append(Op::BrushStroke {
             source_id: u16::from(shown == 0),
@@ -6451,7 +6465,6 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     let mut controller = controller_with_scratch("auto_checkpoint_new");
     open_fused_tab(&mut controller, "auto_checkpoint_new_frames", 2);
     paint(&mut controller, 20);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
     let painted_ops = ops(&controller);
     let path = save_to_proposed(&mut controller);
 
@@ -6472,10 +6485,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     assert_eq!(child.zmap_blob, root.zmap_blob, "the fused ancestor's map");
     assert_eq!(current_row(&controller), Some(child.id.clone()));
     let session = controller.edit_session().expect("the session survives");
-    assert_eq!(
-        (session.op_count(), session.indices()),
-        (0, painted.as_slice())
-    );
+    assert_eq!((session.op_count(), session.stack_ops()), (0, painted_ops));
     assert!(!controller.save_enabled());
 
     // An opened project painted on its older, non-head row.
@@ -6486,7 +6496,6 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     controller.select_checkpoint_row(root_row);
     common::enter_editor(&mut controller);
     paint(&mut controller, 40);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
     let painted_ops = ops(&controller);
     assert!(controller.save_enabled());
     assert!(controller.save_active_project(|_| None));
@@ -6501,10 +6510,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     assert_eq!(added.zmap_blob, saved_zmap_blob(&path, &chain[0]));
     assert_eq!(current_row(&controller), Some(added.id));
     let session = controller.edit_session().expect("the session survives");
-    assert_eq!(
-        (session.op_count(), session.indices()),
-        (0, painted.as_slice())
-    );
+    assert_eq!((session.op_count(), session.stack_ops()), (0, painted_ops));
     assert!(!controller.save_enabled());
 }
 
@@ -6722,7 +6728,7 @@ fn a_save_that_does_not_write_loses_nothing() {
     let mut controller = controller_with_scratch("save_loses_nothing");
     open_fused_tab(&mut controller, "save_loses_nothing_frames", 2);
     paint(&mut controller, 20);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
 
     assert!(!controller.save_active_project(|_| None));
     assert_eq!(
@@ -6745,10 +6751,7 @@ fn a_save_that_does_not_write_loses_nothing() {
     );
     assert_eq!(current_row(&controller), Some("held:1".to_string()));
     let session = controller.edit_session().unwrap();
-    assert_eq!(
-        (session.op_count(), session.indices()),
-        (0, painted.as_slice())
-    );
+    assert_eq!((session.op_count(), session.stack_ops()), (0, painted_ops));
     assert!(controller.save_enabled());
 
     let path = save_to_proposed(&mut controller);
@@ -6797,7 +6800,7 @@ fn an_older_checkpoint_edits_through_its_own_registration() {
     let sealed = Sealed::read_with(&mut controller, &frames, root_registration);
     set_size(&mut controller, 6.0);
     drag(&mut controller, &[(10.0, 10.0), (30.0, 20.0)]);
-    assert_ne!(indices(&controller), sealed.indices, "the stroke painted");
+    assert_eq!(ops(&controller).len(), 1, "the stroke is appended");
     sealed.assert_shown(&controller, "an older checkpoint's edit");
 
     // The head's registration would have drawn something else.
@@ -6854,8 +6857,10 @@ fn entering_the_editor_opens_its_session_off_thread() {
     );
     common::settle_session(&mut controller);
     let session = controller.edit_session().expect("the settle installs it");
-    assert_eq!(session.indices(), read_whole_zmap(&zmap).as_slice());
+    assert_eq!(session.info(), stored_info(&zmap));
+    assert!(session.stack_ops().is_empty());
     assert_eq!(session.op_count(), 0);
+    let plain = displayed_whole(&mut controller);
 
     // Two op-bearing rows, the second built on the first, strokes either
     // side of a 16 px tile edge.
@@ -6863,12 +6868,8 @@ fn entering_the_editor_opens_its_session_off_thread() {
     assert!(controller.save_checkpoint());
     paint(&mut controller, 33);
     assert!(controller.save_checkpoint());
-    let chained = controller.edit_session().unwrap().indices().to_vec();
-    assert_ne!(
-        chained,
-        read_whole_zmap(&zmap),
-        "the strokes changed the map"
-    );
+    let chained = controller.edit_session().unwrap().stack_ops();
+    assert_eq!(chained.len(), 2);
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.select_checkpoint_row(row_index(&controller, "held:0"));
     assert!(controller.edit_session().is_none());
@@ -6884,15 +6885,16 @@ fn entering_the_editor_opens_its_session_off_thread() {
     assert!(controller.edit_session().is_none());
     common::settle_session(&mut controller);
     let session = controller.edit_session().expect("the settle installs it");
-    assert_eq!(
-        session.indices(),
-        chained.as_slice(),
-        "the chain is applied"
-    );
+    assert_eq!(session.stack_ops(), chained, "the chain is applied");
     assert_eq!(session.op_count(), 0, "the replay is rebased away");
     assert!(
         !controller.take_recomposited().is_empty(),
         "the replay filled the resident tiles"
+    );
+    common::settle_recomposites(&mut controller);
+    assert!(
+        displayed_whole(&mut controller) != plain,
+        "the replay painted the chain's pixels"
     );
 }
 
@@ -6915,8 +6917,8 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
     let mut controller = controller_with_scratch(name);
     open_fused_tab(&mut controller, name, 2);
     paint(&mut controller, 20);
+    let painted_ops = ops(&controller);
     assert!(controller.save_checkpoint());
-    let painted = controller.edit_session().unwrap().indices().to_vec();
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.select_checkpoint_row(row_index(&controller, "held:0"));
     let events = record_events(&mut controller);
@@ -6928,8 +6930,8 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
         controller
             .edit_session()
             .expect("the replacement lands")
-            .indices(),
-        painted.as_slice(),
+            .stack_ops(),
+        painted_ops,
         "the row selected last owns the session"
     );
     assert_eq!(

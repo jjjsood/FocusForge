@@ -1184,6 +1184,44 @@ impl EditState {
         }
     }
 
+    /// The ops applied over the row's chain, oldest first; undone ops are not
+    /// included.
+    pub fn ops(&self) -> impl Iterator<Item = &Op> {
+        self.session.ops()
+    }
+
+    /// How many ops are applied.
+    pub fn op_count(&self) -> usize {
+        self.session.op_count()
+    }
+
+    /// Whether an applied op can be undone.
+    pub fn can_undo(&self) -> bool {
+        self.session.can_undo()
+    }
+
+    /// Whether an undone op can be redone.
+    pub fn can_redo(&self) -> bool {
+        self.session.can_redo()
+    }
+
+    /// Appends `op` and discards the redo stack. Returns the region it
+    /// changes; on `Err` nothing changed.
+    pub fn append(&mut self, op: Op) -> Result<Option<Rect>, RetouchError> {
+        self.session.append(op)
+    }
+
+    /// Steps back one op, returning its region; `None` with nothing to undo.
+    pub fn undo(&mut self) -> Option<Option<Rect>> {
+        self.session.undo()
+    }
+
+    /// Re-applies the most recently undone op, returning its region; `None`
+    /// with nothing to redo.
+    pub fn redo(&mut self) -> Option<Option<Rect>> {
+        self.session.redo()
+    }
+
     fn render_input(&self) -> RenderInput {
         RenderInput {
             base: Arc::clone(&self.base),

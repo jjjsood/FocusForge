@@ -2313,12 +2313,24 @@ fn editor_opens_over_every_method() {
         common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
         assert_eq!(controller.mode(), ShellMode::Editor, "{method}");
-        let session = controller
-            .edit_session()
-            .unwrap_or_else(|| panic!("{method}: the editor owns the run's Z-Map"));
         assert!(
-            session
-                .indices()
+            controller.edit_session().is_some(),
+            "{method}: the editor owns the run's Z-Map"
+        );
+        let (_, zmap) = controller
+            .materialize_active_tab_planes()
+            .unwrap_or_else(|| panic!("{method}: the run's planes are ready"));
+        let reader = focusforge_core::zmap::ZMapReader::open(&zmap).unwrap();
+        let tile = Rect {
+            x: 0,
+            y: 0,
+            width: reader.info().width(),
+            height: reader.info().height(),
+        };
+        let mut indices = vec![0u16; reader.info().tile_len(tile)];
+        reader.read_tile_into(tile, &mut indices).unwrap();
+        assert!(
+            indices
                 .iter()
                 .all(|&i| i == NO_SOURCE || usize::from(i) < 3),
             "{method}: every index names one of the three frames or NO_SOURCE"
@@ -4327,8 +4339,8 @@ fn the_unsaved_mark_follows_unsealed_ops() {
     assert_eq!(marks(&c), (false, false));
 
     common::enter_editor(&mut c);
-    let map = c.edit_session().unwrap().tile();
-    let (w, h) = (map.width as f32, map.height as f32);
+    let map = c.edit_session().unwrap().info();
+    let (w, h) = (map.width() as f32, map.height() as f32);
     let left = PaneRect {
         x: 0.0,
         y: 0.0,
@@ -5884,8 +5896,8 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
     controller.select_project(0);
 
     common::enter_editor(&mut controller);
-    let map = controller.edit_session().unwrap().tile();
-    let (w, h) = (map.width as f32, map.height as f32);
+    let map = controller.edit_session().unwrap().info();
+    let (w, h) = (map.width() as f32, map.height() as f32);
     let pane = |x: f32| PaneRect {
         x,
         y: 0.0,

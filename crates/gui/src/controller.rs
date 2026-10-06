@@ -1684,12 +1684,6 @@ impl AppController {
         self.resident_tile_size_for_test = Some(size);
     }
 
-    /// Test-only: the active tab's live editor state, to swap its frame
-    /// reader.
-    pub fn edit_state_mut_for_test(&mut self) -> Option<&mut job::EditState> {
-        self.state.active_mut()?.edit.as_mut()
-    }
-
     /// Installs the regions recomposite workers have parked, on the tab each
     /// was queued for -- active or not -- and dispatches what queued behind
     /// them. Returns `true` once no tab has a recomposite in flight.
@@ -1918,14 +1912,14 @@ impl AppController {
 
     /// The active tab's own edit session, once its worker has opened and
     /// [`Self::settle_edit_session`] installed it.
-    pub fn edit_session(&self) -> Option<&job::EditSession> {
-        Some(&self.state.active()?.edit.as_ref()?.session)
+    pub fn edit_session(&self) -> Option<&job::EditState> {
+        self.state.active()?.edit.as_ref()
     }
 
     /// Mutable twin of [`Self::edit_session`] -- the seam an editor op
     /// appends through.
-    pub fn edit_session_mut(&mut self) -> Option<&mut job::EditSession> {
-        Some(&mut self.state.active_mut()?.edit.as_mut()?.session)
+    pub fn edit_session_mut(&mut self) -> Option<&mut job::EditState> {
+        self.state.active_mut()?.edit.as_mut()
     }
 
     /// The active tab's edited view for the renderer's overlay -- `None`
@@ -2898,8 +2892,8 @@ impl AppController {
             soft: self.state.brush.soft,
             soft_fraction: self.state.brush.soft / 100.0,
             picking: self.state.brush.picking,
-            can_undo: self.edit_session().is_some_and(job::EditSession::can_undo),
-            can_redo: self.edit_session().is_some_and(job::EditSession::can_redo),
+            can_undo: self.edit_session().is_some_and(job::EditState::can_undo),
+            can_redo: self.edit_session().is_some_and(job::EditState::can_redo),
             can_save_checkpoint: self.edit_session().is_some_and(|s| s.op_count() > 0),
         }
     }

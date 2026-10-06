@@ -19,7 +19,7 @@ use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project, ProjectError,
     SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
 };
-use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::bridge::Canvas;
 use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::PointerKind;
@@ -386,20 +386,6 @@ fn samples(path: &Path) -> Vec<u16> {
         .samples
 }
 
-fn read_zmap(path: &Path) -> Vec<u16> {
-    let reader = ZMapReader::open(path).unwrap();
-    let info = reader.info();
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width: info.width(),
-        height: info.height(),
-    };
-    let mut indices = vec![0u16; info.tile_len(whole)];
-    reader.read_tile_into(whole, &mut indices).unwrap();
-    indices
-}
-
 fn row_index(controller: &AppController, id: &str) -> usize {
     controller
         .checkpoints_panel()
@@ -531,8 +517,9 @@ fn stroke(x: i32, y: i32, source_id: u16) -> Op {
     }
 }
 
-fn live_indices(controller: &AppController) -> Vec<u16> {
-    controller.edit_session().unwrap().indices().to_vec()
+/// Every op the live image shows over its base, oldest first.
+fn live_stack(controller: &AppController) -> Vec<Op> {
+    controller.edit_session().unwrap().stack_ops()
 }
 
 fn live_ops(controller: &AppController) -> usize {
@@ -660,7 +647,7 @@ fn manual_checkpoint_is_a_child_of_the_origin() {
     assert!(controller.brush_toolbar_view().can_save_checkpoint);
     controller.redo();
     assert_eq!(live_ops(&controller), 2);
-    let live = live_indices(&controller);
+    let live = live_stack(&controller);
     let bytes = fs::read(&project.project).unwrap();
     let before = row_ids(&controller.checkpoints_panel());
 
@@ -676,7 +663,7 @@ fn manual_checkpoint_is_a_child_of_the_origin() {
     );
     assert_eq!(live_ops(&controller), 0);
     assert!(!controller.edit_session().unwrap().can_undo());
-    assert_eq!(live_indices(&controller), live);
+    assert_eq!(live_stack(&controller), live);
     assert!(!controller.brush_toolbar_view().can_save_checkpoint);
     assert!(
         controller.save_enabled(),
@@ -927,58 +914,58 @@ fn restoring_an_unsaved_stroke_checkpoint_shows_its_image() {
 
     paint(&mut controller, stroke(1, 1, 0));
     paint(&mut controller, stroke(3, 1, 1));
-    let x_indices = live_indices(&controller);
+    let x_ops = live_stack(&controller);
     assert!(controller.save_checkpoint());
     paint(&mut controller, stroke(4, 2, 1));
-    let y_indices = live_indices(&controller);
-    assert_ne!(x_indices, y_indices);
+    let y_ops = live_stack(&controller);
+    assert_ne!(x_ops, y_ops);
     assert!(controller.save_checkpoint());
     let (x, y) = ("held:0", "held:1");
 
     // Stacking mode: restore the head first (silent), then X.
     click(&mut controller, &project.edited);
     wait_for_render(&mut controller);
-    assert_ne!(live_indices(&controller), x_indices);
+    assert_ne!(live_stack(&controller), x_ops);
     assert!(controller.set_mode(ShellMode::Stacking));
     click(&mut controller, x);
     wait_for_render(&mut controller);
     let session = controller
         .edit_session()
         .expect("an op row opens its session");
-    assert_eq!(session.indices(), x_indices.as_slice());
+    assert_eq!(session.stack_ops(), x_ops);
     assert_eq!(session.op_count(), 0);
     assert!(!session.can_undo() && !session.can_redo());
     let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), head_image, "the base's planes load");
     assert_eq!(current_row(&controller).as_deref(), Some(x));
 
-    // Entering the editor keeps the restored indices.
+    // Entering the editor keeps the restored op list.
     enter_editor(&mut controller);
-    assert_eq!(live_indices(&controller), x_indices);
+    assert_eq!(live_stack(&controller), x_ops);
     assert_eq!(live_ops(&controller), 0);
 
     // Two levels: Y over X over the head.
     click(&mut controller, y);
     wait_for_render(&mut controller);
-    assert_eq!(live_indices(&controller), y_indices);
+    assert_eq!(live_stack(&controller), y_ops);
     assert_eq!(live_ops(&controller), 0);
     assert!(!controller.edit_session().unwrap().can_undo());
 }
 
 /// Restores `target` from Stacking mode, then enters the editor, and checks
 /// live holds exactly `expected` with nothing to undo in both.
-fn assert_restores_to(controller: &mut AppController, target: &str, expected: &[u16]) {
+fn assert_restores_to(controller: &mut AppController, target: &str, expected: &[Op]) {
     assert!(controller.set_mode(ShellMode::Stacking));
     click(controller, target);
     wait_for_render(controller);
     let session = controller
         .edit_session()
         .expect("an op row opens its session");
-    assert_eq!(session.indices(), expected);
+    assert_eq!(session.stack_ops(), expected);
     assert_eq!(session.op_count(), 0);
     assert!(!session.can_undo() && !session.can_redo());
     enter_editor(controller);
-    assert_eq!(live_indices(controller), expected);
+    assert_eq!(live_stack(controller), expected);
     assert_eq!(live_ops(controller), 0);
 }
 
@@ -989,16 +976,16 @@ fn restoring_an_unsaved_stroke_checkpoint_over_a_saved_fused_base() {
     let (project, mut controller) = editor_on_head("checkpoint_panel_restore_over_root");
     click(&mut controller, &project.root);
     assert_eq!(live_ops(&controller), 0);
-    let root_indices = live_indices(&controller);
+    let root_ops = live_stack(&controller);
     paint(&mut controller, stroke(1, 1, 0));
     paint(&mut controller, stroke(3, 1, 1));
-    let expected = live_indices(&controller);
-    assert_ne!(expected, root_indices);
+    let expected = live_stack(&controller);
+    assert_ne!(expected, root_ops);
     assert!(controller.save_checkpoint());
 
     click(&mut controller, &project.edited);
     wait_for_render(&mut controller);
-    assert_ne!(live_indices(&controller), expected);
+    assert_ne!(live_stack(&controller), expected);
     assert_restores_to(&mut controller, "held:0", &expected);
 }
 
@@ -1022,22 +1009,22 @@ fn restoring_an_unsaved_stroke_checkpoint_over_an_in_memory_fused_base() {
     while common::wait_for_settle(&mut controller, Duration::from_secs(60)).is_some() {}
     assert_eq!(controller.checkpoint_count(), Some(1), "the fuse commits");
     enter_editor(&mut controller);
-    let base = live_indices(&controller);
+    let base = live_stack(&controller);
 
     paint(&mut controller, stroke(10, 10, 1));
     paint(&mut controller, stroke(20, 12, 2));
-    let x_indices = live_indices(&controller);
-    assert_ne!(x_indices, base);
+    let x_ops = live_stack(&controller);
+    assert_ne!(x_ops, base);
     assert!(controller.save_checkpoint());
     paint(&mut controller, stroke(30, 30, 1));
-    let y_indices = live_indices(&controller);
-    assert_ne!(y_indices, x_indices);
+    let y_ops = live_stack(&controller);
+    assert_ne!(y_ops, x_ops);
     assert!(controller.save_checkpoint());
 
     click(&mut controller, "held:0");
-    assert_eq!(live_indices(&controller), base);
-    assert_restores_to(&mut controller, "held:1", &x_indices);
-    assert_restores_to(&mut controller, "held:2", &y_indices);
+    assert_eq!(live_stack(&controller), base);
+    assert_restores_to(&mut controller, "held:1", &x_ops);
+    assert_restores_to(&mut controller, "held:2", &y_ops);
 }
 
 /// The canvas and the session follow the row live stands on, not the
@@ -1057,18 +1044,18 @@ fn live_keeps_its_own_planes_when_the_highlight_moves() {
 
     paint(&mut controller, stroke(1, 1, 0));
     paint(&mut controller, stroke(3, 1, 1));
-    let live = live_indices(&controller);
+    let live = live_stack(&controller);
     assert!(controller.save_checkpoint());
     assert_eq!(current_row(&controller).as_deref(), Some("held:0"));
     let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), head_image, "live's planes, not Clear");
-    assert_eq!(live_indices(&controller), live);
+    assert_eq!(live_stack(&controller), live);
 
     controller.select_project(1);
     controller.select_project(0);
     let composite = loaded_composite(&mut controller, None);
     assert_eq!(samples(&composite), head_image, "after a tab round trip");
-    assert_eq!(live_indices(&controller), live);
+    assert_eq!(live_stack(&controller), live);
     enter_editor(&mut controller);
 
     // Over the root instead of the head.
@@ -1093,8 +1080,6 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
     common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
     click(&mut controller, &project.root);
     enter_editor(&mut controller);
-    let (_, zmap) = controller.materialize_active_tab_planes().unwrap();
-    let root_map = read_zmap(&zmap);
     loaded_composite(&mut controller, None);
 
     // Zero ops: nothing happens, nothing is emitted.
@@ -1122,7 +1107,7 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
     controller.close_guard_confirmed();
     common::settle_session(&mut controller);
     assert_eq!(live_ops(&controller), 0);
-    assert_eq!(live_indices(&controller), root_map);
+    assert!(live_stack(&controller).is_empty());
     assert_eq!(
         current_row(&controller).as_deref(),
         Some(project.root.as_str())
@@ -1138,7 +1123,7 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
         current_row(&controller).as_deref(),
         Some(project.root.as_str())
     );
-    assert_eq!(live_indices(&controller), root_map);
+    assert!(live_stack(&controller).is_empty());
     assert!(controller.save_active_project(|_| None));
     let kept = added_id(&project.project, &[&project.root, &project.edited]);
     assert_eq!(
@@ -1784,7 +1769,7 @@ fn deleting_never_changes_live_or_the_canvas() {
     loaded_composite(&mut controller, None);
     paint(&mut controller, stroke(1, 1, 0));
     paint(&mut controller, stroke(3, 1, 1));
-    let indices = live_indices(&controller);
+    let stack = live_stack(&controller);
     let image = {
         let (composite, _) = controller
             .materialize_active_tab_planes()
@@ -1797,7 +1782,7 @@ fn deleting_never_changes_live_or_the_canvas() {
         assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Keep));
         assert_eq!(live_ops(controller), 2);
         assert!(controller.edit_session().unwrap().can_undo());
-        assert_eq!(live_indices(controller), indices);
+        assert_eq!(live_stack(controller), stack);
         assert!(!controller.take_render_started());
         let seen = events.lock().unwrap();
         assert!(
@@ -1815,7 +1800,7 @@ fn deleting_never_changes_live_or_the_canvas() {
 
     assert!(controller.save_active_project(|_| None));
     assert!(controller.edit_session().is_some());
-    assert_eq!(live_indices(&controller), indices);
+    assert_eq!(live_stack(&controller), stack);
     let kept = saved_ids(&project.project);
     assert!(kept.contains(&child), "the row live stands on stays stored");
     let current = current_row(&controller).expect("live's row is listed again");
