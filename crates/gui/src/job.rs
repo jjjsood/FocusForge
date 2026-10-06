@@ -46,7 +46,7 @@ pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
-pub use focusforge_core::retouch::{EditSession, footprint};
+pub use focusforge_core::retouch::footprint;
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
 /// Which operation a failure belongs to, classified from the typed
@@ -1026,14 +1026,17 @@ struct Recomposites {
     parked: Arc<Mutex<Option<Parked>>>,
 }
 
-/// One tab's live editor state: its undo/redo session, the composite and the
-/// frame set the edited image is blended from and the registration warping
-/// each frame read, the resident display cache the renderer overlays, the
-/// in-progress stroke, if any, and the regions still being rendered. The
-/// queue lives here, so a session that is dropped takes its pending results
-/// with it.
+/// One tab's live editor state: the strokes not yet saved with their undo
+/// and redo stacks, the composite and the frame set the edited image is
+/// blended from and the registration warping each frame read, the resident
+/// display cache the renderer overlays, the in-progress stroke, if any, and
+/// the regions still being rendered. The queue lives here, so a state that
+/// is dropped takes its queued results with it.
 pub struct EditState {
-    pub session: EditSession,
+    /// The ops over `chain` not yet saved, oldest first.
+    pending: Vec<Op>,
+    /// The ops undone from `pending`, the most recent last.
+    undone: Vec<Op>,
     /// The stored Z-Map of the row being edited, read-only.
     zmap: ZMapReader,
     pub sources: Arc<dyn FrameReader>,
@@ -1042,7 +1045,7 @@ pub struct EditState {
     pub base: Arc<TiffStack>,
     /// The file `base` reads.
     pub(crate) composite: PathBuf,
-    /// The ops the row stacks over `base` before the session's own, oldest
+    /// The ops the row stacks over `base` before the pending ones, oldest
     /// first.
     chain: Vec<Op>,
     pub tiles: crate::canvas::ResidentTiles,
@@ -1184,42 +1187,55 @@ impl EditState {
         }
     }
 
-    /// The ops applied over the row's chain, oldest first; undone ops are not
+    /// The pending ops over the row's chain, oldest first; undone ops are not
     /// included.
     pub fn ops(&self) -> impl Iterator<Item = &Op> {
-        self.session.ops()
+        self.pending.iter()
     }
 
-    /// How many ops are applied.
+    /// How many ops are pending.
     pub fn op_count(&self) -> usize {
-        self.session.op_count()
+        self.pending.len()
     }
 
-    /// Whether an applied op can be undone.
+    /// Whether a pending op can be undone.
     pub fn can_undo(&self) -> bool {
-        self.session.can_undo()
+        !self.pending.is_empty()
     }
 
     /// Whether an undone op can be redone.
     pub fn can_redo(&self) -> bool {
-        self.session.can_redo()
+        !self.undone.is_empty()
     }
 
-    /// Appends `op` and discards the redo stack. Returns the region it
-    /// changes; on `Err` nothing changed.
+    /// Validates `op` against the stored map, then pends it and discards the
+    /// redo stack. Returns the region it changes and renders nothing; on
+    /// `Err` nothing changed.
     pub fn append(&mut self, op: Op) -> Result<Option<Rect>, RetouchError> {
-        self.session.append(op)
+        let region = footprint(&op, self.info())?;
+        self.pending.push(op);
+        self.undone.clear();
+        Ok(region)
     }
 
-    /// Steps back one op, returning its region; `None` with nothing to undo.
+    /// Steps back one pending op, returning its region; `None` with nothing
+    /// to undo.
     pub fn undo(&mut self) -> Option<Option<Rect>> {
-        self.session.undo()
+        let op = self.pending.pop()?;
+        let region =
+            footprint(&op, self.info()).expect("a pending op passed footprint when appended");
+        self.undone.push(op);
+        Some(region)
     }
 
-    /// Re-applies the most recently undone op, returning its region; `None`
+    /// Pends the most recently undone op again, returning its region; `None`
     /// with nothing to redo.
     pub fn redo(&mut self) -> Option<Option<Rect>> {
-        self.session.redo()
+        let op = self.undone.pop()?;
+        let region =
+            footprint(&op, self.info()).expect("an undone op passed footprint when appended");
+        self.pending.push(op);
+        Some(region)
     }
 
     fn render_input(&self) -> RenderInput {
@@ -1233,24 +1249,20 @@ impl EditState {
     }
 
     /// Every op the edited image shows over `base`: the row's chain, then the
-    /// session's applied ops, oldest first.
+    /// pending ops, oldest first.
     pub fn stack_ops(&self) -> Vec<Op> {
-        self.chain
-            .iter()
-            .chain(self.session.ops())
-            .cloned()
-            .collect()
+        self.chain.iter().chain(&self.pending).cloned().collect()
     }
 
-    /// Makes the session's applied ops part of the chain and forgets them in
-    /// the session, so nothing is left to undo.
+    /// Makes the pending ops part of the chain and forgets the redo stack, so
+    /// nothing is left to undo or redo.
     pub fn rebase(&mut self) {
-        self.chain.extend(self.session.ops().cloned());
-        self.session.rebase();
+        self.chain.append(&mut self.pending);
+        self.undone.clear();
     }
 
     /// Renders `job` on the calling thread straight into the resident tiles.
-    /// The session-open replay uses it; a live edit goes through
+    /// The open-time replay uses it; a live edit goes through
     /// [`Self::queue_recomposite`].
     pub fn recomposite(&mut self, job: &Recomposite) -> Result<(), String> {
         let input = self.render_input();
@@ -1293,7 +1305,7 @@ impl EditState {
     }
 
     /// Whether no stroke is live and no recomposite is queued or in flight,
-    /// so the resident tiles hold every edit the indices do.
+    /// so the resident tiles hold every edit.
     pub fn is_settled(&self) -> bool {
         self.stroke.is_none() && self.recomposites.queued.is_empty() && !self.recomposites.in_flight
     }
@@ -1377,9 +1389,9 @@ impl EditState {
 
 /// Builds an [`EditState`] over the whole map: `composite` is the image edits
 /// blend over, the resident cache is gridded at `tile_size` px, and `chain`
-/// (a row's ops, oldest first) is replayed and rebased into the session. An
-/// op that cannot be applied ends the replay; a region that cannot be
-/// rendered is skipped.
+/// (a row's ops, oldest first) is replayed over it and kept as the state's
+/// chain. An op that cannot be applied ends the replay; a region that cannot
+/// be rendered is skipped.
 pub fn open_edit_session(
     zmap: &Path,
     composite: &Path,
@@ -1391,16 +1403,17 @@ pub fn open_edit_session(
 ) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
     let info = reader.info();
-    let tile = Rect {
-        x: 0,
-        y: 0,
-        width: info.width(),
-        height: info.height(),
-    };
-    let mut indices = vec![0u16; info.tile_len(tile)];
-    reader.read_tile_into(tile, &mut indices)?;
-    let session = EditSession::new(info, tile, indices)
-        .expect("a whole-map tile always fits its own map and its own tile_len");
+    // The first read maps the file; the mapping outlives the file, which a
+    // save removes together with the row's other held files.
+    reader.read_tile_into(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        &mut [0u16; 1],
+    )?;
     let base = Arc::new(TiffStack::open_files(&[composite.to_path_buf()])?);
     let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
@@ -1411,7 +1424,8 @@ pub fn open_edit_session(
         samples_per_pixel,
     );
     let mut edit = EditState {
-        session,
+        pending: Vec::new(),
+        undone: Vec::new(),
         zmap: reader,
         sources,
         registration,
@@ -1423,27 +1437,28 @@ pub fn open_edit_session(
         stroke: None,
         recomposites: Recomposites::default(),
     };
-    for (at, op) in chain.iter().enumerate() {
-        match edit.session.append(op.clone()) {
-            Ok(Some(region)) => {
-                let job = Recomposite {
-                    region,
-                    pre: PreImage::Base,
-                    ops: chain[..=at].to_vec(),
-                    ends_drag: false,
-                };
-                if let Err(error) = edit.recomposite(&job) {
-                    tracing::error!(%error, "restored stroke recomposite failed");
+    for op in chain {
+        match footprint(&op, info) {
+            Ok(region) => {
+                edit.chain.push(op);
+                if let Some(region) = region {
+                    let job = Recomposite {
+                        region,
+                        pre: PreImage::Base,
+                        ops: edit.chain.clone(),
+                        ends_drag: false,
+                    };
+                    if let Err(error) = edit.recomposite(&job) {
+                        tracing::error!(%error, "restored stroke recomposite failed");
+                    }
                 }
             }
-            Ok(None) => {}
             Err(err) => {
                 tracing::error!(error = %err, "restored stroke could not be applied");
                 break;
             }
         }
     }
-    edit.rebase();
     Ok(edit)
 }
 

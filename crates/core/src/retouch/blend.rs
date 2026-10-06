@@ -22,10 +22,9 @@ const OPAQUE: u32 = 1 << 16;
 /// Caps the radius so the ramp's products stay far inside `u64`.
 const MAX_RADIUS_16: u64 = 1 << 40;
 
-/// A validated brush stroke: [`Op::BrushStroke`]'s fields, checked against
-/// the map they will be applied to.
+/// A validated brush stroke: [`Op::BrushStroke`]'s path, radius and
+/// softness, checked against the map they will be applied to.
 pub(super) struct Stroke<'a> {
-    pub(super) source_id: u16,
     pub(super) path: &'a [Point],
     pub(super) radius: f32,
     pub(super) softness: f32,
@@ -58,7 +57,6 @@ pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, Ret
         });
     }
     Ok(Stroke {
-        source_id: *source_id,
         path: path.as_slice(),
         radius: *radius,
         softness: *softness,

@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Applying an edit op to a Z-Map's indices. A stroke paints `u16` source
-//! indices into the region it covers and touches nothing else -- the
-//! document this module edits is the map, never an image.
+//! The soft brush stroke blended over an image from a source frame, and the
+//! recomposite of a Z-Map's indices into one.
 
 pub mod blend;
-pub mod brush;
 pub mod recomposite;
-pub mod session;
-pub mod zmap_io;
 
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
-pub use brush::{apply, footprint};
+pub use blend::footprint;
 pub use recomposite::{Sources, named_frames, recomposite, recomposite_bands};
-pub use session::EditSession;
-pub use zmap_io::{session_tile, write_edited};
 
 /// Failures validating or applying an op against a Z-Map.
 #[derive(Debug, thiserror::Error)]

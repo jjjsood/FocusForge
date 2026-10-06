@@ -6969,12 +6969,11 @@ fn a_failed_session_open_drops_back_to_stacking() {
     let (_, zmap) = controller
         .materialize_active_tab_planes()
         .expect("a held fused row has planes");
-    let len = fs::metadata(&zmap).unwrap().len();
     fs::OpenOptions::new()
         .write(true)
         .open(&zmap)
         .unwrap()
-        .set_len(len / 2)
+        .set_len(0)
         .unwrap();
     let events = record_events(&mut controller);
 
@@ -7330,4 +7329,177 @@ fn live_stroke_at_the_image_edge_matches_the_saved_render() {
         shown == saved_render(&path),
         "strokes across the image border"
     );
+}
+
+// ---------------------------------------------------------------------
+// Unsaved strokes are an in-memory op list over the saved position.
+// ---------------------------------------------------------------------
+
+#[test]
+fn brush_stroke_appends_soft_op() {
+    let (mut c, _) = open_editor("brush_soft_op");
+    set_size(&mut c, 14.0);
+    c.select_frame(2);
+    let view = c.brush_toolbar_view();
+    assert_ne!(view.size, 8.0, "a size other than the default");
+    let radius = view.size / 2.0;
+    for (at_slider, softness, x) in [(0.0, 0.0f32, 12.0), (1.0, 1.0, 36.0)] {
+        c.set_brush_softness_fraction(at_slider);
+        assert_eq!(c.brush_toolbar_view().soft / 100.0, softness);
+        drag(&mut c, &[(x, 20.0), (x + 6.0, 30.0)]);
+    }
+    assert_eq!(
+        ops(&c),
+        vec![
+            Op::BrushStroke {
+                source_id: 2,
+                path: vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
+                radius,
+                softness: 0.0,
+            },
+            Op::BrushStroke {
+                source_id: 2,
+                path: vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
+                radius,
+                softness: 1.0,
+            },
+        ]
+    );
+}
+
+/// `ops` over the sealed composite at `composite`, rendered whole by the
+/// same function an export of unsaved strokes goes through.
+fn pending_render(composite: &Path, root: &Path, sealed: &Sealed, ops: Vec<Op>) -> Vec<u16> {
+    let state = project::PendingState {
+        composite: composite.to_path_buf(),
+        ops,
+        sources: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
+        registration: sealed.registration.clone(),
+        reference: 0,
+        description: String::new(),
+    };
+    let image = project::CheckpointImage::prepare_pending(&state).expect("the state prepares");
+    let full = image.full();
+    let mut out = vec![0u16; (full.width * full.height * 3) as usize];
+    image
+        .render(None, full, &mut |band: &[u16], rect: Rect| {
+            let row = rect.width as usize * 3;
+            for y in 0..rect.height as usize {
+                let at = ((rect.y as usize + y) * full.width as usize + rect.x as usize) * 3;
+                out[at..at + row].copy_from_slice(&band[y * row..(y + 1) * row]);
+            }
+            Ok(())
+        })
+        .expect("the state renders");
+    out
+}
+
+#[test]
+fn undo_redo_moves_the_state_position() {
+    let (mut c, root) = open_editor("undo_redo_position");
+    let sealed = Sealed::read(&mut c, &root);
+    let composite = c.materialize_active_tab_planes().unwrap().0;
+    // The shown image must equal the render of the ops it stacks over the base.
+    let assert_renders = |c: &AppController, case: &str| {
+        let stacked = c.edit_session().unwrap().stack_ops();
+        assert!(
+            sealed.displayed(c) == pending_render(&composite, &root, &sealed, stacked),
+            "{case}: the shown image differs from the render of its ops"
+        );
+    };
+    set_size(&mut c, 16.0);
+    c.set_brush_softness_fraction(0.6);
+    for (frame, from, to) in [
+        (0, (10.0, 20.0), (40.0, 26.0)),
+        (1, (14.0, 30.0), (44.0, 22.0)),
+        (2, (12.0, 24.0), (42.0, 36.0)),
+    ] {
+        c.select_frame(frame);
+        drag(&mut c, &[from, to]);
+    }
+    let all = ops(&c);
+    assert_eq!(all.len(), 3);
+    assert_renders(&c, "three strokes");
+
+    for k in 1..=3 {
+        c.undo();
+        common::settle_recomposites(&mut c);
+        assert_eq!(ops(&c), all[..3 - k], "undo {k}");
+        assert_renders(&c, &format!("undo {k}"));
+    }
+    assert!(!c.edit_session().unwrap().can_undo());
+    c.take_recomposited();
+    c.undo();
+    common::settle_recomposites(&mut c);
+    assert!(ops(&c).is_empty() && c.take_recomposited().is_empty());
+    assert_renders(&c, "undo with nothing pending");
+    assert!(sealed.displayed(&c) == sealed.composite);
+
+    for k in 1..=3 {
+        c.redo();
+        common::settle_recomposites(&mut c);
+        assert_eq!(ops(&c), all[..k], "redo {k}, in order");
+        assert_renders(&c, &format!("redo {k}"));
+    }
+
+    c.undo();
+    c.undo();
+    common::settle_recomposites(&mut c);
+    assert!(c.edit_session().unwrap().can_redo());
+    c.select_frame(2);
+    drag(&mut c, &[(30.0, 8.0), (34.0, 14.0)]);
+    assert!(!c.edit_session().unwrap().can_redo(), "a stroke ends redo");
+    assert_eq!(ops(&c).len(), 2);
+    assert_eq!(ops(&c)[0], all[0]);
+    assert_renders(&c, "the new stroke after an undo");
+
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the saved render of the pending strokes"
+    );
+}
+
+#[test]
+fn pending_strokes_append_on_save() {
+    let (mut c, root) = open_editor("pending_append_on_save");
+    let sealed = Sealed::read(&mut c, &root);
+    set_size(&mut c, 12.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(0);
+    drag(&mut c, &[(40.0, 50.0), (50.0, 54.0)]);
+    let path = save_to_proposed(&mut c);
+    let before = fs::read(&path).unwrap();
+    let known = saved_ids(&path);
+
+    c.select_frame(1);
+    drag(&mut c, &[(10.0, 12.0), (30.0, 20.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
+    let pending = ops(&c);
+    assert_eq!(pending.len(), 2);
+    assert!(
+        fs::read(&path).unwrap() == before,
+        "two strokes write nothing"
+    );
+    c.request_close(0);
+    assert_eq!(
+        c.pending_close().expect("two strokes ask").body,
+        "2 unsaved brush strokes."
+    );
+    c.cancel_close();
+
+    let shown = sealed.displayed(&c);
+    assert!(c.save_active_project(|_| None));
+    let added = added_checkpoint(&path, &known);
+    assert_eq!(added.ops, pending);
+    assert!(
+        shown == saved_render(&path),
+        "the newest checkpoint renders the live view"
+    );
+
+    let mut reopened = reopen(&path, "pending_append_reopened");
+    common::enter_editor(&mut reopened);
+    assert!(displayed_whole(&mut reopened) == shown);
 }

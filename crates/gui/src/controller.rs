@@ -980,11 +980,9 @@ impl ProjectTab {
             .is_some_and(|entry| matches!(entry.kind, job::InMemoryKind::Ops { .. }))
     }
 
-    /// Whether the edit session holds ops its origin does not.
+    /// Whether strokes are pending over the row's saved ops.
     fn live_modified(&self) -> bool {
-        self.edit
-            .as_ref()
-            .is_some_and(|edit| edit.session.op_count() > 0)
+        self.edit.as_ref().is_some_and(|edit| edit.op_count() > 0)
     }
 
     /// Removes the files of every fused in-memory entry a project save would
@@ -1910,14 +1908,14 @@ impl AppController {
         self.state.active().is_some_and(ProjectTab::can_edit)
     }
 
-    /// The active tab's own edit session, once its worker has opened and
+    /// The active tab's live edit state, once its worker has opened and
     /// [`Self::settle_edit_session`] installed it.
     pub fn edit_session(&self) -> Option<&job::EditState> {
         self.state.active()?.edit.as_ref()
     }
 
     /// Mutable twin of [`Self::edit_session`] -- the seam an editor op
-    /// appends through.
+    /// pends through.
     pub fn edit_session_mut(&mut self) -> Option<&mut job::EditState> {
         self.state.active_mut()?.edit.as_mut()
     }
@@ -2966,18 +2964,18 @@ impl AppController {
         (size / 2.0, self.state.brush.soft / 100.0)
     }
 
-    /// `Ctrl + Z`: steps the active tab's edit session back one op and
+    /// `Ctrl + Z`: steps the active tab's pending strokes back one op and
     /// queues the region it returns for recompositing. Ignored while a
     /// stroke is live.
     pub fn undo(&mut self) {
-        self.undo_or_redo(job::EditSession::undo, false);
+        self.undo_or_redo(job::EditState::undo, false);
     }
 
     /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
     /// queues the region it returns for recompositing. Ignored while a
     /// stroke is live.
     pub fn redo(&mut self) {
-        self.undo_or_redo(job::EditSession::redo, true);
+        self.undo_or_redo(job::EditState::redo, true);
     }
 
     /// Shared by [`Self::undo`]/[`Self::redo`]: `step` is whichever of the
@@ -2986,7 +2984,7 @@ impl AppController {
     /// live.
     fn undo_or_redo(
         &mut self,
-        step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>,
+        step: fn(&mut job::EditState) -> Option<Option<job::Rect>>,
         redo: bool,
     ) {
         let wake = self.recomposite_wake();
@@ -3000,7 +2998,7 @@ impl AppController {
         if edit.stroke.is_some() {
             return;
         }
-        let Some(region) = step(&mut edit.session) else {
+        let Some(region) = step(edit) else {
             return;
         };
         if let Some(region) = region {
@@ -3009,7 +3007,7 @@ impl AppController {
             let (pre, ops) = if redo {
                 (
                     job::PreImage::Current,
-                    edit.session.ops().last().cloned().into_iter().collect(),
+                    edit.ops().last().cloned().into_iter().collect(),
                 )
             } else {
                 (job::PreImage::Base, edit.stack_ops())
@@ -3206,17 +3204,13 @@ impl AppController {
             radius: stroke.radius(),
             softness: stroke.softness(),
         };
-        let has_footprint = job::footprint(&op, edit.session.info())
-            .ok()
-            .flatten()
-            .is_some();
+        let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
         let mut touched = stroke.tick_rects;
         if !has_footprint {
             edit.end_drag(&touched, Vec::new(), &wake);
             return;
         }
         let region = edit
-            .session
             .append(op.clone())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
         // Only the stroke that lights the unsaved mark changes what the tab
@@ -5732,7 +5726,7 @@ impl AppController {
         let ops: Vec<&job::Op> = tab
             .edit
             .as_ref()
-            .map(|edit| edit.session.ops().collect())
+            .map(|edit| edit.ops().collect())
             .unwrap_or_default();
         let mut parts = Vec::new();
         if !ops.is_empty() {
@@ -5785,7 +5779,7 @@ impl AppController {
     pub fn pending_fuse_copy(&self) -> Option<CloseGuardCopy> {
         let (id, _) = self.state.pending_fuse?;
         let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
-        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.ops().collect();
         Some(CloseGuardCopy {
             title: "Save your edits first?".to_string(),
             context: format!("Fusing {}", tab.title),
@@ -5820,7 +5814,7 @@ impl AppController {
     pub fn pending_restore_copy(&self) -> Option<CloseGuardCopy> {
         let (id, key) = self.state.pending_restore.as_ref()?;
         let tab = self.state.active().filter(|tab| tab.id == *id)?;
-        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.ops().collect();
         let panel = self.checkpoints_panel();
         let target = panel
             .entries
@@ -7232,9 +7226,9 @@ impl AppController {
             .is_some_and(|index| self.history_frozen(index))
     }
 
-    /// Keeps tab `index`'s live -- its origin's Z-Map with the session's ops
+    /// Keeps tab `index`'s live -- its origin's Z-Map with the pending ops
     /// -- as an op-bearing checkpoint in memory under the current row. The
-    /// session is rebased onto it and it becomes the current row. `false`,
+    /// pending ops are rebased onto it and it becomes the current row. `false`,
     /// changing nothing, when live is unmodified or the checkpoint cannot be
     /// taken.
     pub fn snapshot_live(&mut self, index: usize) -> bool {
@@ -7255,14 +7249,14 @@ impl AppController {
         let Some(edit) = tab.edit.as_ref() else {
             return false;
         };
-        if edit.session.op_count() == 0 {
+        if edit.op_count() == 0 {
             return false;
         }
         let Some(parent) = tab.row_parent() else {
             return false;
         };
         let kind = job::InMemoryKind::Ops {
-            ops: edit.session.ops().cloned().collect(),
+            ops: edit.ops().cloned().collect(),
             created_at: job::now_unix(),
         };
         if let Some(edit) = tab.edit.as_mut() {
@@ -8479,10 +8473,7 @@ fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
 /// The export modal's own state for `tab`'s current position, `None` when
 /// it has none.
 fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
-    let editing = tab
-        .edit
-        .as_ref()
-        .is_some_and(|edit| edit.session.op_count() > 0);
+    let editing = tab.edit.as_ref().is_some_and(|edit| edit.op_count() > 0);
     let info = row_export_info(tab)?;
     let kind = if editing || info.live {
         ExportKind::Live
@@ -8529,7 +8520,7 @@ fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
     if let Some(edit) = tab
         .edit
         .as_ref()
-        .filter(|edit| edit.session.op_count() > 0 || info.live)
+        .filter(|edit| edit.op_count() > 0 || info.live)
     {
         let (sources, registration) = tab.fused()?;
         return Some(job::ExportSource::Pending(job::PendingState {
