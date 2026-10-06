@@ -448,15 +448,8 @@ fn write_entries(
         let id = match &entry.kind {
             InMemoryKind::Fused(held) => append_held(project, held, parent)?,
             InMemoryKind::Ops { ops, created_at } => {
-                super::append::append_ops_on(
-                    project,
-                    parent,
-                    ops.clone(),
-                    None,
-                    *created_at,
-                    super::ZMapStorage::Bounded,
-                )?
-                .checkpoint
+                super::append::append_ops_on(project, parent, ops.clone(), None, *created_at)?
+                    .checkpoint
             }
         };
         ids[i] = Some(id);
@@ -558,8 +551,6 @@ pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
         compression: "zstd".to_string(),
         uncompressed_len: blob.uncompressed_len,
         compressed_len: blob.compressed_len,
-        base: None,
-        target: None,
     }
 }
 

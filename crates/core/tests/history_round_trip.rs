@@ -3,8 +3,7 @@
 //! Random op sequences over synthetic Z-Maps are sealed, branched and deleted
 //! through both project writers; after reopening the file, every checkpoint
 //! must materialize to the map an in-memory model computed. The model replays
-//! over plain `Vec<u16>` maps and shares nothing with the container, the delta
-//! encoding or the snapshot cadence. A failing case prints its shrunk action
+//! over plain `Vec<u16>` maps and shares nothing with the container. A failing case prints its shrunk action
 //! list; no failure file is kept.
 
 use std::collections::BTreeSet;
@@ -16,7 +15,7 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
     self, BlobKind, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef, Point, Project,
-    SealRequest, ZMapStorage,
+    SealRequest,
 };
 use focusforge_core::retouch::replay;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
@@ -451,15 +450,9 @@ fn write_per_checkpoint(path: &Path, model: &mut Model) -> Result<(), TestCaseEr
                 ops,
                 created_at,
             } => {
-                let sealed = project::append_ops_onto(
-                    path,
-                    &model.nodes[parent].id,
-                    ops,
-                    None,
-                    created_at,
-                    ZMapStorage::Bounded,
-                )
-                .map_err(|e| fail(&format!("seal node {node} under node {parent}"), e))?;
+                let sealed =
+                    project::append_ops_onto(path, &model.nodes[parent].id, ops, None, created_at)
+                        .map_err(|e| fail(&format!("seal node {node} under node {parent}"), e))?;
                 model.nodes[node].id = sealed.checkpoint;
             }
             Step::Delete { node, removed } => {
@@ -630,8 +623,8 @@ proptest! {
     #![proptest_config(config(4))]
 
     #[test]
-    fn histories_crossing_the_cadence_round_trip((g, salt, chain) in case(long_chain)) {
-        let (dir, path, mut model) = start("cadence", g, salt);
+    fn long_histories_round_trip((g, salt, chain) in case(long_chain)) {
+        let (dir, path, mut model) = start("long", g, salt);
         for ops in chain {
             let newest = model.nodes.len() - 1;
             model.seal(newest, ops);
@@ -652,10 +645,10 @@ proptest! {
                     .any(|b| b.hash == checkpoint.zmap_blob && b.kind == BlobKind::Full)
             })
             .count();
-        prop_assert!(
-            full_blobs >= 3,
-            "{} checkpoints are full snapshots; the root and two cadence snapshots make three",
-            full_blobs
+        prop_assert_eq!(
+            full_blobs,
+            model.nodes.len(),
+            "every checkpoint's Z-Map is one full blob"
         );
     }
 }

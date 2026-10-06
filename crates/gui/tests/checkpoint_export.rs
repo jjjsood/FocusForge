@@ -195,7 +195,6 @@ fn build_edited_with_samples(name: &str, samples_per_pixel: u32) -> Edited {
         }],
         None,
         t0 + 60,
-        focusforge_core::project::ZMapStorage::Bounded,
     )
     .unwrap()
     .checkpoint;

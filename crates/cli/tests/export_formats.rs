@@ -22,7 +22,7 @@ use focusforge_core::io::{
 };
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::to_8bit;
-use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, SealRequest, ZMapStorage};
+use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, SealRequest};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use raw_dng::{DngSpec, write_dng};
 
@@ -178,7 +178,6 @@ fn build_synth(name: &str, spp: u32) -> Synth {
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed")
     .checkpoint;
@@ -1091,7 +1090,6 @@ fn build_metadata_synth(
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed")
     .checkpoint;

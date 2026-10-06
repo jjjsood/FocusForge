@@ -817,16 +817,9 @@ fn branched(name: &str) -> Branched {
     let root = head_of(&path);
     let a = append_once(&dir, &path, &sources, 1, 1).checkpoint;
     let onto = |parent: &str, op: Op, at: i64| {
-        project::append_ops_onto(
-            &path,
-            parent,
-            vec![op],
-            None,
-            at,
-            project::ZMapStorage::Bounded,
-        )
-        .unwrap()
-        .checkpoint
+        project::append_ops_onto(&path, parent, vec![op], None, at)
+            .unwrap()
+            .checkpoint
     };
     let b = onto(&a, stroke(1, 5, 5), 2_000);
     let c = onto(&a, stroke(2, 30, 30), 2_100);

@@ -16,8 +16,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, BlobKind, BlobRecord, Metrics, Op, Opened, Plane, Point, Project,
-    ProjectError, SealRequest, ZMapStorage, blob,
+    self, AppendRequest, BlobKind, Metrics, Op, Opened, Plane, Point, Project, ProjectError,
+    SealRequest, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -161,8 +161,7 @@ fn sealed(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
 }
 
 /// One sealed project over `fixtures/mantis-512`'s own golden planes, with
-/// its own 8 source frames referenced -- what a delta-producing append
-/// needs a realistic edit to beat the full blob on.
+/// its own 8 source frames referenced.
 fn sealed_mantis(name: &str) -> (PathBuf, PathBuf) {
     let dir = tmp_dir(name);
     let mantis = common::mantis_512_dir();
@@ -348,20 +347,14 @@ fn verification_is_lazy_but_never_skipped() {
         .zmap_blob
         .clone();
 
-    // A middle checkpoint, forced full, so the root's own snapshot sits
-    // behind it rather than under the head's delta chain.
     let mid = project::append_ops_at(
         &project_path,
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .expect("middle append must succeed");
-    assert_eq!(mid.zmap.kind, BlobKind::Full);
 
-    // A realistic brush edit, proven elsewhere to land as a delta over this
-    // golden map.
     let ops = vec![Op::BrushStroke {
         source_id: 3,
         path: vec![
@@ -372,16 +365,12 @@ fn verification_is_lazy_but_never_skipped() {
         radius: 12.0,
         softness: 0.3,
     }];
-    let sealed_ops = project::append_ops_at(&project_path, ops, None, 1_000, ZMapStorage::Smallest)
-        .expect("append must succeed");
-    assert_eq!(
-        sealed_ops.zmap.kind,
-        BlobKind::SparseDelta,
-        "test edit must land as a delta to exercise the lazy chain"
-    );
+    let sealed_ops =
+        project::append_ops_at(&project_path, ops, None, 1_000).expect("append must succeed");
+    assert_eq!(sealed_ops.zmap.kind, BlobKind::Full);
 
-    // The root's own full snapshot, behind the middle checkpoint and off
-    // the head's own resolve_chain: tamper it.
+    // The root's own Z-Map, behind the middle checkpoint and off the head's
+    // own blob: tamper it.
     let tampered = dir.join("tampered-root.ffp");
     let root_entry = format!("blobs/{root_zmap_hash}.zst");
     let original_root_bytes = read_entry_bytes(&project_path, &root_entry);
@@ -403,14 +392,16 @@ fn verification_is_lazy_but_never_skipped() {
         .collect();
     assert!(
         !verified.contains(&root_zmap_hash),
-        "the untouched root snapshot must not have been hashed"
+        "the untouched root Z-Map must not have been hashed"
+    );
+    assert!(
+        !verified.contains(&mid.zmap.hash),
+        "the middle checkpoint's Z-Map must not have been hashed"
     );
     assert_eq!(
         verified,
-        [mid.zmap.hash.clone(), sealed_ops.zmap.hash.clone()]
-            .into_iter()
-            .collect(),
-        "verified_blobs must be exactly the head's own resolve_chain"
+        HashSet::from([sealed_ops.zmap.hash.clone()]),
+        "verified_blobs must be exactly the head's own Z-Map"
     );
 
     let root_checkpoint = project.history().get(&root_id).unwrap().clone();
@@ -420,31 +411,6 @@ fn verification_is_lazy_but_never_skipped() {
         other => panic!("expected HashMismatch, got {other:?}"),
     }
     assert!(!out.exists(), "no output file may be left");
-}
-
-/// The set of blob hashes `target` resolves through, independent of
-/// `resolve_chain` (`pub(super)`, unreachable from here) -- what open must
-/// have hashed and nothing more.
-fn expected_chain_hashes(blobs: &[BlobRecord], target: &str) -> HashSet<String> {
-    let mut chain = HashSet::new();
-    let mut current = target.to_string();
-    loop {
-        if let Some(full) = blobs
-            .iter()
-            .find(|b| b.kind == BlobKind::Full && b.hash == current)
-        {
-            chain.insert(full.hash.clone());
-            return chain;
-        }
-        let delta = blobs
-            .iter()
-            .find(|b| {
-                b.kind == BlobKind::SparseDelta && b.target.as_deref() == Some(current.as_str())
-            })
-            .expect("a non-full target must resolve through a delta");
-        chain.insert(delta.hash.clone());
-        current = delta.base.clone().expect("a delta always names its base");
-    }
 }
 
 #[test]
@@ -467,7 +433,7 @@ fn open_does_not_hash_the_whole_store() {
 
     let project = Project::open(&project_path).unwrap();
     let head = project.checkpoint().clone();
-    let expected_hashes = expected_chain_hashes(&project.manifest().blobs, &head.zmap_blob);
+    let expected_hashes = HashSet::from([head.zmap_blob.clone()]);
     let verified_hashes: HashSet<String> = project
         .verified_blobs()
         .iter()
@@ -786,7 +752,6 @@ fn link_failures_are_structural_refusals() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap();
     let mut tampered_child = read_checkpoint_json(&project_path, &child.checkpoint);
@@ -1019,15 +984,8 @@ fn append_stroke(project_path: &Path) {
         radius: 2.0,
         softness: 0.0,
     };
-    project::append_ops_onto(
-        project_path,
-        &head,
-        vec![stroke],
-        None,
-        1,
-        project::ZMapStorage::Bounded,
-    )
-    .expect("the stroke must append");
+    project::append_ops_onto(project_path, &head, vec![stroke], None, 1)
+        .expect("the stroke must append");
 }
 
 #[test]

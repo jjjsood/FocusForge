@@ -11,7 +11,7 @@ use focusforge_core::align::{Registration, Transform, WarpingReader};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    self, AlignRecord, CheckpointImage, Metrics, Op, Point, Project, SealRequest, ZMapStorage,
+    self, AlignRecord, CheckpointImage, Metrics, Op, Point, Project, SealRequest,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
@@ -238,7 +238,6 @@ fn unedited_child_renders_the_ancestor_composite() {
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed");
 
@@ -270,7 +269,6 @@ fn op_bearing_render_blends_the_stroke_over_the_ancestor_composite() {
         vec![stroke.clone()],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed");
 

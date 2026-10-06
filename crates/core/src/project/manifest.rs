@@ -6,9 +6,8 @@
 //! and `hash_algorithm` naming the hash rather than leaving it implied --
 //! each with its own test in `crates/core/tests/project_format.rs`.
 //!
-//! **Open refuses, it does not default.** Every field is required except
-//! the optional-by-meaning ones ([`BlobRecord::base`] and
-//! [`BlobRecord::target`]): a manifest missing one fails deserialization.
+//! **Open refuses, it does not default.** A manifest missing a required
+//! field fails deserialization.
 //! `deny_unknown_fields` is deliberately absent.
 
 use serde::{Deserialize, Serialize};
@@ -106,16 +105,6 @@ pub struct BlobRecord {
     pub compression: String,
     pub uncompressed_len: u64,
     pub compressed_len: u64,
-    /// [`BlobKind::SparseDelta`] only: the content hash of the map this
-    /// blob is a patch against. A `full` record's JSON carries neither this
-    /// nor [`Self::target`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
-    /// [`BlobKind::SparseDelta`] only: the content hash of the map this
-    /// blob decodes to, applied over [`Self::base`]'s own materialized map --
-    /// never a checkpoint id and never an entry name of its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
 }
 
 /// What a blob contains. `#[non_exhaustive]` so a future variant can be
@@ -125,9 +114,6 @@ pub struct BlobRecord {
 #[non_exhaustive]
 pub enum BlobKind {
     Full,
-    /// A patch against [`BlobRecord::base`]'s materialized map, decoding to
-    /// [`BlobRecord::target`].
-    SparseDelta,
 }
 
 /// One source frame, referenced -- never embedded.

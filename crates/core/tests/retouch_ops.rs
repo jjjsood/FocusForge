@@ -19,7 +19,7 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
-    Project, ProjectError, SealRequest, ZMapStorage, partial_path,
+    Project, ProjectError, SealRequest, partial_path,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::HostBudget;
@@ -177,7 +177,7 @@ fn seal_held(project_path: &Path, held: &HeldCheckpoint) -> String {
 }
 
 fn append(project_path: &Path, parent: &str, ops: Vec<Op>) -> String {
-    project::append_ops_onto(project_path, parent, ops, None, 1, ZMapStorage::Bounded)
+    project::append_ops_onto(project_path, parent, ops, None, 1)
         .expect("the strokes must append")
         .checkpoint
 }

@@ -25,8 +25,7 @@ use focusforge_core::io::{Rect, TiffHeader, TiffSpec, TiffStack, TiffWriter, ope
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AlignRecord, AppendRequest, Metrics, Op, Plane, Point, Project, SealRequest, ZMapStorage,
-    partial_path,
+    self, AlignRecord, AppendRequest, Metrics, Op, Plane, Point, Project, SealRequest, partial_path,
 };
 use focusforge_core::tile::HostBudget;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
@@ -457,7 +456,6 @@ fn build_branched(name: &str) -> Branched {
         }],
         Some("branch-a".to_string()),
         1,
-        ZMapStorage::Bounded,
     )
     .expect("branch a must succeed")
     .checkpoint;
@@ -473,7 +471,6 @@ fn build_branched(name: &str) -> Branched {
         }],
         Some("branch-b".to_string()),
         2,
-        ZMapStorage::Bounded,
     )
     .expect("branch b must succeed")
     .checkpoint;
@@ -1044,7 +1041,6 @@ fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, S
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed");
 

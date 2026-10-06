@@ -18,7 +18,7 @@ use focusforge_core::project::export::{
     TiffCompression,
 };
 use focusforge_core::project::{
-    self, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
+    self, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -188,7 +188,6 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed");
 

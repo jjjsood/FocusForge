@@ -1483,7 +1483,7 @@ fn editor_requires_a_real_unequal_zmap_hit_before_painting() {
 fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
     use focusforge_core::io::{TiffSpec, TiffWriter};
     use focusforge_core::params::ParamValues;
-    use focusforge_core::project::{Metrics, SealRequest, ZMapStorage, append_ops_at, seal_at};
+    use focusforge_core::project::{Metrics, SealRequest, append_ops_at, seal_at};
     use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
     let dir = common::tree("checkpoints_scrollbar_thumb");
@@ -1539,14 +1539,8 @@ fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
             radius: 0.5,
             softness: 0.0,
         };
-        append_ops_at(
-            &project_path,
-            vec![op],
-            None,
-            noon + i * 60,
-            ZMapStorage::Bounded,
-        )
-        .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
+        append_ops_at(&project_path, vec![op], None, noon + i * 60)
+            .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
 
     let mut controller = AppController::new();

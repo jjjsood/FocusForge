@@ -20,11 +20,11 @@ use super::checkpoint::{Checkpoint, FuseRecord};
 use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::{
-    AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
+    AlignRecord, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
 use super::seal::{composite_blob, now_unix, record, source_ref};
 use super::{
-    HASH_ALGORITHM, Op, Project, SealedProject, fused_extent, materialize_zmap, resolve_chain,
+    HASH_ALGORITHM, Op, Project, SealedProject, full_blob, fused_extent, materialize_zmap,
 };
 use crate::align::Registration;
 use crate::params::ParamValues;
@@ -272,85 +272,30 @@ fn write_fused(
     })
 }
 
-/// Whether a checkpoint's Z-Map is stored as a patch against its parent's
-/// materialized map (whichever compresses smaller), the same choice capped
-/// by the snapshot cadence, or always in full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ZMapStorage {
-    /// Store whichever of a full map and a patch against the parent
-    /// compresses smaller, with no cap on how long the resulting chain
-    /// grows.
-    Smallest,
-    /// [`Self::Smallest`], except a full map is stored whenever the
-    /// parent's [`ZMapChain::needs_snapshot`] is true.
-    Bounded,
-    /// Always store the full map.
-    Full,
-}
-
-/// The byte-budget half of the snapshot cadence: a checkpoint is forced
-/// full once the deltas already written since the last snapshot outweigh
-/// that snapshot's own compressed size by this multiple. A ratio rather
-/// than a fixed byte count, so the same rule self-tunes across map sizes
-/// that differ by orders of magnitude instead of being tuned for one.
-pub const SNAPSHOT_BYTE_BUDGET: u64 = 1;
-
-/// The count half of the snapshot cadence: a checkpoint is forced full once
-/// this many deltas already follow the last snapshot, regardless of their
-/// bytes -- the case the byte budget alone cannot see, a long run of edits
-/// each too small to ever outweigh the snapshot.
-pub const SNAPSHOT_CHECKPOINT_CAP: usize = 32;
-
-/// What [`super::Project::zmap_chain`] reports about the path from a
-/// checkpoint's Z-Map back to its nearest full snapshot: the snapshot's own
-/// compressed size, and the count and total compressed size of the deltas
-/// resolved on top of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZMapChain {
-    pub snapshot_bytes: u64,
-    pub deltas: usize,
-    pub delta_bytes: u64,
-}
-
-impl ZMapChain {
-    /// Whether the cadence forces the next checkpoint on this chain to be a
-    /// full snapshot: [`SNAPSHOT_CHECKPOINT_CAP`] deltas already follow the
-    /// last snapshot, or their bytes already exceed it by
-    /// [`SNAPSHOT_BYTE_BUDGET`].
-    pub fn needs_snapshot(&self) -> bool {
-        self.deltas >= SNAPSHOT_CHECKPOINT_CAP
-            || self.delta_bytes > self.snapshot_bytes.saturating_mul(SNAPSHOT_BYTE_BUDGET)
-    }
-}
-
 /// Seals `ops` as a new checkpoint onto `project_path`'s head, stamping the
 /// current wall clock. Refuses an empty list ([`ProjectError::EmptyOpList`])
 /// rather than writing an op-less checkpoint with no composite. Sources are
 /// never opened or rehashed: the new checkpoint's `stack_fingerprint`,
 /// `algorithm` and `params` are carried forward from the head unchanged, and
 /// the manifest's `composite` keeps naming the fused ancestor's plane -- only
-/// a new Z-Map blob is written, as whichever of [`ZMapStorage::Bounded`]'s
-/// two encodings compresses smaller, or in full once the snapshot cadence
-/// requires it.
+/// a new full Z-Map blob is written.
 pub fn append_ops(
     project_path: &Path,
     ops: Vec<Op>,
     label: Option<String>,
 ) -> Result<SealedProject, ProjectError> {
-    append_ops_at(project_path, ops, label, now_unix(), ZMapStorage::Bounded)
+    append_ops_at(project_path, ops, label, now_unix())
 }
 
 /// [`append_ops`] with the creation timestamp supplied rather than read from
-/// the clock, and the Z-Map storage choice supplied rather than always
-/// [`ZMapStorage::Bounded`]. Seals onto the project's current head.
+/// the clock. Seals onto the project's current head.
 pub fn append_ops_at(
     project_path: &Path,
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
-    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
-    append_ops_saved(project_path, None, ops, label, created_at, storage)
+    append_ops_saved(project_path, None, ops, label, created_at)
 }
 
 /// [`append_ops_at`] against an explicit `parent` rather than always the
@@ -362,9 +307,8 @@ pub fn append_ops_onto(
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
-    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
-    append_ops_saved(project_path, Some(parent), ops, label, created_at, storage)
+    append_ops_saved(project_path, Some(parent), ops, label, created_at)
 }
 
 /// Opens `project_path`, seals `ops` under `parent` (`None` is the head) and
@@ -375,11 +319,10 @@ fn append_ops_saved(
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
-    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(project_path)?;
     let parent = parent.map_or_else(|| project.checkpoint().id.clone(), str::to_string);
-    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at, storage)?;
+    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at)?;
     project.commit()?;
     Ok(sealed)
 }
@@ -391,7 +334,6 @@ pub(super) fn append_ops_on(
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
-    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
     if ops.is_empty() {
         return Err(ProjectError::EmptyOpList {
@@ -399,7 +341,7 @@ pub(super) fn append_ops_on(
         });
     }
     let staging = fresh_staging_dir(project.path())?;
-    let result = append_ops_staged(project, parent, &ops, label, created_at, &staging, storage);
+    let result = append_ops_staged(project, parent, &ops, label, created_at, &staging);
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -441,7 +383,7 @@ fn replay_ops_to_staged(
 
     let partial = partial_path(out);
     let outcome = replay_ops_onto_zmap(&mut project, parent, &head, ops, info, staging, &partial)
-        .and_then(|_| std::fs::rename(&partial, out).map_err(|err| ProjectError::io(out, err)));
+        .and_then(|()| std::fs::rename(&partial, out).map_err(|err| ProjectError::io(out, err)));
     if outcome.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
@@ -468,30 +410,8 @@ pub fn replay_ops_to(
     result
 }
 
-/// The smaller-of-two choice [`ZMapStorage::Smallest`] and
-/// [`ZMapStorage::Bounded`] share once a delta is worth trying at all.
-fn stage_smallest_delta(
-    full: &StagedBlob,
-    info: ZMapInfo,
-    tile: Rect,
-    indices: &[u16],
-    staging: &Path,
-) -> Result<Option<StagedBlob>, ProjectError> {
-    let delta = blob::stage_delta(
-        info.width(),
-        info.height(),
-        tile,
-        indices,
-        ZSTD_LEVEL,
-        staging,
-    )?;
-    Ok((delta.compressed_len < full.compressed_len).then_some(delta))
-}
-
 /// Replays `ops` onto `parent`'s materialized Z-Map inside `staging` and
-/// writes the edited full map to `new_zmap_path`. Returns the tile the edit
-/// touched and its resident indices, which [`append_ops_staged`]'s delta
-/// staging and [`replay_ops_to_staged`]'s plain write both need.
+/// writes the edited full map to `new_zmap_path`.
 fn replay_ops_onto_zmap(
     project: &mut Project,
     parent: &str,
@@ -500,7 +420,7 @@ fn replay_ops_onto_zmap(
     info: ZMapInfo,
     staging: &Path,
     new_zmap_path: &Path,
-) -> Result<(Rect, Vec<u16>), ProjectError> {
+) -> Result<(), ProjectError> {
     let tile = replay::replay_tile(ops, info).map_err(|(index, source)| ProjectError::Op {
         index,
         source: Box::new(source),
@@ -556,7 +476,7 @@ fn replay_ops_onto_zmap(
             .map_err(|err| ProjectError::container(new_zmap_path, err))?;
     }
 
-    Ok((tile, indices))
+    Ok(())
 }
 
 /// `parent`'s checkpoint and the Z-Map geometry of its fused ancestor: the
@@ -580,59 +500,22 @@ fn append_ops_staged(
     label: Option<String>,
     created_at: i64,
     staging: &Path,
-    storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
     let (head, info) = checkpoint_geometry(project, parent)?;
     let manifest = project.manifest().clone();
 
     let new_zmap_path = staging.join("new-zmap.tif");
-    let (tile, indices) =
-        replay_ops_onto_zmap(project, parent, &head, ops, info, staging, &new_zmap_path)?;
+    replay_ops_onto_zmap(project, parent, &head, ops, info, staging, &new_zmap_path)?;
 
     let full = blob::stage_plane(&new_zmap_path, Plane::ZMap, ZSTD_LEVEL, staging)?;
 
-    // A patch against the parent's own materialized map, kept only when it
-    // compresses smaller than storing the whole map again -- never for
-    // `ZMapStorage::Full`, never when the edit touched nearly every pixel,
-    // which a patch cannot beat, and never past `ZMapStorage::Bounded`'s
-    // snapshot cadence, which forces a full map instead.
-    let delta = match storage {
-        ZMapStorage::Smallest => stage_smallest_delta(&full, info, tile, &indices, staging)?,
-        ZMapStorage::Bounded => {
-            if project.zmap_chain(&head)?.needs_snapshot() {
-                None
-            } else {
-                stage_smallest_delta(&full, info, tile, &indices, staging)?
-            }
-        }
-        ZMapStorage::Full => None,
-    };
-
-    let (stored, stored_record) = match &delta {
-        Some(delta) => (
-            delta,
-            BlobRecord {
-                hash: delta.hash.clone(),
-                kind: BlobKind::SparseDelta,
-                compression: "zstd".to_string(),
-                uncompressed_len: delta.uncompressed_len,
-                compressed_len: delta.compressed_len,
-                base: Some(head.zmap_blob.clone()),
-                target: Some(full.hash.clone()),
-            },
-        ),
-        None => (&full, record(&full)),
-    };
+    let stored_record = record(&full);
 
     let checkpoint_id =
         Checkpoint::derive_child_id(&head.id, &head.stack_fingerprint, &full.hash, created_at);
 
     let mut blobs = manifest.blobs.clone();
-    let already_present = blobs.iter().any(|b| {
-        b.hash == stored_record.hash
-            || (stored_record.target.is_some() && b.target == stored_record.target)
-    });
-    if !already_present {
+    if !blobs.iter().any(|b| b.hash == stored_record.hash) {
         blobs.push(stored_record.clone());
     }
 
@@ -681,7 +564,7 @@ fn append_ops_staged(
         hidden: false,
     };
 
-    project.put_blob(stored)?;
+    project.put_blob(&full)?;
     project.put_checkpoint(&checkpoint)?;
     project.set_manifest(new_manifest)?;
 
@@ -860,9 +743,9 @@ pub(super) fn hide_and_collect(
     Ok((removed, head))
 }
 
-/// Every blob hash `checkpoints` reaches: each one's resolved Z-Map chain
-/// ([`resolve_chain`]'s base plus every delta on the way to it) and, when it
-/// carries one, its own [`FuseRecord::composite`].
+/// Every blob hash `checkpoints` reaches: each one's Z-Map blob
+/// ([`full_blob`]) and, when it carries one, its own
+/// [`FuseRecord::composite`].
 fn referenced_blobs<'a>(
     blobs: &[BlobRecord],
     checkpoints: impl Iterator<Item = &'a Checkpoint>,
@@ -870,11 +753,7 @@ fn referenced_blobs<'a>(
 ) -> Result<HashSet<String>, ProjectError> {
     let mut set = HashSet::new();
     for checkpoint in checkpoints {
-        let (base, deltas) = resolve_chain(blobs, &checkpoint.zmap_blob, path)?;
-        set.insert(base.hash.clone());
-        for delta in deltas {
-            set.insert(delta.hash.clone());
-        }
+        set.insert(full_blob(blobs, &checkpoint.zmap_blob, path)?.hash.clone());
         if let Some(fuse) = &checkpoint.fuse {
             set.insert(fuse.composite.blob.clone());
         }

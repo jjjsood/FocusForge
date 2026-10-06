@@ -17,7 +17,7 @@ use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project, ProjectError,
-    SealRequest, ZMapStorage, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
+    SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 use focusforge_gui::bridge::Canvas;
@@ -150,7 +150,7 @@ fn write_chain(project_path: &Path, times: &[i64]) {
             radius: 0.5,
             softness: 0.0,
         };
-        append_ops_at(project_path, vec![op], None, at, ZMapStorage::Bounded)
+        append_ops_at(project_path, vec![op], None, at)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
 }
@@ -179,15 +179,7 @@ fn rows_match_the_core_listing() {
             radius: 0.5,
             softness: 0.0,
         };
-        append_ops_onto(
-            &project_path,
-            parent,
-            vec![op],
-            None,
-            t0 + 60,
-            ZMapStorage::Bounded,
-        )
-        .unwrap();
+        append_ops_onto(&project_path, parent, vec![op], None, t0 + 60).unwrap();
     }
 
     let mut controller = AppController::new();
@@ -359,7 +351,6 @@ fn build_edited(name: &str) -> Edited {
         }],
         None,
         t0 + 60,
-        ZMapStorage::Bounded,
     )
     .unwrap()
     .checkpoint;
@@ -1503,7 +1494,6 @@ fn three_saved(name: &str) -> (Edited, String) {
         vec![stroke(4, 0, 2)],
         None,
         T0 + 120,
-        ZMapStorage::Bounded,
     )
     .unwrap()
     .checkpoint;
@@ -1717,7 +1707,6 @@ fn a_confirmed_delete_removes_exactly_that_row() {
             vec![stroke(x, 0, 2)],
             None,
             at,
-            ZMapStorage::Bounded,
         )
         .unwrap();
     }
@@ -1963,7 +1952,6 @@ fn deletes_and_views_leave_no_files_behind() {
                 vec![stroke(i as i32, 2, 2)],
                 None,
                 at,
-                ZMapStorage::Bounded,
             )
             .unwrap()
             .checkpoint,

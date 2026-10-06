@@ -16,7 +16,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
+    self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -294,7 +294,6 @@ fn branching_adds_a_child_and_rewrites_nothing() {
         vec![stroke(2, 10, 10, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .expect("append onto the head must succeed");
 
@@ -310,7 +309,6 @@ fn branching_adds_a_child_and_rewrites_nothing() {
         vec![stroke(5, 50, 35, 1.0)],
         None,
         1_700_000_100,
-        ZMapStorage::Full,
     )
     .expect("branching onto the root must succeed");
 
@@ -357,7 +355,6 @@ fn traversal_over_a_branched_history() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -366,7 +363,6 @@ fn traversal_over_a_branched_history() {
         vec![stroke(2, 6, 6, 1.0)],
         None,
         1_700_000_010,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -376,7 +372,6 @@ fn traversal_over_a_branched_history() {
         vec![stroke(3, 20, 20, 1.0)],
         None,
         1_700_000_020,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -441,7 +436,6 @@ fn leaf_delete_touches_nothing_else() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap();
 
@@ -470,23 +464,9 @@ fn shared_blob_survives_a_delete() {
         .clone();
     let ops = vec![stroke(4, 15, 12, 1.0)];
 
-    let branch1 = project::append_ops_at(
-        &project_path,
-        ops.clone(),
-        None,
-        1_700_000_000,
-        ZMapStorage::Full,
-    )
-    .unwrap();
-    let branch2 = project::append_ops_onto(
-        &project_path,
-        &root_id,
-        ops,
-        None,
-        1_700_000_010,
-        ZMapStorage::Full,
-    )
-    .unwrap();
+    let branch1 = project::append_ops_at(&project_path, ops.clone(), None, 1_700_000_000).unwrap();
+    let branch2 =
+        project::append_ops_onto(&project_path, &root_id, ops, None, 1_700_000_010).unwrap();
     // The same ops from the same parent, stored in full: one shared blob.
     assert_eq!(branch1.zmap.hash, branch2.zmap.hash);
 
@@ -513,7 +493,6 @@ fn delete_reads_no_source_frame() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap();
 
@@ -600,7 +579,6 @@ fn parent_cycle_is_refused() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -635,7 +613,6 @@ fn parent_stays_a_single_optional_link() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -690,7 +667,6 @@ fn delete_of_the_head_repoints_to_the_newest_survivor() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         root_created_at + 10,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -699,7 +675,6 @@ fn delete_of_the_head_repoints_to_the_newest_survivor() {
         vec![stroke(2, 6, 6, 1.0)],
         None,
         root_created_at + 20,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -727,7 +702,6 @@ fn append_after_branching_keeps_every_sibling() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -737,7 +711,6 @@ fn append_after_branching_keeps_every_sibling() {
         vec![stroke(2, 20, 20, 1.0)],
         None,
         1_700_000_010,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -749,7 +722,6 @@ fn append_after_branching_keeps_every_sibling() {
         vec![stroke(3, 25, 25, 1.0)],
         None,
         1_700_000_020,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -793,7 +765,6 @@ fn branching_across_a_refuse_takes_that_fuses_planes() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_100,
-        ZMapStorage::Full,
     )
     .unwrap();
 
@@ -975,7 +946,7 @@ fn refuse_onto_head(dir: &Path, project_path: &Path, salt: u32, created_at: i64)
 }
 
 fn append_bounded(project_path: &Path, ops: Vec<Op>, created_at: i64) -> project::SealedProject {
-    project::append_ops_at(project_path, ops, None, created_at, ZMapStorage::Bounded).unwrap()
+    project::append_ops_at(project_path, ops, None, created_at).unwrap()
 }
 
 fn visible_ids(project_path: &Path) -> HashSet<String> {
@@ -997,11 +968,6 @@ fn deleting_a_leaf_stops_indexing_it_and_leaves_its_bytes_as_dead_data() {
         .id
         .clone();
     let leaf = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000);
-    assert_eq!(
-        leaf.zmap.kind,
-        project::BlobKind::SparseDelta,
-        "the leaf is a delta child"
-    );
 
     let size_before = read_whole_file(&project_path).len();
     let index_before = Index::read(&project_path).unwrap();
@@ -1054,7 +1020,6 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
         vec![stroke(2, 6, 6, 1.0)],
         root_created_at + 20,
     );
-    assert_eq!(child.zmap.kind, project::BlobKind::SparseDelta);
 
     let outputs = |tag: &str| {
         let mut project = Project::open(&project_path).unwrap();

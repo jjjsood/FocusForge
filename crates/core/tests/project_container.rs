@@ -15,7 +15,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, HEADER_LEN, Index, TRAILER_LEN};
 use focusforge_core::project::{
     self, AppendRequest, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef,
-    Plane, Point, Project, ProjectError, SealRequest, ZMapStorage,
+    Plane, Point, Project, ProjectError, SealRequest,
 };
 
 const T0: i64 = 1_700_000_000;
@@ -125,16 +125,9 @@ impl Fixture {
     }
 
     fn append_ops(&self, parent: &str, ops: Vec<Op>, created_at: i64) -> String {
-        project::append_ops_onto(
-            &self.project,
-            parent,
-            ops,
-            None,
-            created_at,
-            ZMapStorage::Full,
-        )
-        .expect("append_ops_onto must succeed")
-        .checkpoint
+        project::append_ops_onto(&self.project, parent, ops, None, created_at)
+            .expect("append_ops_onto must succeed")
+            .checkpoint
     }
 
     fn held(&self, created_at: i64) -> HeldCheckpoint {
@@ -379,15 +372,7 @@ fn interrupted_append_keeps_previous_state() {
     // What the same follow-up save produces on the uncut previous file.
     let control = fx.dir.join("control.ffp");
     std::fs::write(&control, &before).unwrap();
-    project::append_ops_onto(
-        &control,
-        &previous_head,
-        stroke(10, 10),
-        None,
-        T0 + 50,
-        ZMapStorage::Bounded,
-    )
-    .unwrap();
+    project::append_ops_onto(&control, &previous_head, stroke(10, 10), None, T0 + 50).unwrap();
     let control_bytes = std::fs::read(&control).unwrap();
 
     let mut records: Vec<(u64, u64)> = new
@@ -442,15 +427,8 @@ fn interrupted_append_keeps_previous_state() {
             .unwrap_or_else(|err| panic!("{what}: z-map: {err}"));
         drop(project);
 
-        project::append_ops_onto(
-            &cut_path,
-            &previous_head,
-            stroke(10, 10),
-            None,
-            T0 + 50,
-            ZMapStorage::Bounded,
-        )
-        .unwrap_or_else(|err| panic!("{what}: the next save failed: {err}"));
+        project::append_ops_onto(&cut_path, &previous_head, stroke(10, 10), None, T0 + 50)
+            .unwrap_or_else(|err| panic!("{what}: the next save failed: {err}"));
         assert!(
             std::fs::read(&cut_path).unwrap() == control_bytes,
             "{what}: the next save did not cut the torn tail"

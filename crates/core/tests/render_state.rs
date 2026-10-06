@@ -14,7 +14,7 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
-    Project, SealRequest, ZMapStorage,
+    Project, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -195,7 +195,6 @@ fn build(name: &str) -> Built {
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("the stroke must append")
     .checkpoint;
