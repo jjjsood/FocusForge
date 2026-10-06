@@ -950,8 +950,8 @@ pub struct EditedView<'a> {
     pub tiles: &'a ResidentTiles,
 }
 
-/// The `Composite` pane's overlay draw parameters -- the same values
-/// `focusforge-cli retouch --overlay --opacity` blends with.
+/// The `Composite` pane's overlay draw parameters -- the table and alpha
+/// `display::overlay_cpu` blends with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverlayDraw {
     pub table: Vec<[u8; 3]>,

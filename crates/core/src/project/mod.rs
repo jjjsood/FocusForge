@@ -63,8 +63,8 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 pub use append::{
-    AppendRequest, Deleted, append, append_at, append_ops, append_ops_at, append_ops_onto,
-    delete_checkpoint, replay_ops_to,
+    AppendRequest, Deleted, append, append_at, append_op_chain, append_ops, append_ops_at,
+    append_ops_onto, delete_checkpoint,
 };
 pub use blob::{FileStamp, Plane, StagedBlob, short_hash, source_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
@@ -203,9 +203,8 @@ pub(super) fn fused_extent(project: &Project, id: &str) -> Result<(u32, u32, u32
 
 /// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
 /// names its own `zmap_blob`, resolved against [`Manifest::blobs`] to its
-/// `full` record. What a `ResetRegion` needs to replay against an ancestor
-/// other than the immediate parent, and what
-/// [`materialize_plane`]`(Plane::ZMap)` delegates to for the head.
+/// `full` record. What [`materialize_plane`]`(Plane::ZMap)` delegates to for
+/// the head.
 pub fn materialize_zmap(
     project: &mut Project,
     checkpoint: &Checkpoint,

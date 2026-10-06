@@ -316,58 +316,42 @@ fn checkpoint_serializes_every_field_with_no_parent_and_no_ops() {
 }
 
 #[test]
-fn every_op_variant_round_trips() {
-    let ops = vec![
-        Op::BrushStroke {
-            source_id: 7,
-            path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
-            radius: 12.5,
-            softness: 0.25,
-        },
-        Op::FloodFill {
-            seed: Point { x: 1, y: 2 },
-            source_id: 3,
-            tolerance: 0.5,
-        },
-        Op::ResetRegion {
-            rect: Rect {
-                x: 1,
-                y: 2,
-                width: 3,
-                height: 4,
-            },
-        },
-        Op::Refuse {
-            algorithm: "laplacian".to_string(),
-            params: params(),
-        },
-    ];
+fn the_brush_stroke_round_trips() {
+    let ops = vec![Op::BrushStroke {
+        source_id: 7,
+        path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
+        radius: 12.5,
+        softness: 0.25,
+    }];
     let text = serde_json::to_string(&ops).unwrap();
     let back: Vec<Op> = serde_json::from_str(&text).unwrap();
     assert_eq!(back, ops);
-    for tag in ["brush-stroke", "flood-fill", "reset-region", "refuse"] {
-        assert!(
-            text.contains(tag),
-            "externally-tagged {tag} missing: {text}"
-        );
-    }
+    assert!(
+        text.contains("brush-stroke"),
+        "externally-tagged brush-stroke missing: {text}"
+    );
 }
 
 #[test]
 fn op_with_a_missing_field_is_refused() {
-    for (text, field) in [
-        (r#"{"flood-fill":{}}"#, "seed"),
-        (r#"{"reset-region":{}}"#, "rect"),
-        (
-            r#"{"brush-stroke":{"source_id":1,"path":[],"radius":2.0}}"#,
-            "softness",
-        ),
-        (r#"{"refuse":{"algorithm":"laplacian"}}"#, "params"),
-    ] {
-        let err = serde_json::from_str::<Op>(text).unwrap_err();
+    let err =
+        serde_json::from_str::<Op>(r#"{"brush-stroke":{"source_id":1,"path":[],"radius":2.0}}"#)
+            .unwrap_err();
+    assert!(err.to_string().contains("softness"), "{err}");
+    let err =
+        serde_json::from_str::<Op>(r#"{"brush-stroke":{"path":[],"radius":2.0,"softness":0.5}}"#)
+            .unwrap_err();
+    assert!(err.to_string().contains("source_id"), "{err}");
+}
+
+#[test]
+fn a_dropped_op_tag_is_an_unknown_variant() {
+    for tag in ["flood-fill", "reset-region", "refuse"] {
+        let err = serde_json::from_str::<Op>(&format!(r#"{{"{tag}":{{}}}}"#)).unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string().contains(field),
-            "the refusal of {text} must name `{field}`: {err}"
+            message.contains("unknown variant") && message.contains(tag),
+            "the refusal of `{tag}` must name it as an unknown variant: {message}"
         );
     }
 }

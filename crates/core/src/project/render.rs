@@ -149,9 +149,7 @@ impl CheckpointImage {
                 index,
                 source: Box::new(err),
             })?;
-            let Op::BrushStroke { source_id, .. } = op else {
-                unreachable!("an op that has a footprint is a brush stroke");
-            };
+            let Op::BrushStroke { source_id, .. } = op;
             if let Some(footprint) = footprint {
                 strokes.push(PlacedStroke {
                     op: op.clone(),

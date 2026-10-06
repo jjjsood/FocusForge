@@ -671,44 +671,6 @@ mod tests {
         assert_eq!(changed, differing);
     }
 
-    #[test]
-    fn other_op_variants_are_unsupported() {
-        let info = info();
-        let base = ramp_base(info);
-        let ops = vec![
-            Op::FloodFill {
-                seed: pt(5, 5),
-                source_id: 1,
-                tolerance: 0.1,
-            },
-            Op::ResetRegion {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 4,
-                    height: 4,
-                },
-            },
-            Op::Refuse {
-                algorithm: "laplacian".to_string(),
-                params: crate::params::ParamValues::new(),
-            },
-        ];
-        for op in ops {
-            match footprint(&op, info) {
-                Err(RetouchError::Unsupported) => {}
-                other => panic!("expected Unsupported, got {other:?}"),
-            }
-            let mut indices = base.clone();
-            match apply(&op, info, whole_map(), &mut indices) {
-                Err(RetouchError::Unsupported) => {}
-                other => panic!("expected Unsupported, got {other:?}"),
-            }
-            valid(&indices, FRAMES);
-            assert_eq!(indices, base, "a refused op must not touch the buffer");
-        }
-    }
-
     /// The unculled stroke: every pixel of the footprint is tested against
     /// every path segment.
     fn apply_reference(op: &Op, info: ZMapInfo, tile: Rect, indices: &mut [u16]) -> u64 {

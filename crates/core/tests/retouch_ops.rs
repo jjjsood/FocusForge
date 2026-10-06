@@ -585,7 +585,10 @@ fn states_undo_branch_and_name() {
     under_first.sort_unstable();
     let mut both = vec![states[2].as_str(), branch.as_str()];
     both.sort_unstable();
-    assert_eq!(under_first, both, "the branch sits beside state 2");
+    assert_eq!(
+        under_first, both,
+        "the branch sits beside the chain's second state"
+    );
     assert_eq!(
         history.get(&states[2]).unwrap().label.as_deref(),
         Some("second")
@@ -654,24 +657,24 @@ fn stroke_append_costs_kilobytes() {
 #[test]
 fn append_refuses_bad_ops_and_writes_nothing() {
     let (_, project_path, root, _) = gained_pair("retouch_ops_refused");
-    let staging = project_path.with_file_name("synthetic.ffp.ops-staging");
     let good = stroke(1, &[(10, 10)], 4.0, 0.0);
-    let reset = Op::ResetRegion {
-        rect: Rect {
-            x: 0,
-            y: 0,
-            width: 8,
-            height: 8,
-        },
-    };
     let cases = [
         (vec![good.clone(), stroke(2, &[(10, 10)], 4.0, 0.0)], 1),
-        (vec![reset.clone()], 0),
-        (vec![good, reset], 1),
+        (vec![stroke(1, &[(10, 10)], 4.0, 1.5)], 0),
+        (vec![stroke(1, &[], 4.0, 0.0)], 0),
+        (vec![stroke(1, &[(10, 10)], 0.0, 0.0)], 0),
+        (
+            vec![good.clone(), good.clone(), stroke(1, &[], 4.0, 0.0)],
+            2,
+        ),
     ];
     let bytes = std::fs::read(&project_path).unwrap();
     for (ops, at) in cases {
-        match project::append_ops_onto(&project_path, &root, ops, None, 1) {
+        match project::append_ops_onto(&project_path, &root, ops.clone(), None, 1) {
+            Err(ProjectError::Op { index, .. }) => assert_eq!(index, at),
+            other => panic!("expected op #{at} to be refused, got {:?}", other.err()),
+        }
+        match project::append_op_chain(&project_path, Some(&root), ops, None, 1) {
             Err(ProjectError::Op { index, .. }) => assert_eq!(index, at),
             other => panic!("expected op #{at} to be refused, got {:?}", other.err()),
         }
@@ -680,6 +683,82 @@ fn append_refuses_bad_ops_and_writes_nothing() {
             bytes,
             "file untouched"
         );
-        assert!(!staging.exists(), "no staging directory is left");
     }
+    match project::append_op_chain(&project_path, None, Vec::new(), None, 1) {
+        Err(ProjectError::EmptyOpList { .. }) => {}
+        other => panic!("expected an empty list refused, got {:?}", other.err()),
+    }
+    assert_eq!(
+        std::fs::read(&project_path).unwrap(),
+        bytes,
+        "file untouched"
+    );
+}
+
+#[test]
+fn op_chain_appends_one_state_per_op() {
+    let (_, project_path, root, _) = gained_pair("retouch_ops_chain");
+    let twin = project_path.with_file_name("twin.ffp");
+    std::fs::copy(&project_path, &twin).unwrap();
+    let strokes = vec![
+        stroke(1, &[(10, 10), (20, 14)], 6.0, 0.0),
+        stroke(0, &[(30, 24), (40, 30)], 8.0, 0.5),
+        stroke(1, &[(-12, 40), (20, 44), (80, 40)], 7.0, 0.3),
+    ];
+
+    let ids = project::append_op_chain(
+        &project_path,
+        None,
+        strokes.clone(),
+        Some("strokes".to_string()),
+        5,
+    )
+    .expect("the chain must append");
+
+    assert_eq!(ids.len(), 3);
+    let project = Project::open(&project_path).unwrap();
+    let history = project.history();
+    let mut parent = root.clone();
+    for (id, op) in ids.iter().zip(&strokes) {
+        let checkpoint = history.get(id).unwrap();
+        assert_eq!(checkpoint.parent.as_deref(), Some(parent.as_str()));
+        assert_eq!(checkpoint.ops, std::slice::from_ref(op));
+        parent = id.clone();
+    }
+    let labels: Vec<Option<&str>> = ids
+        .iter()
+        .map(|id| history.get(id).unwrap().label.as_deref())
+        .collect();
+    assert_eq!(labels, [None, None, Some("strokes")], "the last state only");
+    assert_eq!(project.checkpoint().id, ids[2], "the chain moves the head");
+    drop(project);
+
+    let mut sequential = root.clone();
+    for (id, op) in ids.iter().zip(&strokes) {
+        sequential = append(&twin, &sequential, vec![op.clone()]);
+        assert_eq!(
+            render_state(&project_path, id),
+            render_state(&twin, &sequential),
+            "a chained state renders as the same stroke appended on its own"
+        );
+    }
+
+    let branch =
+        project::append_op_chain(&project_path, Some(&ids[0]), strokes[1..].to_vec(), None, 6)
+            .expect("a chain under an older state must append");
+    let project = Project::open(&project_path).unwrap();
+    let history = project.history();
+    assert_eq!(
+        history.get(&branch[0]).unwrap().parent.as_deref(),
+        Some(ids[0].as_str())
+    );
+    assert_eq!(
+        history.children(&ids[0]).len(),
+        2,
+        "the branch sits beside the chain's second state"
+    );
+    assert_eq!(
+        history.get(&ids[1]).unwrap().parent.as_deref(),
+        Some(ids[0].as_str())
+    );
 }

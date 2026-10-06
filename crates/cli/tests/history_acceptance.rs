@@ -69,27 +69,19 @@ fn listed(dir: &Path, project: &Path) -> Vec<Value> {
     doc["checkpoints"].as_array().unwrap().clone()
 }
 
-/// `stroke` as the two op files a command reads: `{"ops":[stroke]}` for
-/// `history apply`, a bare `[stroke]` for `retouch`.
-fn write_op_files(dir: &Path, name: &str, stroke: &Value) -> (PathBuf, PathBuf) {
-    let wrapped = dir.join(format!("{name}.ops.json"));
-    let bare = dir.join(format!("{name}.bare.json"));
-    std::fs::write(&wrapped, json!({ "ops": [stroke] }).to_string()).unwrap();
-    std::fs::write(&bare, json!([stroke]).to_string()).unwrap();
-    (wrapped, bare)
+/// `stroke` as the one-op list `retouch` reads.
+fn write_op_file(dir: &Path, name: &str, stroke: &Value) -> PathBuf {
+    let path = dir.join(format!("{name}.ops.json"));
+    std::fs::write(&path, json!([stroke]).to_string()).unwrap();
+    path
 }
 
 #[test]
 fn real_history_round_trips() {
     let cwd = common::tmp_dir("history_acceptance");
     let out = cwd.join("out");
-    let (before, after, expected, strokes) = (
-        cwd.join("before"),
-        cwd.join("after"),
-        cwd.join("expected"),
-        cwd.join("strokes"),
-    );
-    for dir in [&out, &before, &after, &expected, &strokes] {
+    let (after, strokes) = (cwd.join("after"), cwd.join("strokes"));
+    for dir in [&out, &after, &strokes] {
         std::fs::create_dir_all(dir).unwrap();
     }
 
@@ -114,20 +106,6 @@ fn real_history_round_trips() {
         .as_str()
         .unwrap()
         .to_string();
-    let root_before = before.join("root.tif");
-    run_ok(
-        &cwd,
-        &[
-            "history",
-            "materialize",
-            arg(&project),
-            "--checkpoint",
-            &root,
-            "-o",
-            arg(&root_before),
-        ],
-    );
-
     let fixture = common::fixtures_dir().join("retouch/stroke-list.json");
     let all: Vec<Value> = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
     assert_eq!(all.len(), 3, "the fixture holds three strokes");
@@ -141,41 +119,22 @@ fn real_history_round_trips() {
     ];
     let mut ids: BTreeMap<&str, String> = BTreeMap::from([("root", root.clone())]);
     for (name, stroke, parent) in plan {
-        let (wrapped, bare) = write_op_files(&strokes, name, &all[stroke]);
+        let ops = write_op_file(&strokes, name, &all[stroke]);
         let from = parent.map_or(root.as_str(), |p| ids[p].as_str());
-        let sealed_map = before.join(format!("{name}.tif"));
         let output = run_ok(
             &cwd,
             &[
-                "history",
-                "apply",
+                "retouch",
                 arg(&project),
                 "--ops",
-                arg(&wrapped),
+                arg(&ops),
                 "--from",
                 from,
-                "--save",
-                "-o",
-                arg(&sealed_map),
                 "--json",
             ],
         );
         let report: Value = serde_json::from_str(&output.stdout).unwrap();
-        ids.insert(name, report["checkpoint"].as_str().unwrap().to_string());
-
-        let prev = parent.map_or(golden.clone(), |p| expected.join(format!("{p}.tif")));
-        run_ok(
-            &cwd,
-            &[
-                "retouch",
-                "--zmap",
-                arg(&prev),
-                "--ops",
-                arg(&bare),
-                "--out",
-                arg(&expected.join(format!("{name}.tif"))),
-            ],
-        );
+        ids.insert(name, report["checkpoints"][0].as_str().unwrap().to_string());
     }
 
     let output = run_ok(

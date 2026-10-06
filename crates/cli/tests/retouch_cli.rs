@@ -1,1209 +1,322 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `focusforge-cli retouch`: a Z-Map and an op list in, an edited Z-Map out.
-//!
-//! Each test builds its own Z-Map so none share mutable state. The oracle is
-//! `focusforge_core::retouch::apply` replayed over the whole map -- test-side
-//! only, never the command's own code path.
+//! `focusforge-cli retouch`: an op list appended to a project as one state
+//! per op. One `dummy-stack` run over `fixtures/mantis-512` is shared through
+//! a `OnceLock`; every test copies the sealed project into its own temp
+//! directory before appending to it.
 
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::OnceLock;
 
-use common::CliOutput;
-use focusforge_core::display::tonemap_cpu;
-use focusforge_core::io::TiffStack;
-use focusforge_core::project::Op;
-use focusforge_core::retouch;
-use focusforge_core::tile::Rect;
-use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapReader, ZMapWriter, overlay_table};
+use focusforge_core::project::{self, Project};
+use serde_json::Value;
 
-fn bin(test_name: &str) -> Command {
-    common::cli_bin(test_name)
+fn run(dir: &Path, args: &[&str]) -> common::CliOutput {
+    common::run_in(&mut common::cli_bin("retouch_cli"), dir, args)
 }
 
-fn run_cli(dir: &Path, cmd: &mut Command, args: &[&str]) -> CliOutput {
-    common::run_in(cmd, dir, args)
+fn arg(path: &Path) -> &str {
+    path.to_str().expect("test paths are UTF-8")
 }
 
-/// A 37x23, 10-frame synthetic map: `(x + y) % 10` per pixel, so its content
-/// is neither uniform nor holds `NO_SOURCE`.
-fn synthetic_map(dir: &Path, name: &str) -> PathBuf {
-    let info = ZMapInfo::new(37, 23, 10).unwrap();
-    let indices: Vec<u16> = (0..info.height())
-        .flat_map(|y| (0..info.width()).map(move |x| ((x + y) % info.frame_count()) as u16))
+fn only_project(dir: &Path) -> PathBuf {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
         .collect();
+    assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
+    found.pop().unwrap()
+}
+
+struct SharedStack {
+    _cwd: common::TmpDir,
+    project: PathBuf,
+}
+
+/// One `dummy-stack` run over `fixtures/mantis-512`, paid once for this
+/// whole binary.
+fn shared_stack() -> &'static SharedStack {
+    static ONCE: OnceLock<SharedStack> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let cwd = common::tmp_dir("retouch_cli_shared_stack");
+        let out = cwd.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = common::mantis_512_dir();
+        let output = run(
+            &cwd,
+            &[
+                "stack",
+                arg(&input),
+                "-o",
+                arg(&out),
+                "--algo",
+                "dummy-stack",
+                "--no-align",
+                "--no-crop",
+            ],
+        );
+        assert!(output.success, "stack: {}", output.stderr);
+        let project = only_project(&out);
+        SharedStack { _cwd: cwd, project }
+    })
+}
+
+/// A fresh copy of the shared project, in its own temp directory.
+fn fresh_project(name: &str) -> (common::TmpDir, PathBuf) {
+    let dir = common::tmp_dir(name);
+    let source = &shared_stack().project;
+    let dest = dir.join(source.file_name().unwrap());
+    std::fs::copy(source, &dest).unwrap();
+    (dir, dest)
+}
+
+fn root_id(project: &Path) -> String {
+    Project::open(project).unwrap().checkpoint().id.clone()
+}
+
+/// The three strokes of `fixtures/retouch/stroke-list.json`.
+fn fixture_strokes() -> Vec<Value> {
+    let path = common::fixtures_dir().join("retouch/stroke-list.json");
+    let strokes: Vec<Value> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(strokes.len(), 3, "the fixture holds three strokes");
+    strokes
+}
+
+fn write_json(dir: &Path, name: &str, body: &Value) -> PathBuf {
     let path = dir.join(name);
-    let mut writer = ZMapWriter::create(&path, info).unwrap();
-    writer
-        .write_tile(
-            Rect {
-                x: 0,
-                y: 0,
-                width: info.width(),
-                height: info.height(),
-            },
-            &indices,
-        )
-        .unwrap();
-    writer.finish().unwrap();
+    std::fs::write(&path, body.to_string()).unwrap();
     path
 }
 
-fn read_whole(path: &Path) -> (ZMapInfo, Vec<u16>) {
-    let reader = ZMapReader::open(path).unwrap();
-    let info = reader.info();
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width: info.width(),
-        height: info.height(),
-    };
-    let mut buf = vec![0u16; info.tile_len(rect)];
-    reader.read_tile_into(rect, &mut buf).unwrap();
-    (info, buf)
-}
-
-fn write_ops(dir: &Path, name: &str, json: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, json).unwrap();
-    path
-}
-
-const SYNTHETIC_STROKE_OPS: &str = r#"[
-    {"brush-stroke": {"source_id": 3, "path": [{"x": 0, "y": 0}, {"x": 10, "y": 5}], "radius": 4.0, "softness": 0.0}},
-    {"brush-stroke": {"source_id": 7, "path": [{"x": 20, "y": 15}], "radius": 3.0, "softness": 0.0}}
-]"#;
-
-const THREE_OPS: &str = r#"[
-    {"brush-stroke": {"source_id": 1, "path": [{"x": 2, "y": 2}], "radius": 2.0, "softness": 0.0}},
-    {"brush-stroke": {"source_id": 4, "path": [{"x": 15, "y": 10}], "radius": 2.0, "softness": 0.0}},
-    {"brush-stroke": {"source_id": 9, "path": [{"x": 30, "y": 18}], "radius": 2.0, "softness": 0.0}}
-]"#;
-
-/// The output equals a whole-map replay of the list, and
-/// `pixels_changed` equals the input/output diff count -- on the fixture
-/// map with the checked-in stroke list, and on a synthetic map.
-#[test]
-fn applies_ops_and_writes_a_valid_zmap() {
-    let fixture_dir = common::tmp_dir("applies_ops_fixture");
-    check_applies_and_matches_replay(
-        "applies_ops_fixture",
-        &fixture_dir,
-        &common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif"),
-        &common::fixtures_dir().join("retouch/stroke-list.json"),
-    );
-
-    let dir = common::tmp_dir("applies_ops_synthetic");
-    let zmap = synthetic_map(&dir, "base.tif");
-    let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-    check_applies_and_matches_replay("applies_ops_synthetic", &dir, &zmap, &ops);
-}
-
-fn check_applies_and_matches_replay(test_name: &str, dir: &Path, zmap: &Path, ops_path: &Path) {
-    let out = dir.join("out.tif");
-    let output = run_cli(
-        dir,
-        &mut bin(test_name),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out.to_str().unwrap(),
-            "--json",
-        ],
-    );
-    assert!(output.success, "{test_name} stderr: {}", output.stderr);
-
-    let (info, original) = read_whole(zmap);
-    let ops_text = std::fs::read_to_string(ops_path).unwrap();
-    let ops: Vec<Op> = serde_json::from_str(&ops_text).unwrap();
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width: info.width(),
-        height: info.height(),
-    };
-    let mut expected = original.clone();
-    for op in &ops {
-        retouch::apply(op, info, whole, &mut expected).unwrap();
-    }
-    let expected_changed = original
+fn stroke(source_id: u32, radius: f64, softness: f64, path: &[(i32, i32)]) -> Value {
+    let path: Vec<Value> = path
         .iter()
-        .zip(&expected)
-        .filter(|(a, b)| a != b)
-        .count() as u64;
+        .map(|&(x, y)| serde_json::json!({"x": x, "y": y}))
+        .collect();
+    serde_json::json!({"brush-stroke": {
+        "source_id": source_id, "path": path, "radius": radius, "softness": softness,
+    }})
+}
 
-    let (_, actual) = read_whole(&out);
-    assert_eq!(
-        actual, expected,
-        "{test_name}: output must equal a whole-map replay"
+/// Runs `retouch --json` and returns the new ids in order.
+fn retouch_ok(dir: &Path, project: &Path, ops: &Path, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["retouch", arg(project), "--ops", arg(ops), "--json"];
+    args.extend_from_slice(extra);
+    let output = run(dir, &args);
+    assert!(output.success, "{args:?} stderr: {}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    report["checkpoints"]
+        .as_array()
+        .expect("the report lists the new ids")
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The samples `export --checkpoint` writes for `id`.
+fn exported(dir: &Path, project: &Path, id: &str) -> Vec<u16> {
+    let out = dir.join(format!("export-{id}.tif"));
+    let output = run(
+        dir,
+        &["export", arg(project), "--checkpoint", id, "-o", arg(&out)],
     );
+    assert!(output.success, "export {id}: {}", output.stderr);
+    common::read_whole(&out).0
+}
 
-    let report: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+/// The samples `project::render_checkpoint` writes for `id`.
+fn rendered(dir: &Path, project: &Path, id: &str) -> Vec<u16> {
+    let out = dir.join(format!("render-{id}.tif"));
+    let mut open = Project::open(project).unwrap();
+    project::render_checkpoint(&mut open, id, &out).unwrap();
+    common::read_whole(&out).0
+}
+
+#[test]
+fn retouch_appends_states_and_exports_them() {
+    let (dir, project) = fresh_project("retouch_appends_states_and_exports_them");
+    let root = root_id(&project);
+    let strokes = fixture_strokes();
+    let ops = write_json(&dir, "ops.json", &Value::Array(strokes.clone()));
+
+    let chain = retouch_ok(&dir, &project, &ops, &["--name", "strokes"]);
+    assert_eq!(chain.len(), 3, "one state per op");
+
+    let third = write_json(&dir, "third.json", &Value::Array(vec![strokes[2].clone()]));
+    let prefix = &chain[0][..8];
+    let branch = retouch_ok(
+        &dir,
+        &project,
+        &third,
+        &["--from", prefix, "--name", "side"],
+    );
+    assert_eq!(branch.len(), 1);
+
+    let open = Project::open(&project).unwrap();
+    let history = open.history();
+    let mut parent = root.clone();
+    for id in &chain {
+        let checkpoint = history.get(id).unwrap();
+        assert_eq!(checkpoint.parent.as_deref(), Some(parent.as_str()));
+        assert_eq!(checkpoint.ops.len(), 1);
+        parent = id.clone();
+    }
+    let labels: Vec<Option<&str>> = chain
+        .iter()
+        .map(|id| history.get(id).unwrap().label.as_deref())
+        .collect();
     assert_eq!(
-        report["pixels_changed"].as_u64().unwrap(),
-        expected_changed,
-        "{test_name}: pixels_changed must equal the input/output diff count"
+        labels,
+        [None, None, Some("strokes")],
+        "--name labels the last state"
+    );
+    let side = history.get(&branch[0]).unwrap();
+    assert_eq!(
+        side.parent.as_deref(),
+        Some(chain[0].as_str()),
+        "--from branches"
+    );
+    assert_eq!(side.label.as_deref(), Some("side"));
+    assert_eq!(
+        history.get(&chain[1]).unwrap().parent.as_deref(),
+        Some(chain[0].as_str())
+    );
+    assert_eq!(
+        history.children(&chain[0]).len(),
+        2,
+        "the original child stays"
+    );
+    assert_eq!(
+        open.checkpoint().id,
+        branch[0],
+        "the head follows the last append"
+    );
+    drop(open);
+
+    let root_export = exported(&dir, &project, &root);
+    for id in chain.iter().chain(&branch) {
+        let export = exported(&dir, &project, id);
+        assert_eq!(
+            export,
+            rendered(&dir, &project, id),
+            "{id}: export is the render"
+        );
+        assert_ne!(export, root_export, "{id}: strokes change the image");
+    }
+    // Stroke 2 runs past the right edge: clipped, not refused, and it paints.
+    assert_ne!(
+        exported(&dir, &project, &chain[1]),
+        exported(&dir, &project, &chain[0]),
+        "the clipped stroke changes the image"
+    );
+    assert_ne!(
+        exported(&dir, &project, &chain[2]),
+        exported(&dir, &project, &chain[1]),
+        "the last stroke is blended over the second"
     );
 }
 
-/// `--undo <len>` reproduces the input byte for byte with
-/// `pixels_changed: 0` and `ops_applied: 0`; `--undo 2 --redo 1` equals a
-/// run over the list minus its last op.
-#[test]
-fn undo_all_reproduces_the_input() {
-    let dir = common::tmp_dir("undo_all_reproduces_the_input");
-    let zmap = synthetic_map(&dir, "base.tif");
-    let ops = write_ops(&dir, "ops.json", THREE_OPS);
-
-    let out_undo_all = dir.join("undo-all.tif");
-    let output = run_cli(
-        &dir,
-        &mut bin("undo_all_reproduces_the_input_a"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--out",
-            out_undo_all.to_str().unwrap(),
-            "--undo",
-            "3",
-            "--json",
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    let report: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
-    assert_eq!(report["pixels_changed"].as_u64().unwrap(), 0);
-    assert_eq!(report["ops_applied"].as_u64().unwrap(), 0);
-    assert_eq!(
-        std::fs::read(&zmap).unwrap(),
-        std::fs::read(&out_undo_all).unwrap(),
-        "--undo <len> must reproduce the input byte for byte"
-    );
-
-    let out_undo2_redo1 = dir.join("undo2-redo1.tif");
-    let output = run_cli(
-        &dir,
-        &mut bin("undo_all_reproduces_the_input_b"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--out",
-            out_undo2_redo1.to_str().unwrap(),
-            "--undo",
-            "2",
-            "--redo",
-            "1",
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-
-    let parsed: Vec<Op> = serde_json::from_str(THREE_OPS).unwrap();
-    let minus_last = serde_json::to_string(&parsed[..parsed.len() - 1]).unwrap();
-    let ops_minus_last = write_ops(&dir, "ops-minus-last.json", &minus_last);
-    let out_minus_last = dir.join("minus-last.tif");
-    let output = run_cli(
-        &dir,
-        &mut bin("undo_all_reproduces_the_input_c"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_minus_last.to_str().unwrap(),
-            "--out",
-            out_minus_last.to_str().unwrap(),
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-
-    assert_eq!(
-        std::fs::read(&out_undo2_redo1).unwrap(),
-        std::fs::read(&out_minus_last).unwrap(),
-        "--undo 2 --redo 1 must equal a run over the list minus its last op"
-    );
-}
-
-/// An op the core refuses fails naming its 0-based position, and
-/// writes neither `--out` nor its `.partial`.
-#[test]
-fn refused_op_names_its_position_and_writes_nothing() {
-    let dir = common::tmp_dir("refused_op_names_its_position_and_writes_nothing");
-
-    // source_id out of range on the 8-frame fixture map.
-    {
-        let zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
-        let ops = write_ops(
-            &dir,
-            "source-out-of-range.json",
-            r#"[{"brush-stroke": {"source_id": 8, "path": [{"x": 10, "y": 10}], "radius": 2.0, "softness": 0.0}}]"#,
-        );
-        let out = dir.join("source-out-of-range-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("refused_source_out_of_range"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert!(
-            output.stderr.contains("op #0: source_id 8"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-        assert!(!dir.join("source-out-of-range-out.tif.partial").exists());
-    }
-
-    // A misspelled field name leaves `radius` missing.
-    {
-        let zmap = synthetic_map(&dir, "typo-base.tif");
-        let ops = write_ops(
-            &dir,
-            "typo.json",
-            r#"[{"brush-stroke": {"source_id": 1, "path": [{"x": 5, "y": 5}], "radious": 2.0, "softness": 0.0}}]"#,
-        );
-        let out = dir.join("typo-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("refused_radius_typo"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert!(
-            output.stderr.contains("missing field `radius`"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-        assert!(!dir.join("typo-out.tif.partial").exists());
-    }
-
-    // An unsupported op variant, not at position 0.
-    {
-        let zmap = synthetic_map(&dir, "unsupported-base.tif");
-        let ops = write_ops(
-            &dir,
-            "unsupported.json",
-            r#"[
-                {"brush-stroke": {"source_id": 1, "path": [{"x": 5, "y": 5}], "radius": 2.0, "softness": 0.0}},
-                {"flood-fill": {"seed": {"x": 1, "y": 1}, "source_id": 1, "tolerance": 0.1}}
-            ]"#,
-        );
-        let out = dir.join("unsupported-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("refused_unsupported_op"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert!(
-            output.stderr.contains("op #1: flood-fill is not supported"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-        assert!(!dir.join("unsupported-out.tif.partial").exists());
-    }
-}
-
-/// Two identical runs produce byte-identical output.
-#[test]
-fn run_is_reproducible() {
-    let dir = common::tmp_dir("run_is_reproducible");
-    let zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
-    let ops = common::fixtures_dir().join("retouch/stroke-list.json");
-    let out1 = dir.join("out1.tif");
-    let out2 = dir.join("out2.tif");
-
-    for (name, out) in [
-        ("run_is_reproducible_a", &out1),
-        ("run_is_reproducible_b", &out2),
-    ] {
-        let output = run_cli(
-            &dir,
-            &mut bin(name),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(output.success, "stderr: {}", output.stderr);
-    }
-
-    assert_eq!(std::fs::read(&out1).unwrap(), std::fs::read(&out2).unwrap());
-}
-
-/// `--json` prints exactly one JSON document holding `ops_applied`,
-/// `pixels_changed` and `wrote`, with stderr empty on success; the default
-/// stdout is the human report and does not parse as JSON.
-#[test]
-fn stdout_json_is_one_document() {
-    let dir = common::tmp_dir("stdout_json_is_one_document");
-    let zmap = synthetic_map(&dir, "base.tif");
-    let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-
-    let out_json = dir.join("out-json.tif");
-    let json_output = run_cli(
-        &dir,
-        &mut bin("stdout_json_is_one_document_json"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--out",
-            out_json.to_str().unwrap(),
-            "--json",
-        ],
-    );
-    assert!(json_output.success, "stderr: {}", json_output.stderr);
+/// Runs `retouch` over `body`, expects a refusal that wrote nothing, and
+/// returns its stderr.
+fn refuse(dir: &Path, project: &Path, name: &str, body: &Value) -> String {
+    let ops = write_json(dir, name, body);
+    let before = std::fs::read(project).unwrap();
+    let output = run(dir, &["retouch", arg(project), "--ops", arg(&ops)]);
+    assert!(!output.success, "{name} must be refused");
+    assert!(output.stdout.is_empty(), "{name}: stdout {}", output.stdout);
     assert!(
-        json_output.stderr.is_empty(),
-        "stderr must be empty on success: {}",
-        json_output.stderr
+        !output.stderr.contains("panicked"),
+        "{name}: {}",
+        output.stderr
     );
-    let mut docs =
-        serde_json::Deserializer::from_str(&json_output.stdout).into_iter::<serde_json::Value>();
-    let doc = docs
-        .next()
-        .expect("stdout must hold exactly one JSON document")
-        .unwrap();
-    assert!(
-        docs.next().is_none(),
-        "stdout must hold exactly one JSON document"
+    assert_eq!(
+        std::fs::read(project).unwrap(),
+        before,
+        "{name}: project untouched"
     );
-    assert!(doc.get("ops_applied").is_some());
-    assert!(doc.get("pixels_changed").is_some());
-    assert!(doc.get("wrote").is_some());
+    output.stderr
+}
 
-    let out_human = dir.join("out-human.tif");
-    let human_output = run_cli(
+#[test]
+fn retouch_refuses_bad_ops_and_leaves_project_untouched() {
+    let (dir, project) = fresh_project("retouch_refuses_bad_ops");
+    let good = stroke(1, 4.0, 0.2, &[(40, 40), (60, 50)]);
+    let cases: [(&str, Value, &str); 5] = [
+        ("source", stroke(8, 4.0, 0.2, &[(40, 40)]), "source_id"),
+        ("radius-zero", stroke(1, 0.0, 0.2, &[(40, 40)]), "radius"),
+        (
+            "radius-negative",
+            stroke(1, -3.0, 0.2, &[(40, 40)]),
+            "radius",
+        ),
+        ("softness", stroke(1, 4.0, 1.5, &[(40, 40)]), "softness"),
+        ("path", stroke(1, 4.0, 0.2, &[]), "path"),
+    ];
+    for (name, bad, field) in cases {
+        for position in [0usize, 2] {
+            let mut list = vec![good.clone(); 3];
+            list[position] = bad.clone();
+            let file = format!("{name}-{position}.json");
+            let stderr = refuse(&dir, &project, &file, &Value::Array(list));
+            assert!(
+                stderr.contains(&format!("op #{position}")) && stderr.contains(field),
+                "{name} at {position}: {stderr}"
+            );
+        }
+    }
+    refuse(&dir, &project, "empty.json", &serde_json::json!([]));
+    refuse(
         &dir,
-        &mut bin("stdout_json_is_one_document_human"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--out",
-            out_human.to_str().unwrap(),
-        ],
-    );
-    assert!(human_output.success, "stderr: {}", human_output.stderr);
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&human_output.stdout).is_err(),
-        "the default human report must not parse as JSON"
+        &project,
+        "wrapped.json",
+        &serde_json::json!({"ops": [good]}),
     );
 }
 
-/// A malformed op list -- truncated JSON, or an unknown op tag --
-/// fails naming the `--ops` file and serde's line and column, non-zero
-/// exit, no output.
 #[test]
 fn malformed_op_list_is_a_clean_error() {
-    let dir = common::tmp_dir("malformed_op_list_is_a_clean_error");
-    let zmap = synthetic_map(&dir, "base.tif");
+    let (dir, project) = fresh_project("retouch_malformed_op_list");
+    let bad_json = dir.join("not-json.json");
+    std::fs::write(&bad_json, "[{\"brush-stroke\": ").unwrap();
+    let before = std::fs::read(&project).unwrap();
+    let output = run(&dir, &["retouch", arg(&project), "--ops", arg(&bad_json)]);
+    assert!(!output.success);
+    assert!(output.stderr.contains("not-json.json"), "{}", output.stderr);
+    assert!(!output.stderr.contains("panicked"), "{}", output.stderr);
+    assert_eq!(std::fs::read(&project).unwrap(), before);
 
-    {
-        let ops = write_ops(
-            &dir,
-            "truncated.json",
-            r#"[{"brush-stroke": {"source_id": 1"#,
-        );
-        let out = dir.join("truncated-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("malformed_truncated"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert!(output.stdout.is_empty());
-        assert!(
-            output.stderr.contains(ops.to_str().unwrap())
-                && output.stderr.contains("line")
-                && output.stderr.contains("column"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-    }
-
-    {
-        let ops = write_ops(&dir, "unknown-tag.json", r#"[{"paint-bucket": {}}]"#);
-        let out = dir.join("unknown-tag-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("malformed_unknown_tag"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert!(output.stdout.is_empty());
-        assert!(
-            output.stderr.contains(ops.to_str().unwrap())
-                && output.stderr.contains("line")
-                && output.stderr.contains("column"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-    }
-}
-
-/// `--undo` past the list length, or `--redo` past `--undo`, is
-/// refused naming that flag, and writes nothing.
-#[test]
-fn undo_redo_bounds_are_refused() {
-    let dir = common::tmp_dir("undo_redo_bounds_are_refused");
-    let zmap = synthetic_map(&dir, "base.tif");
-    let ops = write_ops(&dir, "ops.json", THREE_OPS);
-
-    {
-        let out = dir.join("undo-too-large-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("undo_too_large"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--undo",
-                "4",
-            ],
-        );
-        assert!(!output.success);
-        assert!(
-            output.stderr.contains("--undo"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-    }
-
-    {
-        let out = dir.join("redo-too-large-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("redo_too_large"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--undo",
-                "1",
-                "--redo",
-                "2",
-            ],
-        );
-        assert!(!output.success);
-        assert!(
-            output.stderr.contains("--redo"),
-            "stderr: {}",
-            output.stderr
-        );
-        assert!(!out.exists());
-    }
-}
-
-/// `--out` naming the same file as `--zmap` -- directly, or through
-/// a `./` or `..` detour -- is refused, and the input is unchanged.
-#[test]
-fn out_colliding_with_input_is_refused() {
-    let dir = common::tmp_dir("out_colliding_with_input_is_refused");
-    let zmap = synthetic_map(&dir, "base.tif");
-    let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-    let before = std::fs::read(&zmap).unwrap();
-
-    {
-        let output = run_cli(
-            &dir,
-            &mut bin("collide_exact"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                zmap.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert_eq!(std::fs::read(&zmap).unwrap(), before);
-    }
-
-    {
-        let detour = dir.join(".").join("base.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("collide_dot"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                detour.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert_eq!(std::fs::read(&zmap).unwrap(), before);
-    }
-
-    {
-        let sub = dir.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let detour = sub.join("..").join("base.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("collide_dotdot"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                detour.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert_eq!(std::fs::read(&zmap).unwrap(), before);
-    }
-}
-
-/// `--out` reaching the input through a `..` after a symlinked directory is
-/// refused: the kernel resolves that `..` against the link's target, not
-/// against the path text.
-#[cfg(unix)]
-#[test]
-fn out_reaching_input_through_a_symlinked_dir_is_refused() {
-    let dir = common::tmp_dir("out_reaching_input_through_a_symlinked_dir_is_refused");
-    let deep = dir.join("deep");
-    std::fs::create_dir_all(deep.join("a")).unwrap();
-    let zmap = synthetic_map(&deep, "base.tif");
-    let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-    let before = std::fs::read(&zmap).unwrap();
-
-    // `dir/l/../base.tif` reads as `dir/base.tif`, but `l` is `deep/a`, so
-    // the kernel opens `deep/base.tif`: the input.
-    std::os::unix::fs::symlink(deep.join("a"), dir.join("l")).unwrap();
-    let detour = dir.join("l").join("..").join("base.tif");
-    let output = run_cli(
-        &dir,
-        &mut bin("collide_symlink_dotdot"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--out",
-            detour.to_str().unwrap(),
-        ],
-    );
-    assert!(!output.success, "stdout: {}", output.stdout);
-    assert_eq!(std::fs::read(&zmap).unwrap(), before);
-    assert!(!dir.join("base.tif").exists());
-}
-
-/// `--zmap` given as a symlink and `--out` naming that same link is refused:
-/// the link stays in place and its target is unchanged.
-#[cfg(unix)]
-#[test]
-fn out_naming_a_symlinked_input_is_refused() {
-    let dir = common::tmp_dir("out_naming_a_symlinked_input_is_refused");
-    let real = dir.join("real");
-    std::fs::create_dir_all(&real).unwrap();
-    let target = synthetic_map(&real, "base.tif");
-    let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-    let before = std::fs::read(&target).unwrap();
-
-    let link = dir.join("link.tif");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    let output = run_cli(
-        &dir,
-        &mut bin("collide_symlinked_input"),
-        &[
-            "retouch",
-            "--zmap",
-            link.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--out",
-            link.to_str().unwrap(),
-        ],
-    );
-    assert!(!output.success, "stdout: {}", output.stdout);
-    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-    assert_eq!(std::fs::read(&target).unwrap(), before);
-}
-
-fn read_rgb_tiff(path: &Path) -> (u32, u32, Vec<u16>) {
-    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
-    let (width, height) = stack.dimensions();
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let tile = stack.read_tile(0, rect).unwrap();
-    (width, height, tile.samples)
-}
-
-/// `--frames <dir> --render <file>` writes a 16-bit RGB TIFF: outside
-/// `retouch::session_tile` of the op list, identical to the `--undo <len>`
-/// render of the same list; inside, each pixel equals the frame its edited
-/// index names.
-#[test]
-fn render_changes_only_the_footprint() {
-    let dir = common::tmp_dir("render_changes_only_the_footprint");
-    let zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
-    let frames = common::fixtures_dir().join("mantis-512/frames");
-    let ops_path = common::fixtures_dir().join("retouch/stroke-list.json");
-
-    let out_after = dir.join("out-after.tif");
-    let render_after = dir.join("render-after.tif");
-    let after = run_cli(
-        &dir,
-        &mut bin("render_after"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out_after.to_str().unwrap(),
-            "--frames",
-            frames.to_str().unwrap(),
-            "--render",
-            render_after.to_str().unwrap(),
-        ],
-    );
-    assert!(after.success, "stderr: {}", after.stderr);
-
-    let out_before = dir.join("out-before.tif");
-    let render_before = dir.join("render-before.tif");
-    let before = run_cli(
-        &dir,
-        &mut bin("render_before"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out_before.to_str().unwrap(),
-            "--undo",
-            "3",
-            "--frames",
-            frames.to_str().unwrap(),
-            "--render",
-            render_before.to_str().unwrap(),
-        ],
-    );
-    assert!(before.success, "stderr: {}", before.stderr);
-
-    let (info, edited_indices) = read_whole(&out_after);
-    let ops_text = std::fs::read_to_string(&ops_path).unwrap();
-    let all_ops: Vec<Op> = serde_json::from_str(&ops_text).unwrap();
-    let tile = retouch::session_tile(&all_ops, info).unwrap();
-
-    let (width, height, after_rgb) = read_rgb_tiff(&render_after);
-    let (_, _, before_rgb) = read_rgb_tiff(&render_before);
-    let stack = TiffStack::open(&frames).unwrap();
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let frame_samples: Vec<Vec<u16>> = (0..stack.len())
-        .map(|f| stack.read_tile(f, whole).unwrap().samples)
-        .collect();
-
-    for y in 0..height {
-        for x in 0..width {
-            let i = (y * width + x) as usize;
-            let inside =
-                x >= tile.x && x < tile.x + tile.width && y >= tile.y && y < tile.y + tile.height;
-            let px = &after_rgb[i * 3..i * 3 + 3];
-            if !inside {
-                assert_eq!(
-                    px,
-                    &before_rgb[i * 3..i * 3 + 3],
-                    "outside the footprint at ({x},{y})"
-                );
-            } else {
-                let index = edited_indices[i];
-                if index == NO_SOURCE {
-                    assert_eq!(px, [0, 0, 0], "NO_SOURCE pixel at ({x},{y})");
-                } else {
-                    assert_eq!(
-                        px,
-                        &frame_samples[index as usize][i * 3..i * 3 + 3],
-                        "pixel ({x},{y}) must equal frame {index}'s samples"
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn read_rgba_png(path: &Path) -> (u32, u32, Vec<u8>) {
-    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
-    let mut reader = decoder.read_info().unwrap();
-    let info = reader.info();
-    let (width, height) = (info.width, info.height);
-    let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG has no frames")];
-    reader.next_frame(&mut buf).unwrap();
-    (width, height, buf)
-}
-
-/// `--overlay` writes a PNG of the recomposited edit: opacity 0 equals
-/// `tonemap_cpu` of the `--render` TIFF, opacity 1 equals each edited
-/// index's palette colour, and `--solo` differs from the unsoloed image
-/// only where the index is not the soloed one. Bad inputs are refused with
-/// nothing written: opacity out of `[0, 1]`, an out-of-range `--solo`,
-/// `--overlay` without `--frames`, and `--overlay` naming `--out`.
-#[test]
-fn overlay_flags_render() {
-    let dir = common::tmp_dir("overlay_flags_render");
-    let zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
-    let frames = common::fixtures_dir().join("mantis-512/frames");
-    let ops_path = common::fixtures_dir().join("retouch/stroke-list.json");
-
-    // Opacity 0 equals tonemap_cpu of --render's TIFF.
-    let out0 = dir.join("out-0.tif");
-    let render0 = dir.join("render-0.tif");
-    let overlay0 = dir.join("overlay-0.png");
-    let r0 = run_cli(
-        &dir,
-        &mut bin("overlay_opacity_0"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out0.to_str().unwrap(),
-            "--frames",
-            frames.to_str().unwrap(),
-            "--render",
-            render0.to_str().unwrap(),
-            "--overlay",
-            overlay0.to_str().unwrap(),
-            "--opacity",
-            "0",
-        ],
-    );
-    assert!(r0.success, "stderr: {}", r0.stderr);
-
-    let (width, height, render_samples) = read_rgb_tiff(&render0);
-    let mut expected0 = vec![0u8; width as usize * height as usize * 4];
-    tonemap_cpu(&render_samples, width, height, 3, 0, &mut expected0);
-    let (png_width, png_height, actual0) = read_rgba_png(&overlay0);
-    assert_eq!((png_width, png_height), (width, height));
-    assert_eq!(
-        actual0, expected0,
-        "opacity 0 must equal tonemap_cpu's output"
-    );
-
-    // Opacity 1 equals each edited index's palette colour.
-    let out1 = dir.join("out-1.tif");
-    let overlay1 = dir.join("overlay-1.png");
-    let r1 = run_cli(
-        &dir,
-        &mut bin("overlay_opacity_1"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out1.to_str().unwrap(),
-            "--frames",
-            frames.to_str().unwrap(),
-            "--overlay",
-            overlay1.to_str().unwrap(),
-            "--opacity",
-            "1",
-        ],
-    );
-    assert!(r1.success, "stderr: {}", r1.stderr);
-
-    let (info, edited_indices) = read_whole(&out1);
-    let table = overlay_table(info.frame_count(), None);
-    let (_, _, actual1) = read_rgba_png(&overlay1);
-    for i in 0..(width * height) as usize {
-        let expected = table[(usize::from(edited_indices[i])).min(table.len() - 1)];
-        assert_eq!(&actual1[i * 4..i * 4 + 3], &expected[..], "pixel {i}");
-    }
-
-    // --solo differs from the unsoloed image only where the index is not
-    // the soloed one.
-    let out65a = dir.join("out-65-a.tif");
-    let overlay65 = dir.join("overlay-65.png");
-    let r65 = run_cli(
-        &dir,
-        &mut bin("overlay_opacity_65"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out65a.to_str().unwrap(),
-            "--frames",
-            frames.to_str().unwrap(),
-            "--overlay",
-            overlay65.to_str().unwrap(),
-            "--opacity",
-            "0.65",
-        ],
-    );
-    assert!(r65.success, "stderr: {}", r65.stderr);
-
-    let out65b = dir.join("out-65-b.tif");
-    let overlay65_solo = dir.join("overlay-65-solo.png");
-    let r65s = run_cli(
-        &dir,
-        &mut bin("overlay_opacity_65_solo"),
-        &[
-            "retouch",
-            "--zmap",
-            zmap.to_str().unwrap(),
-            "--ops",
-            ops_path.to_str().unwrap(),
-            "--out",
-            out65b.to_str().unwrap(),
-            "--frames",
-            frames.to_str().unwrap(),
-            "--overlay",
-            overlay65_solo.to_str().unwrap(),
-            "--opacity",
-            "0.65",
-            "--solo",
-            "3",
-        ],
-    );
-    assert!(r65s.success, "stderr: {}", r65s.stderr);
-
-    let (_, edited_indices_65) = read_whole(&out65a);
-    let (_, _, unsoloed) = read_rgba_png(&overlay65);
-    let (_, _, soloed) = read_rgba_png(&overlay65_solo);
-    let mut differs_elsewhere = false;
-    for i in 0..(width * height) as usize {
-        let up = &unsoloed[i * 4..i * 4 + 3];
-        let sp = &soloed[i * 4..i * 4 + 3];
-        if edited_indices_65[i] == 3 {
-            assert_eq!(up, sp, "solo must not change the soloed source's pixel {i}");
-        } else if up != sp {
-            differs_elsewhere = true;
-        }
-    }
+    let unknown = serde_json::json!([
+        {"flood-fill": {"seed": {"x": 1, "y": 1}, "source_id": 1, "tolerance": 0.1}}
+    ]);
+    let stderr = refuse(&dir, &project, "flood-fill.json", &unknown);
     assert!(
-        differs_elsewhere,
-        "solo must visibly desaturate at least one non-soloed pixel"
+        stderr.contains("unknown variant") && stderr.contains("flood-fill"),
+        "{stderr}"
     );
 
-    // Bad inputs are refused with nothing written.
-    {
-        let out = dir.join("refuse-opacity.tif");
-        let overlay = dir.join("refuse-opacity.png");
-        let output = run_cli(
-            &dir,
-            &mut bin("overlay_bad_opacity"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops_path.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--frames",
-                frames.to_str().unwrap(),
-                "--overlay",
-                overlay.to_str().unwrap(),
-                "--opacity",
-                "1.5",
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(!overlay.exists());
-        assert!(!out.exists());
-    }
-    {
-        let out = dir.join("refuse-solo.tif");
-        let overlay = dir.join("refuse-solo.png");
-        let output = run_cli(
-            &dir,
-            &mut bin("overlay_bad_solo"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops_path.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--frames",
-                frames.to_str().unwrap(),
-                "--overlay",
-                overlay.to_str().unwrap(),
-                "--solo",
-                "8",
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(!overlay.exists());
-        assert!(!out.exists());
-    }
-    {
-        let out = dir.join("refuse-no-frames.tif");
-        let overlay = dir.join("refuse-no-frames.png");
-        let output = run_cli(
-            &dir,
-            &mut bin("overlay_without_frames"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops_path.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--overlay",
-                overlay.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(!overlay.exists());
-    }
-    {
-        let out = dir.join("refuse-overlay-is-out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("overlay_names_out"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops_path.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--frames",
-                frames.to_str().unwrap(),
-                "--overlay",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(!out.exists());
-    }
+    let missing = dir.join("absent.json");
+    let output = run(&dir, &["retouch", arg(&project), "--ops", arg(&missing)]);
+    assert!(!output.success);
+    assert!(output.stderr.contains("absent.json"), "{}", output.stderr);
 }
 
-/// `--render` refuses: without `--frames` (clap); a frame count that
-/// differs from the map's; naming a not-yet-written `--out`; and (unix)
-/// reaching `--zmap` through a symlinked directory's `..`. Each leaves no
-/// render file.
 #[test]
-fn render_refuses_bad_inputs() {
-    let real_frames = common::fixtures_dir().join("mantis-512/frames");
-    let stroke_list = common::fixtures_dir().join("retouch/stroke-list.json");
-
-    // Without `--frames`, clap's `requires` refuses before anything runs.
-    {
-        let dir = common::tmp_dir("render_without_frames");
-        let zmap = synthetic_map(&dir, "base.tif");
-        let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-        let out = dir.join("out.tif");
-        let render = dir.join("render.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("render_without_frames"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--render",
-                render.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success);
-        assert!(!render.exists());
-    }
-
-    // A 10-frame map against the 8 fixture frames is a frame-count mismatch.
-    {
-        let dir = common::tmp_dir("render_frame_count_mismatch");
-        let zmap = synthetic_map(&dir, "base.tif");
-        let ops = write_ops(&dir, "ops.json", SYNTHETIC_STROKE_OPS);
-        let out = dir.join("out.tif");
-        let render = dir.join("render.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("render_frame_count_mismatch"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                ops.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--frames",
-                real_frames.to_str().unwrap(),
-                "--render",
-                render.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(!render.exists());
-    }
-
-    // `--render` naming a not-yet-written `--out`.
-    {
-        let dir = common::tmp_dir("render_names_not_yet_written_out");
-        let golden_zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
-        let out = dir.join("out.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("render_names_not_yet_written_out"),
-            &[
-                "retouch",
-                "--zmap",
-                golden_zmap.to_str().unwrap(),
-                "--ops",
-                stroke_list.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--frames",
-                real_frames.to_str().unwrap(),
-                "--render",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert!(
-            !out.exists(),
-            "the not-yet-written --out must stay unwritten"
-        );
-    }
-
-    // (unix) `--render` reaching `--zmap` through a symlinked directory's `..`.
-    #[cfg(unix)]
-    {
-        let dir = common::tmp_dir("render_reaches_zmap_through_symlinked_dir");
-        let deep = dir.join("deep");
-        std::fs::create_dir_all(deep.join("a")).unwrap();
-        let golden_zmap = common::fixtures_dir().join("mantis-512/golden/laplacian-zmap.tif");
-        let zmap = deep.join("base.tif");
-        std::fs::copy(&golden_zmap, &zmap).unwrap();
-        let before = std::fs::read(&zmap).unwrap();
-        let out = dir.join("out.tif");
-
-        std::os::unix::fs::symlink(deep.join("a"), dir.join("l")).unwrap();
-        let render_detour = dir.join("l").join("..").join("base.tif");
-        let output = run_cli(
-            &dir,
-            &mut bin("render_reaches_zmap_through_symlinked_dir"),
-            &[
-                "retouch",
-                "--zmap",
-                zmap.to_str().unwrap(),
-                "--ops",
-                stroke_list.to_str().unwrap(),
-                "--out",
-                out.to_str().unwrap(),
-                "--frames",
-                real_frames.to_str().unwrap(),
-                "--render",
-                render_detour.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success, "stdout: {}", output.stdout);
-        assert_eq!(
-            std::fs::read(&zmap).unwrap(),
-            before,
-            "the input Z-Map must never be overwritten by a render"
-        );
-    }
+fn stdout_json_is_one_document() {
+    let (dir, project) = fresh_project("retouch_stdout_json");
+    let root = root_id(&project);
+    let ops = write_json(&dir, "ops.json", &Value::Array(fixture_strokes()));
+    let output = run(
+        &dir,
+        &["retouch", arg(&project), "--ops", arg(&ops), "--json"],
+    );
+    assert!(output.success, "{}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).expect("stdout is one JSON document");
+    assert_eq!(report["from"], root.as_str());
+    assert_eq!(report["ops"], 3);
+    assert_eq!(report["checkpoints"].as_array().unwrap().len(), 3);
+    assert_eq!(report["project"], arg(&project));
 }

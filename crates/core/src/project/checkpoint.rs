@@ -17,7 +17,6 @@ use super::error::ProjectError;
 use super::manifest::{AlignRecord, Metrics, PlaneRef, SourceRef};
 use crate::align::Registration;
 use crate::params::ParamValues;
-use crate::tile::Rect;
 
 /// One node of a checkpoint tree: `parent: None` and an empty `ops` for
 /// the checkpoint a fresh stack or a re-fuse writes; a checkpoint
@@ -114,34 +113,19 @@ pub struct Point {
 
 /// One edit in a checkpoint's op log. **Externally tagged** -- the serde
 /// default, stated here because it is frozen: an untagged enum would make
-/// deserialization buffered and slow (serde-rs/serde#2101), and `Refuse`
-/// carries a [`ParamValues`] that would be caught by exactly that.
+/// deserialization buffered and slow (serde-rs/serde#2101).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Op {
-    /// Paint `source_id` along `path`. The Z-Map is the document: this
-    /// writes indices, never pixels.
+    /// Blend frame `source_id` into the result along `path` through a soft
+    /// round mask of `radius` pixels and `softness` in `0.0..=1.0`. Strokes
+    /// apply in list order; the result image is the document.
     BrushStroke {
         source_id: u16,
         path: Vec<Point>,
         radius: f32,
         softness: f32,
-    },
-    /// Flood `source_id` outward from `seed` while the map stays within
-    /// `tolerance`.
-    FloodFill {
-        seed: Point,
-        source_id: u16,
-        tolerance: f32,
-    },
-    /// Put `rect` back to what fusion computed.
-    ResetRegion { rect: Rect },
-    /// Re-fuse `rect`-free: run `algorithm` with `params` again over this
-    /// checkpoint's state.
-    Refuse {
-        algorithm: String,
-        params: ParamValues,
     },
 }
 

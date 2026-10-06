@@ -7,17 +7,14 @@
 pub mod blend;
 pub mod brush;
 pub mod recomposite;
-pub mod replay;
 pub mod session;
 pub mod zmap_io;
 
-use crate::project::Point;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
 pub use brush::{apply, footprint};
 pub use recomposite::{Sources, named_frames, recomposite, recomposite_bands};
-pub use replay::{replay, replay_tile};
 pub use session::EditSession;
 pub use zmap_io::{session_tile, write_edited};
 
@@ -58,27 +55,7 @@ pub enum RetouchError {
     #[error(transparent)]
     Source(#[from] crate::algorithm::AlgorithmError),
 
-    /// A [`crate::project::Op::ResetRegion`] rect lies outside the map --
-    /// including an empty rect.
-    #[error("reset region {rect:?} lies outside the map")]
-    RegionOutsideMap { rect: Rect },
-
-    /// A [`crate::project::Op::FloodFill`] seed lies outside the map.
-    #[error("flood fill seed {seed:?} lies outside the map")]
-    SeedOutsideMap { seed: Point },
-
-    /// [`crate::project::Op::FloodFill`] has no defined replay semantics: no
-    /// editor control produces its `tolerance` field.
-    #[error("flood-fill has no defined replay semantics")]
-    FloodFillNotReplayable,
-
-    /// [`crate::project::Op::Refuse`] is never replayed from an op list -- a
-    /// re-fuse is recorded as its own checkpoint via `append`.
-    #[error("re-fuse needs its sources; it is recorded as its own checkpoint")]
-    RefuseNotReplayable,
-
-    /// Reading the nearest fused ancestor's map while replaying a
-    /// [`crate::project::Op::ResetRegion`] failed.
-    #[error("reading the fused ancestor's map: {0}")]
+    /// Reading a Z-Map failed.
+    #[error("reading a Z-Map: {0}")]
     Fused(#[from] ZMapError),
 }

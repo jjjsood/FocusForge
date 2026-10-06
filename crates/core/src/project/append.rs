@@ -16,25 +16,15 @@ use std::path::{Path, PathBuf};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
 use super::checkpoint::{Checkpoint, FuseRecord};
-use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
 use super::seal::{composite_blob, now_unix, record, source_ref};
-use super::{
-    HASH_ALGORITHM, Op, Project, SealedProject, full_blob, fused_extent, materialize_zmap,
-};
+use super::{HASH_ALGORITHM, Op, Project, SealedProject, full_blob, fused_extent};
 use crate::align::Registration;
 use crate::params::ParamValues;
-use crate::retouch::{replay, write_edited};
-use crate::tile::Rect;
-use crate::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
-
-/// Rows per band [`write_edited`] streams a new full Z-Map at -- bounded
-/// memory regardless of the map's height, the same discipline
-/// `focusforge-cli retouch` uses.
-const ROWS_PER_PASS: u32 = 256;
+use crate::zmap::ZMapInfo;
 
 /// Everything one append needs -- [`super::seal::SealRequest`]'s own field
 /// set, with `project_path` naming a container that already exists.
@@ -327,6 +317,39 @@ fn append_ops_saved(
     Ok(sealed)
 }
 
+/// Appends `ops` as a chain of states, one per op, each the previous one's
+/// child, the first under `parent` (`None` is the head), and commits once.
+/// The ids come back in order and `label` names the last state only. Every op
+/// is checked before anything is written: the first invalid one is
+/// [`ProjectError::Op`] with its position and the file is left as it was; an
+/// empty list is [`ProjectError::EmptyOpList`].
+pub fn append_op_chain(
+    project_path: &Path,
+    parent: Option<&str>,
+    ops: Vec<Op>,
+    label: Option<String>,
+    created_at: i64,
+) -> Result<Vec<String>, ProjectError> {
+    if ops.is_empty() {
+        return Err(ProjectError::EmptyOpList {
+            path: project_path.to_path_buf(),
+        });
+    }
+    let mut project = Project::open(project_path)?;
+    let mut parent = parent.map_or_else(|| project.checkpoint().id.clone(), str::to_string);
+    checked_parent(&project, &parent, &ops)?;
+    let last = ops.len() - 1;
+    let mut ids = Vec::with_capacity(ops.len());
+    for (index, op) in ops.into_iter().enumerate() {
+        let label = if index == last { label.clone() } else { None };
+        let sealed = append_ops_on(&mut project, &parent, vec![op], label, created_at)?;
+        parent.clone_from(&sealed.checkpoint);
+        ids.push(sealed.checkpoint);
+    }
+    project.commit()?;
+    Ok(ids)
+}
+
 /// [`append_ops_onto`] on an open project, left for the caller to commit.
 pub(super) fn append_ops_on(
     project: &mut Project,
@@ -340,13 +363,7 @@ pub(super) fn append_ops_on(
             path: project.path().to_path_buf(),
         });
     }
-    let (head, info) = checkpoint_geometry(project, parent)?;
-    for (index, op) in ops.iter().enumerate() {
-        crate::retouch::footprint(op, info).map_err(|source| ProjectError::Op {
-            index,
-            source: Box::new(source),
-        })?;
-    }
+    let head = checked_parent(project, parent, &ops)?;
     let manifest = project.manifest().clone();
     let fuse = project.fuse_state(parent)?;
     let zmap_blob = project.fused_ancestor(parent)?.zmap_blob.clone();
@@ -417,151 +434,21 @@ pub(super) fn append_ops_on(
     })
 }
 
-/// A fresh, empty scratch directory next to `project_path`, named after it,
-/// for an op-replay to stage its intermediate blobs in. Callers remove it
-/// once they are done with it; a stale one from an earlier crashed run is
-/// cleared first.
-fn fresh_staging_dir(project_path: &Path) -> Result<PathBuf, ProjectError> {
-    let dir = project_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staging_name = format!(
-        "{}.ops-staging",
-        project_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    );
-    let staging = dir.join(staging_name);
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|err| ProjectError::io(&staging, err))?;
-    Ok(staging)
-}
-
-/// [`replay_ops_to`] staged: opens the project, replays `ops` onto `parent`
-/// through [`replay_ops_onto_zmap`], and writes the edited map to `out` via
-/// `.partial` then rename. The project file is not touched.
-fn replay_ops_to_staged(
-    project_path: &Path,
-    parent: &str,
-    ops: &[Op],
-    staging: &Path,
-    out: &Path,
-) -> Result<(), ProjectError> {
-    let mut project = Project::open(project_path)?;
-    let (head, info) = checkpoint_geometry(&project, parent)?;
-
-    let partial = partial_path(out);
-    let outcome = replay_ops_onto_zmap(&mut project, parent, &head, ops, info, staging, &partial)
-        .and_then(|()| std::fs::rename(&partial, out).map_err(|err| ProjectError::io(out, err)));
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&partial);
-    }
-    outcome
-}
-
-/// Replays `ops` onto `parent`'s materialized Z-Map and writes the edited
-/// map to `out`, without sealing a checkpoint. Refuses an empty list like
-/// [`append_ops_onto`]. Never opens the project file for writing.
-pub fn replay_ops_to(
-    project_path: &Path,
-    parent: &str,
-    ops: Vec<Op>,
-    out: &Path,
-) -> Result<(), ProjectError> {
-    if ops.is_empty() {
-        return Err(ProjectError::EmptyOpList {
-            path: project_path.to_path_buf(),
-        });
-    }
-    let staging = fresh_staging_dir(project_path)?;
-    let result = replay_ops_to_staged(project_path, parent, &ops, &staging, out);
-    let _ = std::fs::remove_dir_all(&staging);
-    result
-}
-
-/// Replays `ops` onto `parent`'s materialized Z-Map inside `staging` and
-/// writes the edited full map to `new_zmap_path`.
-fn replay_ops_onto_zmap(
-    project: &mut Project,
-    parent: &str,
-    head: &Checkpoint,
-    ops: &[Op],
-    info: ZMapInfo,
-    staging: &Path,
-    new_zmap_path: &Path,
-) -> Result<(), ProjectError> {
-    let tile = replay::replay_tile(ops, info).map_err(|(index, source)| ProjectError::Op {
-        index,
-        source: Box::new(source),
-    })?;
-
-    let head_zmap_path = staging.join("head-zmap.tif");
-    materialize_zmap(project, head, &head_zmap_path)?;
-    let head_reader = ZMapReader::open(&head_zmap_path)
-        .map_err(|err| ProjectError::container(&head_zmap_path, err))?;
-
-    let mut indices = vec![0u16; info.tile_len(tile)];
-    head_reader
-        .read_tile_into(tile, &mut indices)
-        .map_err(|err| ProjectError::container(&head_zmap_path, err))?;
-
-    let needs_fused = ops.iter().any(|op| matches!(op, Op::ResetRegion { .. }));
-    let fused_path = if needs_fused && !head.ops.is_empty() {
-        let fused_ancestor = project.fused_ancestor(parent)?.clone();
-        let path = staging.join("fused-zmap.tif");
-        materialize_zmap(project, &fused_ancestor, &path)?;
-        Some(path)
-    } else {
-        None
-    };
-    let fused_reader = match &fused_path {
-        Some(path) => {
-            Some(ZMapReader::open(path).map_err(|err| ProjectError::container(path, err))?)
-        }
-        None => None,
-    };
-
-    let mut fused = |rect: Rect, buf: &mut [u16]| -> Result<(), ZMapError> {
-        match &fused_reader {
-            Some(reader) => reader.read_tile_into(rect, buf),
-            None => head_reader.read_tile_into(rect, buf),
-        }
-    };
-
-    replay::replay(ops, info, tile, &mut indices, &mut fused).map_err(|(index, source)| {
-        ProjectError::Op {
-            index,
-            source: Box::new(source),
-        }
-    })?;
-
-    {
-        let mut writer = ZMapWriter::create(new_zmap_path, info)
-            .map_err(|err| ProjectError::container(new_zmap_path, err))?;
-        write_edited(&head_reader, tile, &indices, ROWS_PER_PASS, &mut writer)
-            .map_err(|err| ProjectError::container(new_zmap_path, err))?;
-        writer
-            .finish()
-            .map_err(|err| ProjectError::container(new_zmap_path, err))?;
-    }
-
-    Ok(())
-}
-
-/// `parent`'s checkpoint and the Z-Map geometry of its fused ancestor: the
-/// common start [`append_ops_on`] and [`replay_ops_to_staged`] both need
-/// before checking or replaying ops against it.
-fn checkpoint_geometry(
-    project: &Project,
-    parent: &str,
-) -> Result<(Checkpoint, ZMapInfo), ProjectError> {
+/// `parent`'s checkpoint, once every op of `ops` is valid against the Z-Map
+/// geometry of `parent`'s fused ancestor: the first op that is not is
+/// [`ProjectError::Op`] with its position.
+fn checked_parent(project: &Project, parent: &str, ops: &[Op]) -> Result<Checkpoint, ProjectError> {
     let head = project.history().get(parent)?.clone();
     let (width, height, frame_count) = fused_extent(project, parent)?;
     let info = ZMapInfo::new(width, height, frame_count)
         .map_err(|err| ProjectError::container(project.path(), err))?;
-    Ok((head, info))
+    for (index, op) in ops.iter().enumerate() {
+        crate::retouch::footprint(op, info).map_err(|source| ProjectError::Op {
+            index,
+            source: Box::new(source),
+        })?;
+    }
+    Ok(head)
 }
 
 /// What a successful [`delete_checkpoint`] hid and stopped listing, and the

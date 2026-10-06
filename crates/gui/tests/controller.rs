@@ -4227,7 +4227,7 @@ fn overlay_controls_match_the_render_parameters() {
             table: focusforge_core::zmap::overlay_table(3, None),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
         }),
-        "matches focusforge-cli retouch --overlay --opacity's own blend, with no --solo"
+        "matches display::overlay_cpu's own blend, with no solo source"
     );
 
     c.set_overlay_on(false);

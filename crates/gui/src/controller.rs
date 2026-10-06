@@ -1967,9 +1967,8 @@ impl AppController {
     }
 
     /// The `Composite` pane's overlay draw parameters, matching
-    /// `focusforge-cli retouch --overlay --opacity`'s own blend, in either
-    /// mode -- `None` with the overlay off or when the active tab's selected
-    /// row has no fuse. The table spans that fuse's sources.
+    /// `display::overlay_cpu`'s blend, in either mode -- `None` with the
+    /// overlay off or when the active tab's selected row has no fuse. The table spans that fuse's sources.
     pub fn overlay_draw(&self) -> Option<OverlayDraw> {
         if !self.state.overlay.on {
             return None;

@@ -403,8 +403,8 @@ fn fail(what: &str, err: impl std::fmt::Display) -> TestCaseError {
     TestCaseError::fail(format!("{what}: {err}"))
 }
 
-/// One `append_ops_onto` / `delete_checkpoint` call per step: what
-/// `history apply --save` and `history delete` run.
+/// One `append_ops_onto` / `delete_checkpoint` call per step: the core
+/// calls behind the GUI's save and `history delete`.
 fn write_per_checkpoint(path: &Path, model: &mut Model) -> Result<(), TestCaseError> {
     for step in model.steps.clone() {
         match step {
@@ -645,7 +645,7 @@ fn failure_prints_the_minimal_sequence() {
         "the failure does not print the shrunk input:\n{printed}"
     );
     assert!(
-        printed.contains("BrushStroke") || printed.contains("ResetRegion"),
+        printed.contains("BrushStroke"),
         "the printed input does not name the ops:\n{printed}"
     );
 }

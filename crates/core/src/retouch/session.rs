@@ -434,60 +434,6 @@ mod tests {
         assert!(session.redo().is_none());
     }
 
-    fn stub_footprint(_op: &Op, _info: ZMapInfo) -> Result<Option<Rect>, RetouchError> {
-        Ok(Some(Rect {
-            x: 5,
-            y: 3,
-            width: 1,
-            height: 1,
-        }))
-    }
-
-    fn stub_apply(
-        _op: &Op,
-        _info: ZMapInfo,
-        _tile: Rect,
-        indices: &mut [u16],
-    ) -> Result<u64, RetouchError> {
-        if let Some(v) = indices.first_mut() {
-            *v = v.wrapping_add(1);
-        }
-        Ok(1)
-    }
-
-    #[test]
-    fn every_op_variant_discards_redo() {
-        let info = info();
-        let tile = tile();
-        let first = stroke_op(0, vec![pt(6, 4)], 1.0, 0.0);
-        let variants = [
-            stroke_op(0, vec![pt(6, 4)], 1.0, 0.0),
-            Op::FloodFill {
-                seed: pt(6, 4),
-                source_id: 0,
-                tolerance: 0.1,
-            },
-            Op::ResetRegion { rect: tile },
-            Op::Refuse {
-                algorithm: String::new(),
-                params: crate::params::ParamValues::default(),
-            },
-        ];
-        for second in &variants {
-            let base = base_indices(info, tile);
-            let mut session =
-                EditSession::with_applier(info, tile, base, stub_footprint, stub_apply).unwrap();
-            session.append(first.clone()).unwrap();
-            session.undo().unwrap();
-            assert!(session.can_redo());
-            session.append(second.clone()).unwrap();
-            assert!(
-                !session.can_redo(),
-                "appending {second:?} did not discard redo"
-            );
-        }
-    }
-
     #[test]
     fn queries_match_behaviour() {
         let info = info();

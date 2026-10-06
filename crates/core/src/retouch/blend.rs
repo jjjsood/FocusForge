@@ -31,19 +31,15 @@ pub(super) struct Stroke<'a> {
     pub(super) softness: f32,
 }
 
-/// Refuses, in order: any op other than [`Op::BrushStroke`]; an empty path;
-/// `source_id >= info.frame_count()`; a non-finite or non-positive radius;
-/// a softness outside `0.0..=1.0`.
+/// Refuses, in order: an empty path; `source_id >= info.frame_count()`; a
+/// non-finite or non-positive radius; a softness outside `0.0..=1.0`.
 pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, RetouchError> {
     let Op::BrushStroke {
         source_id,
         path,
         radius,
         softness,
-    } = op
-    else {
-        return Err(RetouchError::Unsupported);
-    };
+    } = op;
     if path.is_empty() {
         return Err(RetouchError::EmptyPath);
     }
@@ -522,9 +518,6 @@ mod tests {
             stroke_op(0, vec![pt(1, 1)], 0.0, 0.0),
             stroke_op(0, vec![pt(1, 1)], f32::NAN, 0.0),
             stroke_op(0, vec![pt(1, 1)], 3.0, 1.5),
-            Op::ResetRegion {
-                rect: rect(0, 0, 4, 4),
-            },
         ];
         for op in &ops {
             assert!(alpha(op, info, 1, 1).is_err(), "{op:?}");
@@ -770,9 +763,9 @@ mod tests {
             .iter()
             .map(|op| PlacedStroke {
                 op,
-                frame: match op {
-                    Op::BrushStroke { source_id, .. } => usize::from(*source_id),
-                    _ => unreachable!(),
+                frame: {
+                    let Op::BrushStroke { source_id, .. } = op;
+                    usize::from(*source_id)
                 },
                 footprint: footprint(op, info).unwrap().unwrap(),
             })
