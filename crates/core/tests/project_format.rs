@@ -20,7 +20,7 @@ use focusforge_core::project::{
     self, BlobKind, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project, SealRequest,
     SourceResolution, blob,
 };
-use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
 const W: u32 = 64;
 const H: u32 = 48;
@@ -726,4 +726,78 @@ fn checkpoint_id_is_deterministic() {
     assert_eq!(id(10), id(10));
     assert_ne!(id(10), id(11));
     assert_eq!(id(10).len(), 32);
+}
+
+#[test]
+fn multithreaded_blobs_round_trip() {
+    let dir = tmp_dir("project_format_multithreaded_blobs");
+    let mantis = common::mantis_512_dir();
+    let golden = mantis.join("golden");
+    // Copied so `seal` stages its blobs beside private files, not the fixture.
+    let composite_path = dir.join("golden-composite.tif");
+    std::fs::copy(golden.join("laplacian.tif"), &composite_path).unwrap();
+    let zmap_path = dir.join("golden-zmap.tif");
+    std::fs::copy(golden.join("laplacian-zmap.tif"), &zmap_path).unwrap();
+    let sources: Vec<PathBuf> = (0..8)
+        .map(|i| mantis.join("frames").join(format!("{i:02}.tif")))
+        .collect();
+    let values = params();
+    let project_path = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
+    project::seal(request(
+        &project_path,
+        &composite_path,
+        &zmap_path,
+        &sources,
+        &values,
+    ))
+    .expect("seal must succeed");
+
+    // Every blob the project holds decodes to bytes that hash to its own
+    // entry name.
+    let project = Project::open(&project_path).unwrap();
+    let records = &project.manifest().blobs;
+    assert!(!records.is_empty(), "the project must hold blobs");
+    for record in records {
+        let stored = Index::read(&project_path)
+            .unwrap()
+            .read_entry(&project_path, &format!("blobs/{}.zst", record.hash))
+            .unwrap();
+        let bytes = zstd::stream::decode_all(&stored[..]).unwrap();
+        assert_eq!(bytes.len() as u64, record.uncompressed_len);
+        assert_eq!(blake3::hash(&bytes).to_hex().to_string(), record.hash);
+    }
+
+    // The same plane staged at two levels: one entry name, and the plane's
+    // own little-endian bytes back from either file.
+    let le =
+        |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+    let stack =
+        focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&composite_path)).unwrap();
+    let (w, h) = stack.dimensions();
+    let mut composite = vec![0u16; w as usize * h as usize * SPP as usize];
+    stack.read_tile_into(0, full(w, h), &mut composite).unwrap();
+    let reader = ZMapReader::open(&zmap_path).unwrap();
+    let (zw, zh) = reader.dimensions();
+    let mut zmap = vec![0u16; zw as usize * zh as usize];
+    reader.read_tile_into(full(zw, zh), &mut zmap).unwrap();
+    let planes = [
+        (Plane::Composite, composite_path, le(&composite)),
+        (Plane::ZMap, zmap_path, le(&zmap)),
+    ];
+    for (plane, source, expected) in planes {
+        let mut hashes = Vec::new();
+        for level in [1, blob::ZSTD_LEVEL] {
+            let out = dir.join(format!("staged-{plane:?}-{level}"));
+            std::fs::create_dir_all(&out).unwrap();
+            let staged = blob::stage_plane(&source, plane, level, &out).unwrap();
+            let stored = std::fs::read(&staged.path).unwrap();
+            assert_eq!(zstd::stream::decode_all(&stored[..]).unwrap(), expected);
+            hashes.push(staged.hash);
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "{plane:?}: the level moved the entry name"
+        );
+        assert_eq!(hashes[0], blake3::hash(&expected).to_hex().to_string());
+    }
 }
