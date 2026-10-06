@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! [`CheckpointImage`]: a fused checkpoint renders its stored composite, an
-//! op-bearing checkpoint its ancestor's composite spliced with a gather over
-//! the ancestor's aligned, cropped sources.
+//! op-bearing checkpoint its ancestor's composite with each brush stroke
+//! blended in from the ancestor's aligned, cropped sources.
 
 use std::path::{Path, PathBuf};
 
-use focusforge_core::align::{Registration, Transform};
+use focusforge_core::algorithm::TileReader;
+use focusforge_core::align::{Registration, Transform, WarpingReader};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
     self, AlignRecord, CheckpointImage, Metrics, Op, Point, Project, SealRequest, ZMapStorage,
 };
-use focusforge_core::retouch::{Sources, recomposite};
+use focusforge_core::retouch::blend;
 use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
 
 const FRAME_W: u32 = 12;
@@ -72,7 +73,6 @@ struct Root {
     project_path: PathBuf,
     source_paths: Vec<PathBuf>,
     transforms: Vec<Transform>,
-    ancestor_zmap: Vec<u16>,
     root_id: String,
 }
 
@@ -130,7 +130,6 @@ fn seal_root(name: &str) -> Root {
         project_path,
         source_paths,
         transforms,
-        ancestor_zmap,
         root_id: sealed.checkpoint,
     }
 }
@@ -227,11 +226,15 @@ fn fused_render_needs_no_sources() {
 #[test]
 fn unedited_child_renders_the_ancestor_composite() {
     let root = seal_root("checkpoint_render_unedited");
+    // A stroke lying wholly off the image changes no pixel.
     let child = project::append_ops_onto(
         &root.project_path,
         &root.root_id,
-        vec![Op::ResetRegion {
-            rect: full(CROP.width, CROP.height),
+        vec![Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: -40, y: -40 }],
+            radius: 3.0,
+            softness: 0.5,
         }],
         None,
         1,
@@ -240,6 +243,9 @@ fn unedited_child_renders_the_ancestor_composite() {
     .expect("append_ops_onto must succeed");
 
     let mut project = Project::open(&root.project_path).unwrap();
+    for path in &root.source_paths {
+        std::fs::remove_file(path).unwrap();
+    }
     let (_shape, bands) = render_to_bands(&mut project, &child.checkpoint);
     let flat = flatten(&bands);
     assert_eq!(
@@ -249,88 +255,61 @@ fn unedited_child_renders_the_ancestor_composite() {
 }
 
 #[test]
-fn op_bearing_render_is_ancestor_composite_plus_splice() {
-    let root = seal_root("checkpoint_render_splice");
+fn op_bearing_render_blends_the_stroke_over_the_ancestor_composite() {
+    let root = seal_root("checkpoint_render_blend");
+    // From the translated frame, so the alignment and the crop origin both matter.
+    let stroke = Op::BrushStroke {
+        source_id: 2,
+        path: vec![Point { x: 2, y: 2 }, Point { x: 4, y: 3 }],
+        radius: 3.0,
+        softness: 0.5,
+    };
     let child = project::append_ops_onto(
         &root.project_path,
         &root.root_id,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 1.5,
-            softness: 0.0,
-        }],
+        vec![stroke.clone()],
         None,
         1,
         ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed");
 
-    let mut project = Project::open(&root.project_path).unwrap();
-    let child_checkpoint = project.history().get(&child.checkpoint).unwrap().clone();
-    let mut zmap_path = std::env::temp_dir();
-    zmap_path.push(format!(
-        "checkpoint_render_splice_{}.tif",
-        std::process::id()
-    ));
-    project::materialize_zmap(&mut project, &child_checkpoint, &zmap_path).unwrap();
-    let reader = focusforge_core::zmap::ZMapReader::open(&zmap_path).unwrap();
-    let mut checkpoint_idx = vec![0u16; (CROP.width * CROP.height) as usize];
-    reader
-        .read_tile_into(full(CROP.width, CROP.height), &mut checkpoint_idx)
-        .unwrap();
-    std::fs::remove_file(&zmap_path).unwrap();
-
-    let diff_count = checkpoint_idx
-        .iter()
-        .zip(root.ancestor_zmap.iter())
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(diff_count > 0, "the stroke must change at least one index");
-    assert!(
-        diff_count < checkpoint_idx.len(),
-        "the stroke must leave at least one index unchanged"
-    );
-
-    // The independent oracle: a whole-image recomposite over the same
-    // reader, masked by the Z-Map diff.
     let stack = TiffStack::open_files(&root.source_paths).unwrap();
-    let sources = Sources {
-        reader: &focusforge_core::align::WarpingReader::new(
-            &stack,
-            (FRAME_W, FRAME_H),
-            SPP,
-            root.transforms.clone(),
-        ),
-        frame_count: 3,
-        samples_per_pixel: SPP,
-        origin: (CROP.x, CROP.y),
-    };
-    let mut gathered = vec![0u16; checkpoint_idx.len() * SPP as usize];
-    recomposite(
-        &checkpoint_idx,
-        full(CROP.width, CROP.height),
-        &sources,
-        &mut gathered,
-    )
-    .unwrap();
-    let expected: Vec<u16> = (0..checkpoint_idx.len())
-        .map(|i| {
-            if checkpoint_idx[i] != root.ancestor_zmap[i] {
-                gathered[i]
-            } else {
-                COMPOSITE_VALUE
-            }
-        })
+    let warping = WarpingReader::new(&stack, (FRAME_W, FRAME_H), SPP, root.transforms.clone());
+    let area = (CROP.width * CROP.height) as usize;
+    let mut frame = vec![0u16; area];
+    warping
+        .read_tile_into(
+            2,
+            Rect {
+                x: CROP.x,
+                y: CROP.y,
+                ..full(CROP.width, CROP.height)
+            },
+            &mut frame,
+        )
+        .unwrap();
+    let info = ZMapInfo::new(CROP.width, CROP.height, 3).unwrap();
+    let alphas: Vec<u32> = (0..area as u32)
+        .map(|i| blend::alpha(&stroke, info, i % CROP.width, i / CROP.width).unwrap())
+        .collect();
+    assert!(alphas.contains(&0), "the stroke leaves pixels alone");
+    assert!(alphas.contains(&65_536), "the stroke has a core");
+    assert!(
+        alphas.iter().any(|&a| a > 0 && a < 65_536),
+        "the stroke has a soft band"
+    );
+    let expected: Vec<u16> = (0..area)
+        .map(|i| blend::blend_sample(COMPOSITE_VALUE, frame[i], alphas[i]))
         .collect();
 
+    let mut project = Project::open(&root.project_path).unwrap();
     let (shape, bands) = render_to_bands(&mut project, &child.checkpoint);
     assert_eq!(
         shape.description, "staged composite",
-        "a splice's ImageDescription is its fused ancestor's, not a generic one"
+        "an edited state's ImageDescription is its fused ancestor's, not a generic one"
     );
-    let flat = flatten(&bands);
-    assert_eq!(flat, expected);
+    assert_eq!(flatten(&bands), expected);
 }
 
 #[test]

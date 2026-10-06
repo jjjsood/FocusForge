@@ -118,7 +118,7 @@ fn write_op_file(dir: &Path, name: &str, body: &Value) -> PathBuf {
     path
 }
 
-/// Two brush strokes and a small reset, well inside a 512x512, 8-frame map --
+/// Three brush strokes well inside a 512x512, 8-frame map --
 /// [`shared_stack`]'s own geometry.
 fn three_strokes() -> Vec<Op> {
     vec![
@@ -134,13 +134,11 @@ fn three_strokes() -> Vec<Op> {
             radius: 2.0,
             softness: 0.0,
         },
-        Op::ResetRegion {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 4,
-            },
+        Op::BrushStroke {
+            source_id: 3,
+            path: vec![Point { x: 2, y: 2 }],
+            radius: 2.0,
+            softness: 0.0,
         },
     ]
 }

@@ -1,0 +1,687 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! The soft brush stroke: a mask over a disc of `radius` image pixels around
+//! the stroke's path and `out = mix(out, source, alpha)` over it, in integer
+//! fixed point.
+//!
+//! The mask is full inside the hard core, `radius * (1 - softness)`, and falls
+//! linearly in distance to zero at `radius`. Distances are measured in
+//! sixteenths of a pixel from the exact point-to-segment distance of the
+//! integer path, so the mask is a pure function of the stroke's stored fields
+//! and the pixel's coordinate. Alpha is Q16 (`0..=65536`); the blend rounds
+//! to nearest and returns `out` at alpha 0 and `source` at 65536 exactly.
+
+use crate::project::{Op, Point};
+use crate::tile::Rect;
+use crate::zmap::ZMapInfo;
+
+use super::RetouchError;
+
+/// One pixel in the distance unit of the mask.
+const SIXTEENTHS: f64 = 16.0;
+/// Alpha of a fully covered sample.
+const OPAQUE: u32 = 1 << 16;
+/// Caps the radius so the ramp's products stay far inside `u64`.
+const MAX_RADIUS_16: u64 = 1 << 40;
+
+/// A validated brush stroke: [`Op::BrushStroke`]'s fields, checked against
+/// the map they will be applied to.
+pub(super) struct Stroke<'a> {
+    pub(super) source_id: u16,
+    pub(super) path: &'a [Point],
+    pub(super) radius: f32,
+    pub(super) softness: f32,
+}
+
+/// Refuses, in order: any op other than [`Op::BrushStroke`]; an empty path;
+/// `source_id >= info.frame_count()`; a non-finite or non-positive radius;
+/// a softness outside `0.0..=1.0`.
+pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, RetouchError> {
+    let Op::BrushStroke {
+        source_id,
+        path,
+        radius,
+        softness,
+    } = op
+    else {
+        return Err(RetouchError::Unsupported);
+    };
+    if path.is_empty() {
+        return Err(RetouchError::EmptyPath);
+    }
+    if u32::from(*source_id) >= info.frame_count() {
+        return Err(RetouchError::SourceOutOfRange {
+            source_id: *source_id,
+            frame_count: info.frame_count(),
+        });
+    }
+    if !radius.is_finite() || *radius <= 0.0 {
+        return Err(RetouchError::InvalidRadius { radius: *radius });
+    }
+    if !(0.0..=1.0).contains(softness) {
+        return Err(RetouchError::InvalidSoftness {
+            softness: *softness,
+        });
+    }
+    Ok(Stroke {
+        source_id: *source_id,
+        path: path.as_slice(),
+        radius: *radius,
+        softness: *softness,
+    })
+}
+
+/// The dirty region a stroke reports: its path's bounding box widened by
+/// `radius`, clamped to the map's extent. `None` means an empty region --
+/// every pixel of the path lies outside the map, or the path's own extent
+/// clamps to nothing.
+pub fn footprint(op: &Op, info: ZMapInfo) -> Result<Option<Rect>, RetouchError> {
+    let stroke = validate(op, info)?;
+    Ok(stroke_footprint(&stroke, info))
+}
+
+pub(super) fn stroke_footprint(stroke: &Stroke, info: ZMapInfo) -> Option<Rect> {
+    let r = f64::from(stroke.radius);
+    let mut min_x = i64::MAX;
+    let mut min_y = i64::MAX;
+    let mut max_x = i64::MIN;
+    let mut max_y = i64::MIN;
+    for p in stroke.path {
+        let x = f64::from(p.x);
+        let y = f64::from(p.y);
+        min_x = min_x.min((x - r).floor() as i64);
+        min_y = min_y.min((y - r).floor() as i64);
+        // `+ 1`: an exclusive bound, so a pixel at exactly `x + r` is not
+        // excluded when `x + r` is itself an integer.
+        max_x = max_x.max(((x + r).floor() as i64).saturating_add(1));
+        max_y = max_y.max(((y + r).floor() as i64).saturating_add(1));
+    }
+    let x0 = min_x.clamp(0, i64::from(info.width()));
+    let y0 = min_y.clamp(0, i64::from(info.height()));
+    let x1 = max_x.clamp(0, i64::from(info.width()));
+    let y1 = max_y.clamp(0, i64::from(info.height()));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(Rect {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    })
+}
+
+/// Segment `i` of the stroke's path; a one-point path is one zero-length
+/// segment.
+pub(super) fn segment(stroke: &Stroke, i: usize) -> (Point, Point) {
+    match stroke.path {
+        [p] => (*p, *p),
+        path => (path[i], path[i + 1]),
+    }
+}
+
+/// Square cells over `region`, each listing the path segments that can reach
+/// one of its pixels. A pixel is reached only within `radius` of a segment,
+/// so a segment is listed in every cell its bounding box, widened by `radius`
+/// plus one pixel of rounding slack, touches.
+pub(super) struct SegmentGrid {
+    region: Rect,
+    cell: u32,
+    columns: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl SegmentGrid {
+    pub(super) fn new(stroke: &Stroke, region: Rect) -> Self {
+        let r = f64::from(stroke.radius);
+        let cell = r
+            .ceil()
+            .max(64.0)
+            .min(f64::from(region.width.max(region.height))) as u32;
+        let columns = region.width.div_ceil(cell) as usize;
+        let rows = region.height.div_ceil(cell) as usize;
+        let mut cells = vec![Vec::new(); columns * rows];
+        let reach = r + 1.0;
+        let cell_range = |lo: f64, hi: f64, origin: u32, count: usize| {
+            let first = ((lo - reach - f64::from(origin)) / f64::from(cell)).floor();
+            let last = ((hi + reach - f64::from(origin)) / f64::from(cell)).floor();
+            (last >= 0.0 && first < count as f64)
+                .then(|| (first.max(0.0) as usize)..=(last.min(count as f64 - 1.0) as usize))
+        };
+        for i in 0..stroke.path.len().saturating_sub(1).max(1) {
+            let (a, b) = segment(stroke, i);
+            let (ax, ay, bx, by) = (
+                f64::from(a.x),
+                f64::from(a.y),
+                f64::from(b.x),
+                f64::from(b.y),
+            );
+            let (Some(xs), Some(ys)) = (
+                cell_range(ax.min(bx), ax.max(bx), region.x, columns),
+                cell_range(ay.min(by), ay.max(by), region.y, rows),
+            ) else {
+                continue;
+            };
+            for cy in ys {
+                for cx in xs.clone() {
+                    cells[cy * columns + cx].push(i as u32);
+                }
+            }
+        }
+        Self {
+            region,
+            cell,
+            columns,
+            cells,
+        }
+    }
+
+    /// Calls `visit(x, y, segments)` for every pixel of the region lying in a
+    /// cell some segment can reach, with that cell's segment indices.
+    pub(super) fn walk(&self, mut visit: impl FnMut(u32, u32, &[u32])) {
+        let region = self.region;
+        for y in region.y..region.y + region.height {
+            let row = ((y - region.y) / self.cell) as usize;
+            for column in 0..self.columns {
+                let segments = &self.cells[row * self.columns + column];
+                if segments.is_empty() {
+                    continue;
+                }
+                let x0 = region.x + column as u32 * self.cell;
+                let x1 = (x0 + self.cell).min(region.x + region.width);
+                for x in x0..x1 {
+                    visit(x, y, segments);
+                }
+            }
+        }
+    }
+}
+
+/// 256 times the squared distance from the pixel `(px, py)` to segment
+/// `a..b` (a zero-length segment is its own point), rounded down. A distance
+/// beyond what the arithmetic holds saturates, which is far outside any ramp.
+fn segment_d2_256(px: i64, py: i64, a: Point, b: Point) -> u128 {
+    let (ax, ay) = (i128::from(a.x), i128::from(a.y));
+    let (bx, by) = (i128::from(b.x), i128::from(b.y));
+    let (px, py) = (i128::from(px), i128::from(py));
+    let (dx, dy) = (bx - ax, by - ay);
+    let len2 = dx * dx + dy * dy;
+    let dot = (px - ax) * dx + (py - ay) * dy;
+    let point_d2 = |x: i128, y: i128| 256 * ((px - x).pow(2) + (py - y).pow(2)) as u128;
+    if len2 == 0 || dot <= 0 {
+        return point_d2(ax, ay);
+    }
+    if dot >= len2 {
+        return point_d2(bx, by);
+    }
+    let cross = ((px - ax) * dy - (py - ay) * dx).unsigned_abs();
+    cross
+        .checked_mul(cross)
+        .and_then(|c2| c2.checked_mul(256))
+        .map_or(u128::MAX, |n| n / len2 as u128)
+}
+
+/// The distance of the pixel `(x, y)` from `segments` of `stroke`, in
+/// sixteenths of a pixel (floored): the nearest one's.
+fn distance_16(stroke: &Stroke, x: u32, y: u32, segments: impl Iterator<Item = usize>) -> u64 {
+    let d2 = segments
+        .map(|i| {
+            let (a, b) = segment(stroke, i);
+            segment_d2_256(i64::from(x), i64::from(y), a, b)
+        })
+        .min()
+        .unwrap_or(u128::MAX);
+    d2.isqrt() as u64
+}
+
+/// The radius and core of a stroke's mask, in sixteenths of a pixel.
+struct Ramp {
+    radius: u64,
+    core: u64,
+}
+
+impl Ramp {
+    /// Rounds the stored `f32` fields once; a stroke narrower than 1/32 px
+    /// has a zero radius and covers nothing.
+    fn new(stroke: &Stroke) -> Self {
+        let radius = ((f64::from(stroke.radius) * SIXTEENTHS).round() as u64).min(MAX_RADIUS_16);
+        let softness = (f64::from(stroke.softness) * f64::from(OPAQUE)).round() as u64;
+        Self {
+            radius,
+            core: (radius * (u64::from(OPAQUE) - softness)) >> 16,
+        }
+    }
+
+    /// Q16 alpha at distance `d16`: zero from the radius out, opaque inside
+    /// the core, linear between.
+    fn alpha(&self, d16: u64) -> u32 {
+        if d16 >= self.radius {
+            0
+        } else if d16 <= self.core {
+            OPAQUE
+        } else {
+            ((self.radius - d16) * u64::from(OPAQUE) / (self.radius - self.core)) as u32
+        }
+    }
+}
+
+/// The Q16 alpha (`0..=65536`) the stroke `op` gives the pixel `(x, y)`,
+/// testing every segment: the definition [`apply`] reproduces with segment
+/// culling.
+pub fn alpha(op: &Op, info: ZMapInfo, x: u32, y: u32) -> Result<u32, RetouchError> {
+    let stroke = validate(op, info)?;
+    let segments = stroke.path.len().saturating_sub(1).max(1);
+    Ok(Ramp::new(&stroke).alpha(distance_16(&stroke, x, y, 0..segments)))
+}
+
+/// `out` mixed toward `src` by the Q16 `alpha`, rounded to nearest: `out` at
+/// alpha 0, `src` at 65536. The sum reaches 2^32 for two full-scale samples,
+/// so it is summed in `u64`.
+pub fn blend_sample(out: u16, src: u16, alpha: u32) -> u16 {
+    debug_assert!(alpha <= OPAQUE, "alpha is Q16 in 0..=65536");
+    let (out, src, alpha) = (u64::from(out), u64::from(src), u64::from(alpha));
+    ((out * (u64::from(OPAQUE) - alpha) + src * alpha + 32768) >> 16) as u16
+}
+
+/// Blends the stroke `op`'s source samples over `out`. `out` holds the
+/// samples of `out_rect` (row-major, `spp` samples a pixel) and `src` those of
+/// `region`, the part of `out_rect` the caller read the source frame for;
+/// only pixels inside `region` and the stroke's footprint change.
+///
+/// Cost follows the area near the path, not the path's bounding box.
+pub fn apply(
+    op: &Op,
+    info: ZMapInfo,
+    out_rect: Rect,
+    out: &mut [u16],
+    region: Rect,
+    src: &[u16],
+    spp: usize,
+) -> Result<(), RetouchError> {
+    let stroke = validate(op, info)?;
+    if !info.contains(out_rect) || out_rect.intersect(region) != Some(region) {
+        return Err(RetouchError::TileOutsideMap { tile: region });
+    }
+    let samples = |rect: Rect| rect.width as usize * rect.height as usize * spp;
+    for (rect, len) in [(out_rect, out.len()), (region, src.len())] {
+        if len != samples(rect) {
+            return Err(RetouchError::TileBufferSize {
+                expected: samples(rect),
+                actual: len,
+            });
+        }
+    }
+    let Some(active) = stroke_footprint(&stroke, info).and_then(|fp| region.intersect(fp)) else {
+        return Ok(());
+    };
+    let ramp = Ramp::new(&stroke);
+    SegmentGrid::new(&stroke, active).walk(|x, y, segments| {
+        let a = ramp.alpha(distance_16(
+            &stroke,
+            x,
+            y,
+            segments.iter().map(|&i| i as usize),
+        ));
+        if a == 0 {
+            return;
+        }
+        let out_at =
+            ((y - out_rect.y) as usize * out_rect.width as usize + (x - out_rect.x) as usize) * spp;
+        let src_at =
+            ((y - region.y) as usize * region.width as usize + (x - region.x) as usize) * spp;
+        for (o, &s) in out[out_at..out_at + spp]
+            .iter_mut()
+            .zip(&src[src_at..src_at + spp])
+        {
+            *o = blend_sample(*o, s, a);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(x: i32, y: i32) -> Point {
+        Point { x, y }
+    }
+
+    fn stroke_op(source_id: u16, path: Vec<Point>, radius: f32, softness: f32) -> Op {
+        Op::BrushStroke {
+            source_id,
+            path,
+            radius,
+            softness,
+        }
+    }
+
+    fn info(width: u32, height: u32) -> ZMapInfo {
+        ZMapInfo::new(width, height, 4).unwrap()
+    }
+
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A deterministic pseudo-random walk of `count` points starting at
+    /// `(x, y)`, each step at most `step` pixels along either axis.
+    fn walk(seed: u64, count: usize, (mut x, mut y): (i32, i32), step: i32) -> Vec<Point> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as i32).rem_euclid(2 * step + 1) - step
+        };
+        (0..count)
+            .map(|_| {
+                x += next();
+                y += next();
+                pt(x, y)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ends_are_exact() {
+        for v in 0..=u16::MAX {
+            // The other operand is multiplied by zero at an end, so any
+            // partner proves the end for `v`.
+            for other in [0, 1, 32768, u16::MAX, !v, v.wrapping_mul(31)] {
+                assert_eq!(blend_sample(v, other, 0), v, "alpha 0 keeps {v}");
+                assert_eq!(blend_sample(other, v, 65536), v, "alpha 65536 gives {v}");
+            }
+            for alpha in [1, 255, 32768, 65535] {
+                assert_eq!(blend_sample(v, v, alpha), v, "equal samples stay put");
+            }
+        }
+        assert_eq!(blend_sample(0, u16::MAX, 32768), 32768, "half rounds up");
+
+        let info = info(64, 64);
+        for softness in [0.0, 0.5, 1.0] {
+            let op = stroke_op(0, vec![pt(30, 30), pt(40, 30)], 8.0, softness);
+            assert_eq!(alpha(&op, info, 35, 30).unwrap(), 65536, "on the path");
+            assert_eq!(alpha(&op, info, 35, 38).unwrap(), 0, "at the radius");
+            assert_eq!(alpha(&op, info, 35, 50).unwrap(), 0, "beyond the radius");
+        }
+        let hard = stroke_op(0, vec![pt(30, 30)], 8.0, 0.0);
+        for (x, y) in [(30, 37), (35, 35), (37, 30), (23, 30)] {
+            assert_eq!(alpha(&hard, info, x, y).unwrap(), 65536, "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn mask_is_monotone_and_dither_free() {
+        let info = info(200, 200);
+        for radius in [1.5f32, 12.0, 40.0] {
+            for softness in [0.0f32, 0.3, 1.0] {
+                let op = stroke_op(0, vec![pt(100, 100)], radius, softness);
+                let core = f64::from(radius) * (1.0 - f64::from(softness));
+                let reach = radius as u32 + 3;
+                let mut last = u32::MAX;
+                for dx in 0..=reach {
+                    let a = alpha(&op, info, 100 + dx, 100).unwrap();
+                    assert!(a <= last, "r {radius} s {softness}: alpha rises at {dx}");
+                    if f64::from(dx) <= core - 0.1 && f64::from(dx) < f64::from(radius) {
+                        assert_eq!(a, 65536, "r {radius} s {softness}: inside the core at {dx}");
+                    }
+                    if f64::from(dx) >= f64::from(radius) + 0.1 {
+                        assert_eq!(a, 0, "r {radius} s {softness}: outside at {dx}");
+                    }
+                    last = a;
+                }
+                // Equal squared distance, equal alpha: no coordinate pattern.
+                let mut by_d2 = std::collections::BTreeMap::new();
+                for y in 100 - reach..=100 + reach {
+                    for x in 100 - reach..=100 + reach {
+                        let d2 = (x as i64 - 100).pow(2) + (y as i64 - 100).pow(2);
+                        let a = alpha(&op, info, x, y).unwrap();
+                        assert_eq!(
+                            *by_d2.entry(d2).or_insert(a),
+                            a,
+                            "r {radius} s {softness}: ({x}, {y}) differs from its distance class"
+                        );
+                    }
+                }
+                if softness > 0.0 && radius >= 12.0 {
+                    assert!(
+                        by_d2.values().any(|&a| a > 0 && a < 65536),
+                        "r {radius} s {softness}: a soft stroke has a ramp"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mask_covers_only_inside_the_footprint() {
+        let info = info(120, 90);
+        let op = stroke_op(1, vec![pt(-10, 30), pt(60, 45), pt(130, 80)], 17.5, 0.4);
+        let fp = footprint(&op, info).unwrap().unwrap();
+        for y in 0..90 {
+            for x in 0..120 {
+                let inside = x >= fp.x && x < fp.x + fp.width && y >= fp.y && y < fp.y + fp.height;
+                if !inside {
+                    assert_eq!(alpha(&op, info, x, y).unwrap(), 0, "({x}, {y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mask_refuses_what_validation_refuses() {
+        let info = info(32, 32);
+        let ops = [
+            stroke_op(0, vec![], 3.0, 0.0),
+            stroke_op(4, vec![pt(1, 1)], 3.0, 0.0),
+            stroke_op(0, vec![pt(1, 1)], 0.0, 0.0),
+            stroke_op(0, vec![pt(1, 1)], f32::NAN, 0.0),
+            stroke_op(0, vec![pt(1, 1)], 3.0, 1.5),
+            Op::ResetRegion {
+                rect: rect(0, 0, 4, 4),
+            },
+        ];
+        for op in &ops {
+            assert!(alpha(op, info, 1, 1).is_err(), "{op:?}");
+            let mut out = vec![7u16; 32 * 32];
+            let src = vec![9u16; 32 * 32];
+            assert!(
+                apply(
+                    op,
+                    info,
+                    rect(0, 0, 32, 32),
+                    &mut out,
+                    rect(0, 0, 32, 32),
+                    &src,
+                    1
+                )
+                .is_err()
+            );
+            assert!(out.iter().all(|&s| s == 7), "a refused op writes nothing");
+        }
+    }
+
+    #[test]
+    fn mask_apply_blends_only_where_alpha_is_nonzero() {
+        let info = info(40, 30);
+        let out_rect = rect(0, 0, 40, 30);
+        let op = stroke_op(2, vec![pt(10, 10), pt(25, 15)], 6.0, 0.5);
+        let spp = 3;
+        let base: Vec<u16> = (0..40 * 30 * spp)
+            .map(|i| (i * 37 % 65536) as u16)
+            .collect();
+        let src: Vec<u16> = (0..40 * 30 * spp)
+            .map(|i| (i * 91 % 65536) as u16)
+            .collect();
+        let mut out = base.clone();
+        apply(&op, info, out_rect, &mut out, out_rect, &src, spp).unwrap();
+        let mut changed = 0;
+        for y in 0..30u32 {
+            for x in 0..40u32 {
+                let a = alpha(&op, info, x, y).unwrap();
+                for c in 0..spp {
+                    let i = (y as usize * 40 + x as usize) * spp + c;
+                    assert_eq!(out[i], blend_sample(base[i], src[i], a), "({x}, {y}, {c})");
+                    changed += usize::from(out[i] != base[i]);
+                }
+            }
+        }
+        assert!(changed > 0, "the stroke changes something");
+
+        // A sub-region: only its own pixels may change.
+        let region = rect(8, 8, 12, 9);
+        let sub_src: Vec<u16> = (0..12 * 9 * spp).map(|i| (i * 13 % 65536) as u16).collect();
+        let mut out = base.clone();
+        apply(&op, info, out_rect, &mut out, region, &sub_src, spp).unwrap();
+        for y in 0..30u32 {
+            for x in 0..40u32 {
+                let in_region = (8..20).contains(&x) && (8..17).contains(&y);
+                for c in 0..spp {
+                    let i = (y as usize * 40 + x as usize) * spp + c;
+                    if in_region {
+                        let a = alpha(&op, info, x, y).unwrap();
+                        let s = sub_src[((y - 8) as usize * 12 + (x - 8) as usize) * spp + c];
+                        assert_eq!(out[i], blend_sample(base[i], s, a));
+                    } else {
+                        assert_eq!(out[i], base[i], "({x}, {y}) is outside the region");
+                    }
+                }
+            }
+        }
+
+        let mut short = vec![0u16; 5];
+        assert!(matches!(
+            apply(&op, info, out_rect, &mut short, out_rect, &src, spp),
+            Err(RetouchError::TileBufferSize { .. })
+        ));
+        assert!(matches!(
+            apply(
+                &op,
+                info,
+                out_rect,
+                &mut out,
+                rect(30, 20, 20, 20),
+                &src,
+                spp
+            ),
+            Err(RetouchError::TileOutsideMap { .. })
+        ));
+    }
+
+    /// The unculled stroke: every pixel of `tile` is tested against every
+    /// path segment through [`alpha`].
+    fn apply_reference(op: &Op, info: ZMapInfo, tile: Rect, out: &mut [u16], src: &[u16]) {
+        for y in tile.y..tile.y + tile.height {
+            for x in tile.x..tile.x + tile.width {
+                let a = alpha(op, info, x, y).unwrap();
+                let i = ((y - tile.y) * tile.width + (x - tile.x)) as usize;
+                out[i] = blend_sample(out[i], src[i], a);
+            }
+        }
+    }
+
+    fn assert_matches_reference(op: &Op, info: ZMapInfo, tile: Rect, label: &str) {
+        let len = (tile.width * tile.height) as usize;
+        let base: Vec<u16> = (0..len).map(|i| (i * 7 % 65536) as u16).collect();
+        let src: Vec<u16> = (0..len).map(|i| (65535 - i * 11 % 65536) as u16).collect();
+        let mut culled = base.clone();
+        let mut naive = base.clone();
+        apply(op, info, tile, &mut culled, tile, &src, 1).unwrap();
+        apply_reference(op, info, tile, &mut naive, &src);
+        assert_ne!(naive, base, "{label}: the stroke must blend something");
+        assert!(
+            culled == naive,
+            "{label}: culled blend differs from the reference"
+        );
+    }
+
+    #[test]
+    fn mask_culled_blend_equals_the_unculled_stroke() {
+        let info = info(400, 300);
+        let map = rect(0, 0, 400, 300);
+        // A self-crossing walk that leaves the map on every side.
+        let long = walk(7, 60, (200, 150), 90);
+        assert!(
+            long.iter()
+                .any(|p| p.x < 0 || p.x >= 400 || p.y < 0 || p.y >= 300)
+        );
+        for softness in [0.3, 0.0] {
+            let op = stroke_op(3, long.clone(), 64.0, softness);
+            assert_matches_reference(&op, info, map, &format!("long walk, softness {softness}"));
+        }
+        let corners = stroke_op(
+            3,
+            vec![
+                pt(-30, -30),
+                pt(40, 10),
+                pt(399, 299),
+                pt(420, 320),
+                pt(0, 299),
+            ],
+            64.0,
+            0.3,
+        );
+        assert_matches_reference(&corners, info, map, "clipped at the map corners");
+        // The widened bounding box ends exactly on a cell boundary.
+        for path in [
+            vec![pt(100, 150), pt(164, 150)],
+            vec![pt(200, 40), pt(200, 104)],
+        ] {
+            assert_matches_reference(&stroke_op(1, path, 64.0, 0.0), info, map, "cell boundary");
+        }
+        assert_matches_reference(
+            &stroke_op(2, vec![pt(200, 150)], 64.0, 0.3),
+            info,
+            map,
+            "dot",
+        );
+        assert_matches_reference(
+            &stroke_op(2, vec![pt(10, 10), pt(11, 10)], 0.5, 0.0),
+            info,
+            map,
+            "sub-pixel radius",
+        );
+        let tile = rect(123, 77, 150, 111);
+        for softness in [0.3, 0.0] {
+            let op = stroke_op(3, long.clone(), 64.0, softness);
+            assert_matches_reference(&op, info, tile, &format!("sub-rect, softness {softness}"));
+        }
+    }
+
+    #[test]
+    fn mask_a_long_stroke_over_a_large_map_is_not_quadratic() {
+        let info = info(4000, 4000);
+        let map = rect(0, 0, 4000, 4000);
+        // 20 sweeps of 50 points: a 1000-point path whose bounding box is the
+        // whole map.
+        let jitter = walk(11, 1000, (0, 0), 6);
+        let path: Vec<Point> = (0..1000)
+            .map(|i| {
+                let sweep = i / 50;
+                let along = (i % 50) * 4000 / 49;
+                let x = if sweep % 2 == 0 { along } else { 4000 - along };
+                pt(
+                    x + jitter[i as usize].x % 6,
+                    sweep * 200 + 10 + jitter[i as usize].y % 6,
+                )
+            })
+            .collect();
+        let op = stroke_op(2, path, 16.0, 0.3);
+        let mut out = vec![0u16; 4000 * 4000];
+        let src = vec![60_000u16; 4000 * 4000];
+        let start = std::time::Instant::now();
+        apply(&op, info, map, &mut out, map, &src, 1).unwrap();
+        let elapsed = start.elapsed();
+        assert!(out.iter().filter(|&&s| s != 0).count() > 1_000_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a 1000-point stroke took {elapsed:?}"
+        );
+    }
+}

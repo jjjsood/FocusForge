@@ -12,6 +12,8 @@ use crate::tile::Rect;
 use crate::zmap::ZMapInfo;
 
 use super::RetouchError;
+pub use super::blend::footprint;
+use super::blend::{SegmentGrid, Stroke, segment, stroke_footprint, validate};
 
 /// The standard recursive 8x8 Bayer index matrix, holding `0..=63` each
 /// exactly once, keyed `[y & 7][x & 7]`.
@@ -25,94 +27,6 @@ const BAYER_8X8: [[u8; 8]; 8] = [
     [15, 47, 7, 39, 13, 45, 5, 37],
     [63, 31, 55, 23, 61, 29, 53, 21],
 ];
-
-/// A validated brush stroke: [`Op::BrushStroke`]'s fields, checked against
-/// the map they will be applied to.
-struct Stroke<'a> {
-    source_id: u16,
-    path: &'a [Point],
-    radius: f32,
-    softness: f32,
-}
-
-/// Refuses, in order: any op other than [`Op::BrushStroke`]; an empty path;
-/// `source_id >= info.frame_count()`; a non-finite or non-positive radius;
-/// a softness outside `0.0..=1.0`.
-fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, RetouchError> {
-    let Op::BrushStroke {
-        source_id,
-        path,
-        radius,
-        softness,
-    } = op
-    else {
-        return Err(RetouchError::Unsupported);
-    };
-    if path.is_empty() {
-        return Err(RetouchError::EmptyPath);
-    }
-    if u32::from(*source_id) >= info.frame_count() {
-        return Err(RetouchError::SourceOutOfRange {
-            source_id: *source_id,
-            frame_count: info.frame_count(),
-        });
-    }
-    if !radius.is_finite() || *radius <= 0.0 {
-        return Err(RetouchError::InvalidRadius { radius: *radius });
-    }
-    if !(0.0..=1.0).contains(softness) {
-        return Err(RetouchError::InvalidSoftness {
-            softness: *softness,
-        });
-    }
-    Ok(Stroke {
-        source_id: *source_id,
-        path: path.as_slice(),
-        radius: *radius,
-        softness: *softness,
-    })
-}
-
-/// The dirty region a stroke reports: its path's bounding box widened by
-/// `radius`, clamped to the map's extent. `None` means an empty region --
-/// every pixel of the path lies outside the map, or the path's own extent
-/// clamps to nothing.
-pub fn footprint(op: &Op, info: ZMapInfo) -> Result<Option<Rect>, RetouchError> {
-    let stroke = validate(op, info)?;
-    Ok(stroke_footprint(&stroke, info))
-}
-
-fn stroke_footprint(stroke: &Stroke, info: ZMapInfo) -> Option<Rect> {
-    let r = f64::from(stroke.radius);
-    let mut min_x = i64::MAX;
-    let mut min_y = i64::MAX;
-    let mut max_x = i64::MIN;
-    let mut max_y = i64::MIN;
-    for p in stroke.path {
-        let x = f64::from(p.x);
-        let y = f64::from(p.y);
-        min_x = min_x.min((x - r).floor() as i64);
-        min_y = min_y.min((y - r).floor() as i64);
-        // `+ 1`: an exclusive bound, so a boundary pixel at exactly `x + r`
-        // (covered by `covers`'s `<=`) is not excluded when `x + r` is itself
-        // an integer.
-        max_x = max_x.max(((x + r).floor() as i64).saturating_add(1));
-        max_y = max_y.max(((y + r).floor() as i64).saturating_add(1));
-    }
-    let x0 = min_x.clamp(0, i64::from(info.width()));
-    let y0 = min_y.clamp(0, i64::from(info.height()));
-    let x1 = max_x.clamp(0, i64::from(info.width()));
-    let y1 = max_y.clamp(0, i64::from(info.height()));
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    Some(Rect {
-        x: x0 as u32,
-        y: y0 as u32,
-        width: (x1 - x0) as u32,
-        height: (y1 - y0) as u32,
-    })
-}
 
 /// Squared distance from `(px, py)` to the nearest point of segment `a..b`
 /// (a zero-length segment is its own point).
@@ -153,70 +67,6 @@ fn covered(stroke: &Stroke, x: u32, y: u32, d2: f64) -> bool {
     (1.0 - t) * 64.0 > bayer + 0.5
 }
 
-/// Segment `i` of the stroke's path; a one-point path is one zero-length
-/// segment.
-fn segment(stroke: &Stroke, i: usize) -> (Point, Point) {
-    match stroke.path {
-        [p] => (*p, *p),
-        path => (path[i], path[i + 1]),
-    }
-}
-
-/// Square cells over `region`, each listing the path segments that can reach
-/// one of its pixels. A pixel is covered only within `radius` of a segment, so
-/// a segment is listed in every cell its bounding box, widened by `radius`
-/// plus one pixel of rounding slack, touches.
-struct SegmentGrid {
-    cell: u32,
-    columns: usize,
-    cells: Vec<Vec<u32>>,
-}
-
-impl SegmentGrid {
-    fn new(stroke: &Stroke, region: Rect) -> Self {
-        let r = f64::from(stroke.radius);
-        let cell = r
-            .ceil()
-            .max(64.0)
-            .min(f64::from(region.width.max(region.height))) as u32;
-        let columns = region.width.div_ceil(cell) as usize;
-        let rows = region.height.div_ceil(cell) as usize;
-        let mut cells = vec![Vec::new(); columns * rows];
-        let reach = r + 1.0;
-        let cell_range = |lo: f64, hi: f64, origin: u32, count: usize| {
-            let first = ((lo - reach - f64::from(origin)) / f64::from(cell)).floor();
-            let last = ((hi + reach - f64::from(origin)) / f64::from(cell)).floor();
-            (last >= 0.0 && first < count as f64)
-                .then(|| (first.max(0.0) as usize)..=(last.min(count as f64 - 1.0) as usize))
-        };
-        for i in 0..stroke.path.len().saturating_sub(1).max(1) {
-            let (a, b) = segment(stroke, i);
-            let (ax, ay, bx, by) = (
-                f64::from(a.x),
-                f64::from(a.y),
-                f64::from(b.x),
-                f64::from(b.y),
-            );
-            let (Some(xs), Some(ys)) = (
-                cell_range(ax.min(bx), ax.max(bx), region.x, columns),
-                cell_range(ay.min(by), ay.max(by), region.y, rows),
-            ) else {
-                continue;
-            };
-            for cy in ys {
-                for cx in xs.clone() {
-                    cells[cy * columns + cx].push(i as u32);
-                }
-            }
-        }
-        Self {
-            cell,
-            columns,
-            cells,
-        }
-    }
-}
-
 /// Applies `op` over `tile` (an `info.tile_len(tile)`-long slice of `tile`'s
 /// own indices, row-major), writing `source_id` where the stroke covers a
 /// pixel. Returns how many pixels differed from their prior value. Every
@@ -248,35 +98,23 @@ pub fn apply(
     let Some(region) = tile.intersect(footprint) else {
         return Ok(0);
     };
-    let grid = SegmentGrid::new(&stroke, region);
     let mut changed = 0u64;
-    for y in region.y..region.y + region.height {
-        let row = (y - region.y) / grid.cell;
-        for column in 0..grid.columns {
-            let segments = &grid.cells[row as usize * grid.columns + column];
-            if segments.is_empty() {
-                continue;
-            }
-            let x0 = region.x + column as u32 * grid.cell;
-            let x1 = (x0 + grid.cell).min(region.x + region.width);
-            for x in x0..x1 {
-                let d2 = segments
-                    .iter()
-                    .map(|&i| {
-                        let (a, b) = segment(&stroke, i as usize);
-                        segment_dist2(f64::from(x), f64::from(y), a, b)
-                    })
-                    .fold(f64::INFINITY, f64::min);
-                if covered(&stroke, x, y, d2) {
-                    let idx = ((y - tile.y) * tile.width + (x - tile.x)) as usize;
-                    if indices[idx] != stroke.source_id {
-                        indices[idx] = stroke.source_id;
-                        changed += 1;
-                    }
-                }
+    SegmentGrid::new(&stroke, region).walk(|x, y, segments| {
+        let d2 = segments
+            .iter()
+            .map(|&i| {
+                let (a, b) = segment(&stroke, i as usize);
+                segment_dist2(f64::from(x), f64::from(y), a, b)
+            })
+            .fold(f64::INFINITY, f64::min);
+        if covered(&stroke, x, y, d2) {
+            let idx = ((y - tile.y) * tile.width + (x - tile.x)) as usize;
+            if indices[idx] != stroke.source_id {
+                indices[idx] = stroke.source_id;
+                changed += 1;
             }
         }
-    }
+    });
     Ok(changed)
 }
 

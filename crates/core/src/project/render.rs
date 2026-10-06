@@ -6,26 +6,27 @@
 //! ([`super::export::export_checkpoint`], [`super::export::export_held`])
 //! and any tile of either. A fused checkpoint streams its stored composite
 //! and a held result its composite TIFF, reading no source frame; an
-//! op-bearing checkpoint splices its replayed-Z-Map edits over its nearest
-//! fused ancestor's composite.
+//! op-bearing checkpoint blends its brush strokes, in log order, over its
+//! nearest fused ancestor's composite, reading source frames only for a tile
+//! some stroke meets.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::algorithm::TileReader;
 use crate::align::{Registration, WarpingReader};
 use crate::equalize::GainReader;
 use crate::io::{FrameSet, TiffSpec, TiffStack, TiffWriter, open_frame_set};
-use crate::retouch::{RetouchError, Sources, recomposite, recomposite_bands};
+use crate::retouch::{RetouchError, Sources, blend, recomposite_bands};
 use crate::tile::{HostBudget, Rect};
-use crate::zmap::{NO_SOURCE, ZMapReader};
+use crate::zmap::{ZMapInfo, ZMapReader};
 
-use super::checkpoint::{Checkpoint, FuseRecord};
+use super::checkpoint::{Checkpoint, FuseRecord, Op};
 use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::PlaneRef;
 use super::seal::HeldCheckpoint;
 use super::validate::check_sources;
-use super::{Project, READ_BAND_BYTES, materialize_zmap};
+use super::{Project, READ_BAND_BYTES};
 
 /// Rows per band of the export gather.
 const GATHER_ROWS: u32 = 256;
@@ -47,10 +48,12 @@ enum Body {
     /// Streams `composite` directly; no Z-Map is read and no source frame
     /// is opened.
     Fused(PlaneRef),
-    OpBearing {
+    /// Blends `strokes` over `ancestor`'s composite; source frames are
+    /// opened only when a stroke meets the rendered tile.
+    Ops {
         checkpoint: Box<Checkpoint>,
-        ancestor_checkpoint: Box<Checkpoint>,
         ancestor: Box<FuseRecord>,
+        strokes: Vec<PlacedStroke>,
     },
     /// Streams a held result's composite TIFF; no project is read.
     Held(PathBuf),
@@ -62,6 +65,14 @@ enum Body {
         zmap_path: PathBuf,
         source: ZmapSource,
     },
+}
+
+/// A brush stroke with the frame it blends and the part of the image it can
+/// change.
+struct PlacedStroke {
+    op: Op,
+    source: usize,
+    footprint: Rect,
 }
 
 /// A Z-Map file's placement: the sources it was gathered from, in frame
@@ -104,25 +115,58 @@ impl CheckpointImage {
     /// refusing an unknown id ([`ProjectError::UnknownCheckpoint`]). A fused
     /// checkpoint needs no source frames; an op-bearing one is also refused
     /// for unrecorded alignment ([`ProjectError::RenderAlignmentUnrecorded`])
-    /// or sources missing or changed on disk
-    /// ([`ProjectError::RenderSourcesUnavailable`]).
+    /// or an op that is no valid brush stroke ([`ProjectError::Op`]), and
+    /// its render for sources missing or changed on disk
+    /// ([`ProjectError::RenderSourcesUnavailable`]) when a stroke meets the
+    /// tile.
     pub fn prepare(project: &Project, id: &str) -> Result<Self, ProjectError> {
         let checkpoint = project.history().get(id)?.clone();
-        let ancestor_checkpoint = project.fused_ancestor(id)?.clone();
         let record = project.fuse_state(id)?;
 
         let composite = record.composite.clone();
-        if ancestor_checkpoint.id == checkpoint.id {
+        let chain = project.history().ancestors(id)?;
+        // `chain` runs from the checkpoint down to the root; the ops apply
+        // oldest first.
+        let applied = chain.iter().take_while(|c| !c.ops.is_empty()).count();
+        let ops: Vec<&Op> = chain[..applied]
+            .iter()
+            .rev()
+            .flat_map(|c| c.ops.iter())
+            .collect();
+        if ops.is_empty() {
             return Ok(Self::shaped(&composite, Body::Fused(record.composite)));
         }
 
-        check_renderable(project, &checkpoint, &record)?;
+        check_alignment(project, &checkpoint, &record)?;
+        let info = ZMapInfo::new(
+            composite.width,
+            composite.height,
+            record.sources.len() as u32,
+        )
+        .map_err(|err| ProjectError::container(project.path(), err))?;
+        let mut strokes = Vec::new();
+        for (index, op) in ops.into_iter().enumerate() {
+            let footprint = blend::footprint(op, info).map_err(|err| ProjectError::Op {
+                index,
+                source: Box::new(err),
+            })?;
+            let Op::BrushStroke { source_id, .. } = op else {
+                unreachable!("an op that has a footprint is a brush stroke");
+            };
+            if let Some(footprint) = footprint {
+                strokes.push(PlacedStroke {
+                    op: op.clone(),
+                    source: usize::from(*source_id),
+                    footprint,
+                });
+            }
+        }
         Ok(Self::shaped(
             &composite,
-            Body::OpBearing {
+            Body::Ops {
                 checkpoint: Box::new(checkpoint),
-                ancestor_checkpoint: Box::new(ancestor_checkpoint),
                 ancestor: Box::new(record),
+                strokes,
             },
         ))
     }
@@ -211,19 +255,13 @@ impl CheckpointImage {
                 let project = project.expect("a saved checkpoint renders against its project");
                 stream_plane_to_sink(project, composite, &mut crop_bands(tile, spp, sink))
             }
-            Body::OpBearing {
+            Body::Ops {
                 checkpoint,
-                ancestor_checkpoint,
                 ancestor,
+                strokes,
             } => {
                 let project = project.expect("a saved checkpoint renders against its project");
-                render_op_bearing(
-                    project,
-                    checkpoint,
-                    ancestor_checkpoint,
-                    ancestor,
-                    &mut crop_bands(tile, spp, sink),
-                )
+                render_ops(project, checkpoint, ancestor, strokes, tile, sink)
             }
             Body::Held(composite) => render_held(composite, spp, tile, sink),
             Body::External { .. } => {
@@ -244,10 +282,9 @@ impl CheckpointImage {
     }
 }
 
-/// Refuses a gather over `record`'s sources when its alignment names no
-/// per-frame transforms, or when any source is missing or changed on disk
-/// (one `missing: <path>` or `changed: <path> (found at <path>)` line each).
-fn check_renderable(
+/// Refuses a render over `record`'s sources when its alignment names no
+/// per-frame transforms.
+fn check_alignment(
     project: &Project,
     checkpoint: &Checkpoint,
     record: &FuseRecord,
@@ -258,6 +295,17 @@ fn check_renderable(
             checkpoint: checkpoint.id.clone(),
         });
     }
+    Ok(())
+}
+
+/// Refuses a render over `record`'s sources when any is missing or changed
+/// on disk (one `missing: <path>` or `changed: <path> (found at <path>)` line
+/// each).
+fn check_sources_available(
+    project: &Project,
+    checkpoint: &Checkpoint,
+    record: &FuseRecord,
+) -> Result<(), ProjectError> {
     let check = check_sources(&record.sources, |s| project.source_path(s))?;
     if !check.unresolved.is_empty() || !check.changed.is_empty() {
         let mut lines: Vec<String> = check
@@ -283,7 +331,7 @@ fn check_renderable(
 
 /// Refuses `paths` (a live export's sources, plain paths with no stored
 /// fingerprint) when any is missing on disk, one `missing: <path>` line
-/// each -- [`check_renderable`]'s counterpart for a Z-Map that has no
+/// each -- [`check_sources_available`]'s counterpart for a Z-Map that has no
 /// checkpoint of its own to record a `changed` state against.
 fn check_zmap_sources(paths: &[PathBuf], zmap_path: &Path) -> Result<(), ProjectError> {
     let detail: Vec<String> = paths
@@ -450,18 +498,6 @@ fn stream_plane_to_sink(
     }
 }
 
-/// A process-wide counter, so two renders started in the same process in
-/// the same second never share a temp Z-Map path.
-static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-fn temp_zmap_path(zmap_blob: &str) -> PathBuf {
-    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "focusforge-render-{}-{zmap_blob}-{id}.tif",
-        std::process::id()
-    ))
-}
-
 /// What a gather band can fail with: the gather itself, or the sink.
 enum GatherError {
     Retouch(RetouchError),
@@ -507,105 +543,91 @@ fn render_external_body(
     })
 }
 
-/// The ancestor's stored composite, with every pixel whose replayed index
-/// differs from the ancestor's own overwritten by a gather over the
-/// ancestor's aligned, cropped sources.
-fn render_op_bearing(
+/// `ancestor`'s stored composite over `tile`, each stroke the tile meets
+/// blended in over it in log order from its frame, read through the gains and
+/// alignment the fusion used.
+fn render_ops(
     project: &mut Project,
     checkpoint: &Checkpoint,
-    ancestor_checkpoint: &Checkpoint,
     ancestor: &FuseRecord,
+    strokes: &[PlacedStroke],
+    tile: Rect,
     sink: &mut RenderSink<'_>,
 ) -> Result<(), ProjectError> {
+    let spp = ancestor.composite.samples_per_pixel;
+    let touching: Vec<&PlacedStroke> = strokes
+        .iter()
+        .filter(|stroke| stroke.footprint.intersect(tile).is_some())
+        .collect();
+    if touching.is_empty() {
+        return stream_plane_to_sink(
+            project,
+            &ancestor.composite,
+            &mut crop_bands(tile, spp, sink),
+        );
+    }
+
+    check_sources_available(project, checkpoint, ancestor)?;
+    let paths: Vec<PathBuf> = ancestor
+        .sources
+        .iter()
+        .map(|s| project.source_path(s))
+        .collect();
+    let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor)?;
+    let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
+    let warping = warp(&set, &gained, &ancestor.registration, paths.len(), spp);
+    let info = ZMapInfo::new(
+        ancestor.composite.width,
+        ancestor.composite.height,
+        paths.len() as u32,
+    )
+    .expect("prepare built the same extent");
+    let (origin_x, origin_y) = ancestor.registration.origin();
     let project_path = project.path().to_path_buf();
-    let checkpoint_zmap_path = temp_zmap_path(&checkpoint.zmap_blob);
-    let ancestor_zmap_path = temp_zmap_path(&ancestor_checkpoint.zmap_blob);
 
-    let outcome = (|| -> Result<(), ProjectError> {
-        materialize_zmap(project, checkpoint, &checkpoint_zmap_path)?;
-        materialize_zmap(project, ancestor_checkpoint, &ancestor_zmap_path)?;
-
-        let checkpoint_reader = ZMapReader::open(&checkpoint_zmap_path)
-            .map_err(|err| ProjectError::container(&checkpoint_zmap_path, err))?;
-        let ancestor_reader = ZMapReader::open(&ancestor_zmap_path)
-            .map_err(|err| ProjectError::container(&ancestor_zmap_path, err))?;
-
-        let paths: Vec<PathBuf> = ancestor
-            .sources
+    let mut blended: Vec<u16> = Vec::new();
+    let mut frame: Vec<u16> = Vec::new();
+    let mut blend_bands = |band: &[u16], rect: Rect| -> Result<(), ProjectError> {
+        let meeting: Vec<(&PlacedStroke, Rect)> = touching
             .iter()
-            .map(|s| project.source_path(s))
+            .filter_map(|&stroke| Some((stroke, stroke.footprint.intersect(rect)?)))
             .collect();
-        let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor)?;
-        let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
-        let warping = warp(
-            &set,
-            &gained,
-            &ancestor.registration,
-            ancestor.sources.len(),
-            ancestor.composite.samples_per_pixel,
-        );
-        let sources = gather_sources(
-            &warping,
-            ancestor.sources.len() as u32,
-            ancestor.composite.samples_per_pixel,
-            &ancestor.registration,
-        );
-
-        let mut failure: Option<ProjectError> = None;
-        let mut checkpoint_idx: Vec<u16> = Vec::new();
-        let mut ancestor_idx: Vec<u16> = Vec::new();
-        let mut masked: Vec<u16> = Vec::new();
-        let mut gathered: Vec<u16> = Vec::new();
-        let mut out_band: Vec<u16> = Vec::new();
-        project.read_plane_ref_into(&ancestor.composite, &mut |band, rect| {
-            if failure.is_some() {
-                return;
-            }
-            let n = (rect.width * rect.height) as usize;
-            checkpoint_idx.resize(n, 0);
-            ancestor_idx.resize(n, 0);
-            if let Err(err) = checkpoint_reader.read_tile_into(rect, &mut checkpoint_idx) {
-                failure = Some(ProjectError::container(&checkpoint_zmap_path, err));
-                return;
-            }
-            if let Err(err) = ancestor_reader.read_tile_into(rect, &mut ancestor_idx) {
-                failure = Some(ProjectError::container(&ancestor_zmap_path, err));
-                return;
-            }
-            masked.clear();
-            masked.extend(
-                checkpoint_idx
-                    .iter()
-                    .zip(ancestor_idx.iter())
-                    .map(|(&c, &a)| if c != a { c } else { NO_SOURCE }),
-            );
-            gathered.resize(band.len(), 0);
-            if let Err(err) = recomposite(&masked, rect, &sources, &mut gathered) {
-                failure = Some(ProjectError::container(&project_path, err));
-                return;
-            }
-            out_band.clear();
-            out_band.extend_from_slice(band);
-            let spp = sources.samples_per_pixel as usize;
-            for i in 0..n {
-                if checkpoint_idx[i] != ancestor_idx[i] {
-                    out_band[i * spp..(i + 1) * spp]
-                        .copy_from_slice(&gathered[i * spp..(i + 1) * spp]);
-                }
-            }
-            if let Err(err) = sink(&out_band, rect) {
-                failure = Some(err);
-            }
-        })?;
-        match failure {
-            Some(err) => Err(err),
-            None => Ok(()),
+        if meeting.is_empty() {
+            return sink(band, rect);
         }
-    })();
-
-    let _ = std::fs::remove_file(&checkpoint_zmap_path);
-    let _ = std::fs::remove_file(&ancestor_zmap_path);
-    outcome
+        blended.clear();
+        blended.extend_from_slice(band);
+        for (stroke, region) in meeting {
+            frame.resize(
+                region.width as usize * region.height as usize * spp as usize,
+                0,
+            );
+            let at_frame = Rect {
+                x: region.x + origin_x,
+                y: region.y + origin_y,
+                ..region
+            };
+            warping
+                .read_tile_into(stroke.source, at_frame, &mut frame)
+                .map_err(|err| ProjectError::container(&project_path, err))?;
+            blend::apply(
+                &stroke.op,
+                info,
+                rect,
+                &mut blended,
+                region,
+                &frame,
+                spp as usize,
+            )
+            .map_err(|err| ProjectError::container(&project_path, err))?;
+        }
+        sink(&blended, rect)
+    };
+    stream_plane_to_sink(
+        project,
+        &ancestor.composite,
+        &mut crop_bands(tile, spp, &mut blend_bands),
+    )
 }
 
 /// A saved checkpoint's image as a TIFF: [`CheckpointImage::prepare`] then
@@ -655,11 +677,12 @@ pub(super) fn write_tiff(
 /// Writes through a `.partial` sibling of `path`, renamed onto it only once
 /// `encode` returns `Ok`; removed instead on any error, so a refused or
 /// interrupted write leaves nothing behind. Shared by the view render and
-/// every export format's encoder. Any failure -- creating or finishing the
-/// `.partial` file, or the final rename -- comes back as
-/// [`ProjectError::ExportWriteFailed`], so a caller can tell "the
-/// destination could not be written" apart from every other render failure
-/// without inspecting what `encode` did internally.
+/// every export format's encoder. Any other failure comes back as
+/// [`ProjectError::ExportWriteFailed`], so a caller can tell "the destination
+/// could not be written" apart from a render the project refuses
+/// ([`ProjectError::RenderSourcesUnavailable`],
+/// [`ProjectError::RenderAlignmentUnrecorded`], [`ProjectError::Op`]), which
+/// passes through as it is.
 pub(super) fn write_via_partial(
     path: &Path,
     encode: impl FnOnce(&Path) -> Result<(), ProjectError>,
@@ -672,8 +695,13 @@ pub(super) fn write_via_partial(
     if outcome.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
-    outcome.map_err(|err| ProjectError::ExportWriteFailed {
-        path: path.to_path_buf(),
-        source: Box::new(err),
+    outcome.map_err(|err| match err {
+        refusal @ (ProjectError::RenderSourcesUnavailable { .. }
+        | ProjectError::RenderAlignmentUnrecorded { .. }
+        | ProjectError::Op { .. }) => refusal,
+        err => ProjectError::ExportWriteFailed {
+            path: path.to_path_buf(),
+            source: Box::new(err),
+        },
     })
 }

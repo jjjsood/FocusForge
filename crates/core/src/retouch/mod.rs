@@ -4,6 +4,7 @@
 //! indices into the region it covers and touches nothing else -- the
 //! document this module edits is the map, never an image.
 
+pub mod blend;
 pub mod brush;
 pub mod recomposite;
 pub mod replay;

@@ -1044,8 +1044,13 @@ fn relocated_sources_are_read_from_the_located_folder() {
         Opened::NeedsChoice(_) => panic!("moving the project must not change any frame's content"),
     };
     let head_id = project.checkpoint().id.clone();
+    let image = project::CheckpointImage::prepare(&project, &head_id).unwrap();
     assert!(
-        project::CheckpointImage::prepare(&project, &head_id).is_err(),
+        image
+            .render(Some(&mut project), image.full(), &mut |_samples, _rect| Ok(
+                ()
+            ))
+            .is_err(),
         "an edited render must refuse sources it cannot find"
     );
 
@@ -1262,11 +1267,14 @@ fn missing_and_changed_sources_are_reported() {
     };
     assert_eq!(pending.changed(), &[(1, dir.join("frame-01.tif"))]);
 
-    let project = pending.proceed();
+    let mut project = pending.proceed();
     let head = project.checkpoint().id.clone();
-    let refusal = match project::CheckpointImage::prepare(&project, &head) {
+    let image = project::CheckpointImage::prepare(&project, &head).unwrap();
+    let refusal = match image.render(Some(&mut project), image.full(), &mut |_samples, _rect| {
+        Ok(())
+    }) {
         Err(refusal) => refusal.to_string(),
-        Ok(_) => panic!("a render over missing and changed frames must be refused"),
+        Ok(()) => panic!("a render over missing and changed frames must be refused"),
     };
     assert!(refusal.contains("missing: frame-00.tif"), "{refusal}");
     assert!(

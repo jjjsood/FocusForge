@@ -191,7 +191,7 @@ fn build(name: &str) -> Built {
                 },
             ],
             radius: 40.0,
-            softness: 0.0,
+            softness: 0.5,
         }],
         None,
         1,

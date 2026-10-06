@@ -18,7 +18,7 @@ use focusforge_core::project::export::{
     TiffCompression,
 };
 use focusforge_core::project::{
-    self, CheckpointImage, Metrics, Op, Project, ProjectError, SealRequest, ZMapStorage,
+    self, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -106,7 +106,7 @@ fn full(width: u32, height: u32) -> Rect {
 
 /// A fused root at `height` plus one small edit on top. Returns the project,
 /// the root's id and the op-bearing child's id, whose view render takes the
-/// splice path rather than the fused path's plain plane stream.
+/// blend path rather than the fused path's plain plane stream.
 fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
     let dir = tmp_dir(name);
     let staging = dir.join("staging");
@@ -180,13 +180,11 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
     let child = project::append_ops_onto(
         &project_path,
         &sealed.checkpoint,
-        vec![Op::ResetRegion {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: WIDTH.min(8),
-                height: height.min(8),
-            },
+        vec![Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 4, y: 4 }],
+            radius: 6.0,
+            softness: 0.5,
         }],
         None,
         1,
