@@ -22,7 +22,7 @@ use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
-use super::seal::{now_unix, record, source_ref};
+use super::seal::{composite_blob, now_unix, record, source_ref};
 use super::{
     HASH_ALGORITHM, Op, Project, SealedProject, fused_extent, materialize_zmap, resolve_chain,
 };
@@ -128,19 +128,7 @@ fn append_staged(
         sources.push(source_ref(path, &project_dir)?);
     }
 
-    let composite = match composite {
-        Some(blob) => blob.clone(),
-        None => {
-            let blob = blob::stage_plane(
-                request.staged_composite,
-                Plane::Composite,
-                ZSTD_LEVEL,
-                staging,
-            )?;
-            staged.push(blob.clone());
-            blob
-        }
-    };
+    let composite = composite_blob(composite, request.staged_composite, staging, staged)?;
     let zmap = blob::stage_plane(request.staged_zmap, Plane::ZMap, ZSTD_LEVEL, staging)?;
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;

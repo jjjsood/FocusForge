@@ -104,6 +104,22 @@ pub(super) fn seal_with(
     result
 }
 
+/// The composite's blob: `ready` as it is, else `file` compressed into
+/// `staging` and recorded in `staged` for cleanup.
+pub(super) fn composite_blob(
+    ready: Option<&StagedBlob>,
+    file: &Path,
+    staging: &Path,
+    staged: &mut Vec<StagedBlob>,
+) -> Result<StagedBlob, ProjectError> {
+    if let Some(blob) = ready {
+        return Ok(blob.clone());
+    }
+    let blob = blob::stage_plane(file, Plane::Composite, ZSTD_LEVEL, staging)?;
+    staged.push(blob.clone());
+    Ok(blob)
+}
+
 fn seal_staged(
     request: &SealRequest<'_>,
     created_at: i64,
@@ -122,19 +138,7 @@ fn seal_staged(
     }
     let stack_fingerprint = blob::stack_fingerprint(&sources);
 
-    let composite = match composite {
-        Some(blob) => blob.clone(),
-        None => {
-            let blob = blob::stage_plane(
-                request.staged_composite,
-                Plane::Composite,
-                ZSTD_LEVEL,
-                staging,
-            )?;
-            staged.push(blob.clone());
-            blob
-        }
-    };
+    let composite = composite_blob(composite, request.staged_composite, staging, staged)?;
     let zmap = blob::stage_plane(request.staged_zmap, Plane::ZMap, ZSTD_LEVEL, staging)?;
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;
