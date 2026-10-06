@@ -251,7 +251,7 @@ fn info_reports_non_uniform_directory() {
 }
 
 /// Two members share byte order and `RowsPerStrip` (the only two fields the
-/// frozen sentence always names) and disagree only on `Compression`: the
+/// report names) and disagree only on `Compression`: the
 /// detail line must still name the field that actually differs, not repeat
 /// an identical-looking `II/rps=1` on both sides.
 #[test]
@@ -419,7 +419,7 @@ fn info_exits_1_for_empty_directory() {
 }
 
 /// With the `gpu` feature off, `stack` runs CPU-only:
-/// no GPU probing, no `--no-gpu` flag, and the additive `backend` field is
+/// no GPU probing, no `--no-gpu` flag, and the `backend` field is
 /// always `"cpu"` -- run against `dummy-stack` (cheap: no pyramid, no
 /// alignment, no crop) to keep the run inexpensive.
 #[test]

@@ -256,8 +256,7 @@ fn resolve_export_options(output: &Path, args: &FormatArgs) -> Result<ExportOpti
     ExportOptions::from_values(format, &values).map_err(|err| err.to_string())
 }
 
-/// The frozen `export --json` schema, additive-only -- the same contract
-/// `InfoReport` and `StackReport` carry.
+/// The `export --json` report.
 #[derive(Serialize)]
 pub struct ExportReport {
     pub project: String,

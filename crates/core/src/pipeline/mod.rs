@@ -31,9 +31,9 @@ use crate::io::{
     open_frame_set,
 };
 use crate::job::{
-    AlignIdentity, ControlState, FrameFingerprint, JOB_RECORD_FORMAT, Job, JobControl, JobOutcome,
-    JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
-    StageCache, StageKey, read_alignment,
+    AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
+    JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache,
+    StageKey, read_alignment,
 };
 use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
@@ -614,7 +614,6 @@ pub fn run(
         .unwrap_or_else(|| "cpu".to_string());
 
     let record = JobRecord {
-        format: JOB_RECORD_FORMAT,
         fingerprint,
         width,
         height,
@@ -1074,9 +1073,6 @@ fn peek_resumable_alignment(
         let Ok(candidate) = serde_json::from_str::<JobRecord>(&text) else {
             continue;
         };
-        if candidate.format != JOB_RECORD_FORMAT {
-            continue;
-        }
         if !candidate.composite_output.exists() {
             continue;
         }
@@ -1240,6 +1236,87 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peek_resumable_alignment_skips_a_ledger_missing_raw_identity() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let composite = scratch.path().join("out.tif");
+        std::fs::write(&composite, []).expect("output marker");
+        let fingerprint = StackFingerprint {
+            frames: vec![FrameFingerprint {
+                path: PathBuf::from("frame.tif"),
+                file_size: 1,
+                image_description: None,
+                width: 1,
+                height: 1,
+                samples_per_pixel: 3,
+                strip_offsets: vec![8],
+                strip_byte_counts: vec![3],
+                raw_identity: None,
+            }],
+        };
+        let record = JobRecord {
+            fingerprint: fingerprint.clone(),
+            width: 1,
+            height: 1,
+            samples_per_pixel: 3,
+            frame_count: 1,
+            tile_size: 64,
+            levels: 1,
+            stack_algorithm: "test".to_string(),
+            stack_params: ParamValues::new(),
+            backend: "cpu".to_string(),
+            align: None,
+            crop: None,
+            equalization: None,
+            composite_output: composite,
+            zmap_output: None,
+        };
+        let ledger = scratch.path().join("resume").join("candidate");
+        std::fs::create_dir_all(&ledger).expect("ledger directory");
+        std::fs::write(
+            ledger.join("job.json"),
+            serde_json::to_vec(&record).expect("record serializes"),
+        )
+        .expect("job record writes");
+
+        assert_eq!(
+            peek_resumable_alignment(
+                scratch.path(),
+                &fingerprint,
+                64,
+                1,
+                "test",
+                &ParamValues::new(),
+                None,
+            ),
+            Some(None)
+        );
+
+        let path = ledger.join("job.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("job record reads"))
+                .expect("job record is JSON");
+        value["fingerprint"]["frames"][0]
+            .as_object_mut()
+            .expect("frame is an object")
+            .remove("raw_identity");
+        std::fs::write(path, serde_json::to_vec(&value).expect("record serializes"))
+            .expect("job record writes");
+
+        assert_eq!(
+            peek_resumable_alignment(
+                scratch.path(),
+                &fingerprint,
+                64,
+                1,
+                "test",
+                &ParamValues::new(),
+                None,
+            ),
+            None
+        );
+    }
 
     #[test]
     fn working_space_names_the_transfer_each_reader_delivers() {

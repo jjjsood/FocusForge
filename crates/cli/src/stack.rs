@@ -34,8 +34,7 @@ use crate::set::{SetArgs, merge_preset, parse_settings};
 use crate::signals;
 use crate::status::StatusSink;
 
-/// The `stack --json` document; fields are only ever added, never removed
-/// or renamed.
+/// The `stack --json` document.
 #[derive(Serialize)]
 pub struct StackReport {
     pub input: String,
@@ -90,8 +89,8 @@ pub struct StackReport {
     /// The brightness equalization's estimate; `null` when it was off.
     pub equalization: Option<EqualizationReport>,
     /// `"cpu"`, or the selected adapter's [`focusforge_core::gpu::BackendInfo`]
-    /// display -- additive, so which path ran is machine-readable and not
-    /// only a stderr line.
+    /// display, so which path ran is machine-readable and not only a stderr
+    /// line.
     pub backend: String,
     /// The device in-flight-byte budget actually in force for this run's
     /// GPU path -- `null` on the CPU path.
@@ -291,7 +290,6 @@ pub fn run(
     dir: &Path,
     output: Option<&Path>,
     algo_id: Option<&str>,
-    zmap: Option<&Path>,
     json: bool,
     set: &SetArgs,
     align_opts: &AlignOptions<'_>,
@@ -417,13 +415,8 @@ pub fn run(
         AlignBackendChoice::cpu()
     };
 
-    // The zmap-flag and `-o` refusals fire **before** the input directory is
-    // read at all -- a run naming both a missing input and a bad `-o` must name
-    // the `-o`, which `refuses_empty_dir_and_unwritable_output` pins. Both are
-    // group-independent, so they fire exactly once, before the first group.
-    if let Some(zmap) = zmap {
-        return refuse(zmap_flag_refusal(zmap));
-    }
+    // The `-o` refusal fires before the input directory is read, so a run
+    // naming both a missing input and a bad output names the output first.
     if let Err(msg) = check_output_dir(output) {
         return refuse(msg);
     }
@@ -677,18 +670,6 @@ fn project_path(out_dir: Option<&Path>, group: &Group) -> PathBuf {
         .join(format!("{}.{}", group.name, PROJECT_EXTENSION))
 }
 
-/// The `--zmap` refusal. Loud means the message names the replacement: a
-/// removed flag is refused *quietly and unhelpfully*, by clap, as
-/// "unexpected argument '--zmap'".
-fn zmap_flag_refusal(zmap: &Path) -> String {
-    format!(
-        "`stack` does not take `--zmap {}`: a project carries its own Z-Map. \
-         Run `focusforge-cli export <project> --zmap {}` after the run.",
-        zmap.display(),
-        zmap.display()
-    )
-}
-
 /// Two groups must never resolve to one project path. The naming rule
 /// makes this unreachable inside a single directory; it becomes reachable
 /// the moment `-o` collapses several directories onto one, so it is
@@ -792,7 +773,6 @@ fn write_manifest(
     let root_str = root.display().to_string();
     let merged = merge_manifest_entries(&path, &root_str, entries);
     let manifest = groups::RunManifest {
-        format: groups::MANIFEST_FORMAT,
         root: root_str,
         groups: merged,
     };
@@ -816,18 +796,18 @@ fn merge_manifest_entries(
     let existing = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<groups::RunManifest>(&text).ok())
-        .filter(|m| m.format == groups::MANIFEST_FORMAT && m.root == root);
+        .filter(|m| m.root == root);
 
     let Some(existing) = existing else {
         return entries;
     };
 
     let fresh_identities: std::collections::HashSet<&str> =
-        entries.iter().map(|e| e.identity()).collect();
+        entries.iter().map(|e| e.identity.as_str()).collect();
     let mut merged: Vec<groups::ManifestEntry> = existing
         .groups
         .into_iter()
-        .filter(|e| !fresh_identities.contains(e.identity()))
+        .filter(|e| !fresh_identities.contains(e.identity.as_str()))
         .collect();
     merged.extend(entries);
     merged
@@ -871,7 +851,7 @@ fn report_results(results: &[GroupResult], json: bool) {
                 _ => None,
             })
             .collect();
-        let wrapped = serde_json::json!({ "format": 1, "groups": documents });
+        let wrapped = serde_json::json!({ "groups": documents });
         match serde_json::to_string_pretty(&wrapped) {
             Ok(text) => println!("{text}"),
             Err(err) => {
@@ -1376,7 +1356,7 @@ fn sealed_path(report: &focusforge_core::pipeline::FuseReport) -> String {
     }
 }
 
-/// Assembles the frozen [`StackReport`] from the driver's
+/// Assembles [`StackReport`] from the driver's
 /// [`focusforge_core::pipeline::FuseReport`] plus the facts only this crate
 /// knows: the input directory as the user wrote it, and the GPU-only device
 /// budget/peak (`crates/core` never learns what VRAM is).
@@ -1833,13 +1813,6 @@ mod tests {
     }
 
     #[test]
-    fn the_zmap_refusal_names_the_replacement() {
-        let message = zmap_flag_refusal(Path::new("map.tif"));
-        assert!(message.contains("focusforge-cli export"), "{message}");
-        assert!(message.contains("--zmap map.tif"), "{message}");
-    }
-
-    #[test]
     fn colliding_frame_names_the_matching_frame() {
         let frame_paths = vec![PathBuf::from("dir/00.tif"), PathBuf::from("dir/01.tif")];
         let frame_names = vec!["00.tif".to_string(), "01.tif".to_string()];
@@ -1910,7 +1883,6 @@ mod tests {
         let dir = guard.path();
         let path = dir.join("manifest.json");
         let existing = groups::RunManifest {
-            format: groups::MANIFEST_FORMAT,
             root: "root".to_string(),
             groups: vec![
                 sample_manifest_entry("a", "a.ffp"),
@@ -1919,13 +1891,55 @@ mod tests {
         };
         std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        let fresh = vec![sample_manifest_entry("a", "a2.ffp")];
+        let mut fresh_entry = sample_manifest_entry("renamed", "a2.ffp");
+        fresh_entry.identity = "a".to_string();
+        let fresh = vec![fresh_entry];
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 2);
-        let a = merged.iter().find(|e| e.identity() == "a").unwrap();
+        let a = merged.iter().find(|e| e.identity == "a").unwrap();
         assert_eq!(a.outputs, vec!["a2.ffp".to_string()]);
-        let b = merged.iter().find(|e| e.identity() == "b").unwrap();
+        let b = merged.iter().find(|e| e.identity == "b").unwrap();
         assert_eq!(b.outputs, vec!["b.ffp".to_string()]);
+    }
+
+    #[test]
+    fn merge_manifest_entries_uses_empty_identity_as_an_ordinary_key() {
+        let guard = tempfile::TempDir::with_prefix("ff-stack-merge-empty-test-").unwrap();
+        let path = guard.path().join("manifest.json");
+        let mut existing_entry = sample_manifest_entry("old name", "old.ffp");
+        existing_entry.identity = String::new();
+        let existing = groups::RunManifest {
+            root: "root".to_string(),
+            groups: vec![existing_entry],
+        };
+        std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let mut fresh_entry = sample_manifest_entry("new name", "new.ffp");
+        fresh_entry.identity = String::new();
+        let merged = merge_manifest_entries(&path, "root", vec![fresh_entry]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "new name");
+        assert_eq!(merged[0].identity, "");
+    }
+
+    #[test]
+    fn merge_manifest_entries_treats_a_manifest_missing_identity_as_absent() {
+        let guard =
+            tempfile::TempDir::with_prefix("ff-stack-merge-missing-identity-test-").unwrap();
+        let path = guard.path().join("manifest.json");
+        std::fs::write(
+            &path,
+            r#"{"root":"root","groups":[{"name":"old","frame_count":1,"outcome":"completed","outputs":["old.ffp"],"wall_seconds":1.0,"error":null}]}"#,
+        )
+        .unwrap();
+
+        let merged = merge_manifest_entries(
+            &path,
+            "root",
+            vec![sample_manifest_entry("fresh", "fresh.ffp")],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].identity, "fresh");
     }
 
     #[test]
@@ -1934,7 +1948,6 @@ mod tests {
         let dir = guard.path();
         let path = dir.join("manifest.json");
         let existing = groups::RunManifest {
-            format: groups::MANIFEST_FORMAT,
             root: "other-root".to_string(),
             groups: vec![sample_manifest_entry("a", "a.ffp")],
         };
@@ -1943,6 +1956,6 @@ mod tests {
         let fresh = vec![sample_manifest_entry("b", "b.ffp")];
         let merged = merge_manifest_entries(&path, "root", fresh);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].identity(), "b");
+        assert_eq!(merged[0].identity, "b");
     }
 }

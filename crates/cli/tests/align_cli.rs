@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Process-level coverage of `focusforge-cli align`: the human report, the
-//! frozen `--json` schema, both solver modes, `--write-warped`, and the
+//! `--json` report, both solver modes, `--write-warped`, and the
 //! strict-versus-`--lax` exit policy.
 //!
 //! Every recipe here that reaches a real solve passes `--lax`: frame 0 of
@@ -225,7 +225,7 @@ fn align_json_schema_is_stable() {
 }
 
 /// The anchor arm's worker bound and the peak it actually reached land on
-/// the frozen `align --json` report, additively, alongside every key
+/// the `align --json` report alongside every key
 /// `align_json_schema_is_stable` already pins.
 #[test]
 fn worker_limit_in_report() {

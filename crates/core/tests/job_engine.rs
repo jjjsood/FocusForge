@@ -410,6 +410,78 @@ fn engine_output_is_byte_identical() {
     );
 }
 
+/// Delegates to `inner` and records the most `consume` calls running at once.
+struct PeakTracking<'a> {
+    inner: &'a dyn TileConsumer,
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl TileConsumer for PeakTracking<'_> {
+    fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+        let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(2));
+        let result = self.inner.consume(job);
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+}
+
+#[test]
+fn capped_admission_is_byte_identical() {
+    let stack = open_stack();
+    let (width, height) = stack.dimensions();
+    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
+
+    let ref_opts = options("capped-reference", 1 << 30);
+    let ref_scheduler = build_scheduler(&stack, &ref_opts);
+    let ref_composite = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capped_reference.tif");
+    let ref_zmap = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capped_reference-zmap.tif");
+    let ref_consumer = laplacian_consumer(stack_ctx, &ref_composite, Some(&ref_zmap));
+    ref_scheduler
+        .run(&NoopPreprocess, &ref_consumer)
+        .expect("reference run must succeed");
+    ref_consumer
+        .finish()
+        .expect("reference finish must succeed");
+
+    let job_opts = options("capped-engine", 1 << 30);
+    let job_scheduler = build_scheduler(&stack, &job_opts);
+    if job_scheduler.in_flight_limit() < 2 {
+        eprintln!("host reports too little parallelism to admit several tiles; skipping");
+        return;
+    }
+    let mut job = Job::new(&job_scheduler);
+    job.control().set_admission_cap(Some(1));
+    let job_composite = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capped_engine.tif");
+    let job_zmap = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("capped_engine-zmap.tif");
+    let job_consumer = laplacian_consumer(stack_ctx, &job_composite, Some(&job_zmap));
+    let tracked = PeakTracking {
+        inner: &job_consumer,
+        live: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    };
+    let outcome = job
+        .run(&NoopPreprocess, &tracked)
+        .expect("capped engine run must succeed");
+    assert_eq!(outcome, JobOutcome::Completed);
+    let peak = tracked.peak.load(Ordering::SeqCst);
+    job_consumer.finish().expect("engine finish must succeed");
+
+    assert_eq!(peak, 1, "a cap of 1 admits one tile at a time");
+    assert_eq!(
+        std::fs::read(&ref_composite).unwrap(),
+        std::fs::read(&job_composite).unwrap(),
+        "composite output must be byte-identical capped and uncapped"
+    );
+    assert_eq!(
+        std::fs::read(&ref_zmap).unwrap(),
+        std::fs::read(&job_zmap).unwrap(),
+        "Z-Map output must be byte-identical capped and uncapped"
+    );
+}
+
 #[test]
 fn pause_lands_within_the_unit_bound() {
     let stack = open_stack();

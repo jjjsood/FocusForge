@@ -19,7 +19,7 @@ use focusforge_core::project::{
     Metrics, Op, Point, Project, SealRequest, append_ops_onto, seal_at,
 };
 use focusforge_gui::checkpoints::local_date_and_time;
-use focusforge_gui::{AppController, OpenOutcome, ShellMode};
+use focusforge_gui::{AppController, OpenOutcome};
 
 const SETTLE: Duration = Duration::from_secs(60);
 
@@ -63,22 +63,11 @@ fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) {
 /// Saves the active, never-saved tab to the path the save dialog proposes.
 fn save_to_proposed(controller: &mut AppController) -> PathBuf {
     let mut target = None;
-    assert!(controller.save_active_project(|proposed| {
+    assert!(common::save_and_settle(controller, |proposed| {
         target = Some(proposed.to_path_buf());
         target.clone()
     }));
     target.expect("a never-saved tab asks where to save")
-}
-
-fn wait_for_render(controller: &mut AppController) {
-    let start = Instant::now();
-    while !controller.settle_checkpoint_render() {
-        assert!(
-            start.elapsed() < SETTLE,
-            "the checkpoint render did not settle"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 fn wait_export(controller: &mut AppController) {
@@ -321,8 +310,7 @@ fn export_button_opens_the_modal_for_the_current_position() {
     common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
     let root_row = row_index(&controller, &edited.root);
     controller.select_checkpoint_row(root_row);
-    assert!(controller.set_mode(ShellMode::Editor));
-    wait_for_render(&mut controller);
+    common::enter_editor(&mut controller);
     controller
         .edit_session_mut()
         .expect("editor mode opens a session")
@@ -478,8 +466,7 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
     let root_row = row_index(&controller, &edited.root);
     controller.select_checkpoint_row(root_row);
-    assert!(controller.set_mode(ShellMode::Editor));
-    wait_for_render(&mut controller);
+    common::enter_editor(&mut controller);
     // A fresh session (0 ops) replays to exactly the row's own Z-Map, so
     // this is also what `baseline.tif` (the row's own, non-live export,
     // below) gathers.

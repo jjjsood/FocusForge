@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `focusforge-cli align`: computes and reports the per-frame transforms
-//! for a stack -- human text by default, a frozen `--json` document on
+//! for a stack -- human text by default, a `--json` document on
 //! request, and an optional per-frame warped-TIFF dump for a visual check
 //! before any fusion runs. Every number here comes from
 //! `focusforge_core::align`.
@@ -54,8 +54,7 @@ pub(crate) fn resolve_align_algo(id: Option<&str>) -> Result<&'static dyn AlignA
     .map_err(|e| e.to_string())
 }
 
-/// The frozen `align --json` document: fields are only ever added, the
-/// same discipline `InfoReport`/`StackReport` follow.
+/// The `align --json` document.
 #[derive(Serialize)]
 pub struct AlignReport {
     pub input: String,

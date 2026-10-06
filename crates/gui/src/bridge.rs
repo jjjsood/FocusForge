@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slint::ComponentHandle;
 use slint::Model as _;
@@ -104,6 +104,12 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// Whether no exact pane read is queued, running or waiting to be taken;
+    /// `true` without a preparer.
+    pub fn exact_idle(&self) -> bool {
+        self.preparer.as_ref().is_none_or(Preparer::exact_idle)
+    }
+
     /// Which tab's planes the renderer currently holds.
     pub fn tab(&self) -> Option<usize> {
         self.tab
@@ -201,11 +207,14 @@ impl Canvas {
     }
 
     /// Hands the worker one request for every pane whose texture does not
-    /// yet show its draw; a request still pending is replaced by it.
+    /// yet show its draw; a request still pending is replaced by it. Each
+    /// pane's backdrop read is queued behind it, once per content change;
+    /// `None` for a backdrop draw skips that pane's.
     fn request_reads(
         &mut self,
         frame: Option<&PaneDraw>,
         plane: Option<&PaneDraw>,
+        backdrops: (Option<&PaneDraw>, Option<&PaneDraw>),
         generation: Option<u64>,
         overlay: Option<&OverlayDraw>,
     ) {
@@ -221,6 +230,18 @@ impl Canvas {
         if !jobs.is_empty() {
             preparer.submit(jobs);
         }
+        let (frame_backdrop, plane_backdrop) = backdrops;
+        let backdrop_jobs: Vec<PaneJob> = frame_backdrop
+            .and_then(|draw| renderer.request_frame_backdrop(draw))
+            .into_iter()
+            .chain(
+                plane_backdrop
+                    .and_then(|draw| renderer.request_plane_backdrop(draw, generation, overlay)),
+            )
+            .collect();
+        if !backdrop_jobs.is_empty() {
+            preparer.submit_backdrop(backdrop_jobs);
+        }
     }
 
     /// Renders whatever the worker completed into the panes' textures, the
@@ -234,7 +255,11 @@ impl Canvas {
             for prepared in &done {
                 let stamp = prepared.job.stamp;
                 let _scope = measurement_scope_with_fields(
-                    "gui_canvas_publish",
+                    if prepared.job.backdrop {
+                        "gui_canvas_backdrop_publish"
+                    } else {
+                        "gui_canvas_publish"
+                    },
                     stamp,
                     stamp,
                     1,
@@ -260,9 +285,23 @@ impl Canvas {
 thread_local! {
     /// What the worker's wake runs on the event loop: publish, then show.
     static PREPARED_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// What a save worker's wake runs on the event loop: settle the save,
+    /// then show its outcome.
+    static SAVE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// What a recomposite worker's wake runs on the event loop: install the
+    /// gathered regions, then repaint.
+    static RECOMPOSITE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The one optional detached pane. The source textures stay in `Canvas`;
     /// this window only binds the matching image on the shared device.
     static COMPARISON_WINDOW: RefCell<Option<Rc<ComparisonWindow>>> = const { RefCell::new(None) };
+}
+
+/// Shows the loading indicator while a load or a save is running, worded
+/// for a save whenever one is.
+pub fn push_busy(app: &AppWindow, controller: &AppController) {
+    let saving = controller.save_in_flight();
+    app.set_load_caption(if saving { "Saving…" } else { "Loading…" }.into());
+    app.set_load_active(controller.load_in_flight() || saving);
 }
 
 /// Publishes the worker's completed reads and shows every pane where the
@@ -327,6 +366,29 @@ fn show_panes(
             app.set_frame_crop_h(0.0);
         }
     }
+
+    // The backdrop shows wherever it exists, whether or not the exact
+    // texture does; only a pane with neither is cleared.
+    let (backdrop, rect) = frame_draw
+        .and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
+        .unwrap_or_default();
+    app.set_frame_backdrop(backdrop);
+    app.set_frame_backdrop_x(rect.0);
+    app.set_frame_backdrop_y(rect.1);
+    app.set_frame_backdrop_w(rect.2);
+    app.set_frame_backdrop_h(rect.3);
+    let (backdrop, rect) = plane_draw
+        .and_then(|draw| {
+            let renderer = renderer?;
+            (renderer.plane() == PaneSource::Composite)
+                .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
+        })
+        .unwrap_or_default();
+    app.set_backdrop(backdrop);
+    app.set_backdrop_x(rect.0);
+    app.set_backdrop_y(rect.1);
+    app.set_backdrop_w(rect.2);
+    app.set_backdrop_h(rect.3);
 
     let planes = plane_draw.and_then(|draw| {
         let renderer = renderer?;
@@ -430,6 +492,24 @@ fn show_comparison_pane(
             window.set_cursor_visible(false);
         }
         let renderer = canvas.renderer.as_ref();
+        // The backdrop of whichever pane is detached, placed by that pane's
+        // draw; none clears it.
+        let (backdrop, rect) = match detached {
+            PaneSource::Composite => {
+                frame_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
+            }
+            PaneSource::ZMap => plane_draw.and_then(|draw| {
+                let renderer = renderer?;
+                (renderer.plane() == PaneSource::Composite)
+                    .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
+            }),
+        }
+        .unwrap_or_default();
+        window.set_backdrop(backdrop);
+        window.set_backdrop_x(rect.0);
+        window.set_backdrop_y(rect.1);
+        window.set_backdrop_w(rect.2);
+        window.set_backdrop_h(rect.3);
         match detached {
             // Historical `Composite` names the selected-frame pane.
             PaneSource::Composite => {
@@ -537,7 +617,7 @@ pub fn repaint(
             batch.publication,
         )
     });
-    let (feed, render_started, message_lines) = {
+    let (feed, render_started, session_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
@@ -545,11 +625,18 @@ pub fn repaint(
         (
             feed,
             controller.take_render_started(),
+            controller.take_session_started(),
             controller.composite_message_lines(),
         )
     };
     if render_started {
         poll_checkpoint_render(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if session_started {
+        poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if controller.lock().unwrap().take_thumbnails_started() {
+        poll_thumbnails(app.as_weak(), controller.clone());
     }
     if let Some(lines) = changed_lines(app.get_composite_message_lines(), &message_lines) {
         app.set_composite_message_lines(lines);
@@ -603,9 +690,22 @@ pub fn repaint(
     }
     push_brush_cursor(app, &controller.lock().unwrap());
 
+    let (frame_backdrop, plane_backdrop) = {
+        let controller = controller.lock().unwrap();
+        // A live stroke or an unfinished recomposite changes the edit
+        // generation every tick; the composite backdrop waits for them.
+        (
+            controller.frame_backdrop_draw(),
+            controller
+                .edits_settled()
+                .then(|| controller.plane_backdrop_draw())
+                .flatten(),
+        )
+    };
     canvas.borrow_mut().request_reads(
         frame_draw.as_ref(),
         plane_draw.as_ref(),
+        (frame_backdrop.as_ref(), plane_backdrop.as_ref()),
         generation,
         overlay.as_ref(),
     );
@@ -628,6 +728,11 @@ pub fn finish_input_trace() {
     }
 }
 
+/// Stamps one rendered frame in the trace; free without trace accounting.
+pub fn record_frame_rendered() {
+    let _scope = measurement_scope("gui_frame_rendered");
+}
+
 /// Polls [`AppController::settle_checkpoint_render`] every [`job::POLL`]
 /// until the background render settles, then repaints -- the render's
 /// worker cannot reach the canvas.
@@ -644,6 +749,40 @@ fn poll_checkpoint_render(
             repaint(&app, &controller, &canvas);
         } else {
             poll_checkpoint_render(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_edit_session`] every [`job::POLL`] until no
+/// editor session is being opened, then repaints -- the worker cannot reach
+/// the canvas, and an installed session changes what the panes show.
+fn poll_edit_session(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_edit_session() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_edit_session(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_thumbnails`] every [`job::POLL`] until no
+/// picture decode is in flight; the pictures reach the cards through the
+/// `OverlayChanged` event the settle emits.
+fn poll_thumbnails(app_weak: slint::Weak<AppWindow>, controller: Arc<Mutex<AppController>>) {
+    slint::Timer::single_shot(job::POLL, move || {
+        if app_weak.upgrade().is_none() {
+            return;
+        }
+        if !controller.lock().unwrap().settle_thumbnails() {
+            poll_thumbnails(app_weak, controller);
         }
     });
 }
@@ -693,6 +832,8 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::LoadStarted
         | ShellEvent::LoadReady
         | ShellEvent::ImportReady
+        | ShellEvent::SaveReady
+        | ShellEvent::RecompositeReady
         | ShellEvent::CheckpointsChanged => InputSurface::Other,
         ShellEvent::ProjectsChanged
         | ShellEvent::TabScrollChanged
@@ -1461,6 +1602,11 @@ fn start_job_timer(
             return;
         };
         record_timing(TimingCounter::JobPolls, 1);
+        let exact_idle = canvas.borrow().exact_idle();
+        controller
+            .lock()
+            .unwrap()
+            .relax_admission(exact_idle, Instant::now());
         let settled = controller.lock().unwrap().settle_job();
         if settled.is_some() {
             push_projects(&app, &controller);
@@ -2091,19 +2237,21 @@ fn open_recent(
     );
 }
 
-/// Runs one of the controller's saves -- `Save project`, its `Ctrl+S` twin
-/// and the close question's `Save and close`. A failed save closes the
-/// projects overlay before opening the failure toast.
+/// Starts one of the controller's saves -- `Save project`, its `Ctrl+S` twin
+/// and the close question's `Save and close` -- and shows the busy
+/// indicator. A save that cannot start closes the projects overlay before
+/// opening the failure toast; [`publish_saved`] shows the outcome of one
+/// that does.
 fn save_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
-    save: impl FnOnce(&mut AppController) -> bool,
+    start: impl FnOnce(&mut AppController) -> bool,
 ) {
     let failure = {
         let mut controller = controller.lock().unwrap();
-        if save(&mut controller) {
+        if start(&mut controller) {
             None
         } else {
             controller.take_settled_failure()
@@ -2112,17 +2260,46 @@ fn save_project(
     let Some(app) = app_weak.upgrade() else {
         return;
     };
+    show_save_state(&app, controller, canvas, toast_timer, failure);
+}
+
+/// Publishes a save worker's result: settles it, then shows what it changed
+/// and any failure it noted.
+fn publish_saved(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let failure = {
+        let mut controller = controller.lock().unwrap();
+        controller.settle_save();
+        controller.take_settled_failure()
+    };
+    show_save_state(app, controller, canvas, toast_timer, failure);
+}
+
+/// Toasts a failed save over a closed projects overlay, then refreshes the
+/// busy indicator, the tabs and the canvas.
+fn show_save_state(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+    failure: Option<job::Notification>,
+) {
     if let Some(notification) = failure {
         controller.lock().unwrap().close_projects_overlay();
         open_job_toast(
-            &app,
+            app,
             notification.operation.summary().to_string(),
             toast_timer,
         );
     }
-    push_projects(&app, controller);
+    push_busy(app, &controller.lock().unwrap());
+    push_projects(app, controller);
     direct_publication_scope(InputSurface::Gallery);
-    repaint(&app, controller, canvas);
+    repaint(app, controller, canvas);
 }
 
 /// Wires every callback in `app` to `controller`, and returns [`Installed`]
@@ -2175,6 +2352,37 @@ pub fn install(
                 }
             });
         }));
+    }
+
+    {
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let toast_timer = toast_timer.clone();
+        SAVE_HANDLER.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::new(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    publish_saved(&app, &controller, &canvas, &toast_timer);
+                }
+            }));
+        });
+    }
+
+    {
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        RECOMPOSITE_HANDLER.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::new(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    {
+                        let _settle = measurement_scope("gui_recomposite_settle");
+                        controller.lock().unwrap().settle_recomposites();
+                    }
+                    repaint(&app, &controller, &canvas);
+                }
+            }));
+        });
     }
 
     app.on_window_drag_requested({
@@ -2238,6 +2446,8 @@ pub fn install(
     });
     app.on_mode_selected({
         let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
         move |mode| {
             record_surface_input(InputSurface::Other);
             let mode = if mode.as_str() == "editor" {
@@ -2246,6 +2456,10 @@ pub fn install(
                 ShellMode::Stacking
             };
             controller.lock().unwrap().set_mode(mode);
+            // Arms the poll of a session or render the switch started.
+            if let Some(app) = app_weak.upgrade() {
+                repaint(&app, &controller, &canvas);
+            }
         }
     });
     app.on_dock_tab_selected({
@@ -2647,7 +2861,7 @@ pub fn install(
                 ChromeKey::SaveProject => {
                     record_gallery_input();
                     save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                        c.save_active_project(crate::picker::pick_save_project)
+                        c.start_save_active_project(crate::picker::pick_save_project)
                     })
                 }
             }
@@ -3249,11 +3463,15 @@ pub fn install(
     // twin wiring above.
     app.on_checkpoint_scrolled({
         let controller = controller.clone();
-        move |delta| controller.lock().unwrap().scroll_checkpoints_panel(delta)
+        move |delta| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().scroll_checkpoints_panel(delta)
+        }
     });
     app.on_checkpoint_scrollbar_pointer({
         let controller = controller.clone();
         move |kind, y| {
+            record_surface_input(InputSurface::Other);
             let kind = match kind {
                 0 => PointerKind::Down,
                 2 => PointerKind::Move,
@@ -3267,7 +3485,10 @@ pub fn install(
     });
     app.on_checkpoint_scrollbar_dragged({
         let controller = controller.clone();
-        move |y| controller.lock().unwrap().checkpoints_scrollbar_dragged(y)
+        move |y| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().checkpoints_scrollbar_dragged(y)
+        }
     });
     app.on_checkpoint_viewport_height_changed({
         let controller = controller.clone();
@@ -3490,7 +3711,7 @@ pub fn install(
         move || {
             record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                c.close_guard_secondary_pressed(crate::picker::pick_save_project)
+                c.start_close_guard_secondary(crate::picker::pick_save_project)
             });
             poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
@@ -3566,7 +3787,7 @@ pub fn install(
         move || {
             record_gallery_input();
             save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                c.save_active_project(crate::picker::pick_save_project)
+                c.start_save_active_project(crate::picker::pick_save_project)
             })
         }
     });
@@ -3987,7 +4208,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         // The indicator's threshold and fade are the Slint region's own
         // state, driven by `load-active` alone -- it shows no other part of
         // a load's progress, so a tick has nothing to push.
-        ShellEvent::LoadStarted => app.set_load_active(true),
+        ShellEvent::LoadStarted => push_busy(app, &controller.lock().unwrap()),
         ShellEvent::LoadProgress { .. } => {}
         ShellEvent::LoadReady => {
             let outcome = controller.lock().unwrap().settle_open();
@@ -4016,7 +4237,21 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 }
                 None => {}
             }
-            app.set_load_active(false);
+            push_busy(app, &controller.lock().unwrap());
+        }
+        // A save worker's result is ready; the handler installed with the
+        // window settles it, since only it reaches the canvas and the toast.
+        ShellEvent::SaveReady => {
+            if let Some(handler) = SAVE_HANDLER.with(|slot| slot.borrow().clone()) {
+                handler();
+            }
+        }
+        // A recomposite worker parked its regions; the handler installed with
+        // the window settles them and repaints.
+        ShellEvent::RecompositeReady => {
+            if let Some(handler) = RECOMPOSITE_HANDLER.with(|slot| slot.borrow().clone()) {
+                handler();
+            }
         }
         // An import scan (`AppController::add_frames`) is ready to settle.
         // Never touches the canvas: an add either stages a question or
@@ -4057,7 +4292,8 @@ mod tests {
 
     use super::{
         AppController, DockTab, ShellEvent, finish_input_trace, model_publication_scope,
-        record_gallery_input, record_images_input, record_settings_input, record_surface_input,
+        record_frame_rendered, record_gallery_input, record_images_input, record_settings_input,
+        record_surface_input,
     };
     use crate::diagnostics::{
         InputSurface, finish_input_batches, record_coalesced_input, record_destroyed_window,
@@ -4087,6 +4323,11 @@ mod tests {
         }
 
         assert!(timing_snapshot().is_none());
+        record_frame_rendered();
+        assert!(
+            timing_snapshot().is_none(),
+            "a frame stamp records nothing while accounting is off"
+        );
         assert_eq!(record_input(InputSurface::Settings), 0);
         record_coalesced_input(InputSurface::Settings);
         record_images_input();
@@ -4101,6 +4342,14 @@ mod tests {
         let _ = finish_input_batches();
         let before = timing_snapshot().expect("trace accounting is enabled");
 
+        record_frame_rendered();
+        let stamped = timing_snapshot().expect("accounting stays on");
+        assert_eq!(
+            stamped.gui_admitted,
+            before.gui_admitted + 1,
+            "one frame stamp admits exactly one span"
+        );
+        assert_eq!(stamped.admitted, before.admitted);
         assert_ne!(record_input(InputSurface::Canvas), 0);
         record_coalesced_input(InputSurface::Canvas);
         record_coalesced_input(InputSurface::Canvas);
@@ -4166,7 +4415,8 @@ mod tests {
         finish_input_trace();
         assert_eq!(finish_input_batches(), [None, None, None, None, None]);
         let after = timing_snapshot().expect("trace accounting remains enabled");
-        assert_eq!(after.admitted, before.admitted + 10);
+        assert_eq!(after.gui_admitted, before.gui_admitted + 11);
+        assert_eq!(after.admitted, before.admitted);
     }
 
     /// Drives the real generated Images callbacks through an installed,
@@ -4246,6 +4496,65 @@ mod tests {
                 && batches[3].is_none()
                 && batches[4].is_none(),
             "the scroll records under no other surface: {batches:?}"
+        );
+    }
+
+    /// Drives the three real checkpoint-list scroll callbacks through an
+    /// installed, headless window: each is one `Other` input, and the list
+    /// has nothing to scroll, so none is drained by a publication.
+    #[test]
+    fn checkpoint_scroll_callbacks_invoked_through_the_real_window_record_an_input() {
+        const CHILD: &str = "FOCUSFORGE_GUI_CHECKPOINT_SCROLL_TRACE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("the test binary has a path"),
+            )
+            .args([
+                "--exact",
+                "bridge::tests::checkpoint_scroll_callbacks_invoked_through_the_real_window_record_an_input",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated callback-routing test starts");
+            assert!(
+                status.success(),
+                "the isolated callback-routing test passes: {status}"
+            );
+            return;
+        }
+
+        i_slint_backend_testing::init_no_event_loop();
+        enable_trace_accounting();
+
+        let app = super::AppWindow::new().unwrap();
+        let mut opened = AppController::new();
+        let frames = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames");
+        if let Some(load) = opened.open_paths(&[frames]) {
+            load.join().expect("the load worker did not panic");
+        }
+        opened.settle_open().expect("the fixture load settles");
+        let controller = Arc::new(Mutex::new(opened));
+        let canvas = std::rc::Rc::new(std::cell::RefCell::new(super::Canvas::default()));
+        let _installed = super::install(
+            &app,
+            controller.clone(),
+            canvas,
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
+        );
+        let _ = finish_input_batches();
+
+        app.invoke_checkpoint_scrolled(40.0);
+        app.invoke_checkpoint_scrollbar_pointer(0, 5.0);
+        app.invoke_checkpoint_scrollbar_dragged(9.0);
+
+        let batches = finish_input_batches();
+        let other = batches[4].expect("every checkpoint scroll callback records an Other input");
+        assert_eq!(other.count, 3);
+        assert!(
+            batches[..4].iter().all(Option::is_none),
+            "no checkpoint scroll callback records under another surface: {batches:?}"
         );
     }
 }

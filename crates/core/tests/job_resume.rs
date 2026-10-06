@@ -25,7 +25,7 @@ use focusforge_core::equalize::{Equalization, UNIT_GAIN};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
 use focusforge_core::io::{FrameReader, TiffStack};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
-use focusforge_core::job::record::{JOB_RECORD_FORMAT, JobRecord};
+use focusforge_core::job::record::JobRecord;
 use focusforge_core::job::{AlignIdentity, Job, JobOutcome, Resumable, ResumeStore};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
@@ -91,7 +91,6 @@ fn job_record(
 ) -> JobRecord {
     let (width, height) = stack.dimensions();
     JobRecord {
-        format: JOB_RECORD_FORMAT,
         fingerprint: stack_fingerprint(stack),
         width,
         height,
@@ -111,7 +110,7 @@ fn job_record(
 }
 
 #[test]
-fn resume_store_reads_a_ledger_with_a_header_shaped_fingerprint() {
+fn resume_store_rejects_a_ledger_missing_raw_identity() {
     let stack = open_stack();
     let scratch = scratch_base("legacy-frame-fingerprint");
     let composite = scratch.join("composite.tif");
@@ -145,7 +144,7 @@ fn resume_store_reads_a_ledger_with_a_header_shaped_fingerprint() {
     let store = ResumeStore::open(&scratch).expect("resume store must open");
     assert!(matches!(
         store.find(&record).expect("find must succeed"),
-        Resumable::Ledger(_)
+        Resumable::None
     ));
 }
 
@@ -579,11 +578,6 @@ fn resume_refuses_changed_equalization() {
 }
 
 #[test]
-fn job_records_carry_the_equalization_format() {
-    assert_eq!(JOB_RECORD_FORMAT, 4);
-}
-
-#[test]
 fn resume_refuses_changed_tile_geometry() {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
@@ -795,31 +789,6 @@ fn truncated_output_is_not_complete() {
         "at least one recorded unit's rows must no longer be held by the truncated file: \
          completed={completed:?}, surviving={surviving:?}"
     );
-    let _ = std::fs::remove_dir_all(&scratch);
-}
-
-#[test]
-fn unknown_ledger_format_starts_over() {
-    let stack = open_stack();
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(stack.len(), width, height, 3);
-    let values = resolved_laplacian_values(stack_ctx);
-
-    let scratch = scratch_base("unknown-format");
-    let composite_path = scratch.join("out.tif");
-    std::fs::create_dir_all(&scratch).unwrap();
-    std::fs::write(&composite_path, b"partial").unwrap();
-
-    let store = ResumeStore::open(&scratch).unwrap();
-    let mut record = job_record(&stack, &values, &composite_path, None);
-    record.format = u32::MAX;
-    store.begin(&record).unwrap();
-
-    record.format = JOB_RECORD_FORMAT;
-    match store.find(&record).unwrap() {
-        Resumable::None => {}
-        other => panic!("expected Resumable::None for an unrecognised format, got {other:?}"),
-    }
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
@@ -1277,7 +1246,6 @@ fn resume_on_the_reference_stack() {
         let scheduler = TileScheduler::new(&stack, stack_ctx, 3, &job_opts_kill)
             .expect("job scheduler must build");
         let record = JobRecord {
-            format: JOB_RECORD_FORMAT,
             fingerprint: stack_fingerprint(&stack),
             width,
             height,
@@ -1338,7 +1306,6 @@ fn resume_on_the_reference_stack() {
     let scheduler2 = TileScheduler::new(&stack2, stack_ctx, 3, &job_opts_resume)
         .expect("resume scheduler must build");
     let record2 = JobRecord {
-        format: JOB_RECORD_FORMAT,
         fingerprint: stack_fingerprint(&stack2),
         width,
         height,

@@ -136,19 +136,9 @@ fn segment_dist2(px: f64, py: f64, a: Point, b: Point) -> f64 {
     ddx * ddx + ddy * ddy
 }
 
-/// Whether pixel `(x, y)` (absolute map coordinates) lies under `stroke`.
-fn covers(stroke: &Stroke, x: u32, y: u32) -> bool {
-    let px = f64::from(x);
-    let py = f64::from(y);
-    let mut d2 = f64::INFINITY;
-    if stroke.path.len() < 2 {
-        let p = stroke.path[0];
-        d2 = segment_dist2(px, py, p, p);
-    } else {
-        for w in stroke.path.windows(2) {
-            d2 = d2.min(segment_dist2(px, py, w[0], w[1]));
-        }
-    }
+/// Whether a pixel `(x, y)` at squared distance `d2` from the path lies under
+/// `stroke`.
+fn covered(stroke: &Stroke, x: u32, y: u32, d2: f64) -> bool {
     let r = f64::from(stroke.radius);
     let softness = f64::from(stroke.softness);
     let core = r * (1.0 - softness);
@@ -163,12 +153,78 @@ fn covers(stroke: &Stroke, x: u32, y: u32) -> bool {
     (1.0 - t) * 64.0 > bayer + 0.5
 }
 
+/// Segment `i` of the stroke's path; a one-point path is one zero-length
+/// segment.
+fn segment(stroke: &Stroke, i: usize) -> (Point, Point) {
+    match stroke.path {
+        [p] => (*p, *p),
+        path => (path[i], path[i + 1]),
+    }
+}
+
+/// Square cells over `region`, each listing the path segments that can reach
+/// one of its pixels. A pixel is covered only within `radius` of a segment, so
+/// a segment is listed in every cell its bounding box, widened by `radius`
+/// plus one pixel of rounding slack, touches.
+struct SegmentGrid {
+    cell: u32,
+    columns: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl SegmentGrid {
+    fn new(stroke: &Stroke, region: Rect) -> Self {
+        let r = f64::from(stroke.radius);
+        let cell = r
+            .ceil()
+            .max(64.0)
+            .min(f64::from(region.width.max(region.height))) as u32;
+        let columns = region.width.div_ceil(cell) as usize;
+        let rows = region.height.div_ceil(cell) as usize;
+        let mut cells = vec![Vec::new(); columns * rows];
+        let reach = r + 1.0;
+        let cell_range = |lo: f64, hi: f64, origin: u32, count: usize| {
+            let first = ((lo - reach - f64::from(origin)) / f64::from(cell)).floor();
+            let last = ((hi + reach - f64::from(origin)) / f64::from(cell)).floor();
+            (last >= 0.0 && first < count as f64)
+                .then(|| (first.max(0.0) as usize)..=(last.min(count as f64 - 1.0) as usize))
+        };
+        for i in 0..stroke.path.len().saturating_sub(1).max(1) {
+            let (a, b) = segment(stroke, i);
+            let (ax, ay, bx, by) = (
+                f64::from(a.x),
+                f64::from(a.y),
+                f64::from(b.x),
+                f64::from(b.y),
+            );
+            let (Some(xs), Some(ys)) = (
+                cell_range(ax.min(bx), ax.max(bx), region.x, columns),
+                cell_range(ay.min(by), ay.max(by), region.y, rows),
+            ) else {
+                continue;
+            };
+            for cy in ys {
+                for cx in xs.clone() {
+                    cells[cy * columns + cx].push(i as u32);
+                }
+            }
+        }
+        Self {
+            cell,
+            columns,
+            cells,
+        }
+    }
+}
+
 /// Applies `op` over `tile` (an `info.tile_len(tile)`-long slice of `tile`'s
 /// own indices, row-major), writing `source_id` where the stroke covers a
 /// pixel. Returns how many pixels differed from their prior value. Every
 /// refusal happens before the first write: `tile` must satisfy
 /// `info.contains(tile)`, and `indices.len()` must equal
 /// `info.tile_len(tile)`.
+///
+/// Cost follows the area near the path, not the path's bounding box.
 pub fn apply(
     op: &Op,
     info: ZMapInfo,
@@ -192,14 +248,31 @@ pub fn apply(
     let Some(region) = tile.intersect(footprint) else {
         return Ok(0);
     };
+    let grid = SegmentGrid::new(&stroke, region);
     let mut changed = 0u64;
     for y in region.y..region.y + region.height {
-        for x in region.x..region.x + region.width {
-            if covers(&stroke, x, y) {
-                let idx = ((y - tile.y) * tile.width + (x - tile.x)) as usize;
-                if indices[idx] != stroke.source_id {
-                    indices[idx] = stroke.source_id;
-                    changed += 1;
+        let row = (y - region.y) / grid.cell;
+        for column in 0..grid.columns {
+            let segments = &grid.cells[row as usize * grid.columns + column];
+            if segments.is_empty() {
+                continue;
+            }
+            let x0 = region.x + column as u32 * grid.cell;
+            let x1 = (x0 + grid.cell).min(region.x + region.width);
+            for x in x0..x1 {
+                let d2 = segments
+                    .iter()
+                    .map(|&i| {
+                        let (a, b) = segment(&stroke, i as usize);
+                        segment_dist2(f64::from(x), f64::from(y), a, b)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                if covered(&stroke, x, y, d2) {
+                    let idx = ((y - tile.y) * tile.width + (x - tile.x)) as usize;
+                    if indices[idx] != stroke.source_id {
+                        indices[idx] = stroke.source_id;
+                        changed += 1;
+                    }
                 }
             }
         }
@@ -796,5 +869,174 @@ mod tests {
             valid(&indices, FRAMES);
             assert_eq!(indices, base, "a refused op must not touch the buffer");
         }
+    }
+
+    /// The unculled stroke: every pixel of the footprint is tested against
+    /// every path segment.
+    fn apply_reference(op: &Op, info: ZMapInfo, tile: Rect, indices: &mut [u16]) -> u64 {
+        let stroke = validate(op, info).unwrap();
+        let Some(region) = stroke_footprint(&stroke, info).and_then(|fp| tile.intersect(fp)) else {
+            return 0;
+        };
+        let segments = stroke.path.len().saturating_sub(1).max(1);
+        let mut changed = 0;
+        for y in region.y..region.y + region.height {
+            for x in region.x..region.x + region.width {
+                let d2 = (0..segments)
+                    .map(|i| {
+                        let (a, b) = segment(&stroke, i);
+                        segment_dist2(f64::from(x), f64::from(y), a, b)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                if covered(&stroke, x, y, d2) {
+                    let idx = ((y - tile.y) * tile.width + (x - tile.x)) as usize;
+                    if indices[idx] != stroke.source_id {
+                        indices[idx] = stroke.source_id;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// A deterministic pseudo-random walk of `count` points starting at
+    /// `(x, y)`, each step at most `step` pixels along either axis.
+    fn walk(seed: u64, count: usize, (mut x, mut y): (i32, i32), step: i32) -> Vec<Point> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as i32).rem_euclid(2 * step + 1) - step
+        };
+        (0..count)
+            .map(|_| {
+                x += next();
+                y += next();
+                pt(x, y)
+            })
+            .collect()
+    }
+
+    fn assert_matches_reference(op: &Op, info: ZMapInfo, tile: Rect, label: &str) {
+        let base: Vec<u16> = (0..info.tile_len(tile))
+            .map(|i| (i as u32 % info.frame_count()) as u16)
+            .collect();
+        let mut culled = base.clone();
+        let mut naive = base;
+        let culled_changed = apply(op, info, tile, &mut culled).unwrap();
+        let naive_changed = apply_reference(op, info, tile, &mut naive);
+        assert!(
+            naive_changed > 0,
+            "{label}: the stroke must paint something"
+        );
+        assert_eq!(culled_changed, naive_changed, "{label}: changed count");
+        assert!(
+            culled == naive,
+            "{label}: indices differ from the reference"
+        );
+    }
+
+    #[test]
+    fn culled_apply_equals_the_unculled_stroke() {
+        let info = ZMapInfo::new(700, 500, FRAMES).unwrap();
+        let map = Rect {
+            x: 0,
+            y: 0,
+            width: 700,
+            height: 500,
+        };
+        // About 300 points, a self-crossing walk that leaves the map on every side.
+        let long = walk(7, 300, (350, 250), 120);
+        assert!(
+            long.iter()
+                .any(|p| p.x < 0 || p.x >= 700 || p.y < 0 || p.y >= 500)
+        );
+        for softness in [0.3, 0.0] {
+            let op = stroke_op(7, long.clone(), 64.0, softness);
+            assert_matches_reference(&op, info, map, &format!("long walk, softness {softness}"));
+        }
+
+        let corners = stroke_op(
+            3,
+            vec![
+                pt(-30, -30),
+                pt(40, 10),
+                pt(699, 499),
+                pt(720, 520),
+                pt(0, 499),
+            ],
+            64.0,
+            0.3,
+        );
+        assert_matches_reference(&corners, info, map, "clipped at the map corners");
+
+        // A segment whose widened bounding box ends exactly on a cell boundary:
+        // the pixel at distance `radius` along the axis sits in the next cell.
+        for path in [
+            vec![pt(100, 250), pt(164, 250)],
+            vec![pt(300, 100), pt(300, 164)],
+        ] {
+            let op = stroke_op(4, path, 64.0, 0.0);
+            assert_matches_reference(&op, info, map, "bounding box ends on a cell boundary");
+        }
+
+        let dot = stroke_op(5, vec![pt(350, 250)], 64.0, 0.3);
+        assert_matches_reference(&dot, info, map, "one point");
+        let tiny = stroke_op(5, vec![pt(10, 10), pt(11, 10)], 0.5, 0.0);
+        assert_matches_reference(&tiny, info, map, "sub-pixel radius");
+
+        // A tile that is a sub-rect of the map, cutting the stroke on all sides.
+        let tile = Rect {
+            x: 123,
+            y: 77,
+            width: 300,
+            height: 211,
+        };
+        for softness in [0.3, 0.0] {
+            let op = stroke_op(7, long.clone(), 64.0, softness);
+            assert_matches_reference(
+                &op,
+                info,
+                tile,
+                &format!("sub-rect tile, softness {softness}"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_stroke_over_a_large_map_is_not_quadratic() {
+        let info = ZMapInfo::new(4000, 4000, FRAMES).unwrap();
+        let map = Rect {
+            x: 0,
+            y: 0,
+            width: 4000,
+            height: 4000,
+        };
+        // 20 sweeps of 50 points: a 1000-point path whose bounding box is the
+        // whole map.
+        let jitter = walk(11, 1000, (0, 0), 6);
+        let path: Vec<Point> = (0..1000)
+            .map(|i| {
+                let sweep = i / 50;
+                let along = (i % 50) * 4000 / 49;
+                let x = if sweep % 2 == 0 { along } else { 4000 - along };
+                pt(
+                    x + jitter[i as usize].x % 6,
+                    sweep * 200 + 10 + jitter[i as usize].y % 6,
+                )
+            })
+            .collect();
+        let op = stroke_op(2, path, 16.0, 0.3);
+        let mut indices = vec![0u16; info.tile_len(map)];
+        let start = std::time::Instant::now();
+        let changed = apply(&op, info, map, &mut indices).unwrap();
+        let elapsed = start.elapsed();
+        assert!(changed > 1_000_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a 1000-point stroke took {elapsed:?}"
+        );
     }
 }

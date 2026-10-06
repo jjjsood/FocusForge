@@ -151,6 +151,17 @@ pub struct JobRequest {
 /// own frame clock.
 pub const POLL: Duration = Duration::from_millis(100);
 
+/// How long the canvas must see no action before a run's interactive
+/// admission cap may lift.
+pub const INTERACTION_QUIET: Duration = Duration::from_millis(250);
+
+/// The most tiles or registrations a run may hold in flight while the
+/// canvas is being used: a quarter of the host's threads, at least one.
+pub fn interactive_cap() -> usize {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (threads / 4).max(1)
+}
+
 /// The host budget the frame pane and the edit session each open their
 /// readers against.
 pub fn host_budget() -> HostBudget {
@@ -683,17 +694,18 @@ fn checkpoint_plane_paths(
 pub enum CheckpointPlanes {
     /// Its composite and Z-Map, on disk.
     Ready(PathBuf, PathBuf),
-    /// An op-bearing checkpoint: [`render_checkpoint_planes`] must run
-    /// first, off the event-loop thread, since it re-hashes every source.
+    /// Not cached yet: [`render_checkpoint_planes`] must run first, off the
+    /// event-loop thread, since it decompresses planes and an op-bearing
+    /// checkpoint re-hashes every source.
     NeedsRender,
 }
 
-/// A fused checkpoint's stored composite and its Z-Map, written into the
-/// plane cache unless both are already newer than the `.ffp`; an op-bearing
-/// checkpoint answers [`CheckpointPlanes::NeedsRender`] without reading any
+/// A fused checkpoint's plane cache pair when both files are already newer
+/// than the `.ffp`; any other checkpoint, or a stale or missing pair,
+/// answers [`CheckpointPlanes::NeedsRender`]. Reads metadata only, never a
 /// plane.
-pub fn fused_checkpoint_planes(
-    project: &mut Project,
+pub fn cached_checkpoint_planes(
+    project: &Project,
     scratch_root: &Path,
     id: &str,
 ) -> Result<CheckpointPlanes, PlaneCacheError> {
@@ -702,10 +714,11 @@ pub fn fused_checkpoint_planes(
     }
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project.path(), id);
     let ffp_modified = std::fs::metadata(project.path())?.modified()?;
-    if !(is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified)) {
-        write_checkpoint_planes(project, id, &composite, &zmap)?;
+    if is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified) {
+        Ok(CheckpointPlanes::Ready(composite, zmap))
+    } else {
+        Ok(CheckpointPlanes::NeedsRender)
     }
-    Ok(CheckpointPlanes::Ready(composite, zmap))
 }
 
 /// Renders checkpoint `id` of the project at `project_path` into its plane
@@ -1032,42 +1045,161 @@ pub enum EditSessionError {
     Frames(#[from] FrameError),
 }
 
+/// What a recomposite worker parks: each region it gathered, in dispatch
+/// order, with its samples or the reason its read failed.
+type Gathered = Vec<(Rect, Result<Vec<u16>, String>)>;
+
+/// Wakes the UI thread once a recomposite worker has parked its result.
+pub type RecompositeWake = Arc<dyn Fn() + Send + Sync>;
+
+/// One session's recomposite queue: regions waiting for a worker, whether a
+/// worker holds a batch, and where it parks the result.
+#[derive(Default)]
+struct Recomposites {
+    queued: Vec<Rect>,
+    in_flight: bool,
+    parked: Arc<Mutex<Option<Gathered>>>,
+}
+
 /// One tab's live editor state: its undo/redo session, the frame set a
 /// stroke recomposites against and the registration warping each of its
-/// reads, the resident display cache the renderer overlays, and the
-/// in-progress stroke, if any.
+/// reads, the resident display cache the renderer overlays, the
+/// in-progress stroke, if any, and the regions whose pixels are still being
+/// gathered. The queue lives here, so a session that is dropped takes its
+/// pending results with it.
 pub struct EditState {
     pub session: EditSession,
-    pub sources: Box<dyn FrameReader>,
+    pub sources: Arc<dyn FrameReader>,
     pub registration: Registration,
     pub tiles: crate::canvas::ResidentTiles,
     pub stroke: Option<crate::brush::LiveStroke>,
+    recomposites: Recomposites,
 }
 
 /// A resident tile's default edge -- edits are small, so a fixed 256 px grid
 /// keeps memory proportional to the edited area.
 pub const RESIDENT_TILE_SIZE: u32 = 256;
 
+/// Runs `f` over `reader`'s frames each read through its recorded transform,
+/// at the registration's own crop origin -- the same view the left pane
+/// draws, so a stroke transfers exactly what it showed.
+fn with_registered_sources<R>(
+    reader: &dyn FrameReader,
+    registration: &Registration,
+    f: impl FnOnce(&Sources) -> R,
+) -> R {
+    let frame = reader.dimensions();
+    let samples_per_pixel = reader.frame(0).samples_per_pixel;
+    let transforms = registration.transforms(reader.len());
+    let gained = GainReader::new(reader, registration.gains());
+    let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
+    f(&Sources {
+        reader: &warped,
+        frame_count: reader.len() as u32,
+        samples_per_pixel,
+        origin: registration.origin(),
+    })
+}
+
 impl EditState {
-    /// Recomposites `region` into this tab's resident display tiles, from
-    /// its own edited indices and the frame-as-fused view: each source read
-    /// through its recorded transform, at the registration's own crop
-    /// origin -- the same view the left pane draws, so a stroke transfers
-    /// exactly what it showed.
+    /// Recomposites `region` into this tab's resident display tiles on the
+    /// calling thread, from its own edited indices and the frame-as-fused
+    /// view. The session-open replay uses it; a live edit goes through
+    /// [`Self::queue_recomposite`].
     pub fn recomposite(&mut self, region: Rect) -> Result<(), RetouchError> {
-        let frame = self.sources.dimensions();
-        let samples_per_pixel = self.sources.frame(0).samples_per_pixel;
-        let transforms = self.registration.transforms(self.sources.len());
-        let gained = GainReader::new(&*self.sources, self.registration.gains());
-        let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
-        let sources = Sources {
-            reader: &warped,
-            frame_count: self.sources.len() as u32,
-            samples_per_pixel,
-            origin: self.registration.origin(),
-        };
-        self.tiles
-            .recomposite(region, self.session.indices(), &sources)
+        let (tiles, indices) = (&mut self.tiles, self.session.indices());
+        with_registered_sources(&*self.sources, &self.registration, |sources| {
+            tiles.recomposite(region, indices, sources)
+        })
+    }
+
+    /// Queues `region`, whose edited indices already changed, for a worker
+    /// to gather, and bumps the tiles' generation so the overlay shows the
+    /// new indices at once. Regions queued while a worker holds a batch go
+    /// out together when it is installed; `wake` runs on the worker once a
+    /// batch is parked.
+    pub fn queue_recomposite(&mut self, region: Rect, wake: &RecompositeWake) {
+        self.recomposites.queued.push(region);
+        self.tiles.touch();
+        if !self.recomposites.in_flight {
+            self.dispatch_recomposites(wake);
+        }
+    }
+
+    /// Whether no stroke is live and no recomposite is queued or in flight,
+    /// so the resident tiles hold every edit the indices do.
+    pub fn is_settled(&self) -> bool {
+        self.stroke.is_none() && self.recomposites.queued.is_empty() && !self.recomposites.in_flight
+    }
+
+    /// Installs the batch a worker has parked, in the order its regions were
+    /// queued, then dispatches whatever queued meanwhile. A region whose
+    /// read failed is logged and leaves its tiles as they were. Returns
+    /// `true` once nothing is in flight.
+    pub fn settle_recomposite(&mut self, wake: &RecompositeWake) -> bool {
+        let parked = self
+            .recomposites
+            .parked
+            .lock()
+            .expect("no worker panicked while parking its recomposites")
+            .take();
+        if let Some(gathered) = parked {
+            self.recomposites.in_flight = false;
+            for (region, result) in gathered {
+                match result {
+                    Ok(samples) => self.tiles.install(region, &samples),
+                    Err(error) => {
+                        tracing::error!(%error, ?region, "background recomposite failed");
+                    }
+                }
+            }
+            self.dispatch_recomposites(wake);
+        }
+        !self.recomposites.in_flight
+    }
+
+    /// Hands every queued region to one worker thread, with the indices as
+    /// they are now, and marks the batch in flight.
+    fn dispatch_recomposites(&mut self, wake: &RecompositeWake) {
+        if self.recomposites.queued.is_empty() {
+            return;
+        }
+        let width = self.session.tile().width;
+        let indices = self.session.indices();
+        let batch: Vec<(Rect, Vec<u16>)> = self
+            .recomposites
+            .queued
+            .drain(..)
+            .map(|region| (region, crate::canvas::gather_rect(indices, width, region)))
+            .collect();
+        self.recomposites.in_flight = true;
+        let sources = Arc::clone(&self.sources);
+        let registration = self.registration.clone();
+        let parked = Arc::clone(&self.recomposites.parked);
+        let wake = Arc::clone(wake);
+        std::thread::spawn(move || {
+            let gathered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_registered_sources(&*sources, &registration, |sources| {
+                    batch
+                        .iter()
+                        .map(|(region, indices)| {
+                            let samples = crate::canvas::gather(*region, indices, sources);
+                            (*region, samples.map_err(|error| error.to_string()))
+                        })
+                        .collect::<Gathered>()
+                })
+            }))
+            .unwrap_or_else(|_| {
+                batch
+                    .iter()
+                    .map(|(region, _)| (*region, Err("the recomposite worker panicked".into())))
+                    .collect()
+            });
+            *parked
+                .lock()
+                .expect("no worker panicked while parking its recomposites") = Some(gathered);
+            wake();
+        });
     }
 }
 
@@ -1075,13 +1207,18 @@ impl EditState {
 /// map: an [`EditSession`] seeded from every pixel, `frames` opened through
 /// [`open_frame_set`] as the frame set a stroke recomposites against
 /// (warped by `registration` at recomposite time), and an empty resident
-/// display cache gridded at `tile_size` px.
+/// display cache gridded at `tile_size` px. `chain` -- the ops an op-bearing
+/// row stacks over its fused base, oldest first -- is then applied and
+/// recomposited and the session rebased onto it, so it opens with no ops of
+/// its own. A chain op that cannot be applied ends the replay; a region that
+/// cannot be recomposited is skipped.
 pub fn open_edit_session(
     zmap: &Path,
     frames: &[PathBuf],
     registration: Registration,
     tile_size: u32,
     budget: HostBudget,
+    chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
     let info = reader.info();
@@ -1095,7 +1232,7 @@ pub fn open_edit_session(
     reader.read_tile_into(tile, &mut indices)?;
     let session = EditSession::new(info, tile, indices)
         .expect("a whole-map tile always fits its own map and its own tile_len");
-    let sources = open_frame_set(frames, budget)?.reader;
+    let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
         tile_size,
@@ -1103,14 +1240,34 @@ pub fn open_edit_session(
         info.height(),
         samples_per_pixel,
     );
-    Ok(EditState {
+    let mut edit = EditState {
         session,
         sources,
         registration,
         tiles,
         stroke: None,
-    })
+        recomposites: Recomposites::default(),
+    };
+    for op in chain {
+        match edit.session.append(op) {
+            Ok(Some(region)) => {
+                if let Err(err) = edit.recomposite(region) {
+                    tracing::error!(error = %err, "restored stroke recomposite failed");
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "restored stroke could not be applied");
+                break;
+            }
+        }
+    }
+    edit.session.rebase();
+    Ok(edit)
 }
+
+/// A written project, opened, with the id written per kept entry.
+pub type SavedProject = (Project, Vec<String>);
 
 /// Writes `entries`, each under its own parent, and applies `deletes` at
 /// `target` -- onto the project already there when `onto_existing` -- then
@@ -1123,7 +1280,7 @@ pub fn save_in_memory(
     deletes: &[ParentRef],
     keep: Option<&ParentRef>,
     onto_existing: bool,
-) -> Result<(Project, Vec<String>), ProjectError> {
+) -> Result<SavedProject, ProjectError> {
     let ids = project::seal_in_memory(target, entries, deletes, keep, onto_existing)?;
     Ok((Project::open(target)?, ids))
 }

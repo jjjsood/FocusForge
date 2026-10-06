@@ -10,13 +10,11 @@
 //!
 //! # The grouping file
 //!
-//! TOML, a scalar `format` key followed by one `[[group]]` block per stack,
-//! with `frames` holding paths **relative to the directory the run was
+//! TOML with one `[[group]]` block per stack, with `frames` holding paths
+//! **relative to the directory the run was
 //! pointed at**:
 //!
 //! ```toml
-//! format = 1
-//!
 //! [[group]]
 //! name = "IMG_9801-9862"
 //! frames = [
@@ -32,12 +30,6 @@
 //! `--write-groups <path>` writes exactly what `--groups <path>` reads, so
 //! writing and feeding the unedited file back is a no-op.
 //!
-//! **Field order is load-bearing**, one notch worse than the preset's
-//! (`crate::preset`): a scalar emitted *after* an array of tables lands
-//! inside the **last** `[[group]]` block, and `toml::ser::Error` is opaque
-//! in 1.1.6, so there is no variant to match on. `format` is declared first
-//! and `groups_file_round_trips_with_the_scalar_outside_the_array` (below)
-//! is the guard.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -46,21 +38,14 @@ use clap::Args;
 use focusforge_core::io::{Group, GroupSignal, Proposal};
 use serde::{Deserialize, Serialize};
 
-/// The grouping file's schema version. Changes are additive only: a later
-/// field must not break a consumer written against an earlier one.
-pub const GROUPS_FILE_FORMAT: u32 = 1;
-
-/// The run-level manifest's schema version.
-pub const MANIFEST_FORMAT: u32 = 1;
-
 /// The three grouping/subset flags, flattened into `stack`:
 /// `--groups`/`--write-groups` decide what a stack *is*, `--only` decides
 /// which of the proposed stacks run.
 #[derive(Args, Debug, Default)]
 pub struct GroupArgs {
     /// Group the frames as this TOML file says instead of proposing a
-    /// grouping: `format = 1` plus one `[[group]]` block per stack, each
-    /// with a `name` and a `frames` array of paths relative to `<dir>`.
+    /// grouping: one `[[group]]` block per stack, each with a `name` and a
+    /// `frames` array of paths relative to `<dir>`.
     /// Every frame found under `<dir>` must appear in exactly one group.
     #[arg(long, value_name = "PATH")]
     pub groups: Option<PathBuf>,
@@ -81,13 +66,9 @@ pub struct GroupArgs {
 }
 
 /// One grouping file.
-///
-/// `format` is declared **before** `group` -- see this module's docs for why
-/// that is a correctness property and not a style choice.
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct GroupsFile {
-    pub format: u32,
     #[serde(default)]
     pub group: Vec<GroupEntry>,
 }
@@ -111,7 +92,6 @@ pub struct GroupEntry {
 /// stack is a visible failure" cannot hold only for grouped runs.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RunManifest {
-    pub format: u32,
     /// The input directory as the user wrote it.
     pub root: String,
     pub groups: Vec<ManifestEntry>,
@@ -122,9 +102,7 @@ pub struct ManifestEntry {
     pub name: String,
     /// The identity the run's `--status` stream used for this group --
     /// the group name for a multi-group run, the input directory as the
-    /// user wrote it for a single-group one. Absent reads as empty;
-    /// [`Self::identity`] then falls back to `name`.
-    #[serde(default)]
+    /// user wrote it for a single-group one.
     pub identity: String,
     pub frame_count: usize,
     /// `completed`, `failed`, `cancelled` or `dry-run` -- the same
@@ -135,23 +113,10 @@ pub struct ManifestEntry {
     pub error: Option<String>,
 }
 
-impl ManifestEntry {
-    /// The identity to report: the stored field, or [`Self::name`] when it
-    /// is empty.
-    pub fn identity(&self) -> &str {
-        if self.identity.is_empty() {
-            &self.name
-        } else {
-            &self.identity
-        }
-    }
-}
-
 /// The proposal as a grouping file: frames relative to `proposal.root`
 /// where they sit under it, absolute (well, as-walked) otherwise.
 pub fn to_file(proposal: &Proposal) -> GroupsFile {
     GroupsFile {
-        format: GROUPS_FILE_FORMAT,
         group: proposal
             .groups
             .iter()
@@ -181,13 +146,6 @@ pub fn write(proposal: &Proposal, path: &Path) -> Result<(), String> {
 /// -- lexical normalization, which needs no file to exist.
 pub fn load(path: &Path, root: &Path, walked: &Proposal) -> Result<Proposal, String> {
     let file: GroupsFile = crate::preset::read_toml(path)?;
-    if file.format != GROUPS_FILE_FORMAT {
-        return Err(format!(
-            "{}: unsupported grouping file format {} (this build reads {GROUPS_FILE_FORMAT})",
-            path.display(),
-            file.format
-        ));
-    }
     if file.group.is_empty() {
         return Err(format!("{}: no [[group]] block at all", path.display()));
     }
@@ -505,31 +463,11 @@ mod tests {
         );
     }
 
-    /// The array-of-tables twin of
-    /// `preset::tests::preset_round_trips_with_scalars_outside_both_tables`,
-    /// one notch worse: a scalar emitted after `[[group]]` lands inside the
-    /// **last** group, where it would deserialize as an unknown field.
-    #[test]
-    fn groups_file_round_trips_with_the_scalar_outside_the_array() {
-        let file = to_file(&sample_proposal());
-        let text = toml::to_string_pretty(&file).expect("a grouping file must serialize");
-        let format_line = text.find("format =").expect("format must be written");
-        let first_table = text.find('[').expect("a [[group]] header must be written");
-        assert!(
-            format_line < first_table,
-            "`format` must precede every [[group]] header, else it lands inside one:\n{text}"
-        );
-        let back: GroupsFile = toml::from_str(&text).expect("a written grouping must re-read");
-        assert_eq!(back, file);
-        assert_eq!(back.group[0].frames, vec!["IMG_9801.tif", "IMG_9862.tif"]);
-    }
-
     #[test]
     fn an_unknown_key_is_refused_rather_than_ignored() {
-        let err = toml::from_str::<GroupsFile>(
-            "format = 1\n\n[[group]]\nname = \"a\"\nframes = []\nnmae = \"typo\"\n",
-        )
-        .expect_err("a mistyped key must refuse");
+        let err =
+            toml::from_str::<GroupsFile>("[[group]]\nname = \"a\"\nframes = []\nnmae = \"typo\"\n")
+                .expect_err("a mistyped key must refuse");
         assert!(err.to_string().contains("nmae"), "{err}");
     }
 }

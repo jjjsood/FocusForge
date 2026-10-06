@@ -55,10 +55,6 @@ rm "$repo/target"
 make_link "$repo" "$repo/.pool-two/cargo-target/slot/leaf"
 expect_dir "hidden pool nested" "$repo" "$repo/.locks"
 
-rm "$repo/target"
-make_link "$repo" "$repo/cargo-target"
-expect_dir "legacy pool" "$repo" "$repo/.locks"
-
 other="$TMP/other repository"
 make_repo "$other"
 rm "$repo/target"

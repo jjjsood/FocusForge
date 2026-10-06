@@ -46,12 +46,23 @@ Use the icon at the top right of either image to move that pane into a second
 window. Only one pane can be detached, and the remaining pane's icon stays
 hidden until the detached pane returns. The remaining pane fills the main
 canvas. Both images share the same visible area, zoom and pan; unused space
-stays black when the windows have different sizes. Drag the second window by
+stays black when the windows have different sizes. Each pane, the detached
+window included, shows a coarse whole-image backdrop under the sharp view, so
+zooming out or panning past the loaded region shows no blank edge while the
+sharp pixels catch up. Drag the second window by
 its title bar; its dock icon or close button returns the image to the main
 window. It can also be minimized or maximized. On Linux, the second window
 currently uses X11 or XWayland when `DISPLAY` is available, otherwise native
 Wayland when `WAYLAND_DISPLAY` is available. Starting with neither display
 reports a clear error instead of choosing a different backend.
+
+## Staying responsive
+
+Loading frame planes, saving a project, loading one and recompositing after
+a brush stroke all run off the window's thread, so the window keeps
+responding while they work. While you pan, zoom or paint, a running fuse or
+alignment holds back to a quarter of the machine's threads (at least one) and
+lifts that cap once the canvas has been quiet for a quarter of a second.
 
 ## Fusing a stack
 

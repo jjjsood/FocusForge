@@ -173,7 +173,10 @@ attaches: start the binary, then connect Tracy from the same machine — the
 client listens on localhost and announces itself nowhere. Stage and tile
 zones appear live, named by their fields.
 
-`focusforge-gui` takes the same feature and reads the same variable.
+`focusforge-gui` takes the same feature and reads the same variable; its
+`gui_`-prefixed spans draw on their own admission budget, apart from the
+processing spans, and the closing `timing_summary` span reports both. Add
+`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` to see Slint's frame timing.
 
 ## Before you send a change
 

@@ -20,16 +20,11 @@ use std::time::Instant;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::{Deserialize, Serialize};
 
-/// The status record's schema version. Changes are additive only: a later
-/// field must not break a consumer written against an earlier one.
-pub const STATUS_RECORD_FORMAT: u32 = 1;
-
 /// One stack's verdict. `outcome` follows the exit codes: 0 -> `completed`,
 /// 130 -> `cancelled`, 1 -> `failed`, plus `dry-run` for a run that
 /// computed nothing.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StatusRecord {
-    pub format: u32,
     /// The identity of the one stack this record describes -- the input
     /// directory as the user wrote it for a single-group run, matching
     /// `StackReport::input`, or the group name for a multi-group one.
@@ -91,7 +86,6 @@ impl<'a> StatusSink<'a> {
             return;
         };
         let record = StatusRecord {
-            format: STATUS_RECORD_FORMAT,
             identity: self.identity.clone(),
             command: self.command.to_string(),
             outcome: outcome.to_string(),

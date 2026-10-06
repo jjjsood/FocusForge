@@ -652,6 +652,7 @@ fn run_window<T: ComponentHandle + 'static>(
                         *device.borrow_mut() = None;
                     });
                 }
+                slint::RenderingState::AfterRendering => bridge::record_frame_rendered(),
                 _ => {}
             })
         {
@@ -771,6 +772,10 @@ fn run_window<T: ComponentHandle + 'static>(
 
     let run_result = app.run();
     bridge::shutdown_windows();
+    // Quitting never interrupts a write in progress.
+    if let Some(controller) = &controller {
+        controller.lock().unwrap().finish_saves();
+    }
     if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
         app.set_frame_source(slint::Image::default());
         app.set_composite_source(slint::Image::default());

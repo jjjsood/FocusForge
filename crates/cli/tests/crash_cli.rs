@@ -57,7 +57,7 @@ fn panic_writes_report() {
         "the file name names the binary: {name}"
     );
 
-    assert_eq!(report["format"], 1);
+    assert!(report.get("format").is_none());
     assert!(
         report["payload"].as_str().is_some_and(|p| !p.is_empty()),
         "payload: {}",

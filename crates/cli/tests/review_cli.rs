@@ -268,11 +268,10 @@ fn seal_project(
 }
 
 /// Writes a hand-built `manifest.json` in the shape `groups::RunManifest`
-/// reads: `format = 1`, `root`, one `groups` entry per
+/// reads: `root`, one `groups` entry per
 /// `(name, identity, outcome, outputs, error)`.
 fn write_manifest(out_dir: &Path, root: &str, entries: &[serde_json::Value]) {
     let manifest = serde_json::json!({
-        "format": 1,
         "root": root,
         "groups": entries,
     });
@@ -299,6 +298,48 @@ fn manifest_entry(
         "wall_seconds": wall_seconds,
         "error": error,
     })
+}
+
+#[test]
+fn manifest_entry_without_identity_refuses_the_whole_manifest() {
+    let (dir, project_path) =
+        seal_project("review_cli_missing_identity", Metrics::default(), 1, None);
+    let valid = manifest_entry(
+        "valid",
+        "completed",
+        vec![project_path.display().to_string()],
+        0.1,
+        None,
+    );
+    let mut missing = manifest_entry("missing", "completed", Vec::new(), 0.1, None);
+    missing.as_object_mut().unwrap().remove("identity");
+    write_manifest(&dir, dir.to_str().unwrap(), &[valid, missing]);
+
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
+    assert!(!review.success);
+    assert!(review.stdout.is_empty(), "stdout: {}", review.stdout);
+    assert!(review.stderr.contains("manifest.json"), "{}", review.stderr);
+    assert!(review.stderr.contains("identity"), "{}", review.stderr);
+}
+
+#[test]
+fn manifest_entry_keeps_an_explicit_empty_identity() {
+    let (dir, project_path) =
+        seal_project("review_cli_empty_identity", Metrics::default(), 1, None);
+    let mut entry = manifest_entry(
+        "display name",
+        "completed",
+        vec![project_path.display().to_string()],
+        0.1,
+        None,
+    );
+    entry["identity"] = serde_json::Value::String(String::new());
+    write_manifest(&dir, dir.to_str().unwrap(), &[entry]);
+
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
+    assert!(review.success, "stderr: {}", review.stderr);
+    let document: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
+    assert_eq!(document["results"][0]["identity"], "");
 }
 
 /// Every file under `dir`, recursively, as `(relative path, len, modified)`
@@ -606,7 +647,7 @@ fn json_is_one_wrapped_document() {
         serde_json::Deserializer::from_str(&review.stdout).into_iter::<serde_json::Value>();
     let first = de.next().expect("stdout must hold one JSON value").unwrap();
     assert!(de.next().is_none(), "stdout must hold exactly one document");
-    assert_eq!(first["format"], 1);
+    assert!(first.get("format").is_none());
     assert!(first["results"].is_array());
 }
 
