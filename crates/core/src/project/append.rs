@@ -2,15 +2,14 @@
 
 //! [`append`]: writes a new checkpoint onto an already-sealed project,
 //! extending its chain rather than starting a fresh container.
-//! [`append_ops`]: seals a non-empty op list onto the head as a checkpoint of
-//! its own, replaying it against the head's Z-Map rather than staging a
-//! freshly fused composite.
+//! [`append_ops`]: records a non-empty op list as a checkpoint of its own,
+//! one record and no blob.
 //!
 //! Every save adds its records to the end of the project file and commits
 //! them with one footer ([`super::container`]): the previous checkpoint and
 //! every blob it names stay where they are, and a save that fails leaves the
-//! file as it was. Blobs are staged with [`super::blob::stage_plane`]
-//! exactly as [`super::seal::seal`] does.
+//! file as it was. A fused checkpoint's blobs are staged with
+//! [`super::blob::stage_plane`] exactly as [`super::seal::seal`] does.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -272,13 +271,14 @@ fn write_fused(
     })
 }
 
-/// Seals `ops` as a new checkpoint onto `project_path`'s head, stamping the
+/// Records `ops` as a new checkpoint onto `project_path`'s head, stamping the
 /// current wall clock. Refuses an empty list ([`ProjectError::EmptyOpList`])
-/// rather than writing an op-less checkpoint with no composite. Sources are
+/// and a list holding anything but a valid brush stroke
+/// ([`ProjectError::Op`], naming the first bad op) before writing. Sources are
 /// never opened or rehashed: the new checkpoint's `stack_fingerprint`,
 /// `algorithm` and `params` are carried forward from the head unchanged, and
-/// the manifest's `composite` keeps naming the fused ancestor's plane -- only
-/// a new full Z-Map blob is written.
+/// its `zmap_blob` and the manifest's planes name the fused ancestor's. The
+/// append writes the checkpoint record and no blob.
 pub fn append_ops(
     project_path: &Path,
     ops: Vec<Op>,
@@ -340,10 +340,81 @@ pub(super) fn append_ops_on(
             path: project.path().to_path_buf(),
         });
     }
-    let staging = fresh_staging_dir(project.path())?;
-    let result = append_ops_staged(project, parent, &ops, label, created_at, &staging);
-    let _ = std::fs::remove_dir_all(&staging);
-    result
+    let (head, info) = checkpoint_geometry(project, parent)?;
+    for (index, op) in ops.iter().enumerate() {
+        crate::retouch::footprint(op, info).map_err(|source| ProjectError::Op {
+            index,
+            source: Box::new(source),
+        })?;
+    }
+    let manifest = project.manifest().clone();
+    let fuse = project.fuse_state(parent)?;
+    let zmap_blob = project.fused_ancestor(parent)?.zmap_blob.clone();
+    let zmap = full_blob(&manifest.blobs, &zmap_blob, project.path())?.clone();
+    let composite = manifest
+        .blobs
+        .iter()
+        .find(|b| b.hash == fuse.composite.blob)
+        .cloned()
+        .expect("manifest.blobs always names a fuse's own composite blob");
+
+    let ops_json =
+        serde_json::to_vec(&ops).map_err(|err| ProjectError::container(project.path(), err))?;
+    let checkpoint_id = Checkpoint::derive_child_id(
+        &head.id,
+        &head.stack_fingerprint,
+        &blake3::hash(&ops_json).to_hex(),
+        created_at,
+    );
+
+    // The checkpoint sits under `parent`'s own fuse, which is not necessarily
+    // the project's current head's, so the planes the manifest names come
+    // from `parent`'s fused ancestor.
+    let new_manifest = Manifest {
+        producer: manifest.producer.clone(),
+        created_at,
+        hash_algorithm: manifest.hash_algorithm.clone(),
+        stack_fingerprint: head.stack_fingerprint.clone(),
+        algorithm: head.algorithm.clone(),
+        params: head.params.clone(),
+        align: fuse.align.clone(),
+        sources: fuse.sources.clone(),
+        composite: fuse.composite.clone(),
+        zmap: PlaneRef {
+            blob: zmap_blob.clone(),
+            width: fuse.composite.width,
+            height: fuse.composite.height,
+            frame_count: fuse.composite.frame_count,
+            ..manifest.zmap.clone()
+        },
+        blobs: manifest.blobs.clone(),
+        metrics: fuse.metrics,
+        checkpoint: checkpoint_id.clone(),
+        registration: fuse.registration.clone(),
+    };
+
+    let checkpoint = Checkpoint {
+        id: checkpoint_id.clone(),
+        parent: Some(head.id.clone()),
+        ops,
+        zmap_blob,
+        stack_fingerprint: head.stack_fingerprint.clone(),
+        algorithm: head.algorithm.clone(),
+        params: head.params.clone(),
+        created_at,
+        label,
+        fuse: None,
+        hidden: false,
+    };
+    project.put_checkpoint(&checkpoint)?;
+    project.set_manifest(new_manifest)?;
+
+    Ok(SealedProject {
+        path: project.path().to_path_buf(),
+        composite,
+        zmap,
+        checkpoint: checkpoint_id,
+    })
 }
 
 /// A fresh, empty scratch directory next to `project_path`, named after it,
@@ -480,8 +551,8 @@ fn replay_ops_onto_zmap(
 }
 
 /// `parent`'s checkpoint and the Z-Map geometry of its fused ancestor: the
-/// common start [`append_ops_staged`] and [`replay_ops_to_staged`] both need
-/// before replaying ops onto it.
+/// common start [`append_ops_on`] and [`replay_ops_to_staged`] both need
+/// before checking or replaying ops against it.
 fn checkpoint_geometry(
     project: &Project,
     parent: &str,
@@ -491,96 +562,6 @@ fn checkpoint_geometry(
     let info = ZMapInfo::new(width, height, frame_count)
         .map_err(|err| ProjectError::container(project.path(), err))?;
     Ok((head, info))
-}
-
-fn append_ops_staged(
-    project: &mut Project,
-    parent: &str,
-    ops: &[Op],
-    label: Option<String>,
-    created_at: i64,
-    staging: &Path,
-) -> Result<SealedProject, ProjectError> {
-    let (head, info) = checkpoint_geometry(project, parent)?;
-    let manifest = project.manifest().clone();
-
-    let new_zmap_path = staging.join("new-zmap.tif");
-    replay_ops_onto_zmap(project, parent, &head, ops, info, staging, &new_zmap_path)?;
-
-    let full = blob::stage_plane(&new_zmap_path, Plane::ZMap, ZSTD_LEVEL, staging)?;
-
-    let stored_record = record(&full);
-
-    let checkpoint_id =
-        Checkpoint::derive_child_id(&head.id, &head.stack_fingerprint, &full.hash, created_at);
-
-    let mut blobs = manifest.blobs.clone();
-    if !blobs.iter().any(|b| b.hash == stored_record.hash) {
-        blobs.push(stored_record.clone());
-    }
-
-    // The checkpoint sealed here sits under `parent`'s own fuse, which is
-    // not necessarily the project's current head's -- so the manifest's
-    // composite, alignment, crop, sources and metrics come from `parent`'s
-    // fused ancestor, not from the manifest already open.
-    let fuse = project.fuse_state(parent)?;
-
-    let new_manifest = Manifest {
-        producer: manifest.producer.clone(),
-        created_at,
-        hash_algorithm: manifest.hash_algorithm.clone(),
-        stack_fingerprint: head.stack_fingerprint.clone(),
-        algorithm: head.algorithm.clone(),
-        params: head.params.clone(),
-        align: fuse.align.clone(),
-        sources: fuse.sources.clone(),
-        composite: fuse.composite.clone(),
-        // Same reasoning as `composite` above: this checkpoint's own Z-Map
-        // extent, not whatever the previously open manifest declared.
-        zmap: PlaneRef {
-            blob: full.hash.clone(),
-            width: fuse.composite.width,
-            height: fuse.composite.height,
-            frame_count: fuse.composite.frame_count,
-            ..manifest.zmap.clone()
-        },
-        blobs,
-        metrics: fuse.metrics,
-        checkpoint: checkpoint_id.clone(),
-        registration: fuse.registration.clone(),
-    };
-
-    let checkpoint = Checkpoint {
-        id: checkpoint_id.clone(),
-        parent: Some(head.id.clone()),
-        ops: ops.to_vec(),
-        zmap_blob: full.hash.clone(),
-        stack_fingerprint: head.stack_fingerprint.clone(),
-        algorithm: head.algorithm.clone(),
-        params: head.params.clone(),
-        created_at,
-        label,
-        fuse: None,
-        hidden: false,
-    };
-
-    project.put_blob(&full)?;
-    project.put_checkpoint(&checkpoint)?;
-    project.set_manifest(new_manifest)?;
-
-    let composite_record = manifest
-        .blobs
-        .iter()
-        .find(|b| b.hash == fuse.composite.blob)
-        .cloned()
-        .expect("manifest.blobs always names a fuse's own composite blob");
-
-    Ok(SealedProject {
-        path: project.path().to_path_buf(),
-        composite: composite_record,
-        zmap: stored_record,
-        checkpoint: checkpoint_id,
-    })
 }
 
 /// What a successful [`delete_checkpoint`] hid and stopped listing, and the

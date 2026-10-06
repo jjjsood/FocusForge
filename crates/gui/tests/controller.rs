@@ -6354,17 +6354,14 @@ fn saved(path: &Path) -> Project {
     Project::open(path).expect("the saved project opens")
 }
 
-/// `id`'s Z-Map as a saved project materializes it.
-fn saved_map(path: &Path, id: &str, name: &str) -> Vec<u16> {
-    let mut project = saved(path);
-    let checkpoint = project
+/// `id`'s Z-Map blob in the saved project.
+fn saved_zmap_blob(path: &Path, id: &str) -> String {
+    saved(path)
         .history()
         .get(id)
         .expect("the checkpoint is saved")
-        .clone();
-    let out = common::tree(name).join("zmap.tif");
-    project::materialize_zmap(&mut project, &checkpoint, &out).expect("the Z-Map materializes");
-    read_whole_zmap(&out)
+        .zmap_blob
+        .clone()
 }
 
 fn saved_ids(path: &Path) -> Vec<String> {
@@ -6411,6 +6408,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     open_fused_tab(&mut controller, "auto_checkpoint_new_frames", 2);
     paint(&mut controller, 20);
     let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
     let path = save_to_proposed(&mut controller);
 
     let project = saved(&path);
@@ -6426,10 +6424,8 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
         1,
         "the automatic checkpoint carries the stroke"
     );
-    assert_eq!(
-        saved_map(&path, &child.id, "auto_checkpoint_new_map"),
-        painted
-    );
+    assert_eq!(child.ops, painted_ops);
+    assert_eq!(child.zmap_blob, root.zmap_blob, "the fused ancestor's map");
     assert_eq!(current_row(&controller), Some(child.id.clone()));
     let session = controller.edit_session().expect("the session survives");
     assert_eq!(
@@ -6447,6 +6443,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     common::enter_editor(&mut controller);
     paint(&mut controller, 40);
     let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
     assert!(controller.save_enabled());
     assert!(controller.save_active_project(|_| None));
 
@@ -6456,10 +6453,8 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
         Some(chain[0].as_str()),
         "not the head"
     );
-    assert_eq!(
-        saved_map(&path, &added.id, "auto_checkpoint_older_map"),
-        painted
-    );
+    assert_eq!(added.ops, painted_ops);
+    assert_eq!(added.zmap_blob, saved_zmap_blob(&path, &chain[0]));
     assert_eq!(current_row(&controller), Some(added.id));
     let session = controller.edit_session().expect("the session survives");
     assert_eq!(
@@ -6632,7 +6627,7 @@ fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
     common::enter_editor(&mut controller);
     assert!(controller.queue_checkpoint_delete(&chain[2]));
     paint(&mut controller, 50);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
     assert!(controller.save_active_project(|_| None));
 
     let project = saved(&path);
@@ -6644,8 +6639,8 @@ fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
     assert_eq!(project.history().all().len(), 4);
     let added = project.checkpoint().clone();
     assert_eq!(added.parent.as_deref(), Some(chain[2].as_str()));
-    assert!(!added.ops.is_empty(), "an op list over the hidden row");
-    assert_eq!(saved_map(&path, &added.id, "deleted_origin_map"), painted);
+    assert_eq!(added.ops, painted_ops, "an op list over the hidden row");
+    assert_eq!(added.zmap_blob, saved_zmap_blob(&path, &chain[0]));
     assert_eq!(current_row(&controller), Some(added.id));
     assert_eq!(controller.edit_session().unwrap().op_count(), 0);
 }

@@ -16,6 +16,7 @@ use focusforge_core::align::{Registration, WarpingReader};
 use focusforge_core::equalize::{Equalization, GainReader};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, frame_paths, open_frame_set};
 use focusforge_core::params::ParamValues;
+use focusforge_core::project::container::Index;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
@@ -497,24 +498,188 @@ fn stroke_over_raw_frames() {
     assert_eq!(read_tiff(&view), read_tiff(&export), "view equals export");
 }
 
+/// `id` rendered whole.
+fn render_state(project_path: &Path, id: &str) -> Vec<u16> {
+    let mut project = Project::open(project_path).unwrap();
+    let image = CheckpointImage::prepare(&project, id).unwrap();
+    render_tiled(&image, &mut project, 32)
+}
+
 #[test]
-fn an_op_that_is_no_stroke_is_refused_with_its_position() {
-    let (_, project_path, root, _) = gained_pair("retouch_ops_refused");
-    let ops = vec![
-        stroke(1, &[(10, 10)], 4.0, 0.0),
-        Op::ResetRegion {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 8,
-            },
-        },
+fn states_undo_branch_and_name() {
+    let (_, project_path, root, sources) = gained_pair("retouch_ops_states");
+    let strokes = [
+        stroke(1, &[(10, 10), (20, 14)], 6.0, 0.0),
+        stroke(1, &[(30, 24), (40, 30)], 8.0, 0.5),
+        // Starts outside the image and leaves it again.
+        stroke(1, &[(-12, 40), (20, 44), (80, 40)], 7.0, 0.3),
     ];
-    let edited = append(&project_path, &root, ops);
+    let mut states = vec![root.clone()];
+    for (k, op) in strokes.iter().enumerate() {
+        let label = (k == 1).then(|| "second".to_string());
+        let sealed = project::append_ops_onto(
+            &project_path,
+            states.last().unwrap(),
+            vec![op.clone()],
+            label,
+            1 + k as i64,
+        )
+        .expect("the stroke must append");
+        states.push(sealed.checkpoint);
+    }
+
+    let composite = composite_pattern((WIDTH * HEIGHT * SPP) as usize);
+    let registration = Project::open(&project_path)
+        .unwrap()
+        .fuse_state(&root)
+        .unwrap()
+        .registration;
+    let set = open_frame_set(&sources, HostBudget::explicit(1 << 30)).unwrap();
+    let gained = GainReader::new(&*set.reader, registration.gains());
+    let warping = WarpingReader::new(
+        &gained,
+        set.reader.dimensions(),
+        SPP,
+        registration.transforms(sources.len()),
+    );
+    let expected = |ops: &[Op]| {
+        reference_blend(
+            &composite,
+            (WIDTH, HEIGHT, SPP),
+            sources.len() as u32,
+            ops,
+            &warping,
+            registration.origin(),
+        )
+    };
+    let before: Vec<Vec<u16>> = states
+        .iter()
+        .map(|id| render_state(&project_path, id))
+        .collect();
+    for (k, rendered) in before.iter().enumerate() {
+        assert_eq!(rendered, &expected(&strokes[..k]), "state {k}");
+    }
+    assert_ne!(before[0], before[1], "a stroke changes the image");
+
+    let branch = project::append_ops_onto(
+        &project_path,
+        &states[1],
+        vec![strokes[2].clone()],
+        Some("branch".to_string()),
+        9,
+    )
+    .expect("a stroke under an older state must append")
+    .checkpoint;
+
     let project = Project::open(&project_path).unwrap();
-    match CheckpointImage::prepare(&project, &edited) {
-        Err(ProjectError::Op { index: 1, .. }) => {}
-        other => panic!("expected op #1 to be refused, got {:?}", other.err()),
+    let history = project.history();
+    let listed: Vec<&str> = history.visible().iter().map(|c| c.id.as_str()).collect();
+    for id in states.iter().chain([&branch]) {
+        assert!(listed.contains(&id.as_str()), "{id} stays listed");
+    }
+    let mut under_first: Vec<&str> = history
+        .children(&states[1])
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    under_first.sort_unstable();
+    let mut both = vec![states[2].as_str(), branch.as_str()];
+    both.sort_unstable();
+    assert_eq!(under_first, both, "the branch sits beside state 2");
+    assert_eq!(
+        history.get(&states[2]).unwrap().label.as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        history.get(&branch).unwrap().label.as_deref(),
+        Some("branch")
+    );
+    let root_blob = history.get(&root).unwrap().zmap_blob.clone();
+    for id in &states[1..] {
+        assert_eq!(history.get(id).unwrap().zmap_blob, root_blob, "{id}");
+    }
+    assert_eq!(history.get(&branch).unwrap().zmap_blob, root_blob);
+    drop(project);
+
+    for (k, id) in states.iter().enumerate() {
+        assert_eq!(
+            render_state(&project_path, id),
+            before[k],
+            "state {k} renders unchanged after the branch"
+        );
+    }
+    assert_eq!(
+        render_state(&project_path, &branch),
+        expected(&[strokes[0].clone(), strokes[2].clone()]),
+        "the branch renders its own prefix"
+    );
+}
+
+/// Names of the blob records the project file lists.
+fn blob_entries(project_path: &Path) -> Vec<String> {
+    Index::read(project_path)
+        .unwrap()
+        .names()
+        .filter(|name| name.starts_with("blobs/"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn stroke_append_costs_kilobytes() {
+    let (_, project_path, root, _) = gained_pair("retouch_ops_cost");
+    let path: Vec<(i32, i32)> = (0..64).map(|i| (i % 60, 8 + i % 30)).collect();
+    let before_blobs = blob_entries(&project_path);
+    let before_manifest = Project::open(&project_path)
+        .unwrap()
+        .manifest()
+        .blobs
+        .clone();
+    let before_len = std::fs::metadata(&project_path).unwrap().len();
+
+    let edited = append(&project_path, &root, vec![stroke(1, &path, 4.0, 0.2)]);
+
+    assert_eq!(blob_entries(&project_path), before_blobs, "no blob record");
+    let project = Project::open(&project_path).unwrap();
+    assert_eq!(project.manifest().blobs, before_manifest, "manifest blobs");
+    let (_, record_len) = Index::read(&project_path)
+        .unwrap()
+        .get(&format!("checkpoints/{edited}.json"))
+        .expect("the checkpoint record is indexed");
+    assert!(record_len < 2048, "the record takes {record_len} bytes");
+    let growth = std::fs::metadata(&project_path).unwrap().len() - before_len;
+    assert!(growth < 64 * 1024, "the file grew by {growth} bytes");
+}
+
+#[test]
+fn append_refuses_bad_ops_and_writes_nothing() {
+    let (_, project_path, root, _) = gained_pair("retouch_ops_refused");
+    let staging = project_path.with_file_name("synthetic.ffp.ops-staging");
+    let good = stroke(1, &[(10, 10)], 4.0, 0.0);
+    let reset = Op::ResetRegion {
+        rect: Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        },
+    };
+    let cases = [
+        (vec![good.clone(), stroke(2, &[(10, 10)], 4.0, 0.0)], 1),
+        (vec![reset.clone()], 0),
+        (vec![good, reset], 1),
+    ];
+    let bytes = std::fs::read(&project_path).unwrap();
+    for (ops, at) in cases {
+        match project::append_ops_onto(&project_path, &root, ops, None, 1) {
+            Err(ProjectError::Op { index, .. }) => assert_eq!(index, at),
+            other => panic!("expected op #{at} to be refused, got {:?}", other.err()),
+        }
+        assert_eq!(
+            std::fs::read(&project_path).unwrap(),
+            bytes,
+            "file untouched"
+        );
+        assert!(!staging.exists(), "no staging directory is left");
     }
 }

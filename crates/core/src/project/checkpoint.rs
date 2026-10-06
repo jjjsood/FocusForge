@@ -71,17 +71,20 @@ impl Checkpoint {
         Self::derive(None, stack_fingerprint, zmap_blob, created_at)
     }
 
-    /// `blake3(parent ‖ stack_fingerprint ‖ zmap_blob ‖ created_at)`,
+    /// `blake3(parent ‖ stack_fingerprint ‖ content ‖ created_at)`,
     /// hex-truncated to 32 characters -- the parent is folded into the hash
     /// so appending onto unchanged sources within the same wall-clock second
     /// still derives an id distinct from the checkpoint it is parented on.
+    /// `content` is the Z-Map blob hash of a fused checkpoint, and the hash
+    /// of its ops' JSON for an op checkpoint, which names its fused
+    /// ancestor's Z-Map and so cannot tell two branches apart by it.
     pub fn derive_child_id(
         parent: &str,
         stack_fingerprint: &str,
-        zmap_blob: &str,
+        content: &str,
         created_at: i64,
     ) -> String {
-        Self::derive(Some(parent), stack_fingerprint, zmap_blob, created_at)
+        Self::derive(Some(parent), stack_fingerprint, content, created_at)
     }
 
     fn derive(

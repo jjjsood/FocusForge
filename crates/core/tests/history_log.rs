@@ -2,21 +2,17 @@
 
 //! Sealing a non-empty op list as a checkpoint: reading it back with every
 //! op and field intact, the append-only property over a checkpoint carrying
-//! a field this build does not know, the stored Z-Map blob matching an
-//! independent replay of the parent's map, and a reset after an op-bearing
-//! head resolving its fused ancestor from disk.
+//! a field this build does not know, and the checkpoint naming its fused
+//! ancestor's Z-Map with no blob of its own.
 
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::{Registration, Transform};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
-use focusforge_core::project::{
-    self, AlignRecord, Metrics, Op, Point, Project, SealRequest, materialize_zmap,
-};
-use focusforge_core::retouch::replay;
+use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, Project, SealRequest};
 use focusforge_core::tile::Rect;
-use focusforge_core::zmap::{ZMapInfo, ZMapReader};
+use focusforge_core::zmap::ZMapInfo;
 
 /// A width that differs from `project_append.rs`'s own fixture size, so the
 /// two suites' helpers cannot be mistaken for one another.
@@ -215,7 +211,7 @@ fn inject_unknown_field(path: &Path, entry_name: &str) {
     std::fs::rename(&rewritten, path).unwrap();
 }
 
-fn one_of_each_replayable_variant() -> Vec<Op> {
+fn two_strokes() -> Vec<Op> {
     vec![
         Op::BrushStroke {
             source_id: 2,
@@ -223,13 +219,11 @@ fn one_of_each_replayable_variant() -> Vec<Op> {
             radius: 3.5,
             softness: 0.25,
         },
-        Op::ResetRegion {
-            rect: Rect {
-                x: 1,
-                y: 1,
-                width: 4,
-                height: 3,
-            },
+        Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 5, y: 2 }],
+            radius: 2.0,
+            softness: 0.0,
         },
     ]
 }
@@ -249,7 +243,7 @@ fn checkpoint_with_ops_round_trips() {
         std::fs::remove_file(source).unwrap();
     }
 
-    let ops = one_of_each_replayable_variant();
+    let ops = two_strokes();
     let sealed_ops = project::append_ops(&project_path, ops.clone(), Some("edit".to_string()))
         .expect("append_ops must succeed with the project's source frames deleted");
 
@@ -267,18 +261,19 @@ fn checkpoint_with_ops_round_trips() {
         .iter()
         .filter(|e| !entries_before.contains(e))
         .collect();
-    let new_blobs: Vec<&&String> = new_entries
-        .iter()
-        .filter(|e| e.starts_with("blobs/"))
-        .collect();
-    assert_eq!(
-        new_blobs.len(),
-        1,
-        "exactly one new blob (the Z-Map, no composite) must be added: {new_entries:?}"
-    );
     assert!(
-        new_blobs[0].ends_with(&format!("{}.zst", sealed_ops.zmap.hash)),
-        "the one new blob must be the sealed Z-Map: {new_blobs:?}"
+        new_entries.iter().all(|e| !e.starts_with("blobs/")),
+        "an op append writes no blob: {new_entries:?}"
+    );
+    assert_eq!(
+        sealed_ops.zmap.hash,
+        Project::open(&project_path)
+            .unwrap()
+            .history()
+            .get(&head_id)
+            .unwrap()
+            .zmap_blob,
+        "the op checkpoint names its fused ancestor's Z-Map"
     );
 }
 
@@ -294,8 +289,7 @@ fn sealing_a_checkpoint_mutates_no_existing_entry() {
     inject_unknown_field(&project_path, &format!("checkpoints/{head_id}.json"));
     let before = read_all_entries(&project_path);
 
-    project::append_ops(&project_path, one_of_each_replayable_variant(), None)
-        .expect("append_ops must succeed");
+    project::append_ops(&project_path, two_strokes(), None).expect("append_ops must succeed");
 
     let after = read_all_entries(&project_path);
     for (name, bytes) in before.iter().filter(|(name, _)| *name != "manifest.json") {
@@ -364,8 +358,7 @@ fn alignment_and_crop_are_recorded() {
     assert_eq!(manifest.registration.crop, Some(full(10, 8)));
 
     // `append_ops` carries both forward, unchanged.
-    project::append_ops(&project_path, one_of_each_replayable_variant(), None)
-        .expect("append_ops must succeed");
+    project::append_ops(&project_path, two_strokes(), None).expect("append_ops must succeed");
     let after = Project::open(&project_path).unwrap().manifest().clone();
     assert_eq!(after.align, manifest.align);
     assert_eq!(after.registration, manifest.registration);
@@ -375,125 +368,4 @@ fn alignment_and_crop_are_recorded() {
     value.as_object_mut().unwrap().remove("registration");
     let err = serde_json::from_value::<focusforge_core::project::Manifest>(value).unwrap_err();
     assert!(err.to_string().contains("registration"), "{err}");
-}
-
-/// Reads a checkpoint's Z-Map blob into a full-map index buffer.
-fn read_full_zmap(
-    project: &mut Project,
-    checkpoint: &project::Checkpoint,
-    path: &Path,
-) -> Vec<u16> {
-    materialize_zmap(project, checkpoint, path).expect("materialize_zmap must succeed");
-    let reader = ZMapReader::open(path).expect("the materialized Z-Map must open");
-    let info = ZMapInfo::new(W, H, FRAMES).unwrap();
-    let mut indices = vec![0u16; info.tile_len(full(W, H))];
-    reader
-        .read_tile_into(full(W, H), &mut indices)
-        .expect("reading the full map must succeed");
-    indices
-}
-
-#[test]
-fn append_ops_zmap_blob_matches_a_replay_of_the_parents_map() {
-    let (dir, project_path, _sources) = sealed("history_log_matches_replay");
-    let mut project = Project::open(&project_path).unwrap();
-    let parent = project.checkpoint().clone();
-    let parent_indices = read_full_zmap(&mut project, &parent, &dir.join("parent-zmap.tif"));
-
-    let info = ZMapInfo::new(W, H, FRAMES).unwrap();
-    let full_rect = full(W, H);
-    let ops = one_of_each_replayable_variant();
-    let mut expected = parent_indices.clone();
-    let mut fused_from_parent =
-        |rect: Rect, buf: &mut [u16]| -> Result<(), focusforge_core::zmap::ZMapError> {
-            for row in 0..rect.height {
-                let src = ((rect.y + row) * info.width() + rect.x) as usize;
-                let dst = (row * rect.width) as usize;
-                buf[dst..dst + rect.width as usize]
-                    .copy_from_slice(&parent_indices[src..src + rect.width as usize]);
-            }
-            Ok(())
-        };
-    replay::replay(&ops, info, full_rect, &mut expected, &mut fused_from_parent)
-        .expect("in-memory replay must succeed");
-
-    project::append_ops(&project_path, ops, None).expect("append_ops must succeed");
-
-    let mut reopened = Project::open(&project_path).unwrap();
-    let head = reopened.checkpoint().clone();
-    let actual = read_full_zmap(&mut reopened, &head, &dir.join("head-zmap.tif"));
-
-    assert_eq!(
-        actual, expected,
-        "the Z-Map blob append_ops wrote must match an independent replay of the parent's map"
-    );
-}
-
-#[test]
-fn append_ops_reset_after_ops_resolves_the_fused_ancestor_from_disk() {
-    let (dir, project_path, _sources) = sealed("history_log_reset_after_ops");
-    let mut project = Project::open(&project_path).unwrap();
-    let fused_root = project.checkpoint().clone();
-    let fused_indices = read_full_zmap(&mut project, &fused_root, &dir.join("fused-zmap.tif"));
-
-    let info = ZMapInfo::new(W, H, FRAMES).unwrap();
-    let brush_rect = Rect {
-        x: 2,
-        y: 2,
-        width: 6,
-        height: 5,
-    };
-    let brush = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 4, y: 4 }],
-        radius: 3.0,
-        softness: 0.0,
-    };
-    project::append_ops(&project_path, vec![brush], None)
-        .expect("the first append_ops (brush, onto the fused root) must succeed");
-
-    let mut after_brush = Project::open(&project_path).unwrap();
-    let brushed = after_brush.checkpoint().clone();
-    assert!(
-        !brushed.ops.is_empty(),
-        "the head must now carry the brush op"
-    );
-    let brushed_indices = read_full_zmap(&mut after_brush, &brushed, &dir.join("brushed-zmap.tif"));
-    let region = |indices: &[u16], rect: Rect| -> Vec<u16> {
-        let mut out = Vec::with_capacity(info.tile_len(rect));
-        for row in 0..rect.height {
-            let start = ((rect.y + row) * info.width() + rect.x) as usize;
-            out.extend_from_slice(&indices[start..start + rect.width as usize]);
-        }
-        out
-    };
-    assert_ne!(
-        region(&brushed_indices, brush_rect),
-        region(&fused_indices, brush_rect),
-        "the brush must actually change its region before the reset undoes it"
-    );
-
-    let reset_rect = Rect {
-        x: 3,
-        y: 3,
-        width: 3,
-        height: 3,
-    };
-    project::append_ops(
-        &project_path,
-        vec![Op::ResetRegion { rect: reset_rect }],
-        None,
-    )
-    .expect("the second append_ops (reset, onto an op-bearing head) must succeed");
-
-    let mut final_project = Project::open(&project_path).unwrap();
-    let final_head = final_project.checkpoint().clone();
-    let final_indices =
-        read_full_zmap(&mut final_project, &final_head, &dir.join("final-zmap.tif"));
-
-    assert_eq!(
-        region(&final_indices, reset_rect),
-        region(&fused_indices, reset_rect),
-        "the reset must restore the fused root's indices, not the op-bearing parent's"
-    );
 }

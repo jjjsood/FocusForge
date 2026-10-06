@@ -362,24 +362,29 @@ fn apply_and_seal_creates_a_child() {
     // The root's own checkpoint entry is unchanged.
     assert_eq!(root_checkpoint_before, read_checkpoint(&project, &root));
 
-    // The sealed child's own map equals what the unsaved `-o` run wrote.
-    let materialized = dir.join("materialized-child.tif");
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "materialize",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &child_id,
-            "-o",
-            materialized.to_str().unwrap(),
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
+    // The sealed child is a record only: its map is its fused ancestor's.
+    let materialize = |checkpoint: &str, out: &Path| {
+        let output = run(
+            &dir,
+            &[
+                "history",
+                "materialize",
+                project.to_str().unwrap(),
+                "--checkpoint",
+                checkpoint,
+                "-o",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert!(output.success, "stderr: {}", output.stderr);
+    };
+    let child_map = dir.join("materialized-child.tif");
+    let root_map = dir.join("materialized-root.tif");
+    materialize(&child_id, &child_map);
+    materialize(&root, &root_map);
     assert_eq!(
-        std::fs::read(&materialized).unwrap(),
-        std::fs::read(&unsaved_out).unwrap()
+        std::fs::read(&child_map).unwrap(),
+        std::fs::read(&root_map).unwrap()
     );
 }
 

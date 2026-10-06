@@ -609,8 +609,8 @@ fn delete_appends_hide_record() {
         assert!(new.get(&format!("checkpoints/{id}.json")).is_none());
     }
     assert!(
-        dropped.iter().any(|(name, _)| name.starts_with("blobs/")),
-        "the Z-Map blobs only the dropped checkpoints used stay indexed: {dropped:?}"
+        dropped.iter().all(|(name, _)| !name.starts_with("blobs/")),
+        "both op checkpoints name the root's Z-Map, so no blob is dropped: {dropped:?}"
     );
     let dropped_len: u64 = dropped.iter().map(|&(_, len)| len).sum();
     assert!(

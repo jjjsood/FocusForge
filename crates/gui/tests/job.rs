@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, Point, Project};
+use focusforge_core::project::{self, Op, Point, Project};
 use focusforge_core::registry;
-use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
 use focusforge_gui::job;
@@ -4198,7 +4198,7 @@ fn save_and_close_seals_unsaved_ops() {
         .expect("the older row is listed");
     c.select_checkpoint_row(row);
     paint_strokes(&mut c, 2);
-    let live = c.edit_session().unwrap().indices().to_vec();
+    let live: Vec<Op> = c.edit_session().unwrap().ops().cloned().collect();
 
     c.request_close(0);
     assert!(c.pending_close().is_some());
@@ -4218,21 +4218,14 @@ fn save_and_close_seals_unsaved_ops() {
     );
     assert_eq!(added.2, 2);
 
-    let mut project = Project::open(&path).unwrap();
-    let checkpoint = project.history().get(&added.0).unwrap().clone();
-    let out = common::tree("save_close_seals_out").join("zmap.ffz");
-    project::materialize_zmap(&mut project, &checkpoint, &out).unwrap();
-    let reader = ZMapReader::open(&out).unwrap();
-    let info = reader.info();
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width: info.width(),
-        height: info.height(),
-    };
-    let mut saved = vec![0u16; info.tile_len(whole)];
-    reader.read_tile_into(whole, &mut saved).unwrap();
-    assert_eq!(saved, live);
+    let project = Project::open(&path).unwrap();
+    let checkpoint = project.history().get(&added.0).unwrap();
+    assert_eq!(checkpoint.ops, live, "the painted strokes are the record");
+    assert_eq!(
+        checkpoint.zmap_blob,
+        project.history().get(&root).unwrap().zmap_blob,
+        "the record names its fused ancestor's Z-Map"
+    );
 }
 
 #[test]

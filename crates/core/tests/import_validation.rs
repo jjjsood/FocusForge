@@ -347,13 +347,33 @@ fn verification_is_lazy_but_never_skipped() {
         .zmap_blob
         .clone();
 
-    let mid = project::append_ops_at(
-        &project_path,
-        vec![stroke(1, 5, 5, 1.0)],
-        None,
-        1_700_000_000,
-    )
-    .expect("middle append must succeed");
+    // A re-fuse in the middle, so the head's op checkpoint names its map
+    // and the root's stays off the head's own path.
+    let staging = dir.join("mid-staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (mid_composite, mid_zmap) = stage_planes(&staging, 512, 512, 8);
+    let sources: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            common::mantis_512_dir()
+                .join("frames")
+                .join(format!("{i:02}.tif"))
+        })
+        .collect();
+    let values = params();
+    let mid = project::append(AppendRequest {
+        project_path: &project_path,
+        staged_composite: &mid_composite,
+        staged_zmap: &mid_zmap,
+        sources: &sources,
+        algorithm: "laplacian",
+        params: &values,
+        align: None,
+        registration: Registration::default(),
+        composite_description: "re-fused composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("middle re-fuse must succeed");
 
     let ops = vec![Op::BrushStroke {
         source_id: 3,
@@ -394,14 +414,11 @@ fn verification_is_lazy_but_never_skipped() {
         !verified.contains(&root_zmap_hash),
         "the untouched root Z-Map must not have been hashed"
     );
-    assert!(
-        !verified.contains(&mid.zmap.hash),
-        "the middle checkpoint's Z-Map must not have been hashed"
-    );
+    assert_eq!(sealed_ops.zmap.hash, mid.zmap.hash);
     assert_eq!(
         verified,
-        HashSet::from([sealed_ops.zmap.hash.clone()]),
-        "verified_blobs must be exactly the head's own Z-Map"
+        HashSet::from([mid.zmap.hash.clone()]),
+        "verified_blobs must be exactly the Z-Map the head names"
     );
 
     let root_checkpoint = project.history().get(&root_id).unwrap().clone();

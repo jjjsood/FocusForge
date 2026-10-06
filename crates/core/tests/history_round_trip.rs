@@ -2,8 +2,8 @@
 
 //! Random op sequences over synthetic Z-Maps are sealed, branched and deleted
 //! through both project writers; after reopening the file, every checkpoint
-//! must materialize to the map an in-memory model computed. The model replays
-//! over plain `Vec<u16>` maps and shares nothing with the container. A failing
+//! must materialize to the map an in-memory model computed. The model holds
+//! plain `Vec<u16>` maps and shares nothing with the container. A failing
 //! case prints its shrunk action list; no failure file is kept.
 
 use std::collections::BTreeSet;
@@ -17,7 +17,6 @@ use focusforge_core::project::{
     self, BlobKind, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef, Point, Project,
     SealRequest,
 };
-use focusforge_core::retouch::replay;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -149,8 +148,7 @@ fn start(label: &str, g: Geometry, salt: u32) -> (PathBuf, PathBuf, Model) {
     )
     .expect("seal must succeed");
     let root_id = Project::open(&path).unwrap().checkpoint().id.clone();
-    let info = ZMapInfo::new(g.w, g.h, g.frames).unwrap();
-    let model = Model::new(info, root_id, zmap_noisy(g.w, g.h, g.frames, salt));
+    let model = Model::new(root_id, zmap_noisy(g.w, g.h, g.frames, salt));
     (dir, path, model)
 }
 
@@ -188,22 +186,8 @@ fn brush_stroke(g: Geometry) -> BoxedStrategy<Op> {
         .boxed()
 }
 
-fn reset_region(g: Geometry) -> BoxedStrategy<Op> {
-    (0..g.w, 0..g.h)
-        .prop_flat_map(move |(x, y)| (Just(x), Just(y), 1..=g.w - x, 1..=g.h - y))
-        .prop_map(|(x, y, width, height)| Op::ResetRegion {
-            rect: Rect {
-                x,
-                y,
-                width,
-                height,
-            },
-        })
-        .boxed()
-}
-
 fn ops_list(g: Geometry) -> BoxedStrategy<Vec<Op>> {
-    vec(prop_oneof![brush_stroke(g), reset_region(g)], 1..=3).boxed()
+    vec(brush_stroke(g), 1..=3).boxed()
 }
 
 /// One step of a generated history. Picks index the model's visible nodes in
@@ -294,19 +278,17 @@ enum Step {
     Delete { node: usize, removed: Vec<usize> },
 }
 
-/// Mirrors the project's seal, hide and collect rules over plain maps. A
-/// `ResetRegion` resolves against the root's map: the history holds no
-/// re-fuse.
+/// Mirrors the project's seal, hide and collect rules over plain maps. Every
+/// op node materializes the root's map: an op checkpoint names its fused
+/// ancestor's, and the history holds no re-fuse.
 struct Model {
-    info: ZMapInfo,
     nodes: Vec<Node>,
     steps: Vec<Step>,
 }
 
 impl Model {
-    fn new(info: ZMapInfo, root_id: String, root_map: Vec<u16>) -> Self {
+    fn new(root_id: String, root_map: Vec<u16>) -> Self {
         Model {
-            info,
             nodes: vec![Node {
                 id: root_id,
                 parent: None,
@@ -326,25 +308,7 @@ impl Model {
 
     /// Seals `ops` under `parent`, returning the new node.
     fn seal(&mut self, parent: usize, ops: Vec<Op>) -> usize {
-        let whole = full(self.info.width(), self.info.height());
-        let width = self.info.width() as usize;
-        let root = &self.nodes[0].map;
-        let mut map = self.nodes[parent].map.clone();
-        replay::replay(
-            &ops,
-            self.info,
-            whole,
-            &mut map,
-            &mut |rect: Rect, buf: &mut [u16]| {
-                for row in 0..rect.height as usize {
-                    let from = (rect.y as usize + row) * width + rect.x as usize;
-                    let len = rect.width as usize;
-                    buf[row * len..(row + 1) * len].copy_from_slice(&root[from..from + len]);
-                }
-                Ok(())
-            },
-        )
-        .expect("a generated op is valid by construction");
+        let map = self.nodes[0].map.clone();
         let node = self.nodes.len();
         self.nodes.push(Node {
             id: String::new(),
