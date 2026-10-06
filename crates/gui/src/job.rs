@@ -1034,6 +1034,8 @@ struct Recomposites {
 /// with it.
 pub struct EditState {
     pub session: EditSession,
+    /// The stored Z-Map of the row being edited, read-only.
+    zmap: ZMapReader,
     pub sources: Arc<dyn FrameReader>,
     pub registration: Registration,
     /// The composite the edits are blended over.
@@ -1154,12 +1156,40 @@ fn blend_region(
 }
 
 impl EditState {
+    /// The stored Z-Map's shape.
+    pub fn info(&self) -> ZMapInfo {
+        self.zmap.info()
+    }
+
+    /// The stored Z-Map's index at pixel (`x`, `y`); `None` outside the map or
+    /// when the read fails.
+    pub fn stored_source(&self, x: u32, y: u32) -> Option<u16> {
+        let info = self.info();
+        if x >= info.width() || y >= info.height() {
+            return None;
+        }
+        let mut index = [0u16; 1];
+        let pixel = Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        };
+        match self.zmap.read_tile_into(pixel, &mut index) {
+            Ok(()) => Some(index[0]),
+            Err(error) => {
+                tracing::warn!(%error, x, y, "stored Z-Map read failed");
+                None
+            }
+        }
+    }
+
     fn render_input(&self) -> RenderInput {
         RenderInput {
             base: Arc::clone(&self.base),
             sources: Arc::clone(&self.sources),
             registration: self.registration.clone(),
-            info: self.session.info(),
+            info: self.info(),
             samples_per_pixel: self.sources.frame(0).samples_per_pixel as usize,
         }
     }
@@ -1195,7 +1225,7 @@ impl EditState {
     }
 
     /// Queues `job` for a worker and bumps the tiles' generation, so the
-    /// Z-Map pane shows the changed indices at once. Jobs queued while a
+    /// repaint picks the region up. Jobs queued while a
     /// worker holds a batch go out together when it is installed, rendered
     /// in queue order; `wake` runs on the worker once a batch is parked.
     pub fn queue_recomposite(&mut self, job: Recomposite, wake: &RecompositeWake) {
@@ -1344,6 +1374,7 @@ pub fn open_edit_session(
     );
     let mut edit = EditState {
         session,
+        zmap: reader,
         sources,
         registration,
         base,

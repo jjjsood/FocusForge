@@ -2126,7 +2126,7 @@ mod preparing {
 use std::num::NonZeroU32;
 
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
-use focusforge_gui::canvas::{ResidentTiles, overlay_edited, step_copy};
+use focusforge_gui::canvas::{ResidentTiles, overlay_edited};
 
 const MAP: u32 = 64;
 const FRAMES: usize = 3;
@@ -2172,47 +2172,6 @@ fn region_samples(plane: &[u16], region: Rect) -> Vec<u16> {
 
 fn contains(r: Rect, x: u32, y: u32) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-}
-
-#[test]
-fn step_copy_matches_the_files_decimated_read() {
-    let (width, height) = (37u32, 29u32);
-    let plane: Vec<u16> = (0..width * height).map(|i| (i * 7 % 1013) as u16).collect();
-    let path = common::tree("step_copy_plane").join("plane.tif");
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let spec = TiffSpec {
-        width,
-        height,
-        samples_per_pixel: 1,
-        description: None,
-    };
-    let mut writer = TiffWriter::create(&path, spec).unwrap();
-    writer.write_tile(whole, &plane).unwrap();
-    writer.finish().unwrap();
-    let stack = TiffStack::open_files(&[path]).unwrap();
-
-    let rect = Rect {
-        x: 3,
-        y: 5,
-        width: 22,
-        height: 17,
-    };
-    for step in [1u32, 3] {
-        let step = NonZeroU32::new(step).unwrap();
-        let len = (rect.width.div_ceil(step.get()) * rect.height.div_ceil(step.get())) as usize;
-        let mut from_file = vec![0u16; len];
-        stack
-            .read_tile_step_into(0, rect, step, &mut from_file)
-            .unwrap();
-        let mut from_memory = vec![u16::MAX; len];
-        step_copy(&plane, width, rect, step, &mut from_memory);
-        assert_eq!(from_memory, from_file, "step {step}");
-    }
 }
 
 #[test]

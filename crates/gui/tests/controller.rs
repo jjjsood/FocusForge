@@ -1398,7 +1398,8 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
     };
     controller.set_pane_geometry(left, right);
     let map = map_rect(&controller);
-    let values = indices(&controller);
+    let zmap = controller.held_checkpoints().last().unwrap().zmap.clone();
+    let values = read_whole_zmap(&zmap);
     let current = controller.brush_source().unwrap();
     let (x, y, expected) = (0..map.height)
         .flat_map(|y| (0..map.width).map(move |x| (x, y)))
@@ -3283,7 +3284,7 @@ use std::num::NonZeroU32;
 
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::retouch::blend;
-use focusforge_core::retouch::{EditSession, apply, footprint};
+use focusforge_core::retouch::{EditSession, footprint};
 use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
 use focusforge_gui::brush::LiveStroke;
 use focusforge_gui::canvas::overlay_edited;
@@ -4432,6 +4433,60 @@ fn pipette_reads_and_appends_nothing() {
 }
 
 #[test]
+fn pipette_reads_the_stored_map() {
+    let (mut c, _) = open_editor("pipette_stored_map");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let stored = read_whole_zmap(&zmap);
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let (width, height) = (info.width(), info.height());
+    let (x, y, under) = (8..height - 8)
+        .flat_map(|y| (8..width - 8).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let source = stored[(y * width + x) as usize];
+            (source != NO_SOURCE).then_some((x, y, source))
+        })
+        .expect("the fused map names a source away from its edge");
+    let painter = (under + 1) % 3;
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.0);
+    c.select_frame(usize::from(painter));
+    let (px, py) = (x as f32, y as f32);
+    drag(&mut c, &[(px - 3.0, py), (px, py), (px + 3.0, py)]);
+    assert!(
+        matches!(
+            ops(&c)[..],
+            [Op::BrushStroke { source_id, .. }] if source_id == painter
+        ),
+        "a stroke from another frame covers the pixel"
+    );
+
+    let alt_click = |c: &mut AppController| {
+        let (sx, sy) = at(px, py);
+        c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+        c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+    };
+    alt_click(&mut c);
+    assert_eq!(
+        c.brush_source(),
+        Some(under),
+        "Alt + click reads the stored map under the stroke"
+    );
+
+    c.select_frame(usize::from(painter));
+    c.toggle_pipette();
+    let (sx, sy) = at(px, py);
+    c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+    assert_eq!(
+        c.brush_cursor_view().unwrap().pick_color,
+        job::source_color(under, c.frame_count().unwrap()),
+        "the armed cursor previews the stored source"
+    );
+    drag(&mut c, &[(px, py)]);
+    assert_eq!(c.brush_source(), Some(under), "the armed pick");
+    assert_eq!(ops(&c).len(), 1, "picking appends nothing");
+}
+
+#[test]
 fn held_alt_shows_the_pipette_cursor() {
     let (mut c, _) = open_editor("brush_alt_cursor");
     let hover = |c: &mut AppController, mods: Modifiers| {
@@ -5050,7 +5105,6 @@ fn live_stroke_previews_each_new_segment() {
     bind_softness_to_alt_wheel(&mut c);
     let before = session(&c);
     assert!(before.2, "one stroke waits on the redo stack");
-    let before_indices = indices(&c);
     let view = c.brush_toolbar_view();
     let (source, radius, softness) = (1u16, view.size / 2.0, view.soft / 100.0);
     let info = c.edit_session().unwrap().info();
@@ -5084,10 +5138,13 @@ fn live_stroke_previews_each_new_segment() {
             c.pointer_moved(sx, sy);
         }
         if k == 2 {
-            let held = indices(&c);
+            let held = sealed.displayed(&c);
             c.key(true, "z", CTRL);
             c.key(true, "z", CTRL_SHIFT);
-            assert_eq!(indices(&c), held, "undo/redo mid-drag change nothing");
+            assert!(
+                sealed.displayed(&c) == held,
+                "undo/redo mid-drag change nothing"
+            );
             assert_eq!(session(&c), before);
             c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
             c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
@@ -5104,18 +5161,6 @@ fn live_stroke_previews_each_new_segment() {
             c.take_recomposited(),
             region.into_iter().collect::<Vec<_>>(),
             "flush {k}: exactly the new segment's footprint, once"
-        );
-        let mut painted = before_indices.clone();
-        apply(
-            &stroke(rounded(&trace[..=end])),
-            info,
-            sealed.map,
-            &mut painted,
-        )
-        .unwrap();
-        assert!(
-            indices(&c) == painted,
-            "flush {k}: the preview paints the rounded trace so far"
         );
         let mut shown = sealed.expected(&before.1, info);
         sealed.blend_over(&mut shown, &stroke(rounded(&trace[..=end])), info);
@@ -5148,12 +5193,6 @@ fn live_stroke_previews_each_new_segment() {
         ops.last(),
         Some(&committed),
         "the frozen source, radius and softness"
-    );
-    let mut fresh = EditSession::new(info, sealed.map, before_indices).unwrap();
-    fresh.append(committed).unwrap();
-    assert!(
-        indices(&c) == fresh.indices(),
-        "a fresh session with that op"
     );
     sealed.assert_shown(&c, "after release");
 }
@@ -5640,7 +5679,7 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     set_size(&mut c, 12.0);
     c.select_frame(1);
 
-    // A live tick: the preview paints the indices, nothing is gathered yet.
+    // A live tick: queued for a worker, so nothing shows and nothing is gathered yet.
     let path: Vec<(f32, f32)> = (0..12)
         .map(|i| (8.0 + 3.0 * i as f32, 20.0 + i as f32))
         .collect();
@@ -5650,7 +5689,11 @@ fn a_stroke_recomposites_off_the_ui_thread() {
         c.pointer_moved(x, y);
     }
     c.flush_live_stroke();
-    assert_ne!(indices(&c), sealed.indices, "the tick painted at once");
+    assert!(ops(&c).is_empty(), "the tick records no op");
+    assert!(
+        sealed.displayed(&c) == sealed.composite,
+        "the tick shows nothing until a worker installs it"
+    );
     assert!(
         c.take_recomposited().is_empty(),
         "the tick gathered nothing"
@@ -5666,7 +5709,8 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     let info = c.edit_session().unwrap().info();
     let bbox = footprint(&ops(&c)[0], info).unwrap().unwrap();
     c.undo();
-    assert_eq!(indices(&c), sealed.indices, "the undo stepped at once");
+    assert!(ops(&c).is_empty(), "the undo stepped at once");
+    assert!(c.edit_session().unwrap().can_redo());
     assert!(
         c.take_recomposited().is_empty(),
         "the undo gathered nothing"
@@ -5803,7 +5847,7 @@ fn background_recomposite_matches_the_synchronous_one() {
         ops(&c),
     )
     .expect("a second session over the same frames opens");
-    assert_eq!(fresh.session.indices(), indices(&c).as_slice());
+    assert_eq!(fresh.stack_ops(), ops(&c), "the same op list");
     fresh.tiles.take_recomposited();
 
     let view = c.edited_view().unwrap();

@@ -1893,9 +1893,9 @@ impl AppController {
     }
 
     /// Discards the active tab's own in-progress stroke, if any: restores
-    /// its preview and drops it, so leaving the editor or switching tab
-    /// mid-drag never leaves a preview outstanding on a tab nobody is
-    /// drawing on anymore.
+    /// and re-renders the tiles its ticks touched without it, so leaving the
+    /// editor or switching tab mid-drag never leaves a half stroke on a tab
+    /// nobody is drawing on anymore.
     fn discard_live_stroke(&mut self) {
         let wake = self.recomposite_wake();
         let Some(tab) = self.state.active_mut() else {
@@ -1905,7 +1905,6 @@ impl AppController {
             return;
         };
         if let Some(stroke) = edit.stroke.take() {
-            edit.session.discard_preview();
             edit.end_drag(&stroke.tick_rects, Vec::new(), &wake);
         }
     }
@@ -1933,11 +1932,7 @@ impl AppController {
     /// before an edit session has opened.
     pub fn edited_view(&self) -> Option<crate::canvas::EditedView<'_>> {
         let edit = self.state.active()?.edit.as_ref()?;
-        Some(crate::canvas::EditedView {
-            indices: edit.session.indices(),
-            map_width: edit.session.tile().width,
-            tiles: &edit.tiles,
-        })
+        Some(crate::canvas::EditedView { tiles: &edit.tiles })
     }
 
     /// The bottom bar's overlay controls.
@@ -3052,13 +3047,7 @@ impl AppController {
             return None;
         }
         let (x, y) = (sx.floor() as u32, sy.floor() as u32);
-        let session = tab.edit.as_ref().map(|edit| &edit.session)?;
-        let tile = session.tile();
-        if x >= tile.width || y >= tile.height {
-            return None;
-        }
-        let idx = (y * tile.width + x) as usize;
-        session.indices().get(idx).copied()
+        tab.edit.as_ref()?.stored_source(x, y)
     }
 
     /// `Alt + click`, or the armed pipette's `Start`: reads the Z-Map index
@@ -3149,9 +3138,8 @@ impl AppController {
     }
 
     /// Called by every repaint before it reads anything else: takes the
-    /// active tab's live stroke's newest segment, if any, previews it on the
-    /// indices and queues exactly that segment's footprint for rendering into
-    /// the resident tiles -- the whole path so far blended over the pre-stroke
+    /// active tab's live stroke's newest segment, if any, and queues exactly
+    /// that segment's footprint for rendering into the resident tiles -- the whole path so far blended over the pre-stroke
     /// samples -- one tick per repaint, never per motion event. A no-op with
     /// no live stroke or no motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
@@ -3181,9 +3169,7 @@ impl AppController {
             radius,
             softness,
         };
-        let region = edit
-            .session
-            .preview(&op)
+        let region = job::footprint(&op, edit.info())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
         let Some(region) = region else {
             return;
@@ -3202,8 +3188,7 @@ impl AppController {
             .push(region);
     }
 
-    /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
-    /// appends the stroke's resampled path unless its footprint is empty or
+    /// `Paint`'s `End`: flushes remaining motion, then appends the stroke's resampled path unless its footprint is empty or
     /// off-image. Re-renders every resident tile the ticks or the appended
     /// stroke touched from its pre-stroke samples with the resampled path
     /// blended over them.
@@ -3217,7 +3202,6 @@ impl AppController {
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
-        edit.session.discard_preview();
         let Some(stroke) = edit.stroke.take() else {
             return;
         };

@@ -970,9 +970,9 @@ impl CanvasRenderer {
     /// the pane's image. `sealed_indices` is the sealed Z-Map over the same
     /// texels (empty when the job read none). `edited`, present on a job
     /// issued under an edit generation, overlays the composite with the
-    /// resident tiles' gathered pixel wherever its index differs and draws
-    /// the Z-Map pane from the edited indices; the job's own overlay blends
-    /// the rainbow over a three-sample composite. `None`, with nothing
+    /// resident tiles' gathered pixel wherever its index differs; the Z-Map
+    /// pane and the job's own overlay draw the stored map, the overlay
+    /// blending the rainbow over a three-sample composite. `None`, with nothing
     /// rendered or uploaded, when the job is stale -- issued before a source,
     /// plane or device change or before a newer job for the pane published --
     /// or when there is no device.
@@ -1014,34 +1014,7 @@ impl CanvasRenderer {
         };
         let step = job.draw.step;
         let edited = edited.filter(|_| job.state.generation.is_some());
-        let edited_indices = edited.map(|view| {
-            let mut out = vec![0u16; width as usize * height as usize];
-            crate::canvas::step_copy(view.indices, view.map_width, rect, step, &mut out);
-            out
-        });
         match job.pane {
-            Pane::ZMap => match edited_indices.as_deref() {
-                Some(indices) => texture.ensure_and_render(
-                    renderer,
-                    &device,
-                    &queue,
-                    width,
-                    height,
-                    indices,
-                    1,
-                    job.index_scale,
-                ),
-                None => texture.ensure_and_render(
-                    renderer,
-                    &device,
-                    &queue,
-                    width,
-                    height,
-                    samples,
-                    samples_per_pixel,
-                    job.index_scale,
-                ),
-            },
             Pane::Composite if !sealed_indices.is_empty() => {
                 let merged = edited.map(|view| {
                     let mut merged = samples.to_vec();
@@ -1055,10 +1028,15 @@ impl CanvasRenderer {
                     merged
                 });
                 let composite = merged.as_deref().unwrap_or(samples);
-                let indices = edited_indices.as_deref().unwrap_or(sealed_indices);
                 match &job.state.overlay {
                     Some(overlay) => texture.ensure_and_render_overlay(
-                        &device, &queue, width, height, composite, indices, overlay,
+                        &device,
+                        &queue,
+                        width,
+                        height,
+                        composite,
+                        sealed_indices,
+                        overlay,
                     ),
                     None => texture.ensure_and_render(
                         renderer,

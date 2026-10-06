@@ -940,13 +940,10 @@ impl ResidentTiles {
     }
 }
 
-/// The renderer's view of an open edit session: the whole map's edited
-/// indices (the Z-Map pane's pixels), the map's width (for indexing them),
-/// and the resident cache of edited composite samples.
+/// The renderer's view of an open edit session: the resident cache of
+/// edited composite samples.
 #[derive(Clone, Copy)]
 pub struct EditedView<'a> {
-    pub indices: &'a [u16],
-    pub map_width: u32,
     pub tiles: &'a ResidentTiles,
 }
 
@@ -983,30 +980,6 @@ fn read_job(job: PaneJob, mut samples: Vec<u16>, mut indices: Vec<u16>) -> Optio
             tracing::warn!(%error, pane = ?job.pane, "pane read failed");
             None
         }
-    }
-}
-
-/// Reads every `step`-th row and column of `rect` from an in-memory,
-/// single-sample-per-pixel `plane` (row-major, `plane_width` wide) into
-/// `out` -- the same decimation `TiffStack::read_tile_step_into` applies to
-/// an mmap'd file, applied here to a resident buffer instead.
-pub fn step_copy(plane: &[u16], plane_width: u32, rect: Rect, step: NonZeroU32, out: &mut [u16]) {
-    let step = step.get();
-    let out_w = rect.width.div_ceil(step);
-    let mut oy = 0u32;
-    let mut sy = rect.y;
-    while sy < rect.y + rect.height {
-        let mut ox = 0u32;
-        let mut sx = rect.x;
-        while sx < rect.x + rect.width {
-            let src = sy as usize * plane_width as usize + sx as usize;
-            let dst = (oy * out_w + ox) as usize;
-            out[dst] = plane[src];
-            ox += 1;
-            sx += step;
-        }
-        oy += 1;
-        sy += step;
     }
 }
 
