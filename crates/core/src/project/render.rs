@@ -100,8 +100,8 @@ impl CheckpointImage {
         }
     }
 
-    /// The render of a saved checkpoint. Resolves `id` against `project`, refusing an unknown
-    /// id ([`ProjectError::UnknownCheckpoint`]). A fused
+    /// The render of a saved checkpoint. Resolves `id` against `project`,
+    /// refusing an unknown id ([`ProjectError::UnknownCheckpoint`]). A fused
     /// checkpoint needs no source frames; an op-bearing one is also refused
     /// for unrecorded alignment ([`ProjectError::RenderAlignmentUnrecorded`])
     /// or sources missing or changed on disk

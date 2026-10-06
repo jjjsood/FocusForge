@@ -351,9 +351,9 @@ pub fn run(
     if !unresolved.is_empty() {
         let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
-             because the path was recorded as given or because it is no longer there. An unedited image \
-             export reads no source frame; an edited one re-reads its fused ancestor's frames \
-             and fails below if one is missing or changed:",
+             because the path was recorded as given or because it is no longer there. An \
+             unedited image export reads no source frame; an edited one re-reads its fused \
+             ancestor's frames and fails below if one is missing or changed:",
             unresolved.len()
         );
         eprintln!("{warning}");
