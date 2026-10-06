@@ -18,6 +18,7 @@
 //! serialized [`Checkpoint`] -- `parent: None`, `ops: []` -- it writes
 //! beside them.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -205,7 +206,7 @@ fn seal_staged(
 
 /// A finished run kept outside any container: its two planes as TIFF files
 /// plus everything [`seal_at`] and [`super::append_at`] record beside them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeldCheckpoint {
     pub composite: PathBuf,
     pub zmap: PathBuf,
