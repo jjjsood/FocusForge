@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -1173,15 +1174,7 @@ fn seal_synthetic_project(dir: &Path, seed: u16) -> PathBuf {
 }
 
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    use std::io::Read;
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_manifest_value(path: &Path) -> Value {
@@ -1204,33 +1197,20 @@ fn mutate_container(
     replace: &[(String, Vec<u8>)],
     add: &[(String, Vec<u8>)],
 ) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        if drop.contains(&name.as_str()) {
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        if drop.contains(&name) {
             continue;
         }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        if let Some(entry) = replace.iter().find(|entry| &entry.0 == name) {
-            bytes = entry.1.clone();
-        }
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        let bytes = match replace.iter().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1.clone(),
+            None => index.read_entry(src, name).unwrap(),
+        };
+        writer.put_bytes(name, &bytes).unwrap();
     }
     for (name, bytes) in add {
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(bytes).unwrap();
+        writer.put_bytes(name, bytes).unwrap();
     }
     writer.finish().unwrap();
 }

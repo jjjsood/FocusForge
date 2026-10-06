@@ -6,11 +6,11 @@
 //! appends of the same inputs are byte-identical apart from `created_at` --
 //! re-pointed at the append path rather than reinvented for it.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, AppendRequest, Metrics, Op, ParentRef, Point, Project, SealRequest,
 };
@@ -205,35 +205,22 @@ fn append_once(
 }
 
 fn entry_names(path: &Path) -> Vec<String> {
-    let file = std::fs::File::open(path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
         .collect()
 }
 
 /// Copies `src` to `dst`, dropping one named entry entirely -- what produces
 /// a manifest that names a blob the archive does not hold.
 fn remove_entry(src: &Path, dst: &Path, entry: &str) {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in names {
-        if name == entry {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(&name)
-            .unwrap()
-            .read_to_end(&mut bytes)
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names().filter(|name| *name != entry) {
+        writer
+            .put_bytes(name, &index.read_entry(src, name).unwrap())
             .unwrap();
-        writer.start_file(&*name, options).unwrap();
-        writer.write_all(&bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -510,7 +497,7 @@ fn leftover_temporaries(dir: &Path) -> Vec<String> {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains(".saving") || name.contains(".partial"))
+        .filter(|name| name.contains(".partial"))
         .collect()
 }
 

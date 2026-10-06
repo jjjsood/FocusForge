@@ -29,8 +29,9 @@ pub enum HistoryCommand {
     /// `-o` writes the edited map without sealing. At least one is required;
     /// given both, the map written is the sealed checkpoint's own.
     Apply(ApplyArgs),
-    /// Delete one checkpoint: it is hidden, and removed from the file once no
-    /// visible checkpoint is built on it. Refuses the last visible checkpoint.
+    /// Delete one checkpoint: it is hidden, and dropped from the project once no
+    /// visible checkpoint is built on it; its space is reclaimed by
+    /// `history compact`. Refuses the last visible checkpoint.
     Delete(DeleteArgs),
 }
 

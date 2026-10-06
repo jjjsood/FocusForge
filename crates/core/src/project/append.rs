@@ -6,27 +6,22 @@
 //! its own, replaying it against the head's Z-Map rather than staging a
 //! freshly fused composite.
 //!
-//! Reuses [`super::container::ProjectWriter`]'s `.partial`-then-rename
-//! discipline and [`super::blob::stage_plane`]'s staging exactly as
-//! [`super::seal::seal`] does. The previous checkpoint and every blob it
-//! names survive the write because every existing entry is copied into the
-//! new container byte for byte before the new ones are added
-//! (copy_forward), and every read of the old container happens before
-//! the writer is finished -- the rename that replaces it lands after the
-//! last read.
+//! Every save adds its records to the end of the project file and commits
+//! them with one footer ([`super::container`]): the previous checkpoint and
+//! every blob it names stay where they are, and a save that fails leaves the
+//! file as it was. Blobs are staged with [`super::blob::stage_plane`]
+//! exactly as [`super::seal::seal`] does.
 
 use std::collections::HashSet;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
 use super::checkpoint::{Checkpoint, FuseRecord};
-use super::container::{ProjectWriter, partial_path};
+use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
-use super::read_json;
 use super::seal::{now_unix, record, source_ref};
 use super::{
     HASH_ALGORITHM, Op, Project, SealedProject, fused_extent, materialize_zmap, resolve_chain,
@@ -74,14 +69,18 @@ pub fn append_at(
     request: AppendRequest<'_>,
     created_at: i64,
 ) -> Result<SealedProject, ProjectError> {
-    append_onto(request, None, created_at)
+    let mut project = Project::open(request.project_path)?;
+    let sealed = append_onto(&mut project, &request, None, created_at)?;
+    project.commit()?;
+    Ok(sealed)
 }
 
-/// [`append_at`] under an explicit `parent` checkpoint instead of the
-/// project's head; `None` is the head. The caller has checked that `parent`
-/// exists.
+/// [`append_at`] onto an open project, under an explicit `parent` checkpoint
+/// instead of the project's head; `None` is the head. The caller has checked
+/// that `parent` exists and commits the project.
 pub(super) fn append_onto(
-    request: AppendRequest<'_>,
+    project: &mut Project,
+    request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
 ) -> Result<SealedProject, ProjectError> {
@@ -92,7 +91,7 @@ pub(super) fn append_onto(
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let mut staged: Vec<StagedBlob> = Vec::new();
-    let result = append_staged(&request, parent, created_at, &staging, &mut staged);
+    let result = append_staged(project, request, parent, created_at, &staging, &mut staged);
     for blob in &staged {
         blob.remove();
     }
@@ -100,20 +99,22 @@ pub(super) fn append_onto(
 }
 
 fn append_staged(
+    project: &mut Project,
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
-    let project_dir = request
-        .project_path
+    let project_dir = project
+        .path()
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let mut sources = Vec::with_capacity(request.sources.len());
     for path in request.sources {
-        sources.push(source_ref(path, project_dir)?);
+        sources.push(source_ref(path, &project_dir)?);
     }
 
     let composite = blob::stage_plane(
@@ -127,28 +128,29 @@ fn append_staged(
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;
 
-    write_fused(FusedWrite {
-        project_path: request.project_path,
-        parent,
-        composite: &composite,
-        zmap: &zmap,
-        frame_count,
-        sources,
-        algorithm: request.algorithm,
-        params: request.params,
-        align: request.align.clone(),
-        registration: request.registration.clone(),
-        composite_description: request.composite_description.clone(),
-        label: request.label.clone(),
-        metrics: request.metrics,
-        created_at,
-    })
+    write_fused(
+        project,
+        FusedWrite {
+            parent,
+            composite: &composite,
+            zmap: &zmap,
+            frame_count,
+            sources,
+            algorithm: request.algorithm,
+            params: request.params,
+            align: request.align.clone(),
+            registration: request.registration.clone(),
+            composite_description: request.composite_description.clone(),
+            label: request.label.clone(),
+            metrics: request.metrics,
+            created_at,
+        },
+    )
 }
 
 /// A fused checkpoint whose planes are already staged: what
 /// [`write_fused`] records under its parent.
 struct FusedWrite<'a> {
-    project_path: &'a Path,
     /// `None` is the project's head.
     parent: Option<&'a str>,
     composite: &'a StagedBlob,
@@ -165,9 +167,11 @@ struct FusedWrite<'a> {
     created_at: i64,
 }
 
-fn write_fused(write: FusedWrite<'_>) -> Result<SealedProject, ProjectError> {
+fn write_fused(
+    project: &mut Project,
+    write: FusedWrite<'_>,
+) -> Result<SealedProject, ProjectError> {
     let FusedWrite {
-        project_path,
         parent,
         composite,
         zmap,
@@ -186,17 +190,11 @@ fn write_fused(write: FusedWrite<'_>) -> Result<SealedProject, ProjectError> {
     let composite_record = record(composite);
     let zmap_record = record(zmap);
 
-    let old_file = File::open(project_path).map_err(|err| ProjectError::io(project_path, err))?;
-    let mut old_archive =
-        zip::ZipArchive::new(old_file).map_err(|err| ProjectError::container(project_path, err))?;
-    let old_manifest: Manifest = read_json(&mut old_archive, project_path, "manifest.json")?;
-    verify_blobs_present(&mut old_archive, &old_manifest, project_path)?;
-    let parent_id = parent.map_or_else(|| old_manifest.checkpoint.clone(), str::to_string);
-
+    let parent_id = parent.map_or_else(|| project.manifest().checkpoint.clone(), str::to_string);
     let checkpoint_id =
         Checkpoint::derive_child_id(&parent_id, &stack_fingerprint, &zmap.hash, created_at);
 
-    let mut blobs = old_manifest.blobs.clone();
+    let mut blobs = project.manifest().blobs.clone();
     for rec in [composite_record.clone(), zmap_record.clone()] {
         if !blobs.iter().any(|b| b.hash == rec.hash) {
             blobs.push(rec);
@@ -256,71 +254,17 @@ fn write_fused(write: FusedWrite<'_>) -> Result<SealedProject, ProjectError> {
         hidden: false,
     };
 
-    let mut writer = ProjectWriter::create(project_path)?;
-    let manifest_text = serde_json::to_string_pretty(&manifest)
-        .map_err(|err| ProjectError::container(project_path, err))?;
-    writer.add_text("manifest.json", &manifest_text)?;
-    copy_forward(&mut old_archive, &mut writer, project_path, |_| true)?;
-    writer.add_blob(&composite.hash, &composite.path)?;
-    writer.add_blob(&zmap.hash, &zmap.path)?;
-    let checkpoint_text = serde_json::to_string_pretty(&checkpoint)
-        .map_err(|err| ProjectError::container(project_path, err))?;
-    writer.add_text(
-        &format!("checkpoints/{checkpoint_id}.json"),
-        &checkpoint_text,
-    )?;
-
-    let path = writer.finish()?;
+    project.put_blob(composite)?;
+    project.put_blob(zmap)?;
+    project.put_checkpoint(&checkpoint)?;
+    project.set_manifest(manifest)?;
 
     Ok(SealedProject {
-        path,
+        path: project.path().to_path_buf(),
         composite: composite_record,
         zmap: zmap_record,
         checkpoint: checkpoint_id,
     })
-}
-
-/// Refuses (naming the missing blob) when the manifest declares a blob that
-/// has no matching zip entry -- what a raw [`copy_forward`] would otherwise
-/// silently drop, since it only ever copies entries that are actually there.
-pub(super) fn verify_blobs_present(
-    old_archive: &mut zip::ZipArchive<File>,
-    old_manifest: &Manifest,
-    path: &Path,
-) -> Result<(), ProjectError> {
-    for blob in &old_manifest.blobs {
-        let name = format!("blobs/{}.zst", blob.hash);
-        if old_archive.index_for_name(&name).is_none() {
-            return Err(ProjectError::MissingEntry {
-                path: path.to_path_buf(),
-                entry: name,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Copies every existing zip entry except `manifest.json` and any name
-/// `keep` refuses, byte for byte, preserving names and archive order. The
-/// append-only discipline: re-serializing would rewrite an existing
-/// checkpoint's bytes.
-fn copy_forward(
-    old_archive: &mut zip::ZipArchive<File>,
-    writer: &mut ProjectWriter,
-    path: &Path,
-    keep: impl Fn(&str) -> bool,
-) -> Result<(), ProjectError> {
-    let names: Vec<String> = old_archive.file_names().map(str::to_string).collect();
-    for name in names {
-        if name == "manifest.json" || !keep(&name) {
-            continue;
-        }
-        let mut entry = old_archive
-            .by_name(&name)
-            .map_err(|err| ProjectError::container(path, format!("{name}: {err}")))?;
-        writer.add_stream(&name, &mut entry)?;
-    }
-    Ok(())
 }
 
 /// Whether a checkpoint's Z-Map is stored as a patch against its parent's
@@ -401,9 +345,7 @@ pub fn append_ops_at(
     created_at: i64,
     storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
-    let project = Project::open(project_path)?;
-    let parent = project.checkpoint().id.clone();
-    append_ops_onto(project_path, &parent, ops, label, created_at, storage)
+    append_ops_saved(project_path, None, ops, label, created_at, storage)
 }
 
 /// [`append_ops_at`] against an explicit `parent` rather than always the
@@ -417,21 +359,42 @@ pub fn append_ops_onto(
     created_at: i64,
     storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
+    append_ops_saved(project_path, Some(parent), ops, label, created_at, storage)
+}
+
+/// Opens `project_path`, seals `ops` under `parent` (`None` is the head) and
+/// commits.
+fn append_ops_saved(
+    project_path: &Path,
+    parent: Option<&str>,
+    ops: Vec<Op>,
+    label: Option<String>,
+    created_at: i64,
+    storage: ZMapStorage,
+) -> Result<SealedProject, ProjectError> {
+    let mut project = Project::open(project_path)?;
+    let parent = parent.map_or_else(|| project.checkpoint().id.clone(), str::to_string);
+    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at, storage)?;
+    project.commit()?;
+    Ok(sealed)
+}
+
+/// [`append_ops_onto`] on an open project, left for the caller to commit.
+pub(super) fn append_ops_on(
+    project: &mut Project,
+    parent: &str,
+    ops: Vec<Op>,
+    label: Option<String>,
+    created_at: i64,
+    storage: ZMapStorage,
+) -> Result<SealedProject, ProjectError> {
     if ops.is_empty() {
         return Err(ProjectError::EmptyOpList {
-            path: project_path.to_path_buf(),
+            path: project.path().to_path_buf(),
         });
     }
-    let staging = fresh_staging_dir(project_path)?;
-    let result = append_ops_staged(
-        project_path,
-        parent,
-        &ops,
-        label,
-        created_at,
-        &staging,
-        storage,
-    );
+    let staging = fresh_staging_dir(project.path())?;
+    let result = append_ops_staged(project, parent, &ops, label, created_at, &staging, storage);
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -460,8 +423,7 @@ fn fresh_staging_dir(project_path: &Path) -> Result<PathBuf, ProjectError> {
 
 /// [`replay_ops_to`] staged: opens the project, replays `ops` onto `parent`
 /// through [`replay_ops_onto_zmap`], and writes the edited map to `out` via
-/// `.partial` then rename. Never opens [`ProjectWriter`]: the project file is
-/// not touched.
+/// `.partial` then rename. The project file is not touched.
 fn replay_ops_to_staged(
     project_path: &Path,
     parent: &str,
@@ -469,7 +431,8 @@ fn replay_ops_to_staged(
     staging: &Path,
     out: &Path,
 ) -> Result<(), ProjectError> {
-    let (mut project, head, _manifest, info) = open_at_checkpoint(project_path, parent)?;
+    let mut project = Project::open(project_path)?;
+    let (head, info) = checkpoint_geometry(&project, parent)?;
 
     let partial = partial_path(out);
     let outcome = replay_ops_onto_zmap(&mut project, parent, &head, ops, info, staging, &partial)
@@ -591,25 +554,22 @@ fn replay_ops_onto_zmap(
     Ok((tile, indices))
 }
 
-/// Opens `project_path`, resolves `parent` to its checkpoint and clones the
-/// container's manifest and Z-Map geometry -- the common start
-/// [`append_ops_staged`] and [`replay_ops_to_staged`] both need before
-/// replaying ops onto the head.
-fn open_at_checkpoint(
-    project_path: &Path,
+/// `parent`'s checkpoint and the Z-Map geometry of its fused ancestor: the
+/// common start [`append_ops_staged`] and [`replay_ops_to_staged`] both need
+/// before replaying ops onto it.
+fn checkpoint_geometry(
+    project: &Project,
     parent: &str,
-) -> Result<(Project, Checkpoint, Manifest, ZMapInfo), ProjectError> {
-    let project = Project::open(project_path)?;
+) -> Result<(Checkpoint, ZMapInfo), ProjectError> {
     let head = project.history().get(parent)?.clone();
-    let manifest = project.manifest().clone();
-    let (width, height, frame_count) = fused_extent(&project, parent)?;
+    let (width, height, frame_count) = fused_extent(project, parent)?;
     let info = ZMapInfo::new(width, height, frame_count)
-        .map_err(|err| ProjectError::container(project_path, err))?;
-    Ok((project, head, manifest, info))
+        .map_err(|err| ProjectError::container(project.path(), err))?;
+    Ok((head, info))
 }
 
 fn append_ops_staged(
-    project_path: &Path,
+    project: &mut Project,
     parent: &str,
     ops: &[Op],
     label: Option<String>,
@@ -617,18 +577,12 @@ fn append_ops_staged(
     staging: &Path,
     storage: ZMapStorage,
 ) -> Result<SealedProject, ProjectError> {
-    let (mut project, head, manifest, info) = open_at_checkpoint(project_path, parent)?;
+    let (head, info) = checkpoint_geometry(project, parent)?;
+    let manifest = project.manifest().clone();
 
     let new_zmap_path = staging.join("new-zmap.tif");
-    let (tile, indices) = replay_ops_onto_zmap(
-        &mut project,
-        parent,
-        &head,
-        ops,
-        info,
-        staging,
-        &new_zmap_path,
-    )?;
+    let (tile, indices) =
+        replay_ops_onto_zmap(project, parent, &head, ops, info, staging, &new_zmap_path)?;
 
     let full = blob::stage_plane(&new_zmap_path, Plane::ZMap, ZSTD_LEVEL, staging)?;
 
@@ -722,24 +676,9 @@ fn append_ops_staged(
         hidden: false,
     };
 
-    let old_file = File::open(project_path).map_err(|err| ProjectError::io(project_path, err))?;
-    let mut old_archive =
-        zip::ZipArchive::new(old_file).map_err(|err| ProjectError::container(project_path, err))?;
-    verify_blobs_present(&mut old_archive, &manifest, project_path)?;
-
-    let mut writer = ProjectWriter::create(project_path)?;
-    let manifest_text = serde_json::to_string_pretty(&new_manifest)
-        .map_err(|err| ProjectError::container(project_path, err))?;
-    writer.add_text("manifest.json", &manifest_text)?;
-    copy_forward(&mut old_archive, &mut writer, project_path, |_| true)?;
-    writer.add_blob(&stored.hash, &stored.path)?;
-    let checkpoint_text = serde_json::to_string_pretty(&checkpoint)
-        .map_err(|err| ProjectError::container(project_path, err))?;
-    writer.add_text(
-        &format!("checkpoints/{checkpoint_id}.json"),
-        &checkpoint_text,
-    )?;
-    let path = writer.finish()?;
+    project.put_blob(stored)?;
+    project.put_checkpoint(&checkpoint)?;
+    project.set_manifest(new_manifest)?;
 
     let composite_record = manifest
         .blobs
@@ -749,32 +688,35 @@ fn append_ops_staged(
         .expect("manifest.blobs always names a fuse's own composite blob");
 
     Ok(SealedProject {
-        path,
+        path: project.path().to_path_buf(),
         composite: composite_record,
         zmap: stored_record,
         checkpoint: checkpoint_id,
     })
 }
 
-/// What a successful [`delete_checkpoint`] hid and physically removed, and
-/// the head it leaves the project pointing at.
+/// What a successful [`delete_checkpoint`] hid and stopped listing, and the
+/// head it leaves the project pointing at.
 pub struct Deleted {
     /// The checkpoint the call hid.
     pub hidden: String,
-    /// Every checkpoint taken out of the file: `hidden` and the checkpoints
-    /// hidden earlier, whichever have no visible checkpoint built on them.
+    /// Every checkpoint the project no longer lists: `hidden` and the
+    /// checkpoints hidden earlier, whichever have no visible checkpoint built
+    /// on them. Their bytes stay in the file as dead data.
     pub removed: Vec<String>,
     pub head: String,
 }
 
-/// Hides `id`, then removes every hidden checkpoint no visible one is built
-/// on, with the blobs only those needed; nothing is re-parented. Refuses an
-/// unknown or hidden `id` ([`ProjectError::UnknownCheckpoint`]) and the last
-/// visible checkpoint ([`ProjectError::LastVisibleDelete`]) before writing.
-/// When the head goes, the newest visible checkpoint becomes the head and the
-/// manifest is rebuilt from it ([`Project::fuse_state`]).
+/// Hides `id`, then stops listing every hidden checkpoint no visible one is
+/// built on, with the blobs only those needed; nothing is re-parented.
+/// Refuses an unknown or hidden `id` ([`ProjectError::UnknownCheckpoint`]) and
+/// the last visible checkpoint ([`ProjectError::LastVisibleDelete`]) before
+/// writing. When the head goes, the newest visible checkpoint becomes the head
+/// and the manifest is rebuilt from it ([`Project::fuse_state`]).
 pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, ProjectError> {
-    let (removed, head) = hide_and_collect(project_path, Some(id), None)?;
+    let mut project = Project::open(project_path)?;
+    let (removed, head) = hide_and_collect(&mut project, Some(id), None)?;
+    project.commit()?;
     Ok(Deleted {
         hidden: id.to_string(),
         removed,
@@ -782,29 +724,30 @@ pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, Proje
     })
 }
 
-/// [`delete_checkpoint`]'s body: hides `hide` when given, then removes every
-/// hidden checkpoint nothing visible is built on, returning the ids removed
-/// and the head. `keep` counts as visible for that removal, so it and its
-/// ancestors stay stored even when hidden. With nothing to hide and nothing
-/// to remove, the file is not written.
+/// [`delete_checkpoint`]'s body on an open project, left for the caller to
+/// commit: hides `hide` when given, then stops listing every hidden
+/// checkpoint nothing visible is built on, returning the ids dropped and the
+/// head. `keep` counts as visible for that, so it and its ancestors stay
+/// listed even when hidden. With nothing to hide and nothing to drop, nothing
+/// is written.
 pub(super) fn hide_and_collect(
-    project_path: &Path,
+    project: &mut Project,
     hide: Option<&str>,
     keep: Option<&str>,
 ) -> Result<(Vec<String>, String), ProjectError> {
-    let project = Project::open(project_path)?;
+    let project_path = project.path().to_path_buf();
     let history = project.history();
-    let target = hide.map(|id| history.get(id)).transpose()?;
-    if let (Some(id), Some(target)) = (hide, target) {
+    let target: Option<Checkpoint> = hide.map(|id| history.get(id)).transpose()?.cloned();
+    if let (Some(id), Some(target)) = (hide, &target) {
         if target.hidden {
             return Err(ProjectError::UnknownCheckpoint {
-                path: project_path.to_path_buf(),
+                path: project_path,
                 id: id.to_string(),
             });
         }
         if history.visible().len() == 1 {
             return Err(ProjectError::LastVisibleDelete {
-                path: project_path.to_path_buf(),
+                path: project_path,
                 checkpoint: id.to_string(),
             });
         }
@@ -880,67 +823,36 @@ pub(super) fn hide_and_collect(
     };
 
     let removed_blobs =
-        referenced_blobs(&manifest.blobs, removed_checkpoints.iter(), project_path)?;
-    let survivor_blobs = referenced_blobs(&manifest.blobs, survivors.iter(), project_path)?;
-    let kept_blobs: Vec<BlobRecord> = manifest
+        referenced_blobs(&manifest.blobs, removed_checkpoints.iter(), &project_path)?;
+    let survivor_blobs = referenced_blobs(&manifest.blobs, survivors.iter(), &project_path)?;
+    let (kept_blobs, dropped_blobs): (Vec<BlobRecord>, Vec<BlobRecord>) = manifest
         .blobs
         .iter()
-        .filter(|b| !removed_blobs.contains(&b.hash) || survivor_blobs.contains(&b.hash))
         .cloned()
-        .collect();
-    let kept_blob_names: HashSet<String> = kept_blobs
-        .iter()
-        .map(|b| format!("blobs/{}.zst", b.hash))
-        .collect();
-    // A kept target's JSON is rewritten with its flag set, so it leaves the
-    // verbatim copy as a removed checkpoint's does.
-    let dropped_checkpoint_names: HashSet<String> = removed
-        .iter()
-        .map(String::as_str)
-        .chain(hide)
-        .map(|id| format!("checkpoints/{id}.json"))
-        .collect();
-    let hidden_text = match (hide, target) {
-        (Some(id), Some(target)) if !removed_set.contains(id) => {
-            let hidden = Checkpoint {
-                hidden: true,
-                ..target.clone()
-            };
-            let text = serde_json::to_string_pretty(&hidden)
-                .map_err(|err| ProjectError::container(project_path, err))?;
-            Some((id, text))
-        }
+        .partition(|b| !removed_blobs.contains(&b.hash) || survivor_blobs.contains(&b.hash));
+    // A target that stays listed is rewritten with its flag set.
+    let hidden = match (hide, target) {
+        (Some(id), Some(target)) if !removed_set.contains(id) => Some(Checkpoint {
+            hidden: true,
+            ..target
+        }),
         _ => None,
     };
 
-    let final_manifest = Manifest {
+    project.drop_checkpoints(&removed)?;
+    if let Some(hidden) = &hidden {
+        project.put_checkpoint(hidden)?;
+    }
+    for blob in &dropped_blobs {
+        project.drop_blob(&blob.hash)?;
+    }
+    let head = new_manifest.checkpoint.clone();
+    project.set_manifest(Manifest {
         blobs: kept_blobs,
         ..new_manifest
-    };
-
-    let old_file = File::open(project_path).map_err(|err| ProjectError::io(project_path, err))?;
-    let mut old_archive =
-        zip::ZipArchive::new(old_file).map_err(|err| ProjectError::container(project_path, err))?;
-
-    let mut writer = ProjectWriter::create(project_path)?;
-    let manifest_text = serde_json::to_string_pretty(&final_manifest)
-        .map_err(|err| ProjectError::container(project_path, err))?;
-    writer.add_text("manifest.json", &manifest_text)?;
-    copy_forward(&mut old_archive, &mut writer, project_path, |name| {
-        if dropped_checkpoint_names.contains(name) {
-            return false;
-        }
-        if name.starts_with("blobs/") {
-            return kept_blob_names.contains(name);
-        }
-        true
     })?;
-    if let Some((id, text)) = hidden_text {
-        writer.add_text(&format!("checkpoints/{id}.json"), &text)?;
-    }
-    writer.finish()?;
 
-    Ok((removed, final_manifest.checkpoint))
+    Ok((removed, head))
 }
 
 /// Every blob hash `checkpoints` reaches: each one's resolved Z-Map chain

@@ -6483,14 +6483,15 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     let before = fs::read(&path).unwrap();
 
     // A save that cannot write keeps the delete and leaves the file alone.
-    let mut blocker = path.clone().into_os_string();
-    blocker.push(".saving");
-    let blocker = PathBuf::from(blocker);
-    fs::create_dir(&blocker).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&path, perms.clone()).unwrap();
     assert!(!controller.save_active_project(|_| None));
     assert_eq!(fs::read(&path).unwrap(), before, "the file is untouched");
     assert!(controller.save_enabled(), "the delete is still queued");
-    fs::remove_dir(&blocker).unwrap();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&path, perms).unwrap();
 
     // The current row's delete leaves it stored hidden and unlisted.
     assert!(controller.save_active_project(|_| None));

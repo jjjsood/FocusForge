@@ -8,12 +8,12 @@
 mod common;
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
@@ -226,14 +226,7 @@ fn read_zmap_pixels(path: &Path) -> Vec<u16> {
 }
 
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_whole_file(path: &Path) -> Vec<u8> {
@@ -241,8 +234,11 @@ fn read_whole_file(path: &Path) -> Vec<u8> {
 }
 
 fn archive_entry_names(path: &Path) -> HashSet<String> {
-    let archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    archive.file_names().map(str::to_string).collect()
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
+        .collect()
 }
 
 /// `result.unwrap_err()`, without requiring the `Ok` side to implement
@@ -269,29 +265,17 @@ fn mutate_container(
     replace: &[(String, Vec<u8>)],
     add: &[(String, Vec<u8>)],
 ) {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        if let Some(entry) = replace.iter().find(|entry| &entry.0 == name) {
-            bytes = entry.1.clone();
-        }
-        writer.start_file(name.as_str(), options).unwrap();
-        std::io::Write::write_all(&mut writer, &bytes).unwrap();
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        let bytes = match replace.iter().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1.clone(),
+            None => index.read_entry(src, name).unwrap(),
+        };
+        writer.put_bytes(name, &bytes).unwrap();
     }
     for (name, bytes) in add {
-        writer.start_file(name.as_str(), options).unwrap();
-        std::io::Write::write_all(&mut writer, bytes).unwrap();
+        writer.put_bytes(name, bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -956,26 +940,14 @@ fn root_id_of(path: &Path) -> String {
     chain.last().unwrap().id.clone()
 }
 
-/// Every zip entry but the manifest, by name: what a delete must leave
+/// Every indexed record but the manifest, by name: what a delete must leave
 /// alone for each checkpoint it does not touch.
 fn entries_but_manifest(path: &Path) -> BTreeMap<String, Vec<u8>> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let names: Vec<String> = archive
-        .file_names()
+    let index = Index::read(path).unwrap();
+    index
+        .names()
         .filter(|name| *name != "manifest.json")
-        .map(str::to_string)
-        .collect();
-    names
-        .into_iter()
-        .map(|name| {
-            let mut bytes = Vec::new();
-            archive
-                .by_name(&name)
-                .unwrap()
-                .read_to_end(&mut bytes)
-                .unwrap();
-            (name, bytes)
-        })
+        .map(|name| (name.to_string(), index.read_entry(path, name).unwrap()))
         .collect()
 }
 
@@ -1017,7 +989,7 @@ fn visible_ids(project_path: &Path) -> HashSet<String> {
 }
 
 #[test]
-fn deleting_a_leaf_removes_it_and_shrinks_the_file() {
+fn deleting_a_leaf_stops_indexing_it_and_leaves_its_bytes_as_dead_data() {
     let (_dir, project_path) = sealed("checkpoint_store_leaf_shrinks", 48, 32, 6);
     let root_id = Project::open(&project_path)
         .unwrap()
@@ -1032,6 +1004,7 @@ fn deleting_a_leaf_removes_it_and_shrinks_the_file() {
     );
 
     let size_before = read_whole_file(&project_path).len();
+    let index_before = Index::read(&project_path).unwrap();
     let entries_before = entries_but_manifest(&project_path);
     let deleted = project::delete_checkpoint(&project_path, &leaf.checkpoint).unwrap();
     assert_eq!(deleted.hidden, leaf.checkpoint);
@@ -1046,10 +1019,17 @@ fn deleting_a_leaf_removes_it_and_shrinks_the_file() {
             .iter()
             .all(|c| c.id != leaf.checkpoint)
     );
+    let checkpoint_record = format!("checkpoints/{}.json", leaf.checkpoint);
+    let blob_record = format!("blobs/{}.zst", leaf.zmap.hash);
     let names = archive_entry_names(&project_path);
-    assert!(!names.contains(&format!("checkpoints/{}.json", leaf.checkpoint)));
-    assert!(!names.contains(&format!("blobs/{}.zst", leaf.zmap.hash)));
-    assert!(read_whole_file(&project_path).len() < size_before);
+    assert!(!names.contains(&checkpoint_record));
+    assert!(!names.contains(&blob_record));
+    assert!(read_whole_file(&project_path).len() > size_before);
+    let dropped_len =
+        index_before.get(&checkpoint_record).unwrap().1 + index_before.get(&blob_record).unwrap().1;
+    assert!(
+        Index::read(&project_path).unwrap().dead_bytes() >= index_before.dead_bytes() + dropped_len
+    );
 
     let mut expected = entries_before;
     expected.remove(&format!("checkpoints/{}.json", leaf.checkpoint));
@@ -1106,7 +1086,7 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
     assert!(!visible_ids(&project_path).contains(&parent));
     assert!(project.history().get(&parent).unwrap().hidden);
     drop(project);
-    let size_after_hide = read_whole_file(&project_path).len();
+    let dead_after_hide = Index::read(&project_path).unwrap().dead_bytes();
 
     let parent_json = format!("checkpoints/{parent}.json");
     let mut expected = entries_before;
@@ -1129,8 +1109,15 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
 
     let deleted = project::delete_checkpoint(&project_path, &child.checkpoint).unwrap();
     let removed: HashSet<String> = deleted.removed.into_iter().collect();
-    assert_eq!(removed, HashSet::from([parent, child.checkpoint]));
-    assert!(read_whole_file(&project_path).len() < size_after_hide);
+    assert_eq!(
+        removed,
+        HashSet::from([parent.clone(), child.checkpoint.clone()])
+    );
+    let index = Index::read(&project_path).unwrap();
+    assert!(index.dead_bytes() > dead_after_hide);
+    for id in &removed {
+        assert!(!index.contains(&format!("checkpoints/{id}.json")));
+    }
 }
 
 #[test]

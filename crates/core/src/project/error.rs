@@ -21,7 +21,7 @@ pub enum ProjectError {
     },
 
     /// The container itself could not be written, opened or navigated --
-    /// a malformed zip, a missing entry, a manifest that will not parse.
+    /// a record that will not parse, a manifest that will not parse.
     #[error("{}: {message}", path.display())]
     Container { path: PathBuf, message: String },
 
@@ -110,21 +110,21 @@ pub enum ProjectError {
     )]
     LastVisibleDelete { path: PathBuf, checkpoint: String },
 
-    /// `path` is not a FocusForge project: not a zip at all, or a zip with
-    /// no `manifest.json`.
+    /// `path` is not a FocusForge project: empty, shorter than the file
+    /// header, another kind of file, or a container with no `manifest.json`.
     #[error("{}: is not a FocusForge project", path.display())]
     NotAProject { path: PathBuf },
 
-    /// `path` carries a valid zip signature but its central directory
-    /// cannot be read -- the file was cut short.
+    /// `path` carries the project header but no footer that validates -- the
+    /// file was cut short before its first save was committed.
     #[error(
         "{}: is truncated or incomplete -- the file was cut short",
         path.display()
     )]
     Truncated { path: PathBuf },
 
-    /// `entry` is named by a record -- a blob, a checkpoint -- but is not in
-    /// the container.
+    /// `entry` is named by a record -- a blob, a checkpoint -- but is not
+    /// listed in the container's footer.
     #[error("{}: is missing {entry}, which it references", path.display())]
     MissingEntry { path: PathBuf, entry: String },
 
@@ -239,9 +239,9 @@ impl ProjectError {
     }
 
     /// A container-level failure against `path`, from any error type that
-    /// renders -- the one place a `TiffError`, a `ZMapError`, a `zip::result::ZipError`
-    /// or a `serde_json::Error` becomes a project failure that still names
-    /// the file the caller handed in.
+    /// renders -- the one place a `TiffError`, a `ZMapError` or a
+    /// `serde_json::Error` becomes a project failure that still names the file
+    /// the caller handed in.
     pub(crate) fn container(path: impl Into<PathBuf>, message: impl std::fmt::Display) -> Self {
         ProjectError::Container {
             path: path.into(),

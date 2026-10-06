@@ -58,7 +58,7 @@ pub struct GroupingQuestion {
 
 /// One tab's project state: not yet fused, or reopened from a saved `.ffp`.
 /// `Opened` is boxed so a `Vec<ProjectTab>` growth never copies a
-/// `zip::ZipArchive<File>` inline.
+/// `Project` (its file handle, record index and pending write) inline.
 pub enum GuiProject {
     Unsaved(Group),
     Opened(Box<Project>),

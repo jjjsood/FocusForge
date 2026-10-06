@@ -6,11 +6,11 @@
 //! independent replay of the parent's map, and a reset after an op-bearing
 //! head resolving its fused ancestor from disk.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::{Registration, Transform};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, AlignRecord, Metrics, Op, Point, Project, SealRequest, materialize_zmap,
 };
@@ -177,30 +177,18 @@ fn sealed_with_align_and_crop(name: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
 }
 
 fn entry_names(path: &Path) -> Vec<String> {
-    let file = std::fs::File::open(path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
         .collect()
 }
 
 fn read_all_entries(path: &Path) -> std::collections::HashMap<String, Vec<u8>> {
-    let file = std::fs::File::open(path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    names
-        .into_iter()
-        .map(|name| {
-            let mut bytes = Vec::new();
-            archive
-                .by_name(&name)
-                .unwrap()
-                .read_to_end(&mut bytes)
-                .unwrap();
-            (name, bytes)
-        })
+    let index = Index::read(path).unwrap();
+    index
+        .names()
+        .map(|name| (name.to_string(), index.read_entry(path, name).unwrap()))
         .collect()
 }
 
@@ -208,18 +196,11 @@ fn read_all_entries(path: &Path) -> std::collections::HashMap<String, Vec<u8>> {
 /// -- so a serde re-serialize of that entry would drop the field and this
 /// test would catch it.
 fn inject_unknown_field(path: &Path, entry_name: &str) {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    for name in &names {
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
+    let index = Index::read(path).unwrap();
+    let rewritten = path.with_extension("rewritten");
+    let mut writer = ContainerWriter::create(&rewritten).unwrap();
+    for name in index.names() {
+        let mut bytes = index.read_entry(path, name).unwrap();
         if name == entry_name {
             let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             value
@@ -228,18 +209,10 @@ fn inject_unknown_field(path: &Path, entry_name: &str) {
                 .insert("totally-unknown-field".to_string(), serde_json::json!(true));
             bytes = serde_json::to_vec_pretty(&value).unwrap();
         }
-        entries.push((name.clone(), bytes));
-    }
-    drop(archive);
-
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(path).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (name, bytes) in entries {
-        writer.start_file(&*name, options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        writer.put_bytes(name, &bytes).unwrap();
     }
     writer.finish().unwrap();
+    std::fs::rename(&rewritten, path).unwrap();
 }
 
 fn one_of_each_replayable_variant() -> Vec<Op> {

@@ -2,24 +2,21 @@
 
 //! The project container: what a stacking run writes instead of an image.
 //!
-//! A project is a zip holding exactly three kinds of entry:
+//! A project is one file. [`container`] describes its layout: a header,
+//! records appended one after another and a footer that indexes the live
+//! ones and commits them. Three kinds of record exist:
 //!
 //! ```text
-//! $ unzip -l mantis-512.ffp   # a real run over fixtures/mantis-512
-//!   Length      Date    Time    Name
-//! ---------  ---------- -----   ----
-//!      3804  1980-01-01 00:00   manifest.json
-//!   1426980  1980-01-01 00:00   blobs/d24eca28….zst        the composite plane
-//!     40385  1980-01-01 00:00   blobs/7108de1d….zst        the Z-Map plane
-//!       359  1980-01-01 00:00   checkpoints/5b71adbf….json
+//! manifest.json                  the head's description
+//! blobs/<hash>.zst               a plane, or a patch of one, zstd-compressed
+//! checkpoints/<id>.json          one checkpoint
 //! ```
 //!
-//! Every entry is `Stored`, because the blobs are already zstd-compressed.
-//! Every timestamp is the DOS epoch, because the `zip` dependency enables no
-//! clock feature -- which is what makes two seals of the same inputs produce
-//! identical container bytes (`the_container_is_reproducible`).
-//! Nothing outside those three paths is ever written, and a test asserts it
-//! (`container_layout_is_exactly_the_named_entries`).
+//! A save appends records and a footer and never rewrites a byte; a torn tail
+//! after the last valid footer is ignored on open and cut off by the next
+//! save. Nothing outside those three paths is ever written, and a test asserts
+//! it (`container_layout_is_exactly_the_named_entries`). Two seals of the same
+//! inputs produce identical bytes (`the_container_is_reproducible`).
 //!
 //! # Format commitments
 //!
@@ -29,7 +26,7 @@
 //!
 //! | Commitment | Where it lives | Test |
 //! |---|---|---|
-//! | 1. the entry layout | [`container`] | `container_layout_is_exactly_the_named_entries` |
+//! | 1. the record layout | [`container`] | `container_layout_is_exactly_the_named_entries` |
 //! | 2. a blob kind field | [`BlobRecord::kind`] | `blob_kind_is_recorded_and_required` |
 //! | 3. a hash over uncompressed content, algorithm named | [`blob::stage_plane`], [`Manifest::hash_algorithm`] | `hash_is_over_uncompressed_content` |
 //! | 4. a fully serialized `Checkpoint` with all four `Op` variants | [`Checkpoint`], [`Op`] | `checkpoint_serializes_every_field_with_no_parent_and_no_ops`, `every_op_variant_round_trips` |
@@ -61,7 +58,7 @@ pub mod seal;
 pub mod validate;
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -72,7 +69,8 @@ pub use append::{
 };
 pub use blob::{FileStamp, Plane, StagedBlob, short_hash, source_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
-pub use container::{ProjectWriter, partial_path};
+pub use container::partial_path;
+use container::{ContainerWriter, Index};
 pub use error::ProjectError;
 pub use export::{export_checkpoint, export_zmap};
 pub use manifest::{
@@ -512,7 +510,14 @@ const READ_BAND_BYTES: usize = 4 << 20;
 /// `focusforge-cli export`. The GUI editor opens one for editing.
 pub struct Project {
     path: PathBuf,
-    archive: zip::ZipArchive<File>,
+    file: File,
+    /// The records of the committed state; [`Self::index`] adds a pending
+    /// save's.
+    index: Index,
+    /// The appends of a save in progress, written by [`Self::commit`].
+    pending: Option<ContainerWriter>,
+    /// Whether `manifest` changed since it was last written.
+    manifest_changed: bool,
     manifest: Manifest,
     checkpoint: Checkpoint,
     history: History,
@@ -536,50 +541,21 @@ impl Project {
     /// disagreeing with its sources); verifies the head's own Z-Map chain
     /// by hash. Never reads a source frame.
     pub fn open(path: &Path) -> Result<Self, ProjectError> {
-        let mut file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
-        let mut magic = [0u8; 4];
-        match file.read_exact(&mut magic) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(ProjectError::NotAProject {
-                    path: path.to_path_buf(),
-                });
-            }
-            Err(source) => return Err(ProjectError::io(path, source)),
-        }
-        if magic != *b"PK\x03\x04" && magic != *b"PK\x05\x06" {
+        let file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
+        let index = Index::read_from(&file, path)?;
+        if !index.contains("manifest.json") {
             return Err(ProjectError::NotAProject {
                 path: path.to_path_buf(),
             });
         }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|source| ProjectError::io(path, source))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|_| ProjectError::Truncated {
-            path: path.to_path_buf(),
-        })?;
+        let manifest: Manifest = read_json(&file, &index, path, "manifest.json")?;
 
-        if archive.index_for_name("manifest.json").is_none() {
-            return Err(ProjectError::NotAProject {
-                path: path.to_path_buf(),
-            });
-        }
-        let mut manifest_text = String::new();
-        archive
-            .by_name("manifest.json")
-            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?
-            .read_to_string(&mut manifest_text)
-            .map_err(|source| ProjectError::io(path, source))?;
-
-        let manifest: Manifest = serde_json::from_str(&manifest_text)
-            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?;
-
-        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
         let mut checkpoints = Vec::new();
-        for name in names {
+        for name in index.names() {
             if let Some(rest) = name.strip_prefix("checkpoints/")
                 && rest.ends_with(".json")
             {
-                checkpoints.push(read_json::<Checkpoint>(&mut archive, path, &name)?);
+                checkpoints.push(read_json::<Checkpoint>(&file, &index, path, name)?);
             }
         }
         let history = History::build(checkpoints, path)?;
@@ -591,7 +567,15 @@ impl Project {
             })?
             .clone();
 
-        append::verify_blobs_present(&mut archive, &manifest, path)?;
+        for blob in &manifest.blobs {
+            let name = blob_entry(&blob.hash);
+            if !index.contains(&name) {
+                return Err(ProjectError::MissingEntry {
+                    path: path.to_path_buf(),
+                    entry: name,
+                });
+            }
+        }
         for c in history.all() {
             resolve_chain(&manifest.blobs, &c.zmap_blob, path)?;
             match &c.fuse {
@@ -651,7 +635,10 @@ impl Project {
 
         let mut project = Project {
             path: path.to_path_buf(),
-            archive,
+            file,
+            index,
+            pending: None,
+            manifest_changed: false,
             manifest,
             checkpoint,
             history,
@@ -780,6 +767,95 @@ impl Project {
         self.relocated = Some(folder);
     }
 
+    /// The records of this project, a save in progress included.
+    pub(super) fn index(&self) -> &Index {
+        self.pending
+            .as_ref()
+            .map_or(&self.index, ContainerWriter::index)
+    }
+
+    fn writer(&mut self) -> Result<&mut ContainerWriter, ProjectError> {
+        if self.pending.is_none() {
+            self.pending = Some(ContainerWriter::append(&self.path, &self.index)?);
+        }
+        Ok(self.pending.as_mut().expect("the writer was just opened"))
+    }
+
+    /// Adds the staged blob to the pending save, unless the project already
+    /// holds that hash.
+    pub(super) fn put_blob(&mut self, blob: &StagedBlob) -> Result<(), ProjectError> {
+        let mut source =
+            File::open(&blob.path).map_err(|source| ProjectError::io(&blob.path, source))?;
+        self.writer()?.put(&blob_entry(&blob.hash), &mut source)
+    }
+
+    /// Adds `checkpoint` to the pending save and to the history reads see.
+    pub(super) fn put_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<(), ProjectError> {
+        let bytes = serde_json::to_vec(checkpoint)
+            .map_err(|err| ProjectError::container(&self.path, err))?;
+        self.writer()?
+            .put_bytes(&checkpoint_entry(&checkpoint.id), &bytes)?;
+        let mut all: Vec<Checkpoint> = self
+            .history
+            .all()
+            .into_iter()
+            .filter(|c| c.id != checkpoint.id)
+            .cloned()
+            .collect();
+        all.push(checkpoint.clone());
+        self.history = History::build(all, &self.path)?;
+        Ok(())
+    }
+
+    /// Makes `manifest` the project's manifest and its checkpoint the head;
+    /// the record is written once, by [`Self::commit`]. The head's
+    /// checkpoint must be in the history already.
+    pub(super) fn set_manifest(&mut self, manifest: Manifest) -> Result<(), ProjectError> {
+        self.checkpoint = self.history.get(&manifest.checkpoint)?.clone();
+        self.manifest = manifest;
+        self.manifest_changed = true;
+        Ok(())
+    }
+
+    /// Stops listing the checkpoints `ids` in the pending save and in the
+    /// history. A checkpoint is dropped with every one built on it.
+    pub(super) fn drop_checkpoints(&mut self, ids: &[String]) -> Result<(), ProjectError> {
+        for id in ids {
+            self.writer()?.drop_entry(&checkpoint_entry(id));
+        }
+        let rest: Vec<Checkpoint> = self
+            .history
+            .all()
+            .into_iter()
+            .filter(|c| !ids.contains(&c.id))
+            .cloned()
+            .collect();
+        self.history = History::build(rest, &self.path)?;
+        Ok(())
+    }
+
+    /// Stops listing the blob `hash` in the pending save.
+    pub(super) fn drop_blob(&mut self, hash: &str) -> Result<(), ProjectError> {
+        self.writer()?.drop_entry(&blob_entry(hash));
+        Ok(())
+    }
+
+    /// Writes the manifest if it changed, then the footer: every record put
+    /// since the project was opened becomes the committed state at once. After
+    /// an error the project is stale; reopen it.
+    pub(super) fn commit(&mut self) -> Result<(), ProjectError> {
+        if self.manifest_changed {
+            let bytes = serde_json::to_vec(&self.manifest)
+                .map_err(|err| ProjectError::container(&self.path, err))?;
+            self.writer()?.put_bytes("manifest.json", &bytes)?;
+            self.manifest_changed = false;
+        }
+        if let Some(writer) = self.pending.take() {
+            self.index = writer.finish()?;
+        }
+        Ok(())
+    }
+
     /// Every source this project cannot resolve, for either of the two
     /// reasons a project has:
     ///
@@ -895,11 +971,12 @@ impl Project {
     /// enough to hold entirely in memory unlike a payload plane's own
     /// banded read.
     fn read_blob_whole(&mut self, expected_hash: &str) -> Result<Vec<u8>, ProjectError> {
-        let entry = format!("blobs/{expected_hash}.zst");
-        let file = self
-            .archive
-            .by_name(&entry)
-            .map_err(|err| ProjectError::container(&self.path, format!("{entry}: {err}")))?;
+        let file = container::record_reader(
+            &self.file,
+            self.index(),
+            &self.path,
+            &blob_entry(expected_hash),
+        )?;
         let mut decoder = zstd::stream::read::Decoder::new(file)
             .map_err(|source| ProjectError::io(&self.path, source))?;
         let mut bytes = Vec::new();
@@ -928,14 +1005,15 @@ impl Project {
         plane: &PlaneRef,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
-        let entry = format!("blobs/{}.zst", plane.blob);
         let expected_len =
             plane.width as u64 * plane.height as u64 * plane.samples_per_pixel as u64 * 2;
 
-        let file = self
-            .archive
-            .by_name(&entry)
-            .map_err(|err| ProjectError::container(&self.path, format!("{entry}: {err}")))?;
+        let file = container::record_reader(
+            &self.file,
+            self.index(),
+            &self.path,
+            &blob_entry(&plane.blob),
+        )?;
         let mut decoder = zstd::stream::read::Decoder::new(file)
             .map_err(|source| ProjectError::io(&self.path, source))?;
 
@@ -996,18 +1074,26 @@ impl Project {
     }
 }
 
-pub(super) fn read_json<T: serde::de::DeserializeOwned>(
-    archive: &mut zip::ZipArchive<File>,
+/// The record name of the blob with content hash `hash`.
+pub(super) fn blob_entry(hash: &str) -> String {
+    format!("blobs/{hash}.zst")
+}
+
+pub(super) fn checkpoint_entry(id: &str) -> String {
+    format!("checkpoints/{id}.json")
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(
+    file: &File,
+    index: &Index,
     path: &Path,
     entry: &str,
 ) -> Result<T, ProjectError> {
-    let mut text = String::new();
-    archive
-        .by_name(entry)
-        .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))?
-        .read_to_string(&mut text)
+    let mut bytes = Vec::new();
+    container::record_reader(file, index, path, entry)?
+        .read_to_end(&mut bytes)
         .map_err(|source| ProjectError::io(path, source))?;
-    serde_json::from_str(&text)
+    serde_json::from_slice(&bytes)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
 }
 

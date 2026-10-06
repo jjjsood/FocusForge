@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, BlobKind, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project, SealRequest,
     SourceResolution, blob,
@@ -160,10 +161,10 @@ fn sealed(name: &str) -> (PathBuf, PathBuf) {
 }
 
 fn entry_names(path: &Path) -> Vec<String> {
-    let file = std::fs::File::open(path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
         .collect()
 }
 
@@ -172,26 +173,14 @@ fn entry_names(path: &Path) -> Vec<String> {
 /// future-dated project the read path is supposed to refuse without the
 /// writer growing a hook that exists only for tests.
 fn rewrite_entry(src: &Path, dst: &Path, entry: &str, replace: impl Fn(&[u8]) -> Vec<u8>) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in names {
-        let mut bytes = Vec::new();
-        archive
-            .by_name(&name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        let mut bytes = index.read_entry(src, name).unwrap();
         if name == entry {
             bytes = replace(&bytes);
         }
-        writer.start_file(&*name, options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        writer.put_bytes(name, &bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -233,17 +222,11 @@ fn container_layout_is_exactly_the_named_entries() {
 #[test]
 fn manifest_carries_no_format_version() {
     let (_dir, project_path) = sealed("project_format_no_version");
-    let file = std::fs::File::open(&project_path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    let mut text = String::new();
-    {
-        use std::io::Read;
-        archive
-            .by_name("manifest.json")
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
-    }
+    let bytes = Index::read(&project_path)
+        .unwrap()
+        .read_entry(&project_path, "manifest.json")
+        .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert!(
         value.get("format_version").is_none(),

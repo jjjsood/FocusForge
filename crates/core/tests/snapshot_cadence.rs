@@ -7,12 +7,12 @@
 
 mod common;
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::Index;
 use focusforge_core::project::{
     self, BlobKind, Metrics, Op, Point, Project, SealRequest, ZMapChain, ZMapStorage,
 };
@@ -203,14 +203,7 @@ fn read_zmap_pixels(path: &Path) -> Vec<u16> {
 }
 
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_checkpoint_json(path: &Path, id: &str) -> serde_json::Value {
@@ -706,9 +699,11 @@ fn full_only_project_is_not_rewritten() {
         "0 deltas behind a full head, nothing blocks the smaller-of-two choice"
     );
 
-    let before_archive =
-        zip::ZipArchive::new(std::fs::File::open(&before_snapshot).unwrap()).unwrap();
-    let before_names: Vec<String> = before_archive.file_names().map(|n| n.to_string()).collect();
+    let before_names: Vec<String> = Index::read(&before_snapshot)
+        .unwrap()
+        .names()
+        .map(str::to_string)
+        .collect();
     for name in &before_names {
         if name == "manifest.json" {
             continue; // a new blob record and head change manifest.json
