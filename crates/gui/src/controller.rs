@@ -442,6 +442,9 @@ struct ProjectTab {
     /// [`AppController::save_active_project`] writes them. A parent is an
     /// index into this list or a saved checkpoint's id.
     held: Vec<job::InMemoryCheckpoint>,
+    /// The threads compressing the composites of `held`'s fused entries, each
+    /// with the composite file it reads; a save joins them.
+    compressing: Vec<(PathBuf, job::Compression)>,
     /// Rows (saved or in memory) whose deletion waits for the next project
     /// save; the list already leaves them out.
     pending_deletes: Vec<job::ParentRef>,
@@ -742,6 +745,7 @@ impl ProjectTab {
             menu_open: None,
             expanded: BTreeSet::new(),
             held: Vec::new(),
+            compressing: Vec::new(),
             pending_deletes: Vec::new(),
             viewed: Vec::new(),
             selected_checkpoint,
@@ -1302,6 +1306,8 @@ struct ShellState {
     locate: LocateSlot,
     /// The running and queued saves, and what follows the last one.
     save: SaveSlot,
+    /// Background compactions of projects whose tab closed.
+    compactions: Vec<std::thread::JoinHandle<()>>,
     /// The `Composite` pane's rainbow overlay -- window-wide (see
     /// [`OverlayState`]).
     overlay: OverlayState,
@@ -3817,6 +3823,7 @@ impl AppController {
         if self.state.load.in_flight {
             return None;
         }
+        self.join_compactions();
         let target = match entry::classify(paths) {
             Ok(target) => target,
             Err(err) => {
@@ -4343,9 +4350,11 @@ impl AppController {
         {
             self.state.pending_checkpoint_delete = None;
         }
+        let mut compact_path = None;
         if let GuiProject::Opened(project) = &closed.project {
             let _ =
                 std::fs::remove_dir_all(job::plane_cache_dir(&self.scratch_root(), project.path()));
+            compact_path = Some(project.path().to_path_buf());
         }
         remove_in_memory(&closed.held);
         if let Some(parked) = &closed.parked {
@@ -4370,6 +4379,13 @@ impl AppController {
         };
         if closed_was_active {
             self.state.pending_frame_change = None;
+        }
+        // The tab's file handle is closed before the file is rewritten.
+        drop(closed);
+        if let Some(path) = compact_path {
+            self.state
+                .compactions
+                .push(std::thread::spawn(move || job::compact_quietly(&path)));
         }
         self.leave_editor_if_unfit();
         // A close renumbers every later tab down by one, so an index-shaped
@@ -6941,6 +6957,8 @@ impl AppController {
         tab.drop_session();
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
+        tab.compressing
+            .push((planes.0.clone(), job::spawn_compression(planes.0.clone())));
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
         tab.row_planes = None;
         tab.held.push(job::InMemoryCheckpoint {
@@ -7449,10 +7467,13 @@ impl AppController {
         let deletes = tab.pending_deletes.clone();
         let keep = tab.row_parent();
         let onto_existing = matches!(tab.project, GuiProject::Opened(_));
+        let compressing = std::mem::take(&mut self.state.projects[index].compressing);
         let outcome = Arc::clone(&self.state.save.outcome);
         let sink = self.sink.clone();
         let (path, worker_keep) = (target.clone(), keep.clone());
         let worker = std::thread::spawn(move || {
+            let mut held = held;
+            job::attach_compressed(&mut held, compressing);
             let result =
                 job::save_in_memory(&path, &held, &deletes, worker_keep.as_ref(), onto_existing)
                     .map_err(|err| err.to_string());
@@ -7547,6 +7568,35 @@ impl AppController {
         }
     }
 
+    /// Waits for the background compactions of closed tabs.
+    fn join_compactions(&mut self) {
+        for handle in self.state.compactions.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
+    /// Waits for the compactions of closed tabs, then compacts every open
+    /// project that is mostly dead data. The end of a session calls it, so
+    /// the process never exits mid-compaction.
+    pub fn finish_compactions(&mut self) {
+        self.join_compactions();
+        for tab in &self.state.projects {
+            if let GuiProject::Opened(project) = &tab.project {
+                job::compact_quietly(project.path());
+            }
+        }
+    }
+
+    /// Waits for every tab's background composite compression and gives each
+    /// held checkpoint its finished blob. A save does the same for its own
+    /// tab; headless runs and tests call this to look at the result.
+    pub fn finish_compressions(&mut self) {
+        for tab in &mut self.state.projects {
+            let handles = std::mem::take(&mut tab.compressing);
+            job::attach_compressed(&mut tab.held, handles);
+        }
+    }
+
     /// Joins and settles the running save and every save queued behind it,
     /// then returns whether each one wrote. Blocks: the way headless runs,
     /// tests and the end of a session wait out a write.
@@ -7613,6 +7663,7 @@ impl AppController {
             tab.title = entry::tab_title(&tab.project);
             remove_in_memory(&tab.held);
             tab.held.clear();
+            tab.compressing.clear();
             tab.pending_deletes.clear();
             if tab.edit.is_none() {
                 self.state.canvas_dirty = true;

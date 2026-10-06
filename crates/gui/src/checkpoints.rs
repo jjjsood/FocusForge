@@ -660,6 +660,7 @@ mod tests {
                 composite_description: String::new(),
                 metrics: Metrics::default(),
                 created_at: 0,
+                compressed_composite: None,
             }),
             parent: None,
         }

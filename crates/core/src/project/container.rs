@@ -173,6 +173,11 @@ impl Index {
         self.end.saturating_sub(HEADER_LEN + self.footer_len + live)
     }
 
+    /// Whether more than half of the committed file is dead bytes.
+    pub fn mostly_dead(&self) -> bool {
+        self.dead_bytes() * 2 > self.end
+    }
+
     /// Reads one record whole from the file at `path`.
     pub fn read_entry(&self, path: &Path, name: &str) -> Result<Vec<u8>, ProjectError> {
         let file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
@@ -412,6 +417,39 @@ impl ContainerWriter {
         self.finished = true;
         Ok(self.index.clone())
     }
+}
+
+/// Rewrites the project at `path` to its live records only, through a
+/// synced sibling file renamed over it, and returns the bytes reclaimed. A
+/// project with no dead bytes and no torn tail is left untouched (0).
+/// Record names, hence checkpoint ids and blob hashes, do not change.
+pub fn compact(path: &Path) -> Result<u64, ProjectError> {
+    compact_from(path, &Index::read(path)?)
+}
+
+/// [`compact`] when more than half of the committed file is dead bytes.
+pub fn compact_if_mostly_dead(path: &Path) -> Result<Option<u64>, ProjectError> {
+    let index = Index::read(path)?;
+    if !index.mostly_dead() {
+        return Ok(None);
+    }
+    compact_from(path, &index).map(Some)
+}
+
+fn compact_from(path: &Path, index: &Index) -> Result<u64, ProjectError> {
+    let io = |source| ProjectError::io(path, source);
+    let old_len = std::fs::metadata(path).map_err(io)?.len();
+    if index.dead_bytes() == 0 && old_len == index.end() {
+        return Ok(0);
+    }
+    let source = File::open(path).map_err(io)?;
+    let mut writer = ContainerWriter::create(path)?;
+    for name in index.names() {
+        writer.put(name, &mut record_reader(&source, index, path, name)?)?;
+    }
+    drop(source);
+    let compacted = writer.finish()?;
+    Ok(old_len.saturating_sub(compacted.end()))
 }
 
 impl Drop for ContainerWriter {

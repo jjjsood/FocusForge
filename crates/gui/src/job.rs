@@ -1438,6 +1438,58 @@ pub fn settle(
     }
 }
 
+/// Compacts the project at `path` when most of it is dead data; a failure
+/// leaves the project as it was and is only logged.
+pub fn compact_quietly(path: &Path) {
+    if let Err(err) = project::container::compact_if_mostly_dead(path) {
+        tracing::warn!(error = %err, path = %path.display(), "the project could not be compacted");
+    }
+}
+
+/// A thread compressing one held composite into a blob beside it.
+pub type Compression = std::thread::JoinHandle<Result<project::blob::StagedBlob, ProjectError>>;
+
+pub fn spawn_compression(composite: PathBuf) -> Compression {
+    std::thread::spawn(move || {
+        let dir = composite
+            .parent()
+            .expect("a held composite sits in its own directory");
+        project::blob::stage_plane(
+            &composite,
+            project::Plane::Composite,
+            project::blob::ZSTD_LEVEL,
+            dir,
+        )
+    })
+}
+
+/// Joins `handles` and gives each finished blob to the fused entry whose
+/// composite it was made from. A failed compression, or a blob whose file is
+/// gone, leaves its entry for the save to compress itself.
+pub fn attach_compressed(entries: &mut [InMemoryCheckpoint], handles: Vec<(PathBuf, Compression)>) {
+    for (composite, handle) in handles {
+        let blob = match handle.join() {
+            Ok(Ok(blob)) if blob.path.is_file() => blob,
+            Ok(Ok(_)) => continue,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, composite = %composite.display(), "the composite could not be compressed in the background");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(composite = %composite.display(), "the composite compression panicked");
+                continue;
+            }
+        };
+        for entry in entries.iter_mut() {
+            if let InMemoryKind::Fused(held) = &mut entry.kind
+                && held.composite == composite
+            {
+                held.compressed_composite = Some(Box::new(blob.clone()));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod export_refusal_tests {
     use super::*;

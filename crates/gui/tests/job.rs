@@ -2710,6 +2710,104 @@ fn fuse_and_settle(controller: &mut AppController) {
     controller.set_mode(ShellMode::Stacking);
 }
 
+/// The project's record for composite blob `hash`, if it holds one.
+fn blob_record(project: &Path, hash: &str) -> Option<Vec<u8>> {
+    use focusforge_core::project::container::Index;
+    let index = Index::read(project).unwrap();
+    let name = format!("blobs/{hash}.zst");
+    index
+        .contains(&name)
+        .then(|| index.read_entry(project, &name).unwrap())
+}
+
+#[test]
+fn held_result_is_compressed_before_save() {
+    use focusforge_core::project::Plane;
+    use focusforge_core::project::blob::{self, ZSTD_LEVEL};
+
+    let mut controller = controller_with_frames("held_compressed", 3);
+    fuse_and_settle(&mut controller);
+    controller.finish_compressions();
+    let held = controller.held_checkpoints().pop().unwrap();
+    let blob = held
+        .compressed_composite
+        .clone()
+        .expect("the fused composite is compressed in the background");
+    assert!(blob.path.is_file());
+    let compressed = std::fs::read(&blob.path).unwrap();
+
+    // Saving needs no second compression: the TIFF is gone.
+    std::fs::remove_file(&held.composite).unwrap();
+    let project = save_to_proposed(&mut controller);
+    assert_eq!(
+        blob_record(&project, &blob.hash),
+        Some(compressed),
+        "the saved record is the background blob"
+    );
+
+    // A save right after the next fuse waits for its compression.
+    controller.toggle_frame_excluded(2);
+    fuse_and_settle(&mut controller);
+    let held = controller.held_checkpoints().pop().unwrap();
+    assert_eq!(held.sources.len(), 2);
+    assert!(
+        held.compressed_composite.is_none(),
+        "nothing joined the compression yet"
+    );
+    let expected = blob::stage_plane(
+        &held.composite,
+        Plane::Composite,
+        ZSTD_LEVEL,
+        &common::tree("held_compressed_expected"),
+    )
+    .unwrap();
+    assert!(controller.save_active_project(|_| panic!("an opened tab never asks where")));
+    assert!(blob_record(&project, &expected.hash).is_some());
+}
+
+/// Appends `len` dead bytes to the project through the container.
+fn append_dead_bytes(project: &Path, len: u64) {
+    use focusforge_core::project::container::{ContainerWriter, Index};
+    use std::io::Read;
+    let index = Index::read(project).unwrap();
+    let mut writer = ContainerWriter::append(project, &index).unwrap();
+    writer
+        .put("filler.bin", &mut std::io::repeat(0).take(len))
+        .unwrap();
+    writer.drop_entry("filler.bin");
+    writer.finish().unwrap();
+}
+
+#[test]
+fn tab_reopens_after_compaction() {
+    use focusforge_core::project::container::Index;
+
+    let mut controller = controller_with_frames("compaction_reopen", 2);
+    fuse_and_settle(&mut controller);
+    let path = save_to_proposed(&mut controller);
+    let head = Project::open(&path).unwrap().checkpoint().id.clone();
+    append_dead_bytes(&path, 8 << 20);
+    assert!(Index::read(&path).unwrap().mostly_dead());
+
+    // Closing compacts in the background; reopening waits for it.
+    controller.close_project(0);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&path)),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(Index::read(&path).unwrap().dead_bytes(), 0);
+    assert_eq!(Project::open(&path).unwrap().checkpoint().id, head);
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    // Quitting compacts a tab that is still open.
+    append_dead_bytes(&path, 8 << 20);
+    assert!(Index::read(&path).unwrap().mostly_dead());
+    controller.finish_compactions();
+    assert_eq!(Index::read(&path).unwrap().dead_bytes(), 0);
+    assert!(!project::partial_path(&path).exists());
+    assert_eq!(Project::open(&path).unwrap().checkpoint().id, head);
+}
+
 #[test]
 fn a_first_fuse_writes_no_project_file() {
     let root = common::tree("first_fuse_writes_nothing_frames");

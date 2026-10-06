@@ -2,8 +2,8 @@
 
 //! `focusforge-cli history`: every checkpoint operation reachable headless --
 //! list, materialize one to a file, apply an op list read from a file
-//! (previewing it, sealing it as a new checkpoint, or both), and delete a
-//! checkpoint.
+//! (previewing it, sealing it as a new checkpoint, or both), delete a
+//! checkpoint, and compact a project to its live checkpoints.
 //!
 //! Each subcommand is a thin adapter over one `focusforge_core::project`
 //! entry point: argument parsing, a report and an exit code, no replay or
@@ -33,6 +33,9 @@ pub enum HistoryCommand {
     /// visible checkpoint is built on it; its space is reclaimed by
     /// `history compact`. Refuses the last visible checkpoint.
     Delete(DeleteArgs),
+    /// Rewrite the project to its live checkpoints only and report the bytes
+    /// reclaimed.
+    Compact(CompactArgs),
 }
 
 #[derive(Args)]
@@ -94,6 +97,15 @@ pub struct DeleteArgs {
     json: bool,
 }
 
+#[derive(Args)]
+pub struct CompactArgs {
+    /// The project to compact.
+    project: PathBuf,
+    /// Emit the JSON report instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+}
+
 pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
     match command {
         HistoryCommand::List(args) => list(&args.project, args.json, accept_changed_sources),
@@ -119,6 +131,7 @@ pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
             args.json,
             accept_changed_sources,
         ),
+        HistoryCommand::Compact(args) => compact(&args.project, args.json),
     }
 }
 
@@ -466,6 +479,10 @@ fn apply(
         wrote_out = Some(output.display().to_string());
     }
 
+    if save {
+        compact_after_save(project_path);
+    }
+
     let report = ApplyReport {
         project: project_path.display().to_string(),
         from: from_id,
@@ -522,6 +539,8 @@ fn delete(
         Ok(deleted) => deleted,
         Err(err) => return fail(err),
     };
+    compact_after_save(project_path);
+
     let report = DeleteReport {
         project: project_path.display().to_string(),
         hidden: deleted.hidden,
@@ -540,6 +559,51 @@ fn delete(
             report.hidden,
             report.removed.join(", "),
             report.head
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Compacts the project when most of it is dead data. The save already
+/// committed, so a failure here is a warning and the command still succeeds.
+fn compact_after_save(project_path: &Path) {
+    match project::container::compact_if_mostly_dead(project_path) {
+        Ok(Some(reclaimed)) => eprintln!(
+            "compacted {}: {reclaimed} bytes reclaimed",
+            project_path.display()
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!(
+            "warning: could not compact {}: {err}",
+            project_path.display()
+        ),
+    }
+}
+
+#[derive(Serialize)]
+struct CompactReport {
+    project: String,
+    reclaimed_bytes: u64,
+}
+
+fn compact(project_path: &Path, json: bool) -> ExitCode {
+    let reclaimed_bytes = match project::container::compact(project_path) {
+        Ok(reclaimed) => reclaimed,
+        Err(err) => return fail_with_code(&err, exit_code_for(&err)),
+    };
+    let report = CompactReport {
+        project: project_path.display().to_string(),
+        reclaimed_bytes,
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        println!(
+            "{}\nreclaimed: {} bytes",
+            report.project, report.reclaimed_bytes
         );
     }
     ExitCode::SUCCESS

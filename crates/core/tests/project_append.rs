@@ -426,6 +426,7 @@ fn held_checkpoint(
         composite_description: "staged composite".to_string(),
         metrics: Metrics::default(),
         created_at,
+        compressed_composite: None,
     }
 }
 

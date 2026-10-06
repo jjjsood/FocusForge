@@ -70,19 +70,21 @@ pub fn append_at(
     created_at: i64,
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(request.project_path)?;
-    let sealed = append_onto(&mut project, &request, None, created_at)?;
+    let sealed = append_onto(&mut project, &request, None, created_at, None)?;
     project.commit()?;
     Ok(sealed)
 }
 
 /// [`append_at`] onto an open project, under an explicit `parent` checkpoint
 /// instead of the project's head; `None` is the head. The caller has checked
-/// that `parent` exists and commits the project.
+/// that `parent` exists and commits the project. A `composite` blob already
+/// staged is written as it is and stays where it is.
 pub(super) fn append_onto(
     project: &mut Project,
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
+    composite: Option<&StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
     let staging = request
         .staged_composite
@@ -91,7 +93,15 @@ pub(super) fn append_onto(
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let mut staged: Vec<StagedBlob> = Vec::new();
-    let result = append_staged(project, request, parent, created_at, &staging, &mut staged);
+    let result = append_staged(
+        project,
+        request,
+        parent,
+        created_at,
+        composite,
+        &staging,
+        &mut staged,
+    );
     for blob in &staged {
         blob.remove();
     }
@@ -103,6 +113,7 @@ fn append_staged(
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
+    composite: Option<&StagedBlob>,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
@@ -117,13 +128,19 @@ fn append_staged(
         sources.push(source_ref(path, &project_dir)?);
     }
 
-    let composite = blob::stage_plane(
-        request.staged_composite,
-        Plane::Composite,
-        ZSTD_LEVEL,
-        staging,
-    )?;
-    staged.push(composite.clone());
+    let composite = match composite {
+        Some(blob) => blob.clone(),
+        None => {
+            let blob = blob::stage_plane(
+                request.staged_composite,
+                Plane::Composite,
+                ZSTD_LEVEL,
+                staging,
+            )?;
+            staged.push(blob.clone());
+            blob
+        }
+    };
     let zmap = blob::stage_plane(request.staged_zmap, Plane::ZMap, ZSTD_LEVEL, staging)?;
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;

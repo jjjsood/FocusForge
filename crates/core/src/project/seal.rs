@@ -80,6 +80,16 @@ pub fn seal(request: SealRequest<'_>) -> Result<SealedProject, ProjectError> {
 /// same inputs, which makes this the entry point a reproducibility check
 /// uses.
 pub fn seal_at(request: SealRequest<'_>, created_at: i64) -> Result<SealedProject, ProjectError> {
+    seal_with(request, created_at, None)
+}
+
+/// [`seal_at`] with the composite's blob already staged: it is written as
+/// it is and stays where it is.
+pub(super) fn seal_with(
+    request: SealRequest<'_>,
+    created_at: i64,
+    composite: Option<&StagedBlob>,
+) -> Result<SealedProject, ProjectError> {
     let staging = request
         .staged_composite
         .parent()
@@ -87,7 +97,7 @@ pub fn seal_at(request: SealRequest<'_>, created_at: i64) -> Result<SealedProjec
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let mut staged: Vec<StagedBlob> = Vec::new();
-    let result = seal_staged(&request, created_at, &staging, &mut staged);
+    let result = seal_staged(&request, created_at, composite, &staging, &mut staged);
     for blob in &staged {
         blob.remove();
     }
@@ -97,6 +107,7 @@ pub fn seal_at(request: SealRequest<'_>, created_at: i64) -> Result<SealedProjec
 fn seal_staged(
     request: &SealRequest<'_>,
     created_at: i64,
+    composite: Option<&StagedBlob>,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
@@ -111,13 +122,19 @@ fn seal_staged(
     }
     let stack_fingerprint = blob::stack_fingerprint(&sources);
 
-    let composite = blob::stage_plane(
-        request.staged_composite,
-        Plane::Composite,
-        ZSTD_LEVEL,
-        staging,
-    )?;
-    staged.push(composite.clone());
+    let composite = match composite {
+        Some(blob) => blob.clone(),
+        None => {
+            let blob = blob::stage_plane(
+                request.staged_composite,
+                Plane::Composite,
+                ZSTD_LEVEL,
+                staging,
+            )?;
+            staged.push(blob.clone());
+            blob
+        }
+    };
     let zmap = blob::stage_plane(request.staged_zmap, Plane::ZMap, ZSTD_LEVEL, staging)?;
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;
@@ -226,6 +243,11 @@ pub struct HeldCheckpoint {
     pub metrics: Metrics,
     /// Unix seconds, UTC, stamped when the run finished.
     pub created_at: i64,
+    /// The composite already compressed and hashed, beside the held planes.
+    /// A save writes it as it is instead of reading the composite again. Not
+    /// persisted: the file it names belongs to the process that made it.
+    #[serde(skip)]
+    pub compressed_composite: Option<Box<StagedBlob>>,
 }
 
 /// Where an in-memory checkpoint is recorded: under a checkpoint the project
@@ -465,7 +487,7 @@ fn apply_deletes(
 
 /// Seals `held` as a new project's root at `path`.
 fn seal_root(path: &Path, held: &HeldCheckpoint) -> Result<String, ProjectError> {
-    Ok(seal_at(
+    Ok(seal_with(
         SealRequest {
             project_path: path,
             staged_composite: &held.composite,
@@ -480,6 +502,7 @@ fn seal_root(path: &Path, held: &HeldCheckpoint) -> Result<String, ProjectError>
             metrics: held.metrics,
         },
         held.created_at,
+        held.compressed_composite.as_deref(),
     )?
     .checkpoint)
 }
@@ -508,6 +531,7 @@ fn append_held(
         },
         Some(parent),
         held.created_at,
+        held.compressed_composite.as_deref(),
     )?;
     Ok(written.checkpoint)
 }

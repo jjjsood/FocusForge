@@ -1012,13 +1012,169 @@ fn output_does_not_reveal_storage_kind() {
     }
 }
 
+/// The live records of `path`, each with its bytes, in name order.
+fn live_records(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let index = Index::read(path).unwrap();
+    index
+        .names()
+        .map(|name| (name.to_string(), index.read_entry(path, name).unwrap()))
+        .collect()
+}
+
+/// Appends `len` dead bytes to the project through the container.
+fn append_dead_bytes(path: &Path, len: u64) {
+    use std::io::Read;
+    let index = Index::read(path).unwrap();
+    let mut writer = ContainerWriter::append(path, &index).unwrap();
+    writer
+        .put("filler.bin", &mut std::io::repeat(0).take(len))
+        .unwrap();
+    writer.drop_entry("filler.bin");
+    writer.finish().unwrap();
+}
+
+#[test]
+fn compact_keeps_visible_states() {
+    let (dir, project) = fresh_project("compact_keeps_visible_states");
+    let root = root_id(&project);
+    let first = seal_strokes(&dir, &project, None);
+    let tip = seal_strokes(&dir, &project, None);
+    let project_arg = project.to_str().unwrap();
+    let output = run(
+        &dir,
+        &["history", "delete", project_arg, "--checkpoint", &tip],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(
+        !output.stderr.contains("compacted"),
+        "the delete left the file under the threshold: {}",
+        output.stderr
+    );
+
+    let visible = listed(&dir, &project);
+    let ids: Vec<&str> = visible.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&first.as_str()) && ids.contains(&root.as_str()));
+    assert!(!ids.contains(&tip.as_str()));
+    let records_before = live_records(&project);
+    let old_len = std::fs::metadata(&project).unwrap().len();
+    assert!(Index::read(&project).unwrap().dead_bytes() > 0);
+
+    let output = run(&dir, &["history", "compact", project_arg, "--json"]);
+    assert!(output.success, "stderr: {}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(report["project"], project_arg);
+    let new_len = std::fs::metadata(&project).unwrap().len();
+    assert!(new_len < old_len);
+    assert_eq!(report["reclaimed_bytes"], old_len - new_len);
+
+    assert_eq!(listed(&dir, &project), visible);
+    assert_eq!(live_records(&project), records_before);
+    assert_eq!(Index::read(&project).unwrap().dead_bytes(), 0);
+    assert_eq!(Project::open(&project).unwrap().checkpoint().id, first);
+    assert!(
+        Index::read(&project)
+            .unwrap()
+            .get(&format!("checkpoints/{tip}.json"))
+            .is_none()
+    );
+    assert!(!project::partial_path(&project).exists());
+
+    let compacted = std::fs::read(&project).unwrap();
+    let output = run(&dir, &["history", "compact", project_arg]);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(
+        output.stdout.contains("reclaimed: 0 bytes"),
+        "{}",
+        output.stdout
+    );
+    assert_eq!(std::fs::read(&project).unwrap(), compacted);
+
+    let not_a_project = dir.join("notes.ffp");
+    std::fs::write(&not_a_project, b"plain text, not a project").unwrap();
+    let output = run(
+        &dir,
+        &["history", "compact", not_a_project.to_str().unwrap()],
+    );
+    assert_eq!(output.exit_code, Some(3), "stderr: {}", output.stderr);
+}
+
+#[test]
+fn save_commands_compact_mostly_dead_files() {
+    const FILLER: u64 = 16 << 20;
+    let (dir, project) = fresh_project("save_commands_compact_mostly_dead_files");
+    let root = root_id(&project);
+    let project_arg = project.to_str().unwrap();
+
+    // A save onto a file under the threshold does not compact.
+    let kept = seal_strokes(&dir, &project, None);
+    let run_save = |dir: &Path| {
+        let ops = write_op_file(
+            dir,
+            "ops-again.json",
+            &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        );
+        run(
+            dir,
+            &[
+                "history",
+                "apply",
+                project_arg,
+                "--ops",
+                ops.to_str().unwrap(),
+                "--save",
+                "--json",
+            ],
+        )
+    };
+    let output = run_save(&dir);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(!output.stderr.contains("compacted"), "{}", output.stderr);
+
+    // A save onto a mostly dead file compacts it, after the save committed.
+    append_dead_bytes(&project, FILLER);
+    let output = run_save(&dir);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stderr.contains("compacted"), "{}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert!(report["checkpoint"].is_string());
+    assert!(std::fs::metadata(&project).unwrap().len() < FILLER);
+    assert_eq!(Index::read(&project).unwrap().dead_bytes(), 0);
+
+    // A delete does the same and prints the same report as before.
+    let tip = report["checkpoint"].as_str().unwrap().to_string();
+    append_dead_bytes(&project, FILLER);
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project_arg,
+            "--checkpoint",
+            &tip,
+            "--json",
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stderr.contains("compacted"), "{}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(report["hidden"], tip);
+    assert_eq!(report["removed"], serde_json::json!([tip]));
+    assert!(std::fs::metadata(&project).unwrap().len() < FILLER);
+    assert_eq!(Index::read(&project).unwrap().dead_bytes(), 0);
+    let ids: Vec<String> = listed(&dir, &project)
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&root) && ids.contains(&kept) && !ids.contains(&tip));
+}
+
 #[test]
 fn help_lists_every_command() {
     let dir = common::tmp_dir("help_lists_every_command");
 
     let output = run(&dir, &["history", "--help"]);
     assert!(output.success);
-    for name in ["list", "materialize", "apply", "delete"] {
+    for name in ["list", "materialize", "apply", "delete", "compact"] {
         assert!(
             output.stdout.contains(name),
             "history --help missing {name}: {}",
@@ -1026,7 +1182,7 @@ fn help_lists_every_command() {
         );
     }
 
-    let subcommand_flags: [(&str, &[&str]); 4] = [
+    let subcommand_flags: [(&str, &[&str]); 5] = [
         ("list", &["--json"]),
         ("materialize", &["--checkpoint", "--output", "--json"]),
         (
@@ -1034,6 +1190,7 @@ fn help_lists_every_command() {
             &["--ops", "--from", "--save", "--output", "--json"],
         ),
         ("delete", &["--checkpoint", "--json"]),
+        ("compact", &["--json"]),
     ];
     for (sub, flags) in subcommand_flags {
         let output = run(&dir, &["history", sub, "--help"]);

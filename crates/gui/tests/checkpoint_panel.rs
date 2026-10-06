@@ -254,6 +254,7 @@ fn held_at(created_at: i64) -> InMemoryCheckpoint {
         composite_description: String::new(),
         metrics: Metrics::default(),
         created_at,
+        compressed_composite: None,
     };
     InMemoryCheckpoint {
         kind: InMemoryKind::Fused(held),

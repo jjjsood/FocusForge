@@ -774,7 +774,9 @@ fn run_window<T: ComponentHandle + 'static>(
     bridge::shutdown_windows();
     // Quitting never interrupts a write in progress.
     if let Some(controller) = &controller {
-        controller.lock().unwrap().finish_saves();
+        let mut controller = controller.lock().unwrap();
+        controller.finish_saves();
+        controller.finish_compactions();
     }
     if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
         app.set_frame_source(slint::Image::default());

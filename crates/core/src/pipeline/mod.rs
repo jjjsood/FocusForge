@@ -846,6 +846,7 @@ pub fn run(
                 composite_description,
                 metrics,
                 created_at: project::seal::now_unix(),
+                compressed_composite: None,
             },
         )
         .map(FuseProduct::Held),

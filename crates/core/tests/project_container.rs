@@ -151,6 +151,7 @@ impl Fixture {
             composite_description: "golden".to_string(),
             metrics: Metrics::default(),
             created_at,
+            compressed_composite: None,
         }
     }
 }
@@ -640,4 +641,166 @@ fn delete_appends_hide_record() {
         old.dead_bytes(),
         new.dead_bytes()
     );
+}
+
+/// Appends a record of `len` zero bytes to the project, then stops listing it.
+fn append_dead_record(path: &Path, len: u64) {
+    let index = Index::read(path).unwrap();
+    let mut writer = ContainerWriter::append(path, &index).unwrap();
+    writer
+        .put("filler.bin", &mut std::io::repeat(0).take(len))
+        .unwrap();
+    writer.drop_entry("filler.bin");
+    writer.finish().unwrap();
+}
+
+/// A container with a 100-byte live record whose `filler` bytes are dead.
+fn filler_container(path: &Path, filler: u64) -> Index {
+    let mut writer = ContainerWriter::create(path).unwrap();
+    writer.put_bytes("live.bin", &[7; 100]).unwrap();
+    writer.finish().unwrap();
+    append_dead_record(path, filler);
+    Index::read(path).unwrap()
+}
+
+/// The filler size at which exactly half of the committed file is dead.
+fn half_dead_filler(dir: &Path) -> u64 {
+    let probe = dir.join("probe.ffp");
+    let mut filler = 2000u64;
+    for _ in 0..8 {
+        let index = filler_container(&probe, filler);
+        let excess = index.dead_bytes() as i64 * 2 - index.end() as i64;
+        if excess == 0 {
+            return filler;
+        }
+        filler = filler.checked_add_signed(-excess).unwrap();
+    }
+    panic!("no filler size puts exactly half of the file into dead bytes");
+}
+
+#[test]
+fn auto_compaction_threshold() {
+    let dir = tmp_dir("container_threshold");
+    let half = half_dead_filler(&dir);
+
+    let at_half = dir.join("half.ffp");
+    let index = filler_container(&at_half, half);
+    assert_eq!(index.dead_bytes() * 2, index.end());
+    assert!(!index.mostly_dead(), "exactly half dead is not over half");
+    let before = std::fs::read(&at_half).unwrap();
+    assert_eq!(
+        project::container::compact_if_mostly_dead(&at_half).unwrap(),
+        None
+    );
+    assert!(
+        std::fs::read(&at_half).unwrap() == before,
+        "a file at the threshold was rewritten"
+    );
+
+    let over = dir.join("over.ffp");
+    assert!(filler_container(&over, half + 1).mostly_dead());
+
+    // A real project made mostly dead; a save and a delete leave it as it is.
+    let fx = Fixture::new("container_threshold_project");
+    let o1 = fx.append_ops(&fx.root.clone(), stroke(100, 100), T0 + 10);
+    append_dead_record(&fx.project, 8 << 20);
+    assert!(Index::read(&fx.project).unwrap().mostly_dead());
+
+    let before = std::fs::read(&fx.project).unwrap();
+    project::seal_in_memory(
+        &fx.project,
+        &[ops_entry(
+            stroke(120, 90),
+            T0 + 20,
+            ParentRef::Saved(o1.clone()),
+        )],
+        &[],
+        None,
+        true,
+    )
+    .unwrap();
+    let saved = std::fs::read(&fx.project).unwrap();
+    assert!(saved.len() > before.len() && saved[..before.len()] == before[..]);
+    assert!(Index::read(&fx.project).unwrap().mostly_dead());
+
+    project::delete_checkpoint(&fx.project, &o1).unwrap();
+    let deleted = std::fs::read(&fx.project).unwrap();
+    assert!(deleted[..saved.len()] == saved[..], "a delete moved bytes");
+    let state = snapshot(&Project::open(&fx.project).unwrap());
+
+    let reclaimed = project::container::compact_if_mostly_dead(&fx.project)
+        .unwrap()
+        .expect("a mostly dead file is compacted");
+    let compacted = std::fs::read(&fx.project).unwrap();
+    assert_eq!(reclaimed, (deleted.len() - compacted.len()) as u64);
+    assert!(reclaimed > 8 << 20);
+    assert_eq!(Index::read(&fx.project).unwrap().dead_bytes(), 0);
+    assert_eq!(snapshot(&Project::open(&fx.project).unwrap()), state);
+    no_partial_beside(&fx.project);
+    assert_eq!(
+        project::container::compact_if_mostly_dead(&fx.project).unwrap(),
+        None
+    );
+    assert!(std::fs::read(&fx.project).unwrap() == compacted);
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_compaction_keeps_project() {
+    let fx = Fixture::new("container_interrupted_compaction");
+    fx.append_ops(&fx.root.clone(), stroke(100, 100), T0 + 10);
+    append_dead_record(&fx.project, 1 << 20);
+    let before = std::fs::read(&fx.project).unwrap();
+    let head = fx.head();
+
+    // Writes into the sibling file fail with "no space left on device".
+    std::os::unix::fs::symlink("/dev/full", project::partial_path(&fx.project)).unwrap();
+    let err =
+        project::container::compact(&fx.project).expect_err("the sibling file cannot be written");
+    assert!(matches!(err, ProjectError::Io { .. }), "{err}");
+
+    assert!(
+        std::fs::read(&fx.project).unwrap() == before,
+        "the project changed"
+    );
+    assert_eq!(fx.head(), head);
+    no_partial_beside(&fx.project);
+}
+
+#[test]
+fn compressed_composite_is_appended_without_the_tiff() {
+    let fx = Fixture::new("container_compressed_composite");
+    let held_dir = fx.dir.join("held");
+    std::fs::create_dir_all(&held_dir).unwrap();
+    let blob = project::blob::stage_plane(
+        &fx.composite,
+        Plane::Composite,
+        project::blob::ZSTD_LEVEL,
+        &held_dir,
+    )
+    .unwrap();
+    let mut held = fx.held(T0 + 10);
+    held.composite = held_dir.join("composite.tif");
+    held.compressed_composite = Some(Box::new(blob.clone()));
+    assert!(!held.composite.exists());
+
+    for (name, onto_existing) in [("new.ffp", false), ("existing.ffp", true)] {
+        let target = fx.dir.join(name);
+        let parent = if onto_existing {
+            std::fs::copy(&fx.project, &target).unwrap();
+            Some(ParentRef::Saved(fx.root.clone()))
+        } else {
+            None
+        };
+        let entry = fused_entry(held.clone(), parent);
+        project::seal_in_memory(&target, &[entry], &[], None, onto_existing)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let index = Index::read(&target).unwrap();
+        assert_eq!(
+            index.read_entry(&target, &blob_name(&blob.hash)).unwrap(),
+            std::fs::read(&blob.path).unwrap(),
+            "{name}: the record is the staged file"
+        );
+        assert!(blob.path.exists(), "{name}: the held blob is not consumed");
+    }
 }
