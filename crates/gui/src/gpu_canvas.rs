@@ -779,8 +779,8 @@ impl CanvasRenderer {
     /// that pane already covers `draw.src`/`draw.step` under the same edit
     /// generation and overlay (whatever `dst` and `pixelated` now are; work
     /// still in flight for it is retired), with no planes or device, or an
-    /// out-of-bounds `draw.src`. A composite drawn under an edit session or a three-sample overlay also
-    /// reads the sealed Z-Map indices.
+    /// out-of-bounds `draw.src`. A composite drawn under an edit session or
+    /// a three-sample overlay also reads the sealed Z-Map indices.
     pub fn request_planes(
         &mut self,
         draw: &PaneDraw,
@@ -923,10 +923,10 @@ impl CanvasRenderer {
     /// texels (empty when the job read none). `edited`, present on a job
     /// issued under an edit generation, overlays the composite with the
     /// resident tiles' gathered pixel wherever its index differs; the job's
-    /// own overlay blends the rainbow over a three-sample composite. `None`, with
-    /// nothing rendered or uploaded, when the job is stale -- issued before a
-    /// source, plane or device change or before a newer job for the pane
-    /// published -- or when there is no device.
+    /// own overlay blends the rainbow over a three-sample composite. `None`,
+    /// with nothing rendered or uploaded, when the job is stale -- issued
+    /// before a source, plane or device change or before a newer job for the
+    /// pane published -- or when there is no device.
     pub fn publish_edited(
         &mut self,
         job: &PaneJob,
@@ -1084,9 +1084,9 @@ impl CanvasRenderer {
     /// whatever `dst`/`pixelated` now are. `edited`, present, overlays the
     /// composite with the resident tiles' gathered pixel wherever its index
     /// differs; `overlay`, present on a three-sample composite, blends the
-    /// rainbow overlay in place of the plain render. `None` with no planes open, an
-    /// out-of-bounds `draw.src`, or a failed read (coverage stays untouched
-    /// on that path).
+    /// rainbow overlay in place of the plain render. `None` with no planes
+    /// open, an out-of-bounds `draw.src`, or a failed read (coverage stays
+    /// untouched on that path).
     pub fn redraw_planes(
         &mut self,
         draw: &PaneDraw,
