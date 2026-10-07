@@ -21,7 +21,7 @@ pub enum ProjectError {
     },
 
     /// The container itself could not be written, opened or navigated --
-    /// a malformed zip, a missing entry, a manifest that will not parse.
+    /// a record that will not parse, a manifest that will not parse.
     #[error("{}: {message}", path.display())]
     Container { path: PathBuf, message: String },
 
@@ -54,35 +54,6 @@ pub enum ProjectError {
     #[error("{}: an empty op list cannot be sealed", path.display())]
     EmptyOpList { path: PathBuf },
 
-    /// A stored patch names a base blob that has no record in this project
-    /// -- neither a full map nor a further patch. `blob` is the patch's own
-    /// hash, `base` the missing one it names.
-    #[error(
-        "{}: blob {blob} names base {base}, which is not present in this project",
-        path.display()
-    )]
-    PatchBaseMissing {
-        path: PathBuf,
-        blob: String,
-        base: String,
-    },
-
-    /// A stored patch's own declared map shape does not match this
-    /// project's Z-Map plane -- refused rather than applied.
-    #[error(
-        "{}: blob {blob} declares a {found_width}x{found_height} map, but this project's \
-         Z-Map is {expected_width}x{expected_height}",
-        path.display()
-    )]
-    PatchGeometryMismatch {
-        path: PathBuf,
-        blob: String,
-        found_width: u32,
-        found_height: u32,
-        expected_width: u32,
-        expected_height: u32,
-    },
-
     /// A checkpoint's `parent` names an id no checkpoint in the project
     /// carries.
     #[error("{}: checkpoint {checkpoint} names parent {parent}, which is not in this project", path.display())]
@@ -110,21 +81,21 @@ pub enum ProjectError {
     )]
     LastVisibleDelete { path: PathBuf, checkpoint: String },
 
-    /// `path` is not a FocusForge project: not a zip at all, or a zip with
-    /// no `manifest.json`.
+    /// `path` is not a FocusForge project: empty, shorter than the file
+    /// header, another kind of file, or a container with no `manifest.json`.
     #[error("{}: is not a FocusForge project", path.display())]
     NotAProject { path: PathBuf },
 
-    /// `path` carries a valid zip signature but its central directory
-    /// cannot be read -- the file was cut short.
+    /// `path` carries the project header but no footer that validates -- the
+    /// file was cut short before its first save was committed.
     #[error(
         "{}: is truncated or incomplete -- the file was cut short",
         path.display()
     )]
     Truncated { path: PathBuf },
 
-    /// `entry` is named by a record -- a blob, a checkpoint -- but is not in
-    /// the container.
+    /// `entry` is named by a record -- a blob, a checkpoint -- but is not
+    /// listed in the container's footer.
     #[error("{}: is missing {entry}, which it references", path.display())]
     MissingEntry { path: PathBuf, entry: String },
 
@@ -207,8 +178,8 @@ pub enum ProjectError {
         samples_per_pixel: u32,
     },
 
-    /// [`super::render::CheckpointImage::prepare_zmap`] found at least one of
-    /// `source.sources` missing on disk: `detail` names each, one per line,
+    /// [`super::render::CheckpointImage::prepare_pending`] found at least one of
+    /// the state's sources missing on disk: `detail` names each, one per line,
     /// `missing: <path>`. There is no stored fingerprint to compare a
     /// present file against, unlike a checkpoint's own recorded sources, so
     /// this never reports `changed`.
@@ -239,9 +210,9 @@ impl ProjectError {
     }
 
     /// A container-level failure against `path`, from any error type that
-    /// renders -- the one place a `TiffError`, a `ZMapError`, a `zip::result::ZipError`
-    /// or a `serde_json::Error` becomes a project failure that still names
-    /// the file the caller handed in.
+    /// renders -- the one place a `TiffError`, a `ZMapError` or a
+    /// `serde_json::Error` becomes a project failure that still names the file
+    /// the caller handed in.
     pub(crate) fn container(path: impl Into<PathBuf>, message: impl std::fmt::Display) -> Self {
         ProjectError::Container {
             path: path.into(),

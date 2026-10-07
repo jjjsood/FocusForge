@@ -8,8 +8,7 @@
 //!
 //! [`NO_SOURCE`] is legal everywhere and every consumer must *handle* it --
 //! forgetting it is a silent wrong-pixel bug, not a compile error: the
-//! palette needs a defined colour for it and a recomposite shader a defined
-//! behaviour for it.
+//! palette needs a defined colour for it.
 //!
 //! Two traps a reader will otherwise hit:
 //!

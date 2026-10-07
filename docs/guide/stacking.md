@@ -39,11 +39,12 @@ focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 
 `export` reads a project and writes the image (`-o`), the Z-Map
 (`--zmap`), or both in one invocation — at least one of the two is required.
-The image is rendered from the project's Z-Map, so it always reflects the
-checkpoint you ask for (the head by default; `--checkpoint <id>` picks
-another). Rendering reads the source frames again and checks them against
-the hashes recorded when the project was written; a missing or changed
-frame is named and nothing is written.
+The image is rendered from the project's stored composite, so it always
+reflects the checkpoint you ask for (the head by default; `--checkpoint <id>`
+picks another). An unretouched checkpoint needs no source frames; a retouched
+one reads them again and checks them against the hashes recorded when the
+project was written, and a missing or changed frame is named with nothing
+written. `export` refuses an output path that names the project itself.
 
 The format follows `-o`'s extension: `.tif`, `.png` or `.jpg`. Each format
 has its own options:

@@ -19,9 +19,9 @@ retouching the result.
 - [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
   align`/`stack` register frames before fusing, choosing a mode, and
   checking a result before committing to a full run
-- [`guide/retouch.md`](guide/retouch.md) — editing a stack's Z-Map by hand,
-  from the op list `focusforge-cli retouch` applies to the window's brush,
-  pipette, overlay and undo/redo
+- [`guide/retouch.md`](guide/retouch.md) — retouching a result with soft
+  brush strokes, from the op list `focusforge-cli retouch` appends to the
+  window's brush, pipette, overlay and undo/redo
 - [`guide/history.md`](guide/history.md) — a project's checkpoint tree: the
   window's checkpoint list, saving, restoring, branching and deleting, the
   same from `focusforge-cli history`, and what a damaged or moved project
@@ -42,7 +42,7 @@ retouching the result.
 - [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
   layout the reader accepts and the writer emits
 - [`reference/project-format.md`](reference/project-format.md) — the
-  `.ffp` project container: checkpoints, stored Z-Maps, source frame checks
+  `.ffp` project container: checkpoints, stored planes, source frame checks
   and the refusals a damaged project gets
 
 Building from source, the repository layout and the test suite are in

@@ -283,6 +283,17 @@ pub fn run(
     options.budget = options.budget.capped_to(request.max_host_memory);
     let opened = open_frame_set(&request.frames, options.budget)
         .map_err(|err| PipelineError::Input(err.to_string()))?;
+    // Hashes the sources one file at a time while the fusion reads them; the
+    // seal joins it, so the hashes are in the memo by the time it needs them.
+    // A failed hash is left for the seal to hit and report.
+    let source_hashes = {
+        let frames = request.frames.clone();
+        std::thread::spawn(move || {
+            for frame in &frames {
+                let _ = project::source_hash(frame, None);
+            }
+        })
+    };
     options.budget = opened.scheduler_budget;
     let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = request
@@ -777,6 +788,7 @@ pub fn run(
     }
 
     observer.stage(RunStage::Seal);
+    let _ = source_hashes.join();
     let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader);
     let align_record =
         alignment_result
@@ -834,6 +846,7 @@ pub fn run(
                 composite_description,
                 metrics,
                 created_at: project::seal::now_unix(),
+                compressed_composite: None,
             },
         )
         .map(FuseProduct::Held),

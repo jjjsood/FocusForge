@@ -14,9 +14,10 @@ use std::path::{Path, PathBuf};
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, BlobKind, BlobRecord, Metrics, Op, Opened, Plane, Point, Project,
-    ProjectError, SealRequest, ZMapStorage, blob,
+    self, AppendRequest, BlobKind, Metrics, Op, Opened, Plane, Point, Project, ProjectError,
+    SealRequest, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -160,8 +161,7 @@ fn sealed(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
 }
 
 /// One sealed project over `fixtures/mantis-512`'s own golden planes, with
-/// its own 8 source frames referenced -- what a delta-producing append
-/// needs a realistic edit to beat the full blob on.
+/// its own 8 source frames referenced.
 fn sealed_mantis(name: &str) -> (PathBuf, PathBuf) {
     let dir = tmp_dir(name);
     let mantis = common::mantis_512_dir();
@@ -207,15 +207,7 @@ fn err<T>(result: Result<T, ProjectError>) -> ProjectError {
 }
 
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    use std::io::Read;
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_manifest_value(path: &Path) -> serde_json::Value {
@@ -237,33 +229,20 @@ fn mutate_container(
     add: &[(String, Vec<u8>)],
     drop: &[&str],
 ) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        if drop.contains(&name.as_str()) {
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        if drop.contains(&name) {
             continue;
         }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        if let Some(entry) = replace.iter().find(|entry| &entry.0 == name) {
-            bytes = entry.1.clone();
-        }
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        let bytes = match replace.iter().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1.clone(),
+            None => index.read_entry(src, name).unwrap(),
+        };
+        writer.put_bytes(name, &bytes).unwrap();
     }
     for (name, bytes) in add {
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(bytes).unwrap();
+        writer.put_bytes(name, bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -368,20 +347,34 @@ fn verification_is_lazy_but_never_skipped() {
         .zmap_blob
         .clone();
 
-    // A middle checkpoint, forced full, so the root's own snapshot sits
-    // behind it rather than under the head's delta chain.
-    let mid = project::append_ops_at(
-        &project_path,
-        vec![stroke(1, 5, 5, 1.0)],
-        None,
-        1_700_000_000,
-        ZMapStorage::Full,
-    )
-    .expect("middle append must succeed");
-    assert_eq!(mid.zmap.kind, BlobKind::Full);
+    // A re-fuse in the middle, so the head's op checkpoint names its map
+    // and the root's stays off the head's own path.
+    let staging = dir.join("mid-staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (mid_composite, mid_zmap) = stage_planes(&staging, 512, 512, 8);
+    let sources: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            common::mantis_512_dir()
+                .join("frames")
+                .join(format!("{i:02}.tif"))
+        })
+        .collect();
+    let values = params();
+    let mid = project::append(AppendRequest {
+        project_path: &project_path,
+        staged_composite: &mid_composite,
+        staged_zmap: &mid_zmap,
+        sources: &sources,
+        algorithm: "laplacian",
+        params: &values,
+        align: None,
+        registration: Registration::default(),
+        composite_description: "re-fused composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("middle re-fuse must succeed");
 
-    // A realistic brush edit, proven elsewhere to land as a delta over this
-    // golden map.
     let ops = vec![Op::BrushStroke {
         source_id: 3,
         path: vec![
@@ -392,16 +385,12 @@ fn verification_is_lazy_but_never_skipped() {
         radius: 12.0,
         softness: 0.3,
     }];
-    let sealed_ops = project::append_ops_at(&project_path, ops, None, 1_000, ZMapStorage::Smallest)
-        .expect("append must succeed");
-    assert_eq!(
-        sealed_ops.zmap.kind,
-        BlobKind::SparseDelta,
-        "test edit must land as a delta to exercise the lazy chain"
-    );
+    let sealed_ops =
+        project::append_ops_at(&project_path, ops, None, 1_000).expect("append must succeed");
+    assert_eq!(sealed_ops.zmap.kind, BlobKind::Full);
 
-    // The root's own full snapshot, behind the middle checkpoint and off
-    // the head's own resolve_chain: tamper it.
+    // The root's own Z-Map, behind the middle checkpoint and off the head's
+    // own blob: tamper it.
     let tampered = dir.join("tampered-root.ffp");
     let root_entry = format!("blobs/{root_zmap_hash}.zst");
     let original_root_bytes = read_entry_bytes(&project_path, &root_entry);
@@ -423,14 +412,13 @@ fn verification_is_lazy_but_never_skipped() {
         .collect();
     assert!(
         !verified.contains(&root_zmap_hash),
-        "the untouched root snapshot must not have been hashed"
+        "the untouched root Z-Map must not have been hashed"
     );
+    assert_eq!(sealed_ops.zmap.hash, mid.zmap.hash);
     assert_eq!(
         verified,
-        [mid.zmap.hash.clone(), sealed_ops.zmap.hash.clone()]
-            .into_iter()
-            .collect(),
-        "verified_blobs must be exactly the head's own resolve_chain"
+        HashSet::from([mid.zmap.hash.clone()]),
+        "verified_blobs must be exactly the Z-Map the head names"
     );
 
     let root_checkpoint = project.history().get(&root_id).unwrap().clone();
@@ -440,31 +428,6 @@ fn verification_is_lazy_but_never_skipped() {
         other => panic!("expected HashMismatch, got {other:?}"),
     }
     assert!(!out.exists(), "no output file may be left");
-}
-
-/// The set of blob hashes `target` resolves through, independent of
-/// `resolve_chain` (`pub(super)`, unreachable from here) -- what open must
-/// have hashed and nothing more.
-fn expected_chain_hashes(blobs: &[BlobRecord], target: &str) -> HashSet<String> {
-    let mut chain = HashSet::new();
-    let mut current = target.to_string();
-    loop {
-        if let Some(full) = blobs
-            .iter()
-            .find(|b| b.kind == BlobKind::Full && b.hash == current)
-        {
-            chain.insert(full.hash.clone());
-            return chain;
-        }
-        let delta = blobs
-            .iter()
-            .find(|b| {
-                b.kind == BlobKind::SparseDelta && b.target.as_deref() == Some(current.as_str())
-            })
-            .expect("a non-full target must resolve through a delta");
-        chain.insert(delta.hash.clone());
-        current = delta.base.clone().expect("a delta always names its base");
-    }
 }
 
 #[test]
@@ -487,7 +450,7 @@ fn open_does_not_hash_the_whole_store() {
 
     let project = Project::open(&project_path).unwrap();
     let head = project.checkpoint().clone();
-    let expected_hashes = expected_chain_hashes(&project.manifest().blobs, &head.zmap_blob);
+    let expected_hashes = HashSet::from([head.zmap_blob.clone()]);
     let verified_hashes: HashSet<String> = project
         .verified_blobs()
         .iter()
@@ -806,7 +769,6 @@ fn link_failures_are_structural_refusals() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap();
     let mut tampered_child = read_checkpoint_json(&project_path, &child.checkpoint);
@@ -1029,9 +991,24 @@ fn located_frames_are_checked_by_content() {
     assert_eq!(right.changed.len(), 0);
 }
 
+/// Appends a one-point stroke under the head: an op-bearing head is the only
+/// state whose render reads source frames.
+fn append_stroke(project_path: &Path) {
+    let head = Project::open(project_path).unwrap().checkpoint().id.clone();
+    let stroke = project::Op::BrushStroke {
+        source_id: 1,
+        path: vec![project::Point { x: 4, y: 4 }],
+        radius: 2.0,
+        softness: 0.0,
+    };
+    project::append_ops_onto(project_path, &head, vec![stroke], None, 1)
+        .expect("the stroke must append");
+}
+
 #[test]
 fn relocated_sources_are_read_from_the_located_folder() {
     let (dir, project_path) = sealed("import_validation_relocate_sources", 32, 24, 3);
+    append_stroke(&project_path);
     let copy_dir = tmp_dir("import_validation_relocate_sources_copy");
     let copied_project = copy_dir.join(project_path.file_name().unwrap());
     std::fs::copy(&project_path, &copied_project).unwrap();
@@ -1042,21 +1019,291 @@ fn relocated_sources_are_read_from_the_located_folder() {
         Opened::NeedsChoice(_) => panic!("moving the project must not change any frame's content"),
     };
     let head_id = project.checkpoint().id.clone();
+    let image = project::CheckpointImage::prepare(&project, &head_id).unwrap();
     assert!(
-        project::CheckpointImage::prepare_export(&project, &head_id).is_err(),
-        "export must refuse sources it cannot find"
+        image
+            .render(Some(&mut project), image.full(), &mut |_samples, _rect| Ok(
+                ()
+            ))
+            .is_err(),
+        "an edited render must refuse sources it cannot find"
     );
 
     let before = std::fs::read(&copied_project).unwrap();
     project.relocate_sources(dir.clone());
-    let image = project::CheckpointImage::prepare_export(&project, &head_id)
+    let image = project::CheckpointImage::prepare(&project, &head_id)
         .expect("a located folder must resolve every source");
     image
-        .render(&mut project, &mut |_samples, _rect| Ok(()))
+        .render(Some(&mut project), image.full(), &mut |_samples, _rect| {
+            Ok(())
+        })
         .expect("render must read the located folder's frames");
     assert_eq!(
         std::fs::read(&copied_project).unwrap(),
         before,
         ".ffp bytes must be unchanged by relocation"
+    );
+}
+
+/// A sealed project whose frames live in a sibling directory, so every
+/// source is recorded `AsGiven`.
+fn sealed_as_given(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
+    let dir = tmp_dir(name);
+    let staging = dir.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, w, h, frames);
+    let frames_dir = dir.join("frames");
+    std::fs::create_dir_all(&frames_dir).unwrap();
+    let sources = write_sources(&frames_dir, frames as usize, w, h);
+    let project_dir = dir.join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_path = project_dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
+    let values = params();
+    project::seal(seal_request(
+        &project_path,
+        &composite,
+        &zmap,
+        &sources,
+        &values,
+    ))
+    .expect("seal must succeed");
+    (dir, project_path)
+}
+
+/// Where each of the project's recorded sources lives on disk.
+fn source_paths(project_path: &Path) -> Vec<PathBuf> {
+    let project = Project::open(project_path).unwrap();
+    project
+        .manifest()
+        .sources
+        .iter()
+        .map(|source| project.source_path(source))
+        .collect()
+}
+
+/// Flips the last byte of `path` through the same inode and puts its
+/// modification time back, so size, mtime and file id all stay as they were.
+fn alter_in_place(path: &Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let metadata = file.metadata().unwrap();
+    file.seek(SeekFrom::Start(metadata.len() - 1)).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Start(metadata.len() - 1)).unwrap();
+    file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+        .unwrap();
+}
+
+fn set_mtime(path: &Path, modified: std::time::SystemTime) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+}
+
+/// Moves `path`'s modification time forward without touching its bytes.
+fn bump_mtime(path: &Path) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    set_mtime(path, modified + std::time::Duration::from_secs(60));
+}
+
+#[test]
+fn unchanged_stamp_skips_rehash() {
+    for frames in [3u32, 5] {
+        for (label, (_dir, project_path)) in [
+            (
+                "relative",
+                sealed(
+                    &format!("import_validation_stamp_rel_{frames}"),
+                    32,
+                    24,
+                    frames,
+                ),
+            ),
+            (
+                "as-given",
+                sealed_as_given(
+                    &format!("import_validation_stamp_abs_{frames}"),
+                    32,
+                    24,
+                    frames,
+                ),
+            ),
+        ] {
+            let recorded = Project::open(&project_path)
+                .unwrap()
+                .manifest()
+                .sources
+                .clone();
+            let paths = source_paths(&project_path);
+            // Push the process memo off the recorded stamp: a touch that an
+            // open re-hashes and remembers, then the mtime put back. Only
+            // the recorded stamp can vouch for the frame after that.
+            let original = std::fs::metadata(&paths[1]).unwrap().modified().unwrap();
+            bump_mtime(&paths[1]);
+            assert!(matches!(
+                Project::open_checked(&project_path).unwrap(),
+                Opened::Ready(_)
+            ));
+            set_mtime(&paths[1], original);
+            alter_in_place(&paths[1]);
+            assert_ne!(
+                blake3::hash(&std::fs::read(&paths[1]).unwrap())
+                    .to_hex()
+                    .to_string(),
+                recorded[1].hash,
+                "{label}/{frames}: the test must really have changed the bytes"
+            );
+            match Project::open_checked(&project_path).unwrap() {
+                Opened::Ready(_) => {}
+                Opened::NeedsChoice(_) => {
+                    panic!("{label}/{frames}: an unchanged stamp must not be re-hashed")
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn touched_source_rehashes_once_and_stays_ready() {
+    let (dir, project_path) = sealed("import_validation_touched", 32, 24, 3);
+    let paths = source_paths(&project_path);
+    let project_bytes = std::fs::read(&project_path).unwrap();
+    let ready = |label: &str| match Project::open_checked(&project_path).unwrap() {
+        Opened::Ready(_) => {}
+        Opened::NeedsChoice(_) => panic!("{label}: expected Ready"),
+    };
+
+    // A bumped mtime: re-hashed, found unchanged.
+    bump_mtime(&paths[0]);
+    ready("touched frame");
+    // The fresh stamp is now remembered, so an edit that keeps it is not seen.
+    alter_in_place(&paths[0]);
+    ready("remembered stamp");
+
+    // A byte-identical copy in a new file (new inode).
+    let copy = dir.join("copy.tif");
+    std::fs::copy(&paths[1], &copy).unwrap();
+    std::fs::rename(&copy, &paths[1]).unwrap();
+    ready("identical copy");
+
+    assert_eq!(
+        std::fs::read(&project_path).unwrap(),
+        project_bytes,
+        "open must not write the project"
+    );
+
+    // A later append records each frame's current stamp.
+    let staging = dir.join("staging-append");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, 32, 24, 3);
+    let values = params();
+    project::append(AppendRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &paths,
+        algorithm: "laplacian",
+        params: &values,
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("append must succeed");
+    let appended = Project::open(&project_path).unwrap();
+    for (source, path) in appended.manifest().sources.iter().zip(&paths) {
+        assert_eq!(source.stamp(), blob::FileStamp::of(path).unwrap());
+    }
+}
+
+#[test]
+fn missing_and_changed_sources_are_reported() {
+    let (dir, project_path) = sealed("import_validation_missing_changed", 32, 24, 3);
+    append_stroke(&project_path);
+    let paths = source_paths(&project_path);
+
+    std::fs::remove_file(&paths[0]).unwrap();
+    match Project::open_checked(&project_path).unwrap() {
+        Opened::Ready(project) => assert_eq!(project.validation().unresolved_sources, 1),
+        Opened::NeedsChoice(_) => panic!("a missing frame warns, it does not block"),
+    }
+
+    std::fs::copy(&paths[2], &paths[1]).unwrap();
+    let pending = match Project::open_checked(&project_path).unwrap() {
+        Opened::NeedsChoice(pending) => pending,
+        Opened::Ready(_) => panic!("a frame with other content must block"),
+    };
+    assert_eq!(pending.changed(), &[(1, dir.join("frame-01.tif"))]);
+
+    let mut project = pending.proceed();
+    let head = project.checkpoint().id.clone();
+    let image = project::CheckpointImage::prepare(&project, &head).unwrap();
+    let refusal = match image.render(Some(&mut project), image.full(), &mut |_samples, _rect| {
+        Ok(())
+    }) {
+        Err(refusal) => refusal.to_string(),
+        Ok(()) => panic!("a render over missing and changed frames must be refused"),
+    };
+    assert!(refusal.contains("missing: frame-00.tif"), "{refusal}");
+    assert!(
+        refusal.contains(&format!(
+            "changed: frame-01.tif (found at {})",
+            dir.join("frame-01.tif").display()
+        )),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn append_reuses_source_hashes() {
+    let (dir, project_path) = sealed("import_validation_append_memo", 32, 24, 3);
+    let paths = source_paths(&project_path);
+    let original: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            blake3::hash(&std::fs::read(path).unwrap())
+                .to_hex()
+                .to_string()
+        })
+        .collect();
+
+    // A hash that ran again would see this byte.
+    alter_in_place(&paths[1]);
+
+    let staging = dir.join("staging-append");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, 32, 24, 3);
+    let values = params();
+    project::append(AppendRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &paths,
+        algorithm: "laplacian",
+        params: &values,
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("append must succeed");
+
+    let manifest = Project::open(&project_path).unwrap().manifest().clone();
+    let mut expected = manifest.sources.clone();
+    for (source, hash) in expected.iter_mut().zip(&original) {
+        source.hash = hash.clone();
+    }
+    assert_eq!(manifest.sources, expected);
+    assert_eq!(
+        manifest.stack_fingerprint,
+        blob::stack_fingerprint(&expected)
     );
 }

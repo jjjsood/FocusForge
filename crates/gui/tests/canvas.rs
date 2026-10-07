@@ -217,7 +217,7 @@ fn renderer_refuses_invalid_visible_draw_before_guarding() {
     let (composite, zmap) = golden_plane_files();
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
     let draw = PaneDraw {
         src: (0, 0, 16, 16),
         dst: (0.0, 0.0, 16.0, 16.0),
@@ -250,7 +250,7 @@ fn cached_redraw_refuses_invalid_visible_draw_without_losing_coverage() {
     let frame = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
     renderer
         .set_frame(&frame, None, job::host_budget())
         .expect("fixture frame opens");
@@ -319,7 +319,7 @@ fn pending_pan_keeps_retained_coverage_inside_current_crop_until_latest_publish(
     let (composite, zmap) = golden_plane_files();
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
     let first = PaneDraw {
         src: (128, 128, 128, 128),
         dst: (0.0, 0.0, 128.0, 128.0),
@@ -805,6 +805,7 @@ fn an_opened_project_feeds_its_planes_once_the_render_settles() {
         CanvasFeed::Load {
             composite, zmap, ..
         } => {
+            let zmap = zmap.expect("a readable Z-Map feeds the canvas");
             assert!(composite.starts_with(&dir) && zmap.starts_with(&dir));
             assert!(composite.is_file() && zmap.is_file());
         }
@@ -1523,10 +1524,10 @@ fn both_brush_cursors_follow_either_pane() {
     };
     let (left_pos, left_size) = rect("pane-left");
     let (right_pos, _right_size) = rect("pane-right");
+    app.set_cursor_frame_x(40.0);
+    app.set_cursor_frame_y(left_size.height / 2.0);
     app.set_cursor_composite_x(40.0);
     app.set_cursor_composite_y(left_size.height / 2.0);
-    app.set_cursor_zmap_x(40.0);
-    app.set_cursor_zmap_y(left_size.height / 2.0);
 
     // Each clip container matches its own pane's rect exactly.
     for (clip_id, pane_id) in [
@@ -1694,7 +1695,6 @@ fn golden_plane_files() -> (PathBuf, PathBuf) {
 #[test]
 fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
-    use focusforge_gui::canvas::PaneSource;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
     use focusforge_gui::viewport::{ImageSize, PaneDraw};
     use std::num::NonZeroU32;
@@ -1731,7 +1731,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     renderer
-        .set_planes(&composite_path, &zmap_path)
+        .set_planes(&composite_path, Some(&zmap_path))
         .expect("golden planes open");
     renderer
         .set_frame(&frame_path, None, job::host_budget())
@@ -1765,7 +1765,6 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     };
     let composite_spp = samples_per_pixel(&composite_path);
     let frame_spp = samples_per_pixel(&frame_path);
-    let zmap_spp = 1;
     let plane_image = image_size(&composite_path);
     let frame_image = image_size(&frame_path);
 
@@ -1888,48 +1887,15 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         "zoom",
     );
 
-    // 5. Selecting the Z-Map plane for the first time at this content reads
-    // and uploads exactly it.
-    renderer.select_plane(PaneSource::ZMap);
-    let before = counters();
-    let (_, plane) = renderer
-        .redraw_planes(&zoomed, None, None)
-        .expect("Z-Map plane draws");
-    assert_eq!(plane, PaneSource::ZMap);
-    let after = counters();
-    assert_one_plane(
-        before,
-        after,
-        &zoomed
-            .guarded(plane_image, u32::MAX)
-            .expect("an unbounded test texture fits"),
-        zmap_spp,
-        "first Z-Map select",
-    );
-
-    // Selecting back to Composite at the same content is a no-op: its own
-    // coverage is still current, and the Z-Map is not touched either.
-    renderer.select_plane(PaneSource::Composite);
-    let before = counters();
-    let (_, plane) = renderer
-        .redraw_planes(&zoomed, None, None)
-        .expect("composite plane draws");
-    assert_eq!(plane, PaneSource::Composite);
-    let after = counters();
-    assert_steady(before, after, "select back to composite");
-    assert_nothing_read(before, after, "select back to composite");
-
-    // 6. `set_planes` on the unchanged draw invalidates both panes' own
-    // coverage; the next draw (composite still selected) re-reads exactly
-    // that one plane.
+    // 5. `set_planes` on the unchanged draw invalidates the composite pane's
+    // coverage; the next draw re-reads exactly it.
     renderer
-        .set_planes(&composite_path, &zmap_path)
+        .set_planes(&composite_path, Some(&zmap_path))
         .expect("golden planes re-open");
     let before = counters();
-    let (_, plane) = renderer
+    renderer
         .redraw_planes(&zoomed, None, None)
         .expect("composite plane draws again");
-    assert_eq!(plane, PaneSource::Composite);
     let after = counters();
     assert_one_plane(
         before,
@@ -1941,7 +1907,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         "post set_planes",
     );
 
-    // 7. `set_frame` on the frame's unchanged draw invalidates its coverage;
+    // 6. `set_frame` on the frame's unchanged draw invalidates its coverage;
     // the next frame draw re-reads exactly the frame.
     renderer
         .set_frame(&frame_path, None, job::host_budget())
@@ -2073,7 +2039,6 @@ mod preparing {
             },
             stamp,
             reader: reader.clone(),
-            index_scale: 0,
             indices: None,
             state: Default::default(),
             backdrop: false,
@@ -2120,14 +2085,13 @@ mod preparing {
 }
 
 // ---------------------------------------------------------------------
-// The edited view: resident recomposited tiles over the sealed planes.
+// The edited view: resident rendered tiles over the sealed planes.
 // ---------------------------------------------------------------------
 
 use std::num::NonZeroU32;
 
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
-use focusforge_core::retouch::Sources;
-use focusforge_gui::canvas::{ResidentTiles, overlay_edited, step_copy};
+use focusforge_gui::canvas::{ResidentTiles, overlay_edited};
 
 const MAP: u32 = 64;
 const FRAMES: usize = 3;
@@ -2137,15 +2101,6 @@ fn mantis64_stack() -> TiffStack {
         .map(|i| common::fixture_frame("mantis-64", i))
         .collect();
     TiffStack::open_files(&paths).expect("the mantis-64 frames open")
-}
-
-fn sources(stack: &TiffStack) -> Sources<'_> {
-    Sources {
-        reader: stack,
-        frame_count: FRAMES as u32,
-        samples_per_pixel: 3,
-        origin: (0, 0),
-    }
 }
 
 fn whole_map() -> Rect {
@@ -2170,49 +2125,18 @@ fn frame_planes(stack: &TiffStack) -> Vec<Vec<u16>> {
         .collect()
 }
 
-fn contains(r: Rect, x: u32, y: u32) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+/// `region`'s rows of the whole-map `plane`, three samples a pixel.
+fn region_samples(plane: &[u16], region: Rect) -> Vec<u16> {
+    let mut out = Vec::new();
+    for y in region.y..region.y + region.height {
+        let start = ((y * MAP + region.x) * 3) as usize;
+        out.extend_from_slice(&plane[start..start + region.width as usize * 3]);
+    }
+    out
 }
 
-#[test]
-fn step_copy_matches_the_files_decimated_read() {
-    let (width, height) = (37u32, 29u32);
-    let plane: Vec<u16> = (0..width * height).map(|i| (i * 7 % 1013) as u16).collect();
-    let path = common::tree("step_copy_plane").join("plane.tif");
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let spec = TiffSpec {
-        width,
-        height,
-        samples_per_pixel: 1,
-        description: None,
-    };
-    let mut writer = TiffWriter::create(&path, spec).unwrap();
-    writer.write_tile(whole, &plane).unwrap();
-    writer.finish().unwrap();
-    let stack = TiffStack::open_files(&[path]).unwrap();
-
-    let rect = Rect {
-        x: 3,
-        y: 5,
-        width: 22,
-        height: 17,
-    };
-    for step in [1u32, 3] {
-        let step = NonZeroU32::new(step).unwrap();
-        let len = (rect.width.div_ceil(step.get()) * rect.height.div_ceil(step.get())) as usize;
-        let mut from_file = vec![0u16; len];
-        stack
-            .read_tile_step_into(0, rect, step, &mut from_file)
-            .unwrap();
-        let mut from_memory = vec![u16::MAX; len];
-        step_copy(&plane, width, rect, step, &mut from_memory);
-        assert_eq!(from_memory, from_file, "step {step}");
-    }
+fn contains(r: Rect, x: u32, y: u32) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
 #[test]
@@ -2221,8 +2145,6 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
     let planes = frame_planes(&stack);
     // A 13 px grid: the region below spans tiles (0..=1, 1..=2).
     let mut tiles = ResidentTiles::new(13, MAP, MAP, 3);
-    let edited = vec![1u16; (MAP * MAP) as usize];
-    let sealed = vec![0u16; (MAP * MAP) as usize];
     let region = Rect {
         x: 10,
         y: 20,
@@ -2230,28 +2152,17 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
         height: 10,
     };
     let generation = tiles.generation();
-    tiles
-        .recomposite(region, &edited, &sources(&stack))
-        .unwrap();
+    tiles.install(region, &region_samples(&planes[1], region));
     assert_eq!(tiles.generation(), generation + 1, "one bump per call");
-    assert_eq!(tiles.take_recomposited(), vec![region]);
-    assert!(tiles.take_recomposited().is_empty(), "the log drains");
+    assert_eq!(tiles.take_rendered_regions(), vec![region]);
+    assert!(tiles.take_rendered_regions().is_empty(), "the log drains");
 
-    // Every index differs from the sealed one, so the overlay shows each
-    // texel's resident pixel wherever one was installed: the gather inside
-    // the region, and the sealed sentinel everywhere else, including the
-    // rest of the four tiles the region met.
+    // The overlay shows each texel's resident pixel wherever one was
+    // installed: the region's, and the sealed sentinel everywhere else,
+    // including the rest of the four tiles the region met.
     const SENTINEL: u16 = 7777;
     let mut samples = vec![SENTINEL; (MAP * MAP * 3) as usize];
-    overlay_edited(
-        &mut samples,
-        &sealed,
-        &edited,
-        whole_map(),
-        NonZeroU32::MIN,
-        3,
-        &tiles,
-    );
+    overlay_edited(&mut samples, whole_map(), NonZeroU32::MIN, 3, &tiles);
     for y in 0..MAP {
         for x in 0..MAP {
             let i = ((y * MAP + x) * 3) as usize;
@@ -2273,7 +2184,6 @@ fn a_pending_region_never_shows_unfilled_tile_samples() {
     // untouched texels of tiles (1, 1) and (1, 2) and the fresh tiles (2, 1)
     // and (2, 2).
     let mut tiles = ResidentTiles::new(13, MAP, MAP, 3);
-    let sealed = vec![0u16; (MAP * MAP) as usize];
     let first = Rect {
         x: 10,
         y: 20,
@@ -2286,18 +2196,7 @@ fn a_pending_region_never_shows_unfilled_tile_samples() {
         width: 14,
         height: 10,
     };
-    let mut edited = sealed.clone();
-    for y in first.y..first.y + first.height {
-        for x in first.x..first.x + first.width {
-            edited[(y * MAP + x) as usize] = 1;
-        }
-    }
-    tiles.recomposite(first, &edited, &sources(&stack)).unwrap();
-    for y in pending.y..pending.y + pending.height {
-        for x in pending.x..pending.x + pending.width {
-            edited[(y * MAP + x) as usize] = 2;
-        }
-    }
+    tiles.install(first, &region_samples(&planes[1], first));
     let generation = tiles.generation();
     tiles.touch();
     assert_eq!(
@@ -2311,20 +2210,8 @@ fn a_pending_region_never_shows_unfilled_tile_samples() {
         let step = NonZeroU32::new(step).unwrap();
         let out_w = MAP.div_ceil(step.get());
         let texels = (out_w * out_w) as usize;
-        let mut sealed_step = vec![0u16; texels];
-        let mut edited_step = vec![0u16; texels];
-        step_copy(&sealed, MAP, whole_map(), step, &mut sealed_step);
-        step_copy(&edited, MAP, whole_map(), step, &mut edited_step);
         let mut samples = vec![SENTINEL; texels * 3];
-        overlay_edited(
-            &mut samples,
-            &sealed_step,
-            &edited_step,
-            whole_map(),
-            step,
-            3,
-            tiles,
-        );
+        overlay_edited(&mut samples, whole_map(), step, 3, tiles);
         (step.get(), out_w, samples)
     };
     let check = |step: u32, tiles: &ResidentTiles, expected: &dyn Fn(u32, u32) -> Vec<u16>| {
@@ -2357,9 +2244,7 @@ fn a_pending_region_never_shows_unfilled_tile_samples() {
         check(step, &tiles, &before);
     }
 
-    tiles
-        .recomposite(pending, &edited, &sources(&stack))
-        .unwrap();
+    tiles.install(pending, &region_samples(&planes[2], pending));
     let after = |x: u32, y: u32| {
         if contains(pending, x, y) {
             plane_pixel(2, x, y)
@@ -2593,25 +2478,22 @@ fn stale_stamps_are_refused_in_any_arrival_order() {
 fn prepared_samples_match_a_direct_read() {
     use focusforge_core::io::TiffStack;
     use focusforge_core::tile::Rect;
-    use focusforge_core::zmap::ZMapReader;
     use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
     use focusforge_gui::viewport::PaneDraw;
     use preparing::take_stamp;
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
-    let (composite_path, zmap_path) = golden_plane_files();
+    let (composite_path, _) = golden_plane_files();
     let frame_path = common::fixture_frame("mantis-64", 0);
     let frame = Arc::new(TiffStack::open_files(&[frame_path]).expect("frame opens"));
     let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
-    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
 
     let preparer = Preparer::new(|| {});
     let mut stamp = 0;
     let mut check = |pane: Pane,
                      reader: Arc<dyn PaneReader>,
                      size: (u32, u32),
-                     index_scale: u32,
                      direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
         let odd = |extent: u32| (extent - 4) | 1;
         let rects = [(1, 3, odd(size.0), odd(size.1)), (0, 0, size.0, size.1)];
@@ -2644,7 +2526,6 @@ fn prepared_samples_match_a_direct_read() {
                     draw,
                     stamp,
                     reader: reader.clone(),
-                    index_scale,
                     indices: None,
                     state: Default::default(),
                     backdrop: false,
@@ -2664,7 +2545,6 @@ fn prepared_samples_match_a_direct_read() {
         Pane::Frame,
         frame.clone(),
         frame.dimensions(),
-        0,
         &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
     );
     let composite_size = composite.dimensions();
@@ -2672,25 +2552,17 @@ fn prepared_samples_match_a_direct_read() {
         Pane::Composite,
         composite.clone(),
         composite_size,
-        0,
         &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
-    );
-    check(
-        Pane::ZMap,
-        zmap.clone(),
-        composite_size,
-        1,
-        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
     );
 }
 
-/// A job requested before a source switch, close, plane selection, device
+/// A job requested before a source switch, close, device
 /// change or a newer publish renders and uploads nothing. Upload accounting
 /// is process-global, so this runs alone in a child.
 #[test]
 fn stale_results_render_nothing() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
-    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::canvas::PaneJob;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
     use focusforge_gui::viewport::PaneDraw;
     use std::num::NonZeroU32;
@@ -2723,7 +2595,9 @@ fn stale_results_render_nothing() {
     let frame_path = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -2813,28 +2687,23 @@ fn stale_results_render_nothing() {
     let before_planes = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job");
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &before_planes, "set_planes");
     let before_clear = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job");
     renderer.clear_planes();
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &before_clear, "clear_planes");
 
-    // A plane selection.
-    let before_select = renderer
-        .request_planes(&draw(7), None, None)
-        .expect("plane job");
-    renderer.select_plane(PaneSource::ZMap);
-    refused(&mut renderer, &before_select, "select_plane");
-    let zmap_job = renderer
-        .request_planes(&draw(7), None, None)
-        .expect("Z-Map job");
-    accepted(&mut renderer, &zmap_job, "Z-Map after the selection");
-
     // A device change.
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     let before_device = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job after reset");
@@ -2885,7 +2754,7 @@ fn backdrop_of(width: u32, height: u32, pane: f32) -> focusforge_gui::viewport::
 /// reads.
 #[test]
 fn backdrop_is_read_once_per_content_change() {
-    use focusforge_gui::canvas::{OverlayDraw, Pane, PaneSource, Preparer};
+    use focusforge_gui::canvas::{OverlayDraw, Pane, Preparer};
     use focusforge_gui::gpu_canvas::CanvasRenderer;
     use preparing::*;
 
@@ -2930,7 +2799,9 @@ fn backdrop_is_read_once_per_content_change() {
     let frame_path = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -3015,27 +2886,116 @@ fn backdrop_is_read_once_per_content_change() {
     plane(&mut renderer, Some(2), None, "the next edit generation");
     let overlay = OverlayDraw::for_opacity(8, 0.5);
     plane(&mut renderer, Some(2), Some(&overlay), "an overlay toggle");
-
-    renderer.select_plane(PaneSource::ZMap);
-    let selected = renderer
-        .request_plane_backdrop(&plane_back, None, None)
-        .expect("a plane selection issues one job for the Z-Map");
-    assert_eq!(selected.pane, Pane::ZMap);
-    assert!(
-        renderer
-            .request_plane_backdrop(&plane_back, None, None)
-            .is_none()
-    );
 }
 
-/// A backdrop job issued before a source, frame, plane, device or newer
+/// The composite job of `renderer` for `generation` and `overlay`, exact or
+/// backdrop, issued over freshly set planes so no earlier publish covers it.
+fn composite_job(
+    renderer: &mut focusforge_gui::gpu_canvas::CanvasRenderer,
+    planes: (&Path, Option<&Path>),
+    generation: Option<u64>,
+    overlay: Option<&focusforge_gui::canvas::OverlayDraw>,
+    backdrop: bool,
+) -> focusforge_gui::canvas::PaneJob {
+    let exact = focusforge_gui::viewport::PaneDraw {
+        src: (0, 0, 64, 64),
+        dst: (0.0, 0.0, 64.0, 64.0),
+        crop: (0.0, 0.0, 64.0, 64.0),
+        pixelated: false,
+        step: NonZeroU32::MIN,
+    };
+    renderer
+        .set_planes(planes.0, planes.1)
+        .expect("the composite opens whatever the Z-Map is");
+    let job = if backdrop {
+        renderer.request_plane_backdrop(&backdrop_of(512, 512, 128.0), generation, overlay)
+    } else {
+        renderer.request_planes(&exact, generation, overlay)
+    };
+    job.unwrap_or_else(|| {
+        panic!("a composite job issues (backdrop {backdrop}, generation {generation:?})")
+    })
+}
+
+/// The composite pane draws without the Z-Map: absent, or a file that fails
+/// to open, its jobs issue and publish exact and backdrop, with and without
+/// an edit generation, and with the overlay requested, and none carries an
+/// index reader.
+#[test]
+fn display_ignores_the_zmap() {
+    use focusforge_gui::canvas::EditedView;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, _) = golden_plane_files();
+    let garbage = common::tree("display_ignores_the_zmap").join("zmap.tif");
+    fs::write(&garbage, b"not a Z-Map").unwrap();
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    let tiles = ResidentTiles::new(16, 512, 512, 3);
+    let view = EditedView { tiles: &tiles };
+    let overlay = focusforge_gui::canvas::OverlayDraw::for_opacity(8, 0.5);
+
+    for zmap in [None, Some(garbage.as_path())] {
+        for generation in [None, Some(tiles.generation())] {
+            for overlay in [None, Some(&overlay)] {
+                let label = format!("zmap {zmap:?}, generation {generation:?}");
+                let edited = generation.map(|_| &view);
+                for backdrop in [false, true] {
+                    let planes = (composite.as_path(), zmap);
+                    let job = composite_job(&mut renderer, planes, generation, overlay, backdrop);
+                    assert!(job.indices.is_none(), "{label}: no index reader");
+                    let published = renderer.publish_edited(&job, &job_samples(&job), &[], edited);
+                    assert!(
+                        published.is_some(),
+                        "{label}: the job publishes (backdrop {backdrop})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The index reader rides a composite job iff the overlay is on: an edit
+/// generation, the exact view and the backdrop alone never attach it.
+#[test]
+fn zmap_is_read_lazily() {
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, zmap) = golden_plane_files();
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    let overlay = focusforge_gui::canvas::OverlayDraw::for_opacity(8, 0.5);
+
+    for generation in [None, Some(1)] {
+        for overlay in [None, Some(&overlay)] {
+            for backdrop in [false, true] {
+                let planes = (composite.as_path(), Some(zmap.as_path()));
+                let job = composite_job(&mut renderer, planes, generation, overlay, backdrop);
+                assert_eq!(
+                    job.indices.is_some(),
+                    overlay.is_some(),
+                    "generation {generation:?}, overlay {}, backdrop {backdrop}",
+                    overlay.is_some()
+                );
+            }
+        }
+    }
+}
+
+/// A backdrop job issued before a source, frame, device or newer
 /// publish renders and uploads nothing, whichever of it and the exact
 /// results arrives first. Upload accounting is process-global, so this runs
 /// alone in a child.
 #[test]
 fn backdrop_from_a_previous_content_is_refused() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
-    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::canvas::PaneJob;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
 
     const CHILD: &str = "FOCUSFORGE_GUI_STALE_BACKDROP_ACCOUNTING_CHILD";
@@ -3066,7 +3026,9 @@ fn backdrop_from_a_previous_content_is_refused() {
     let frame_path = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -3131,24 +3093,18 @@ fn backdrop_from_a_previous_content_is_refused() {
     let old = renderer
         .request_plane_backdrop(&plane_back, None, None)
         .expect("job");
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &old, "set_planes");
     let old = renderer
         .request_plane_backdrop(&plane_back, None, None)
         .expect("job");
     renderer.clear_planes();
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &old, "clear_planes");
-    let old = renderer
-        .request_plane_backdrop(&plane_back, None, None)
-        .expect("job");
-    renderer.select_plane(PaneSource::ZMap);
-    refused(&mut renderer, &old, "select_plane");
-    let zmap_job = renderer
-        .request_plane_backdrop(&plane_back, None, None)
-        .expect("Z-Map job");
-    accepted(&mut renderer, &zmap_job, "the Z-Map after the selection");
-
     let old = renderer
         .request_plane_backdrop(&plane_back, Some(1), None)
         .expect("job");
@@ -3178,7 +3134,9 @@ fn backdrop_follows_device_detach_and_attach() {
     let plane_back = backdrop_of(512, 512, 128.0);
 
     let mut renderer = CanvasRenderer::new();
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -3257,17 +3215,15 @@ fn backdrop_follows_device_detach_and_attach() {
 /// does, at the step `backdrop_draw` chose.
 #[test]
 fn backdrop_samples_match_a_direct_read() {
-    use focusforge_core::zmap::ZMapReader;
     use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
     use preparing::take_stamp;
     use std::sync::Arc;
 
-    let (composite_path, zmap_path) = golden_plane_files();
+    let (composite_path, _) = golden_plane_files();
     let frame = Arc::new(
         TiffStack::open_files(&[common::fixture_frame("mantis-64", 0)]).expect("frame opens"),
     );
     let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
-    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
 
     let (width, height) = (1u32, 40u32);
     let column: Vec<u16> = (0..height).map(|i| (i * 311 % 1009) as u16).collect();
@@ -3302,7 +3258,6 @@ fn backdrop_samples_match_a_direct_read() {
                      pane: Pane,
                      reader: Arc<dyn PaneReader>,
                      size: (u32, u32),
-                     index_scale: u32,
                      direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
         // An image smaller than the pane, then panes it needs coarser reads for.
         for pane_side in [4.0 * size.0.max(size.1) as f32, 16.0, 7.0, 3.0] {
@@ -3339,7 +3294,6 @@ fn backdrop_samples_match_a_direct_read() {
                 draw,
                 stamp,
                 reader: reader.clone(),
-                index_scale,
                 indices: None,
                 state: Default::default(),
                 backdrop: true,
@@ -3363,7 +3317,6 @@ fn backdrop_samples_match_a_direct_read() {
         Pane::Frame,
         frame.clone(),
         frame.dimensions(),
-        0,
         &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
     );
     let size = composite.dimensions();
@@ -3372,23 +3325,13 @@ fn backdrop_samples_match_a_direct_read() {
         Pane::Composite,
         composite.clone(),
         size,
-        0,
         &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
-    );
-    check(
-        "mantis-512 Z-Map",
-        Pane::ZMap,
-        zmap.clone(),
-        size,
-        1,
-        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
     );
     check(
         "one-pixel-wide image",
         Pane::Frame,
         thin.clone(),
         (width, height),
-        0,
         &|rect, step, out| thin.read_tile_step_into(0, rect, step, out).unwrap(),
     );
 }
@@ -3489,60 +3432,43 @@ fn preparer_is_exact_idle_only_once_the_exact_read_is_taken() {
 fn overlay_keeps_sealed_pixels_where_index_unchanged() {
     let stack = mantis64_stack();
     let planes = frame_planes(&stack);
-    let sealed: Vec<u16> = (0..MAP * MAP)
-        .map(|i| ((i / 5) % FRAMES as u32) as u16)
-        .collect();
-    let mut edited = sealed.clone();
     let region = Rect {
         x: 9,
         y: 14,
         width: 23,
         height: 19,
     };
-    // Inside the region one diagonal band changes source; every other pixel
-    // there is gathered at its own sealed index, as a repaint with the
-    // sealed source leaves it.
-    for y in region.y..region.y + region.height {
-        for x in region.x..region.x + region.width {
-            let i = (y * MAP + x) as usize;
-            if (x + y) % 4 == 0 {
-                edited[i] = (sealed[i] + 1) % FRAMES as u16;
+    // Inside the region one diagonal band comes from another frame; every
+    // other pixel there keeps the first frame's.
+    let mut installed = region_samples(&planes[0], region);
+    for y in 0..region.height {
+        for x in 0..region.width {
+            if (region.x + x + region.y + y).is_multiple_of(4) {
+                let i = (((region.y + y) * MAP + region.x + x) * 3) as usize;
+                let at = ((y * region.width + x) * 3) as usize;
+                installed[at..at + 3].copy_from_slice(&planes[1][i..i + 3]);
             }
         }
     }
     let mut tiles = ResidentTiles::new(16, MAP, MAP, 3);
-    tiles
-        .recomposite(region, &edited, &sources(&stack))
-        .unwrap();
+    tiles.install(region, &installed);
 
     // The sealed composite stands in as a sentinel no frame sample equals,
-    // so a gathered pixel in its place cannot hide.
+    // so an installed pixel in its place cannot hide.
     let sealed_sample = |i: usize| 60000 + (i % 1000) as u16;
     for step in [1u32, 2] {
         let step = NonZeroU32::new(step).unwrap();
         let out_w = MAP.div_ceil(step.get());
         let texels = (out_w * out_w) as usize;
-        let mut sealed_step = vec![0u16; texels];
-        let mut edited_step = vec![0u16; texels];
-        step_copy(&sealed, MAP, whole_map(), step, &mut sealed_step);
-        step_copy(&edited, MAP, whole_map(), step, &mut edited_step);
         let mut samples: Vec<u16> = (0..texels * 3).map(sealed_sample).collect();
-        overlay_edited(
-            &mut samples,
-            &sealed_step,
-            &edited_step,
-            whole_map(),
-            step,
-            3,
-            &tiles,
-        );
+        overlay_edited(&mut samples, whole_map(), step, 3, &tiles);
         for ty in 0..out_w {
             for tx in 0..out_w {
                 let (x, y) = (tx * step.get(), ty * step.get());
                 let t = (ty * out_w + tx) as usize;
-                let i = (y * MAP + x) as usize;
-                let expected: Vec<u16> = if edited[i] != sealed[i] {
-                    planes[edited[i] as usize][i * 3..i * 3 + 3].to_vec()
+                let expected: Vec<u16> = if contains(region, x, y) {
+                    let at = (((y - region.y) * region.width + (x - region.x)) * 3) as usize;
+                    installed[at..at + 3].to_vec()
                 } else {
                     (t * 3..t * 3 + 3).map(sealed_sample).collect()
                 };

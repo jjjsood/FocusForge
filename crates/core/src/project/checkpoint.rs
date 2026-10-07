@@ -17,7 +17,6 @@ use super::error::ProjectError;
 use super::manifest::{AlignRecord, Metrics, PlaneRef, SourceRef};
 use crate::align::Registration;
 use crate::params::ParamValues;
-use crate::tile::Rect;
 
 /// One node of a checkpoint tree: `parent: None` and an empty `ops` for
 /// the checkpoint a fresh stack or a re-fuse writes; a checkpoint
@@ -71,17 +70,20 @@ impl Checkpoint {
         Self::derive(None, stack_fingerprint, zmap_blob, created_at)
     }
 
-    /// `blake3(parent ‖ stack_fingerprint ‖ zmap_blob ‖ created_at)`,
+    /// `blake3(parent ‖ stack_fingerprint ‖ content ‖ created_at)`,
     /// hex-truncated to 32 characters -- the parent is folded into the hash
     /// so appending onto unchanged sources within the same wall-clock second
     /// still derives an id distinct from the checkpoint it is parented on.
+    /// `content` is the Z-Map blob hash of a fused checkpoint, and the hash
+    /// of its ops' JSON for an op checkpoint, which names its fused
+    /// ancestor's Z-Map and so cannot tell two branches apart by it.
     pub fn derive_child_id(
         parent: &str,
         stack_fingerprint: &str,
-        zmap_blob: &str,
+        content: &str,
         created_at: i64,
     ) -> String {
-        Self::derive(Some(parent), stack_fingerprint, zmap_blob, created_at)
+        Self::derive(Some(parent), stack_fingerprint, content, created_at)
     }
 
     fn derive(
@@ -111,34 +113,19 @@ pub struct Point {
 
 /// One edit in a checkpoint's op log. **Externally tagged** -- the serde
 /// default, stated here because it is frozen: an untagged enum would make
-/// deserialization buffered and slow (serde-rs/serde#2101), and `Refuse`
-/// carries a [`ParamValues`] that would be caught by exactly that.
+/// deserialization buffered and slow (serde-rs/serde#2101).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum Op {
-    /// Paint `source_id` along `path`. The Z-Map is the document: this
-    /// writes indices, never pixels.
+    /// Blend frame `source_id` into the result along `path` through a soft
+    /// round mask of `radius` pixels and `softness` in `0.0..=1.0`. Strokes
+    /// apply in list order; the result image is the document.
     BrushStroke {
         source_id: u16,
         path: Vec<Point>,
         radius: f32,
         softness: f32,
-    },
-    /// Flood `source_id` outward from `seed` while the map stays within
-    /// `tolerance`.
-    FloodFill {
-        seed: Point,
-        source_id: u16,
-        tolerance: f32,
-    },
-    /// Put `rect` back to what fusion computed.
-    ResetRegion { rect: Rect },
-    /// Re-fuse `rect`-free: run `algorithm` with `params` again over this
-    /// checkpoint's state.
-    Refuse {
-        algorithm: String,
-        params: ParamValues,
     },
 }
 
@@ -264,6 +251,19 @@ impl History {
                 None => return Ok(chain),
             }
         }
+    }
+
+    /// The ops a render of `id` applies, oldest first: those of the unbroken
+    /// run of op-bearing checkpoints from `id` down, since a fused checkpoint
+    /// holds the planes the ops above it blend over.
+    pub fn op_chain(&self, id: &str) -> Result<Vec<&Op>, ProjectError> {
+        let chain = self.ancestors(id)?;
+        let applied = chain.iter().take_while(|c| !c.ops.is_empty()).count();
+        Ok(chain[..applied]
+            .iter()
+            .rev()
+            .flat_map(|c| c.ops.iter())
+            .collect())
     }
 
     /// The direct children of `id`.

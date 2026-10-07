@@ -4,8 +4,8 @@ A project keeps its history as a tree of checkpoints. Every fuse produces
 one, and every set of retouch edits you save adds one on top of the
 checkpoint it started from. Any checkpoint can be restored, exported or
 branched from, so an experiment never costs the version you already liked.
-Because a checkpoint is a Z-Map, not pixels, a retouched checkpoint adds
-only the size of its edit to the project file.
+A retouched checkpoint stores its strokes, not pixels, so it adds only the
+size of its edit to the project file.
 
 ## In the window
 
@@ -43,25 +43,22 @@ Strokes that belong to no checkpoint yet are never dropped silently:
 
 ```bash
 focusforge-cli history list frames.ffp
-focusforge-cli history apply frames.ffp --ops ops.json --save
-focusforge-cli history apply frames.ffp --ops ops.json --from 5b71 --save
-focusforge-cli history materialize frames.ffp --checkpoint 5b71 -o zmap.tif
+focusforge-cli retouch frames.ffp --ops ops.json
+focusforge-cli retouch frames.ffp --ops ops.json --from 5b71
+focusforge-cli export frames.ffp --checkpoint 5b71 --zmap zmap.tif
 focusforge-cli history delete frames.ffp --checkpoint 5b71
 ```
 
 - `list` prints every visible checkpoint, newest first, with its parent.
   Ids can be shortened to any unique prefix everywhere.
-- `apply` replays an op list (`{"ops": [...]}`, the shape in
-  [retouching](retouch.md)) onto a checkpoint, the head unless `--from`
-  names another. `--save` seals the result as a new checkpoint; with `-o`
-  it also writes the edited Z-Map, and with `-o` alone it only previews
-  without changing the project. Applying onto an older checkpoint starts a
-  branch.
-- `materialize` writes a checkpoint's Z-Map as a TIFF.
 - `delete` hides a checkpoint and removes it from the file once no visible
   checkpoint is built on it. The last visible checkpoint is refused.
 
-`export --checkpoint <id>` renders any checkpoint to an image.
+`retouch` appends an op list (the shape in [retouching](retouch.md)) to the
+head, or to the checkpoint `--from` names, which starts a branch.
+`history compact` rewrites the file to its live checkpoints and reports the
+bytes reclaimed. `export --checkpoint <id>` renders any checkpoint to an image, and with
+`--zmap` writes its Z-Map.
 
 ## Damaged or moved projects
 

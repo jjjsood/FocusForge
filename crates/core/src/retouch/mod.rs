@@ -1,24 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Applying an edit op to a Z-Map's indices. A stroke paints `u16` source
-//! indices into the region it covers and touches nothing else -- the
-//! document this module edits is the map, never an image.
+//! The soft brush stroke blended over an image from a source frame.
 
-pub mod brush;
-pub mod recomposite;
-pub mod replay;
-pub mod session;
-pub mod zmap_io;
+pub mod blend;
 
-use crate::project::Point;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
-pub use brush::{apply, footprint};
-pub use recomposite::{Sources, named_frames, recomposite, recomposite_bands};
-pub use replay::{replay, replay_tile};
-pub use session::EditSession;
-pub use zmap_io::{session_tile, write_edited};
+pub use blend::{footprint, overlay_colors, top_source};
 
 /// Failures validating or applying an op against a Z-Map.
 #[derive(Debug, thiserror::Error)]
@@ -49,35 +38,15 @@ pub enum RetouchError {
     #[error("tile {tile:?} lies outside the map's extent")]
     TileOutsideMap { tile: Rect },
 
-    /// The index buffer handed to `apply` does not match the tile's area.
-    #[error("index buffer holds {actual} entries, expected {expected}")]
+    /// A sample buffer handed to `apply` does not match its rect's area.
+    #[error("sample buffer holds {actual} samples, expected {expected}")]
     TileBufferSize { expected: usize, actual: usize },
 
-    /// A recomposite's source reader failed to produce a frame's pixels.
+    /// A source reader failed to produce a frame's pixels.
     #[error(transparent)]
     Source(#[from] crate::algorithm::AlgorithmError),
 
-    /// A [`crate::project::Op::ResetRegion`] rect lies outside the map --
-    /// including an empty rect.
-    #[error("reset region {rect:?} lies outside the map")]
-    RegionOutsideMap { rect: Rect },
-
-    /// A [`crate::project::Op::FloodFill`] seed lies outside the map.
-    #[error("flood fill seed {seed:?} lies outside the map")]
-    SeedOutsideMap { seed: Point },
-
-    /// [`crate::project::Op::FloodFill`] has no defined replay semantics: no
-    /// editor control produces its `tolerance` field.
-    #[error("flood-fill has no defined replay semantics")]
-    FloodFillNotReplayable,
-
-    /// [`crate::project::Op::Refuse`] is never replayed from an op list -- a
-    /// re-fuse is recorded as its own checkpoint via `append`.
-    #[error("re-fuse needs its sources; it is recorded as its own checkpoint")]
-    RefuseNotReplayable,
-
-    /// Reading the nearest fused ancestor's map while replaying a
-    /// [`crate::project::Op::ResetRegion`] failed.
-    #[error("reading the fused ancestor's map: {0}")]
+    /// Reading a Z-Map failed.
+    #[error("reading a Z-Map: {0}")]
     Fused(#[from] ZMapError),
 }

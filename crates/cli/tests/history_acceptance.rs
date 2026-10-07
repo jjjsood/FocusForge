@@ -2,10 +2,10 @@
 
 //! A real edit history over `fixtures/mantis-512`, driven only through the
 //! shipped binary: a laplacian stack, three chained checkpoints, one branch,
-//! one delete, then every visible checkpoint materialized in a fresh process.
-//! Each map must equal the one its own seal wrote and the one a
-//! `retouch` chain produces without ever reading a project, compared by
-//! `tools/tiff-diff.py`, which shares no code with the writer under test.
+//! one delete, then every visible checkpoint's Z-Map exported in a fresh process.
+//! Each op checkpoint's map must equal the root's, compared by
+//! `tools/tiff-diff.py`, which shares no code with the writer under test, and
+//! its export must differ from the root's.
 
 mod common;
 
@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use focusforge_core::project::Project;
 use serde_json::{Value, json};
 
 fn run(dir: &Path, args: &[&str]) -> common::CliOutput {
@@ -51,10 +52,6 @@ fn assert_identical(a: &Path, b: &Path) {
     assert_eq!(oracle(a, b), 0, "{a:?} differs from {b:?}");
 }
 
-fn assert_differ(a: &Path, b: &Path) {
-    assert_eq!(oracle(a, b), 1, "{a:?} and {b:?} are expected to differ");
-}
-
 fn only_project(dir: &Path) -> PathBuf {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
@@ -72,27 +69,19 @@ fn listed(dir: &Path, project: &Path) -> Vec<Value> {
     doc["checkpoints"].as_array().unwrap().clone()
 }
 
-/// `stroke` as the two op files a command reads: `{"ops":[stroke]}` for
-/// `history apply`, a bare `[stroke]` for `retouch`.
-fn write_op_files(dir: &Path, name: &str, stroke: &Value) -> (PathBuf, PathBuf) {
-    let wrapped = dir.join(format!("{name}.ops.json"));
-    let bare = dir.join(format!("{name}.bare.json"));
-    std::fs::write(&wrapped, json!({ "ops": [stroke] }).to_string()).unwrap();
-    std::fs::write(&bare, json!([stroke]).to_string()).unwrap();
-    (wrapped, bare)
+/// `stroke` as the one-op list `retouch` reads.
+fn write_op_file(dir: &Path, name: &str, stroke: &Value) -> PathBuf {
+    let path = dir.join(format!("{name}.ops.json"));
+    std::fs::write(&path, json!([stroke]).to_string()).unwrap();
+    path
 }
 
 #[test]
 fn real_history_round_trips() {
     let cwd = common::tmp_dir("history_acceptance");
     let out = cwd.join("out");
-    let (before, after, expected, strokes) = (
-        cwd.join("before"),
-        cwd.join("after"),
-        cwd.join("expected"),
-        cwd.join("strokes"),
-    );
-    for dir in [&out, &before, &after, &expected, &strokes] {
+    let (after, strokes) = (cwd.join("after"), cwd.join("strokes"));
+    for dir in [&out, &after, &strokes] {
         std::fs::create_dir_all(dir).unwrap();
     }
 
@@ -117,20 +106,6 @@ fn real_history_round_trips() {
         .as_str()
         .unwrap()
         .to_string();
-    let root_before = before.join("root.tif");
-    run_ok(
-        &cwd,
-        &[
-            "history",
-            "materialize",
-            arg(&project),
-            "--checkpoint",
-            &root,
-            "-o",
-            arg(&root_before),
-        ],
-    );
-
     let fixture = common::fixtures_dir().join("retouch/stroke-list.json");
     let all: Vec<Value> = serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
     assert_eq!(all.len(), 3, "the fixture holds three strokes");
@@ -144,41 +119,22 @@ fn real_history_round_trips() {
     ];
     let mut ids: BTreeMap<&str, String> = BTreeMap::from([("root", root.clone())]);
     for (name, stroke, parent) in plan {
-        let (wrapped, bare) = write_op_files(&strokes, name, &all[stroke]);
+        let ops = write_op_file(&strokes, name, &all[stroke]);
         let from = parent.map_or(root.as_str(), |p| ids[p].as_str());
-        let sealed_map = before.join(format!("{name}.tif"));
         let output = run_ok(
             &cwd,
             &[
-                "history",
-                "apply",
+                "retouch",
                 arg(&project),
                 "--ops",
-                arg(&wrapped),
+                arg(&ops),
                 "--from",
                 from,
-                "--save",
-                "-o",
-                arg(&sealed_map),
                 "--json",
             ],
         );
         let report: Value = serde_json::from_str(&output.stdout).unwrap();
-        ids.insert(name, report["checkpoint"].as_str().unwrap().to_string());
-
-        let prev = parent.map_or(golden.clone(), |p| expected.join(format!("{p}.tif")));
-        run_ok(
-            &cwd,
-            &[
-                "retouch",
-                "--zmap",
-                arg(&prev),
-                "--ops",
-                arg(&bare),
-                "--out",
-                arg(&expected.join(format!("{name}.tif"))),
-            ],
-        );
+        ids.insert(name, report["checkpoints"][0].as_str().unwrap().to_string());
     }
 
     let output = run_ok(
@@ -218,32 +174,49 @@ fn real_history_round_trips() {
     assert_eq!(parent_of("c3"), ids["c1"].as_str(), "c3 lists c1 as parent");
     assert_eq!(parent_of("b"), ids["root"].as_str());
 
-    // The edits are real: a map equal to everything is no evidence.
-    assert_differ(&before.join("c1.tif"), &golden);
-    assert_differ(&before.join("c3.tif"), &before.join("c2.tif"));
-    assert_differ(&before.join("b.tif"), &golden);
-
-    // Every command above is its own process; each map is read back now.
-    for name in ["root", "c1", "c3", "b"] {
-        let materialized = after.join(format!("{name}.tif"));
+    // An op checkpoint is a record naming the root's Z-Map; the edits show in
+    // its render, and a render equal to the root's would be no evidence.
+    let recorded = Project::open(&project).unwrap();
+    let root_blob = recorded.history().get(&root).unwrap().zmap_blob.clone();
+    let export = |name: &str| {
+        let out = after.join(format!("{name}-export.tif"));
         run_ok(
             &cwd,
             &[
-                "history",
-                "materialize",
+                "export",
                 arg(&project),
                 "--checkpoint",
                 &ids[name],
                 "-o",
-                arg(&materialized),
+                arg(&out),
             ],
         );
-        assert_identical(&materialized, &before.join(format!("{name}.tif")));
-        let independent = if name == "root" {
-            golden.clone()
-        } else {
-            expected.join(format!("{name}.tif"))
-        };
-        assert_identical(&materialized, &independent);
+        std::fs::read(&out).unwrap()
+    };
+    let root_render = export("root");
+    for name in ["c1", "c3", "b"] {
+        assert_eq!(
+            recorded.history().get(&ids[name]).unwrap().zmap_blob,
+            root_blob,
+            "{name} names the root's Z-Map"
+        );
+        assert_ne!(export(name), root_render, "{name} renders its strokes");
+    }
+
+    // Every command above is its own process; each map is read back now.
+    for name in ["root", "c1", "c3", "b"] {
+        let exported = after.join(format!("{name}.tif"));
+        run_ok(
+            &cwd,
+            &[
+                "export",
+                arg(&project),
+                "--checkpoint",
+                &ids[name],
+                "--zmap",
+                arg(&exported),
+            ],
+        );
+        assert_identical(&exported, &golden);
     }
 }

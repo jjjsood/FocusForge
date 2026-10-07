@@ -31,6 +31,8 @@ pub mod pack;
 pub mod warp_coords;
 
 #[cfg(feature = "gpu")]
+pub mod blend;
+#[cfg(feature = "gpu")]
 pub mod device;
 /// The display kernel: a 16-to-8-bit reduction with ordered dither and no
 /// tone curve, the display texture Slint imports, and the one readback
@@ -47,11 +49,6 @@ pub mod fuse;
 pub mod harness;
 #[cfg(feature = "gpu")]
 pub(crate) mod pipeline;
-/// The recomposite kernel: the WGSL twin of
-/// `focusforge_core::retouch::recomposite::recomposite`, one dispatch per
-/// named frame.
-#[cfg(feature = "gpu")]
-pub mod recomposite;
 #[cfg(feature = "gpu")]
 pub mod stack_tile;
 #[cfg(feature = "gpu")]

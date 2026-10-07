@@ -19,7 +19,8 @@ use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, 
 
 use super::Project;
 use super::error::ProjectError;
-use super::render::{CheckpointImage, Renderer, ZmapSource, write_tiff, write_via_partial};
+use super::render::{CheckpointImage, PendingState, Renderer, write_tiff, write_via_partial};
+use super::seal::HeldCheckpoint;
 
 /// The largest side JPEG can encode: SOF0's width/height fields are 16 bits.
 const JPEG_MAX_SIDE: u32 = 65535;
@@ -130,7 +131,7 @@ pub static TIFF_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "tiff-bits".to_string(),
             label: "Bit depth".to_string(),
-            help: "16-bit keeps every sample the Z-Map gather produced; 8-bit rounds \
+            help: "16-bit keeps every sample of the result image; 8-bit rounds \
                    each sample through the same conversion JPEG uses."
                 .to_string(),
             kind: ParamKind::Enum {
@@ -185,7 +186,7 @@ pub static PNG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "png-bits".to_string(),
             label: "Bit depth".to_string(),
-            help: "16-bit keeps every sample the Z-Map gather produced; 8-bit rounds \
+            help: "16-bit keeps every sample of the result image; 8-bit rounds \
                    each sample through the same conversion JPEG uses."
                 .to_string(),
             kind: ParamKind::Enum {
@@ -664,13 +665,12 @@ fn check_supported_samples(
 
 /// Validates `options` against its own schema (so a value built directly,
 /// not through [`ExportOptions::from_values`], is refused the same way),
-/// then renders `id` through the export render and writes it as `options`
-/// say: a `.partial` sibling of `path`, renamed onto it only once every band
-/// is written and removed instead on any error, exactly as the view render
-/// is. `metadata_options` resolves the alignment reference frame's EXIF,
-/// ICC, XMP and IPTC into the same file, never failing the export on its
-/// own: a damaged or missing block is named in the returned
-/// [`MetadataOutcome`] instead.
+/// then renders `id` through the one render ([`CheckpointImage::render`]) and
+/// writes it as `options` say: a `.partial` sibling of `path`, renamed onto it
+/// only once every band is written, removed on any error. `metadata_options`
+/// resolves the reference frame's EXIF, ICC, XMP and IPTC into the file; a
+/// damaged or missing block is named in the returned [`MetadataOutcome`],
+/// never fatal. An unedited checkpoint reads no source frame for pixels.
 pub fn export_checkpoint(
     project: &mut Project,
     id: &str,
@@ -678,13 +678,13 @@ pub fn export_checkpoint(
     options: &ExportOptions,
     metadata_options: &MetadataOptions,
 ) -> Result<MetadataOutcome, ProjectError> {
-    let image = CheckpointImage::prepare_export(project, id)?;
+    let image = CheckpointImage::prepare(project, id)?;
     let record = project.fuse_state(id)?;
     let frame = record.align.as_ref().map_or(0, |a| a.reference);
     let frame_path = project.source_path(&record.sources[frame]);
     encode(
         &image,
-        &mut |sink| image.render(project, sink),
+        &mut |sink| image.render(Some(&mut *project), image.full(), sink),
         frame,
         &frame_path,
         path,
@@ -693,24 +693,44 @@ pub fn export_checkpoint(
     )
 }
 
-/// The live export render, over a Z-Map file `zmap` (a held row's staged
-/// map, or an edit session's Z-Map written to a temp file) plus `source`'s
-/// placement, rather than a checkpoint history entry -- otherwise exactly
-/// [`export_checkpoint`]'s own validation, metadata resolution and
-/// `.partial` discipline, through the one shared `encode` path.
-pub fn export_zmap(
-    zmap: &Path,
-    source: &ZmapSource,
+/// [`export_checkpoint`] for a held result, not yet in any project: streams
+/// its composite TIFF, so it needs no project; the reference frame is read
+/// only for its metadata.
+pub fn export_held(
+    held: &HeldCheckpoint,
     path: &Path,
     options: &ExportOptions,
     metadata_options: &MetadataOptions,
 ) -> Result<MetadataOutcome, ProjectError> {
-    let image = CheckpointImage::prepare_zmap(zmap, source)?;
-    let frame = source.reference;
-    let frame_path = source.sources[frame].clone();
+    let image = CheckpointImage::prepare_held(held)?;
+    let frame = held.align.as_ref().map_or(0, |a| a.reference);
     encode(
         &image,
-        &mut |sink| image.render_external(sink),
+        &mut |sink| image.render(None, image.full(), sink),
+        frame,
+        &held.sources[frame],
+        path,
+        options,
+        metadata_options,
+    )
+}
+
+/// [`export_checkpoint`] for a [`PendingState`], strokes not yet saved: the
+/// same render, validation, metadata resolution and `.partial` discipline
+/// through the one shared `encode` path, with no project read or written.
+/// A missing source is [`ProjectError::ExportSourcesUnavailable`].
+pub fn export_pending(
+    state: &PendingState,
+    path: &Path,
+    options: &ExportOptions,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataOutcome, ProjectError> {
+    let image = CheckpointImage::prepare_pending(state)?;
+    let frame = state.reference;
+    let frame_path = state.sources[frame].clone();
+    encode(
+        &image,
+        &mut |sink| image.render(None, image.full(), sink),
         frame,
         &frame_path,
         path,
@@ -723,7 +743,7 @@ pub fn export_zmap(
 /// `.partial` sibling of `path`, renamed onto it only once complete), and
 /// resolves `frame_path`'s metadata into the same file -- a damaged or
 /// missing block is named in the returned [`MetadataOutcome`], never fatal.
-/// Shared by [`export_checkpoint`] and [`export_zmap`].
+/// Shared by [`export_checkpoint`], [`export_held`] and [`export_pending`].
 fn encode(
     image: &CheckpointImage,
     render: &mut Renderer<'_>,
@@ -1001,9 +1021,10 @@ struct JpegMetadataSkips {
     iptc: bool,
 }
 
-/// 8-bit JPEG through `jpeg_encoder`. The calling thread converts and sends
-/// each band over a bounded channel while a scoped worker thread encodes
-/// row by row, so neither side holds the whole image resident. EXIF goes
+/// 8-bit JPEG through `jpeg_encoder`. The calling thread converts and hands
+/// each band over a rendezvous channel while a scoped worker thread encodes
+/// row by row, so neither side holds the whole image resident and at most two
+/// 8-bit bands are alive at once, whichever side is faster. EXIF goes
 /// through `add_exif_metadata` (APP1 `Exif`), ICC through `add_icc_profile`
 /// (APP2, chunked by the encoder itself), XMP through `add_app_segment`
 /// (a second APP1, `http://ns.adobe.com/xap/1.0/` prefixed) and IPTC
@@ -1035,7 +1056,7 @@ fn write_jpeg(
 
     write_via_partial(path, |partial| {
         let file = std::fs::File::create(partial).map_err(|err| ProjectError::io(partial, err))?;
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(0);
         let source = JpegRowSource::new(rx, width, height, samples_per_pixel);
         let (render_result, encode_result, thread_skips) = std::thread::scope(|scope| {
             let handle = scope.spawn(move || {

@@ -6,16 +6,15 @@
 //! appends of the same inputs are byte-identical apart from `created_at` --
 //! re-pointed at the append path rather than reinvented for it.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, AppendRequest, Metrics, Op, ParentRef, Point, Project, SealRequest,
 };
-use focusforge_core::retouch::EditSession;
-use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
 const W: u32 = 64;
 const H: u32 = 48;
@@ -205,35 +204,22 @@ fn append_once(
 }
 
 fn entry_names(path: &Path) -> Vec<String> {
-    let file = std::fs::File::open(path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
         .collect()
 }
 
 /// Copies `src` to `dst`, dropping one named entry entirely -- what produces
 /// a manifest that names a blob the archive does not hold.
 fn remove_entry(src: &Path, dst: &Path, entry: &str) {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in names {
-        if name == entry {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(&name)
-            .unwrap()
-            .read_to_end(&mut bytes)
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names().filter(|name| *name != entry) {
+        writer
+            .put_bytes(name, &index.read_entry(src, name).unwrap())
             .unwrap();
-        writer.start_file(&*name, options).unwrap();
-        writer.write_all(&bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -439,6 +425,7 @@ fn held_checkpoint(
         composite_description: "staged composite".to_string(),
         metrics: Metrics::default(),
         created_at,
+        compressed_composite: None,
     }
 }
 
@@ -510,26 +497,8 @@ fn leftover_temporaries(dir: &Path) -> Vec<String> {
         .unwrap()
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains(".saving") || name.contains(".partial"))
+        .filter(|name| name.contains(".partial"))
         .collect()
-}
-
-fn read_map(path: &Path) -> Vec<u16> {
-    let reader = ZMapReader::open(path).unwrap();
-    let mut out = vec![0u16; (W * H) as usize];
-    reader.read_tile_into(full(W, H), &mut out).unwrap();
-    out
-}
-
-/// The Z-Map checkpoint `id` materializes to in the file at `path`.
-fn materialized(path: &Path, id: &str) -> Vec<u16> {
-    let mut project = Project::open(path).unwrap();
-    let checkpoint = project.history().get(id).unwrap().clone();
-    let out = path.with_file_name(format!("materialized-{id}.tif"));
-    project::materialize_zmap(&mut project, &checkpoint, &out).unwrap();
-    let map = read_map(&out);
-    std::fs::remove_file(&out).unwrap();
-    map
 }
 
 fn parent_of(path: &Path, id: &str) -> Option<String> {
@@ -696,8 +665,8 @@ fn sealing_in_memory_checkpoints_writes_each_under_its_own_parent() {
 }
 
 #[test]
-fn an_in_memory_op_checkpoint_materializes_to_its_replay() {
-    let (dir, project_path, sources) = sealed("in_memory_ops_replay");
+fn in_memory_op_checkpoints_name_their_fused_ancestors_map() {
+    let (dir, project_path, sources) = sealed("in_memory_ops_fused_map");
     let root = head_of(&project_path);
     let first_ops = vec![stroke(2, 10, 10), stroke(1, 30, 25)];
     let second_ops = vec![stroke(3, 25, 12)];
@@ -713,32 +682,23 @@ fn an_in_memory_op_checkpoint_materializes_to_its_replay() {
     ];
     let ids = project::seal_in_memory(&project_path, &entries, &[], None, true).unwrap();
 
-    let replay = |parent: &str, ops: &[Op]| {
-        let info = ZMapInfo::new(W, H, FRAMES).unwrap();
-        let mut session =
-            EditSession::new(info, full(W, H), materialized(&project_path, parent)).unwrap();
-        for op in ops {
-            session.append(op.clone()).unwrap();
-        }
-        session.indices().to_vec()
-    };
-    let cases: [(usize, &str, &[Op]); 3] = [
-        (0, root.as_str(), &first_ops),
-        (1, ids[0].as_str(), &second_ops),
-        (3, ids[2].as_str(), &third_ops),
+    let project = Project::open(&project_path).unwrap();
+    let zmap_of = |id: &str| project.history().get(id).unwrap().zmap_blob.clone();
+    let cases: [(usize, &[Op], String); 4] = [
+        (0, &first_ops, zmap_of(&root)),
+        (1, &second_ops, zmap_of(&root)),
+        (2, &[], zmap_of(&ids[2])),
+        (3, &third_ops, zmap_of(&ids[2])),
     ];
-    for (entry, parent, ops) in cases {
-        let expected = replay(parent, ops);
-        let got = materialized(&project_path, ids[entry].as_str());
-        assert_ne!(
-            got,
-            materialized(&project_path, parent),
-            "the ops changed it"
+    for (entry, ops, fused_zmap) in cases {
+        let got = project.history().get(ids[entry].as_str()).unwrap();
+        assert_eq!(got.ops, ops, "entry {entry} carries its own ops");
+        assert_eq!(
+            got.zmap_blob, fused_zmap,
+            "entry {entry} names its fused ancestor's map"
         );
-        assert_eq!(got, expected, "entry {entry} equals replay over its parent");
     }
 
-    let project = Project::open(&project_path).unwrap();
     for (entry, created_at) in [(0, 7_000), (1, 7_100), (2, 7_200), (3, 7_300)] {
         assert_eq!(
             project
@@ -829,16 +789,9 @@ fn branched(name: &str) -> Branched {
     let root = head_of(&path);
     let a = append_once(&dir, &path, &sources, 1, 1).checkpoint;
     let onto = |parent: &str, op: Op, at: i64| {
-        project::append_ops_onto(
-            &path,
-            parent,
-            vec![op],
-            None,
-            at,
-            project::ZMapStorage::Bounded,
-        )
-        .unwrap()
-        .checkpoint
+        project::append_ops_onto(&path, parent, vec![op], None, at)
+            .unwrap()
+            .checkpoint
     };
     let b = onto(&a, stroke(1, 5, 5), 2_000);
     let c = onto(&a, stroke(2, 30, 30), 2_100);

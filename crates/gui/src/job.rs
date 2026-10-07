@@ -12,12 +12,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm};
+use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
-    COMPOSITE_FILENAME, FrameError, FrameReader, ZMAP_FILENAME, open_frame_set,
+    COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
 pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
@@ -25,15 +25,17 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
     self, AlignRequest, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage, StageObserver,
 };
+pub use focusforge_core::project::PendingState;
 pub use focusforge_core::project::export::{
     ExportFormat, ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression,
     params_for,
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
-use focusforge_core::retouch::{RetouchError, Sources};
+use focusforge_core::retouch::{RetouchError, blend};
 pub use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
+use focusforge_gpu::blend::Blender;
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
@@ -45,7 +47,7 @@ pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
-pub use focusforge_core::retouch::{EditSession, footprint};
+pub use focusforge_core::retouch::{footprint, top_source};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
 /// Which operation a failure belongs to, classified from the typed
@@ -692,18 +694,18 @@ fn checkpoint_plane_paths(
 
 /// What a saved checkpoint needs before the canvas can show it.
 pub enum CheckpointPlanes {
-    /// Its composite and Z-Map, on disk.
-    Ready(PathBuf, PathBuf),
+    /// Its composite, on disk, and its Z-Map when one is cached.
+    Ready(PathBuf, Option<PathBuf>),
     /// Not cached yet: [`render_checkpoint_planes`] must run first, off the
     /// event-loop thread, since it decompresses planes and an op-bearing
     /// checkpoint re-hashes every source.
     NeedsRender,
 }
 
-/// A fused checkpoint's plane cache pair when both files are already newer
-/// than the `.ffp`; any other checkpoint, or a stale or missing pair,
-/// answers [`CheckpointPlanes::NeedsRender`]. Reads metadata only, never a
-/// plane.
+/// A fused checkpoint's cached planes when its composite is already newer
+/// than the `.ffp`; the Z-Map is carried only when it is as fresh. Any other
+/// checkpoint, or a stale or missing composite, answers
+/// [`CheckpointPlanes::NeedsRender`]. Reads metadata only, never a plane.
 pub fn cached_checkpoint_planes(
     project: &Project,
     scratch_root: &Path,
@@ -714,25 +716,26 @@ pub fn cached_checkpoint_planes(
     }
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project.path(), id);
     let ffp_modified = std::fs::metadata(project.path())?.modified()?;
-    if is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified) {
-        Ok(CheckpointPlanes::Ready(composite, zmap))
-    } else {
-        Ok(CheckpointPlanes::NeedsRender)
+    if !is_fresh(&composite, ffp_modified) {
+        return Ok(CheckpointPlanes::NeedsRender);
     }
+    let zmap = is_fresh(&zmap, ffp_modified).then_some(zmap);
+    Ok(CheckpointPlanes::Ready(composite, zmap))
 }
 
 /// Renders checkpoint `id` of the project at `project_path` into its plane
-/// cache pair, over a project opened on the calling thread. An op-bearing
+/// cache, over a project opened on the calling thread. An op-bearing
 /// checkpoint re-hashes its sources on every call and refuses on any
-/// missing or changed frame.
+/// missing or changed frame. A Z-Map that fails to materialize is logged and
+/// answered as `None`: the composite is the image, the map only analysis.
 pub fn render_checkpoint_planes(
     project_path: &Path,
     scratch_root: &Path,
     id: &str,
-) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
+) -> Result<(PathBuf, Option<PathBuf>), PlaneCacheError> {
     let mut project = Project::open(project_path)?;
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project_path, id);
-    write_checkpoint_planes(&mut project, id, &composite, &zmap)?;
+    let zmap = write_checkpoint_planes(&mut project, id, &composite, zmap)?;
     Ok((composite, zmap))
 }
 
@@ -740,15 +743,26 @@ fn write_checkpoint_planes(
     project: &mut Project,
     id: &str,
     composite: &Path,
-    zmap: &Path,
-) -> Result<(), PlaneCacheError> {
+    zmap: PathBuf,
+) -> Result<Option<PathBuf>, PlaneCacheError> {
     if let Some(dir) = composite.parent() {
         std::fs::create_dir_all(dir)?;
     }
     project::render_checkpoint(project, id, composite)?;
     let checkpoint = project.history().get(id)?.clone();
-    project::materialize_zmap(project, &checkpoint, zmap)?;
-    Ok(())
+    match project::materialize_zmap(project, &checkpoint, &zmap) {
+        Ok(()) => Ok(Some(zmap)),
+        Err(err) => {
+            tracing::warn!(
+                project = %project.path().display(),
+                checkpoint = id,
+                error = %err,
+                "the Z-Map could not be read; the overlay is unavailable for this checkpoint"
+            );
+            let _ = std::fs::remove_file(&zmap);
+            Ok(None)
+        }
+    }
 }
 
 /// One `"missing: <path>"` / `"changed: <path> (found at <path>)"` detail
@@ -788,8 +802,8 @@ pub fn render_refusal_lines(err: &PlaneCacheError) -> Vec<String> {
 /// planes, or the right pane's refusal lines. A panicked worker refuses with
 /// the generic line rather than leaving its row pending.
 pub fn render_outcome(
-    result: std::thread::Result<Result<(PathBuf, PathBuf), PlaneCacheError>>,
-) -> Result<(PathBuf, PathBuf), Vec<String>> {
+    result: std::thread::Result<Result<(PathBuf, Option<PathBuf>), PlaneCacheError>>,
+) -> Result<(PathBuf, Option<PathBuf>), Vec<String>> {
     match result {
         Ok(rendered) => rendered.map_err(|err| render_refusal_lines(&err)),
         Err(_) => {
@@ -806,43 +820,28 @@ pub enum ExportSource {
     /// A saved checkpoint: reopens `project_path` and calls
     /// [`project::export_checkpoint`].
     Saved { project_path: PathBuf, id: String },
-    /// A held row's own state -- not yet in any `.ffp`.
+    /// A held row's own state -- not yet in any `.ffp`: exports its
+    /// composite through [`project::export_held`], with no project; the
+    /// reference frame is read only for its metadata.
     Held(HeldCheckpoint),
-    /// The active tab's edit session applied over its current row: a clone
-    /// of `EditSession::indices()`, the map's own shape, and the row's own
-    /// sources/registration/reference/description (`ProjectTab::fused()`
-    /// for the first two).
-    Live {
-        width: u32,
-        height: u32,
-        indices: Vec<u16>,
-        sources: Vec<PathBuf>,
-        registration: Registration,
-        reference: usize,
-        description: String,
-    },
+    /// The active tab's strokes not yet saved, over its current row's
+    /// composite: exported through [`project::export_pending`], with no
+    /// project.
+    Pending(project::PendingState),
 }
 
-/// [`export_position`]'s own error: a project/render failure, or writing a
-/// live export's temp Z-Map.
+/// [`export_position`]'s own error: a project or render failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
     #[error(transparent)]
     Project(#[from] ProjectError),
-    #[error(transparent)]
-    ZMap(#[from] ZMapError),
 }
-
-/// A process-wide counter, so two live exports started in the same process
-/// never share a temp Z-Map path.
-static NEXT_EXPORT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Writes `source`'s image to `path` as the default TIFF (16-bit
 /// uncompressed, EXIF and ICC on) -- the export modal's own worker body,
-/// run off the UI thread. A held row's or a live edit session's export
-/// changes nothing about the project: no checkpoint is written, no `.ffp`
-/// touched, and a live export's temp Z-Map is removed whether the write
-/// finishes or fails.
+/// run off the UI thread. A held row's or a pending state's export changes
+/// nothing about the project: no checkpoint is written and no `.ffp`
+/// touched.
 pub fn export_position(
     source: ExportSource,
     path: &Path,
@@ -855,67 +854,12 @@ pub fn export_position(
             project::export_checkpoint(&mut project, &id, path, options, metadata)?;
         }
         ExportSource::Held(held) => {
-            let zmap_source = project::ZmapSource {
-                reference: held.align.as_ref().map_or(0, |a| a.reference),
-                sources: held.sources,
-                registration: held.registration,
-                description: held.composite_description,
-            };
-            project::export_zmap(&held.zmap, &zmap_source, path, options, metadata)?;
+            project::export_held(&held, path, options, metadata)?;
         }
-        ExportSource::Live {
-            width,
-            height,
-            indices,
-            sources,
-            registration,
-            reference,
-            description,
-        } => {
-            let temp = std::env::temp_dir().join(format!(
-                "focusforge-export-{}-{}.tif",
-                std::process::id(),
-                NEXT_EXPORT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let write = (|| -> Result<(), ExportError> {
-                write_zmap(&temp, width, height, sources.len() as u32, &indices)?;
-                let zmap_source = project::ZmapSource {
-                    sources,
-                    registration,
-                    reference,
-                    description,
-                };
-                project::export_zmap(&temp, &zmap_source, path, options, metadata)?;
-                Ok(())
-            })();
-            let _ = std::fs::remove_file(&temp);
-            write?;
+        ExportSource::Pending(state) => {
+            project::export_pending(&state, path, options, metadata)?;
         }
     }
-    Ok(())
-}
-
-/// Writes `indices`, a whole `width` x `height` map over `frame_count`
-/// sources, as the Z-Map file at `path`.
-pub fn write_zmap(
-    path: &Path,
-    width: u32,
-    height: u32,
-    frame_count: u32,
-    indices: &[u16],
-) -> Result<(), ZMapError> {
-    let info = ZMapInfo::new(width, height, frame_count)?;
-    let mut writer = ZMapWriter::create(path, info)?;
-    writer.write_tile(
-        Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        },
-        indices,
-    )?;
-    writer.finish()?;
     Ok(())
 }
 
@@ -983,7 +927,7 @@ fn export_frame_line(line: &str) -> String {
 }
 
 /// The export modal's own refusal lines: one per source for a missing or
-/// changed frame (a saved checkpoint's own recorded sources, or a held/live
+/// changed frame (a saved checkpoint's own recorded sources, or a live
 /// export's plain paths, which can only ever be `missing`), naming the
 /// underlying cause for anything else -- an unwritable destination above
 /// all.
@@ -1035,45 +979,102 @@ pub fn frame_refusal_lines(path: &Path) -> Vec<String> {
     ]
 }
 
-/// What can go wrong opening a tab's editor state: its Z-Map or the source
-/// frames a stroke recomposites against.
+/// What can go wrong opening a tab's editor state: its Z-Map, the composite
+/// it edits over or the source frames a stroke blends from.
 #[derive(Debug, thiserror::Error)]
 pub enum EditSessionError {
     #[error(transparent)]
     ZMap(#[from] ZMapError),
     #[error(transparent)]
+    Composite(#[from] focusforge_core::TiffError),
+    #[error(transparent)]
     Frames(#[from] FrameError),
 }
 
-/// What a recomposite worker parks: each region it gathered, in dispatch
-/// order, with its samples or the reason its read failed.
-type Gathered = Vec<(Rect, Result<Vec<u16>, String>)>;
-
-/// Wakes the UI thread once a recomposite worker has parked its result.
-pub type RecompositeWake = Arc<dyn Fn() + Send + Sync>;
-
-/// One session's recomposite queue: regions waiting for a worker, whether a
-/// worker holds a batch, and where it parks the result.
-#[derive(Default)]
-struct Recomposites {
-    queued: Vec<Rect>,
-    in_flight: bool,
-    parked: Arc<Mutex<Option<Gathered>>>,
+/// What a region render starts from before its ops are blended over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreImage {
+    /// The base composite alone.
+    Base,
+    /// The base composite under the resident samples as they were before the
+    /// drag in progress began.
+    Snapshot,
+    /// The base composite under the resident samples as they are.
+    Current,
 }
 
-/// One tab's live editor state: its undo/redo session, the frame set a
-/// stroke recomposites against and the registration warping each of its
-/// reads, the resident display cache the renderer overlays, the
-/// in-progress stroke, if any, and the regions whose pixels are still being
-/// gathered. The queue lives here, so a session that is dropped takes its
-/// pending results with it.
+/// One region of the edited image to render: where, what it starts from, the
+/// ops blended over that in order, and whether it is the last job of a drag,
+/// after which the pre-drag samples are dropped.
+#[derive(Debug, Clone)]
+pub struct RegionRender {
+    pub region: Rect,
+    pub pre: PreImage,
+    pub ops: Vec<Op>,
+    pub ends_drag: bool,
+}
+
+/// What a region-render worker renders: each region, in dispatch order, with
+/// its samples or the reason it failed.
+type Rendered = Vec<(Rect, Result<Vec<u16>, String>)>;
+
+/// What a worker parks: its regions, the pre-drag tiles it holds once the
+/// batch is done (`None` when it panicked), and whether the batch ended the
+/// drag.
+struct Parked {
+    rendered: Rendered,
+    snapshot: Option<crate::canvas::ResidentTiles>,
+    ends_drag: bool,
+}
+
+/// Wakes the UI thread once a region-render worker has parked its result.
+pub type RegionRenderWake = Arc<dyn Fn() + Send + Sync>;
+
+/// One session's region-render queue: jobs waiting for a worker, whether a
+/// worker holds a batch, and where it parks the result.
+#[derive(Default)]
+struct RegionRenders {
+    queued: Vec<RegionRender>,
+    in_flight: bool,
+    parked: Arc<Mutex<Option<Parked>>>,
+}
+
+/// One tab's live editor state: the strokes not yet saved with their undo
+/// and redo stacks, the composite and the frame set the edited image is
+/// blended from and the registration warping each frame read, the resident
+/// display cache the renderer overlays, the in-progress stroke, if any, and
+/// the regions still being rendered. The queue lives here, so a state that
+/// is dropped takes its queued results with it.
 pub struct EditState {
-    pub session: EditSession,
+    /// The ops over `chain` not yet saved, oldest first.
+    pending: Vec<Op>,
+    /// The ops undone from `pending`, the most recent last.
+    undone: Vec<Op>,
+    /// The stored Z-Map of the row being edited, read-only; `None` when it
+    /// could not be read.
+    zmap: Option<ZMapReader>,
+    /// The map's shape: the composite's extent over the frame set.
+    info: ZMapInfo,
     pub sources: Arc<dyn FrameReader>,
     pub registration: Registration,
+    /// The composite the edits are blended over.
+    pub base: Arc<TiffStack>,
+    /// The file `base` reads.
+    pub(crate) composite: PathBuf,
+    /// The ops already blended into `base`, oldest first.
+    base_ops: Vec<Op>,
+    /// The ops the row stacks over `base` before the pending ones, oldest
+    /// first.
+    chain: Vec<Op>,
     pub tiles: crate::canvas::ResidentTiles,
+    /// The blend kernel on the display device, while one is attached; a
+    /// region renders on the CPU without it.
+    blender: Option<Blender>,
+    /// The resident samples as they were when the drag in progress began, a
+    /// tile at a time; empty between drags.
+    snapshot: crate::canvas::ResidentTiles,
     pub stroke: Option<crate::brush::LiveStroke>,
-    recomposites: Recomposites,
+    region_renders: RegionRenders,
 }
 
 /// A resident tile's default edge -- edits are small, so a fixed 256 px grid
@@ -1081,157 +1082,420 @@ pub struct EditState {
 pub const RESIDENT_TILE_SIZE: u32 = 256;
 
 /// Runs `f` over `reader`'s frames each read through its recorded transform,
-/// at the registration's own crop origin -- the same view the left pane
+/// with the registration's own crop origin -- the same view the left pane
 /// draws, so a stroke transfers exactly what it showed.
 fn with_registered_sources<R>(
     reader: &dyn FrameReader,
     registration: &Registration,
-    f: impl FnOnce(&Sources) -> R,
+    f: impl FnOnce(&dyn TileReader, (u32, u32)) -> R,
 ) -> R {
     let frame = reader.dimensions();
     let samples_per_pixel = reader.frame(0).samples_per_pixel;
     let transforms = registration.transforms(reader.len());
     let gained = GainReader::new(reader, registration.gains());
     let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
-    f(&Sources {
-        reader: &warped,
-        frame_count: reader.len() as u32,
-        samples_per_pixel,
-        origin: registration.origin(),
-    })
+    f(&warped, registration.origin())
 }
 
-impl EditState {
-    /// Recomposites `region` into this tab's resident display tiles on the
-    /// calling thread, from its own edited indices and the frame-as-fused
-    /// view. The session-open replay uses it; a live edit goes through
-    /// [`Self::queue_recomposite`].
-    pub fn recomposite(&mut self, region: Rect) -> Result<(), RetouchError> {
-        let (tiles, indices) = (&mut self.tiles, self.session.indices());
-        with_registered_sources(&*self.sources, &self.registration, |sources| {
-            tiles.recomposite(region, indices, sources)
-        })
-    }
+/// What rendering a region reads, apart from the resident samples.
+struct RenderInput {
+    base: Arc<TiffStack>,
+    sources: Arc<dyn FrameReader>,
+    registration: Registration,
+    info: ZMapInfo,
+    samples_per_pixel: usize,
+    blender: Option<Blender>,
+}
 
-    /// Queues `region`, whose edited indices already changed, for a worker
-    /// to gather, and bumps the tiles' generation so the overlay shows the
-    /// new indices at once. Regions queued while a worker holds a batch go
-    /// out together when it is installed; `wake` runs on the worker once a
-    /// batch is parked.
-    pub fn queue_recomposite(&mut self, region: Rect, wake: &RecompositeWake) {
-        self.recomposites.queued.push(region);
-        self.tiles.touch();
-        if !self.recomposites.in_flight {
-            self.dispatch_recomposites(wake);
+/// Renders `job`: the pre-image's samples over its region with its ops
+/// blended in order from their frames, the same step a saved checkpoint's
+/// render takes. The result is installed in `local`; a job that ends the
+/// drag then empties `snapshot`, whether it rendered or not.
+fn render_region(
+    input: &RenderInput,
+    job: &RegionRender,
+    local: &mut crate::canvas::ResidentTiles,
+    snapshot: &mut crate::canvas::ResidentTiles,
+) -> Result<Vec<u16>, String> {
+    let rendered = blend_region(input, job, local, snapshot);
+    if job.ends_drag {
+        snapshot.clear();
+    }
+    rendered
+}
+
+fn blend_region(
+    input: &RenderInput,
+    job: &RegionRender,
+    local: &mut crate::canvas::ResidentTiles,
+    snapshot: &mut crate::canvas::ResidentTiles,
+) -> Result<Vec<u16>, String> {
+    let region = job.region;
+    let spp = input.samples_per_pixel;
+    let mut out = vec![0u16; region.width as usize * region.height as usize * spp];
+    input
+        .base
+        .read_tile_into(0, region, &mut out)
+        .map_err(|error| error.to_string())?;
+    match job.pre {
+        PreImage::Base => {}
+        PreImage::Current => local.overlay_into(region, &mut out),
+        PreImage::Snapshot => {
+            snapshot.capture(local, region);
+            snapshot.overlay_into(region, &mut out);
         }
     }
-
-    /// Whether no stroke is live and no recomposite is queued or in flight,
-    /// so the resident tiles hold every edit the indices do.
-    pub fn is_settled(&self) -> bool {
-        self.stroke.is_none() && self.recomposites.queued.is_empty() && !self.recomposites.in_flight
+    let mut placed = Vec::new();
+    for op in &job.ops {
+        let Op::BrushStroke { source_id, .. } = op else {
+            return Err(RetouchError::Unsupported.to_string());
+        };
+        let footprint = blend::footprint(op, input.info).map_err(|error| error.to_string())?;
+        if let Some(footprint) = footprint {
+            placed.push(blend::PlacedStroke {
+                op,
+                frame: usize::from(*source_id),
+                footprint,
+            });
+        }
     }
-
-    /// Installs the batch a worker has parked, in the order its regions were
-    /// queued, then dispatches whatever queued meanwhile. A region whose
-    /// read failed is logged and leaves its tiles as they were. Returns
-    /// `true` once nothing is in flight.
-    pub fn settle_recomposite(&mut self, wake: &RecompositeWake) -> bool {
-        let parked = self
-            .recomposites
-            .parked
-            .lock()
-            .expect("no worker panicked while parking its recomposites")
-            .take();
-        if let Some(gathered) = parked {
-            self.recomposites.in_flight = false;
-            for (region, result) in gathered {
-                match result {
-                    Ok(samples) => self.tiles.install(region, &samples),
-                    Err(error) => {
-                        tracing::error!(%error, ?region, "background recomposite failed");
+    // A stroke the device cannot blend, or any device failure, goes through
+    // the CPU blend, which leaves the same samples.
+    let mut device_failed = false;
+    let mut blend_stroke = |op: &Op,
+                            info: ZMapInfo,
+                            out_rect: Rect,
+                            out: &mut [u16],
+                            region: Rect,
+                            src: &[u16],
+                            spp: usize| {
+        if let Some(blender) = &input.blender {
+            match blender.apply(op, info, out_rect, out, region, src, spp) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !std::mem::replace(&mut device_failed, true) {
+                        tracing::warn!(%error, ?region, "device blend failed; blending on the CPU");
                     }
                 }
             }
-            self.dispatch_recomposites(wake);
         }
-        !self.recomposites.in_flight
+        blend::apply(op, info, out_rect, out, region, src, spp)
+    };
+    with_registered_sources(&*input.sources, &input.registration, |reader, origin| {
+        blend::apply_strokes(
+            input.info,
+            region,
+            &mut out,
+            &placed,
+            reader,
+            origin,
+            spp,
+            &mut blend_stroke,
+        )
+    })
+    .map_err(|error| error.to_string())?;
+    local.install(region, &out);
+    Ok(out)
+}
+
+impl EditState {
+    /// The stored Z-Map's shape.
+    pub fn info(&self) -> ZMapInfo {
+        self.info
     }
 
-    /// Hands every queued region to one worker thread, with the indices as
-    /// they are now, and marks the batch in flight.
-    fn dispatch_recomposites(&mut self, wake: &RecompositeWake) {
-        if self.recomposites.queued.is_empty() {
+    /// The stored Z-Map's index at pixel (`x`, `y`); `None` outside the map,
+    /// without a readable map or when the read fails.
+    pub fn stored_source(&self, x: u32, y: u32) -> Option<u16> {
+        let zmap = self.zmap.as_ref()?;
+        let info = self.info;
+        if x >= info.width() || y >= info.height() {
+            return None;
+        }
+        let mut index = [0u16; 1];
+        let pixel = Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        };
+        match zmap.read_tile_into(pixel, &mut index) {
+            Ok(()) => Some(index[0]),
+            Err(error) => {
+                tracing::warn!(%error, x, y, "stored Z-Map read failed");
+                None
+            }
+        }
+    }
+
+    /// The pending ops over the row's chain, oldest first; undone ops are not
+    /// included.
+    pub fn ops(&self) -> impl Iterator<Item = &Op> {
+        self.pending.iter()
+    }
+
+    /// How many ops are pending.
+    pub fn op_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether a pending op can be undone.
+    pub fn can_undo(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Whether an undone op can be redone.
+    pub fn can_redo(&self) -> bool {
+        !self.undone.is_empty()
+    }
+
+    /// Validates `op` against the stored map, then pends it and discards the
+    /// redo stack. Returns the region it changes and renders nothing; on
+    /// `Err` nothing changed.
+    pub fn append(&mut self, op: Op) -> Result<Option<Rect>, RetouchError> {
+        let region = footprint(&op, self.info())?;
+        self.pending.push(op);
+        self.undone.clear();
+        Ok(region)
+    }
+
+    /// Steps back one pending op, returning its region; `None` with nothing
+    /// to undo.
+    pub fn undo(&mut self) -> Option<Option<Rect>> {
+        let op = self.pending.pop()?;
+        let region =
+            footprint(&op, self.info()).expect("a pending op passed footprint when appended");
+        self.undone.push(op);
+        Some(region)
+    }
+
+    /// Pends the most recently undone op again, returning its region; `None`
+    /// with nothing to redo.
+    pub fn redo(&mut self) -> Option<Option<Rect>> {
+        let op = self.undone.pop()?;
+        let region =
+            footprint(&op, self.info()).expect("an undone op passed footprint when appended");
+        self.pending.push(op);
+        Some(region)
+    }
+
+    fn render_input(&self) -> RenderInput {
+        RenderInput {
+            base: Arc::clone(&self.base),
+            sources: Arc::clone(&self.sources),
+            registration: self.registration.clone(),
+            info: self.info(),
+            samples_per_pixel: self.sources.frame(0).samples_per_pixel as usize,
+            blender: self.blender.clone(),
+        }
+    }
+
+    /// Blends later regions on `blender`'s device, or on the CPU for `None`.
+    /// A batch already dispatched keeps the blender it was dispatched with.
+    pub fn set_blender(&mut self, blender: Option<Blender>) {
+        self.blender = blender;
+    }
+
+    /// Every op the edited image shows over `base`: the row's chain, then the
+    /// pending ops, oldest first.
+    pub fn stack_ops(&self) -> Vec<Op> {
+        self.chain.iter().chain(&self.pending).cloned().collect()
+    }
+
+    /// Every op the edited image shows, including those already in `base`:
+    /// the base ops, then [`Self::stack_ops`].
+    pub fn drawn_ops(&self) -> Vec<Op> {
+        self.base_ops
+            .iter()
+            .cloned()
+            .chain(self.stack_ops())
+            .collect()
+    }
+
+    /// Makes the pending ops part of the chain and forgets the redo stack, so
+    /// nothing is left to undo or redo.
+    pub fn rebase(&mut self) {
+        self.chain.append(&mut self.pending);
+        self.undone.clear();
+    }
+
+    /// Renders `job` on the calling thread straight into the resident tiles.
+    /// The open-time replay uses it; a live edit goes through
+    /// [`Self::queue_region_render`].
+    pub fn render_region_now(&mut self, job: &RegionRender) -> Result<(), String> {
+        let input = self.render_input();
+        render_region(&input, job, &mut self.tiles, &mut self.snapshot).map(|_| ())
+    }
+
+    fn enqueue(&mut self, job: RegionRender) {
+        self.region_renders.queued.push(job);
+        self.tiles.touch();
+    }
+
+    /// Queues `job` for a worker and bumps the tiles' generation, so the
+    /// repaint picks the region up. Jobs queued while a worker holds a batch
+    /// go out together when it is installed, rendered in queue order; `wake`
+    /// runs on the worker once a batch is parked.
+    pub fn queue_region_render(&mut self, job: RegionRender, wake: &RegionRenderWake) {
+        self.enqueue(job);
+        if !self.region_renders.in_flight {
+            self.dispatch_region_renders(wake);
+        }
+    }
+
+    /// Ends a drag: queues every resident tile `touched` meets, each
+    /// re-rendered from its pre-drag samples with `ops` blended over them;
+    /// the last job drops the pre-drag samples.
+    pub fn end_drag(&mut self, touched: &[Rect], ops: Vec<Op>, wake: &RegionRenderWake) {
+        let tiles = self.tiles.tile_rects(touched);
+        let last = tiles.len().saturating_sub(1);
+        for (at, region) in tiles.into_iter().enumerate() {
+            self.enqueue(RegionRender {
+                region,
+                pre: PreImage::Snapshot,
+                ops: ops.clone(),
+                ends_drag: at == last,
+            });
+        }
+        if !self.region_renders.in_flight {
+            self.dispatch_region_renders(wake);
+        }
+    }
+
+    /// Whether no stroke is live and no region render is queued or in flight,
+    /// so the resident tiles hold every edit.
+    pub fn is_settled(&self) -> bool {
+        self.stroke.is_none()
+            && self.region_renders.queued.is_empty()
+            && !self.region_renders.in_flight
+    }
+
+    /// Installs the batch a worker has parked, in the order its jobs were
+    /// queued, then dispatches whatever queued meanwhile. A region whose
+    /// render failed is logged and leaves its tiles as they were. Returns
+    /// `true` once nothing is in flight.
+    pub fn settle_region_renders(&mut self, wake: &RegionRenderWake) -> bool {
+        let parked = self
+            .region_renders
+            .parked
+            .lock()
+            .expect("no worker panicked while parking its region renders")
+            .take();
+        if let Some(parked) = parked {
+            self.region_renders.in_flight = false;
+            match parked.snapshot {
+                Some(snapshot) => self.snapshot = snapshot,
+                None if parked.ends_drag => self.snapshot.clear(),
+                None => {}
+            }
+            for (region, result) in parked.rendered {
+                match result {
+                    Ok(samples) => self.tiles.install(region, &samples),
+                    Err(error) => {
+                        tracing::error!(%error, ?region, "background region render failed");
+                    }
+                }
+            }
+            self.dispatch_region_renders(wake);
+        }
+        !self.region_renders.in_flight
+    }
+
+    /// Hands every queued job to one worker thread, with the resident tiles
+    /// they meet as they are now, and marks the batch in flight.
+    fn dispatch_region_renders(&mut self, wake: &RegionRenderWake) {
+        if self.region_renders.queued.is_empty() {
             return;
         }
-        let width = self.session.tile().width;
-        let indices = self.session.indices();
-        let batch: Vec<(Rect, Vec<u16>)> = self
-            .recomposites
-            .queued
-            .drain(..)
-            .map(|region| (region, crate::canvas::gather_rect(indices, width, region)))
-            .collect();
-        self.recomposites.in_flight = true;
-        let sources = Arc::clone(&self.sources);
-        let registration = self.registration.clone();
-        let parked = Arc::clone(&self.recomposites.parked);
+        let jobs: Vec<RegionRender> = self.region_renders.queued.drain(..).collect();
+        let regions: Vec<Rect> = jobs.iter().map(|job| job.region).collect();
+        let (mut local, mut snapshot) = (self.tiles.subset(&regions), self.snapshot.clone());
+        let ends_drag = jobs.iter().any(|job| job.ends_drag);
+        let input = self.render_input();
+        self.region_renders.in_flight = true;
+        let parked = Arc::clone(&self.region_renders.parked);
         let wake = Arc::clone(wake);
         std::thread::spawn(move || {
-            let gathered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_registered_sources(&*sources, &registration, |sources| {
-                    batch
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                jobs.iter()
+                    .map(|job| {
+                        let samples = render_region(&input, job, &mut local, &mut snapshot);
+                        (job.region, samples)
+                    })
+                    .collect::<Rendered>()
+            }));
+            let parked_result = match result {
+                Ok(rendered) => Parked {
+                    rendered,
+                    snapshot: Some(snapshot),
+                    ends_drag,
+                },
+                Err(_) => Parked {
+                    rendered: jobs
                         .iter()
-                        .map(|(region, indices)| {
-                            let samples = crate::canvas::gather(*region, indices, sources);
-                            (*region, samples.map_err(|error| error.to_string()))
-                        })
-                        .collect::<Gathered>()
-                })
-            }))
-            .unwrap_or_else(|_| {
-                batch
-                    .iter()
-                    .map(|(region, _)| (*region, Err("the recomposite worker panicked".into())))
-                    .collect()
-            });
+                        .map(|job| (job.region, Err("the region render worker panicked".into())))
+                        .collect(),
+                    snapshot: None,
+                    ends_drag,
+                },
+            };
             *parked
                 .lock()
-                .expect("no worker panicked while parking its recomposites") = Some(gathered);
+                .expect("no worker panicked while parking its region renders") =
+                Some(parked_result);
             wake();
         });
     }
 }
 
-/// Opens `zmap` and `frames` and builds an [`EditState`] over the whole
-/// map: an [`EditSession`] seeded from every pixel, `frames` opened through
-/// [`open_frame_set`] as the frame set a stroke recomposites against
-/// (warped by `registration` at recomposite time), and an empty resident
-/// display cache gridded at `tile_size` px. `chain` -- the ops an op-bearing
-/// row stacks over its fused base, oldest first -- is then applied and
-/// recomposited and the session rebased onto it, so it opens with no ops of
-/// its own. A chain op that cannot be applied ends the replay; a region that
-/// cannot be recomposited is skipped.
+/// Builds an [`EditState`] over the whole map: `composite` is the image edits
+/// blend over, the resident cache is gridded at `tile_size` px, `base_ops`
+/// are the ops `composite` already shows (oldest first), and `chain` (a row's
+/// ops, oldest first) is replayed over it and kept as the state's chain. An
+/// op that cannot be applied ends the replay; a region that cannot be
+/// rendered is skipped.
+// The inputs are independent; none of them groups naturally with another.
+#[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
-    zmap: &Path,
+    zmap: Option<&Path>,
+    composite: &Path,
     frames: &[PathBuf],
     registration: Registration,
     tile_size: u32,
     budget: HostBudget,
+    base_ops: Vec<Op>,
     chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
-    let reader = ZMapReader::open(zmap)?;
-    let info = reader.info();
-    let tile = Rect {
+    let pixel = Rect {
         x: 0,
         y: 0,
-        width: info.width(),
-        height: info.height(),
+        width: 1,
+        height: 1,
     };
-    let mut indices = vec![0u16; info.tile_len(tile)];
-    reader.read_tile_into(tile, &mut indices)?;
-    let session = EditSession::new(info, tile, indices)
-        .expect("a whole-map tile always fits its own map and its own tile_len");
+    let base = Arc::new(TiffStack::open_files(&[composite.to_path_buf()])?);
+    let header = base.header(0);
+    let mut first = vec![0u16; header.samples_per_pixel as usize];
+    base.read_tile_into(0, pixel, &mut first)?;
+    let info = ZMapInfo::new(
+        header.width,
+        header.height,
+        u32::try_from(frames.len()).unwrap_or(u32::MAX),
+    )?;
+    // Each plane is mapped on its first read; the mapping outlives the file,
+    // which a save removes together with the row's other held files. A map
+    // that fails to open or read costs the pipette its stored reading only.
+    let reader = zmap.and_then(|path| {
+        ZMapReader::open(path)
+            .and_then(|reader| {
+                reader
+                    .read_tile_into(pixel, &mut [0u16; 1])
+                    .map(|()| reader)
+            })
+            .map_err(|error| {
+                tracing::warn!(%error, path = %path.display(), "the Z-Map could not be opened");
+            })
+            .ok()
+    });
     let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
@@ -1241,28 +1505,44 @@ pub fn open_edit_session(
         samples_per_pixel,
     );
     let mut edit = EditState {
-        session,
+        pending: Vec::new(),
+        undone: Vec::new(),
+        zmap: reader,
+        info,
         sources,
         registration,
+        base,
+        composite: composite.to_path_buf(),
+        base_ops,
+        chain: Vec::new(),
+        snapshot: tiles.subset(&[]),
         tiles,
+        blender: None,
         stroke: None,
-        recomposites: Recomposites::default(),
+        region_renders: RegionRenders::default(),
     };
     for op in chain {
-        match edit.session.append(op) {
-            Ok(Some(region)) => {
-                if let Err(err) = edit.recomposite(region) {
-                    tracing::error!(error = %err, "restored stroke recomposite failed");
+        match footprint(&op, info) {
+            Ok(region) => {
+                edit.chain.push(op);
+                if let Some(region) = region {
+                    let job = RegionRender {
+                        region,
+                        pre: PreImage::Base,
+                        ops: edit.chain.clone(),
+                        ends_drag: false,
+                    };
+                    if let Err(error) = edit.render_region_now(&job) {
+                        tracing::error!(%error, "restored stroke render failed");
+                    }
                 }
             }
-            Ok(None) => {}
             Err(err) => {
                 tracing::error!(error = %err, "restored stroke could not be applied");
                 break;
             }
         }
     }
-    edit.session.rebase();
     Ok(edit)
 }
 
@@ -1435,6 +1715,58 @@ pub fn settle(
             alignment: None,
             operation: Some(FailedOperation::Fusion),
         },
+    }
+}
+
+/// Compacts the project at `path` when most of it is dead data; a failure
+/// leaves the project as it was and is only logged.
+pub fn compact_quietly(path: &Path) {
+    if let Err(err) = project::container::compact_if_mostly_dead(path) {
+        tracing::warn!(error = %err, path = %path.display(), "the project could not be compacted");
+    }
+}
+
+/// A thread compressing one held composite into a blob beside it.
+pub type Compression = std::thread::JoinHandle<Result<project::blob::StagedBlob, ProjectError>>;
+
+pub fn spawn_compression(composite: PathBuf) -> Compression {
+    std::thread::spawn(move || {
+        let dir = composite
+            .parent()
+            .expect("a held composite sits in its own directory");
+        project::blob::stage_plane(
+            &composite,
+            project::Plane::Composite,
+            project::blob::ZSTD_LEVEL,
+            dir,
+        )
+    })
+}
+
+/// Joins `handles` and gives each finished blob to the fused entry whose
+/// composite it was made from. A failed compression, or a blob whose file is
+/// gone, leaves its entry for the save to compress itself.
+pub fn attach_compressed(entries: &mut [InMemoryCheckpoint], handles: Vec<(PathBuf, Compression)>) {
+    for (composite, handle) in handles {
+        let blob = match handle.join() {
+            Ok(Ok(blob)) if blob.path.is_file() => blob,
+            Ok(Ok(_)) => continue,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, composite = %composite.display(), "the composite could not be compressed in the background");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(composite = %composite.display(), "the composite compression panicked");
+                continue;
+            }
+        };
+        for entry in entries.iter_mut() {
+            if let InMemoryKind::Fused(held) = &mut entry.kind
+                && held.composite == composite
+            {
+                held.compressed_composite = Some(Box::new(blob.clone()));
+            }
+        }
     }
 }
 

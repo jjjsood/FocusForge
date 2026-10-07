@@ -3,8 +3,8 @@
 //! `focusforge-cli export`: a project in, an image out.
 //!
 //! One `laplacian` run over `fixtures/mantis-512` is shared through a
-//! `OnceLock`; its export is compared against an in-process export and a
-//! gather of the head's Z-Map over the stack's frames.
+//! `OnceLock`; its export is compared against an in-process export and the
+//! head's stored composite.
 //!
 //! Every spawn isolates `.scratch/` with its own per-process temp directory
 //! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
@@ -23,11 +23,10 @@ use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::{Registration, WarpingReader};
 use focusforge_core::io::{Rect, TiffHeader, TiffSpec, TiffStack, TiffWriter, open_frame_set};
 use focusforge_core::params::ParamValues;
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AlignRecord, AppendRequest, Metrics, Op, Plane, Point, Project, SealRequest, ZMapStorage,
-    partial_path,
+    self, AlignRecord, AppendRequest, Metrics, Op, Plane, Point, Project, SealRequest, partial_path,
 };
-use focusforge_core::retouch::{Sources, recomposite};
 use focusforge_core::tile::HostBudget;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -102,8 +101,22 @@ fn shared_project() -> &'static SharedProject {
     })
 }
 
+/// `project`'s head composite as stored, materialized under `dir`: its
+/// width, height and samples.
+fn stored_composite(project: &mut Project, dir: &Path) -> (u32, u32, Vec<u16>) {
+    let path = dir.join("head-composite.tif");
+    project::materialize_plane(project, Plane::Composite, &path).unwrap();
+    let stack = TiffStack::open_files(&[path]).unwrap();
+    let (width, height) = stack.dimensions();
+    let samples = stack
+        .read_tile(0, branched_full(width, height))
+        .unwrap()
+        .samples;
+    (width, height, samples)
+}
+
 #[test]
-fn exported_image_is_the_zmap_gather() {
+fn exported_image_is_the_stored_composite() {
     let shared = shared_project();
     let dir = common::tmp_dir("export_cli_gather");
     let out = dir.join("out.tif");
@@ -138,31 +151,13 @@ fn exported_image_is_the_zmap_gather() {
         "the CLI export must equal the in-process export byte for byte"
     );
 
-    // The `--no-align --no-crop` run gathers straight from the frames.
-    let zmap_path = dir.join("head-zmap.tif");
-    project::materialize_zmap(&mut project, &head, &zmap_path).unwrap();
-    let map = ZMapReader::open(&zmap_path).unwrap();
-    let (width, height) = map.dimensions();
-    let whole = branched_full(width, height);
-    let mut indices = vec![0u16; (width * height) as usize];
-    map.read_tile_into(whole, &mut indices).unwrap();
-    let stack = TiffStack::open(common::fixtures_dir().join("mantis-512")).unwrap();
-    let spp = stack.header(0).samples_per_pixel;
-    let sources = Sources {
-        reader: &stack,
-        frame_count: stack.len() as u32,
-        samples_per_pixel: spp,
-        origin: (0, 0),
-    };
-    let mut expected = vec![0u16; indices.len() * spp as usize];
-    recomposite(&indices, whole, &sources, &mut expected).unwrap();
-
+    let (width, height, stored) = stored_composite(&mut project, &dir);
     let exported = TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
     assert_eq!(exported.dimensions(), (width, height));
-    let tile = exported.read_tile(0, whole).unwrap();
+    let tile = exported.read_tile(0, branched_full(width, height)).unwrap();
     assert!(
-        tile.samples == expected,
-        "the exported pixels must be the head's Z-Map gathered over the stack's frames"
+        tile.samples == stored,
+        "the exported pixels must be the head's stored composite"
     );
 }
 
@@ -233,9 +228,11 @@ fn export_warns_about_unresolved_sources_and_still_writes() {
         result.stderr
     );
     assert!(
-        result.stderr.contains("re-reads every source frame")
-            && !result.stderr.contains("unaffected"),
-        "the warning must say an image export needs every source: {}",
+        result
+            .stderr
+            .contains("unedited image export reads no source frame")
+            && !result.stderr.contains("re-reads every source frame"),
+        "the warning must say an unedited export needs no source: {}",
         result.stderr
     );
     assert!(
@@ -459,7 +456,6 @@ fn build_branched(name: &str) -> Branched {
         }],
         Some("branch-a".to_string()),
         1,
-        ZMapStorage::Bounded,
     )
     .expect("branch a must succeed")
     .checkpoint;
@@ -475,7 +471,6 @@ fn build_branched(name: &str) -> Branched {
         }],
         Some("branch-b".to_string()),
         2,
-        ZMapStorage::Bounded,
     )
     .expect("branch b must succeed")
     .checkpoint;
@@ -553,48 +548,40 @@ fn exports_every_checkpoint_of_a_branched_history() {
 }
 
 #[test]
-fn fused_export_without_sources_is_refused() {
-    let dir = common::tmp_dir("export_cli_fused_refused_out");
+fn fused_export_needs_no_sources() {
+    let dir = common::tmp_dir("export_cli_fused_unsourced_out");
+    let export = |branched: &Branched, checkpoint: &str, out: &Path| {
+        let result = run_cli_in(
+            branched.project_path.parent().unwrap(),
+            &[
+                "export",
+                branched.project_path.to_str().unwrap(),
+                "--checkpoint",
+                checkpoint,
+                "-o",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert!(!partial_of(out).exists());
+        let stack = TiffStack::open_files(&[out.to_path_buf()]).unwrap();
+        let (width, height) = stack.dimensions();
+        stack
+            .read_tile(0, branched_full(width, height))
+            .unwrap()
+            .samples
+    };
 
-    // Every source missing: each one named on its own line.
+    // Every source missing: the stored composite is written regardless.
     let missing = build_branched("export_cli_fused_missing");
+    let intact = export(&missing, &missing.root, &dir.join("root-intact.tif"));
     for path in &missing.source_paths {
         std::fs::remove_file(path).unwrap();
     }
-    let out = dir.join("root-missing.tif");
-    let result = run_cli_in(
-        missing.project_path.parent().unwrap(),
-        &[
-            "export",
-            missing.project_path.to_str().unwrap(),
-            "--checkpoint",
-            &missing.root,
-            "-o",
-            out.to_str().unwrap(),
-        ],
-    );
-    assert!(!result.success, "stdout: {}", result.stdout);
-    assert!(!out.exists() && !partial_of(&out).exists());
-    assert!(
-        result.stderr.contains(&missing.root),
-        "the refusal must name the checkpoint: {}",
-        result.stderr
-    );
-    for path in &missing.source_paths {
-        let name = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(
-            result
-                .stderr
-                .lines()
-                .filter(|line| line.contains("missing:") && line.contains(name))
-                .count(),
-            1,
-            "{name} must be listed on a line of its own: {}",
-            result.stderr
-        );
-    }
+    let without = export(&missing, &missing.root, &dir.join("root-missing.tif"));
+    assert!(without == intact, "sources must not change the export");
 
-    // `--zmap` alone reads no source frame.
+    // `--zmap` alone reads no source frame either.
     let zmap_out = dir.join("root-zmap.tif");
     let result = run_cli_in(
         missing.project_path.parent().unwrap(),
@@ -609,39 +596,17 @@ fn fused_export_without_sources_is_refused() {
     );
     assert!(result.success, "stderr: {}", result.stderr);
 
-    // Changed sources, each one named.
+    // Changed sources are not read either.
     let changed = build_branched("export_cli_fused_changed");
+    let intact = export(&changed, &changed.refuse, &dir.join("refuse-intact.tif"));
     for path in &changed.source_paths[1..] {
         let mut bytes = std::fs::read(path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         std::fs::write(path, &bytes).unwrap();
     }
-    let out = dir.join("refuse-changed.tif");
-    let result = run_cli_in(
-        changed.project_path.parent().unwrap(),
-        &[
-            "export",
-            changed.project_path.to_str().unwrap(),
-            "--checkpoint",
-            &changed.refuse,
-            "-o",
-            out.to_str().unwrap(),
-        ],
-    );
-    assert!(!result.success, "stdout: {}", result.stdout);
-    assert!(!out.exists() && !partial_of(&out).exists());
-    for path in &changed.source_paths[1..] {
-        let name = path.file_name().unwrap().to_str().unwrap();
-        assert!(
-            result
-                .stderr
-                .lines()
-                .any(|line| line.contains("changed:") && line.contains(name)),
-            "{name} must be listed as changed: {}",
-            result.stderr
-        );
-    }
+    let altered = export(&changed, &changed.refuse, &dir.join("refuse-changed.tif"));
+    assert!(altered == intact, "sources must not change the export");
 }
 
 #[test]
@@ -858,7 +823,7 @@ fn export_frame_out_of_range_is_refused_and_writes_nothing() {
 }
 
 #[test]
-fn export_zmap_of_a_checkpoint_matches_history_materialize() {
+fn export_zmap_of_a_checkpoint_matches_the_core_map() {
     let branched = build_branched("export_cli_zmap_checkpoint");
     let dir = common::tmp_dir("export_cli_zmap_checkpoint_out");
     let out = dir.join("branch-a-zmap.tif");
@@ -883,7 +848,7 @@ fn export_zmap_of_a_checkpoint_matches_history_materialize() {
     assert_eq!(
         std::fs::read(&out).unwrap(),
         std::fs::read(&expected).unwrap(),
-        "export --zmap must equal history materialize's own map byte for byte"
+        "export --zmap must equal core's own map byte for byte"
     );
 
     let json_out = dir.join("branch-a-zmap.json.tif");
@@ -905,7 +870,7 @@ fn export_zmap_of_a_checkpoint_matches_history_materialize() {
 }
 
 #[test]
-fn materialize_uses_the_checkpoints_own_geometry() {
+fn exported_zmap_uses_the_checkpoints_own_geometry() {
     let branched = build_branched("export_cli_own_geometry");
     let dir = common::tmp_dir("export_cli_own_geometry_out");
     let cwd = branched.project_path.parent().unwrap();
@@ -917,23 +882,11 @@ fn materialize_uses_the_checkpoints_own_geometry() {
         ("branch_b", &branched.branch_b),
     ] {
         let exported = dir.join(format!("{label}-export-zmap.tif"));
-        let materialized = dir.join(format!("{label}-materialize.tif"));
         let image = dir.join(format!("{label}.tif"));
         for (args, out) in [
             (
                 vec!["export", project_arg, "--checkpoint", id, "--zmap"],
                 &exported,
-            ),
-            (
-                vec![
-                    "history",
-                    "materialize",
-                    project_arg,
-                    "--checkpoint",
-                    id,
-                    "-o",
-                ],
-                &materialized,
             ),
             (
                 vec!["export", project_arg, "--checkpoint", id, "-o"],
@@ -950,26 +903,44 @@ fn materialize_uses_the_checkpoints_own_geometry() {
             );
         }
         let extent = branched_extent(&branched, id);
-        for map_path in [&exported, &materialized] {
-            let map = ZMapReader::open(map_path).unwrap();
-            assert_eq!(map.dimensions(), extent, "{label}: {map_path:?}");
-            assert_eq!(map.frame_count(), BFRAMES as u32, "{label}: {map_path:?}");
-        }
+        let map = ZMapReader::open(&exported).unwrap();
+        assert_eq!(map.dimensions(), extent, "{label}: map");
+        assert_eq!(map.frame_count(), BFRAMES as u32, "{label}: map");
         let stack = TiffStack::open_files(std::slice::from_ref(&image)).unwrap();
         assert_eq!(stack.dimensions(), extent, "{label}: image");
     }
 }
 
+#[test]
+fn output_naming_the_project_is_refused() {
+    let branched = build_branched("export_cli_output_names_project");
+    let cwd = branched.project_path.parent().unwrap();
+    let project_arg = branched.project_path.to_str().unwrap();
+    let before = std::fs::read(&branched.project_path).unwrap();
+    for flags in [
+        vec!["-o", project_arg, "--format", "tiff"],
+        vec!["--zmap", project_arg],
+        vec!["--frame", "0", "--frame-output", project_arg],
+    ] {
+        let mut args = vec!["export", project_arg];
+        args.extend(flags.iter().copied());
+        let result = run_cli_in(cwd, &args);
+        assert!(!result.success, "{args:?} must be refused");
+        assert!(
+            result.stderr.contains("also the project file"),
+            "{args:?}: stderr: {}",
+            result.stderr
+        );
+        assert_eq!(
+            std::fs::read(&branched.project_path).unwrap(),
+            before,
+            "{args:?} must leave the project unchanged"
+        );
+    }
+}
+
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    use std::io::Read;
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_checkpoint_json(path: &Path, id: &str) -> serde_json::Value {
@@ -981,29 +952,17 @@ fn read_checkpoint_json(path: &Path, id: &str) -> serde_json::Value {
 /// can inject a record the production writer would never produce (a fused
 /// checkpoint whose `fuse` record was stripped).
 fn mutate_container(src: &Path, dst: &Path, drop: &[&str], replace: &[(String, Vec<u8>)]) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        if drop.contains(&name.as_str()) {
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        if drop.contains(&name) {
             continue;
         }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        if let Some(entry) = replace.iter().find(|entry| &entry.0 == name) {
-            bytes = entry.1.clone();
-        }
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        let bytes = match replace.iter().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1.clone(),
+            None => index.read_entry(src, name).unwrap(),
+        };
+        writer.put_bytes(name, &bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -1096,7 +1055,6 @@ fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, S
         }],
         None,
         1,
-        ZMapStorage::Bounded,
     )
     .expect("append_ops_onto must succeed");
 
@@ -1154,13 +1112,12 @@ fn refused_checkpoint_export_leaves_nothing() {
     );
 
     // The same fused checkpoint from the *unmutated* project, with every
-    // source moved away: its image is gathered from those sources, so it
-    // is refused too.
+    // source moved away: its stored composite is exported without them.
     for path in &fuse_unknown.source_paths {
         std::fs::remove_file(path).unwrap();
     }
     let out = dir.join("fused-without-sources.tif");
-    assert_refused(
+    let result = run_cli_in(
         fuse_unknown.project_path.parent().unwrap(),
         &[
             "export",
@@ -1170,8 +1127,9 @@ fn refused_checkpoint_export_leaves_nothing() {
             "-o",
             out.to_str().unwrap(),
         ],
-        &out,
     );
+    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(out.exists());
 
     // Missing sources, each one named.
     let missing = build_branched("export_cli_refused_missing_sources");
@@ -1241,18 +1199,21 @@ fn refused_checkpoint_export_leaves_nothing() {
         build_unrecorded_alignment("export_cli_refused_alignment");
     for (label, checkpoint) in [("fused", &align_root), ("op-bearing", &align_child)] {
         let out = dir.join(format!("alignment-{label}.tif"));
-        assert_refused(
-            align_project.parent().unwrap(),
-            &[
-                "export",
-                align_project.to_str().unwrap(),
-                "--checkpoint",
-                checkpoint,
-                "-o",
-                out.to_str().unwrap(),
-            ],
-            &out,
-        );
+        let args = [
+            "export",
+            align_project.to_str().unwrap(),
+            "--checkpoint",
+            checkpoint,
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        if label == "fused" {
+            let result = run_cli_in(align_project.parent().unwrap(), &args);
+            assert!(result.success, "stderr: {}", result.stderr);
+            assert!(out.exists());
+        } else {
+            assert_refused(align_project.parent().unwrap(), &args, &out);
+        }
     }
 
     // An unwritable destination.
@@ -1430,8 +1391,8 @@ fn export_frame_applies_the_recorded_equalization() {
 }
 
 #[test]
-fn export_image_gathers_through_the_recorded_equalization() {
-    let cwd = common::tmp_dir("export_cli_equalized_gather");
+fn equalized_export_is_the_stored_composite() {
+    let cwd = common::tmp_dir("export_cli_equalized_image");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     let input = common::fixtures_dir().join("mantis-512");
@@ -1453,15 +1414,16 @@ fn export_image_gathers_through_the_recorded_equalization() {
     assert!(stacked.success, "stderr: {}", stacked.stderr);
     let project_path = only_project(&out_dir);
     let mut project = Project::open(&project_path).expect("open project");
-    let gains = project
-        .manifest()
-        .registration
-        .equalization
-        .clone()
-        .expect("the project records the equalization")
-        .gains;
     assert!(
-        gains.iter().any(|&g| g != 1 << 16),
+        project
+            .manifest()
+            .registration
+            .equalization
+            .as_ref()
+            .expect("the project records the equalization")
+            .gains
+            .iter()
+            .any(|&g| g != 1 << 16),
         "the fixture's frames differ in brightness"
     );
 
@@ -1477,34 +1439,14 @@ fn export_image_gathers_through_the_recorded_equalization() {
     );
     assert!(result.success, "stderr: {}", result.stderr);
 
-    let head = project.checkpoint().clone();
-    let zmap_path = cwd.join("head-zmap.tif");
-    project::materialize_zmap(&mut project, &head, &zmap_path).unwrap();
-    let map = ZMapReader::open(&zmap_path).unwrap();
-    let (width, height) = map.dimensions();
-    let whole = branched_full(width, height);
-    let mut indices = vec![0u16; (width * height) as usize];
-    map.read_tile_into(whole, &mut indices).unwrap();
-
-    let stack = TiffStack::open(&input).unwrap();
-    let spp = stack.header(0).samples_per_pixel as usize;
-    let frames: Vec<Vec<u16>> = (0..stack.len())
-        .map(|f| stack.read_tile(f, whole).unwrap().samples)
-        .collect();
-    let mut want = vec![0u16; indices.len() * spp];
-    for (px, &frame) in indices.iter().enumerate() {
-        let frame = usize::from(frame);
-        for c in 0..spp {
-            let sample = u64::from(frames[frame][px * spp + c]);
-            want[px * spp + c] =
-                ((sample * u64::from(gains[frame]) + 32_768) >> 16).min(65_535) as u16;
-        }
-    }
-
+    let (width, height, stored) = stored_composite(&mut project, &cwd);
     let exported = TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
-    let got = exported.read_tile(0, whole).unwrap().samples;
+    let got = exported
+        .read_tile(0, branched_full(width, height))
+        .unwrap()
+        .samples;
     assert!(
-        got == want,
-        "the exported pixels must be the head's Z-Map gathered over the gained frames"
+        got == stored,
+        "the exported pixels must be the stored composite, which already carries the gains"
     );
 }

@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, Point, Project};
+use focusforge_core::project::{self, Op, Point, Project};
 use focusforge_core::registry;
-use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
 use focusforge_gui::job;
@@ -2313,12 +2313,24 @@ fn editor_opens_over_every_method() {
         common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
         assert_eq!(controller.mode(), ShellMode::Editor, "{method}");
-        let session = controller
-            .edit_session()
-            .unwrap_or_else(|| panic!("{method}: the editor owns the run's Z-Map"));
         assert!(
-            session
-                .indices()
+            controller.edit_session().is_some(),
+            "{method}: the editor owns the run's Z-Map"
+        );
+        let (_, zmap) = controller
+            .materialize_active_tab_planes()
+            .unwrap_or_else(|| panic!("{method}: the run's planes are ready"));
+        let reader = focusforge_core::zmap::ZMapReader::open(&zmap).unwrap();
+        let tile = Rect {
+            x: 0,
+            y: 0,
+            width: reader.info().width(),
+            height: reader.info().height(),
+        };
+        let mut indices = vec![0u16; reader.info().tile_len(tile)];
+        reader.read_tile_into(tile, &mut indices).unwrap();
+        assert!(
+            indices
                 .iter()
                 .all(|&i| i == NO_SOURCE || usize::from(i) < 3),
             "{method}: every index names one of the three frames or NO_SOURCE"
@@ -2710,6 +2722,104 @@ fn fuse_and_settle(controller: &mut AppController) {
     controller.set_mode(ShellMode::Stacking);
 }
 
+/// The project's record for composite blob `hash`, if it holds one.
+fn blob_record(project: &Path, hash: &str) -> Option<Vec<u8>> {
+    use focusforge_core::project::container::Index;
+    let index = Index::read(project).unwrap();
+    let name = format!("blobs/{hash}.zst");
+    index
+        .contains(&name)
+        .then(|| index.read_entry(project, &name).unwrap())
+}
+
+#[test]
+fn held_result_is_compressed_before_save() {
+    use focusforge_core::project::Plane;
+    use focusforge_core::project::blob::{self, ZSTD_LEVEL};
+
+    let mut controller = controller_with_frames("held_compressed", 3);
+    fuse_and_settle(&mut controller);
+    controller.finish_compressions();
+    let held = controller.held_checkpoints().pop().unwrap();
+    let blob = held
+        .compressed_composite
+        .clone()
+        .expect("the fused composite is compressed in the background");
+    assert!(blob.path.is_file());
+    let compressed = std::fs::read(&blob.path).unwrap();
+
+    // Saving needs no second compression: the TIFF is gone.
+    std::fs::remove_file(&held.composite).unwrap();
+    let project = save_to_proposed(&mut controller);
+    assert_eq!(
+        blob_record(&project, &blob.hash),
+        Some(compressed),
+        "the saved record is the background blob"
+    );
+
+    // A save right after the next fuse waits for its compression.
+    controller.toggle_frame_excluded(2);
+    fuse_and_settle(&mut controller);
+    let held = controller.held_checkpoints().pop().unwrap();
+    assert_eq!(held.sources.len(), 2);
+    assert!(
+        held.compressed_composite.is_none(),
+        "nothing joined the compression yet"
+    );
+    let expected = blob::stage_plane(
+        &held.composite,
+        Plane::Composite,
+        ZSTD_LEVEL,
+        &common::tree("held_compressed_expected"),
+    )
+    .unwrap();
+    assert!(controller.save_active_project(|_| panic!("an opened tab never asks where")));
+    assert!(blob_record(&project, &expected.hash).is_some());
+}
+
+/// Appends `len` dead bytes to the project through the container.
+fn append_dead_bytes(project: &Path, len: u64) {
+    use focusforge_core::project::container::{ContainerWriter, Index};
+    use std::io::Read;
+    let index = Index::read(project).unwrap();
+    let mut writer = ContainerWriter::append(project, &index).unwrap();
+    writer
+        .put("filler.bin", &mut std::io::repeat(0).take(len))
+        .unwrap();
+    writer.drop_entry("filler.bin");
+    writer.finish().unwrap();
+}
+
+#[test]
+fn tab_reopens_after_compaction() {
+    use focusforge_core::project::container::Index;
+
+    let mut controller = controller_with_frames("compaction_reopen", 2);
+    fuse_and_settle(&mut controller);
+    let path = save_to_proposed(&mut controller);
+    let head = Project::open(&path).unwrap().checkpoint().id.clone();
+    append_dead_bytes(&path, 8 << 20);
+    assert!(Index::read(&path).unwrap().mostly_dead());
+
+    // Closing compacts in the background; reopening waits for it.
+    controller.close_project(0);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&path)),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(Index::read(&path).unwrap().dead_bytes(), 0);
+    assert_eq!(Project::open(&path).unwrap().checkpoint().id, head);
+    assert_eq!(controller.checkpoint_count(), Some(1));
+
+    // Quitting compacts a tab that is still open.
+    append_dead_bytes(&path, 8 << 20);
+    assert!(Index::read(&path).unwrap().mostly_dead());
+    controller.finish_compactions();
+    assert_eq!(Index::read(&path).unwrap().dead_bytes(), 0);
+    assert!(!project::partial_path(&path).exists());
+    assert_eq!(Project::open(&path).unwrap().checkpoint().id, head);
+}
+
 #[test]
 fn a_first_fuse_writes_no_project_file() {
     let root = common::tree("first_fuse_writes_nothing_frames");
@@ -2742,6 +2852,7 @@ fn a_first_fuse_writes_no_project_file() {
         CanvasFeed::Load {
             composite, zmap, ..
         } => {
+            let zmap = zmap.expect("a readable Z-Map feeds the canvas");
             for plane in [&composite, &zmap] {
                 assert!(plane.is_file());
                 assert!(
@@ -4100,7 +4211,7 @@ fn save_and_close_seals_unsaved_ops() {
         .expect("the older row is listed");
     c.select_checkpoint_row(row);
     paint_strokes(&mut c, 2);
-    let live = c.edit_session().unwrap().indices().to_vec();
+    let live: Vec<Op> = c.edit_session().unwrap().ops().cloned().collect();
 
     c.request_close(0);
     assert!(c.pending_close().is_some());
@@ -4120,21 +4231,14 @@ fn save_and_close_seals_unsaved_ops() {
     );
     assert_eq!(added.2, 2);
 
-    let mut project = Project::open(&path).unwrap();
-    let checkpoint = project.history().get(&added.0).unwrap().clone();
-    let out = common::tree("save_close_seals_out").join("zmap.ffz");
-    project::materialize_zmap(&mut project, &checkpoint, &out).unwrap();
-    let reader = ZMapReader::open(&out).unwrap();
-    let info = reader.info();
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width: info.width(),
-        height: info.height(),
-    };
-    let mut saved = vec![0u16; info.tile_len(whole)];
-    reader.read_tile_into(whole, &mut saved).unwrap();
-    assert_eq!(saved, live);
+    let project = Project::open(&path).unwrap();
+    let checkpoint = project.history().get(&added.0).unwrap();
+    assert_eq!(checkpoint.ops, live, "the painted strokes are the record");
+    assert_eq!(
+        checkpoint.zmap_blob,
+        project.history().get(&root).unwrap().zmap_blob,
+        "the record names its fused ancestor's Z-Map"
+    );
 }
 
 #[test]
@@ -4236,8 +4340,8 @@ fn the_unsaved_mark_follows_unsealed_ops() {
     assert_eq!(marks(&c), (false, false));
 
     common::enter_editor(&mut c);
-    let map = c.edit_session().unwrap().tile();
-    let (w, h) = (map.width as f32, map.height as f32);
+    let map = c.edit_session().unwrap().info();
+    let (w, h) = (map.width() as f32, map.height() as f32);
     let left = PaneRect {
         x: 0.0,
         y: 0.0,
@@ -5718,6 +5822,46 @@ fn closing_the_window_during_a_save_all_quit_raises_no_second_question() {
     controller.finish_saves();
 }
 
+/// A saved row whose Z-Map blob fails to decode still gets its composite in
+/// the plane cache; no Z-Map file is left behind.
+#[test]
+fn checkpoint_planes_survive_an_unreadable_zmap() {
+    let mut controller = controller_with_frames("zmapless_planes", 2);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    let (project_path, id, head) = common::save_two_fuses(&mut controller);
+    let blob = Project::open(&project_path)
+        .unwrap()
+        .history()
+        .get(&id)
+        .unwrap()
+        .zmap_blob
+        .clone();
+    common::corrupt_blob(&project_path, &blob);
+    let scratch = common::tree("zmapless_planes_cache");
+
+    let (composite, zmap) = job::render_checkpoint_planes(&project_path, &scratch, &id)
+        .expect("the composite renders without its Z-Map");
+    assert!(composite.is_file());
+    assert_eq!(zmap, None, "no Z-Map is offered");
+    let cached = std::fs::read_dir(composite.parent().unwrap())
+        .unwrap()
+        .count();
+    assert_eq!(cached, 1, "no Z-Map file, whole or partial, is left");
+    let project = Project::open(&project_path).unwrap();
+    assert!(matches!(
+        job::cached_checkpoint_planes(&project, &scratch, &id).unwrap(),
+        job::CheckpointPlanes::Ready(_, None)
+    ));
+
+    let (_, head_zmap) =
+        job::render_checkpoint_planes(&project_path, &scratch, &head).expect("the head renders");
+    assert!(
+        head_zmap.is_some_and(|zmap| zmap.is_file()),
+        "the head keeps its Z-Map"
+    );
+}
+
 #[test]
 fn a_save_makes_the_previous_plane_files_stale() {
     let mut controller = controller_with_frames("stale_planes", 2);
@@ -5793,8 +5937,8 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
     controller.select_project(0);
 
     common::enter_editor(&mut controller);
-    let map = controller.edit_session().unwrap().tile();
-    let (w, h) = (map.width as f32, map.height as f32);
+    let map = controller.edit_session().unwrap().info();
+    let (w, h) = (map.width() as f32, map.height() as f32);
     let pane = |x: f32| PaneRect {
         x,
         y: 0.0,
@@ -5842,7 +5986,7 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
     );
 
     controller.pointer(PointerKind::Up, Button::Left, x, y, Modifiers::NONE);
-    common::settle_recomposites(&mut controller);
+    common::settle_region_renders(&mut controller);
     assert!(controller.edits_settled());
     // Releasing the stroke was itself a canvas action: the window restarts.
     controller.relax_admission(true, quiet);

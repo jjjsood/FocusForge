@@ -7,6 +7,8 @@
 
 use focusforge_core::display::{overlay_cpu, tonemap_cpu, zmap_index_scale};
 use focusforge_core::io::TiffStack;
+use focusforge_core::project::{Op, Point};
+use focusforge_core::retouch::overlay_colors;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
 use focusforge_gpu::device::shared_device_or_skip;
@@ -279,8 +281,8 @@ fn a_reused_renderer_matches_cpu_after_shrinking_and_switching_channels() {
 
 /// The overlay entry point against `overlay_cpu`, on a crop of the golden
 /// composite + Z-Map whose sides are not multiples of 8, at every blend
-/// opacity the CLI exposes, with solo off and on, and with a couple of
-/// pixels forced to `NO_SOURCE`.
+/// opacity the CLI exposes, with solo off and on, with a couple of pixels
+/// forced to `NO_SOURCE` and one soft stroke crossing the crop.
 #[test]
 fn overlay_parity_matches_cpu() {
     let Some(shared) = shared_device_or_skip() else {
@@ -313,9 +315,25 @@ fn overlay_parity_matches_cpu() {
     indices[5] = NO_SOURCE;
 
     let sources = zmap.frame_count();
+    let stroke = Op::BrushStroke {
+        source_id: 2,
+        path: vec![Point { x: 0, y: 12 }, Point { x: 30, y: 20 }],
+        radius: 9.0,
+        softness: 0.6,
+    };
     for alpha in [0u8, 166, 255] {
         for solo in [None, Some(3u16)] {
             let table = overlay_table(sources, solo);
+            let mut colors = vec![[0u8; 3]; indices.len()];
+            overlay_colors(
+                std::slice::from_ref(&stroke),
+                zmap.info(),
+                crop,
+                std::num::NonZeroU32::MIN,
+                &table,
+                &indices,
+                &mut colors,
+            );
 
             let target = DisplayTexture::new(shared.device(), crop.width, crop.height);
             render_overlay(
@@ -323,8 +341,7 @@ fn overlay_parity_matches_cpu() {
                 shared.queue(),
                 &target,
                 &composite_samples,
-                &indices,
-                &table,
+                &colors,
                 alpha,
             );
             let gpu_bytes = read_display_texture(shared.device(), shared.queue(), &target);
@@ -332,10 +349,9 @@ fn overlay_parity_matches_cpu() {
             let mut cpu_bytes = vec![0u8; (crop.width * crop.height * 4) as usize];
             overlay_cpu(
                 &composite_samples,
-                &indices,
+                &colors,
                 crop.width,
                 crop.height,
-                &table,
                 alpha,
                 &mut cpu_bytes,
             );

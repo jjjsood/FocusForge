@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -117,35 +118,15 @@ fn write_op_file(dir: &Path, name: &str, body: &Value) -> PathBuf {
     path
 }
 
-/// Two brush strokes and a small reset, well inside a 512x512, 8-frame map --
-/// [`shared_stack`]'s own geometry.
-fn three_strokes() -> Vec<Op> {
-    vec![
-        Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
-            radius: 3.0,
-            softness: 0.0,
-        },
-        Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 100, y: 100 }],
-            radius: 2.0,
-            softness: 0.0,
-        },
-        Op::ResetRegion {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: 4,
-                height: 4,
-            },
-        },
-    ]
-}
-
-fn op_file(body: &Value) -> Value {
-    serde_json::json!({"ops": body})
+/// A brush stroke well inside a 512x512, 8-frame map -- [`shared_stack`]'s
+/// own geometry.
+fn one_stroke() -> Vec<Op> {
+    vec![Op::BrushStroke {
+        source_id: 1,
+        path: vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
+        radius: 3.0,
+        softness: 0.0,
+    }]
 }
 
 #[test]
@@ -156,23 +137,21 @@ fn list_prints_one_record_per_checkpoint() {
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        &serde_json::to_value(one_stroke()).unwrap(),
     );
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let child: Value = serde_json::from_str(&output.stdout).unwrap();
-    let child_id = child["checkpoint"].as_str().unwrap().to_string();
+    let child_id = child["checkpoints"][0].as_str().unwrap().to_string();
 
     let output = run(
         &dir,
@@ -192,8 +171,8 @@ fn list_prints_one_record_per_checkpoint() {
 }
 
 #[test]
-fn materialize_matches_core_replay() {
-    let (dir, project) = fresh_project("materialize_matches_core_replay");
+fn exported_zmap_matches_core_replay() {
+    let (dir, project) = fresh_project("exported_zmap_matches_core_replay");
     let root = root_id(&project);
 
     let before_root_zmap = dir.join("root-before.tif");
@@ -211,65 +190,58 @@ fn materialize_matches_core_replay() {
     let ops_a = write_op_file(
         &dir,
         "ops-a.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        &serde_json::to_value(one_stroke()).unwrap(),
     );
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops_a.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let child_a: Value = serde_json::from_str(&output.stdout).unwrap();
-    let child_a_id = child_a["checkpoint"].as_str().unwrap().to_string();
+    let child_a_id = child_a["checkpoints"][0].as_str().unwrap().to_string();
 
     // A second seal makes `child_a` non-head.
     let ops_b = write_op_file(
         &dir,
         "ops-b.json",
-        &op_file(
-            &serde_json::to_value(vec![Op::BrushStroke {
-                source_id: 3,
-                path: vec![Point { x: 200, y: 200 }],
-                radius: 2.0,
-                softness: 0.0,
-            }])
-            .unwrap(),
-        ),
+        &serde_json::to_value(vec![Op::BrushStroke {
+            source_id: 3,
+            path: vec![Point { x: 200, y: 200 }],
+            radius: 2.0,
+            softness: 0.0,
+        }])
+        .unwrap(),
     );
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops_b.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
 
-    // Materialize the non-head, op-bearing checkpoint through the CLI, and
+    // Export the non-head, op-bearing checkpoint's map through the CLI, and
     // compare against `core`'s own `materialize_zmap` of the same
     // checkpoint.
-    let cli_out = dir.join("materialize-child-a.tif");
+    let cli_out = dir.join("export-child-a.tif");
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &child_a_id,
-            "-o",
+            "--zmap",
             cli_out.to_str().unwrap(),
         ],
     );
@@ -286,16 +258,15 @@ fn materialize_matches_core_replay() {
     );
 
     // The root's own map never moved.
-    let root_out = dir.join("materialize-root.tif");
+    let root_out = dir.join("export-root.tif");
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &root,
-            "-o",
+            "--zmap",
             root_out.to_str().unwrap(),
         ],
     );
@@ -303,84 +274,6 @@ fn materialize_matches_core_replay() {
     assert_eq!(
         std::fs::read(&root_out).unwrap(),
         std::fs::read(&before_root_zmap).unwrap()
-    );
-}
-
-#[test]
-fn apply_and_seal_creates_a_child() {
-    let (dir, project) = fresh_project("apply_and_seal_creates_a_child");
-    let root = root_id(&project);
-    let root_checkpoint_before = read_checkpoint(&project, &root);
-
-    let ops = write_op_file(
-        &dir,
-        "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
-    );
-
-    // `-o` alone writes the edited map and leaves the project untouched.
-    let before_bytes = std::fs::read(&project).unwrap();
-    let unsaved_out = dir.join("unsaved.tif");
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "apply",
-            project.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "-o",
-            unsaved_out.to_str().unwrap(),
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    assert_eq!(
-        std::fs::read(&project).unwrap(),
-        before_bytes,
-        "-o alone must not touch the project"
-    );
-    assert!(unsaved_out.exists());
-
-    // `--save` seals a child of the head (the root, here).
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "apply",
-            project.to_str().unwrap(),
-            "--ops",
-            ops.to_str().unwrap(),
-            "--save",
-            "--json",
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    let report: Value = serde_json::from_str(&output.stdout).unwrap();
-    assert_eq!(report["from"], root);
-    let child_id = report["checkpoint"].as_str().unwrap().to_string();
-    assert_ne!(child_id, root);
-
-    // The root's own checkpoint entry is unchanged.
-    assert_eq!(root_checkpoint_before, read_checkpoint(&project, &root));
-
-    // The sealed child's own map equals what the unsaved `-o` run wrote.
-    let materialized = dir.join("materialized-child.tif");
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "materialize",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &child_id,
-            "-o",
-            materialized.to_str().unwrap(),
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    assert_eq!(
-        std::fs::read(&materialized).unwrap(),
-        std::fs::read(&unsaved_out).unwrap()
     );
 }
 
@@ -394,58 +287,52 @@ fn sealing_from_an_older_checkpoint_branches() {
     let ops_a = write_op_file(
         &dir,
         "ops-a.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        &serde_json::to_value(one_stroke()).unwrap(),
     );
     let ops_b = write_op_file(
         &dir,
         "ops-b.json",
-        &op_file(
-            &serde_json::to_value(vec![Op::BrushStroke {
-                source_id: 4,
-                path: vec![Point { x: 300, y: 300 }],
-                radius: 2.0,
-                softness: 0.0,
-            }])
-            .unwrap(),
-        ),
+        &serde_json::to_value(vec![Op::BrushStroke {
+            source_id: 4,
+            path: vec![Point { x: 300, y: 300 }],
+            radius: 2.0,
+            softness: 0.0,
+        }])
+        .unwrap(),
     );
 
     // Seal onto the head (the root): the head advances.
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops_a.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let child_a: Value = serde_json::from_str(&output.stdout).unwrap();
-    let child_a_id = child_a["checkpoint"].as_str().unwrap().to_string();
+    let child_a_id = child_a["checkpoints"][0].as_str().unwrap().to_string();
 
     // Seal a second time, explicitly `--from` the root: a branch, not a
     // third generation.
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops_b.to_str().unwrap(),
             "--from",
             &root,
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let child_b: Value = serde_json::from_str(&output.stdout).unwrap();
-    let child_b_id = child_b["checkpoint"].as_str().unwrap().to_string();
+    let child_b_id = child_b["checkpoints"][0].as_str().unwrap().to_string();
     assert_eq!(child_b["from"], root);
     assert_ne!(child_a_id, child_b_id);
 
@@ -468,17 +355,12 @@ fn sealing_from_an_older_checkpoint_branches() {
     assert_eq!(parent_of(&child_b_id), Value::String(root));
 }
 
-/// Seals the three strokes under the project's head (or `from`), returning
-/// the new checkpoint's id.
-fn seal_strokes(dir: &Path, project: &Path, from: Option<&str>) -> String {
-    let ops = write_op_file(
-        dir,
-        "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
-    );
+/// Appends `ops` through `retouch` under the project's head (or `from`),
+/// returning the new states' ids in order.
+fn retouch(dir: &Path, project: &Path, ops: &[Op], from: Option<&str>) -> Vec<String> {
+    let ops = write_op_file(dir, "ops.json", &serde_json::to_value(ops).unwrap());
     let mut args = vec![
-        "history",
-        "apply",
+        "retouch",
         project.to_str().unwrap(),
         "--ops",
         ops.to_str().unwrap(),
@@ -487,12 +369,16 @@ fn seal_strokes(dir: &Path, project: &Path, from: Option<&str>) -> String {
         args.push("--from");
         args.push(from);
     }
-    args.push("--save");
     args.push("--json");
     let output = run(dir, &args);
     assert!(output.success, "stderr: {}", output.stderr);
     let report: Value = serde_json::from_str(&output.stdout).unwrap();
-    report["checkpoint"].as_str().unwrap().to_string()
+    report["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect()
 }
 
 fn listed(dir: &Path, project: &Path) -> Vec<Value> {
@@ -509,8 +395,8 @@ fn listed(dir: &Path, project: &Path) -> Vec<Value> {
 fn delete_hides_one_checkpoint_like_core() {
     let (dir, project) = fresh_project("delete_hides_one_checkpoint_like_core");
     let root = root_id(&project);
-    let middle = seal_strokes(&dir, &project, None);
-    let tip = seal_strokes(&dir, &project, None);
+    let middle = retouch(&dir, &project, &one_stroke(), None).remove(0);
+    let tip = retouch(&dir, &project, &one_stroke(), None).remove(0);
     assert_eq!(
         read_checkpoint(&project, &tip).parent.as_deref(),
         Some(middle.as_str())
@@ -524,17 +410,15 @@ fn delete_hides_one_checkpoint_like_core() {
     let before_map = dir.join("tip-before.tif");
     let before_export = dir.join("tip-before-export.tif");
     let project_arg = project.to_str().unwrap();
-    for args in [
-        vec!["history", "materialize", project_arg],
-        vec!["export", project_arg],
-    ] {
-        let path = if args[0] == "export" {
-            &before_export
-        } else {
-            &before_map
-        };
-        let mut args = args;
-        args.extend(["--checkpoint", &tip, "-o", path.to_str().unwrap()]);
+    for (flag, path) in [("--zmap", &before_map), ("-o", &before_export)] {
+        let args = [
+            "export",
+            project_arg,
+            "--checkpoint",
+            &tip,
+            flag,
+            path.to_str().unwrap(),
+        ];
         let output = run(&dir, &args);
         assert!(output.success, "{args:?} stderr: {}", output.stderr);
     }
@@ -580,12 +464,11 @@ fn delete_hides_one_checkpoint_like_core() {
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &tip,
-            "-o",
+            "--zmap",
             after_map.to_str().unwrap(),
         ],
     );
@@ -620,12 +503,15 @@ fn delete_hides_one_checkpoint_like_core() {
     );
     let before = std::fs::read(&project).unwrap();
     for reference in [middle.as_str(), prefix] {
-        for args in [
-            vec!["history", "materialize", project.to_str().unwrap()],
-            vec!["export", project.to_str().unwrap()],
-        ] {
-            let mut args = args;
-            args.extend(["--checkpoint", reference, "-o", nowhere.to_str().unwrap()]);
+        for flag in ["--zmap", "-o"] {
+            let args = [
+                "export",
+                project.to_str().unwrap(),
+                "--checkpoint",
+                reference,
+                flag,
+                nowhere.to_str().unwrap(),
+            ];
             let output = run(&dir, &args);
             assert!(!output.success, "{args:?}");
             assert!(
@@ -654,7 +540,7 @@ fn delete_hides_one_checkpoint_like_core() {
 fn delete_reports_what_it_removed_in_text() {
     let (dir, project) = fresh_project("delete_reports_what_it_removed_in_text");
     let root = root_id(&project);
-    let leaf = seal_strokes(&dir, &project, None);
+    let leaf = retouch(&dir, &project, &one_stroke(), None).remove(0);
     let output = run(
         &dir,
         &[
@@ -722,17 +608,15 @@ fn unknown_checkpoint_id_is_refused() {
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        &serde_json::to_value(one_stroke()).unwrap(),
     );
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
@@ -750,33 +634,29 @@ fn unknown_checkpoint_id_is_refused() {
 
     // Unknown id.
     assert_refused(&[
-        "history",
-        "materialize",
+        "export",
         project.to_str().unwrap(),
         "--checkpoint",
         "not-a-real-id",
-        "-o",
+        "--zmap",
         dir.join("nope.tif").to_str().unwrap(),
     ]);
     // Ambiguous prefix.
     assert_refused(&[
-        "history",
-        "materialize",
+        "export",
         project.to_str().unwrap(),
         "--checkpoint",
         "",
-        "-o",
+        "--zmap",
         dir.join("nope.tif").to_str().unwrap(),
     ]);
     assert_refused(&[
-        "history",
-        "apply",
+        "retouch",
         project.to_str().unwrap(),
         "--ops",
         ops.to_str().unwrap(),
         "--from",
         "",
-        "--save",
     ]);
     assert_refused(&[
         "history",
@@ -790,87 +670,15 @@ fn unknown_checkpoint_id_is_refused() {
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &root[..8],
-            "-o",
+            "--zmap",
             dir.join("root.tif").to_str().unwrap(),
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
-}
-
-#[test]
-fn invalid_op_file_is_refused_before_writing() {
-    let (dir, project) = fresh_project("invalid_op_file_is_refused_before_writing");
-
-    let bad_source_id = op_file(
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 8,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 1.0,
-            softness: 0.0,
-        }])
-        .unwrap(),
-    );
-    let bad_rect = op_file(
-        &serde_json::to_value(vec![Op::ResetRegion {
-            rect: Rect {
-                x: 100_000,
-                y: 100_000,
-                width: 10,
-                height: 10,
-            },
-        }])
-        .unwrap(),
-    );
-    let bare_array = serde_json::to_value(vec![Op::ResetRegion {
-        rect: Rect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        },
-    }])
-    .unwrap();
-
-    for (name, body) in [
-        ("bad-source-id.json", bad_source_id),
-        ("bad-rect.json", bad_rect),
-        ("bare-array.json", bare_array),
-    ] {
-        let ops_path = write_op_file(&dir, name, &body);
-        let out = dir.join(format!("{name}.out.tif"));
-        let partial = dir.join(format!("{name}.out.tif.partial"));
-        let before = std::fs::read(&project).unwrap();
-
-        let output = run(
-            &dir,
-            &[
-                "history",
-                "apply",
-                project.to_str().unwrap(),
-                "--ops",
-                ops_path.to_str().unwrap(),
-                "--save",
-                "-o",
-                out.to_str().unwrap(),
-            ],
-        );
-        assert!(!output.success, "{name} must be refused");
-        assert!(
-            output.stderr.contains("error:"),
-            "{name} stderr: {}",
-            output.stderr
-        );
-        assert_eq!(std::fs::read(&project).unwrap(), before, "{name}");
-        assert!(!out.exists(), "{name} left {out:?}");
-        assert!(!partial.exists(), "{name} left {partial:?}");
-        let staging = project.with_extension("ffp.ops-staging");
-        assert!(!staging.exists(), "{name} left {staging:?}");
-    }
 }
 
 #[test]
@@ -888,12 +696,11 @@ fn records_on_stdout_progress_on_stderr() {
 
     assert_one_document(&["history", "list", project.to_str().unwrap(), "--json"]);
     assert_one_document(&[
-        "history",
-        "materialize",
+        "export",
         project.to_str().unwrap(),
         "--checkpoint",
         &root,
-        "-o",
+        "--zmap",
         dir.join("root.tif").to_str().unwrap(),
         "--json",
     ]);
@@ -901,15 +708,13 @@ fn records_on_stdout_progress_on_stderr() {
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        &serde_json::to_value(one_stroke()).unwrap(),
     );
     assert_one_document(&[
-        "history",
-        "apply",
+        "retouch",
         project.to_str().unwrap(),
         "--ops",
         ops.to_str().unwrap(),
-        "--save",
         "--json",
     ]);
     assert_one_document(&["history", "list", project.to_str().unwrap(), "--json"]);
@@ -918,12 +723,11 @@ fn records_on_stdout_progress_on_stderr() {
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             "not-a-real-id",
-            "-o",
+            "--zmap",
             dir.join("nope.tif").to_str().unwrap(),
             "--json",
         ],
@@ -949,42 +753,37 @@ fn output_does_not_reveal_storage_kind() {
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &op_file(
-            &serde_json::to_value(vec![Op::BrushStroke {
-                source_id: 1,
-                path: vec![Point { x: 5, y: 5 }],
-                radius: 1.0,
-                softness: 0.0,
-            }])
-            .unwrap(),
-        ),
+        &serde_json::to_value(vec![Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 5, y: 5 }],
+            radius: 1.0,
+            softness: 0.0,
+        }])
+        .unwrap(),
     );
     let output = run(
         &dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             project.to_str().unwrap(),
             "--ops",
             ops.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let child: Value = serde_json::from_str(&output.stdout).unwrap();
-    let child_id = child["checkpoint"].as_str().unwrap().to_string();
+    let child_id = child["checkpoints"][0].as_str().unwrap().to_string();
 
     let mut combined = String::new();
     for args in [
         vec!["history", "list", project.to_str().unwrap(), "--json"],
         vec![
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &child_id,
-            "-o",
+            "--zmap",
             dir.join("child.tif").to_str().unwrap(),
             "--json",
         ],
@@ -1011,13 +810,167 @@ fn output_does_not_reveal_storage_kind() {
     }
 }
 
+/// The live records of `path`, each with its bytes, in name order.
+fn live_records(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let index = Index::read(path).unwrap();
+    index
+        .names()
+        .map(|name| (name.to_string(), index.read_entry(path, name).unwrap()))
+        .collect()
+}
+
+/// Appends `len` dead bytes to the project through the container.
+fn append_dead_bytes(path: &Path, len: u64) {
+    use std::io::Read;
+    let index = Index::read(path).unwrap();
+    let mut writer = ContainerWriter::append(path, &index).unwrap();
+    writer
+        .put("filler.bin", &mut std::io::repeat(0).take(len))
+        .unwrap();
+    writer.drop_entry("filler.bin");
+    writer.finish().unwrap();
+}
+
+#[test]
+fn compact_keeps_visible_states() {
+    let (dir, project) = fresh_project("compact_keeps_visible_states");
+    let root = root_id(&project);
+    let first = retouch(&dir, &project, &one_stroke(), None).remove(0);
+    let tip = retouch(&dir, &project, &one_stroke(), None).remove(0);
+    let project_arg = project.to_str().unwrap();
+    let output = run(
+        &dir,
+        &["history", "delete", project_arg, "--checkpoint", &tip],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(
+        !output.stderr.contains("compacted"),
+        "the delete left the file under the threshold: {}",
+        output.stderr
+    );
+
+    let visible = listed(&dir, &project);
+    let ids: Vec<&str> = visible.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&first.as_str()) && ids.contains(&root.as_str()));
+    assert!(!ids.contains(&tip.as_str()));
+    let records_before = live_records(&project);
+    let old_len = std::fs::metadata(&project).unwrap().len();
+    assert!(Index::read(&project).unwrap().dead_bytes() > 0);
+
+    let output = run(&dir, &["history", "compact", project_arg, "--json"]);
+    assert!(output.success, "stderr: {}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(report["project"], project_arg);
+    let new_len = std::fs::metadata(&project).unwrap().len();
+    assert!(new_len < old_len);
+    assert_eq!(report["reclaimed_bytes"], old_len - new_len);
+
+    assert_eq!(listed(&dir, &project), visible);
+    assert_eq!(live_records(&project), records_before);
+    assert_eq!(Index::read(&project).unwrap().dead_bytes(), 0);
+    assert_eq!(Project::open(&project).unwrap().checkpoint().id, first);
+    assert!(
+        Index::read(&project)
+            .unwrap()
+            .get(&format!("checkpoints/{tip}.json"))
+            .is_none()
+    );
+    assert!(!project::partial_path(&project).exists());
+
+    let compacted = std::fs::read(&project).unwrap();
+    let output = run(&dir, &["history", "compact", project_arg]);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(
+        output.stdout.contains("reclaimed: 0 bytes"),
+        "{}",
+        output.stdout
+    );
+    assert_eq!(std::fs::read(&project).unwrap(), compacted);
+
+    let not_a_project = dir.join("notes.ffp");
+    std::fs::write(&not_a_project, b"plain text, not a project").unwrap();
+    let output = run(
+        &dir,
+        &["history", "compact", not_a_project.to_str().unwrap()],
+    );
+    assert_eq!(output.exit_code, Some(3), "stderr: {}", output.stderr);
+}
+
+#[test]
+fn save_commands_compact_mostly_dead_files() {
+    const FILLER: u64 = 16 << 20;
+    let (dir, project) = fresh_project("save_commands_compact_mostly_dead_files");
+    let root = root_id(&project);
+    let project_arg = project.to_str().unwrap();
+
+    // A save onto a file under the threshold does not compact.
+    let kept = retouch(&dir, &project, &one_stroke(), None).remove(0);
+    let run_save = |dir: &Path| {
+        let ops = write_op_file(
+            dir,
+            "ops-again.json",
+            &serde_json::to_value(one_stroke()).unwrap(),
+        );
+        run(
+            dir,
+            &[
+                "retouch",
+                project_arg,
+                "--ops",
+                ops.to_str().unwrap(),
+                "--json",
+            ],
+        )
+    };
+    let output = run_save(&dir);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(!output.stderr.contains("compacted"), "{}", output.stderr);
+
+    // A save onto a mostly dead file compacts it, after the save committed.
+    append_dead_bytes(&project, FILLER);
+    let output = run_save(&dir);
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stderr.contains("compacted"), "{}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert!(report["checkpoints"][0].is_string());
+    assert!(std::fs::metadata(&project).unwrap().len() < FILLER);
+    assert_eq!(Index::read(&project).unwrap().dead_bytes(), 0);
+
+    // A delete does the same and prints the same report as before.
+    let tip = report["checkpoints"][0].as_str().unwrap().to_string();
+    append_dead_bytes(&project, FILLER);
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project_arg,
+            "--checkpoint",
+            &tip,
+            "--json",
+        ],
+    );
+    assert!(output.success, "stderr: {}", output.stderr);
+    assert!(output.stderr.contains("compacted"), "{}", output.stderr);
+    let report: Value = serde_json::from_str(&output.stdout).unwrap();
+    assert_eq!(report["hidden"], tip);
+    assert_eq!(report["removed"], serde_json::json!([tip]));
+    assert!(std::fs::metadata(&project).unwrap().len() < FILLER);
+    assert_eq!(Index::read(&project).unwrap().dead_bytes(), 0);
+    let ids: Vec<String> = listed(&dir, &project)
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&root) && ids.contains(&kept) && !ids.contains(&tip));
+}
+
 #[test]
 fn help_lists_every_command() {
     let dir = common::tmp_dir("help_lists_every_command");
 
     let output = run(&dir, &["history", "--help"]);
     assert!(output.success);
-    for name in ["list", "materialize", "apply", "delete"] {
+    for name in ["list", "delete", "compact"] {
         assert!(
             output.stdout.contains(name),
             "history --help missing {name}: {}",
@@ -1025,14 +978,10 @@ fn help_lists_every_command() {
         );
     }
 
-    let subcommand_flags: [(&str, &[&str]); 4] = [
+    let subcommand_flags: [(&str, &[&str]); 3] = [
         ("list", &["--json"]),
-        ("materialize", &["--checkpoint", "--output", "--json"]),
-        (
-            "apply",
-            &["--ops", "--from", "--save", "--output", "--json"],
-        ),
         ("delete", &["--checkpoint", "--json"]),
+        ("compact", &["--json"]),
     ];
     for (sub, flags) in subcommand_flags {
         let output = run(&dir, &["history", sub, "--help"]);
@@ -1048,11 +997,9 @@ fn help_lists_every_command() {
 }
 
 #[test]
-fn output_naming_the_project_is_refused() {
-    let (dir, project) = fresh_project("output_naming_the_project_is_refused");
-    let root = root_id(&project);
-    let before = std::fs::read(&project).unwrap();
-
+fn history_materialize_is_gone() {
+    let (dir, project) = fresh_project("history_materialize_is_gone");
+    let out = dir.join("zmap.tif");
     let output = run(
         &dir,
         &[
@@ -1060,19 +1007,31 @@ fn output_naming_the_project_is_refused() {
             "materialize",
             project.to_str().unwrap(),
             "--checkpoint",
-            &root,
-            "-o",
-            project.to_str().unwrap(),
+            "none",
+            "--output",
+            out.to_str().unwrap(),
         ],
     );
     assert!(!output.success);
-    assert_eq!(std::fs::read(&project).unwrap(), before);
+    assert!(
+        output.stderr.contains("unrecognized subcommand"),
+        "stderr: {}",
+        output.stderr
+    );
+    assert!(!out.exists());
+    let help = run(&dir, &["history", "--help"]);
+    assert!(!help.stdout.contains("materialize"), "{}", help.stdout);
+}
 
+#[test]
+fn history_apply_is_gone() {
+    let (dir, project) = fresh_project("history_apply_is_gone");
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &op_file(&serde_json::to_value(three_strokes()).unwrap()),
+        &serde_json::to_value(one_stroke()).unwrap(),
     );
+    let before = std::fs::read(&project).unwrap();
     let output = run(
         &dir,
         &[
@@ -1081,12 +1040,24 @@ fn output_naming_the_project_is_refused() {
             project.to_str().unwrap(),
             "--ops",
             ops.to_str().unwrap(),
-            "-o",
-            project.to_str().unwrap(),
+            "--save",
         ],
     );
     assert!(!output.success);
+    assert!(
+        output.stderr.contains("unrecognized subcommand"),
+        "stderr: {}",
+        output.stderr
+    );
     assert_eq!(std::fs::read(&project).unwrap(), before);
+
+    let help = run(&dir, &["history", "--help"]);
+    assert!(help.success);
+    assert!(
+        !help.stdout.contains("apply"),
+        "history --help still lists apply: {}",
+        help.stdout
+    );
 }
 
 /// One small project sealed directly under `dir`, its three source frames
@@ -1173,15 +1144,7 @@ fn seal_synthetic_project(dir: &Path, seed: u16) -> PathBuf {
 }
 
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    use std::io::Read;
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_manifest_value(path: &Path) -> Value {
@@ -1204,33 +1167,20 @@ fn mutate_container(
     replace: &[(String, Vec<u8>)],
     add: &[(String, Vec<u8>)],
 ) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        if drop.contains(&name.as_str()) {
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        if drop.contains(&name) {
             continue;
         }
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        if let Some(entry) = replace.iter().find(|entry| &entry.0 == name) {
-            bytes = entry.1.clone();
-        }
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        let bytes = match replace.iter().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1.clone(),
+            None => index.read_entry(src, name).unwrap(),
+        };
+        writer.put_bytes(name, &bytes).unwrap();
     }
     for (name, bytes) in add {
-        writer.start_file(name.as_str(), options).unwrap();
-        writer.write_all(bytes).unwrap();
+        writer.put_bytes(name, bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -1353,31 +1303,27 @@ fn validation_states_are_reported() {
     let ops = write_op_file(
         &ops_dir,
         "orphan-ops.json",
-        &op_file(
-            &serde_json::to_value(vec![Op::BrushStroke {
-                source_id: 1,
-                path: vec![Point { x: 2, y: 2 }],
-                radius: 1.0,
-                softness: 0.0,
-            }])
-            .unwrap(),
-        ),
+        &serde_json::to_value(vec![Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 2, y: 2 }],
+            radius: 1.0,
+            softness: 0.0,
+        }])
+        .unwrap(),
     );
     let output = run(
         &ops_dir,
         &[
-            "history",
-            "apply",
+            "retouch",
             ops_project.to_str().unwrap(),
             "--ops",
             ops.to_str().unwrap(),
-            "--save",
             "--json",
         ],
     );
     assert!(output.success, "stderr: {}", output.stderr);
     let child: Value = serde_json::from_str(&output.stdout).unwrap();
-    let child_id = child["checkpoint"].as_str().unwrap().to_string();
+    let child_id = child["checkpoints"][0].as_str().unwrap().to_string();
     let mut orphan_ops = read_checkpoint_json(&ops_project, &child_id);
     orphan_ops["parent"] = Value::Null;
     let ops_no_parent = dir.join("ops-no-parent.ffp");

@@ -6,13 +6,13 @@
 //! and `hash_algorithm` naming the hash rather than leaving it implied --
 //! each with its own test in `crates/core/tests/project_format.rs`.
 //!
-//! **Open refuses, it does not default.** Every field is required except
-//! the optional-by-meaning ones ([`BlobRecord::base`] and
-//! [`BlobRecord::target`]): a manifest missing one fails deserialization.
+//! **Open refuses, it does not default.** A manifest missing a required
+//! field fails deserialization.
 //! `deny_unknown_fields` is deliberately absent.
 
 use serde::{Deserialize, Serialize};
 
+use super::blob::FileStamp;
 use crate::align::Registration;
 use crate::params::ParamValues;
 use crate::tile::Rect;
@@ -105,16 +105,6 @@ pub struct BlobRecord {
     pub compression: String,
     pub uncompressed_len: u64,
     pub compressed_len: u64,
-    /// [`BlobKind::SparseDelta`] only: the content hash of the map this
-    /// blob is a patch against. A `full` record's JSON carries neither this
-    /// nor [`Self::target`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
-    /// [`BlobKind::SparseDelta`] only: the content hash of the map this
-    /// blob decodes to, applied over [`Self::base`]'s own materialized map --
-    /// never a checkpoint id and never an entry name of its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
 }
 
 /// What a blob contains. `#[non_exhaustive]` so a future variant can be
@@ -124,9 +114,6 @@ pub struct BlobRecord {
 #[non_exhaustive]
 pub enum BlobKind {
     Full,
-    /// A patch against [`BlobRecord::base`]'s materialized map, decoding to
-    /// [`BlobRecord::target`].
-    SparseDelta,
 }
 
 /// One source frame, referenced -- never embedded.
@@ -139,6 +126,23 @@ pub struct SourceRef {
     /// blake3 of the whole file.
     pub hash: String,
     pub bytes: u64,
+    /// Modification time when the hash was taken, nanoseconds since the Unix
+    /// epoch.
+    pub modified_ns: u64,
+    /// `[device, inode]` when the hash was taken; `None` where the platform
+    /// has no stable file id.
+    pub file_id: Option<[u64; 2]>,
+}
+
+impl SourceRef {
+    /// The file stamp this record's hash was taken at.
+    pub fn stamp(&self) -> FileStamp {
+        FileStamp {
+            bytes: self.bytes,
+            modified_ns: self.modified_ns,
+            file_id: self.file_id,
+        }
+    }
 }
 
 /// How [`SourceRef::path`] should be read. "Relative" means **descendant of

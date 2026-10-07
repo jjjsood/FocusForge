@@ -15,9 +15,12 @@
 //! compressed temp file is then copied into the container under
 //! `blobs/<hash>.zst`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::UNIX_EPOCH;
 
 use super::error::ProjectError;
 use super::manifest::SourceRef;
@@ -47,11 +50,30 @@ impl Plane {
 /// the same discipline the read path uses.
 const BAND_BYTES: usize = 4 << 20;
 
-/// The default zstd level. Level 3 is zstd's own default: the Z-Map is
-/// piecewise-constant and compresses by orders of magnitude at any level,
-/// and the composite is photographic and compresses by very little at any
-/// level, so buying seconds of CPU for a higher level buys nothing here.
-pub const ZSTD_LEVEL: i32 = 3;
+/// The zstd level every blob is written at. The Z-Map is piecewise-constant
+/// and compresses by orders of magnitude at any level; the composite is
+/// photographic and barely compresses. On a 61-frame 7795x5208 composite
+/// (243.6 MB) multithreaded level 1 took 0.218 s for ratio 1.150, level 2
+/// 0.242 s for 1.150 and level 3 0.255 s for 1.171: level 1 is the fastest
+/// and within 2 % of level 3's size.
+pub const ZSTD_LEVEL: i32 = 1;
+
+/// A zstd encoder writing to a new file at `path`, one worker per available
+/// core. The worker count never changes the entry name: the hash is over the
+/// uncompressed bytes.
+fn encoder(
+    path: &Path,
+    level: i32,
+) -> Result<zstd::stream::write::Encoder<'static, File>, ProjectError> {
+    let file = File::create(path).map_err(|source| ProjectError::io(path, source))?;
+    let mut encoder = zstd::stream::write::Encoder::new(file, level)
+        .map_err(|source| ProjectError::io(path, source))?;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    encoder
+        .multithread(workers)
+        .map_err(|source| ProjectError::io(path, source))?;
+    Ok(encoder)
+}
 
 /// One compressed plane sitting in a temp file, ready to be copied into a
 /// container under `blobs/<hash>.zst`.
@@ -75,15 +97,77 @@ impl StagedBlob {
     }
 }
 
+/// What identifies one version of a file without reading it: size,
+/// modification time and, where the platform has one, the device and inode.
+///
+/// An in-place edit that keeps all three goes unnoticed; that is the price
+/// of not reading every source on every open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub bytes: u64,
+    /// Nanoseconds since the Unix epoch; `0` for a time before it.
+    pub modified_ns: u64,
+    /// `[device, inode]` on Unix, `None` elsewhere.
+    pub file_id: Option<[u64; 2]>,
+}
+
+impl FileStamp {
+    pub fn of(path: &Path) -> Result<Self, ProjectError> {
+        let io = |source| ProjectError::io(path, source);
+        let metadata = std::fs::metadata(path).map_err(io)?;
+        let modified = metadata.modified().map_err(io)?;
+        #[cfg(unix)]
+        let file_id = {
+            use std::os::unix::fs::MetadataExt;
+            Some([metadata.dev(), metadata.ino()])
+        };
+        #[cfg(not(unix))]
+        let file_id = None;
+        Ok(FileStamp {
+            bytes: metadata.len(),
+            modified_ns: modified
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64),
+            file_id,
+        })
+    }
+}
+
+/// Every source hashed in this process, by the path it was hashed at.
+static SOURCE_HASHES: LazyLock<Mutex<HashMap<PathBuf, (FileStamp, String)>>> =
+    LazyLock::new(Mutex::default);
+
+/// The current stamp of the file at `path` and its blake3 content hash, hex.
+///
+/// The hash comes from `recorded` when its stamp matches, else from this
+/// process's memo at the same stamp, else from reading the file. The memo
+/// lock is held through that read: sources are hashed one at a time
+/// process-wide, and never twice by two racing callers.
+pub fn source_hash(
+    path: &Path,
+    recorded: Option<&SourceRef>,
+) -> Result<(FileStamp, String), ProjectError> {
+    let stamp = FileStamp::of(path)?;
+    if let Some(recorded) = recorded.filter(|r| r.stamp() == stamp) {
+        return Ok((stamp, recorded.hash.clone()));
+    }
+    let mut memo = SOURCE_HASHES.lock().unwrap_or_else(PoisonError::into_inner);
+    let hash = match memo.get(path) {
+        Some((memoised, hash)) if *memoised == stamp => hash.clone(),
+        _ => hash_file(path)?,
+    };
+    memo.insert(path.to_path_buf(), (stamp, hash.clone()));
+    Ok((stamp, hash))
+}
+
 /// blake3 of a whole file, hex.
 ///
-/// `update_mmap_rayon` maps the **whole** file, so this must be called
-/// sequentially over a source list and never inside a `par_iter`: 61
-/// reference frames hashed concurrently would map up to 16 GB at once,
-/// well past an 8 GB memory ceiling. One file at a time is one 268 MB
-/// mapping, and the hashing of that one file is already rayon-parallel
-/// internally.
-pub fn hash_file(path: &Path) -> Result<String, ProjectError> {
+/// `update_mmap_rayon` maps the **whole** file, so this must never run
+/// inside a `par_iter`: 61 reference frames hashed concurrently would map up
+/// to 16 GB at once, well past an 8 GB memory ceiling. One file at a time is
+/// one 268 MB mapping, and the hashing of that one file is already
+/// rayon-parallel internally.
+fn hash_file(path: &Path) -> Result<String, ProjectError> {
     let mut hasher = blake3::Hasher::new();
     hasher
         .update_mmap_rayon(path)
@@ -140,9 +224,7 @@ pub fn stage_plane(
     let rows = (BAND_BYTES / (row_samples * 2)).clamp(1, height as usize) as u32;
 
     let temp = out_dir.join(format!("{}.zst", plane.stem()));
-    let file = File::create(&temp).map_err(|source| ProjectError::io(&temp, source))?;
-    let mut encoder = zstd::stream::write::Encoder::new(file, level)
-        .map_err(|source| ProjectError::io(&temp, source))?;
+    let mut encoder = encoder(&temp, level)?;
 
     let mut hasher = blake3::Hasher::new();
     let mut samples = vec![0u16; row_samples * rows as usize];
@@ -268,173 +350,6 @@ pub fn zmap_frame_count(path: &Path) -> Result<u32, ProjectError> {
         .ok_or_else(|| ProjectError::container(path, "not a Z-Map"))
 }
 
-/// The uncompressed byte length of a patch's own header: the declared map's
-/// width and height, then the patched tile's `x`, `y`, `width` and `height`
-/// -- six little-endian `u32`s, before the tile's own `u16` indices.
-const DELTA_HEADER_LEN: usize = 6 * 4;
-
-/// One [`stage_delta`]/[`decode_delta`] payload: a rectangular tile of new
-/// indices plus the full map's own declared extent, so a decode can be
-/// checked against a project's actual Z-Map shape before it is applied.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DecodedDelta {
-    pub map_width: u32,
-    pub map_height: u32,
-    pub tile: Rect,
-    /// Row-major over `tile`, `tile.width * tile.height` long.
-    pub indices: Vec<u16>,
-}
-
-/// Encodes `indices` (`tile`'s own indices, row-major, `tile.width *
-/// tile.height` long) as a patch against a `map_width x map_height` map,
-/// hashing and zstd-compressing it in one banded pass exactly as
-/// [`stage_plane`] does. The hash covers the header too, so two patches
-/// naming the same tile bytes at different positions never collide.
-pub fn stage_delta(
-    map_width: u32,
-    map_height: u32,
-    tile: Rect,
-    indices: &[u16],
-    level: i32,
-    out_dir: &Path,
-) -> Result<StagedBlob, ProjectError> {
-    let temp = out_dir.join("zmap-delta.zst");
-    let file = File::create(&temp).map_err(|source| ProjectError::io(&temp, source))?;
-    let mut encoder = zstd::stream::write::Encoder::new(file, level)
-        .map_err(|source| ProjectError::io(&temp, source))?;
-    let mut hasher = blake3::Hasher::new();
-
-    let mut header = [0u8; DELTA_HEADER_LEN];
-    for (i, v) in [
-        map_width,
-        map_height,
-        tile.x,
-        tile.y,
-        tile.width,
-        tile.height,
-    ]
-    .iter()
-    .enumerate()
-    {
-        header[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    hasher.update(&header);
-    encoder
-        .write_all(&header)
-        .map_err(|source| ProjectError::io(&temp, source))?;
-    let mut uncompressed_len = header.len() as u64;
-
-    let row_samples = tile.width as usize;
-    let rows = (BAND_BYTES / (row_samples.max(1) * 2)).clamp(1, tile.height.max(1) as usize);
-    let mut bytes: Vec<u8> = Vec::with_capacity(row_samples * rows * 2);
-    let mut y = 0usize;
-    let total_rows = tile.height as usize;
-    while y < total_rows {
-        let band_rows = rows.min(total_rows - y);
-        let start = y * row_samples;
-        let len = row_samples * band_rows;
-        bytes.clear();
-        for sample in &indices[start..start + len] {
-            bytes.extend_from_slice(&sample.to_le_bytes());
-        }
-        hasher.update(&bytes);
-        encoder
-            .write_all(&bytes)
-            .map_err(|source| ProjectError::io(&temp, source))?;
-        uncompressed_len += bytes.len() as u64;
-        y += band_rows;
-    }
-
-    let file = encoder
-        .finish()
-        .map_err(|source| ProjectError::io(&temp, source))?;
-    let compressed_len = file
-        .metadata()
-        .map_err(|source| ProjectError::io(&temp, source))?
-        .len();
-    drop(file);
-
-    Ok(StagedBlob {
-        hash: hasher.finalize().to_hex().to_string(),
-        uncompressed_len,
-        compressed_len,
-        width: map_width,
-        height: map_height,
-        samples_per_pixel: 1,
-        path: temp,
-    })
-}
-
-/// Decodes a [`stage_delta`] payload's **uncompressed** bytes, refusing a
-/// length that does not match its own header or a tile that does not lie
-/// inside its own declared map. `path` names the failure only -- callers
-/// pass the project file, not this blob's temp path.
-pub fn decode_delta(bytes: &[u8], path: &Path) -> Result<DecodedDelta, ProjectError> {
-    if bytes.len() < DELTA_HEADER_LEN {
-        return Err(ProjectError::container(
-            path,
-            format!(
-                "a stored patch is {} bytes, shorter than its own {DELTA_HEADER_LEN}-byte header",
-                bytes.len()
-            ),
-        ));
-    }
-    let read_u32 = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-    let map_width = read_u32(0);
-    let map_height = read_u32(1);
-    let tile = Rect {
-        x: read_u32(2),
-        y: read_u32(3),
-        width: read_u32(4),
-        height: read_u32(5),
-    };
-
-    let in_bounds = tile.width > 0
-        && tile.height > 0
-        && tile
-            .x
-            .checked_add(tile.width)
-            .is_some_and(|xw| xw <= map_width)
-        && tile
-            .y
-            .checked_add(tile.height)
-            .is_some_and(|yh| yh <= map_height);
-    if !in_bounds {
-        return Err(ProjectError::container(
-            path,
-            format!(
-                "a stored patch's tile {tile:?} lies outside its own {map_width}x{map_height} map"
-            ),
-        ));
-    }
-
-    let expected_len = DELTA_HEADER_LEN + tile.width as usize * tile.height as usize * 2;
-    if bytes.len() != expected_len {
-        return Err(ProjectError::container(
-            path,
-            format!(
-                "a stored patch holds {} bytes, not the {expected_len} its own header declares",
-                bytes.len()
-            ),
-        ));
-    }
-
-    let mut indices = vec![0u16; tile.width as usize * tile.height as usize];
-    for (out, chunk) in indices
-        .iter_mut()
-        .zip(bytes[DELTA_HEADER_LEN..].chunks_exact(2))
-    {
-        *out = u16::from_le_bytes([chunk[0], chunk[1]]);
-    }
-
-    Ok(DecodedDelta {
-        map_width,
-        map_height,
-        tile,
-        indices,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +360,8 @@ mod tests {
             resolution: super::super::manifest::SourceResolution::Relative,
             hash: hash.to_string(),
             bytes: 1,
+            modified_ns: 0,
+            file_id: None,
         }
     }
 
@@ -463,103 +380,5 @@ mod tests {
         // fingerprint is derived from content hashes, so an empty stack and
         // a one-frame stack cannot collide the way a header digest might.
         assert_ne!(stack_fingerprint(&[]), stack_fingerprint(&[source("")]));
-    }
-
-    fn roundtrip(map_width: u32, map_height: u32, tile: Rect) {
-        let dir = tempfile::tempdir().unwrap();
-        let indices: Vec<u16> = (0..tile.width * tile.height)
-            .map(|i| (i % 40) as u16)
-            .collect();
-        let staged = stage_delta(map_width, map_height, tile, &indices, 3, dir.path()).unwrap();
-        let compressed = std::fs::read(&staged.path).unwrap();
-        let bytes = zstd::stream::decode_all(&compressed[..]).unwrap();
-        assert_eq!(bytes.len(), staged.uncompressed_len as usize);
-        let decoded = decode_delta(&bytes, Path::new("test.ffp")).unwrap();
-        assert_eq!(decoded.map_width, map_width);
-        assert_eq!(decoded.map_height, map_height);
-        assert_eq!(decoded.tile, tile);
-        assert_eq!(decoded.indices, indices);
-    }
-
-    #[test]
-    fn a_tile_at_the_origin_round_trips() {
-        roundtrip(
-            37,
-            23,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 5,
-                height: 4,
-            },
-        );
-    }
-
-    #[test]
-    fn a_tile_on_the_far_edges_of_an_odd_sized_map_round_trips() {
-        roundtrip(
-            37,
-            23,
-            Rect {
-                x: 30,
-                y: 18,
-                width: 7,
-                height: 5,
-            },
-        );
-    }
-
-    #[test]
-    fn a_whole_map_tile_round_trips() {
-        roundtrip(
-            37,
-            23,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 37,
-                height: 23,
-            },
-        );
-    }
-
-    #[test]
-    fn decode_delta_refuses_bytes_truncated_before_the_header() {
-        match decode_delta(&[0u8; 4], Path::new("test.ffp")) {
-            Err(ProjectError::Container { message, .. }) => {
-                assert!(message.contains("header"), "{message}");
-            }
-            other => panic!("expected a Container refusal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decode_delta_refuses_a_tile_outside_its_own_map() {
-        let mut header = [0u8; DELTA_HEADER_LEN];
-        for (i, v) in [10u32, 10, 8, 8, 5, 5].iter().enumerate() {
-            header[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        let bytes = [header.to_vec(), vec![0u8; 5 * 5 * 2]].concat();
-        match decode_delta(&bytes, Path::new("test.ffp")) {
-            Err(ProjectError::Container { message, .. }) => {
-                assert!(message.contains("outside"), "{message}");
-            }
-            other => panic!("expected a Container refusal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decode_delta_refuses_a_length_that_does_not_match_its_own_header() {
-        let mut header = [0u8; DELTA_HEADER_LEN];
-        for (i, v) in [10u32, 10, 0, 0, 5, 5].iter().enumerate() {
-            header[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        let bytes = [header.to_vec(), vec![0u8; 5 * 5 * 2 - 2]].concat();
-        match decode_delta(&bytes, Path::new("test.ffp")) {
-            Err(ProjectError::Container { message, .. }) => {
-                assert!(message.contains("bytes"), "{message}");
-            }
-            other => panic!("expected a Container refusal, got {other:?}"),
-        }
     }
 }

@@ -21,7 +21,7 @@ use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
-use focusforge_core::retouch::{RetouchError, Sources, recomposite as recomposite_region};
+use focusforge_core::project::Op;
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
@@ -37,19 +37,20 @@ pub enum CanvasFeed {
     Keep,
     /// No tab is active, or the active tab has nothing sealed to show yet.
     Clear,
-    /// Open `composite`/`zmap` as `tab`'s own planes.
+    /// Open `composite`, and `zmap` when the row has a readable one, as
+    /// `tab`'s own planes.
     Load {
         tab: usize,
         composite: PathBuf,
-        zmap: PathBuf,
+        zmap: Option<PathBuf>,
     },
 }
 
 /// Which pane a piece of canvas state belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSource {
+    Frame,
     Composite,
-    ZMap,
 }
 
 /// The display texture's size, the whole "allocated once, re-allocated only
@@ -398,16 +399,6 @@ impl PaneReader for ZMapReader {
 pub enum Pane {
     Frame,
     Composite,
-    ZMap,
-}
-
-impl From<PaneSource> for Pane {
-    fn from(plane: PaneSource) -> Self {
-        match plane {
-            PaneSource::Composite => Pane::Composite,
-            PaneSource::ZMap => Pane::ZMap,
-        }
-    }
 }
 
 /// One pane's view to read: what to read, the stamp it was issued under and
@@ -418,8 +409,6 @@ pub struct PaneJob {
     pub draw: PaneDraw,
     pub stamp: u64,
     pub reader: Arc<dyn PaneReader>,
-    /// Z-Map index scale for the display kernel; 0 for image sources.
-    pub index_scale: u32,
     /// The sealed Z-Map, read alongside a composite whose edit generation or
     /// overlay [`Self::state`] names; `None` when the sealed pixels draw as is.
     pub indices: Option<Arc<dyn PaneReader>>,
@@ -732,46 +721,29 @@ fn rect_intersect(a: Rect, b: Rect) -> Option<Rect> {
     }
 }
 
-/// Copies `rect`'s rows out of `indices`, a single-sample-per-pixel plane
-/// `map_width` wide -- the same row-major layout an [`EditSession`]'s own
-/// indices use.
-///
-/// [`EditSession`]: focusforge_core::retouch::EditSession
-pub(crate) fn gather_rect(indices: &[u16], map_width: u32, rect: Rect) -> Vec<u16> {
-    let mut out = Vec::with_capacity(rect.width as usize * rect.height as usize);
-    for y in rect.y..rect.y + rect.height {
-        let start = y as usize * map_width as usize + rect.x as usize;
-        out.extend_from_slice(&indices[start..start + rect.width as usize]);
-    }
-    out
-}
-
-/// The composite of `region` -- `region_indices` is the region's own rows of
-/// the edited map, as [`gather_rect`] copies them -- read through `sources`
-/// into one buffer, `samples_per_pixel` samples per texel, row-major.
-pub(crate) fn gather(
-    region: Rect,
-    region_indices: &[u16],
-    sources: &Sources,
-) -> Result<Vec<u16>, RetouchError> {
-    let texels = region.width as usize * region.height as usize;
-    let mut out = vec![0u16; texels * sources.samples_per_pixel as usize];
-    recomposite_region(region_indices, region, sources, &mut out)?;
-    Ok(out)
-}
-
-/// One resident tile: its samples, and which texels hold a gathered pixel.
+/// One resident tile: its samples, and which texels hold an edited pixel.
+#[derive(Clone)]
 struct Tile {
     samples: Vec<u16>,
     filled: Vec<bool>,
 }
 
-/// A resident cache of recomposited pixels over a fixed grid of tiles,
-/// gathered only where a stroke has touched them -- a tile is allocated
-/// empty on first install and never seeded from the sealed composite, so a
-/// texel no install has covered carries no gathered sample at all
-/// ([`overlay_edited`] falls back to the sealed pixel there). Memory is
-/// proportional to the edited area, never to the image.
+impl Tile {
+    fn empty(tile_size: u32, samples_per_pixel: usize) -> Self {
+        let texels = tile_size as usize * tile_size as usize;
+        Self {
+            samples: vec![0u16; texels * samples_per_pixel],
+            filled: vec![false; texels],
+        }
+    }
+}
+
+/// A resident cache of the edited image's samples over a fixed grid of
+/// tiles, installed only where a stroke has touched them -- a tile is
+/// allocated empty on first install, so a texel no install has covered
+/// carries no sample at all ([`overlay_edited`] shows the sealed pixel
+/// there). Memory is proportional to the edited area, never to the image.
+#[derive(Clone)]
 pub struct ResidentTiles {
     tile_size: u32,
     width: u32,
@@ -779,9 +751,9 @@ pub struct ResidentTiles {
     samples_per_pixel: u32,
     tiles: HashMap<(u32, u32), Tile>,
     generation: u64,
-    /// Every region installed since the last [`Self::take_recomposited`]
+    /// Every region installed since the last [`Self::take_rendered_regions`]
     /// -- a test's own window onto what actually redrew.
-    recomposited: Vec<Rect>,
+    rendered_regions: Vec<Rect>,
 }
 
 impl ResidentTiles {
@@ -794,29 +766,29 @@ impl ResidentTiles {
             samples_per_pixel,
             tiles: HashMap::new(),
             generation: 0,
-            recomposited: Vec::new(),
+            rendered_regions: Vec::new(),
         }
     }
 
     /// Bumped once per [`Self::install`] and per [`Self::touch`] -- the
-    /// renderer's own cue that the resident cache or the edited indices over
-    /// it changed since the last frame it drew.
+    /// renderer's own cue that the resident cache or the ops drawn over it
+    /// changed since the last frame it drew.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// Bumps [`Self::generation`] without changing a pixel: the edited
-    /// indices changed, so the overlay over these tiles must redraw.
+    /// Bumps [`Self::generation`] without changing a pixel: the ops
+    /// drawn over these tiles changed, so the overlay over them must redraw.
     pub fn touch(&mut self) {
         self.generation += 1;
     }
 
     /// Drains the log of every region installed since the last call.
-    pub fn take_recomposited(&mut self) -> Vec<Rect> {
-        std::mem::take(&mut self.recomposited)
+    pub fn take_rendered_regions(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.rendered_regions)
     }
 
-    /// The gathered pixel at `(x, y)`, if an install has covered it --
+    /// The edited pixel at `(x, y)`, if an install has covered it --
     /// `None` outside every installed region.
     fn pixel_at(&self, x: u32, y: u32) -> Option<&[u16]> {
         let key = (x / self.tile_size, y / self.tile_size);
@@ -831,88 +803,157 @@ impl ResidentTiles {
         tile.samples.get(texel * spp..texel * spp + spp)
     }
 
-    /// Gathers `region`'s composite from the whole map's `indices` through
-    /// `sources` and installs it: `gather` then [`Self::install`].
-    pub fn recomposite(
-        &mut self,
-        region: Rect,
-        indices: &[u16],
-        sources: &Sources,
-    ) -> Result<(), RetouchError> {
-        let samples = gather(region, &gather_rect(indices, self.width, region), sources)?;
-        self.install(region, &samples);
-        Ok(())
+    /// Every grid tile `region` meets, with its rect inside the map.
+    fn grid(&self, region: Rect) -> Vec<((u32, u32), Rect)> {
+        let ts = self.tile_size;
+        let (x1, y1) = (
+            (region.x + region.width - 1) / ts,
+            (region.y + region.height - 1) / ts,
+        );
+        let mut out = Vec::new();
+        for ty in region.y / ts..=y1 {
+            for tx in region.x / ts..=x1 {
+                let rect = Rect {
+                    x: tx * ts,
+                    y: ty * ts,
+                    width: ts.min(self.width.saturating_sub(tx * ts)),
+                    height: ts.min(self.height.saturating_sub(ty * ts)),
+                };
+                out.push(((tx, ty), rect));
+            }
+        }
+        out
     }
 
-    /// Splices `samples` -- `region`'s gathered composite, row-major --
+    /// The rect of every grid tile any of `regions` meets, each once.
+    pub fn tile_rects(&self, regions: &[Rect]) -> Vec<Rect> {
+        let mut tiles = std::collections::BTreeMap::new();
+        for &region in regions {
+            tiles.extend(self.grid(region));
+        }
+        tiles.into_values().collect()
+    }
+
+    /// A copy holding only the tiles `regions` meet.
+    pub fn subset(&self, regions: &[Rect]) -> Self {
+        let mut out = Self::new(
+            self.tile_size,
+            self.width,
+            self.height,
+            self.samples_per_pixel,
+        );
+        for &region in regions {
+            for (key, _) in self.grid(region) {
+                if let Some(tile) = self.tiles.get(&key) {
+                    out.tiles.entry(key).or_insert_with(|| tile.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Copies each tile `region` meets from `from` -- empty where `from`
+    /// holds none -- unless this cache already holds it, so the first call
+    /// per tile fixes what that tile looked like.
+    pub fn capture(&mut self, from: &Self, region: Rect) {
+        let (ts, spp) = (self.tile_size, self.samples_per_pixel as usize);
+        for (key, _) in self.grid(region) {
+            self.tiles.entry(key).or_insert_with(|| {
+                from.tiles
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Tile::empty(ts, spp))
+            });
+        }
+    }
+
+    /// Drops every tile.
+    pub fn clear(&mut self) {
+        self.tiles.clear();
+    }
+
+    /// Copies the filled texels inside `region` onto `out`, `region`'s own
+    /// row-major samples, and leaves every other texel as it is.
+    pub fn overlay_into(&self, region: Rect, out: &mut [u16]) {
+        let (ts, spp) = (self.tile_size as usize, self.samples_per_pixel as usize);
+        for (key, tile_rect) in self.grid(region) {
+            let (Some(tile), Some(part)) =
+                (self.tiles.get(&key), rect_intersect(region, tile_rect))
+            else {
+                continue;
+            };
+            for y in part.y..part.y + part.height {
+                for x in part.x..part.x + part.width {
+                    let local = (y - tile_rect.y) as usize * ts + (x - tile_rect.x) as usize;
+                    if !tile.filled[local] {
+                        continue;
+                    }
+                    let at = ((y - region.y) as usize * region.width as usize
+                        + (x - region.x) as usize)
+                        * spp;
+                    out[at..at + spp]
+                        .copy_from_slice(&tile.samples[local * spp..(local + 1) * spp]);
+                }
+            }
+        }
+    }
+
+    /// Splices `samples` -- `region`'s edited composite, row-major --
     /// into every grid tile `region` meets, allocating a tile empty on first
     /// touch and marking the texels filled. Bumps [`Self::generation`] once
     /// and logs `region`, regardless of how many tiles it spans.
     pub fn install(&mut self, region: Rect, samples: &[u16]) {
         let ts = self.tile_size;
         let spp = self.samples_per_pixel as usize;
-        let x0 = region.x / ts;
-        let y0 = region.y / ts;
-        let x1 = (region.x + region.width - 1) / ts;
-        let y1 = (region.y + region.height - 1) / ts;
-        for ty in y0..=y1 {
-            for tx in x0..=x1 {
-                let tile_rect = Rect {
-                    x: tx * ts,
-                    y: ty * ts,
-                    width: ts.min(self.width.saturating_sub(tx * ts)),
-                    height: ts.min(self.height.saturating_sub(ty * ts)),
-                };
-                let Some(part) = rect_intersect(region, tile_rect) else {
-                    continue;
-                };
-                let tile = self.tiles.entry((tx, ty)).or_insert_with(|| Tile {
-                    samples: vec![0u16; ts as usize * ts as usize * spp],
-                    filled: vec![false; ts as usize * ts as usize],
-                });
-                let local_x0 = (part.x - tile_rect.x) as usize;
-                let local_y0 = (part.y - tile_rect.y) as usize;
-                let row_len = part.width as usize;
-                for row in 0..part.height as usize {
-                    let src_row = (part.y - region.y) as usize + row;
-                    let src =
-                        (src_row * region.width as usize + (part.x - region.x) as usize) * spp;
-                    let texel = (local_y0 + row) * ts as usize + local_x0;
-                    tile.samples[texel * spp..(texel + row_len) * spp]
-                        .copy_from_slice(&samples[src..src + row_len * spp]);
-                    tile.filled[texel..texel + row_len].fill(true);
-                }
+        for (key, tile_rect) in self.grid(region) {
+            let Some(part) = rect_intersect(region, tile_rect) else {
+                continue;
+            };
+            let tile = self
+                .tiles
+                .entry(key)
+                .or_insert_with(|| Tile::empty(ts, spp));
+            let local_x0 = (part.x - tile_rect.x) as usize;
+            let local_y0 = (part.y - tile_rect.y) as usize;
+            let row_len = part.width as usize;
+            for row in 0..part.height as usize {
+                let src_row = (part.y - region.y) as usize + row;
+                let src = (src_row * region.width as usize + (part.x - region.x) as usize) * spp;
+                let texel = (local_y0 + row) * ts as usize + local_x0;
+                tile.samples[texel * spp..(texel + row_len) * spp]
+                    .copy_from_slice(&samples[src..src + row_len * spp]);
+                tile.filled[texel..texel + row_len].fill(true);
             }
         }
         self.generation += 1;
-        self.recomposited.push(region);
+        self.rendered_regions.push(region);
     }
 }
 
-/// The renderer's view of an open edit session: the whole map's edited
-/// indices, the map's width (for indexing them), and the resident cache
-/// [`ResidentTiles::install`] filled.
+/// The renderer's view of an open edit session: the resident cache of
+/// edited composite samples.
 #[derive(Clone, Copy)]
 pub struct EditedView<'a> {
-    pub indices: &'a [u16],
-    pub map_width: u32,
     pub tiles: &'a ResidentTiles,
 }
 
-/// The `Composite` pane's overlay draw parameters -- the same values
-/// `focusforge-cli retouch --overlay --opacity` blends with.
+/// The `Composite` pane's overlay draw parameters: the colour table, the
+/// strokes drawn over the stored Z-Map's colours and the alpha
+/// `display::overlay_cpu` blends with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverlayDraw {
     pub table: Vec<[u8; 3]>,
+    pub ops: Arc<[Op]>,
     pub alpha: u8,
 }
 
 impl OverlayDraw {
     /// The overlay's own palette table for `sources` frames, with nothing
-    /// soloed, and `opacity`'s (`0.0..=1.0`) alpha.
+    /// soloed, no strokes and `opacity`'s (`0.0..=1.0`) alpha.
     pub fn for_opacity(sources: u32, opacity: f32) -> Self {
         Self {
             table: overlay_table(sources, None),
+            ops: Arc::from([]),
             alpha: alpha_from_opacity(opacity),
         }
     }
@@ -935,39 +976,11 @@ fn read_job(job: PaneJob, mut samples: Vec<u16>, mut indices: Vec<u16>) -> Optio
     }
 }
 
-/// Reads every `step`-th row and column of `rect` from an in-memory,
-/// single-sample-per-pixel `plane` (row-major, `plane_width` wide) into
-/// `out` -- the same decimation `TiffStack::read_tile_step_into` applies to
-/// an mmap'd file, applied here to a resident buffer instead.
-pub fn step_copy(plane: &[u16], plane_width: u32, rect: Rect, step: NonZeroU32, out: &mut [u16]) {
-    let step = step.get();
-    let out_w = rect.width.div_ceil(step);
-    let mut oy = 0u32;
-    let mut sy = rect.y;
-    while sy < rect.y + rect.height {
-        let mut ox = 0u32;
-        let mut sx = rect.x;
-        while sx < rect.x + rect.width {
-            let src = sy as usize * plane_width as usize + sx as usize;
-            let dst = (oy * out_w + ox) as usize;
-            out[dst] = plane[src];
-            ox += 1;
-            sx += step;
-        }
-        oy += 1;
-        sy += step;
-    }
-}
-
 /// Overlays `samples` (already the sealed composite, decimated over `rect`
-/// at `step`) with `tiles`' gathered pixel at every texel whose edited index
-/// (`edited_indices`, the same decimation) differs from its sealed index
-/// (`sealed_indices`) -- left as the sealed pixel everywhere else, including
-/// a texel no install has covered yet.
+/// at `step`) with `tiles`' edited pixel at every texel it holds one for --
+/// left as the sealed pixel everywhere else.
 pub fn overlay_edited(
     samples: &mut [u16],
-    sealed_indices: &[u16],
-    edited_indices: &[u16],
     rect: Rect,
     step: NonZeroU32,
     samples_per_pixel: u32,
@@ -983,9 +996,7 @@ pub fn overlay_edited(
         let mut sx = rect.x;
         while sx < rect.x + rect.width {
             let t = (oy * out_w + ox) as usize;
-            if sealed_indices[t] != edited_indices[t]
-                && let Some(pixel) = tiles.pixel_at(sx, sy)
-            {
+            if let Some(pixel) = tiles.pixel_at(sx, sy) {
                 samples[t * spp..t * spp + spp].copy_from_slice(pixel);
             }
             ox += 1;

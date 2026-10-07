@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The overlay blend: [`overlay_table`](crate::zmap::overlay_table)'s
-//! colour for each pixel's Z-Map index, blended over the composite at an
-//! adjustable opacity. Integer throughout, the same reduction
+//! The overlay blend: one colour per pixel, from
+//! [`overlay_colors`](crate::retouch::overlay_colors), blended over the
+//! composite at an adjustable opacity. Integer throughout, the same reduction
 //! [`crate::display::tonemap_cpu`] uses, so `crates/gpu`'s WGSL twin agrees bit-exactly.
 
 use rayon::prelude::*;
@@ -16,25 +16,21 @@ pub fn alpha_from_opacity(opacity: f32) -> u8 {
     (opacity * 255.0).round() as u8
 }
 
-/// Blends `table`'s colour for each pixel's Z-Map `indices` entry over
-/// `composite` at `alpha`, in `tonemap_cpu`'s RGBA8 buffer-local-coordinate
-/// shape; an index at or past `table.len() - 1` (`NO_SOURCE` included)
-/// clamps to the table's last entry. `composite.len()` must be
-/// `width * height * 3`, `indices.len()` and `out.len() / 4` must be
-/// `width * height`.
+/// Blends each pixel's overlay colour in `colors` over `composite` at
+/// `alpha`, in `tonemap_cpu`'s RGBA8 buffer-local-coordinate shape.
+/// `composite.len()` must be `width * height * 3`, `colors.len()` and
+/// `out.len() / 4` must be `width * height`.
 pub fn overlay_cpu(
     composite: &[u16],
-    indices: &[u16],
+    colors: &[[u8; 3]],
     width: u32,
     height: u32,
-    table: &[[u8; 3]],
     alpha: u8,
     out: &mut [u8],
 ) {
     debug_assert_eq!(composite.len(), width as usize * height as usize * 3);
-    debug_assert_eq!(indices.len(), width as usize * height as usize);
+    debug_assert_eq!(colors.len(), width as usize * height as usize);
     debug_assert_eq!(out.len(), width as usize * height as usize * 4);
-    let last = table.len() as u32 - 1;
     let alpha = u32::from(alpha);
     out.par_chunks_exact_mut(4)
         .enumerate()
@@ -42,7 +38,7 @@ pub fn overlay_cpu(
             let x = (i as u32) % width;
             let y = (i as u32) / width;
             let base_index = i * 3;
-            let over = table[(u32::from(indices[i]).min(last)) as usize];
+            let over = colors[i];
             for c in 0..3 {
                 let base = u32::from(reduce16to8(composite[base_index + c], x, y));
                 let blended = (base * (255 - alpha) + u32::from(over[c]) * alpha + 127) / 255;
@@ -56,6 +52,7 @@ pub fn overlay_cpu(
 #[test]
 fn opacity_endpoints_are_exact() {
     use crate::display::tonemap_cpu;
+    use crate::retouch::overlay_colors;
     use crate::zmap::{NO_SOURCE, overlay_table};
 
     let width = 37u32;
@@ -74,6 +71,23 @@ fn opacity_endpoints_are_exact() {
         };
     }
     let table = overlay_table(5, None);
+    let info = crate::zmap::ZMapInfo::new(width, height, 5).unwrap();
+    let rect = crate::tile::Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut colors = vec![[0u8; 3]; n];
+    overlay_colors(
+        &[],
+        info,
+        rect,
+        std::num::NonZeroU32::MIN,
+        &table,
+        &indices,
+        &mut colors,
+    );
 
     // Opacity 0 leaves tonemap_cpu's own composite output untouched.
     let mut expected = vec![0u8; n * 4];
@@ -81,10 +95,9 @@ fn opacity_endpoints_are_exact() {
     let mut actual = vec![0u8; n * 4];
     overlay_cpu(
         &composite,
-        &indices,
+        &colors,
         width,
         height,
-        &table,
         alpha_from_opacity(0.0),
         &mut actual,
     );
@@ -97,10 +110,9 @@ fn opacity_endpoints_are_exact() {
     // pixels exactly the table's last entry.
     overlay_cpu(
         &composite,
-        &indices,
+        &colors,
         width,
         height,
-        &table,
         alpha_from_opacity(1.0),
         &mut actual,
     );

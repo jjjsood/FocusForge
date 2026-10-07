@@ -84,10 +84,10 @@ export component AppWindow inherits Window {
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
     in property <bool> cursor-visible: false;
+    in property <length> cursor-frame-x;
+    in property <length> cursor-frame-y;
     in property <length> cursor-composite-x;
     in property <length> cursor-composite-y;
-    in property <length> cursor-zmap-x;
-    in property <length> cursor-zmap-y;
 
     no-frame: true;
     resize-border-width: 8px;
@@ -214,14 +214,13 @@ export component AppWindow inherits Window {
         save-checkpoint-requested => { root.save-checkpoint-requested(); }
     }
 
-    // Both images are `in` properties set from Rust
+    // The images are `in` properties set from Rust
     // (`crates/gui/src/gpu_canvas.rs`) once a project is loaded -- the wgpu
     // texture is never computed here.
     in property <image> composite-source;
-    in property <image> zmap-source;
     // The selected source frame (`src/gpu_canvas.rs::redraw_frame`) -- the
     // left pane's own image, label and refusal text, independent of the
-    // composite/Z-Map pair above.
+    // composite above.
     in property <image> frame-source;
     in property <string> frame-label: "";
     // Each pane's refusal, one entry per line: the selected frame's on the
@@ -257,8 +256,8 @@ export component AppWindow inherits Window {
     callback checkpoint-scrollbar-dragged(length);
     callback checkpoint-viewport-height-changed(length);
     out property <length> checkpoint-viewport-height: dock.checkpoint-viewport-height;
+    callback frame-undock-requested();
     callback composite-undock-requested();
-    callback zmap-undock-requested();
     // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
     // matching one-line-forward style as the two above.
     callback canvas-scrolled(length, length, length, length, bool, bool, bool);
@@ -348,7 +347,6 @@ export component AppWindow inherits Window {
             width: 100%;
             height: 100%;
             composite-source: root.composite-source;
-            zmap-source: root.zmap-source;
             frame-source: root.frame-source;
             frame-label: root.frame-label;
             frame-message-lines: root.frame-message-lines;
@@ -393,13 +391,13 @@ export component AppWindow inherits Window {
             cursor-picking: root.cursor-picking;
             cursor-pick-color: root.cursor-pick-color;
         cursor-visible: root.cursor-visible;
+        cursor-frame-x: root.cursor-frame-x;
+        cursor-frame-y: root.cursor-frame-y;
         cursor-composite-x: root.cursor-composite-x;
         cursor-composite-y: root.cursor-composite-y;
-        cursor-zmap-x: root.cursor-zmap-x;
-        cursor-zmap-y: root.cursor-zmap-y;
 
+            frame-undock-requested => { root.frame-undock-requested(); }
             composite-undock-requested => { root.composite-undock-requested(); }
-            zmap-undock-requested => { root.zmap-undock-requested(); }
             open-folder-requested => { root.open-folder-requested(); }
             canvas-scrolled(dx, dy, x, y, ctrl, shift, alt) => {
                 root.canvas-scrolled(dx, dy, x, y, ctrl, shift, alt);

@@ -8,15 +8,15 @@
 mod common;
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest, ZMapStorage,
+    self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -200,23 +200,6 @@ fn stroke(source_id: u16, x: i32, y: i32, radius: f32) -> Op {
     }
 }
 
-fn read_pixel(path: &Path, x: u32, y: u32) -> u16 {
-    let reader = ZMapReader::open(path).unwrap();
-    let mut buf = [0u16; 1];
-    reader
-        .read_tile_into(
-            Rect {
-                x,
-                y,
-                width: 1,
-                height: 1,
-            },
-            &mut buf,
-        )
-        .unwrap();
-    buf[0]
-}
-
 fn read_zmap_pixels(path: &Path) -> Vec<u16> {
     let reader = ZMapReader::open(path).unwrap();
     let (w, h) = reader.dimensions();
@@ -226,14 +209,7 @@ fn read_zmap_pixels(path: &Path) -> Vec<u16> {
 }
 
 fn read_entry_bytes(path: &Path, name: &str) -> Vec<u8> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let mut bytes = Vec::new();
-    archive
-        .by_name(name)
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+    Index::read(path).unwrap().read_entry(path, name).unwrap()
 }
 
 fn read_whole_file(path: &Path) -> Vec<u8> {
@@ -241,8 +217,11 @@ fn read_whole_file(path: &Path) -> Vec<u8> {
 }
 
 fn archive_entry_names(path: &Path) -> HashSet<String> {
-    let archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    archive.file_names().map(str::to_string).collect()
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
+        .collect()
 }
 
 /// `result.unwrap_err()`, without requiring the `Ok` side to implement
@@ -269,36 +248,24 @@ fn mutate_container(
     replace: &[(String, Vec<u8>)],
     add: &[(String, Vec<u8>)],
 ) {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in &names {
-        let mut bytes = Vec::new();
-        archive
-            .by_name(name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
-        if let Some(entry) = replace.iter().find(|entry| &entry.0 == name) {
-            bytes = entry.1.clone();
-        }
-        writer.start_file(name.as_str(), options).unwrap();
-        std::io::Write::write_all(&mut writer, &bytes).unwrap();
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        let bytes = match replace.iter().find(|entry| entry.0 == name) {
+            Some(entry) => entry.1.clone(),
+            None => index.read_entry(src, name).unwrap(),
+        };
+        writer.put_bytes(name, &bytes).unwrap();
     }
     for (name, bytes) in add {
-        writer.start_file(name.as_str(), options).unwrap();
-        std::io::Write::write_all(&mut writer, bytes).unwrap();
+        writer.put_bytes(name, bytes).unwrap();
     }
     writer.finish().unwrap();
 }
 
 #[test]
 fn branching_adds_a_child_and_rewrites_nothing() {
-    let (dir, project_path) = sealed("checkpoint_store_branch_add", 64, 48, 8);
+    let (_dir, project_path) = sealed("checkpoint_store_branch_add", 64, 48, 8);
     let root_id = Project::open(&project_path)
         .unwrap()
         .checkpoint()
@@ -310,7 +277,6 @@ fn branching_adds_a_child_and_rewrites_nothing() {
         vec![stroke(2, 10, 10, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .expect("append onto the head must succeed");
 
@@ -326,7 +292,6 @@ fn branching_adds_a_child_and_rewrites_nothing() {
         vec![stroke(5, 50, 35, 1.0)],
         None,
         1_700_000_100,
-        ZMapStorage::Full,
     )
     .expect("branching onto the root must succeed");
 
@@ -344,19 +309,20 @@ fn branching_adds_a_child_and_rewrites_nothing() {
         "sibling entry must be byte-unchanged"
     );
 
-    let mut project = Project::open(&project_path).unwrap();
+    let project = Project::open(&project_path).unwrap();
     let b = project.history().get(&sealed_b.checkpoint).unwrap().clone();
     assert_eq!(b.parent.as_deref(), Some(root_id.as_str()));
 
-    let out = dir.join("b.tif");
-    project::materialize_zmap(&mut project, &b, &out).unwrap();
-    // B ignores A's edit at (10, 10) -- it replayed over the root, not the head.
-    assert_ne!(
-        read_pixel(&out, 10, 10),
-        2,
-        "a branch off the root must not see a sibling's edit"
+    let root_blob = project.history().get(&root_id).unwrap().zmap_blob.clone();
+    assert_eq!(
+        b.zmap_blob, root_blob,
+        "an op checkpoint names the fused map"
     );
-    assert_eq!(read_pixel(&out, 50, 35), 5, "B's own stroke must land");
+    assert_eq!(
+        b.ops,
+        vec![stroke(5, 50, 35, 1.0)],
+        "B holds its own stroke only"
+    );
 }
 
 #[test]
@@ -373,7 +339,6 @@ fn traversal_over_a_branched_history() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -382,7 +347,6 @@ fn traversal_over_a_branched_history() {
         vec![stroke(2, 6, 6, 1.0)],
         None,
         1_700_000_010,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -392,7 +356,6 @@ fn traversal_over_a_branched_history() {
         vec![stroke(3, 20, 20, 1.0)],
         None,
         1_700_000_020,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -457,7 +420,6 @@ fn leaf_delete_touches_nothing_else() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap();
 
@@ -467,58 +429,16 @@ fn leaf_delete_touches_nothing_else() {
 
     let names = archive_entry_names(&project_path);
     assert!(!names.contains(&format!("checkpoints/{}.json", leaf.checkpoint)));
-    assert!(!names.contains(&format!("blobs/{}.zst", leaf.zmap.hash)));
+    assert!(
+        names.contains(&format!("blobs/{}.zst", leaf.zmap.hash)),
+        "the root's blob stays indexed"
+    );
 
     let mut project = Project::open(&project_path).unwrap();
     let root_again = project.history().get(&root_id).unwrap().clone();
     let after = dir.join("root-after.tif");
     project::materialize_zmap(&mut project, &root_again, &after).unwrap();
     assert_eq!(root_pixels_before, read_zmap_pixels(&after));
-}
-
-#[test]
-fn shared_blob_survives_a_delete() {
-    let (dir, project_path) = sealed("checkpoint_store_shared_blob", 48, 32, 6);
-    let root_id = Project::open(&project_path)
-        .unwrap()
-        .checkpoint()
-        .id
-        .clone();
-    let ops = vec![stroke(4, 15, 12, 1.0)];
-
-    let branch1 = project::append_ops_at(
-        &project_path,
-        ops.clone(),
-        None,
-        1_700_000_000,
-        ZMapStorage::Full,
-    )
-    .unwrap();
-    let branch2 = project::append_ops_onto(
-        &project_path,
-        &root_id,
-        ops,
-        None,
-        1_700_000_010,
-        ZMapStorage::Full,
-    )
-    .unwrap();
-    // The same ops from the same parent, stored in full: one shared blob.
-    assert_eq!(branch1.zmap.hash, branch2.zmap.hash);
-
-    let mut project = Project::open(&project_path).unwrap();
-    let branch2_checkpoint = project.history().get(&branch2.checkpoint).unwrap().clone();
-    let before = dir.join("branch2-before.tif");
-    project::materialize_zmap(&mut project, &branch2_checkpoint, &before).unwrap();
-    let pixels_before = read_zmap_pixels(&before);
-
-    project::delete_checkpoint(&project_path, &branch1.checkpoint).unwrap();
-
-    let mut project = Project::open(&project_path).unwrap();
-    let branch2_checkpoint = project.history().get(&branch2.checkpoint).unwrap().clone();
-    let after = dir.join("branch2-after.tif");
-    project::materialize_zmap(&mut project, &branch2_checkpoint, &after).unwrap();
-    assert_eq!(pixels_before, read_zmap_pixels(&after));
 }
 
 #[test]
@@ -529,7 +449,6 @@ fn delete_reads_no_source_frame() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap();
 
@@ -616,7 +535,6 @@ fn parent_cycle_is_refused() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -651,7 +569,6 @@ fn parent_stays_a_single_optional_link() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -706,7 +623,6 @@ fn delete_of_the_head_repoints_to_the_newest_survivor() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         root_created_at + 10,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -715,7 +631,6 @@ fn delete_of_the_head_repoints_to_the_newest_survivor() {
         vec![stroke(2, 6, 6, 1.0)],
         None,
         root_created_at + 20,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -743,7 +658,6 @@ fn append_after_branching_keeps_every_sibling() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_000,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -753,7 +667,6 @@ fn append_after_branching_keeps_every_sibling() {
         vec![stroke(2, 20, 20, 1.0)],
         None,
         1_700_000_010,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -765,7 +678,6 @@ fn append_after_branching_keeps_every_sibling() {
         vec![stroke(3, 25, 25, 1.0)],
         None,
         1_700_000_020,
-        ZMapStorage::Full,
     )
     .unwrap()
     .checkpoint;
@@ -809,7 +721,6 @@ fn branching_across_a_refuse_takes_that_fuses_planes() {
         vec![stroke(1, 5, 5, 1.0)],
         None,
         1_700_000_100,
-        ZMapStorage::Full,
     )
     .unwrap();
 
@@ -911,7 +822,7 @@ fn unrecorded_fuse_is_refused_by_name() {
         .unwrap()
         .checkpoint()
         .created_at;
-    append_bounded(
+    append_ops(
         &project_path2,
         vec![stroke(1, 5, 5, 1.0)],
         root_created_at + 10,
@@ -956,26 +867,14 @@ fn root_id_of(path: &Path) -> String {
     chain.last().unwrap().id.clone()
 }
 
-/// Every zip entry but the manifest, by name: what a delete must leave
+/// Every indexed record but the manifest, by name: what a delete must leave
 /// alone for each checkpoint it does not touch.
 fn entries_but_manifest(path: &Path) -> BTreeMap<String, Vec<u8>> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-    let names: Vec<String> = archive
-        .file_names()
+    let index = Index::read(path).unwrap();
+    index
+        .names()
         .filter(|name| *name != "manifest.json")
-        .map(str::to_string)
-        .collect();
-    names
-        .into_iter()
-        .map(|name| {
-            let mut bytes = Vec::new();
-            archive
-                .by_name(&name)
-                .unwrap()
-                .read_to_end(&mut bytes)
-                .unwrap();
-            (name, bytes)
-        })
+        .map(|name| (name.to_string(), index.read_entry(path, name).unwrap()))
         .collect()
 }
 
@@ -1002,8 +901,8 @@ fn refuse_onto_head(dir: &Path, project_path: &Path, salt: u32, created_at: i64)
     .checkpoint
 }
 
-fn append_bounded(project_path: &Path, ops: Vec<Op>, created_at: i64) -> project::SealedProject {
-    project::append_ops_at(project_path, ops, None, created_at, ZMapStorage::Bounded).unwrap()
+fn append_ops(project_path: &Path, ops: Vec<Op>, created_at: i64) -> project::SealedProject {
+    project::append_ops_at(project_path, ops, None, created_at).unwrap()
 }
 
 fn visible_ids(project_path: &Path) -> HashSet<String> {
@@ -1017,21 +916,17 @@ fn visible_ids(project_path: &Path) -> HashSet<String> {
 }
 
 #[test]
-fn deleting_a_leaf_removes_it_and_shrinks_the_file() {
+fn deleting_a_leaf_stops_indexing_it_and_leaves_its_bytes_as_dead_data() {
     let (_dir, project_path) = sealed("checkpoint_store_leaf_shrinks", 48, 32, 6);
     let root_id = Project::open(&project_path)
         .unwrap()
         .checkpoint()
         .id
         .clone();
-    let leaf = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000);
-    assert_eq!(
-        leaf.zmap.kind,
-        project::BlobKind::SparseDelta,
-        "the leaf is a delta child"
-    );
+    let leaf = append_ops(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000);
 
     let size_before = read_whole_file(&project_path).len();
+    let index_before = Index::read(&project_path).unwrap();
     let entries_before = entries_but_manifest(&project_path);
     let deleted = project::delete_checkpoint(&project_path, &leaf.checkpoint).unwrap();
     assert_eq!(deleted.hidden, leaf.checkpoint);
@@ -1046,14 +941,17 @@ fn deleting_a_leaf_removes_it_and_shrinks_the_file() {
             .iter()
             .all(|c| c.id != leaf.checkpoint)
     );
+    let checkpoint_record = format!("checkpoints/{}.json", leaf.checkpoint);
     let names = archive_entry_names(&project_path);
-    assert!(!names.contains(&format!("checkpoints/{}.json", leaf.checkpoint)));
-    assert!(!names.contains(&format!("blobs/{}.zst", leaf.zmap.hash)));
-    assert!(read_whole_file(&project_path).len() < size_before);
+    assert!(!names.contains(&checkpoint_record));
+    assert!(read_whole_file(&project_path).len() > size_before);
+    let dropped_len = index_before.get(&checkpoint_record).unwrap().1;
+    assert!(
+        Index::read(&project_path).unwrap().dead_bytes() >= index_before.dead_bytes() + dropped_len
+    );
 
     let mut expected = entries_before;
     expected.remove(&format!("checkpoints/{}.json", leaf.checkpoint));
-    expected.remove(&format!("blobs/{}.zst", leaf.zmap.hash));
     assert_eq!(
         expected,
         entries_but_manifest(&project_path),
@@ -1069,12 +967,11 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
         .checkpoint()
         .created_at;
     let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
-    let child = append_bounded(
+    let child = append_ops(
         &project_path,
         vec![stroke(2, 6, 6, 1.0)],
         root_created_at + 20,
     );
-    assert_eq!(child.zmap.kind, project::BlobKind::SparseDelta);
 
     let outputs = |tag: &str| {
         let mut project = Project::open(&project_path).unwrap();
@@ -1106,7 +1003,7 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
     assert!(!visible_ids(&project_path).contains(&parent));
     assert!(project.history().get(&parent).unwrap().hidden);
     drop(project);
-    let size_after_hide = read_whole_file(&project_path).len();
+    let dead_after_hide = Index::read(&project_path).unwrap().dead_bytes();
 
     let parent_json = format!("checkpoints/{parent}.json");
     let mut expected = entries_before;
@@ -1129,8 +1026,15 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
 
     let deleted = project::delete_checkpoint(&project_path, &child.checkpoint).unwrap();
     let removed: HashSet<String> = deleted.removed.into_iter().collect();
-    assert_eq!(removed, HashSet::from([parent, child.checkpoint]));
-    assert!(read_whole_file(&project_path).len() < size_after_hide);
+    assert_eq!(
+        removed,
+        HashSet::from([parent.clone(), child.checkpoint.clone()])
+    );
+    let index = Index::read(&project_path).unwrap();
+    assert!(index.dead_bytes() > dead_after_hide);
+    for id in &removed {
+        assert!(!index.contains(&format!("checkpoints/{id}.json")));
+    }
 }
 
 #[test]
@@ -1150,7 +1054,7 @@ fn the_last_visible_checkpoint_cannot_be_deleted() {
     assert!(e.to_string().contains(&root_id));
     assert_eq!(before, read_whole_file(&project_path));
 
-    let child = append_bounded(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000).checkpoint;
+    let child = append_ops(&project_path, vec![stroke(1, 5, 5, 1.0)], 1_700_000_000).checkpoint;
     let deleted = project::delete_checkpoint(&project_path, &root_id).unwrap();
     assert_eq!(deleted.hidden, root_id);
     assert!(deleted.removed.is_empty(), "the child is built on the root");
@@ -1186,12 +1090,12 @@ fn the_head_moves_to_the_newest_visible_checkpoint() {
         .composite
         .blob
         .clone();
-    let child = append_bounded(
+    let child = append_ops(
         &project_path,
         vec![stroke(1, 5, 5, 1.0)],
         root_created_at + 20,
     );
-    let head = append_bounded(
+    let head = append_ops(
         &project_path,
         vec![stroke(2, 6, 6, 1.0)],
         root_created_at + 30,
@@ -1238,7 +1142,7 @@ fn hidden_checkpoints_survive_a_reopen() {
         .checkpoint()
         .created_at;
     let parent = refuse_onto_head(&dir, &project_path, 71, root_created_at + 10);
-    let child = append_bounded(
+    let child = append_ops(
         &project_path,
         vec![stroke(1, 5, 5, 1.0)],
         root_created_at + 20,

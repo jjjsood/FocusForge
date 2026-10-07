@@ -32,16 +32,17 @@ GNU General Public License v3.
 - Exports any checkpoint of a project as a TIFF, PNG or JPEG image
   (`focusforge-cli export`), with per-format bit depth, compression, JPEG
   quality and chroma subsampling, and EXIF, ICC, XMP and IPTC carried over;
-  rendered from the Z-Map, separately from the run that produced it
+  rendered from the stored composite, separately from the run that produced it
 - Keeps every retouch as a checkpoint in a branching history: list,
   restore, branch from, export and delete checkpoints in the window or with
   `focusforge-cli history`
 - Reports outcome, sharpness and Z-Map coverage per stack after a run
   (`focusforge-cli review`), so a failed stack in a batch is a visible record
   rather than a missing file
-- Retouches a stack's Z-Map by hand — brush, pipette and a rainbow source
-  overlay, unlimited undo with redo discarded on a new edit — headless via
-  `focusforge-cli retouch` or with a mouse in the window's editor mode
+- Retouches the result with soft brush strokes from a chosen frame — brush,
+  pipette and a rainbow source overlay, unlimited undo with redo discarded
+  on a new edit — headless via `focusforge-cli retouch` or with a mouse in
+  the window's editor mode
 - Reusable parameter bundles (presets) and a re-run flag that fuses only the
   stacks you name, so tuning one stack after a batch run costs one re-run,
   not the whole folder again
@@ -65,7 +66,7 @@ GNU General Public License v3.
   packages the evidence into one redacted ZIP, and the next start after a
   crash tells you it's there
 - A window (`focusforge-gui`) alongside the CLI: open a folder or a saved
-  project into a tab, view the selected source frame beside the composite or Z-Map,
+  project into a tab, view the selected source frame beside the composite,
   choose a method and edit its parameters in Prepare, Fuse, Align and
   Finish sections, switch alignment on or off, run, pause, cancel or retry a fuse,
   and switch into editor mode to retouch the result, browse its

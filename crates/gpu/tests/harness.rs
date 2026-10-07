@@ -17,14 +17,16 @@ mod device;
 mod ecc_parity;
 #[path = "harness/errors.rs"]
 mod errors;
+#[path = "harness/full_frame_render_identity.rs"]
+mod full_frame_render_identity;
 #[path = "harness/parity.rs"]
 mod parity;
+#[path = "harness/parity_blend.rs"]
+mod parity_blend;
 #[path = "harness/parity_fusion.rs"]
 mod parity_fusion;
 #[path = "harness/parity_pipeline.rs"]
 mod parity_pipeline;
-#[path = "harness/parity_recomposite.rs"]
-mod parity_recomposite;
 #[path = "harness/parity_tonemap.rs"]
 mod parity_tonemap;
 #[path = "harness/parity_warp.rs"]

@@ -3,34 +3,35 @@
 //! [`seal`]: the one function `crates/cli` calls to turn a finished run into
 //! a project.
 //!
-//! **A project cannot be written tile by tile.** A blob's zip entry name
+//! **A project cannot be written tile by tile.** A blob's record name
 //! *is* the content hash of the finished plane, which is unknown until the
 //! last tile, and zstd exposes no seekable format. So fusion keeps writing
 //! its two staged TIFFs under a scratch directory, and the project is
-//! sealed **after** the job completes, by staging then renaming the two
-//! files onto the names a user gave. Sealing never touches the ledger, the
+//! sealed **after** the job completes, by compressing the two files into
+//! records of a new project. Sealing never touches the ledger, the
 //! resume path, the coverage refusal or the cancel semantics, and it is
 //! the only shape the format allows.
 //!
 //! This function is where the format commitments are made concrete at once:
-//! the entry layout, the [`BlobKind`] it records on every blob, the hash it
+//! the record layout, the [`BlobKind`] it records on every blob, the hash it
 //! takes over *uncompressed* bytes with its algorithm named, and the fully
 //! serialized [`Checkpoint`] -- `parent: None`, `ops: []` -- it writes
 //! beside them.
 
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
 use super::checkpoint::{Checkpoint, FuseRecord, Op};
-use super::container::ProjectWriter;
+use super::container::{ContainerWriter, PartialFile};
 use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-use super::{HASH_ALGORITHM, Project};
+use super::{HASH_ALGORITHM, Project, blob_entry, checkpoint_entry};
 use crate::align::Registration;
 use crate::params::ParamValues;
 
@@ -49,8 +50,8 @@ pub struct SealRequest<'a> {
     pub align: Option<AlignRecord>,
     /// Every frame's transform and the applied crop.
     pub registration: Registration,
-    /// The `ImageDescription` an export of the fused checkpoint's own
-    /// gather writes into its TIFF's IFD.
+    /// The `ImageDescription` an export of the fused checkpoint's unedited
+    /// result image writes into its TIFF's IFD.
     pub composite_description: String,
     pub label: Option<String>,
     pub metrics: Metrics,
@@ -76,10 +77,19 @@ pub fn seal(request: SealRequest<'_>) -> Result<SealedProject, ProjectError> {
 /// clock.
 ///
 /// `created_at` is the **only** thing that differs between two seals of the
-/// same inputs -- the `zip` dependency deliberately has no clock feature, so
-/// every entry gets the default DOS timestamp -- which makes this the entry
-/// point a reproducibility check uses.
+/// same inputs, which makes this the entry point a reproducibility check
+/// uses.
 pub fn seal_at(request: SealRequest<'_>, created_at: i64) -> Result<SealedProject, ProjectError> {
+    seal_with(request, created_at, None)
+}
+
+/// [`seal_at`] with the composite's blob already staged: it is written as
+/// it is and stays where it is.
+pub(super) fn seal_with(
+    request: SealRequest<'_>,
+    created_at: i64,
+    composite: Option<&StagedBlob>,
+) -> Result<SealedProject, ProjectError> {
     let staging = request
         .staged_composite
         .parent()
@@ -87,21 +97,36 @@ pub fn seal_at(request: SealRequest<'_>, created_at: i64) -> Result<SealedProjec
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let mut staged: Vec<StagedBlob> = Vec::new();
-    let result = seal_staged(&request, created_at, &staging, &mut staged);
+    let result = seal_staged(&request, created_at, composite, &staging, &mut staged);
     for blob in &staged {
         blob.remove();
     }
     result
 }
 
+/// The composite's blob: `ready` as it is, else `file` compressed into
+/// `staging` and recorded in `staged` for cleanup.
+pub(super) fn composite_blob(
+    ready: Option<&StagedBlob>,
+    file: &Path,
+    staging: &Path,
+    staged: &mut Vec<StagedBlob>,
+) -> Result<StagedBlob, ProjectError> {
+    if let Some(blob) = ready {
+        return Ok(blob.clone());
+    }
+    let blob = blob::stage_plane(file, Plane::Composite, ZSTD_LEVEL, staging)?;
+    staged.push(blob.clone());
+    Ok(blob)
+}
+
 fn seal_staged(
     request: &SealRequest<'_>,
     created_at: i64,
+    composite: Option<&StagedBlob>,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
-    // The sources, hashed **sequentially**: `hash_file` maps the whole file,
-    // so 61 reference frames hashed concurrently would map 16 GB at once.
     let project_dir = request
         .project_path
         .parent()
@@ -113,13 +138,7 @@ fn seal_staged(
     }
     let stack_fingerprint = blob::stack_fingerprint(&sources);
 
-    let composite = blob::stage_plane(
-        request.staged_composite,
-        Plane::Composite,
-        ZSTD_LEVEL,
-        staging,
-    )?;
-    staged.push(composite.clone());
+    let composite = composite_blob(composite, request.staged_composite, staging, staged)?;
     let zmap = blob::stage_plane(request.staged_zmap, Plane::ZMap, ZSTD_LEVEL, staging)?;
     staged.push(zmap.clone());
     let frame_count = blob::zmap_frame_count(request.staged_zmap)?;
@@ -182,22 +201,25 @@ fn seal_staged(
         hidden: false,
     };
 
-    let mut writer = ProjectWriter::create(request.project_path)?;
-    let manifest_text = serde_json::to_string_pretty(&manifest)
-        .map_err(|err| ProjectError::container(request.project_path, err))?;
-    writer.add_text("manifest.json", &manifest_text)?;
-    writer.add_blob(&composite.hash, &composite.path)?;
-    writer.add_blob(&zmap.hash, &zmap.path)?;
-    let checkpoint_text = serde_json::to_string_pretty(&checkpoint)
-        .map_err(|err| ProjectError::container(request.project_path, err))?;
-    writer.add_text(
-        &format!("checkpoints/{checkpoint_id}.json"),
-        &checkpoint_text,
+    let mut writer = ContainerWriter::create(request.project_path)?;
+    for staged in [&composite, &zmap] {
+        let mut source =
+            File::open(&staged.path).map_err(|err| ProjectError::io(&staged.path, err))?;
+        writer.put(&blob_entry(&staged.hash), &mut source)?;
+    }
+    let to_json = |err| ProjectError::container(request.project_path, err);
+    writer.put_bytes(
+        &checkpoint_entry(&checkpoint_id),
+        &serde_json::to_vec(&checkpoint).map_err(to_json)?,
     )?;
-    let path = writer.finish()?;
+    writer.put_bytes(
+        "manifest.json",
+        &serde_json::to_vec(&manifest).map_err(to_json)?,
+    )?;
+    writer.finish()?;
 
     Ok(SealedProject {
-        path,
+        path: request.project_path.to_path_buf(),
         composite: composite_record,
         zmap: zmap_record,
         checkpoint: checkpoint_id,
@@ -225,6 +247,11 @@ pub struct HeldCheckpoint {
     pub metrics: Metrics,
     /// Unix seconds, UTC, stamped when the run finished.
     pub created_at: i64,
+    /// The composite already compressed and hashed, beside the held planes.
+    /// A save writes it as it is instead of reading the composite again. Not
+    /// persisted: the file it names belongs to the process that made it.
+    #[serde(skip)]
+    pub compressed_composite: Option<Box<StagedBlob>>,
 }
 
 /// Where an in-memory checkpoint is recorded: under a checkpoint the project
@@ -243,7 +270,7 @@ pub enum ParentRef {
 pub enum InMemoryKind {
     /// A finished fuse's planes.
     Fused(HeldCheckpoint),
-    /// Ops replayed over the parent's Z-Map.
+    /// Ops rendered over the parent's result image.
     Ops { ops: Vec<Op>, created_at: i64 },
 }
 
@@ -287,11 +314,12 @@ pub fn kept_entries(
 }
 
 /// Writes the [`kept_entries`], each under its own parent, hides `deletes`
-/// (see [`super::delete_checkpoint`]) and removes hidden checkpoints nothing
-/// visible is built on, sparing `keep` and its ancestors: one rename over
-/// `target` (onto the project there when `onto_existing`). Returns the id
-/// written per written entry. On error `target` is left as it was; bad
-/// references and unknown deletes are refused before any write.
+/// (see [`super::delete_checkpoint`]) and stops listing hidden checkpoints
+/// nothing visible is built on, sparing `keep` and its ancestors. Everything
+/// is appended to `target` (the project there when `onto_existing`) and
+/// committed at once. Returns the id written per written entry. On error
+/// `target` is left as it was; bad references and unknown deletes are refused
+/// before any write.
 pub fn seal_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
@@ -299,22 +327,32 @@ pub fn seal_in_memory(
     keep: Option<&ParentRef>,
     onto_existing: bool,
 ) -> Result<Vec<String>, ProjectError> {
-    plan_in_memory(target, entries, deletes, keep, onto_existing)?;
-    let mut name = target
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".saving");
-    let temp = target.with_file_name(name);
-    let result =
-        write_in_memory(target, &temp, entries, deletes, keep, onto_existing).and_then(|ids| {
-            std::fs::rename(&temp, target).map_err(|source| ProjectError::io(target, source))?;
-            Ok(ids)
-        });
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+    let kept = kept_entries(entries, deletes, keep);
+    let mut ids: Vec<Option<String>> = vec![None; entries.len()];
+    if onto_existing {
+        let mut project = Project::open(target)?;
+        plan_in_memory(target, entries, deletes, keep, Some(&project))?;
+        write_entries(&mut project, entries, &kept, &mut ids)?;
+        apply_deletes(&mut project, deletes, keep, &ids)?;
+        project.commit()?;
+    } else {
+        plan_in_memory(target, entries, deletes, keep, None)?;
+        let guard = PartialFile::new(target);
+        let InMemoryKind::Fused(root) = &entries[0].kind else {
+            unreachable!("plan_in_memory refuses a first entry that is not a fuse");
+        };
+        ids[0] = Some(seal_root(guard.path(), root)?);
+        if kept[1..].iter().any(|&written| written) || !deletes.is_empty() {
+            let mut project = Project::open(guard.path())?;
+            write_entries(&mut project, entries, &kept, &mut ids)?;
+            apply_deletes(&mut project, deletes, keep, &ids)?;
+            project.commit()?;
+        }
+        guard
+            .commit()
+            .map_err(|source| ProjectError::io(target, source))?;
     }
-    result
+    Ok(ids.into_iter().flatten().collect())
 }
 
 fn plan_in_memory(
@@ -322,17 +360,13 @@ fn plan_in_memory(
     entries: &[InMemoryCheckpoint],
     deletes: &[ParentRef],
     keep: Option<&ParentRef>,
-    onto_existing: bool,
+    opened: Option<&Project>,
 ) -> Result<(), ProjectError> {
+    let onto_existing = opened.is_some();
     let refuse = |message: String| ProjectError::container(target, message);
     if entries.is_empty() && (deletes.is_empty() || !onto_existing) {
         return Err(refuse("no checkpoint to save".to_string()));
     }
-    let opened = if onto_existing {
-        Some(Project::open(target)?)
-    } else {
-        None
-    };
 
     for (i, entry) in entries.iter().enumerate() {
         let root = !onto_existing && i == 0;
@@ -352,7 +386,7 @@ fn plan_in_memory(
                 )));
             }
             Some(ParentRef::Entry(_)) => {}
-            Some(ParentRef::Saved(id)) => match &opened {
+            Some(ParentRef::Saved(id)) => match opened {
                 Some(project) => {
                     project.history().get(id)?;
                 }
@@ -366,7 +400,7 @@ fn plan_in_memory(
     }
 
     for reference in deletes.iter().chain(keep) {
-        match (reference, &opened) {
+        match (reference, opened) {
             (ParentRef::Entry(i), _) if *i >= entries.len() => {
                 return Err(refuse(format!("checkpoint {i} is not in the list")));
             }
@@ -387,20 +421,18 @@ fn plan_in_memory(
     Ok(())
 }
 
-fn write_in_memory(
-    target: &Path,
-    temp: &Path,
+/// Appends every `kept` entry not yet in `ids` to `project`, each under its
+/// own parent, recording the id written.
+fn write_entries(
+    project: &mut Project,
     entries: &[InMemoryCheckpoint],
-    deletes: &[ParentRef],
-    keep: Option<&ParentRef>,
-    onto_existing: bool,
-) -> Result<Vec<String>, ProjectError> {
-    if onto_existing {
-        std::fs::copy(target, temp).map_err(|source| ProjectError::io(target, source))?;
-    }
-    let kept = kept_entries(entries, deletes, keep);
-    let mut ids: Vec<Option<String>> = vec![None; entries.len()];
-    for (i, entry) in entries.iter().enumerate().filter(|(i, _)| kept[*i]) {
+    kept: &[bool],
+    ids: &mut [Option<String>],
+) -> Result<(), ProjectError> {
+    for (i, entry) in entries.iter().enumerate() {
+        if !kept[i] || ids[i].is_some() {
+            continue;
+        }
         let parent: Option<String> = match &entry.parent {
             None => None,
             Some(ParentRef::Saved(id)) => Some(id.clone()),
@@ -410,22 +442,29 @@ fn write_in_memory(
                     .expect("an entry kept for its child is written before it"),
             ),
         };
+        let parent = parent
+            .as_deref()
+            .expect("an entry after the root has a parent");
         let id = match &entry.kind {
-            InMemoryKind::Fused(held) => write_fused(temp, held, parent.as_deref())?,
+            InMemoryKind::Fused(held) => append_held(project, held, parent)?,
             InMemoryKind::Ops { ops, created_at } => {
-                super::append_ops_onto(
-                    temp,
-                    parent.as_deref().expect("an ops entry has a parent"),
-                    ops.clone(),
-                    None,
-                    *created_at,
-                    super::ZMapStorage::Bounded,
-                )?
-                .checkpoint
+                super::append::append_ops_on(project, parent, ops.clone(), None, *created_at)?
+                    .checkpoint
             }
         };
         ids[i] = Some(id);
     }
+    Ok(())
+}
+
+/// Hides `deletes` on `project`, then stops listing hidden checkpoints
+/// nothing visible is built on, sparing `keep` and its ancestors.
+fn apply_deletes(
+    project: &mut Project,
+    deletes: &[ParentRef],
+    keep: Option<&ParentRef>,
+    ids: &[Option<String>],
+) -> Result<(), ProjectError> {
     let keep_id: Option<&str> = keep.map(|reference| match reference {
         ParentRef::Saved(id) => id.as_str(),
         ParentRef::Entry(i) => ids[*i].as_deref().expect("the pinned entry is written"),
@@ -436,61 +475,67 @@ fn write_in_memory(
             ParentRef::Entry(i) => ids[*i].as_deref(),
         };
         if let Some(id) = id {
-            super::append::hide_and_collect(temp, Some(id), keep_id)?;
+            super::append::hide_and_collect(project, Some(id), keep_id)?;
         }
     }
-    super::append::hide_and_collect(temp, None, keep_id)?;
-    Ok(ids.into_iter().flatten().collect())
+    super::append::hide_and_collect(project, None, keep_id)?;
+    Ok(())
 }
 
-/// Writes one fused checkpoint into `temp`: as a new project's root when
-/// `parent` is `None`, else under `parent`.
-fn write_fused(
-    temp: &Path,
+/// Seals `held` as a new project's root at `path`.
+fn seal_root(path: &Path, held: &HeldCheckpoint) -> Result<String, ProjectError> {
+    Ok(seal_with(
+        SealRequest {
+            project_path: path,
+            staged_composite: &held.composite,
+            staged_zmap: &held.zmap,
+            sources: &held.sources,
+            algorithm: &held.algorithm,
+            params: &held.params,
+            align: held.align.clone(),
+            registration: held.registration.clone(),
+            composite_description: held.composite_description.clone(),
+            label: None,
+            metrics: held.metrics,
+        },
+        held.created_at,
+        held.compressed_composite.as_deref(),
+    )?
+    .checkpoint)
+}
+
+/// Appends `held` to `project` as a fused checkpoint under `parent`.
+fn append_held(
+    project: &mut Project,
     held: &HeldCheckpoint,
-    parent: Option<&str>,
+    parent: &str,
 ) -> Result<String, ProjectError> {
-    let written = match parent {
-        None => seal_at(
-            SealRequest {
-                project_path: temp,
-                staged_composite: &held.composite,
-                staged_zmap: &held.zmap,
-                sources: &held.sources,
-                algorithm: &held.algorithm,
-                params: &held.params,
-                align: held.align.clone(),
-                registration: held.registration.clone(),
-                composite_description: held.composite_description.clone(),
-                label: None,
-                metrics: held.metrics,
-            },
-            held.created_at,
-        )?,
-        Some(_) => super::append::append_onto(
-            super::AppendRequest {
-                project_path: temp,
-                staged_composite: &held.composite,
-                staged_zmap: &held.zmap,
-                sources: &held.sources,
-                algorithm: &held.algorithm,
-                params: &held.params,
-                align: held.align.clone(),
-                registration: held.registration.clone(),
-                composite_description: held.composite_description.clone(),
-                label: None,
-                metrics: held.metrics,
-            },
-            parent,
-            held.created_at,
-        )?,
-    };
+    let path = project.path().to_path_buf();
+    let written = super::append::append_onto(
+        project,
+        &super::AppendRequest {
+            project_path: &path,
+            staged_composite: &held.composite,
+            staged_zmap: &held.zmap,
+            sources: &held.sources,
+            algorithm: &held.algorithm,
+            params: &held.params,
+            align: held.align.clone(),
+            registration: held.registration.clone(),
+            composite_description: held.composite_description.clone(),
+            label: None,
+            metrics: held.metrics,
+        },
+        Some(parent),
+        held.created_at,
+        held.compressed_composite.as_deref(),
+    )?;
     Ok(written.checkpoint)
 }
 
 /// The manifest's blob list: one record per **distinct** hash, in the order
-/// the container writes them. Two identical planes collapse to one entry in
-/// the archive, and the manifest must say the same thing the archive does.
+/// the container writes them. Two identical planes collapse to one record,
+/// and the manifest must say the same thing the container does.
 fn blob_records(composite: &BlobRecord, zmap: &BlobRecord) -> Vec<BlobRecord> {
     if composite.hash == zmap.hash {
         vec![composite.clone()]
@@ -506,8 +551,6 @@ pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
         compression: "zstd".to_string(),
         uncompressed_len: blob.uncompressed_len,
         compressed_len: blob.compressed_len,
-        base: None,
-        target: None,
     }
 }
 
@@ -519,10 +562,7 @@ pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
 /// therefore routinely produces `AsGiven` projects -- that is the intended
 /// behaviour, not a defect.
 pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, ProjectError> {
-    let hash = blob::hash_file(path)?;
-    let bytes = std::fs::metadata(path)
-        .map_err(|source| ProjectError::io(path, source))?
-        .len();
+    let (stamp, hash) = blob::source_hash(path, None)?;
     let absolute = std::path::absolute(path).map_err(|source| ProjectError::io(path, source))?;
     let base =
         std::path::absolute(project_dir).map_err(|source| ProjectError::io(project_dir, source))?;
@@ -540,7 +580,9 @@ pub(super) fn source_ref(path: &Path, project_dir: &Path) -> Result<SourceRef, P
         path,
         resolution,
         hash,
-        bytes,
+        bytes: stamp.bytes,
+        modified_ns: stamp.modified_ns,
+        file_id: stamp.file_id,
     })
 }
 

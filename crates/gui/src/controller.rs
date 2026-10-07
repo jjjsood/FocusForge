@@ -5,7 +5,7 @@
 //! `AppController`, whose method signatures name no Slint type, so the
 //! window's behaviour is reachable from `cargo test` without a window.
 //!
-//! The canvas methods below (`pane_label`, `undock_enabled`, `frame_count`,
+//! The canvas methods below (`undock_enabled`, `frame_count`,
 //! `frame_draw`, `plane_draw`, ...) live here rather than in `crate::canvas`
 //! so they can reach `ShellState`'s private fields; `crate::canvas` owns
 //! only the plain types and pure functions. The entry path's own state
@@ -43,6 +43,7 @@ use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
+use focusforge_gpu::blend::Blender;
 
 pub use crate::entry::{
     EntryError, GroupingQuestion, GuiProject, ImportRefused, LocateTarget, OpenAs, OpenOutcome,
@@ -186,9 +187,9 @@ pub enum ShellEvent {
     /// A save's worker has parked its outcome
     /// ([`AppController::settle_save`]).
     SaveReady,
-    /// A recomposite worker has parked its gathered regions
-    /// ([`AppController::settle_recomposites`]).
-    RecompositeReady,
+    /// A region-render worker has parked its rendered regions
+    /// ([`AppController::settle_region_renders`]).
+    RegionRenderReady,
 }
 
 /// The native window that owns a chrome operation.
@@ -353,8 +354,8 @@ pub struct BrushCursorView {
     /// shown in the cursor's swatch.
     pub pick_color: [u8; 3],
     /// The shared source point projected into each pane's local coordinates.
+    pub frame_position: (f32, f32),
     pub composite_position: (f32, f32),
-    pub zmap_position: (f32, f32),
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -442,6 +443,9 @@ struct ProjectTab {
     /// [`AppController::save_active_project`] writes them. A parent is an
     /// index into this list or a saved checkpoint's id.
     held: Vec<job::InMemoryCheckpoint>,
+    /// The threads compressing the composites of `held`'s fused entries, each
+    /// with the composite file it reads; a save joins them.
+    compressing: Vec<(PathBuf, job::Compression)>,
     /// Rows (saved or in memory) whose deletion waits for the next project
     /// save; the list already leaves them out.
     pending_deletes: Vec<job::ParentRef>,
@@ -538,14 +542,15 @@ enum RowPlanes {
     /// A saved row whose planes are not cached yet; the canvas keeps what
     /// it showed until they are.
     Pending,
-    Ready(PathBuf, PathBuf),
+    /// The composite, and the Z-Map unless it failed to read.
+    Ready(PathBuf, Option<PathBuf>),
     /// The right pane's refusal text, one entry per line.
     Refused(Vec<String>),
 }
 
 /// What the active tab can show in the right pane right now.
 enum TabPlanes {
-    Ready(PathBuf, PathBuf),
+    Ready(PathBuf, Option<PathBuf>),
     Pending,
     None,
 }
@@ -561,7 +566,7 @@ struct RenderSlot {
     outcome: Arc<Mutex<Option<RenderOutcome>>>,
 }
 
-type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
+type RenderOutcome = Result<(PathBuf, Option<PathBuf>), Vec<String>>;
 
 /// The card-picture decodes in flight and where their workers park the
 /// results: tab id, the generation the decode was requested for, and the
@@ -742,6 +747,7 @@ impl ProjectTab {
             menu_open: None,
             expanded: BTreeSet::new(),
             held: Vec::new(),
+            compressing: Vec::new(),
             pending_deletes: Vec::new(),
             viewed: Vec::new(),
             selected_checkpoint,
@@ -959,6 +965,50 @@ impl ProjectTab {
         }
     }
 
+    /// The ops the row's planes already show: a saved checkpoint's render
+    /// carries its own op chain; a fused in-memory row's planes carry none.
+    fn base_ops(&self) -> Vec<job::Op> {
+        let GuiProject::Opened(project) = &self.project else {
+            return Vec::new();
+        };
+        let Some(key) = self
+            .plane_key()
+            .filter(|key| checkpoints::held_index(key).is_none())
+        else {
+            return Vec::new();
+        };
+        project
+            .history()
+            .op_chain(&key)
+            .map(|ops| ops.into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every stroke the overlay draws: the ones in the row's planes, the
+    /// session's own and the stroke being dragged. With no session, the
+    /// row's planes' strokes and its in-memory ones.
+    fn overlay_ops(&self) -> Vec<job::Op> {
+        let Some(edit) = &self.edit else {
+            let held = self
+                .selected_checkpoint
+                .as_deref()
+                .and_then(checkpoints::held_index)
+                .and_then(|index| checkpoints::stroke_chain(&self.held, index))
+                .unwrap_or_default();
+            return self.base_ops().into_iter().chain(held).collect();
+        };
+        let mut ops = edit.drawn_ops();
+        if let Some(stroke) = &edit.stroke {
+            ops.push(job::Op::BrushStroke {
+                source_id: stroke.source(),
+                path: stroke.path_so_far(),
+                radius: stroke.radius(),
+                softness: stroke.softness(),
+            });
+        }
+        ops
+    }
+
     /// Drops the installed session, if any, and starts a new session
     /// generation so one still opening for the old state is dropped when it
     /// lands. Returns whether an installed session was dropped.
@@ -976,11 +1026,9 @@ impl ProjectTab {
             .is_some_and(|entry| matches!(entry.kind, job::InMemoryKind::Ops { .. }))
     }
 
-    /// Whether the edit session holds ops its origin does not.
+    /// Whether strokes are pending over the row's saved ops.
     fn live_modified(&self) -> bool {
-        self.edit
-            .as_ref()
-            .is_some_and(|edit| edit.session.op_count() > 0)
+        self.edit.as_ref().is_some_and(|edit| edit.op_count() > 0)
     }
 
     /// Removes the files of every fused in-memory entry a project save would
@@ -1151,8 +1199,8 @@ struct ShellState {
     panes: Option<(PaneRect, PaneRect)>,
     /// Last valid rect for each side, including a side whose window is
     /// detached and therefore does not report main-window resize callbacks.
+    frame_pane: Option<PaneRect>,
     composite_pane: Option<PaneRect>,
-    zmap_pane: Option<PaneRect>,
     /// The one pane outside the main window, if any.
     detached: Option<PaneSource>,
     /// A grouping question raised by [`AppController::open_paths`], and the
@@ -1302,6 +1350,8 @@ struct ShellState {
     locate: LocateSlot,
     /// The running and queued saves, and what follows the last one.
     save: SaveSlot,
+    /// Background compactions of projects whose tab closed.
+    compactions: Vec<std::thread::JoinHandle<()>>,
     /// The `Composite` pane's rainbow overlay -- window-wide (see
     /// [`OverlayState`]).
     overlay: OverlayState,
@@ -1525,22 +1575,6 @@ fn valid_pane(pane: PaneRect) -> bool {
         && pane.height > 0.0
 }
 
-/// Widens `rect` by `margin` px on every side, clamped to `0..width` /
-/// `0..height` -- the commit pass's bound between a stroke's raw preview
-/// trace and its resampled, RDP'd committed path.
-fn dilate_rect(rect: job::Rect, margin: u32, width: u32, height: u32) -> job::Rect {
-    let x0 = rect.x.saturating_sub(margin);
-    let y0 = rect.y.saturating_sub(margin);
-    let x1 = (rect.x + rect.width + margin).min(width);
-    let y1 = (rect.y + rect.height + margin).min(height);
-    job::Rect {
-        x: x0,
-        y: y0,
-        width: x1.saturating_sub(x0),
-        height: y1.saturating_sub(y0),
-    }
-}
-
 /// The extent of `tab`'s newest composite/Z-Map -- its newest held
 /// checkpoint's, else its opened project's; `None` before any fuse.
 fn fused_image_size(tab: &ProjectTab) -> Option<ImageSize> {
@@ -1625,6 +1659,9 @@ pub struct AppController {
     /// by default, so a headless test controller never probes an adapter;
     /// [`main`](crate) turns this on for the real window.
     gpu_fusion: bool,
+    /// The blend kernel on the display device, handed to every edit session
+    /// while the device is attached.
+    blender: Option<Blender>,
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -1694,46 +1731,61 @@ impl AppController {
         self.resident_tile_size_for_test = Some(size);
     }
 
-    /// Test-only: the active tab's live editor state, to swap its frame
-    /// reader.
-    pub fn edit_state_mut_for_test(&mut self) -> Option<&mut job::EditState> {
-        self.state.active_mut()?.edit.as_mut()
+    /// Blends live strokes on `blender`'s device from here on, in every
+    /// open editor session and in each opened later; a stroke the kernel
+    /// refuses still renders on the CPU.
+    pub fn attach_blender(&mut self, blender: Blender) {
+        self.set_blender(Some(blender));
     }
 
-    /// Installs the regions recomposite workers have parked, on the tab each
+    /// Returns every editor session to blending on the CPU.
+    pub fn detach_blender(&mut self) {
+        self.set_blender(None);
+    }
+
+    fn set_blender(&mut self, blender: Option<Blender>) {
+        for tab in &mut self.state.projects {
+            if let Some(edit) = tab.edit.as_mut() {
+                edit.set_blender(blender.clone());
+            }
+        }
+        self.blender = blender;
+    }
+
+    /// Installs the regions region-render workers have parked, on the tab each
     /// was queued for -- active or not -- and dispatches what queued behind
-    /// them. Returns `true` once no tab has a recomposite in flight.
-    pub fn settle_recomposites(&mut self) -> bool {
-        let wake = self.recomposite_wake();
+    /// them. Returns `true` once no tab has a region render in flight.
+    pub fn settle_region_renders(&mut self) -> bool {
+        let wake = self.region_render_wake();
         let mut idle = true;
         for tab in &mut self.state.projects {
             if let Some(edit) = tab.edit.as_mut() {
-                idle &= edit.settle_recomposite(&wake);
+                idle &= edit.settle_region_renders(&wake);
             }
         }
         idle
     }
 
-    /// What a recomposite worker runs once it has parked a batch: the
-    /// [`ShellEvent::RecompositeReady`] on this controller's sink.
-    fn recomposite_wake(&self) -> job::RecompositeWake {
+    /// What a region-render worker runs once it has parked a batch: the
+    /// [`ShellEvent::RegionRenderReady`] on this controller's sink.
+    fn region_render_wake(&self) -> job::RegionRenderWake {
         let sink = self.sink.clone();
         Arc::new(move || {
             if let Some(sink) = &sink {
-                sink(ShellEvent::RecompositeReady);
+                sink(ShellEvent::RegionRenderReady);
             }
         })
     }
 
     /// Drains the active tab's log of every region installed into its
     /// resident display tiles since the last call -- a queued region is
-    /// logged once [`Self::settle_recomposites`] installs it; empty with no
+    /// logged once [`Self::settle_region_renders`] installs it; empty with no
     /// edit session.
-    pub fn take_recomposited(&mut self) -> Vec<job::Rect> {
+    pub fn take_rendered_regions(&mut self) -> Vec<job::Rect> {
         self.state
             .active_mut()
             .and_then(|tab| tab.edit.as_mut())
-            .map(|edit| edit.tiles.take_recomposited())
+            .map(|edit| edit.tiles.take_rendered_regions())
             .unwrap_or_default()
     }
 
@@ -1804,8 +1856,8 @@ impl AppController {
         if self.state.edits.opening(tab.id, tab.session_generation) {
             return SessionOpen::Opening;
         }
-        let zmap = match self.active_tab_planes() {
-            TabPlanes::Ready(_, zmap) => zmap,
+        let (composite, zmap) = match self.active_tab_planes() {
+            TabPlanes::Ready(composite, zmap) => (composite, zmap),
             TabPlanes::Pending => return SessionOpen::Opening,
             TabPlanes::None => return SessionOpen::Unavailable,
         };
@@ -1819,6 +1871,7 @@ impl AppController {
             return SessionOpen::Unavailable;
         };
         let frames = tab.frames.clone();
+        let base_ops = tab.base_ops();
         let chain = tab
             .selected_checkpoint
             .as_deref()
@@ -1836,11 +1889,13 @@ impl AppController {
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
                 job::open_edit_session(
-                    &zmap,
+                    zmap.as_deref(),
+                    &composite,
                     &frames,
                     registration,
                     tile_size,
                     job::host_budget(),
+                    base_ops,
                     chain,
                 )
             })
@@ -1880,7 +1935,8 @@ impl AppController {
             }
             self.state.canvas_dirty = true;
             match result {
-                Ok(edit) => {
+                Ok(mut edit) => {
+                    edit.set_blender(self.blender.clone());
                     tab.edit = Some(edit);
                     self.emit(ShellEvent::EditorChanged);
                 }
@@ -1902,18 +1958,19 @@ impl AppController {
     }
 
     /// Discards the active tab's own in-progress stroke, if any: restores
-    /// its preview and drops it, so leaving the editor or switching tab
-    /// mid-drag never leaves a preview outstanding on a tab nobody is
-    /// drawing on anymore.
+    /// and re-renders the tiles its ticks touched without it, so leaving the
+    /// editor or switching tab mid-drag never leaves a half stroke on a tab
+    /// nobody is drawing on anymore.
     fn discard_live_stroke(&mut self) {
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
-        if edit.stroke.take().is_some() {
-            edit.session.discard_preview();
+        if let Some(stroke) = edit.stroke.take() {
+            edit.end_drag(&stroke.tick_rects, Vec::new(), &wake);
         }
     }
 
@@ -1924,27 +1981,23 @@ impl AppController {
         self.state.active().is_some_and(ProjectTab::can_edit)
     }
 
-    /// The active tab's own edit session, once its worker has opened and
+    /// The active tab's live edit state, once its worker has opened and
     /// [`Self::settle_edit_session`] installed it.
-    pub fn edit_session(&self) -> Option<&job::EditSession> {
-        Some(&self.state.active()?.edit.as_ref()?.session)
+    pub fn edit_session(&self) -> Option<&job::EditState> {
+        self.state.active()?.edit.as_ref()
     }
 
     /// Mutable twin of [`Self::edit_session`] -- the seam an editor op
-    /// appends through.
-    pub fn edit_session_mut(&mut self) -> Option<&mut job::EditSession> {
-        Some(&mut self.state.active_mut()?.edit.as_mut()?.session)
+    /// pends through.
+    pub fn edit_session_mut(&mut self) -> Option<&mut job::EditState> {
+        self.state.active_mut()?.edit.as_mut()
     }
 
     /// The active tab's edited view for the renderer's overlay -- `None`
     /// before an edit session has opened.
     pub fn edited_view(&self) -> Option<crate::canvas::EditedView<'_>> {
         let edit = self.state.active()?.edit.as_ref()?;
-        Some(crate::canvas::EditedView {
-            indices: edit.session.indices(),
-            map_width: edit.session.tile().width,
-            tiles: &edit.tiles,
-        })
+        Some(crate::canvas::EditedView { tiles: &edit.tiles })
     }
 
     /// The bottom bar's overlay controls.
@@ -1956,9 +2009,12 @@ impl AppController {
     }
 
     /// Whether the overlay can be drawn: the active tab's selected row
-    /// resolves to a fuse. The bottom bar greys the controls otherwise.
+    /// resolves to a fuse whose Z-Map did not fail to read. The bottom bar
+    /// greys the controls otherwise.
     pub fn overlay_available(&self) -> bool {
-        self.state.active().is_some_and(|tab| tab.fused().is_some())
+        self.state.active().is_some_and(|tab| {
+            tab.fused().is_some() && !matches!(tab.row_planes, Some(RowPlanes::Ready(_, None)))
+        })
     }
 
     /// Turns the `Composite` pane's rainbow overlay on or off.
@@ -1973,19 +2029,19 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// The `Composite` pane's overlay draw parameters, matching
-    /// `focusforge-cli retouch --overlay --opacity`'s own blend, in either
-    /// mode -- `None` with the overlay off or when the active tab's selected
-    /// row has no fuse. The table spans that fuse's sources.
+    /// The `Composite` pane's overlay draw parameters -- `None` with the
+    /// overlay off or when the active tab's selected row has no fuse. The
+    /// table spans that fuse's sources; the ops are the strokes the image
+    /// shows, the one being dragged included.
     pub fn overlay_draw(&self) -> Option<OverlayDraw> {
-        if !self.state.overlay.on {
+        if !self.state.overlay.on || !self.overlay_available() {
             return None;
         }
-        let sources = self.state.active()?.fused()?.0.len();
-        Some(OverlayDraw::for_opacity(
-            sources as u32,
-            self.state.overlay.opacity,
-        ))
+        let tab = self.state.active()?;
+        let sources = tab.fused()?.0.len();
+        let mut draw = OverlayDraw::for_opacity(sources as u32, self.state.overlay.opacity);
+        draw.ops = tab.overlay_ops().into();
+        Some(draw)
     }
 
     /// In editor mode, gives a newly active editable tab its own edit
@@ -2653,15 +2709,6 @@ impl AppController {
         }
     }
 
-    /// `"Composite"` / `"Z-Map"` -- the label's geometry is fixed
-    /// elsewhere, not its text.
-    pub fn pane_label(&self, pane: crate::canvas::PaneSource) -> &'static str {
-        match pane {
-            crate::canvas::PaneSource::Composite => "Composite",
-            crate::canvas::PaneSource::ZMap => "Z-Map",
-        }
-    }
-
     /// A pane can leave the main window only while both panes are docked.
     pub fn undock_enabled(&self, _pane: PaneSource) -> bool {
         self.state.detached.is_none()
@@ -2812,12 +2859,12 @@ impl AppController {
         };
         let (pane, anchor) = self.anchor_pane();
         let gesture_pane = match pane {
-            PaneSource::Composite => left,
-            PaneSource::ZMap => right,
+            PaneSource::Frame => left,
+            PaneSource::Composite => right,
         };
         let other_pane = match pane {
-            PaneSource::Composite => right,
-            PaneSource::ZMap => left,
+            PaneSource::Frame => right,
+            PaneSource::Composite => left,
         };
         let detents = self.wheel_detents(Action::ZoomAtCursor, steps);
         let dir = detents.signum();
@@ -2911,16 +2958,17 @@ impl AppController {
             soft: self.state.brush.soft,
             soft_fraction: self.state.brush.soft / 100.0,
             picking: self.state.brush.picking,
-            can_undo: self.edit_session().is_some_and(job::EditSession::can_undo),
-            can_redo: self.edit_session().is_some_and(job::EditSession::can_redo),
+            can_undo: self.edit_session().is_some_and(job::EditState::can_undo),
+            can_redo: self.edit_session().is_some_and(job::EditState::can_redo),
             can_save_checkpoint: self.edit_session().is_some_and(|s| s.op_count() > 0),
         }
     }
 
     /// The brush cursor overlay's own view: extent and path commands built from the current brush
     /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
-    /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
-    /// selected source otherwise -- and projects that source point into both panes. `None` with no active tab, viewport or pane geometry, or while
+    /// preview colour -- the frame the overlay shows under the pointer while armed or while `Alt`
+    /// is held, the selected source otherwise -- and projects that source point into both panes.
+    /// `None` with no active tab, viewport or pane geometry, or while
     /// [`Self::canvas_blocked`] holds.
     pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
         if self.canvas_blocked() {
@@ -2950,8 +2998,8 @@ impl AppController {
             core_commands: paths.core,
             picking,
             pick_color: job::source_color(source, sources),
-            composite_position: viewport.from_source_in(source_point, left),
-            zmap_position: viewport.from_source_in(source_point, right),
+            frame_position: viewport.from_source_in(source_point, left),
+            composite_position: viewport.from_source_in(source_point, right),
         })
     }
 
@@ -2985,26 +3033,30 @@ impl AppController {
         (size / 2.0, self.state.brush.soft / 100.0)
     }
 
-    /// `Ctrl + Z`: steps the active tab's edit session back one op and
-    /// queues the region it returns for recompositing. Ignored while a
+    /// `Ctrl + Z`: steps the active tab's pending strokes back one op and
+    /// queues the region it returns for rendering. Ignored while a
     /// stroke is live.
     pub fn undo(&mut self) {
-        self.undo_or_redo(job::EditSession::undo);
+        self.undo_or_redo(job::EditState::undo, false);
     }
 
     /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
-    /// queues the region it returns for recompositing. Ignored while a
+    /// queues the region it returns for rendering. Ignored while a
     /// stroke is live.
     pub fn redo(&mut self) {
-        self.undo_or_redo(job::EditSession::redo);
+        self.undo_or_redo(job::EditState::redo, true);
     }
 
     /// Shared by [`Self::undo`]/[`Self::redo`]: `step` is whichever of the
     /// two returns `Some` (`None` inside meaning nothing visibly changed) or
     /// `None` when there was nothing to step. A no-op while a stroke is
     /// live.
-    fn undo_or_redo(&mut self, step: fn(&mut job::EditSession) -> Option<Option<job::Rect>>) {
-        let wake = self.recomposite_wake();
+    fn undo_or_redo(
+        &mut self,
+        step: fn(&mut job::EditState) -> Option<Option<job::Rect>>,
+        redo: bool,
+    ) {
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3015,11 +3067,27 @@ impl AppController {
         if edit.stroke.is_some() {
             return;
         }
-        let Some(region) = step(&mut edit.session) else {
+        let Some(region) = step(edit) else {
             return;
         };
         if let Some(region) = region {
-            edit.queue_recomposite(region, &wake);
+            // Undo rebuilds the region from the base and the ops still
+            // applied; redo blends the redone op over what is there.
+            let (pre, ops) = if redo {
+                (
+                    job::PreImage::Current,
+                    edit.ops().last().cloned().into_iter().collect(),
+                )
+            } else {
+                (job::PreImage::Base, edit.stack_ops())
+            };
+            let region_render = job::RegionRender {
+                region,
+                pre,
+                ops,
+                ends_drag: false,
+            };
+            edit.queue_region_render(region_render, &wake);
         }
         if tab.unsaved() != was_unsaved {
             self.emit(ShellEvent::ProjectsChanged);
@@ -3027,11 +3095,10 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// Reads the Z-Map index under `local` (pane-local coordinates) --
-    /// shared by [`Self::pick_source_at`] (which commits it as the brush
-    /// source) and [`Self::brush_cursor_view`] (which only previews its
-    /// colour). `None` off the image, off the active tab's tile, or with
-    /// nothing to read; callers decide what `NO_SOURCE` means to them.
+    /// The frame the overlay shows under `local` (pane-local coordinates):
+    /// the latest stroke covering the pixel by more than half, else the
+    /// stored Z-Map's index. `None` off the image or with nothing to read;
+    /// callers decide what `NO_SOURCE` means to them.
     fn source_index_at(&self, pane: PaneSource, local: (f32, f32)) -> Option<u16> {
         let tab = self.state.active()?;
         let viewport = tab.viewport.as_ref()?;
@@ -3040,17 +3107,17 @@ impl AppController {
             return None;
         }
         let (x, y) = (sx.floor() as u32, sy.floor() as u32);
-        let session = tab.edit.as_ref().map(|edit| &edit.session)?;
-        let tile = session.tile();
-        if x >= tile.width || y >= tile.height {
+        let edit = tab.edit.as_ref()?;
+        let info = edit.info();
+        if x >= info.width() || y >= info.height() {
             return None;
         }
-        let idx = (y * tile.width + x) as usize;
-        session.indices().get(idx).copied()
+        job::top_source(&edit.drawn_ops(), info, x, y).or_else(|| edit.stored_source(x, y))
     }
 
-    /// `Alt + click`, or the armed pipette's `Start`: reads the Z-Map index
-    /// under `local` (pane-local coordinates) and makes it the brush source.
+    /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
+    /// overlay shows under `local` (pane-local coordinates) and makes it the
+    /// brush source.
     /// `NO_SOURCE` and a point off the image leave the source unchanged.
     fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
         let Some(source) = self.source_index_at(pane, local) else {
@@ -3137,12 +3204,13 @@ impl AppController {
     }
 
     /// Called by every repaint before it reads anything else: takes the
-    /// active tab's live stroke's newest segment, if any, previews it and
-    /// queues exactly that segment's footprint for recompositing into the
-    /// resident tiles -- one tick per repaint, never per motion event. A
-    /// no-op with no live stroke or no motion since the last flush.
+    /// active tab's live stroke's newest segment, if any, and queues exactly
+    /// that segment's footprint for rendering into the resident tiles -- the
+    /// whole path so far blended over the pre-stroke samples -- one tick per
+    /// repaint, never per motion event. A no-op with no live stroke or no
+    /// motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
-        let wake = self.recomposite_wake();
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3155,20 +3223,31 @@ impl AppController {
         let Some(segment) = stroke.take_segment() else {
             return;
         };
+        let (source_id, radius, softness) = (stroke.source(), stroke.radius(), stroke.softness());
         let op = job::Op::BrushStroke {
-            source_id: stroke.source(),
+            source_id,
             path: segment,
-            radius: stroke.radius(),
-            softness: stroke.softness(),
+            radius,
+            softness,
         };
-        let region = edit
-            .session
-            .preview(&op)
+        let so_far = job::Op::BrushStroke {
+            source_id,
+            path: stroke.path_so_far(),
+            radius,
+            softness,
+        };
+        let region = job::footprint(&op, edit.info())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
         let Some(region) = region else {
             return;
         };
-        edit.queue_recomposite(region, &wake);
+        let region_render = job::RegionRender {
+            region,
+            pre: job::PreImage::Snapshot,
+            ops: vec![so_far],
+            ends_drag: false,
+        };
+        edit.queue_region_render(region_render, &wake);
         edit.stroke
             .as_mut()
             .expect("the stroke that produced this tick is still live")
@@ -3176,14 +3255,13 @@ impl AppController {
             .push(region);
     }
 
-    /// `Paint`'s `End`: flushes remaining motion, discards the preview, then
-    /// appends the stroke's resampled path unless its footprint is empty or
-    /// off-image. Queues the tick rects (dilated) for recompositing, or the
-    /// appended region itself when no tick fired (a press-release with no
-    /// motion).
+    /// `Paint`'s `End`: flushes remaining motion, then appends the stroke's
+    /// resampled path unless its footprint is empty or off-image. Re-renders
+    /// every resident tile the ticks or the appended stroke touched from its
+    /// pre-stroke samples with the resampled path blended over them.
     fn paint_end(&mut self) {
         self.flush_live_stroke();
-        let wake = self.recomposite_wake();
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3191,7 +3269,6 @@ impl AppController {
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
-        edit.session.discard_preview();
         let Some(stroke) = edit.stroke.take() else {
             return;
         };
@@ -3201,38 +3278,20 @@ impl AppController {
             radius: stroke.radius(),
             softness: stroke.softness(),
         };
-        let has_footprint = job::footprint(&op, edit.session.info())
-            .ok()
-            .flatten()
-            .is_some();
+        let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
+        let mut touched = stroke.tick_rects;
         if !has_footprint {
+            edit.end_drag(&touched, Vec::new(), &wake);
             return;
         }
-        let radius = stroke.radius();
-        let tick_rects = stroke.tick_rects;
         let region = edit
-            .session
-            .append(op)
+            .append(op.clone())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
         // Only the stroke that lights the unsaved mark changes what the tab
         // strip and the project card show.
         let lit = !was_unsaved;
-        let Some(region) = region else {
-            if lit {
-                self.emit(ShellEvent::ProjectsChanged);
-            }
-            return;
-        };
-        let map = edit.session.tile();
-        if tick_rects.is_empty() {
-            edit.queue_recomposite(region, &wake);
-        } else {
-            let margin = (radius / 8.0).ceil() as u32 + 2;
-            for rect in tick_rects {
-                let dilated = dilate_rect(rect, margin, map.width, map.height);
-                edit.queue_recomposite(dilated, &wake);
-            }
-        }
+        touched.extend(region);
+        edit.end_drag(&touched, vec![op], &wake);
         if lit {
             self.emit(ShellEvent::ProjectsChanged);
         }
@@ -3267,27 +3326,28 @@ impl AppController {
             return (pane, (x, y));
         }
         let Some((left, right)) = self.state.panes else {
-            return (PaneSource::Composite, (x, y));
+            return (PaneSource::Frame, (x, y));
         };
-        let (side, pane) =
-            if self.state.detached != Some(PaneSource::Composite) && pane_contains(left, x, y) {
-                (PaneSource::Composite, left)
-            } else if self.state.detached != Some(PaneSource::ZMap) && pane_contains(right, x, y) {
-                (PaneSource::ZMap, right)
-            } else {
-                match self.state.detached {
-                    Some(PaneSource::Composite) => (PaneSource::ZMap, right),
-                    Some(PaneSource::ZMap) => (PaneSource::Composite, left),
-                    None => {
-                        let mid = (left.x + left.width + right.x) / 2.0;
-                        if x < mid {
-                            (PaneSource::Composite, left)
-                        } else {
-                            (PaneSource::ZMap, right)
-                        }
+        let (side, pane) = if self.state.detached != Some(PaneSource::Frame)
+            && pane_contains(left, x, y)
+        {
+            (PaneSource::Frame, left)
+        } else if self.state.detached != Some(PaneSource::Composite) && pane_contains(right, x, y) {
+            (PaneSource::Composite, right)
+        } else {
+            match self.state.detached {
+                Some(PaneSource::Frame) => (PaneSource::Composite, right),
+                Some(PaneSource::Composite) => (PaneSource::Frame, left),
+                None => {
+                    let mid = (left.x + left.width + right.x) / 2.0;
+                    if x < mid {
+                        (PaneSource::Frame, left)
+                    } else {
+                        (PaneSource::Composite, right)
                     }
                 }
-            };
+            }
+        };
         (
             side,
             (
@@ -3309,8 +3369,8 @@ impl AppController {
     fn pane_rect(&self, pane: PaneSource) -> Option<PaneRect> {
         let (left, right) = self.state.panes?;
         Some(match pane {
-            PaneSource::Composite => left,
-            PaneSource::ZMap => right,
+            PaneSource::Frame => left,
+            PaneSource::Composite => right,
         })
     }
 
@@ -3324,18 +3384,18 @@ impl AppController {
             return;
         }
         match self.state.detached {
-            Some(PaneSource::Composite) => self.state.zmap_pane = Some(right),
-            Some(PaneSource::ZMap) => self.state.composite_pane = Some(left),
+            Some(PaneSource::Frame) => self.state.composite_pane = Some(right),
+            Some(PaneSource::Composite) => self.state.frame_pane = Some(left),
             None => {
-                self.state.composite_pane = Some(left);
-                self.state.zmap_pane = Some(right);
+                self.state.frame_pane = Some(left);
+                self.state.composite_pane = Some(right);
             }
         }
         self.install_pane_geometry();
     }
 
     fn install_pane_geometry(&mut self) {
-        let (Some(left), Some(right)) = (self.state.composite_pane, self.state.zmap_pane) else {
+        let (Some(left), Some(right)) = (self.state.frame_pane, self.state.composite_pane) else {
             return;
         };
         self.state.panes = Some((left, right));
@@ -3357,8 +3417,8 @@ impl AppController {
             return;
         }
         match pane {
+            PaneSource::Frame => self.state.frame_pane = Some(rect),
             PaneSource::Composite => self.state.composite_pane = Some(rect),
-            PaneSource::ZMap => self.state.zmap_pane = Some(rect),
         }
         self.install_pane_geometry();
     }
@@ -3502,7 +3562,7 @@ impl AppController {
     }
 
     /// Whether the active tab's edits have settled: no live stroke and no
-    /// recomposite queued or in flight. `true` with no edit session.
+    /// region render queued or in flight. `true` with no edit session.
     pub fn edits_settled(&self) -> bool {
         self.state
             .active()
@@ -3817,6 +3877,7 @@ impl AppController {
         if self.state.load.in_flight {
             return None;
         }
+        self.join_compactions();
         let target = match entry::classify(paths) {
             Ok(target) => target,
             Err(err) => {
@@ -4343,9 +4404,11 @@ impl AppController {
         {
             self.state.pending_checkpoint_delete = None;
         }
+        let mut compact_path = None;
         if let GuiProject::Opened(project) = &closed.project {
             let _ =
                 std::fs::remove_dir_all(job::plane_cache_dir(&self.scratch_root(), project.path()));
+            compact_path = Some(project.path().to_path_buf());
         }
         remove_in_memory(&closed.held);
         if let Some(parked) = &closed.parked {
@@ -4370,6 +4433,13 @@ impl AppController {
         };
         if closed_was_active {
             self.state.pending_frame_change = None;
+        }
+        // The tab's file handle is closed before the file is rewritten.
+        drop(closed);
+        if let Some(path) = compact_path {
+            self.state
+                .compactions
+                .push(std::thread::spawn(move || job::compact_quietly(&path)));
         }
         self.leave_editor_if_unfit();
         // A close renumbers every later tab down by one, so an index-shaped
@@ -5731,7 +5801,7 @@ impl AppController {
         let ops: Vec<&job::Op> = tab
             .edit
             .as_ref()
-            .map(|edit| edit.session.ops().collect())
+            .map(|edit| edit.ops().collect())
             .unwrap_or_default();
         let mut parts = Vec::new();
         if !ops.is_empty() {
@@ -5784,7 +5854,7 @@ impl AppController {
     pub fn pending_fuse_copy(&self) -> Option<CloseGuardCopy> {
         let (id, _) = self.state.pending_fuse?;
         let tab = self.state.projects.iter().find(|tab| tab.id == id)?;
-        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.ops().collect();
         Some(CloseGuardCopy {
             title: "Save your edits first?".to_string(),
             context: format!("Fusing {}", tab.title),
@@ -5819,7 +5889,7 @@ impl AppController {
     pub fn pending_restore_copy(&self) -> Option<CloseGuardCopy> {
         let (id, key) = self.state.pending_restore.as_ref()?;
         let tab = self.state.active().filter(|tab| tab.id == *id)?;
-        let ops: Vec<&job::Op> = tab.edit.as_ref()?.session.ops().collect();
+        let ops: Vec<&job::Op> = tab.edit.as_ref()?.ops().collect();
         let panel = self.checkpoints_panel();
         let target = panel
             .entries
@@ -6941,6 +7011,8 @@ impl AppController {
         tab.drop_session();
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
+        tab.compressing
+            .push((planes.0.clone(), job::spawn_compression(planes.0.clone())));
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
         tab.row_planes = None;
         tab.held.push(job::InMemoryCheckpoint {
@@ -7063,12 +7135,12 @@ impl AppController {
 
     /// The active tab's current row's composite and Z-Map paths: a held
     /// row's own files, a saved row's pair in the plane cache. `None` with
-    /// no current row, while a saved row's cache is not fresh, or once it
-    /// refused.
+    /// no current row, while a saved row's cache is not fresh, once it
+    /// refused, or when the row has no readable Z-Map.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
         match self.active_tab_planes() {
-            TabPlanes::Ready(composite, zmap) => Some((composite, zmap)),
-            TabPlanes::Pending | TabPlanes::None => None,
+            TabPlanes::Ready(composite, Some(zmap)) => Some((composite, zmap)),
+            TabPlanes::Ready(_, None) | TabPlanes::Pending | TabPlanes::None => None,
         }
     }
 
@@ -7090,7 +7162,7 @@ impl AppController {
                 return TabPlanes::None;
             };
             if let Some(held) = fused_of(entry) {
-                return TabPlanes::Ready(held.composite.clone(), held.zmap.clone());
+                return TabPlanes::Ready(held.composite.clone(), Some(held.zmap.clone()));
             }
             // An op-bearing row shows the planes it was taken
             // from; the session's resident tiles carry its edits.
@@ -7104,7 +7176,7 @@ impl AppController {
                         .get(base)
                         .and_then(fused_of)
                         .map_or(TabPlanes::None, |held| {
-                            TabPlanes::Ready(held.composite.clone(), held.zmap.clone())
+                            TabPlanes::Ready(held.composite.clone(), Some(held.zmap.clone()))
                         });
                 }
                 Some(RowBase::Saved(id)) => key = id,
@@ -7229,9 +7301,9 @@ impl AppController {
             .is_some_and(|index| self.history_frozen(index))
     }
 
-    /// Keeps tab `index`'s live -- its origin's Z-Map with the session's ops
+    /// Keeps tab `index`'s live -- its origin's Z-Map with the pending ops
     /// -- as an op-bearing checkpoint in memory under the current row. The
-    /// session is rebased onto it and it becomes the current row. `false`,
+    /// pending ops are rebased onto it and it becomes the current row. `false`,
     /// changing nothing, when live is unmodified or the checkpoint cannot be
     /// taken.
     pub fn snapshot_live(&mut self, index: usize) -> bool {
@@ -7252,18 +7324,18 @@ impl AppController {
         let Some(edit) = tab.edit.as_ref() else {
             return false;
         };
-        if edit.session.op_count() == 0 {
+        if edit.op_count() == 0 {
             return false;
         }
         let Some(parent) = tab.row_parent() else {
             return false;
         };
         let kind = job::InMemoryKind::Ops {
-            ops: edit.session.ops().cloned().collect(),
+            ops: edit.ops().cloned().collect(),
             created_at: job::now_unix(),
         };
         if let Some(edit) = tab.edit.as_mut() {
-            edit.session.rebase();
+            edit.rebase();
         }
         tab.held.push(job::InMemoryCheckpoint {
             kind,
@@ -7449,10 +7521,13 @@ impl AppController {
         let deletes = tab.pending_deletes.clone();
         let keep = tab.row_parent();
         let onto_existing = matches!(tab.project, GuiProject::Opened(_));
+        let compressing = std::mem::take(&mut self.state.projects[index].compressing);
         let outcome = Arc::clone(&self.state.save.outcome);
         let sink = self.sink.clone();
         let (path, worker_keep) = (target.clone(), keep.clone());
         let worker = std::thread::spawn(move || {
+            let mut held = held;
+            job::attach_compressed(&mut held, compressing);
             let result =
                 job::save_in_memory(&path, &held, &deletes, worker_keep.as_ref(), onto_existing)
                     .map_err(|err| err.to_string());
@@ -7547,6 +7622,35 @@ impl AppController {
         }
     }
 
+    /// Waits for the background compactions of closed tabs.
+    fn join_compactions(&mut self) {
+        for handle in self.state.compactions.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
+    /// Waits for the compactions of closed tabs, then compacts every open
+    /// project that is mostly dead data. The end of a session calls it, so
+    /// the process never exits mid-compaction.
+    pub fn finish_compactions(&mut self) {
+        self.join_compactions();
+        for tab in &self.state.projects {
+            if let GuiProject::Opened(project) = &tab.project {
+                job::compact_quietly(project.path());
+            }
+        }
+    }
+
+    /// Waits for every tab's background composite compression and gives each
+    /// held checkpoint its finished blob. A save does the same for its own
+    /// tab; headless runs and tests call this to look at the result.
+    pub fn finish_compressions(&mut self) {
+        for tab in &mut self.state.projects {
+            let handles = std::mem::take(&mut tab.compressing);
+            job::attach_compressed(&mut tab.held, handles);
+        }
+    }
+
     /// Joins and settles the running save and every save queued behind it,
     /// then returns whether each one wrote. Blocks: the way headless runs,
     /// tests and the end of a session wait out a write.
@@ -7613,6 +7717,7 @@ impl AppController {
             tab.title = entry::tab_title(&tab.project);
             remove_in_memory(&tab.held);
             tab.held.clear();
+            tab.compressing.clear();
             tab.pending_deletes.clear();
             if tab.edit.is_none() {
                 self.state.canvas_dirty = true;
@@ -8443,10 +8548,7 @@ fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
 /// The export modal's own state for `tab`'s current position, `None` when
 /// it has none.
 fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
-    let editing = tab
-        .edit
-        .as_ref()
-        .is_some_and(|edit| edit.session.op_count() > 0);
+    let editing = tab.edit.as_ref().is_some_and(|edit| edit.op_count() > 0);
     let info = row_export_info(tab)?;
     let kind = if editing || info.live {
         ExportKind::Live
@@ -8485,27 +8587,25 @@ fn export_project_label(project: &GuiProject) -> String {
     }
 }
 
-/// The worker's own export source for `tab`'s current position -- unsealed
-/// edits over the selected row's Z-Map when the edit session holds any op,
-/// otherwise the row itself, held or saved.
+/// The worker's own export source for `tab`'s current position -- the
+/// strokes not yet saved over the selected row's composite when the edit
+/// session holds any op, otherwise the row itself, held or saved.
 fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
     let info = row_export_info(tab)?;
     if let Some(edit) = tab
         .edit
         .as_ref()
-        .filter(|edit| edit.session.op_count() > 0 || info.live)
+        .filter(|edit| edit.op_count() > 0 || info.live)
     {
         let (sources, registration) = tab.fused()?;
-        let tile = edit.session.tile();
-        return Some(job::ExportSource::Live {
-            width: tile.width,
-            height: tile.height,
-            indices: edit.session.indices().to_vec(),
+        return Some(job::ExportSource::Pending(job::PendingState {
+            composite: edit.composite.clone(),
+            ops: edit.stack_ops(),
             sources,
             registration,
             reference: info.reference,
             description: info.description,
-        });
+        }));
     }
     if info.live {
         return None;

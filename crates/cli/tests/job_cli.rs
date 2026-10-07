@@ -188,7 +188,6 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     use focusforge_core::io::{Rect, TiffStack};
     use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
     use focusforge_core::registry;
-    use focusforge_core::retouch::{Sources, recomposite};
     use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
     let dir = tmp_dir("job_cli_output_unchanged");
@@ -255,41 +254,27 @@ fn stack_output_is_unchanged_under_the_job_engine() {
     scheduler.run(&NoopPreprocess, &consumer).unwrap();
     consumer.finish().unwrap();
 
-    // `export -o` writes a Z-Map gather over the stack's sources, not the
-    // stored `laplacian` blend, so the oracle here is the same gather run
-    // over the library's own Z-Map.
+    // The composite lives inside the project, so the comparison goes
+    // through `export`, decoded the same way as the oracle's own composite.
     let whole = Rect {
         x: 0,
         y: 0,
         width,
         height,
     };
-    let indices = TiffStack::open_files(&[oracle_zmap_path])
-        .unwrap()
-        .read_tile(0, whole)
-        .unwrap()
-        .samples;
-    let sources = Sources {
-        reader: &stack,
-        frame_count: stack.len() as u32,
-        samples_per_pixel: spp,
-        origin: (0, 0),
+    let read = |path: PathBuf| {
+        TiffStack::open_files(&[path])
+            .unwrap()
+            .read_tile(0, whole)
+            .unwrap()
+            .samples
     };
-    let mut expected_gather = vec![0u16; indices.len() * spp as usize];
-    recomposite(&indices, whole, &sources, &mut expected_gather).unwrap();
-
-    // The composite lives inside the project, so the comparison goes
-    // through `export`, then decoded the same way the oracle's own gather is.
-    let exported = export_composite(&dir, &output);
-    let exported_samples = TiffStack::open_files(&[exported])
-        .unwrap()
-        .read_tile(0, whole)
-        .unwrap()
-        .samples;
+    let expected = read(oracle_path);
+    let exported = read(export_composite(&dir, &output));
     assert_eq!(
-        exported_samples, expected_gather,
+        exported, expected,
         "stack must produce the same pixels through the job engine as the library oracle's \
-         Z-Map gathered over the stack's frames"
+         fused composite"
     );
 }
 

@@ -2,24 +2,21 @@
 
 //! The project container: what a stacking run writes instead of an image.
 //!
-//! A project is a zip holding exactly three kinds of entry:
+//! A project is one file. [`container`] describes its layout: a header,
+//! records appended one after another and a footer that indexes the live
+//! ones and commits them. Three kinds of record exist:
 //!
 //! ```text
-//! $ unzip -l mantis-512.ffp   # a real run over fixtures/mantis-512
-//!   Length      Date    Time    Name
-//! ---------  ---------- -----   ----
-//!      3804  1980-01-01 00:00   manifest.json
-//!   1426980  1980-01-01 00:00   blobs/d24eca28….zst        the composite plane
-//!     40385  1980-01-01 00:00   blobs/7108de1d….zst        the Z-Map plane
-//!       359  1980-01-01 00:00   checkpoints/5b71adbf….json
+//! manifest.json                  the head's description
+//! blobs/<hash>.zst               a plane, zstd-compressed
+//! checkpoints/<id>.json          one checkpoint
 //! ```
 //!
-//! Every entry is `Stored`, because the blobs are already zstd-compressed.
-//! Every timestamp is the DOS epoch, because the `zip` dependency enables no
-//! clock feature -- which is what makes two seals of the same inputs produce
-//! identical container bytes (`the_container_is_reproducible`).
-//! Nothing outside those three paths is ever written, and a test asserts it
-//! (`container_layout_is_exactly_the_named_entries`).
+//! A save appends records and a footer and never rewrites a byte; a torn tail
+//! after the last valid footer is ignored on open and cut off by the next
+//! save. Nothing outside those three paths is ever written, and a test asserts
+//! it (`container_layout_is_exactly_the_named_entries`). Two seals of the same
+//! inputs produce identical bytes (`the_container_is_reproducible`).
 //!
 //! # Format commitments
 //!
@@ -29,7 +26,7 @@
 //!
 //! | Commitment | Where it lives | Test |
 //! |---|---|---|
-//! | 1. the entry layout | [`container`] | `container_layout_is_exactly_the_named_entries` |
+//! | 1. the record layout | [`container`] | `container_layout_is_exactly_the_named_entries` |
 //! | 2. a blob kind field | [`BlobRecord::kind`] | `blob_kind_is_recorded_and_required` |
 //! | 3. a hash over uncompressed content, algorithm named | [`blob::stage_plane`], [`Manifest::hash_algorithm`] | `hash_is_over_uncompressed_content` |
 //! | 4. a fully serialized `Checkpoint` with all four `Op` variants | [`Checkpoint`], [`Op`] | `checkpoint_serializes_every_field_with_no_parent_and_no_ops`, `every_op_variant_round_trips` |
@@ -61,25 +58,25 @@ pub mod seal;
 pub mod validate;
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 pub use append::{
-    AppendRequest, Deleted, SNAPSHOT_BYTE_BUDGET, SNAPSHOT_CHECKPOINT_CAP, ZMapChain, ZMapStorage,
-    append, append_at, append_ops, append_ops_at, append_ops_onto, delete_checkpoint,
-    replay_ops_to,
+    AppendRequest, Deleted, append, append_at, append_op_chain, append_ops, append_ops_at,
+    append_ops_onto, delete_checkpoint,
 };
-pub use blob::{Plane, StagedBlob, hash_file, short_hash, stack_fingerprint};
+pub use blob::{FileStamp, Plane, StagedBlob, short_hash, source_hash, stack_fingerprint};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
-pub use container::{ProjectWriter, partial_path};
+pub use container::partial_path;
+use container::{ContainerWriter, Index};
 pub use error::ProjectError;
-pub use export::{export_checkpoint, export_zmap};
+pub use export::{export_checkpoint, export_held, export_pending};
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
-pub use render::{CheckpointImage, ZmapSource, render_checkpoint};
+pub use render::{CheckpointImage, PendingState, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest, SealedProject,
@@ -113,11 +110,8 @@ pub fn materialize_plane(
                 },
             )
             .map_err(|err| ProjectError::container(&partial, err))?;
-            stream_plane(project, which, &partial, path, writer)
+            stream_plane(project, &plane_ref, &partial, path, writer)
         }
-        // The head's own Z-Map may be stored as a chain of patches over an
-        // ancestor's materialized map -- exactly what `materialize_zmap`
-        // already resolves for any checkpoint, head included.
         Plane::ZMap => {
             let head = project.checkpoint().clone();
             materialize_zmap(project, &head, path)
@@ -153,13 +147,12 @@ impl PlaneWriter for crate::zmap::ZMapWriter<std::fs::File> {
 
 fn stream_plane<W: PlaneWriter>(
     project: &mut Project,
-    which: Plane,
+    plane_ref: &PlaneRef,
     partial: &Path,
     final_path: &Path,
     writer: W,
 ) -> Result<(), ProjectError> {
-    let plane_ref = project.plane(which).clone();
-    let outcome = stream_bands(project, &plane_ref, final_path, writer)
+    let outcome = stream_bands(project, plane_ref, final_path, writer)
         .and_then(|writer| {
             writer
                 .finish()
@@ -174,10 +167,8 @@ fn stream_plane<W: PlaneWriter>(
     outcome
 }
 
-/// The `read_plane_ref_into`/`write_tile` loop [`stream_plane`] and
-/// [`materialize_zmap`] both drive, stopping short of `finish()` -- the
-/// step where their two callers part ways: one renames the `.partial`
-/// immediately afterward, the other still has patches to apply to it first.
+/// The `read_plane_ref_into`/`write_tile` loop [`stream_plane`] drives,
+/// stopping short of `finish()`.
 fn stream_bands<W: PlaneWriter>(
     project: &mut Project,
     plane_ref: &PlaneRef,
@@ -211,12 +202,9 @@ pub(super) fn fused_extent(project: &Project, id: &str) -> Result<(u32, u32, u32
 }
 
 /// Streams a Z-Map that is not necessarily the project's head: `checkpoint`
-/// names its own `zmap_blob`, resolved against [`Manifest::blobs`] to
-/// either a `full` record read directly or a chain of `sparse-delta`
-/// records patched, oldest first, over their materialized base -- never
-/// more than one full map resident at a time. What a `ResetRegion` needs to
-/// replay against an ancestor other than the immediate parent, and what
-/// [`materialize_plane`]`(Plane::ZMap)` delegates to for the head.
+/// names its own `zmap_blob`, resolved against [`Manifest::blobs`] to its
+/// `full` record. What [`materialize_plane`]`(Plane::ZMap)` delegates to for
+/// the head.
 pub fn materialize_zmap(
     project: &mut Project,
     checkpoint: &Checkpoint,
@@ -225,134 +213,36 @@ pub fn materialize_zmap(
     let mut plane_ref = project.manifest().zmap.clone();
     (plane_ref.width, plane_ref.height, plane_ref.frame_count) =
         fused_extent(project, &checkpoint.id)?;
-    let blobs = project.manifest().blobs.clone();
-    let (base, deltas) = resolve_chain(&blobs, &checkpoint.zmap_blob, project.path())?;
-
-    let mut base_ref = plane_ref.clone();
-    base_ref.blob = base.hash.clone();
+    plane_ref.blob = full_blob(
+        &project.manifest().blobs,
+        &checkpoint.zmap_blob,
+        project.path(),
+    )?
+    .hash
+    .clone();
 
     let partial = partial_path(path);
     let info = crate::zmap::ZMapInfo::new(plane_ref.width, plane_ref.height, plane_ref.frame_count)
         .map_err(|err| ProjectError::container(&partial, err))?;
     let writer = crate::zmap::ZMapWriter::create(&partial, info)
         .map_err(|err| ProjectError::container(&partial, err))?;
-
-    let outcome = materialize_zmap_onto_partial(
-        project, &base_ref, &deltas, &plane_ref, path, &partial, writer,
-    );
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&partial);
-    }
-    outcome
+    stream_plane(project, &plane_ref, &partial, path, writer)
 }
 
-fn materialize_zmap_onto_partial(
-    project: &mut Project,
-    base_ref: &PlaneRef,
-    deltas: &[&BlobRecord],
-    plane_ref: &PlaneRef,
-    final_path: &Path,
-    partial: &Path,
-    writer: crate::zmap::ZMapWriter<File>,
-) -> Result<(), ProjectError> {
-    let writer = stream_bands(project, base_ref, final_path, writer)?;
-    writer
-        .finish()
-        .map_err(|err| ProjectError::container(final_path, err))?;
-
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width: plane_ref.width,
-        height: plane_ref.height,
-    };
-    let info = crate::zmap::ZMapInfo::new(plane_ref.width, plane_ref.height, plane_ref.frame_count)
-        .map_err(|err| ProjectError::container(final_path, err))?;
-
-    for delta in deltas {
-        let bytes = project.read_blob_whole(&delta.hash)?;
-        let decoded = blob::decode_delta(&bytes, final_path)?;
-        if decoded.map_width != plane_ref.width || decoded.map_height != plane_ref.height {
-            return Err(ProjectError::PatchGeometryMismatch {
-                path: final_path.to_path_buf(),
-                blob: delta.hash.clone(),
-                found_width: decoded.map_width,
-                found_height: decoded.map_height,
-                expected_width: plane_ref.width,
-                expected_height: plane_ref.height,
-            });
-        }
-        let mut patch_writer = crate::zmap::ZMapWriter::reopen(partial, info)
-            .map_err(|err| ProjectError::container(final_path, err))?;
-        patch_writer.seed_coverage(whole);
-        patch_writer
-            .write_tile(decoded.tile, &decoded.indices)
-            .map_err(|err| ProjectError::container(final_path, err))?;
-        patch_writer
-            .finish()
-            .map_err(|err| ProjectError::container(final_path, err))?;
-    }
-
-    std::fs::rename(partial, final_path).map_err(|err| ProjectError::io(final_path, err))
-}
-
-/// The one full [`BlobRecord`] `target` resolves to, plus every
-/// `sparse-delta` on the path to it, **oldest first** -- so a caller applies
-/// them over the base in the order they were originally recorded. Bounded
-/// by `blobs.len()` steps: a chain that has not resolved by then can only be
-/// a cycle, which [`Manifest::blobs`] should never contain.
-pub(super) fn resolve_chain<'a>(
+/// The `full` [`BlobRecord`] named `hash`, or [`ProjectError::MissingEntry`]
+/// when the project lists none.
+pub(super) fn full_blob<'a>(
     blobs: &'a [BlobRecord],
-    target: &str,
+    hash: &str,
     path: &Path,
-) -> Result<(&'a BlobRecord, Vec<&'a BlobRecord>), ProjectError> {
-    let mut newest_first: Vec<&BlobRecord> = Vec::new();
-    let mut current = target.to_string();
-    for _ in 0..=blobs.len() {
-        if let Some(full) = blobs
-            .iter()
-            .find(|b| b.kind == BlobKind::Full && b.hash == current)
-        {
-            let mut deltas = newest_first;
-            deltas.reverse();
-            return Ok((full, deltas));
-        }
-        let delta = blobs.iter().find(|b| {
-            b.kind == BlobKind::SparseDelta && b.target.as_deref() == Some(current.as_str())
-        });
-        match delta {
-            Some(delta) => {
-                let base = delta.base.clone().ok_or_else(|| {
-                    ProjectError::container(
-                        path,
-                        format!(
-                            "blob {} is stored as a patch with no base of its own",
-                            delta.hash
-                        ),
-                    )
-                })?;
-                newest_first.push(delta);
-                current = base;
-            }
-            None => {
-                return match newest_first.last() {
-                    Some(prev) => Err(ProjectError::PatchBaseMissing {
-                        path: path.to_path_buf(),
-                        blob: prev.hash.clone(),
-                        base: current,
-                    }),
-                    None => Err(ProjectError::MissingEntry {
-                        path: path.to_path_buf(),
-                        entry: format!("blobs/{current}.zst"),
-                    }),
-                };
-            }
-        }
-    }
-    Err(ProjectError::container(
-        path,
-        format!("blob {current} sits in a chain longer than this project's own blob list"),
-    ))
+) -> Result<&'a BlobRecord, ProjectError> {
+    blobs
+        .iter()
+        .find(|b| b.kind == BlobKind::Full && b.hash == hash)
+        .ok_or_else(|| ProjectError::MissingEntry {
+            path: path.to_path_buf(),
+            entry: blob_entry(hash),
+        })
 }
 
 use crate::algorithm::StackAlgorithm;
@@ -512,7 +402,14 @@ const READ_BAND_BYTES: usize = 4 << 20;
 /// `focusforge-cli export`. The GUI editor opens one for editing.
 pub struct Project {
     path: PathBuf,
-    archive: zip::ZipArchive<File>,
+    file: File,
+    /// The records of the committed state; [`Self::index`] adds a pending
+    /// save's.
+    index: Index,
+    /// The appends of a save in progress, written by [`Self::commit`].
+    pending: Option<ContainerWriter>,
+    /// Whether `manifest` changed since it was last written.
+    manifest_changed: bool,
     manifest: Manifest,
     checkpoint: Checkpoint,
     history: History,
@@ -531,55 +428,26 @@ pub struct Project {
 impl Project {
     /// Opens `path`: refuses a foreign file, a truncated container or a
     /// manifest or checkpoint that does not parse; refuses a structurally
-    /// broken history (a missing blob, an unresolvable Z-Map chain, an
+    /// broken history (a missing blob, a Z-Map blob with no record, an
     /// op-less checkpoint without a fuse record, a `stack_fingerprint`
-    /// disagreeing with its sources); verifies the head's own Z-Map chain
+    /// disagreeing with its sources); verifies the head's own Z-Map
     /// by hash. Never reads a source frame.
     pub fn open(path: &Path) -> Result<Self, ProjectError> {
-        let mut file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
-        let mut magic = [0u8; 4];
-        match file.read_exact(&mut magic) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(ProjectError::NotAProject {
-                    path: path.to_path_buf(),
-                });
-            }
-            Err(source) => return Err(ProjectError::io(path, source)),
-        }
-        if magic != *b"PK\x03\x04" && magic != *b"PK\x05\x06" {
+        let file = File::open(path).map_err(|source| ProjectError::io(path, source))?;
+        let index = Index::read_from(&file, path)?;
+        if !index.contains("manifest.json") {
             return Err(ProjectError::NotAProject {
                 path: path.to_path_buf(),
             });
         }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|source| ProjectError::io(path, source))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|_| ProjectError::Truncated {
-            path: path.to_path_buf(),
-        })?;
+        let manifest: Manifest = read_json(&file, &index, path, "manifest.json")?;
 
-        if archive.index_for_name("manifest.json").is_none() {
-            return Err(ProjectError::NotAProject {
-                path: path.to_path_buf(),
-            });
-        }
-        let mut manifest_text = String::new();
-        archive
-            .by_name("manifest.json")
-            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?
-            .read_to_string(&mut manifest_text)
-            .map_err(|source| ProjectError::io(path, source))?;
-
-        let manifest: Manifest = serde_json::from_str(&manifest_text)
-            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?;
-
-        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
         let mut checkpoints = Vec::new();
-        for name in names {
+        for name in index.names() {
             if let Some(rest) = name.strip_prefix("checkpoints/")
                 && rest.ends_with(".json")
             {
-                checkpoints.push(read_json::<Checkpoint>(&mut archive, path, &name)?);
+                checkpoints.push(read_json::<Checkpoint>(&file, &index, path, name)?);
             }
         }
         let history = History::build(checkpoints, path)?;
@@ -591,9 +459,17 @@ impl Project {
             })?
             .clone();
 
-        append::verify_blobs_present(&mut archive, &manifest, path)?;
+        for blob in &manifest.blobs {
+            let name = blob_entry(&blob.hash);
+            if !index.contains(&name) {
+                return Err(ProjectError::MissingEntry {
+                    path: path.to_path_buf(),
+                    entry: name,
+                });
+            }
+        }
         for c in history.all() {
-            resolve_chain(&manifest.blobs, &c.zmap_blob, path)?;
+            full_blob(&manifest.blobs, &c.zmap_blob, path)?;
             match &c.fuse {
                 Some(fuse) => {
                     if !manifest.blobs.iter().any(|b| b.hash == fuse.composite.blob) {
@@ -644,14 +520,15 @@ impl Project {
             });
         }
 
-        let (base, deltas) = resolve_chain(&manifest.blobs, &checkpoint.zmap_blob, path)?;
-        let mut base_ref = manifest.zmap.clone();
-        base_ref.blob = base.hash.clone();
-        let delta_hashes: Vec<String> = deltas.iter().map(|d| d.hash.clone()).collect();
+        let mut head_ref = manifest.zmap.clone();
+        head_ref.blob = checkpoint.zmap_blob.clone();
 
         let mut project = Project {
             path: path.to_path_buf(),
-            archive,
+            file,
+            index,
+            pending: None,
+            manifest_changed: false,
             manifest,
             checkpoint,
             history,
@@ -659,10 +536,7 @@ impl Project {
             accepted_mismatch: None,
             relocated: None,
         };
-        project.read_plane_ref_into(&base_ref, &mut |_, _| {})?;
-        for hash in &delta_hashes {
-            project.read_blob_whole(hash)?;
-        }
+        project.read_plane_ref_into(&head_ref, &mut |_, _| {})?;
         Ok(project)
     }
 
@@ -734,21 +608,6 @@ impl Project {
             })
     }
 
-    /// The path from `checkpoint`'s own Z-Map back to its nearest full
-    /// snapshot: the snapshot's own compressed size, and the count and
-    /// total compressed size of the deltas resolved on top of it. Never
-    /// refuses on length -- the chain-length cap applies when writing, not
-    /// when reading.
-    pub fn zmap_chain(&self, checkpoint: &Checkpoint) -> Result<ZMapChain, ProjectError> {
-        let (base, deltas) =
-            resolve_chain(&self.manifest.blobs, &checkpoint.zmap_blob, &self.path)?;
-        Ok(ZMapChain {
-            snapshot_bytes: base.compressed_len,
-            deltas: deltas.len(),
-            delta_bytes: deltas.iter().map(|d| d.compressed_len).sum(),
-        })
-    }
-
     /// Where one recorded source is looked for: under a located folder
     /// ([`Self::relocate_sources`]) when one is set, by its recorded file
     /// name; otherwise relative to the project's own directory when it was
@@ -778,6 +637,95 @@ impl Project {
     /// ([`check_sources`]) against the sources' recorded content.
     pub fn relocate_sources(&mut self, folder: PathBuf) {
         self.relocated = Some(folder);
+    }
+
+    /// The records of this project, a save in progress included.
+    pub(super) fn index(&self) -> &Index {
+        self.pending
+            .as_ref()
+            .map_or(&self.index, ContainerWriter::index)
+    }
+
+    fn writer(&mut self) -> Result<&mut ContainerWriter, ProjectError> {
+        if self.pending.is_none() {
+            self.pending = Some(ContainerWriter::append(&self.path, &self.index)?);
+        }
+        Ok(self.pending.as_mut().expect("the writer was just opened"))
+    }
+
+    /// Adds the staged blob to the pending save, unless the project already
+    /// holds that hash.
+    pub(super) fn put_blob(&mut self, blob: &StagedBlob) -> Result<(), ProjectError> {
+        let mut source =
+            File::open(&blob.path).map_err(|source| ProjectError::io(&blob.path, source))?;
+        self.writer()?.put(&blob_entry(&blob.hash), &mut source)
+    }
+
+    /// Adds `checkpoint` to the pending save and to the history reads see.
+    pub(super) fn put_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<(), ProjectError> {
+        let bytes = serde_json::to_vec(checkpoint)
+            .map_err(|err| ProjectError::container(&self.path, err))?;
+        self.writer()?
+            .put_bytes(&checkpoint_entry(&checkpoint.id), &bytes)?;
+        let mut all: Vec<Checkpoint> = self
+            .history
+            .all()
+            .into_iter()
+            .filter(|c| c.id != checkpoint.id)
+            .cloned()
+            .collect();
+        all.push(checkpoint.clone());
+        self.history = History::build(all, &self.path)?;
+        Ok(())
+    }
+
+    /// Makes `manifest` the project's manifest and its checkpoint the head;
+    /// the record is written once, by [`Self::commit`]. The head's
+    /// checkpoint must be in the history already.
+    pub(super) fn set_manifest(&mut self, manifest: Manifest) -> Result<(), ProjectError> {
+        self.checkpoint = self.history.get(&manifest.checkpoint)?.clone();
+        self.manifest = manifest;
+        self.manifest_changed = true;
+        Ok(())
+    }
+
+    /// Stops listing the checkpoints `ids` in the pending save and in the
+    /// history. A checkpoint is dropped with every one built on it.
+    pub(super) fn drop_checkpoints(&mut self, ids: &[String]) -> Result<(), ProjectError> {
+        for id in ids {
+            self.writer()?.drop_entry(&checkpoint_entry(id));
+        }
+        let rest: Vec<Checkpoint> = self
+            .history
+            .all()
+            .into_iter()
+            .filter(|c| !ids.contains(&c.id))
+            .cloned()
+            .collect();
+        self.history = History::build(rest, &self.path)?;
+        Ok(())
+    }
+
+    /// Stops listing the blob `hash` in the pending save.
+    pub(super) fn drop_blob(&mut self, hash: &str) -> Result<(), ProjectError> {
+        self.writer()?.drop_entry(&blob_entry(hash));
+        Ok(())
+    }
+
+    /// Writes the manifest if it changed, then the footer: every record put
+    /// since the project was opened becomes the committed state at once. After
+    /// an error the project is stale; reopen it.
+    pub(super) fn commit(&mut self) -> Result<(), ProjectError> {
+        if self.manifest_changed {
+            let bytes = serde_json::to_vec(&self.manifest)
+                .map_err(|err| ProjectError::container(&self.path, err))?;
+            self.writer()?.put_bytes("manifest.json", &bytes)?;
+            self.manifest_changed = false;
+        }
+        if let Some(writer) = self.pending.take() {
+            self.index = writer.finish()?;
+        }
+        Ok(())
     }
 
     /// Every source this project cannot resolve, for either of the two
@@ -832,91 +780,8 @@ impl Project {
         which: Plane,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
-        if which == Plane::ZMap {
-            let head = self.checkpoint.clone();
-            let stored_whole = self
-                .manifest
-                .blobs
-                .iter()
-                .any(|b| b.kind == BlobKind::Full && b.hash == head.zmap_blob);
-            if !stored_whole {
-                return self.read_zmap_head_via_materialize(&head, sink);
-            }
-        }
         let plane = self.plane(which).clone();
         self.read_plane_ref_into(&plane, sink)
-    }
-
-    /// [`Self::read_plane_into`]`(Plane::ZMap)` when the head is stored as a
-    /// patch chain: materializes it into a uniquely named temp file (there
-    /// is no blob entry named by `zmap_blob` to stream directly), streams
-    /// that file back out in bands, then removes it either way.
-    fn read_zmap_head_via_materialize(
-        &mut self,
-        head: &Checkpoint,
-        sink: &mut impl FnMut(&[u16], Rect),
-    ) -> Result<(), ProjectError> {
-        let temp = std::env::temp_dir().join(format!(
-            "focusforge-zmap-{}-{}.tif",
-            std::process::id(),
-            head.zmap_blob
-        ));
-        let result = materialize_zmap(self, head, &temp).and_then(|()| {
-            let reader = crate::zmap::ZMapReader::open(&temp)
-                .map_err(|err| ProjectError::container(&temp, err))?;
-            let (width, height) = reader.dimensions();
-            let row_samples = width as usize;
-            let rows = (READ_BAND_BYTES / (row_samples * 2)).clamp(1, height as usize) as u32;
-            let mut buf = vec![0u16; row_samples * rows as usize];
-            let mut y = 0;
-            while y < height {
-                let band_rows = rows.min(height - y);
-                let rect = Rect {
-                    x: 0,
-                    y,
-                    width,
-                    height: band_rows,
-                };
-                let len = row_samples * band_rows as usize;
-                reader
-                    .read_tile_into(rect, &mut buf[..len])
-                    .map_err(|err| ProjectError::container(&temp, err))?;
-                sink(&buf[..len], rect);
-                y += band_rows;
-            }
-            Ok(())
-        });
-        let _ = std::fs::remove_file(&temp);
-        result
-    }
-
-    /// Reads and zstd-decompresses one blob entry whole, verifying its
-    /// blake3 hash against `expected_hash` -- for a patch blob, small
-    /// enough to hold entirely in memory unlike a payload plane's own
-    /// banded read.
-    fn read_blob_whole(&mut self, expected_hash: &str) -> Result<Vec<u8>, ProjectError> {
-        let entry = format!("blobs/{expected_hash}.zst");
-        let file = self
-            .archive
-            .by_name(&entry)
-            .map_err(|err| ProjectError::container(&self.path, format!("{entry}: {err}")))?;
-        let mut decoder = zstd::stream::read::Decoder::new(file)
-            .map_err(|source| ProjectError::io(&self.path, source))?;
-        let mut bytes = Vec::new();
-        decoder
-            .read_to_end(&mut bytes)
-            .map_err(|source| ProjectError::io(&self.path, source))?;
-        let actual = blake3::hash(&bytes).to_hex().to_string();
-        if actual != expected_hash {
-            return Err(ProjectError::HashMismatch {
-                path: self.path.clone(),
-                blob: expected_hash.to_string(),
-                actual,
-            });
-        }
-        self.verified
-            .push((expected_hash.to_string(), bytes.len() as u64));
-        Ok(bytes)
     }
 
     /// [`Self::read_plane_into`]'s body, over an arbitrary [`PlaneRef`]
@@ -928,14 +793,15 @@ impl Project {
         plane: &PlaneRef,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
-        let entry = format!("blobs/{}.zst", plane.blob);
         let expected_len =
             plane.width as u64 * plane.height as u64 * plane.samples_per_pixel as u64 * 2;
 
-        let file = self
-            .archive
-            .by_name(&entry)
-            .map_err(|err| ProjectError::container(&self.path, format!("{entry}: {err}")))?;
+        let file = container::record_reader(
+            &self.file,
+            self.index(),
+            &self.path,
+            &blob_entry(&plane.blob),
+        )?;
         let mut decoder = zstd::stream::read::Decoder::new(file)
             .map_err(|source| ProjectError::io(&self.path, source))?;
 
@@ -996,18 +862,26 @@ impl Project {
     }
 }
 
-pub(super) fn read_json<T: serde::de::DeserializeOwned>(
-    archive: &mut zip::ZipArchive<File>,
+/// The record name of the blob with content hash `hash`.
+pub(super) fn blob_entry(hash: &str) -> String {
+    format!("blobs/{hash}.zst")
+}
+
+pub(super) fn checkpoint_entry(id: &str) -> String {
+    format!("checkpoints/{id}.json")
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(
+    file: &File,
+    index: &Index,
     path: &Path,
     entry: &str,
 ) -> Result<T, ProjectError> {
-    let mut text = String::new();
-    archive
-        .by_name(entry)
-        .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))?
-        .read_to_string(&mut text)
+    let mut bytes = Vec::new();
+    container::record_reader(file, index, path, entry)?
+        .read_to_end(&mut bytes)
         .map_err(|source| ProjectError::io(path, source))?;
-    serde_json::from_str(&text)
+    serde_json::from_slice(&bytes)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
 }
 

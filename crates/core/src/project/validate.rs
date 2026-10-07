@@ -28,10 +28,12 @@ pub struct SourceCheck {
     rehashed: Option<Vec<SourceRef>>,
 }
 
-/// Re-hashes each of `sources` at the path `locate` returns for it,
-/// sequentially (never in a `par_iter`, for the reason [`blob::hash_file`]
-/// documents) -- so a same-named replacement is caught rather than accepted
-/// on the strength of its name alone.
+/// Checks each of `sources` at the path `locate` returns for it. A file whose
+/// stamp matches the record is unchanged without being read; any other is
+/// hashed ([`blob::source_hash`]) and compared with the recorded hash.
+///
+/// An in-place edit that keeps size, modification time and file id is not
+/// detected.
 pub fn check_sources(
     sources: &[SourceRef],
     locate: impl Fn(&SourceRef) -> PathBuf,
@@ -46,7 +48,7 @@ pub fn check_sources(
             rehashed.push(source.clone());
             continue;
         }
-        let hash = blob::hash_file(&path)?;
+        let (_, hash) = blob::source_hash(&path, Some(source))?;
         if hash != source.hash {
             changed.push((index, path.clone()));
         }
@@ -136,11 +138,11 @@ impl PendingProject {
 }
 
 impl Project {
-    /// [`Project::open`] plus a source-content re-hash: `Ready` when every
-    /// resolvable source still hashes to what it was recorded against,
-    /// `NeedsChoice` when one does not. Internal callers use plain
-    /// [`Project::open`] instead, since re-hashing every source per edit
-    /// would price a retouch commit at the size of the sources, not the map.
+    /// [`Project::open`] plus a source check ([`check_sources`]): `Ready`
+    /// when every resolvable source is still the file it was recorded
+    /// against, `NeedsChoice` when one is not. A source whose file stamp
+    /// matches the record is not read; only a changed stamp costs a hash.
+    /// Internal callers use plain [`Project::open`] instead.
     pub fn open_checked(path: &Path) -> Result<Opened, ProjectError> {
         let project = Project::open(path)?;
         let check = check_sources(&project.manifest.sources, |s| project.source_path(s))?;

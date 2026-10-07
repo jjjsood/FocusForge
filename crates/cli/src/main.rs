@@ -249,9 +249,10 @@ enum Command {
         /// Write the Z-Map to this path.
         #[arg(long, value_name = "FILE")]
         zmap: Option<PathBuf>,
-        /// A checkpoint id or unique id prefix. Defaults to the head. Every
-        /// image export re-reads and verifies the nearest fused ancestor's
-        /// source frames; `--zmap` alone needs none.
+        /// A checkpoint id or unique id prefix. Defaults to the head. An
+        /// unedited image export needs no source frames; an edited one
+        /// re-reads and verifies the nearest fused ancestor's. `--zmap`
+        /// alone needs none.
         #[arg(long, value_name = "ID")]
         checkpoint: Option<String>,
         /// `--format` and its per-format flags: what `-o`'s image is
@@ -271,55 +272,33 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Apply an op list to a Z-Map and write the edited Z-Map. Every
-    /// editing capability is reachable through this command, headless.
+    /// Append an op list to a project as new states, one per op, each the
+    /// previous one's child: on the current head, or on `--from` as a
+    /// branch. `export --checkpoint` writes any of them.
     Retouch {
-        /// The Z-Map to edit.
-        #[arg(long, value_name = "FILE")]
-        zmap: PathBuf,
-        /// The op list to apply, in the persisted `Op` JSON shape.
-        /// Positions in error messages count from 0 in list order.
+        /// The project to append to.
+        project: PathBuf,
+        /// The op list: a JSON array of ops in the persisted `Op` shape.
+        /// A brush stroke blends frame `source_id` over the image along
+        /// its path: fully within `radius * (1 - softness)`, fading
+        /// linearly to nothing at `radius`. Every op is checked before
+        /// anything is written; positions in error messages count from 0 in
+        /// list order.
         #[arg(long, value_name = "FILE")]
         ops: PathBuf,
-        /// Where to write the edited Z-Map. Required: no default output
-        /// path, and never the same file as `--zmap`.
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-        /// Undo this many ops off the end of the list before writing.
-        #[arg(long, default_value_t = 0)]
-        undo: usize,
-        /// Redo this many undone ops. Must not exceed `--undo`.
-        #[arg(long, default_value_t = 0)]
-        redo: usize,
-        /// Directory of source frames to recomposite `--render` from.
-        /// Required by `--render`.
-        #[arg(long, value_name = "DIR")]
-        frames: Option<PathBuf>,
-        /// Write the recomposited image at the edited map's undo/redo
-        /// position: a per-pixel gather from `--frames`, CPU only.
-        #[arg(long, value_name = "FILE", requires = "frames")]
-        render: Option<PathBuf>,
-        /// Blend the rainbow overlay over the edited map's recomposited
-        /// image and write it as a PNG. Requires `--frames`, as `--render`
-        /// does.
-        #[arg(long, value_name = "FILE", requires = "frames")]
-        overlay: Option<PathBuf>,
-        /// The overlay's blend opacity: `0.0` leaves the composite
-        /// untouched, `1.0` is the palette colour alone.
-        #[arg(long, default_value_t = 0.65)]
-        opacity: f32,
-        /// Highlight this 0-based source index in the overlay -- the
-        /// numbering an op's `source_id` uses -- and desaturate every
-        /// other source, rather than the undivided wheel.
-        #[arg(long, value_name = "INDEX")]
-        solo: Option<u16>,
+        /// The state to append under -- any unique prefix of its id.
+        /// Defaults to the project's current head.
+        #[arg(long)]
+        from: Option<String>,
+        /// Name the last appended state.
+        #[arg(long)]
+        name: Option<String>,
         /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
-    /// List, materialize, apply an op list onto, or delete a project's
-    /// checkpoints. Every history operation is reachable through this
-    /// command, headless.
+    /// List, delete or compact a project's checkpoints. Every history
+    /// operation is reachable through this command, headless.
     History {
         /// Accept a project whose recorded source frames' content changed
         /// since it was written, printing a warning instead of refusing.
@@ -566,30 +545,12 @@ fn main() -> ExitCode {
             json,
         ),
         Command::Retouch {
-            zmap,
+            project,
             ops,
-            out,
-            undo,
-            redo,
-            frames,
-            render,
-            overlay,
-            opacity,
-            solo,
+            from,
+            name,
             json,
-        } => retouch::run(
-            &zmap,
-            &ops,
-            &out,
-            undo,
-            redo,
-            frames.as_deref(),
-            render.as_deref(),
-            overlay.as_deref(),
-            opacity,
-            solo,
-            json,
-        ),
+        } => retouch::run(&project, &ops, from.as_deref(), name.as_deref(), json),
         Command::History {
             command,
             accept_changed_sources,

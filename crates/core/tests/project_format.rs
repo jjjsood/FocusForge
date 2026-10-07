@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, BlobKind, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project, SealRequest,
     SourceResolution, blob,
 };
-use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
 const W: u32 = 64;
 const H: u32 = 48;
@@ -160,10 +161,10 @@ fn sealed(name: &str) -> (PathBuf, PathBuf) {
 }
 
 fn entry_names(path: &Path) -> Vec<String> {
-    let file = std::fs::File::open(path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
+    Index::read(path)
+        .unwrap()
+        .names()
+        .map(str::to_string)
         .collect()
 }
 
@@ -172,26 +173,14 @@ fn entry_names(path: &Path) -> Vec<String> {
 /// future-dated project the read path is supposed to refuse without the
 /// writer growing a hook that exists only for tests.
 fn rewrite_entry(src: &Path, dst: &Path, entry: &str, replace: impl Fn(&[u8]) -> Vec<u8>) {
-    use std::io::{Read, Write};
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(src).unwrap()).unwrap();
-    let names: Vec<String> = (0..archive.len())
-        .map(|i| archive.by_index(i).unwrap().name().to_string())
-        .collect();
-    let mut writer = zip::write::ZipWriter::new(std::fs::File::create(dst).unwrap());
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for name in names {
-        let mut bytes = Vec::new();
-        archive
-            .by_name(&name)
-            .unwrap()
-            .read_to_end(&mut bytes)
-            .unwrap();
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        let mut bytes = index.read_entry(src, name).unwrap();
         if name == entry {
             bytes = replace(&bytes);
         }
-        writer.start_file(&*name, options).unwrap();
-        writer.write_all(&bytes).unwrap();
+        writer.put_bytes(name, &bytes).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -233,17 +222,11 @@ fn container_layout_is_exactly_the_named_entries() {
 #[test]
 fn manifest_carries_no_format_version() {
     let (_dir, project_path) = sealed("project_format_no_version");
-    let file = std::fs::File::open(&project_path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    let mut text = String::new();
-    {
-        use std::io::Read;
-        archive
-            .by_name("manifest.json")
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
-    }
+    let bytes = Index::read(&project_path)
+        .unwrap()
+        .read_entry(&project_path, "manifest.json")
+        .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert!(
         value.get("format_version").is_none(),
@@ -333,58 +316,42 @@ fn checkpoint_serializes_every_field_with_no_parent_and_no_ops() {
 }
 
 #[test]
-fn every_op_variant_round_trips() {
-    let ops = vec![
-        Op::BrushStroke {
-            source_id: 7,
-            path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
-            radius: 12.5,
-            softness: 0.25,
-        },
-        Op::FloodFill {
-            seed: Point { x: 1, y: 2 },
-            source_id: 3,
-            tolerance: 0.5,
-        },
-        Op::ResetRegion {
-            rect: Rect {
-                x: 1,
-                y: 2,
-                width: 3,
-                height: 4,
-            },
-        },
-        Op::Refuse {
-            algorithm: "laplacian".to_string(),
-            params: params(),
-        },
-    ];
+fn the_brush_stroke_round_trips() {
+    let ops = vec![Op::BrushStroke {
+        source_id: 7,
+        path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
+        radius: 12.5,
+        softness: 0.25,
+    }];
     let text = serde_json::to_string(&ops).unwrap();
     let back: Vec<Op> = serde_json::from_str(&text).unwrap();
     assert_eq!(back, ops);
-    for tag in ["brush-stroke", "flood-fill", "reset-region", "refuse"] {
-        assert!(
-            text.contains(tag),
-            "externally-tagged {tag} missing: {text}"
-        );
-    }
+    assert!(
+        text.contains("brush-stroke"),
+        "externally-tagged brush-stroke missing: {text}"
+    );
 }
 
 #[test]
 fn op_with_a_missing_field_is_refused() {
-    for (text, field) in [
-        (r#"{"flood-fill":{}}"#, "seed"),
-        (r#"{"reset-region":{}}"#, "rect"),
-        (
-            r#"{"brush-stroke":{"source_id":1,"path":[],"radius":2.0}}"#,
-            "softness",
-        ),
-        (r#"{"refuse":{"algorithm":"laplacian"}}"#, "params"),
-    ] {
-        let err = serde_json::from_str::<Op>(text).unwrap_err();
+    let err =
+        serde_json::from_str::<Op>(r#"{"brush-stroke":{"source_id":1,"path":[],"radius":2.0}}"#)
+            .unwrap_err();
+    assert!(err.to_string().contains("softness"), "{err}");
+    let err =
+        serde_json::from_str::<Op>(r#"{"brush-stroke":{"path":[],"radius":2.0,"softness":0.5}}"#)
+            .unwrap_err();
+    assert!(err.to_string().contains("source_id"), "{err}");
+}
+
+#[test]
+fn a_dropped_op_tag_is_an_unknown_variant() {
+    for tag in ["flood-fill", "reset-region", "refuse"] {
+        let err = serde_json::from_str::<Op>(&format!(r#"{{"{tag}":{{}}}}"#)).unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string().contains(field),
-            "the refusal of {text} must name `{field}`: {err}"
+            message.contains("unknown variant") && message.contains(tag),
+            "the refusal of `{tag}` must name it as an unknown variant: {message}"
         );
     }
 }
@@ -759,4 +726,78 @@ fn checkpoint_id_is_deterministic() {
     assert_eq!(id(10), id(10));
     assert_ne!(id(10), id(11));
     assert_eq!(id(10).len(), 32);
+}
+
+#[test]
+fn multithreaded_blobs_round_trip() {
+    let dir = tmp_dir("project_format_multithreaded_blobs");
+    let mantis = common::mantis_512_dir();
+    let golden = mantis.join("golden");
+    // Copied so `seal` stages its blobs beside private files, not the fixture.
+    let composite_path = dir.join("golden-composite.tif");
+    std::fs::copy(golden.join("laplacian.tif"), &composite_path).unwrap();
+    let zmap_path = dir.join("golden-zmap.tif");
+    std::fs::copy(golden.join("laplacian-zmap.tif"), &zmap_path).unwrap();
+    let sources: Vec<PathBuf> = (0..8)
+        .map(|i| mantis.join("frames").join(format!("{i:02}.tif")))
+        .collect();
+    let values = params();
+    let project_path = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
+    project::seal(request(
+        &project_path,
+        &composite_path,
+        &zmap_path,
+        &sources,
+        &values,
+    ))
+    .expect("seal must succeed");
+
+    // Every blob the project holds decodes to bytes that hash to its own
+    // entry name.
+    let project = Project::open(&project_path).unwrap();
+    let records = &project.manifest().blobs;
+    assert!(!records.is_empty(), "the project must hold blobs");
+    for record in records {
+        let stored = Index::read(&project_path)
+            .unwrap()
+            .read_entry(&project_path, &format!("blobs/{}.zst", record.hash))
+            .unwrap();
+        let bytes = zstd::stream::decode_all(&stored[..]).unwrap();
+        assert_eq!(bytes.len() as u64, record.uncompressed_len);
+        assert_eq!(blake3::hash(&bytes).to_hex().to_string(), record.hash);
+    }
+
+    // The same plane staged at two levels: one entry name, and the plane's
+    // own little-endian bytes back from either file.
+    let le =
+        |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+    let stack =
+        focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&composite_path)).unwrap();
+    let (w, h) = stack.dimensions();
+    let mut composite = vec![0u16; w as usize * h as usize * SPP as usize];
+    stack.read_tile_into(0, full(w, h), &mut composite).unwrap();
+    let reader = ZMapReader::open(&zmap_path).unwrap();
+    let (zw, zh) = reader.dimensions();
+    let mut zmap = vec![0u16; zw as usize * zh as usize];
+    reader.read_tile_into(full(zw, zh), &mut zmap).unwrap();
+    let planes = [
+        (Plane::Composite, composite_path, le(&composite)),
+        (Plane::ZMap, zmap_path, le(&zmap)),
+    ];
+    for (plane, source, expected) in planes {
+        let mut hashes = Vec::new();
+        for level in [1, blob::ZSTD_LEVEL] {
+            let out = dir.join(format!("staged-{plane:?}-{level}"));
+            std::fs::create_dir_all(&out).unwrap();
+            let staged = blob::stage_plane(&source, plane, level, &out).unwrap();
+            let stored = std::fs::read(&staged.path).unwrap();
+            assert_eq!(zstd::stream::decode_all(&stored[..]).unwrap(), expected);
+            hashes.push(staged.hash);
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "{plane:?}: the level moved the entry name"
+        );
+        assert_eq!(hashes[0], blake3::hash(&expected).to_hex().to_string());
+    }
 }

@@ -13,6 +13,10 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
 use focusforge_core::project::{self, Op, Point, Project};
 use focusforge_core::zmap::ZMapReader;
+use focusforge_gpu::blend::Blender;
+use focusforge_gpu::device::SharedDevice;
+#[cfg(feature = "gpu-tests")]
+use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gui::canvas::PaneSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
@@ -478,6 +482,13 @@ fn take_mode_changes(events: &Mutex<Vec<ShellEvent>>) -> Vec<ShellMode> {
         .collect()
 }
 
+/// The shape of the Z-Map at `path`, read straight from disk.
+fn stored_info(path: &Path) -> ZMapInfo {
+    ZMapReader::open(path)
+        .expect("the tab's Z-Map must open")
+        .info()
+}
+
 /// The whole Z-Map at `path`, read straight from disk.
 fn read_whole_zmap(path: &Path) -> Vec<u16> {
     let reader = ZMapReader::open(path).expect("the tab's Z-Map must open");
@@ -693,20 +704,23 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
 
     assert!(controller.set_mode(ShellMode::Editor));
     let (_, zmap_b) = controller.materialize_active_tab_planes().unwrap();
+    let info_b = controller.edit_session().unwrap().info();
     assert_eq!(
-        controller.edit_session().unwrap().indices(),
-        read_whole_zmap(&zmap_b).as_slice(),
-        "tab 1's session is its own whole Z-Map"
+        info_b,
+        stored_info(&zmap_b),
+        "tab 1's session is over its own Z-Map"
     );
 
     controller.select_project(0);
     assert_eq!(controller.mode(), ShellMode::Editor);
     let (_, zmap_a) = controller.materialize_active_tab_planes().unwrap();
+    let info_a = controller.edit_session().unwrap().info();
     assert_eq!(
-        controller.edit_session().unwrap().indices(),
-        read_whole_zmap(&zmap_a).as_slice(),
-        "tab 0's session is its own whole Z-Map"
+        info_a,
+        stored_info(&zmap_a),
+        "tab 0's session is over its own Z-Map"
     );
+    assert_ne!(info_a, info_b, "2 frames against 3");
 
     controller
         .edit_session_mut()
@@ -760,7 +774,8 @@ fn edit_session_follows_the_newest_planes() {
     let newest = controller.held_checkpoints().last().unwrap().zmap.clone();
     let session = controller.edit_session().unwrap();
     assert_eq!(session.op_count(), 0, "a fresh session, not the old one");
-    assert_eq!(session.indices(), read_whole_zmap(&newest).as_slice());
+    assert_eq!(session.info(), stored_info(&newest));
+    assert!(session.stack_ops().is_empty());
 }
 
 #[test]
@@ -857,10 +872,10 @@ fn controller_events_reach_an_installed_sink() {
 
 #[test]
 fn undocking_refuses_the_last_pane_and_docks_back_idempotently() {
-    for detached in [PaneSource::Composite, PaneSource::ZMap] {
+    for detached in [PaneSource::Frame, PaneSource::Composite] {
         let other = match detached {
-            PaneSource::Composite => PaneSource::ZMap,
-            PaneSource::ZMap => PaneSource::Composite,
+            PaneSource::Frame => PaneSource::Composite,
+            PaneSource::Composite => PaneSource::Frame,
         };
         let mut controller = AppController::new();
         let events = record_events(&mut controller);
@@ -874,8 +889,8 @@ fn undocking_refuses_the_last_pane_and_docks_back_idempotently() {
         controller.undocked_window_closed(detached);
         controller.undocked_window_closed(detached);
 
+        assert!(controller.undock_enabled(PaneSource::Frame));
         assert!(controller.undock_enabled(PaneSource::Composite));
-        assert!(controller.undock_enabled(PaneSource::ZMap));
         assert_eq!(
             events.lock().unwrap().as_slice(),
             [
@@ -890,12 +905,12 @@ fn undocking_refuses_the_last_pane_and_docks_back_idempotently() {
 fn an_accepted_main_quit_closes_the_detached_window_first() {
     let mut controller = AppController::new();
     let events = record_events(&mut controller);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undock_requested(PaneSource::Composite);
     controller.window_close();
     assert_eq!(
         events.lock().unwrap().as_slice(),
         [
-            ShellEvent::PaneUndockRequested(PaneSource::ZMap),
+            ShellEvent::PaneUndockRequested(PaneSource::Composite),
             ShellEvent::DetachedWindowCloseRequested,
             ShellEvent::WindowCloseRequested,
         ]
@@ -914,7 +929,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
             ]
         );
     };
-    for detached in [PaneSource::Composite, PaneSource::ZMap] {
+    for detached in [PaneSource::Frame, PaneSource::Composite] {
         let mut immediate = AppController::new();
         immediate.undock_requested(detached);
         let events = record_events(&mut immediate);
@@ -924,14 +939,14 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
 
     let mut discard = controller_with_scratch("detached_quit_without_saving");
     open_fused_tab(&mut discard, "detached_quit_without_saving", 3);
-    discard.undock_requested(PaneSource::ZMap);
+    discard.undock_requested(PaneSource::Composite);
     let events = record_events(&mut discard);
     discard.quit_without_saving();
     assert_close_tail(&events);
 
     let mut save = controller_with_scratch("detached_save_all_quit");
     open_fused_tab(&mut save, "detached_save_all_quit", 3);
-    save.undock_requested(PaneSource::Composite);
+    save.undock_requested(PaneSource::Frame);
     let events = record_events(&mut save);
     save.window_close();
     let target = common::tree("detached_save_all_quit").join("saved.ffp");
@@ -940,7 +955,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
 
     let mut headless = controller_with_scratch("detached_save_all_quit_sync");
     open_fused_tab(&mut headless, "detached_save_all_quit_sync", 3);
-    headless.undock_requested(PaneSource::ZMap);
+    headless.undock_requested(PaneSource::Composite);
     let events = record_events(&mut headless);
     let target = common::tree("detached_save_all_quit_sync").join("saved.ffp");
     assert!(headless.save_all_and_quit(|_| Some(target.clone())));
@@ -953,13 +968,13 @@ fn cancelling_a_guarded_quit_keeps_the_detached_pane() {
     open_mantis64_tab(&mut controller, "detached_guarded_quit", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undock_requested(PaneSource::Composite);
     let events = record_events(&mut controller);
     controller.window_close();
     assert!(controller.pending_quit_copy().is_some());
     controller.cancel_quit();
     assert!(controller.pending_quit_copy().is_none());
-    assert!(!controller.undock_enabled(PaneSource::Composite));
+    assert!(!controller.undock_enabled(PaneSource::Frame));
     assert!(
         !events
             .lock()
@@ -974,13 +989,13 @@ fn cancelling_the_guarded_save_picker_keeps_the_detached_pane() {
     open_mantis64_tab(&mut controller, "detached_save_picker_cancel", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    controller.undock_requested(PaneSource::Composite);
+    controller.undock_requested(PaneSource::Frame);
     let events = record_events(&mut controller);
     controller.window_close();
     assert!(controller.pending_quit_copy().is_some());
     assert!(!controller.close_guard_secondary_pressed(|_| None));
     assert!(controller.pending_quit_copy().is_none());
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
     assert!(!events.lock().unwrap().iter().any(|event| matches!(
         event,
         ShellEvent::DetachedWindowCloseRequested | ShellEvent::WindowCloseRequested
@@ -993,12 +1008,12 @@ fn failed_guarded_quit_save_keeps_the_detached_pane() {
     open_mantis64_tab(&mut controller, "detached_failed_quit_save", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undock_requested(PaneSource::Composite);
     let events = record_events(&mut controller);
     controller.window_close();
     let absent = common::tree("detached_failed_quit_save").join("absent/x.ffp");
     assert!(!controller.close_guard_secondary_pressed(|_| Some(absent.clone())));
-    assert!(!controller.undock_enabled(PaneSource::Composite));
+    assert!(!controller.undock_enabled(PaneSource::Frame));
     let events = events.lock().unwrap();
     assert!(!events.contains(&ShellEvent::DetachedWindowCloseRequested));
     assert!(!events.contains(&ShellEvent::WindowCloseRequested));
@@ -1025,7 +1040,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
 
     for width in [f32::NAN, 0.0, -1.0, f32::INFINITY] {
         controller.set_pane_geometry_for(
-            PaneSource::ZMap,
+            PaneSource::Composite,
             PaneRect {
                 x: 0.0,
                 y: 0.0,
@@ -1042,7 +1057,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
         width: 820.0,
         height: 600.0,
     };
-    controller.set_pane_geometry_for(PaneSource::ZMap, detached);
+    controller.set_pane_geometry_for(PaneSource::Composite, detached);
     let frame = controller.frame_draw().unwrap();
     let plane = controller.plane_draw().unwrap();
     assert!(frame.dst.2 <= left.width && frame.dst.3 <= left.height);
@@ -1051,7 +1066,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
 
 #[test]
 fn main_resize_keeps_each_detached_panes_last_geometry() {
-    for detached in [PaneSource::Composite, PaneSource::ZMap] {
+    for detached in [PaneSource::Frame, PaneSource::Composite] {
         let mut controller = controller_with_scratch(&format!("preserve_detached_{detached:?}"));
         open_mantis64_tab(
             &mut controller,
@@ -1071,8 +1086,8 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
             height: 400.0,
         };
         let (left, right) = match detached {
-            PaneSource::Composite => (narrow, roomy),
-            PaneSource::ZMap => (roomy, narrow),
+            PaneSource::Frame => (narrow, roomy),
+            PaneSource::Composite => (roomy, narrow),
         };
         controller.set_pane_geometry(left, right);
         controller.undock_requested(detached);
@@ -1091,15 +1106,15 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
             height: 200.0,
         };
         let (left, right) = match detached {
-            PaneSource::Composite => (replacement, resized_main),
-            PaneSource::ZMap => (resized_main, replacement),
+            PaneSource::Frame => (replacement, resized_main),
+            PaneSource::Composite => (resized_main, replacement),
         };
         controller.set_pane_geometry(left, right);
         assert_eq!(controller.detached_pane(), Some(detached));
 
         let draw = match detached {
-            PaneSource::Composite => controller.frame_draw().unwrap(),
-            PaneSource::ZMap => controller.plane_draw().unwrap(),
+            PaneSource::Frame => controller.frame_draw().unwrap(),
+            PaneSource::Composite => controller.plane_draw().unwrap(),
         };
         assert!(
             draw.dst.2 <= narrow.width,
@@ -1125,7 +1140,7 @@ fn detached_side_survives_resize_and_valid_mode_switches() {
         height: 250.0,
     };
     controller.set_pane_geometry(left, right);
-    controller.undock_requested(PaneSource::Composite);
+    controller.undock_requested(PaneSource::Frame);
     controller.set_pane_geometry(
         PaneRect {
             width: 900.0,
@@ -1134,36 +1149,36 @@ fn detached_side_survives_resize_and_valid_mode_switches() {
         },
         right,
     );
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
     assert!(controller.set_mode(ShellMode::Editor));
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
     assert!(controller.set_mode(ShellMode::Stacking));
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
 }
 
 #[test]
 fn side_geometry_arrives_before_open_in_either_order() {
     for (first, second) in [
-        (PaneSource::Composite, PaneSource::ZMap),
-        (PaneSource::ZMap, PaneSource::Composite),
+        (PaneSource::Frame, PaneSource::Composite),
+        (PaneSource::Composite, PaneSource::Frame),
     ] {
         let name = format!("geometry_order_{first:?}");
         let mut controller = controller_with_scratch(&name);
-        let composite = PaneRect {
+        let frame = PaneRect {
             x: 0.0,
             y: 0.0,
             width: 180.0,
             height: 320.0,
         };
-        let zmap = PaneRect {
+        let composite = PaneRect {
             x: 0.0,
             y: 0.0,
             width: 320.0,
             height: 180.0,
         };
         let rect = |side| match side {
+            PaneSource::Frame => frame,
             PaneSource::Composite => composite,
-            PaneSource::ZMap => zmap,
         };
         controller.set_pane_geometry_for(first, rect(first));
         assert!(controller.frame_draw().is_none());
@@ -1196,22 +1211,43 @@ fn detached_input_uses_its_own_local_coordinates() {
         },
     );
     let fitted = controller.zoom_readout();
-    controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 25.0, 25.0, Modifiers::NONE);
-    controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 25.0, 25.0, Modifiers::NONE);
-    controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 25.0, 25.0, Modifiers::NONE);
+    controller.wheel_for_pane(
+        PaneSource::Composite,
+        0.0,
+        60.0,
+        25.0,
+        25.0,
+        Modifiers::NONE,
+    );
+    controller.wheel_for_pane(
+        PaneSource::Composite,
+        0.0,
+        60.0,
+        25.0,
+        25.0,
+        Modifiers::NONE,
+    );
+    controller.wheel_for_pane(
+        PaneSource::Composite,
+        0.0,
+        60.0,
+        25.0,
+        25.0,
+        Modifiers::NONE,
+    );
     assert_ne!(controller.zoom_readout(), fitted);
     let before_pan = controller.plane_draw().unwrap();
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Middle,
         25.0,
         25.0,
         NO_MODS,
     );
-    controller.pointer_moved_for_pane(PaneSource::ZMap, -75.0, -75.0);
+    controller.pointer_moved_for_pane(PaneSource::Composite, -75.0, -75.0);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Middle,
         -75.0,
@@ -1233,7 +1269,7 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
     };
     controller.set_pane_geometry(pane, pane);
     for _ in 0..3 {
-        controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 40.0, 40.0, NO_MODS);
+        controller.wheel_for_pane(PaneSource::Composite, 0.0, 60.0, 40.0, 40.0, NO_MODS);
     }
     let before = controller.plane_draw().unwrap();
     controller.set_align_algorithm("");
@@ -1241,16 +1277,16 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
     assert!(controller.canvas_blocked());
 
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Middle,
         40.0,
         40.0,
         NO_MODS,
     );
-    controller.pointer_moved_for_pane(PaneSource::ZMap, 0.0, 0.0);
+    controller.pointer_moved_for_pane(PaneSource::Composite, 0.0, 0.0);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Middle,
         0.0,
@@ -1272,11 +1308,11 @@ fn detached_drag_ignores_another_windows_move_and_release() {
     };
     controller.set_pane_geometry(pane, pane);
     for _ in 0..3 {
-        controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 40.0, 40.0, NO_MODS);
+        controller.wheel_for_pane(PaneSource::Composite, 0.0, 60.0, 40.0, 40.0, NO_MODS);
     }
     let before = controller.plane_draw().unwrap();
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Middle,
         40.0,
@@ -1285,10 +1321,10 @@ fn detached_drag_ignores_another_windows_move_and_release() {
     );
     controller.pointer_moved(0.0, 0.0);
     controller.pointer(PointerKind::Up, Button::Middle, 0.0, 0.0, NO_MODS);
-    controller.pointer_moved_for_pane(PaneSource::ZMap, 0.0, 0.0);
+    controller.pointer_moved_for_pane(PaneSource::Composite, 0.0, 0.0);
     assert_ne!(controller.plane_draw().unwrap().dst, before.dst);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Middle,
         0.0,
@@ -1308,7 +1344,7 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
     };
     controller.set_pane_geometry(overlap, overlap);
 
-    controller.undock_requested(PaneSource::Composite);
+    controller.undock_requested(PaneSource::Frame);
     let draw = controller.plane_draw().unwrap();
     let point = (
         draw.dst.0 + (20.5 - draw.src.0 as f32) * draw.dst.2 / draw.src.2 as f32,
@@ -1321,8 +1357,8 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
         [Op::BrushStroke { .. }]
     ));
 
-    controller.undocked_window_closed(PaneSource::Composite);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undocked_window_closed(PaneSource::Frame);
+    controller.undock_requested(PaneSource::Composite);
     let before = ops(&controller).len();
     controller.pointer(PointerKind::Down, Button::Left, point.0, point.1, NO_MODS);
     controller.pointer(PointerKind::Up, Button::Left, point.0, point.1, NO_MODS);
@@ -1332,7 +1368,7 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
 }
 
 #[test]
-fn editor_paints_from_an_unequal_detached_zmap_pane() {
+fn editor_paints_from_an_unequal_detached_composite_pane() {
     let (mut controller, _) = open_editor("unequal_detached_editor_paint");
     controller.set_pane_geometry(
         PaneRect {
@@ -1358,16 +1394,16 @@ fn editor_paints_from_an_unequal_detached_zmap_pane() {
     let start = local(20.0, 20.0);
     let end = local(30.0, 25.0);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Left,
         start.0,
         start.1,
         NO_MODS,
     );
-    controller.pointer_moved_for_pane(PaneSource::ZMap, end.0, end.1);
+    controller.pointer_moved_for_pane(PaneSource::Composite, end.0, end.1);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Left,
         end.0,
@@ -1382,8 +1418,8 @@ fn editor_paints_from_an_unequal_detached_zmap_pane() {
 }
 
 #[test]
-fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
-    let (mut controller, _) = open_editor("unequal_zmap_pipette");
+fn unequal_composite_pipette_reads_the_exact_projected_source_index() {
+    let (mut controller, _) = open_editor("unequal_composite_pipette");
     let left = PaneRect {
         x: 0.0,
         y: 0.0,
@@ -1398,7 +1434,8 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
     };
     controller.set_pane_geometry(left, right);
     let map = map_rect(&controller);
-    let values = indices(&controller);
+    let zmap = controller.held_checkpoints().last().unwrap().zmap.clone();
+    let values = read_whole_zmap(&zmap);
     let current = controller.brush_source().unwrap();
     let (x, y, expected) = (0..map.height)
         .flat_map(|y| (0..map.width).map(move |x| (x, y)))
@@ -1414,7 +1451,7 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
     );
     controller.toggle_pipette();
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Left,
         local.0,
@@ -1422,7 +1459,7 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
         NO_MODS,
     );
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Left,
         local.0,
@@ -1433,8 +1470,8 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
 }
 
 #[test]
-fn editor_requires_a_real_unequal_zmap_hit_before_painting() {
-    let (mut controller, _) = open_editor("unequal_zmap_hit_test");
+fn editor_requires_a_real_unequal_composite_hit_before_painting() {
+    let (mut controller, _) = open_editor("unequal_composite_hit_test");
     let left = PaneRect {
         x: 0.0,
         y: 0.0,
@@ -1483,7 +1520,7 @@ fn editor_requires_a_real_unequal_zmap_hit_before_painting() {
 fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
     use focusforge_core::io::{TiffSpec, TiffWriter};
     use focusforge_core::params::ParamValues;
-    use focusforge_core::project::{Metrics, SealRequest, ZMapStorage, append_ops_at, seal_at};
+    use focusforge_core::project::{Metrics, SealRequest, append_ops_at, seal_at};
     use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
     let dir = common::tree("checkpoints_scrollbar_thumb");
@@ -1539,14 +1576,8 @@ fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
             radius: 0.5,
             softness: 0.0,
         };
-        append_ops_at(
-            &project_path,
-            vec![op],
-            None,
-            noon + i * 60,
-            ZMapStorage::Bounded,
-        )
-        .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
+        append_ops_at(&project_path, vec![op], None, noon + i * 60)
+            .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
 
     let mut controller = AppController::new();
@@ -3288,8 +3319,9 @@ fn post_fuse_frame_uses_identity_at_the_composite_crop() {
 use std::num::NonZeroU32;
 
 use focusforge_core::io::{TiffSpec, TiffStack, TiffWriter};
-use focusforge_core::retouch::{EditSession, apply, footprint};
-use focusforge_core::zmap::{NO_SOURCE, ZMapWriter};
+use focusforge_core::retouch::blend;
+use focusforge_core::retouch::footprint;
+use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
 use focusforge_gui::brush::LiveStroke;
 use focusforge_gui::canvas::overlay_edited;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
@@ -3359,7 +3391,13 @@ fn bind_softness_to_alt_wheel(controller: &mut AppController) {
 
 /// The active tab's whole fused map.
 fn map_rect(controller: &AppController) -> Rect {
-    controller.edit_session().unwrap().tile()
+    let info = controller.edit_session().unwrap().info();
+    Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    }
 }
 
 /// The screen point over the right pane whose paint point is image
@@ -3387,8 +3425,8 @@ fn open_editor(name: &str) -> (AppController, PathBuf) {
 /// [`open_editor`] over a run of fuse method `method` instead of the default.
 fn open_editor_on(name: &str, method: Option<&str>) -> (AppController, PathBuf) {
     let mut controller = controller_with_scratch(name);
-    let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_resident_tile_size_for_test(16);
+    let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_pane_geometry(LEFT, RIGHT);
     assert!(controller.set_mode(ShellMode::Editor));
     let map = map_rect(&controller);
@@ -3440,15 +3478,11 @@ fn drag_screen(controller: &mut AppController, screen: &[(f32, f32)]) {
         controller.pointer_moved(x, y);
     }
     release(controller, *screen.last().unwrap());
-    common::settle_recomposites(controller);
+    common::settle_region_renders(controller);
 }
 
 fn ops(controller: &AppController) -> Vec<Op> {
     controller.edit_session().unwrap().ops().cloned().collect()
-}
-
-fn indices(controller: &AppController) -> Vec<u16> {
-    controller.edit_session().unwrap().indices().to_vec()
 }
 
 /// `rect` of the RGB TIFF at `path`.
@@ -3460,7 +3494,7 @@ fn read_plane(path: &Path, rect: Rect) -> Vec<u16> {
 }
 
 /// The tab's sealed planes and raw frames, read straight from disk, plus the
-/// registration a stroke's own recomposite reads each raw frame through.
+/// registration a stroke's own region render reads each raw frame through.
 struct Sealed {
     map: Rect,
     indices: Vec<u16>,
@@ -3511,51 +3545,104 @@ impl Sealed {
     fn displayed(&self, controller: &AppController) -> Vec<u16> {
         let view = controller.edited_view().unwrap();
         let mut samples = self.composite.clone();
-        overlay_edited(
-            &mut samples,
-            &self.indices,
-            view.indices,
-            self.map,
-            NonZeroU32::MIN,
-            3,
-            view.tiles,
-        );
+        overlay_edited(&mut samples, self.map, NonZeroU32::MIN, 3, view.tiles);
         samples
     }
 
-    /// The reference: the edited index's own frame pixel wherever it differs
-    /// from the sealed index, the sealed composite pixel elsewhere -- each
-    /// frame pixel read at its own registered transform and the crop
-    /// origin, the same view [`focusforge_core::retouch::EditSession`]'s own
-    /// recomposite warps through. `dummy-align`'s shifts are exact integer
-    /// translations, so the mapped point always lands on a source pixel
-    /// centre with no rounding error.
-    fn expected(&self, edited: &[u16]) -> Vec<u16> {
-        let mut out = self.composite.clone();
+    /// Frame `frame` over the whole map, read at its own registered
+    /// transform and the crop origin, the same view a stroke blends from.
+    /// `dummy-align`'s shifts are exact integer translations, so the mapped
+    /// point always lands on a source pixel centre with no rounding error.
+    fn frame_view(&self, frame: usize) -> Vec<u16> {
         let origin = self.registration.origin();
-        for (i, (&e, &s)) in edited.iter().zip(&self.indices).enumerate() {
-            if e != s {
-                let (x, y) = (i as u32 % self.map.width, i as u32 / self.map.width);
-                let (rx, ry) = ((x + origin.0) as f64, (y + origin.1) as f64);
-                let (fx, fy) = self
-                    .registration
-                    .transform(e as usize)
-                    .map_point(rx, ry)
-                    .expect("dummy-align's integer shifts never cross the horizon");
-                let f = ((fy.round() as u32 * FRAME + fx.round() as u32) * 3) as usize;
-                out[i * 3..i * 3 + 3].copy_from_slice(&self.frames[e as usize][f..f + 3]);
-            }
+        let mut out = vec![0u16; (self.map.width * self.map.height * 3) as usize];
+        for i in 0..(self.map.width * self.map.height) as usize {
+            let (x, y) = (i as u32 % self.map.width, i as u32 / self.map.width);
+            let (rx, ry) = ((x + origin.0) as f64, (y + origin.1) as f64);
+            let (fx, fy) = self
+                .registration
+                .transform(frame)
+                .map_point(rx, ry)
+                .expect("dummy-align's integer shifts never cross the horizon");
+            let f = ((fy.round() as u32 * FRAME + fx.round() as u32) * 3) as usize;
+            out[i * 3..i * 3 + 3].copy_from_slice(&self.frames[frame][f..f + 3]);
+        }
+        out
+    }
+
+    /// `op` blended over `out`, a whole-map composite, from its frame.
+    fn blend_over(&self, out: &mut [u16], op: &Op, info: ZMapInfo) {
+        let Op::BrushStroke { source_id, .. } = op else {
+            panic!("only brush strokes are blended");
+        };
+        let src = self.frame_view(usize::from(*source_id));
+        blend::apply(op, info, self.map, out, self.map, &src, 3).unwrap();
+    }
+
+    /// The reference: the sealed composite with each of `ops` blended over
+    /// it in order from its frame.
+    fn expected(&self, ops: &[Op], info: ZMapInfo) -> Vec<u16> {
+        let mut out = self.composite.clone();
+        for op in ops {
+            self.blend_over(&mut out, op, info);
         }
         out
     }
 
     fn assert_shown(&self, controller: &AppController, case: &str) {
-        let edited = indices(controller);
+        let info = controller.edit_session().unwrap().info();
         assert!(
-            self.displayed(controller) == self.expected(&edited),
+            self.displayed(controller) == self.expected(&ops(controller), info),
             "{case}: the displayed composite differs from the reference"
         );
     }
+}
+
+/// What the renderer shows over the whole image: the tab's sealed composite
+/// under the controller's resident tiles.
+fn displayed_whole(controller: &mut AppController) -> Vec<u16> {
+    let map = map_rect(controller);
+    let (composite, _) = controller.materialize_active_tab_planes().unwrap();
+    let mut samples = read_plane(&composite, map);
+    let view = controller.edited_view().unwrap();
+    overlay_edited(&mut samples, map, NonZeroU32::MIN, 3, view.tiles);
+    samples
+}
+
+/// The head checkpoint of the saved project at `path`, rendered whole by the
+/// one function every export and view goes through.
+fn saved_render(path: &Path) -> Vec<u16> {
+    let mut project = saved(path);
+    let id = project.checkpoint().id.clone();
+    let image = project::CheckpointImage::prepare(&project, &id).expect("the checkpoint prepares");
+    let full = image.full();
+    let mut out = vec![0u16; (full.width * full.height * 3) as usize];
+    image
+        .render(Some(&mut project), full, &mut |band: &[u16], rect: Rect| {
+            let row = rect.width as usize * 3;
+            for y in 0..rect.height as usize {
+                let at = ((rect.y as usize + y) * full.width as usize + rect.x as usize) * 3;
+                out[at..at + row].copy_from_slice(&band[y * row..(y + 1) * row]);
+            }
+            Ok(())
+        })
+        .expect("the checkpoint renders");
+    out
+}
+
+/// A drag through image points `path` with a flush and a settle after every
+/// motion, so each segment is a tick of its own.
+fn drag_ticked(controller: &mut AppController, path: &[(f32, f32)]) {
+    press(controller, at(path[0].0, path[0].1));
+    for &(x, y) in &path[1..] {
+        let (sx, sy) = at(x, y);
+        controller.pointer_moved(sx, sy);
+        controller.flush_live_stroke();
+        common::settle_region_renders(controller);
+    }
+    let last = path[path.len() - 1];
+    release(controller, at(last.0, last.1));
+    common::settle_region_renders(controller);
 }
 
 fn rounded(points: &[(f32, f32)]) -> Vec<Point> {
@@ -3570,19 +3657,6 @@ fn rounded(points: &[(f32, f32)]) -> Vec<Point> {
         }
     }
     out
-}
-
-fn dilate(rect: Rect, margin: u32, map: Rect) -> Rect {
-    let x0 = rect.x.saturating_sub(margin);
-    let y0 = rect.y.saturating_sub(margin);
-    let x1 = (rect.x + rect.width + margin).min(map.width);
-    let y1 = (rect.y + rect.height + margin).min(map.height);
-    Rect {
-        x: x0,
-        y: y0,
-        width: x1 - x0,
-        height: y1 - y0,
-    }
 }
 
 /// `corners` joined by straight runs, as `events` motion events spread
@@ -3651,13 +3725,14 @@ fn drag_produces_one_brush_stroke() {
     c.pointer_moved(RIGHT.x + 50.0, 100.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 50.0, 100.0));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(ops(&c).len(), 3, "a drag starting on the left pane");
     assert!(
         matches!(ops(&c).last(), Some(Op::BrushStroke { source_id: 2, .. })),
         "it paints the selected source"
     );
-    let before = indices(&c);
+    common::settle_region_renders(&mut c);
+    let before = displayed_whole(&mut c);
 
     // In the band above the image, with a 1 px brush.
     set_size(&mut c, 1.0);
@@ -3665,8 +3740,9 @@ fn drag_produces_one_brush_stroke() {
     c.pointer_moved(RIGHT.x + 140.0, 20.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 140.0, 20.0));
+    common::settle_region_renders(&mut c);
     assert_eq!(ops(&c).len(), 3, "a stroke wholly off the image");
-    assert_eq!(indices(&c), before);
+    assert_eq!(displayed_whole(&mut c), before);
 }
 
 #[test]
@@ -4072,6 +4148,7 @@ fn legend_has_no_mutation_affordances() {
 fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
     OverlayDraw {
         table: focusforge_core::zmap::overlay_table(sources, None),
+        ops: Arc::from([]),
         alpha: focusforge_core::display::alpha_from_opacity(opacity),
     }
 }
@@ -4190,9 +4267,10 @@ fn overlay_controls_match_the_render_parameters() {
         c.overlay_draw(),
         Some(OverlayDraw {
             table: focusforge_core::zmap::overlay_table(3, None),
+            ops: Arc::from([]),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
         }),
-        "matches focusforge-cli retouch --overlay --opacity's own blend, with no --solo"
+        "matches display::overlay_cpu's own blend, with no solo source"
     );
 
     c.set_overlay_on(false);
@@ -4260,7 +4338,7 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
     assert_eq!(moved.extent, here.extent);
     assert_eq!(moved.ring_commands, here.ring_commands);
     assert_eq!(moved.core_commands, here.core_commands);
-    assert_ne!(moved.zmap_position, here.zmap_position);
+    assert_ne!(moved.composite_position, here.composite_position);
 }
 
 #[test]
@@ -4309,18 +4387,17 @@ fn pipette_reads_and_appends_nothing() {
     c.select_frame(2);
     drag(&mut c, &[(20.0, 50.0), (30.0, 55.0)]);
     c.undo();
-    let state = |c: &AppController| (ops(c), indices(c), c.edit_session().unwrap().can_redo());
+    let state = |c: &AppController| (ops(c), c.edit_session().unwrap().can_redo());
     let before = state(&c);
-    assert!(before.2, "one stroke waits on the redo stack");
-    let edited = before.1.clone();
+    assert!(before.1, "one stroke waits on the redo stack");
     let differing = |source: u16| {
         (8..height)
             .flat_map(|y| (8..width).map(move |x| (x, y)))
             .find(|&(x, y)| {
-                let index = edited[(y * width + x) as usize];
+                let index = sealed[(y * width + x) as usize];
                 index != source && index != NO_SOURCE
             })
-            .map(|(x, y)| ((x as f32, y as f32), edited[(y * width + x) as usize]))
+            .map(|(x, y)| ((x as f32, y as f32), sealed[(y * width + x) as usize]))
             .expect("the fused map names more than one source")
     };
     let off_image = (RIGHT.x + 100.0, 8.0);
@@ -4396,6 +4473,330 @@ fn pipette_reads_and_appends_nothing() {
     );
 }
 
+/// A saved fuse row whose Z-Map blob fails to decode still renders, opens
+/// the editor and takes strokes; only the overlay and the pipette's reading
+/// off every stroke are lost.
+#[test]
+fn zmap_unreadable_leaves_the_image_working() {
+    use focusforge_gui::canvas::CanvasFeed;
+
+    let mut c = controller_with_scratch("zmap_unreadable");
+    open_fused_tab(&mut c, "zmap_unreadable_frames", 3);
+    let (path, older, _head) = common::save_two_fuses(&mut c);
+    common::corrupt_blob(&path, &saved_zmap_blob(&path, &older));
+
+    let mut c = reopen(&path, "zmap_unreadable_reopened");
+    c.set_pane_geometry(LEFT, RIGHT);
+    c.set_overlay_on(true);
+    let row = row_index(&c, &older);
+    c.select_checkpoint_row(row);
+    assert!(matches!(c.canvas_feed(None), CanvasFeed::Clear));
+    assert!(c.overlay_available(), "the row's planes are still pending");
+    common::settle_render(&mut c);
+    match c.canvas_feed(None) {
+        CanvasFeed::Load {
+            composite, zmap, ..
+        } => {
+            assert!(composite.is_file(), "the composite loads");
+            assert_eq!(zmap, None, "without a Z-Map");
+        }
+        other => panic!("the settled row must load, got {other:?}"),
+    }
+    assert!(!c.overlay_available(), "no Z-Map, no overlay");
+    assert_eq!(c.overlay_draw(), None);
+
+    common::enter_editor(&mut c);
+    c.select_frame(1);
+    common::paint(
+        &mut c,
+        Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 20, y: 20 }],
+            radius: 4.0,
+            softness: 0.0,
+        },
+    );
+    assert_eq!(ops(&c).len(), 1, "a stroke appends");
+    let (sx, sy) = at(50.0, 50.0);
+    c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+    c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+    assert_eq!(
+        c.brush_source(),
+        Some(1),
+        "a pick off every stroke reads nothing"
+    );
+}
+
+#[test]
+fn pipette_reads_the_overlay() {
+    let (mut c, _) = open_editor("pipette_overlay");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let stored = read_whole_zmap(&zmap);
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let (width, height) = (info.width(), info.height());
+    let (x, y, under) = (8..height - 8)
+        .flat_map(|y| (8..width - 8).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let source = stored[(y * width + x) as usize];
+            (source != NO_SOURCE).then_some((x, y, source))
+        })
+        .expect("the fused map names a source away from its edge");
+    let painter = (under + 1) % 3;
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.0);
+    c.select_frame(usize::from(painter));
+    let (px, py) = (x as f32, y as f32);
+    drag(&mut c, &[(px - 3.0, py), (px, py), (px + 3.0, py)]);
+    assert!(
+        matches!(
+            ops(&c)[..],
+            [Op::BrushStroke { source_id, .. }] if source_id == painter
+        ),
+        "a stroke from another frame covers the pixel"
+    );
+
+    // A pixel clear of the stroke whose stored frame is neither the painter's
+    // nor absent.
+    let (ox, oy, off) = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let source = stored[(y * width + x) as usize];
+            let clear = x.abs_diff(px as u32) > 16 || y.abs_diff(py as u32) > 16;
+            (clear && source != NO_SOURCE && source != painter).then_some((x, y, source))
+        })
+        .expect("the map names another frame clear of the stroke");
+    let (off_x, off_y) = (ox as f32, oy as f32);
+
+    let alt_click = |c: &mut AppController, (x, y): (f32, f32)| {
+        let (sx, sy) = at(x, y);
+        c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+        c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+    };
+    c.select_frame(usize::from(under));
+    alt_click(&mut c, (px, py));
+    assert_eq!(
+        c.brush_source(),
+        Some(painter),
+        "Alt + click over the stroke reads the frame the overlay shows"
+    );
+    c.select_frame(usize::from(painter));
+    alt_click(&mut c, (off_x, off_y));
+    assert_eq!(
+        c.brush_source(),
+        Some(off),
+        "Alt + click off every stroke reads the stored map"
+    );
+
+    c.select_frame(usize::from(under));
+    c.toggle_pipette();
+    let (sx, sy) = at(px, py);
+    c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+    assert_eq!(
+        c.brush_cursor_view().unwrap().pick_color,
+        job::source_color(painter, c.frame_count().unwrap()),
+        "the armed cursor previews the overlay's frame"
+    );
+    let (sx, sy) = at(off_x, off_y);
+    c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+    assert_eq!(
+        c.brush_cursor_view().unwrap().pick_color,
+        job::source_color(off, c.frame_count().unwrap()),
+        "off the stroke the cursor previews the stored frame"
+    );
+    drag(&mut c, &[(px, py)]);
+    assert_eq!(c.brush_source(), Some(painter), "the armed pick");
+    assert_eq!(ops(&c).len(), 1, "picking appends nothing");
+}
+
+/// The overlay's colour at every pixel of the map: the active tab's
+/// `overlay_draw()` over the stored indices at `zmap`.
+fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
+    let draw = c.overlay_draw().expect("the overlay is on");
+    let info = ZMapReader::open(zmap).unwrap().info();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    };
+    let stored = read_whole_zmap(zmap);
+    let mut colors = vec![[0u8; 3]; stored.len()];
+    focusforge_core::retouch::overlay_colors(
+        &draw.ops,
+        info,
+        whole,
+        NonZeroU32::MIN,
+        &draw.table,
+        &stored,
+        &mut colors,
+    );
+    colors
+}
+
+#[test]
+fn live_overlay_follows_the_drag() {
+    let (mut c, _) = open_editor("live_overlay_drag");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let width = info.width() as usize;
+    let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
+    c.set_overlay_on(true);
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.0);
+    let untouched = overlay_pixels(&c, &zmap);
+    assert!(
+        c.overlay_draw().unwrap().ops.is_empty(),
+        "no strokes, no ops"
+    );
+
+    c.select_frame(2);
+    press(&mut c, at(12.0, 20.0));
+    let (sx, sy) = at(30.0, 20.0);
+    c.pointer_moved(sx, sy);
+    c.flush_live_stroke();
+    common::settle_region_renders(&mut c);
+    let held = c.overlay_draw().unwrap().ops;
+    assert!(ops(&c).is_empty(), "the stroke is not an op while held");
+    let [
+        Op::BrushStroke {
+            source_id, path, ..
+        },
+    ] = &held[..]
+    else {
+        panic!("the held overlay draws the live stroke: {held:?}");
+    };
+    assert_eq!(*source_id, 2);
+    assert_eq!(
+        path.last(),
+        Some(&Point { x: 30, y: 20 }),
+        "its path so far"
+    );
+    let mid = overlay_pixels(&c, &zmap);
+    assert_eq!(mid[20 * width + 25], table[2], "the core shows the painter");
+    assert_eq!(mid[0], untouched[0], "far from the stroke the map shows");
+
+    release(&mut c, at(30.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert_eq!(
+        c.overlay_draw().unwrap().ops.to_vec(),
+        c.edit_session().unwrap().drawn_ops(),
+        "after release the overlay lists the session's drawn ops"
+    );
+    assert_eq!(ops(&c).len(), 1);
+
+    c.select_frame(1);
+    drag(&mut c, &[(24.0, 14.0), (24.0, 30.0)]);
+    let both = overlay_pixels(&c, &zmap);
+    assert_eq!(
+        both[24 * width + 24],
+        table[1],
+        "the later stroke is on top"
+    );
+    assert_eq!(both[20 * width + 14], table[2], "the first still shows");
+
+    c.undo();
+    assert_eq!(c.overlay_draw().unwrap().ops.len(), 1);
+    assert_eq!(
+        overlay_pixels(&c, &zmap)[24 * width + 24],
+        untouched[24 * width + 24],
+        "undo takes the later stroke's colour away"
+    );
+    c.redo();
+    assert_eq!(overlay_pixels(&c, &zmap), both, "redo restores it");
+}
+
+#[test]
+fn live_overlay_shows_the_selected_checkpoint() {
+    let (path, chain) = saved_chain("live_overlay_selected", &[20, 40]);
+    let saved_ops: Vec<Op> = saved(&path)
+        .history()
+        .op_chain(&chain[2])
+        .unwrap()
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(saved_ops.len(), 2);
+
+    let mut c = reopen(&path, "live_overlay_selected_reopened");
+    c.set_overlay_on(true);
+    let shown = |c: &AppController| c.overlay_draw().expect("the overlay is on").ops.to_vec();
+    c.select_checkpoint_row(row_index(&c, &chain[2]));
+    assert_eq!(shown(&c), saved_ops, "a saved row with no session");
+    c.select_checkpoint_row(row_index(&c, &chain[1]));
+    assert_eq!(shown(&c), saved_ops[..1], "its parent's chain");
+    c.select_checkpoint_row(row_index(&c, &chain[0]));
+    assert!(shown(&c).is_empty(), "the unedited root carries none");
+
+    c.select_checkpoint_row(row_index(&c, &chain[2]));
+    c.set_pane_geometry(LEFT, RIGHT);
+    common::enter_editor(&mut c);
+    assert_eq!(shown(&c), saved_ops, "entering the editor keeps them");
+    set_size(&mut c, 8.0);
+    c.select_frame(1);
+    drag(&mut c, &[(10.0, 44.0), (30.0, 44.0)]);
+    let with_new = shown(&c);
+    assert_eq!(with_new.len(), 3);
+    assert_eq!(with_new[..2], saved_ops[..]);
+    assert!(c.save_active_project(|_| None));
+    assert_eq!(shown(&c), with_new, "each stroke once after a save");
+
+    // A held op-bearing row draws its chain through its session.
+    let mut held = open_editor("live_overlay_held").0;
+    held.set_overlay_on(true);
+    set_size(&mut held, 8.0);
+    held.select_frame(1);
+    drag(&mut held, &[(12.0, 20.0), (36.0, 26.0)]);
+    held.select_frame(2);
+    drag(&mut held, &[(16.0, 34.0), (40.0, 30.0)]);
+    let strokes = ops(&held);
+    assert!(held.save_checkpoint());
+    let ops_row = row_index(&held, "held:1");
+    held.select_checkpoint_row(row_index(&held, "held:0"));
+    held.select_checkpoint_row(ops_row);
+    assert_eq!(shown(&held), strokes, "a held row with no session");
+    common::enter_editor(&mut held);
+    assert_eq!(shown(&held), strokes, "and through its session");
+}
+
+#[test]
+fn live_overlay_never_reaches_save_or_export() {
+    let scenario = |overlay: bool, name: &str| {
+        let (mut c, root) = open_editor(name);
+        let sealed = Sealed::read(&mut c, &root);
+        set_size(&mut c, 12.0);
+        c.set_brush_softness_fraction(0.5);
+        c.select_frame(0);
+        drag(&mut c, &[(40.0, 50.0), (50.0, 54.0)]);
+        let path = save_to_proposed(&mut c);
+        c.select_frame(1);
+        drag(&mut c, &[(10.0, 12.0), (30.0, 20.0)]);
+        c.select_frame(2);
+        drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
+        let before = fs::read(&path).unwrap();
+        c.set_overlay_on(true);
+        c.set_overlay_opacity_fraction(0.8);
+        c.set_overlay_on(false);
+        assert!(
+            fs::read(&path).unwrap() == before,
+            "toggling the overlay writes nothing"
+        );
+        c.set_overlay_on(overlay);
+        let shown = sealed.displayed(&c);
+        assert!(c.save_active_project(|_| None));
+        let render = saved_render(&path);
+        assert!(
+            shown == render,
+            "the live view and the saved render ignore the overlay"
+        );
+        (render, ops(&c).len(), saved(&path).checkpoint().ops.clone())
+    };
+    let off = scenario(false, "live_overlay_off");
+    let on = scenario(true, "live_overlay_on");
+    assert!(on.0 == off.0, "the render is the same with the overlay on");
+    assert_eq!(on.2, off.2, "the saved ops are the same");
+    assert_eq!(on.2.len(), 2);
+}
+
 #[test]
 fn held_alt_shows_the_pipette_cursor() {
     let (mut c, _) = open_editor("brush_alt_cursor");
@@ -4457,9 +4858,9 @@ fn assert_scene_point_matches(
     c.pointer(PointerKind::Move, Button::Left, point.0, point.1, NO_MODS);
     let cursor = c.brush_cursor_view().unwrap();
     let local = if other.x > home.x {
-        cursor.zmap_position
-    } else {
         cursor.composite_position
+    } else {
+        cursor.frame_position
     };
     let mirrored = (other.x + local.0, other.y + local.1);
     assert!(
@@ -4558,9 +4959,9 @@ fn selected_frame_pixel(c: &AppController, x: u32, y: u32) -> Vec<u16> {
 }
 
 /// A drag over the left pane and the same drag shifted to the cursor's
-/// mirrored point over the right pane append equal ops and leave equal indices, at fit, one zoom
-/// step in, after a pan and with a wider gutter; the left pane's frame is
-/// never written.
+/// mirrored point over the right pane append equal ops and show equal pixels,
+/// at fit, one zoom step in, after a pan and with a wider gutter; the left
+/// pane's frame is never written.
 #[test]
 fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
     let (mut c, _) = open_editor("mirrored_brush_either_pane");
@@ -4570,7 +4971,7 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
     let check_stage = |c: &mut AppController, right: PaneRect, stage: &str| {
         let start = at_pane(LEFT, 29.0, 30.0);
         c.pointer(PointerKind::Move, Button::Left, start.0, start.1, NO_MODS);
-        let mirrored = c.brush_cursor_view().unwrap().zmap_position;
+        let mirrored = c.brush_cursor_view().unwrap().composite_position;
         let mirror_dx = right.x + mirrored.0 - start.0;
         let mirror_dy = right.y + mirrored.1 - start.1;
         let left_path: Vec<(f32, f32)> = (0..4)
@@ -4584,23 +4985,22 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
 
         drag_screen(c, &right_path);
         let right_ops = ops(c);
-        let right_indices = indices(c);
+        let right_image = displayed_whole(c);
         assert_eq!(
             right_ops.len(),
             ops_before + 1,
             "{stage}: the right-pane stroke"
         );
         c.undo();
-        common::settle_recomposites(c);
+        common::settle_region_renders(c);
         assert_eq!(ops(c).len(), ops_before, "{stage}: undo");
 
         let frame_before = selected_frame_pixel(c, 29, 30);
         drag_screen(c, &left_path);
         assert_eq!(ops(c), right_ops, "{stage}: the left pane's op");
-        assert_eq!(
-            indices(c),
-            right_indices,
-            "{stage}: the left pane's indices"
+        assert!(
+            displayed_whole(c) == right_image,
+            "{stage}: the left pane's pixels"
         );
         assert_eq!(
             selected_frame_pixel(c, 29, 30),
@@ -4608,7 +5008,7 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
             "{stage}: the left pane's frame is unchanged"
         );
         c.undo();
-        common::settle_recomposites(c);
+        common::settle_region_renders(c);
     };
 
     check_stage(&mut c, RIGHT, "at fit");
@@ -4632,7 +5032,6 @@ fn a_press_between_the_panes_opens_no_stroke() {
     set_size(&mut c, 8.0);
     c.select_frame(2);
     let before_ops = ops(&c);
-    let before_indices = indices(&c);
     let inside = at(30.0, 30.0);
 
     for (case, start) in [
@@ -4647,9 +5046,8 @@ fn a_press_between_the_panes_opens_no_stroke() {
         c.pointer_moved(inside.0, inside.1);
         c.flush_live_stroke();
         release(&mut c, inside);
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         assert_eq!(ops(&c), before_ops, "a press in {case}");
-        assert_eq!(indices(&c), before_indices, "a press in {case}");
     }
 }
 
@@ -4684,8 +5082,8 @@ fn mirrored_cursor_shares_geometry() {
         after_size.extent, before.extent,
         "size changes the shared geometry"
     );
+    assert_eq!(after_size.frame_position, before.frame_position);
     assert_eq!(after_size.composite_position, before.composite_position);
-    assert_eq!(after_size.zmap_position, before.zmap_position);
 
     c.set_brush_softness_fraction(0.75);
     let after_soft = c.brush_cursor_view().unwrap();
@@ -4693,8 +5091,8 @@ fn mirrored_cursor_shares_geometry() {
         after_soft.core_commands, after_size.core_commands,
         "softness changes the core"
     );
+    assert_eq!(after_soft.frame_position, before.frame_position);
     assert_eq!(after_soft.composite_position, before.composite_position);
-    assert_eq!(after_soft.zmap_position, before.zmap_position);
 
     c.zoom_in();
     let after_zoom = c.brush_cursor_view().unwrap();
@@ -4709,10 +5107,7 @@ fn mirrored_cursor_shares_geometry() {
     assert_eq!(after_pointer.extent, after_zoom.extent);
     assert_eq!(after_pointer.ring_commands, after_zoom.ring_commands);
     assert_eq!(after_pointer.core_commands, after_zoom.core_commands);
-    assert_ne!(
-        after_pointer.composite_position,
-        after_zoom.composite_position
-    );
+    assert_ne!(after_pointer.frame_position, after_zoom.frame_position);
 }
 
 /// With the pipette armed, the left pane's hover and the right pane's hover
@@ -4741,8 +5136,8 @@ fn mirrored_cursor_marks_the_pipette_point() {
     );
 
     let right_point = (
-        RIGHT.x + left_hover.zmap_position.0,
-        RIGHT.y + left_hover.zmap_position.1,
+        RIGHT.x + left_hover.composite_position.0,
+        RIGHT.y + left_hover.composite_position.1,
     );
     c.pointer(
         PointerKind::Move,
@@ -4836,7 +5231,8 @@ fn undo_redo_bindings_and_silent_discard() {
     c.select_frame(2);
     drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
     let both = ops(&c);
-    let after_both = indices(&c);
+    common::settle_region_renders(&mut c);
+    let after_both = sealed.displayed(&c);
 
     for (undo_key, redo_key) in [("z", "Z"), ("Z", "z")] {
         c.key(true, undo_key, CTRL);
@@ -4844,13 +5240,14 @@ fn undo_redo_bindings_and_silent_discard() {
         assert!(c.brush_toolbar_view().can_redo);
         c.key(true, redo_key, CTRL_SHIFT);
         assert_eq!(ops(&c), both, "redo as {redo_key:?}");
-        assert_eq!(indices(&c), after_both);
+        common::settle_region_renders(&mut c);
+        assert!(sealed.displayed(&c) == after_both, "redo as {redo_key:?}");
     }
 
     c.key(true, "z", CTRL);
     c.key(true, "z", CTRL);
-    assert_eq!(indices(&c), sealed.indices, "undo is exact");
-    common::settle_recomposites(&mut c);
+    assert!(ops(&c).is_empty(), "undo is exact");
+    common::settle_region_renders(&mut c);
     assert!(
         sealed.displayed(&c) == sealed.composite,
         "the original composite"
@@ -4870,7 +5267,7 @@ fn undo_redo_bindings_and_silent_discard() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| !matches!(event, ShellEvent::Input(_) | ShellEvent::RecompositeReady))
+        .filter(|event| !matches!(event, ShellEvent::Input(_) | ShellEvent::RegionRenderReady))
         .cloned()
         .collect();
     assert_eq!(
@@ -4879,22 +5276,20 @@ fn undo_redo_bindings_and_silent_discard() {
         "nothing announces it"
     );
 
-    let now = (ops(&c), indices(&c));
+    let now = ops(&c);
     c.key(true, "z", CTRL_SHIFT);
-    assert_eq!((ops(&c), indices(&c)), now, "nothing left to redo");
-    common::settle_recomposites(&mut c);
+    assert_eq!(ops(&c), now, "nothing left to redo");
+    common::settle_region_renders(&mut c);
     sealed.assert_shown(&c, "after the new stroke");
 }
 
 #[test]
-fn stroke_commit_recomposites_its_tick_rects() {
+fn stroke_commit_renders_its_tick_rects() {
     let (mut c, root) = open_editor("brush_commit");
     let sealed = Sealed::read(&mut c, &root);
     set_size(&mut c, 20.0);
     c.set_brush_softness_fraction(0.3);
     c.select_frame(1);
-    let radius = c.brush_toolbar_view().size / 2.0;
-    let margin = (radius / 8.0).ceil() as u32 + 2;
     let info = c.edit_session().unwrap().info();
 
     // Zig-zag runs of about 1.7 px, shorter than the resample spacing
@@ -4914,45 +5309,62 @@ fn stroke_commit_recomposites_its_tick_rects() {
             c.pointer_moved(x, y);
         }
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
-        let tick = c.take_recomposited();
-        assert_eq!(tick.len(), 1, "one recomposite per flush");
+        common::settle_region_renders(&mut c);
+        let tick = c.take_rendered_regions();
+        assert_eq!(tick.len(), 1, "one region render per flush");
         ticks.extend(tick);
     }
     release(&mut c, *screen.last().unwrap());
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
 
-    let commit = c.take_recomposited();
+    let commit = c.take_rendered_regions();
     let map = map_rect(&c);
-    let expected: Vec<Rect> = ticks.iter().map(|&r| dilate(r, margin, map)).collect();
-    assert_eq!(commit, expected, "one pass over the dilated tick rects");
     let op = ops(&c).pop().unwrap();
     let bbox = footprint(&op, info).unwrap().unwrap();
+    let mut cells = std::collections::BTreeSet::new();
+    for r in ticks.iter().chain([&bbox]) {
+        for tx in r.x / 16..=(r.x + r.width - 1) / 16 {
+            for ty in r.y / 16..=(r.y + r.height - 1) / 16 {
+                cells.insert((tx, ty));
+            }
+        }
+    }
+    let expected: Vec<Rect> = cells
+        .into_iter()
+        .map(|(tx, ty)| Rect {
+            x: tx * 16,
+            y: ty * 16,
+            width: 16.min(map.width - tx * 16),
+            height: 16.min(map.height - ty * 16),
+        })
+        .collect();
+    assert_eq!(commit, expected, "one pass over the touched 16 px tiles");
     assert!(!commit.contains(&bbox), "never the stroke's bounding box");
     sealed.assert_shown(&c, "after release");
 
     c.undo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(
-        c.take_recomposited(),
+        c.take_rendered_regions(),
         vec![bbox],
-        "undo recomposites its region"
+        "undo renders its region"
     );
     sealed.assert_shown(&c, "after undo");
     assert!(sealed.displayed(&c) == sealed.composite);
     c.redo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(
-        c.take_recomposited(),
+        c.take_rendered_regions(),
         vec![bbox],
-        "redo recomposites its region"
+        "redo renders its region"
     );
     sealed.assert_shown(&c, "after redo");
 }
 
 #[test]
 fn every_edit_has_a_cli_equivalent() {
-    let (mut c, _) = open_editor("brush_cli");
+    let (mut c, root) = open_editor("brush_cli");
+    let sealed = Sealed::read(&mut c, &root);
     set_size(&mut c, 6.0);
     c.select_frame(1);
     drag(&mut c, &[(10.0, 10.0), (30.0, 25.0), (12.0, 40.0)]);
@@ -4963,18 +5375,17 @@ fn every_edit_has_a_cli_equivalent() {
     drag(&mut c, &[(50.0, 8.0), (20.0, 58.0)]);
     let ops = ops(&c);
     assert_eq!(ops.len(), 2);
-
-    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
-    let info = ZMapReader::open(&zmap).unwrap().info();
-    let mut replay = EditSession::new(info, map_rect(&c), read_whole_zmap(&zmap)).unwrap();
-    for op in &ops {
-        replay.append(op.clone()).unwrap();
-    }
-    assert_eq!(replay.indices(), c.edit_session().unwrap().indices());
+    common::settle_region_renders(&mut c);
 
     let json = serde_json::to_string(&ops).unwrap();
     let parsed: Vec<Op> = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, ops);
+
+    let info = c.edit_session().unwrap().info();
+    assert!(
+        sealed.displayed(&c) == sealed.expected(&parsed, info),
+        "the serialized ops replay to the displayed image"
+    );
 }
 
 #[test]
@@ -4988,8 +5399,8 @@ fn live_stroke_previews_each_new_segment() {
     drag(&mut c, &[(8.0, 56.0)]);
     c.undo();
     c.select_frame(1);
-    common::settle_recomposites(&mut c);
-    c.take_recomposited();
+    common::settle_region_renders(&mut c);
+    c.take_rendered_regions();
     let session = |c: &AppController| {
         let s = c.edit_session().unwrap();
         (
@@ -5001,7 +5412,6 @@ fn live_stroke_previews_each_new_segment() {
     bind_softness_to_alt_wheel(&mut c);
     let before = session(&c);
     assert!(before.2, "one stroke waits on the redo stack");
-    let before_indices = indices(&c);
     let view = c.brush_toolbar_view();
     let (source, radius, softness) = (1u16, view.size / 2.0, view.soft / 100.0);
     let info = c.edit_session().unwrap().info();
@@ -5022,10 +5432,10 @@ fn live_stroke_previews_each_new_segment() {
         .collect();
     press(&mut c, at(trace[0].0, trace[0].1));
     c.flush_live_stroke();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(
-        c.take_recomposited().is_empty(),
-        "a flush with no motion recomposites nothing"
+        c.take_rendered_regions().is_empty(),
+        "a flush with no motion renders nothing"
     );
 
     let mut flushed = 0;
@@ -5035,10 +5445,13 @@ fn live_stroke_previews_each_new_segment() {
             c.pointer_moved(sx, sy);
         }
         if k == 2 {
-            let held = indices(&c);
+            let held = sealed.displayed(&c);
             c.key(true, "z", CTRL);
             c.key(true, "z", CTRL_SHIFT);
-            assert_eq!(indices(&c), held, "undo/redo mid-drag change nothing");
+            assert!(
+                sealed.displayed(&c) == held,
+                "undo/redo mid-drag change nothing"
+            );
             assert_eq!(session(&c), before);
             c.wheel(0.0, 60.0, 0.0, 0.0, SHIFT);
             c.wheel(0.0, 60.0, 0.0, 0.0, ALT);
@@ -5048,40 +5461,36 @@ fn live_stroke_previews_each_new_segment() {
             assert_ne!(c.brush_source(), Some(source));
         }
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         let segment = stroke(rounded(&trace[flushed..=end]));
         let region = footprint(&segment, info).unwrap();
         assert_eq!(
-            c.take_recomposited(),
+            c.take_rendered_regions(),
             region.into_iter().collect::<Vec<_>>(),
             "flush {k}: exactly the new segment's footprint, once"
         );
-        let mut painted = before_indices.clone();
-        apply(
-            &stroke(rounded(&trace[..=end])),
-            info,
-            sealed.map,
-            &mut painted,
-        )
-        .unwrap();
+        let mut shown = sealed.expected(&before.1, info);
+        sealed.blend_over(&mut shown, &stroke(rounded(&trace[..=end])), info);
         assert!(
-            indices(&c) == painted,
-            "flush {k}: the preview paints the rounded trace so far"
+            sealed.displayed(&c) == shown,
+            "flush {k}: the blended trace so far over the pre-stroke samples"
         );
-        sealed.assert_shown(&c, &format!("flush {k}"));
         assert_eq!(
             session(&c),
             before,
             "flush {k}: the op list waits for release"
         );
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
-        assert!(c.take_recomposited().is_empty(), "flush {k}: nothing new");
+        common::settle_region_renders(&mut c);
+        assert!(
+            c.take_rendered_regions().is_empty(),
+            "flush {k}: nothing new"
+        );
         flushed = end;
     }
 
     release(&mut c, at(trace[44].0, trace[44].1));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     let mut live = LiveStroke::new(source, radius, softness, trace[0].0, trace[0].1);
     for w in trace.windows(2) {
         live.push(w[1].0 - w[0].0, w[1].1 - w[0].1);
@@ -5095,17 +5504,11 @@ fn live_stroke_previews_each_new_segment() {
         Some(&committed),
         "the frozen source, radius and softness"
     );
-    let mut fresh = EditSession::new(info, sealed.map, before_indices).unwrap();
-    fresh.append(committed).unwrap();
-    assert!(
-        indices(&c) == fresh.indices(),
-        "a fresh session with that op"
-    );
     sealed.assert_shown(&c, "after release");
 }
 
-/// A brush stroke that paints frame `i` recomposites the composite from the
-/// frame-as-fused view -- the recomposited pixel under the stroke equals a
+/// A brush stroke that paints frame `i` renders the composite from the
+/// frame-as-fused view -- the pixel under the stroke equals a
 /// [`FrameSource`] read of that frame through `selected_frame_view` at the
 /// same point.
 ///
@@ -5121,7 +5524,7 @@ fn stroke_matches_left_pane() {
 
     let sealed = Sealed::read(&mut c, &root);
     let point = (20 * sealed.map.width + 20) as usize;
-    let recomposited = sealed.displayed(&c)[point * 3..point * 3 + 3].to_vec();
+    let stroked = sealed.displayed(&c)[point * 3..point * 3 + 3].to_vec();
 
     let view = c
         .selected_frame_view()
@@ -5149,8 +5552,8 @@ fn stroke_matches_left_pane() {
         .expect("the left pane's own point reads");
 
     assert_eq!(
-        recomposited, left_pixel,
-        "the recomposited pixel must equal the left pane's own read at the same point"
+        stroked, left_pixel,
+        "the stroked pixel must equal the left pane's own read at the same point"
     );
 }
 
@@ -5160,13 +5563,13 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     use focusforge_core::params::ParamValue;
 
     let mut controller = controller_with_scratch(name);
+    controller.set_resident_tile_size_for_test(16);
     open_mantis64_tab(&mut controller, name, count);
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     settle_all(&mut controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
-    controller.set_resident_tile_size_for_test(16);
     controller.set_pane_geometry(LEFT, RIGHT);
     assert!(controller.set_mode(ShellMode::Editor));
     controller
@@ -5364,7 +5767,7 @@ fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
     assert_eq!(off.registration.equalization, None, "an explicit off wins");
 }
 
-/// On an equalized `depth-map` tab a stroke's recomposited pixel is the left
+/// On an equalized `depth-map` tab a stroke's rendered pixel is the left
 /// pane's read of that frame, and that read carries the frame's gain.
 #[test]
 fn equalized_stroke_matches_left_pane() {
@@ -5377,7 +5780,7 @@ fn equalized_stroke_matches_left_pane() {
     assert_ne!(gains[2], UNIT_GAIN, "frame 2 has a gain to apply");
 
     // A point the fuse took from another frame, so the stroke has to
-    // recomposite it rather than keep the sealed pixel.
+    // render it rather than keep the sealed pixel.
     let root = held.sources[0].parent().unwrap().to_path_buf();
     let sealed = Sealed::read(&mut c, &root);
     let width = sealed.map.width as usize;
@@ -5390,7 +5793,7 @@ fn equalized_stroke_matches_left_pane() {
     c.select_frame(2);
     set_size(&mut c, 8.0);
     drag(&mut c, &[(px as f32, py as f32)]);
-    let recomposited = sealed.displayed(&c)[at_index * 3..at_index * 3 + 3].to_vec();
+    let stroked = sealed.displayed(&c)[at_index * 3..at_index * 3 + 3].to_vec();
 
     let view = c
         .selected_frame_view()
@@ -5416,16 +5819,16 @@ fn equalized_stroke_matches_left_pane() {
             .expect("the point reads");
         pixel
     };
-    assert_eq!(recomposited, read(view), "stroke and left pane agree");
+    assert_eq!(stroked, read(view), "stroke and left pane agree");
     let ungained = read(FrameView {
         gain: UNIT_GAIN,
         ..view
     });
-    assert_ne!(recomposited, ungained, "the pixel carries the frame's gain");
+    assert_ne!(stroked, ungained, "the pixel carries the frame's gain");
 }
 
 // ---------------------------------------------------------------------
-// Recomposites run on a worker; the controller installs what they gather.
+// Region renders run on a worker; the controller installs what they render.
 // ---------------------------------------------------------------------
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
@@ -5462,7 +5865,7 @@ impl Gate {
     /// Swaps the active session's frame reader for a closed gate over it.
     fn install(controller: &mut AppController) -> Gate {
         let edit = controller
-            .edit_state_mut_for_test()
+            .edit_session_mut()
             .expect("the tab has an edit session");
         let gate = Gate {
             gate: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
@@ -5561,14 +5964,14 @@ fn drag_unsettled(controller: &mut AppController, path: &[(f32, f32)]) {
     release(controller, *screen.last().unwrap());
 }
 
-/// Waits until `events` holds a `RecompositeReady`, i.e. a worker parked.
-fn wait_for_recomposite_ready(events: &Mutex<Vec<ShellEvent>>) {
+/// Waits until `events` holds a `RegionRenderReady`, i.e. a worker parked.
+fn wait_for_region_render_ready(events: &Mutex<Vec<ShellEvent>>) {
     let start = Instant::now();
     while !events
         .lock()
         .unwrap()
         .iter()
-        .any(|event| matches!(event, ShellEvent::RecompositeReady))
+        .any(|event| matches!(event, ShellEvent::RegionRenderReady))
     {
         assert!(
             start.elapsed() < Duration::from_secs(30),
@@ -5579,14 +5982,14 @@ fn wait_for_recomposite_ready(events: &Mutex<Vec<ShellEvent>>) {
 }
 
 #[test]
-fn a_stroke_recomposites_off_the_ui_thread() {
-    let (mut c, root) = open_editor("recomposite_off_thread");
+fn a_stroke_renders_off_the_ui_thread() {
+    let (mut c, root) = open_editor("region_render_off_thread");
     let sealed = Sealed::read(&mut c, &root);
     let gate = Gate::install(&mut c);
     set_size(&mut c, 12.0);
     c.select_frame(1);
 
-    // A live tick: the preview paints the indices, nothing is gathered yet.
+    // A live tick: queued for a worker, so nothing shows and nothing is gathered yet.
     let path: Vec<(f32, f32)> = (0..12)
         .map(|i| (8.0 + 3.0 * i as f32, 20.0 + i as f32))
         .collect();
@@ -5596,9 +5999,13 @@ fn a_stroke_recomposites_off_the_ui_thread() {
         c.pointer_moved(x, y);
     }
     c.flush_live_stroke();
-    assert_ne!(indices(&c), sealed.indices, "the tick painted at once");
+    assert!(ops(&c).is_empty(), "the tick records no op");
     assert!(
-        c.take_recomposited().is_empty(),
+        sealed.displayed(&c) == sealed.composite,
+        "the tick shows nothing until a worker installs it"
+    );
+    assert!(
+        c.take_rendered_regions().is_empty(),
         "the tick gathered nothing"
     );
 
@@ -5606,23 +6013,46 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     release(&mut c, *screen.last().unwrap());
     assert_eq!(ops(&c).len(), 1);
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "the commit gathered nothing"
     );
     let info = c.edit_session().unwrap().info();
     let bbox = footprint(&ops(&c)[0], info).unwrap().unwrap();
     c.undo();
-    assert_eq!(indices(&c), sealed.indices, "the undo stepped at once");
+    assert!(ops(&c).is_empty(), "the undo stepped at once");
+    assert!(c.edit_session().unwrap().can_redo());
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "the undo gathered nothing"
     );
 
     gate.open();
-    common::settle_recomposites(&mut c);
-    let log = c.take_recomposited();
-    assert_eq!(log.len(), 3, "tick, dilated tick, undo: {log:?}");
-    assert_eq!(log[2], bbox, "the undo's region comes last");
+    common::settle_region_renders(&mut c);
+    let log = c.take_rendered_regions();
+    // The tick's region, then the release's re-render of each 16 px tile the
+    // tick and the stroke meet (tile column by tile column), then the undo.
+    let tick = log[0];
+    let (width, height) = (info.width(), info.height());
+    let tiles_of = |regions: [Rect; 2]| {
+        let mut keys = std::collections::BTreeSet::new();
+        for r in regions {
+            for ty in r.y / 16..=(r.y + r.height - 1) / 16 {
+                for tx in r.x / 16..=(r.x + r.width - 1) / 16 {
+                    keys.insert((tx, ty));
+                }
+            }
+        }
+        keys.into_iter().map(|(tx, ty)| Rect {
+            x: tx * 16,
+            y: ty * 16,
+            width: 16.min(width - tx * 16),
+            height: 16.min(height - ty * 16),
+        })
+    };
+    let mut expected = vec![tick];
+    expected.extend(tiles_of([tick, bbox]));
+    expected.push(bbox);
+    assert_eq!(log, expected, "tick, the touched tiles, undo");
     assert!(gate.off_thread_reads() > 0, "the worker read the frames");
     assert_eq!(
         gate.off_thread_reads(),
@@ -5632,10 +6062,10 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     sealed.assert_shown(&c, "after the undo settles");
 }
 
-/// Edits count as settled only with no live stroke and no recomposite
+/// Edits count as settled only with no live stroke and no region render
 /// queued or in flight; a settle after the last install makes them settled.
 #[test]
-fn edits_settle_after_the_last_recomposite() {
+fn edits_settle_after_the_last_region_render() {
     let (mut c, _root) = open_editor("edits_settle");
     let gate = Gate::install(&mut c);
     set_size(&mut c, 12.0);
@@ -5654,22 +6084,22 @@ fn edits_settle_after_the_last_recomposite() {
     c.flush_live_stroke();
     assert!(
         !c.edits_settled(),
-        "a stroke tick with its recomposite in flight is not settled"
+        "a stroke tick with its region render in flight is not settled"
     );
 
     release(&mut c, *screen.last().unwrap());
     assert!(
         !c.edits_settled(),
-        "a committed stroke whose recomposite is unfinished is not settled"
+        "a committed stroke whose region render is unfinished is not settled"
     );
     assert!(
-        !c.settle_recomposites(),
+        !c.settle_region_renders(),
         "the gated worker has not parked its result"
     );
     assert!(!c.edits_settled(), "still in flight after a settle poll");
 
     gate.open();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(c.edits_settled(), "settled after the last install");
 
     drag(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
@@ -5677,11 +6107,11 @@ fn edits_settle_after_the_last_recomposite() {
 }
 
 #[test]
-fn background_recomposite_matches_the_synchronous_one() {
-    let name = "recomposite_matches_sync";
+fn background_region_render_matches_the_synchronous_one() {
+    let name = "region_render_matches_sync";
     let (mut c, root) = open_editor(name);
     let sealed = Sealed::read(&mut c, &root);
-    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
     let registration = sealed.registration.clone();
     let gate = Gate::install(&mut c);
     set_size(&mut c, 14.0);
@@ -5704,24 +6134,20 @@ fn background_recomposite_matches_the_synchronous_one() {
     c.select_frame(2);
     drag_unsettled(&mut c, &[(5.0, 36.0), (50.0, 46.0)]);
     gate.open();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
 
-    let regions = c.take_recomposited();
-    assert_eq!(
-        regions.len(),
-        11,
-        "a tick and its dilation per stroke: {regions:?}"
-    );
-    assert_eq!(
-        regions[6..9],
-        [bbox(2), bbox(1), bbox(1)],
-        "the undos and the redo follow the three strokes, in order"
+    let regions = c.take_rendered_regions();
+    assert!(
+        regions.windows(3).any(|w| w == [bbox(2), bbox(1), bbox(1)]),
+        "the undos and the redo install their regions in order: {regions:?}"
     );
     sealed.assert_shown(&c, "after every region settled");
 
-    // The same final indices and the same regions, composed synchronously.
+    // The same final ops composed synchronously: opened as a chain over the
+    // same composite and frames.
     let mut fresh = job::open_edit_session(
-        &zmap,
+        Some(&zmap),
+        &composite,
         &(0..3)
             .map(|i| root.join(format!("{i:02}.tif")))
             .collect::<Vec<_>>(),
@@ -5729,46 +6155,28 @@ fn background_recomposite_matches_the_synchronous_one() {
         16,
         job::host_budget(),
         Vec::new(),
+        ops(&c),
     )
     .expect("a second session over the same frames opens");
-    for op in ops(&c) {
-        fresh.session.append(op).unwrap();
-    }
-    assert_eq!(fresh.session.indices(), indices(&c).as_slice());
-    for &region in &regions {
-        fresh.recomposite(region).unwrap();
-    }
-    assert_eq!(fresh.tiles.take_recomposited(), regions);
+    assert_eq!(fresh.stack_ops(), ops(&c), "the same op list");
+    fresh.tiles.take_rendered_regions();
 
     let view = c.edited_view().unwrap();
-    // An index map that differs from the edited one at every texel, so the
-    // overlay shows each installed texel -- one whose index went back to its
-    // sealed value included -- and the marker at every texel never installed.
-    let differs: Vec<u16> = view.indices.iter().map(|&index| !index).collect();
-    let marker = vec![7777u16; sealed.composite.len()];
     let shown = |tiles: &focusforge_gui::canvas::ResidentTiles| {
-        let mut samples = marker.clone();
-        overlay_edited(
-            &mut samples,
-            &differs,
-            view.indices,
-            sealed.map,
-            NonZeroU32::MIN,
-            3,
-            tiles,
-        );
+        let mut samples = sealed.composite.clone();
+        overlay_edited(&mut samples, sealed.map, NonZeroU32::MIN, 3, tiles);
         samples
     };
     assert!(
         shown(view.tiles) == shown(&fresh.tiles),
-        "every resident texel equals the synchronous recomposite's"
+        "the displayed image equals the synchronous render's"
     );
 }
 
 #[test]
-fn a_recomposite_for_a_replaced_session_is_dropped() {
+fn a_region_render_for_a_replaced_session_is_dropped() {
     // (a) A row restored while a stroke's regions are in flight.
-    let name = "recomposite_restored";
+    let name = "region_render_restored";
     let (mut c, root) = open_editor(name);
     let sealed = Sealed::read(&mut c, &root);
     let events = record_events(&mut c);
@@ -5779,18 +6187,21 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     assert!(c.save_checkpoint());
     c.select_checkpoint_row(row_index(&c, "held:0"));
     common::settle_session(&mut c);
-    assert_eq!(indices(&c), sealed.indices, "the restored row's own map");
-    gate.open();
-    wait_for_recomposite_ready(&events);
-    common::settle_recomposites(&mut c);
     assert!(
-        c.take_recomposited().is_empty(),
+        c.edit_session().unwrap().stack_ops().is_empty(),
+        "the restored row's own chain"
+    );
+    gate.open();
+    wait_for_region_render_ready(&events);
+    common::settle_region_renders(&mut c);
+    assert!(
+        c.take_rendered_regions().is_empty(),
         "the replaced session's regions never reach the new one"
     );
     assert!(sealed.displayed(&c) == sealed.composite);
 
     // (b) A tab closed while its regions are in flight.
-    let name = "recomposite_closed";
+    let name = "region_render_closed";
     let (mut c, _) = open_editor(name);
     let events = record_events(&mut c);
     let gate = Gate::install(&mut c);
@@ -5799,29 +6210,28 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     drag_unsettled(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
     c.close_project(0);
     gate.open();
-    wait_for_recomposite_ready(&events);
-    common::settle_recomposites(&mut c);
+    wait_for_region_render_ready(&events);
+    common::settle_region_renders(&mut c);
     assert!(c.edit_session().is_none());
 
     // (c) A plain save is not a replacement: its regions land.
-    let name = "recomposite_saved";
-    let (mut c, root) = open_editor(name);
-    let sealed = Sealed::read(&mut c, &root);
+    let name = "region_render_saved";
+    let (mut c, _) = open_editor(name);
     let gate = Gate::install(&mut c);
     set_size(&mut c, 8.0);
     c.select_frame(1);
     drag_unsettled(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
     save_to_proposed(&mut c);
     gate.open();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(
-        !c.take_recomposited().is_empty(),
+        !c.take_rendered_regions().is_empty(),
         "the save kept the session, so its regions land"
     );
-    assert_ne!(indices(&c), sealed.indices);
+    assert!(!c.edit_session().unwrap().stack_ops().is_empty());
 
     // (d) A result for a switched-away tab lands on its own tab.
-    let name = "recomposite_switched";
+    let name = "region_render_switched";
     let (mut c, _) = open_editor(name);
     let events = record_events(&mut c);
     let gate = Gate::install(&mut c);
@@ -5830,22 +6240,22 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     drag_unsettled(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
     open_mantis64_tab(&mut c, &format!("{name}_other"), 2);
     gate.open();
-    wait_for_recomposite_ready(&events);
-    common::settle_recomposites(&mut c);
+    wait_for_region_render_ready(&events);
+    common::settle_region_renders(&mut c);
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "nothing lands on the active tab"
     );
     c.select_project(0);
     assert!(
-        !c.take_recomposited().is_empty(),
+        !c.take_rendered_regions().is_empty(),
         "the first tab's tiles took its own regions"
     );
 }
 
 #[test]
-fn a_failed_background_recomposite_keeps_the_edit() {
-    let (mut c, root) = open_editor("recomposite_fails");
+fn a_failed_background_region_render_keeps_the_edit() {
+    let (mut c, root) = open_editor("region_render_fails");
     let sealed = Sealed::read(&mut c, &root);
     let gate = Gate::install(&mut c);
     gate.open();
@@ -5858,7 +6268,7 @@ fn a_failed_background_recomposite_keeps_the_edit() {
         drag(&mut c, &[(8.0, 12.0 + 8.0 * before as f32), (40.0, 20.0)]);
         assert_eq!(ops(&c).len(), before + 1, "{case}: the stroke stays");
         assert!(
-            c.take_recomposited().is_empty(),
+            c.take_rendered_regions().is_empty(),
             "{case}: nothing installed"
         );
         assert!(
@@ -5867,20 +6277,23 @@ fn a_failed_background_recomposite_keeps_the_edit() {
         );
     }
     assert_eq!(ops(&c).len(), 2);
-    assert_ne!(indices(&c), sealed.indices);
 
     c.undo();
     assert_eq!(ops(&c).len(), 1, "undo still steps the history");
-    common::settle_recomposites(&mut c);
-    c.take_recomposited();
+    common::settle_region_renders(&mut c);
+    c.take_rendered_regions();
 
     gate.set_fault(Fault::None);
     drag(&mut c, &[(10.0, 50.0), (44.0, 54.0)]);
-    assert!(!c.take_recomposited().is_empty(), "later strokes settle");
+    assert!(
+        !c.take_rendered_regions().is_empty(),
+        "later strokes settle"
+    );
     c.redo();
     c.undo();
     c.undo();
     c.undo();
+    common::settle_region_renders(&mut c);
     sealed.assert_shown(&c, "after the history unwinds");
 }
 
@@ -6105,12 +6518,11 @@ fn assert_wheel_key_pipette_blocked(c: &mut AppController, case: &str) {
 }
 
 /// A brush drag over either pane, blocked: neither pane's press starts a
-/// stroke, so the edit session's own op count and index buffer -- the
-/// in-memory twin of the Z-Map a commit would write -- stay exactly as
-/// they were.
+/// stroke, so the edit session's op list and the displayed image stay exactly
+/// as they were.
 fn assert_drag_blocked(c: &mut AppController, case: &str) {
     let before_ops = ops(c);
-    let before_indices = indices(c);
+    let before_image = displayed_whole(c);
     press(c, at_pane(LEFT, 10.0, 10.0));
     c.pointer_moved(at_pane(LEFT, 20.0, 15.0).0, at_pane(LEFT, 20.0, 15.0).1);
     release(c, at_pane(LEFT, 20.0, 15.0));
@@ -6118,10 +6530,10 @@ fn assert_drag_blocked(c: &mut AppController, case: &str) {
     c.pointer_moved(at(20.0, 15.0).0, at(20.0, 15.0).1);
     release(c, at(20.0, 15.0));
     assert_eq!(ops(c), before_ops, "{case}: a blocked drag must add no op");
-    assert_eq!(
-        indices(c),
-        before_indices,
-        "{case}: a blocked drag must not touch the Z-Map"
+    common::settle_region_renders(c);
+    assert!(
+        displayed_whole(c) == before_image,
+        "{case}: a blocked drag must not touch the image"
     );
 }
 
@@ -6275,8 +6687,9 @@ fn paint(controller: &mut AppController, x: i32) {
     let session = controller
         .edit_session_mut()
         .expect("the tab has an edit session");
-    let width = session.tile().width as usize;
-    let shown = session.indices()[20 * width + x as usize];
+    let shown = session
+        .stored_source(x as u32, 20)
+        .expect("the column lies inside the map");
     session
         .append(Op::BrushStroke {
             source_id: u16::from(shown == 0),
@@ -6300,17 +6713,14 @@ fn saved(path: &Path) -> Project {
     Project::open(path).expect("the saved project opens")
 }
 
-/// `id`'s Z-Map as a saved project materializes it.
-fn saved_map(path: &Path, id: &str, name: &str) -> Vec<u16> {
-    let mut project = saved(path);
-    let checkpoint = project
+/// `id`'s Z-Map blob in the saved project.
+fn saved_zmap_blob(path: &Path, id: &str) -> String {
+    saved(path)
         .history()
         .get(id)
         .expect("the checkpoint is saved")
-        .clone();
-    let out = common::tree(name).join("zmap.tif");
-    project::materialize_zmap(&mut project, &checkpoint, &out).expect("the Z-Map materializes");
-    read_whole_zmap(&out)
+        .zmap_blob
+        .clone()
 }
 
 fn saved_ids(path: &Path) -> Vec<String> {
@@ -6356,7 +6766,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     let mut controller = controller_with_scratch("auto_checkpoint_new");
     open_fused_tab(&mut controller, "auto_checkpoint_new_frames", 2);
     paint(&mut controller, 20);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
     let path = save_to_proposed(&mut controller);
 
     let project = saved(&path);
@@ -6372,16 +6782,11 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
         1,
         "the automatic checkpoint carries the stroke"
     );
-    assert_eq!(
-        saved_map(&path, &child.id, "auto_checkpoint_new_map"),
-        painted
-    );
+    assert_eq!(child.ops, painted_ops);
+    assert_eq!(child.zmap_blob, root.zmap_blob, "the fused ancestor's map");
     assert_eq!(current_row(&controller), Some(child.id.clone()));
     let session = controller.edit_session().expect("the session survives");
-    assert_eq!(
-        (session.op_count(), session.indices()),
-        (0, painted.as_slice())
-    );
+    assert_eq!((session.op_count(), session.stack_ops()), (0, painted_ops));
     assert!(!controller.save_enabled());
 
     // An opened project painted on its older, non-head row.
@@ -6392,7 +6797,7 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     controller.select_checkpoint_row(root_row);
     common::enter_editor(&mut controller);
     paint(&mut controller, 40);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
     assert!(controller.save_enabled());
     assert!(controller.save_active_project(|_| None));
 
@@ -6402,16 +6807,11 @@ fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
         Some(chain[0].as_str()),
         "not the head"
     );
-    assert_eq!(
-        saved_map(&path, &added.id, "auto_checkpoint_older_map"),
-        painted
-    );
+    assert_eq!(added.ops, painted_ops);
+    assert_eq!(added.zmap_blob, saved_zmap_blob(&path, &chain[0]));
     assert_eq!(current_row(&controller), Some(added.id));
     let session = controller.edit_session().expect("the session survives");
-    assert_eq!(
-        (session.op_count(), session.indices()),
-        (0, painted.as_slice())
-    );
+    assert_eq!((session.op_count(), session.stack_ops()), (0, painted_ops));
     assert!(!controller.save_enabled());
 }
 
@@ -6483,14 +6883,15 @@ fn a_pending_delete_is_applied_by_the_project_save() {
     let before = fs::read(&path).unwrap();
 
     // A save that cannot write keeps the delete and leaves the file alone.
-    let mut blocker = path.clone().into_os_string();
-    blocker.push(".saving");
-    let blocker = PathBuf::from(blocker);
-    fs::create_dir(&blocker).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&path, perms.clone()).unwrap();
     assert!(!controller.save_active_project(|_| None));
     assert_eq!(fs::read(&path).unwrap(), before, "the file is untouched");
     assert!(controller.save_enabled(), "the delete is still queued");
-    fs::remove_dir(&blocker).unwrap();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&path, perms).unwrap();
 
     // The current row's delete leaves it stored hidden and unlisted.
     assert!(controller.save_active_project(|_| None));
@@ -6577,7 +6978,7 @@ fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
     common::enter_editor(&mut controller);
     assert!(controller.queue_checkpoint_delete(&chain[2]));
     paint(&mut controller, 50);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
     assert!(controller.save_active_project(|_| None));
 
     let project = saved(&path);
@@ -6589,8 +6990,8 @@ fn edits_on_a_row_queued_for_delete_are_saved_under_it() {
     assert_eq!(project.history().all().len(), 4);
     let added = project.checkpoint().clone();
     assert_eq!(added.parent.as_deref(), Some(chain[2].as_str()));
-    assert!(!added.ops.is_empty(), "an op list over the hidden row");
-    assert_eq!(saved_map(&path, &added.id, "deleted_origin_map"), painted);
+    assert_eq!(added.ops, painted_ops, "an op list over the hidden row");
+    assert_eq!(added.zmap_blob, saved_zmap_blob(&path, &chain[0]));
     assert_eq!(current_row(&controller), Some(added.id));
     assert_eq!(controller.edit_session().unwrap().op_count(), 0);
 }
@@ -6628,7 +7029,7 @@ fn a_save_that_does_not_write_loses_nothing() {
     let mut controller = controller_with_scratch("save_loses_nothing");
     open_fused_tab(&mut controller, "save_loses_nothing_frames", 2);
     paint(&mut controller, 20);
-    let painted = controller.edit_session().unwrap().indices().to_vec();
+    let painted_ops = ops(&controller);
 
     assert!(!controller.save_active_project(|_| None));
     assert_eq!(
@@ -6651,17 +7052,14 @@ fn a_save_that_does_not_write_loses_nothing() {
     );
     assert_eq!(current_row(&controller), Some("held:1".to_string()));
     let session = controller.edit_session().unwrap();
-    assert_eq!(
-        (session.op_count(), session.indices()),
-        (0, painted.as_slice())
-    );
+    assert_eq!((session.op_count(), session.stack_ops()), (0, painted_ops));
     assert!(controller.save_enabled());
 
     let path = save_to_proposed(&mut controller);
     assert_eq!(saved_ids(&path).len(), 2, "a retry writes the same history");
 }
 
-/// Editing from an older, non-head checkpoint recomposites through that
+/// Editing from an older, non-head checkpoint renders through that
 /// checkpoint's own registration: the head here was fused without alignment
 /// or crop, the root with both.
 #[test]
@@ -6703,13 +7101,14 @@ fn an_older_checkpoint_edits_through_its_own_registration() {
     let sealed = Sealed::read_with(&mut controller, &frames, root_registration);
     set_size(&mut controller, 6.0);
     drag(&mut controller, &[(10.0, 10.0), (30.0, 20.0)]);
-    assert_ne!(indices(&controller), sealed.indices, "the stroke painted");
+    assert_eq!(ops(&controller).len(), 1, "the stroke is appended");
     sealed.assert_shown(&controller, "an older checkpoint's edit");
 
     // The head's registration would have drawn something else.
     let wrong = Sealed::read_with(&mut controller, &frames, head_registration);
     assert!(
-        wrong.displayed(&controller) != wrong.expected(&indices(&controller)),
+        wrong.displayed(&controller)
+            != wrong.expected(&ops(&controller), controller.edit_session().unwrap().info()),
         "the check can tell the two registrations apart"
     );
 }
@@ -6759,8 +7158,10 @@ fn entering_the_editor_opens_its_session_off_thread() {
     );
     common::settle_session(&mut controller);
     let session = controller.edit_session().expect("the settle installs it");
-    assert_eq!(session.indices(), read_whole_zmap(&zmap).as_slice());
+    assert_eq!(session.info(), stored_info(&zmap));
+    assert!(session.stack_ops().is_empty());
     assert_eq!(session.op_count(), 0);
+    let plain = displayed_whole(&mut controller);
 
     // Two op-bearing rows, the second built on the first, strokes either
     // side of a 16 px tile edge.
@@ -6768,12 +7169,8 @@ fn entering_the_editor_opens_its_session_off_thread() {
     assert!(controller.save_checkpoint());
     paint(&mut controller, 33);
     assert!(controller.save_checkpoint());
-    let chained = controller.edit_session().unwrap().indices().to_vec();
-    assert_ne!(
-        chained,
-        read_whole_zmap(&zmap),
-        "the strokes changed the map"
-    );
+    let chained = controller.edit_session().unwrap().stack_ops();
+    assert_eq!(chained.len(), 2);
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.select_checkpoint_row(row_index(&controller, "held:0"));
     assert!(controller.edit_session().is_none());
@@ -6789,15 +7186,16 @@ fn entering_the_editor_opens_its_session_off_thread() {
     assert!(controller.edit_session().is_none());
     common::settle_session(&mut controller);
     let session = controller.edit_session().expect("the settle installs it");
-    assert_eq!(
-        session.indices(),
-        chained.as_slice(),
-        "the chain is applied"
-    );
+    assert_eq!(session.stack_ops(), chained, "the chain is applied");
     assert_eq!(session.op_count(), 0, "the replay is rebased away");
     assert!(
-        !controller.take_recomposited().is_empty(),
+        !controller.take_rendered_regions().is_empty(),
         "the replay filled the resident tiles"
+    );
+    common::settle_region_renders(&mut controller);
+    assert!(
+        displayed_whole(&mut controller) != plain,
+        "the replay painted the chain's pixels"
     );
 }
 
@@ -6820,8 +7218,8 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
     let mut controller = controller_with_scratch(name);
     open_fused_tab(&mut controller, name, 2);
     paint(&mut controller, 20);
+    let painted_ops = ops(&controller);
     assert!(controller.save_checkpoint());
-    let painted = controller.edit_session().unwrap().indices().to_vec();
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.select_checkpoint_row(row_index(&controller, "held:0"));
     let events = record_events(&mut controller);
@@ -6833,8 +7231,8 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
         controller
             .edit_session()
             .expect("the replacement lands")
-            .indices(),
-        painted.as_slice(),
+            .stack_ops(),
+        painted_ops,
         "the row selected last owns the session"
     );
     assert_eq!(
@@ -6869,15 +7267,14 @@ fn a_failed_session_open_drops_back_to_stacking() {
     let name = "session_open_fails";
     let mut controller = controller_with_scratch(name);
     fused_twice_without_session(&mut controller, name);
-    let (_, zmap) = controller
+    let (composite, _) = controller
         .materialize_active_tab_planes()
         .expect("a held fused row has planes");
-    let len = fs::metadata(&zmap).unwrap().len();
     fs::OpenOptions::new()
         .write(true)
-        .open(&zmap)
+        .open(&composite)
         .unwrap()
-        .set_len(len / 2)
+        .set_len(0)
         .unwrap();
     let events = record_events(&mut controller);
 
@@ -6974,5 +7371,632 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
         active_fuse_value(&controller, "weight-exponent"),
         "4",
         "editing the copy leaves the original's remembered values alone"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The live view goes through the soft blend: the dithered index brush
+// never paints what the canvas shows.
+// ---------------------------------------------------------------------
+
+/// The strokes the live-view tests paint: three softness classes, each a
+/// press-and-release dab then a ticked drag from another frame.
+fn paint_scripted_strokes(c: &mut AppController) {
+    set_size(c, 10.0);
+    for (i, softness) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
+        c.set_brush_softness_fraction(softness);
+        c.select_frame((i + 1) % 3);
+        let x = 8.0 + 16.0 * i as f32;
+        drag(c, &[(x, 10.0)]);
+        drag_ticked(
+            c,
+            &[
+                (x - 4.0, 24.0),
+                (x + 4.0, 32.0),
+                (x - 3.0, 40.0),
+                (x + 5.0, 52.0),
+            ],
+        );
+    }
+    assert_eq!(ops(c).len(), 6);
+}
+
+/// Gives `c` the blend kernel on `device`, when there is one.
+fn attach_blend_device(c: &mut AppController, device: Option<&SharedDevice>) {
+    if let Some(shared) = device {
+        c.attach_blender(Blender::new(shared.device(), shared.queue()));
+    }
+}
+
+/// Paints [`paint_scripted_strokes`] in an editor over three frames, equalized
+/// or not, and checks the released live view against the saved render.
+fn live_view_matches_saved_render(prefix: &str, device: Option<&SharedDevice>) {
+    for equalized in [false, true] {
+        let name = format!("{prefix}{}", if equalized { "_equalized" } else { "" });
+        let mut c = if equalized {
+            open_equalized_editor(&name, 3)
+        } else {
+            open_editor(&name).0
+        };
+        attach_blend_device(&mut c, device);
+        paint_scripted_strokes(&mut c);
+        let shown = displayed_whole(&mut c);
+        let path = save_to_proposed(&mut c);
+        assert!(
+            shown == saved_render(&path),
+            "equalized {equalized}: the live view differs from the saved render"
+        );
+    }
+}
+
+#[test]
+fn live_view_after_release_equals_the_saved_render() {
+    live_view_matches_saved_render("live_equals_saved", None);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_stroke_on_the_device_matches_the_saved_render() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    live_view_matches_saved_render("live_equals_saved_device", Some(shared));
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_stroke_on_the_device_matches_the_host_blend() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    for equalized in [false, true] {
+        let shown = |device: Option<&SharedDevice>, name: &str| {
+            let mut c = if equalized {
+                open_equalized_editor(name, 3)
+            } else {
+                open_editor(name).0
+            };
+            attach_blend_device(&mut c, device);
+            paint_scripted_strokes(&mut c);
+            displayed_whole(&mut c)
+        };
+        let on_device = shown(
+            Some(shared),
+            &format!("live_host_vs_device_{equalized}_gpu"),
+        );
+        let on_host = shown(None, &format!("live_host_vs_device_{equalized}_cpu"));
+        assert!(
+            on_device == on_host,
+            "equalized {equalized}: the device blend differs from the host blend sample for sample"
+        );
+    }
+}
+
+#[test]
+fn live_soft_edge_is_a_blend_not_a_dither() {
+    let (mut c, root) = open_editor("live_soft_edge");
+    let sealed = Sealed::read(&mut c, &root);
+    let info = c.edit_session().unwrap().info();
+    set_size(&mut c, 20.0);
+    c.set_brush_softness_fraction(0.8);
+    c.select_frame(1);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    let softness = c.brush_toolbar_view().soft / 100.0;
+    let stroke = Op::BrushStroke {
+        source_id: 1,
+        path: rounded(&[(20.0, 30.0), (36.0, 30.0)]),
+        radius,
+        softness,
+    };
+    let source = sealed.frame_view(1);
+
+    let check = |c: &AppController, case: &str| {
+        let shown = sealed.displayed(c);
+        let mut between = 0;
+        for y in 0..sealed.map.height {
+            for x in 0..sealed.map.width {
+                let alpha = blend::alpha(&stroke, info, x, y).unwrap();
+                for k in 0..3 {
+                    let i = ((y * sealed.map.width + x) * 3) as usize + k;
+                    let (base, src) = (sealed.composite[i], source[i]);
+                    assert_eq!(
+                        shown[i],
+                        blend::blend_sample(base, src, alpha),
+                        "{case}: sample {k} of ({x}, {y}) at alpha {alpha}"
+                    );
+                    if alpha > 0
+                        && alpha < 65536
+                        && shown[i] > base.min(src)
+                        && shown[i] < base.max(src)
+                    {
+                        between += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            between > 0,
+            "{case}: the soft ring holds intermediate values"
+        );
+    };
+
+    press(&mut c, at(20.0, 30.0));
+    let (sx, sy) = at(36.0, 30.0);
+    c.pointer_moved(sx, sy);
+    c.flush_live_stroke();
+    common::settle_region_renders(&mut c);
+    check(&c, "during the drag");
+    release(&mut c, at(36.0, 30.0));
+    common::settle_region_renders(&mut c);
+    assert_eq!(ops(&c), vec![stroke.clone()]);
+    check(&c, "after release");
+}
+
+#[test]
+fn live_tick_reblends_only_its_segment_footprint() {
+    live_tick_reblends_only_its_footprint("live_tick", None);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_tick_on_the_device_reblends_only_its_segment_footprint() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    live_tick_reblends_only_its_footprint("live_tick_device", Some(shared));
+}
+
+/// Drags a path that doubles back, a tick at a time: each tick renders one
+/// region, the newest segment's footprint, and shows the path so far over the
+/// pre-stroke samples.
+fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevice>) {
+    let (mut c, root) = open_editor(name);
+    attach_blend_device(&mut c, device);
+    let sealed = Sealed::read(&mut c, &root);
+    let info = c.edit_session().unwrap().info();
+    set_size(&mut c, 12.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(2);
+    let radius = c.brush_toolbar_view().size / 2.0;
+    let softness = c.brush_toolbar_view().soft / 100.0;
+    let stroke = |path: Vec<Point>| Op::BrushStroke {
+        source_id: 2,
+        path,
+        radius,
+        softness,
+    };
+
+    // Segments that double back over each other, so alpha would compound
+    // were each segment blended on its own.
+    let trace = [
+        (10.0, 20.0),
+        (30.0, 24.0),
+        (14.0, 28.0),
+        (34.0, 32.0),
+        (12.0, 36.0),
+        (40.0, 40.0),
+    ];
+    let pre = sealed.composite.clone();
+    press(&mut c, at(trace[0].0, trace[0].1));
+    for end in 1..trace.len() {
+        let (sx, sy) = at(trace[end].0, trace[end].1);
+        c.pointer_moved(sx, sy);
+        c.flush_live_stroke();
+        common::settle_region_renders(&mut c);
+        let segment = stroke(rounded(&trace[end - 1..=end]));
+        assert_eq!(
+            c.take_rendered_regions(),
+            footprint(&segment, info)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "tick {end}: one region, the new segment's footprint"
+        );
+        let mut expected = pre.clone();
+        sealed.blend_over(&mut expected, &stroke(rounded(&trace[..=end])), info);
+        assert!(
+            sealed.displayed(&c) == expected,
+            "tick {end}: the path so far over the pre-stroke samples"
+        );
+    }
+    release(&mut c, at(trace[5].0, trace[5].1));
+    common::settle_region_renders(&mut c);
+    sealed.assert_shown(&c, "after release");
+}
+
+#[test]
+fn undo_redo_restore_the_blended_samples() {
+    let (mut c, root) = open_editor("live_undo_redo");
+    let sealed = Sealed::read(&mut c, &root);
+    let info = c.edit_session().unwrap().info();
+    set_size(&mut c, 16.0);
+    c.set_brush_softness_fraction(0.6);
+    for (frame, from, to) in [
+        (0, (10.0, 20.0), (40.0, 26.0)),
+        (1, (14.0, 30.0), (44.0, 22.0)),
+        (2, (12.0, 24.0), (42.0, 36.0)),
+    ] {
+        c.select_frame(frame);
+        drag(&mut c, &[from, to]);
+    }
+    let all = ops(&c);
+    assert_eq!(all.len(), 3);
+    sealed.assert_shown(&c, "three strokes");
+    let first_two = sealed.expected(&all[..2], info);
+    let last_region = footprint(&all[2], info).unwrap().unwrap();
+
+    c.undo();
+    common::settle_region_renders(&mut c);
+    assert_eq!(c.edit_session().unwrap().op_count(), 2);
+    assert!(
+        sealed.displayed(&c) == first_two,
+        "undo shows the first two"
+    );
+    assert!(c.take_rendered_regions().ends_with(&[last_region]));
+    c.redo();
+    common::settle_region_renders(&mut c);
+    assert_eq!(c.edit_session().unwrap().op_count(), 3);
+    sealed.assert_shown(&c, "redo restores the third");
+    c.undo();
+    common::settle_region_renders(&mut c);
+    assert!(
+        sealed.displayed(&c) == first_two,
+        "a second undo after the redo"
+    );
+
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the saved render of two strokes"
+    );
+}
+
+#[test]
+fn reopened_soft_checkpoint_shows_the_blend() {
+    // A held op-bearing row replays its chain over the base it was taken from.
+    let mut c = open_editor("reopen_held").0;
+    set_size(&mut c, 14.0);
+    c.set_brush_softness_fraction(0.7);
+    c.select_frame(1);
+    drag(&mut c, &[(12.0, 20.0), (36.0, 26.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(16.0, 34.0), (40.0, 30.0)]);
+    assert!(c.save_checkpoint());
+    let ops_row = row_index(&c, "held:1");
+    c.select_checkpoint_row(row_index(&c, "held:0"));
+    c.select_checkpoint_row(ops_row);
+    common::enter_editor(&mut c);
+    assert_eq!(
+        c.edit_session().unwrap().op_count(),
+        0,
+        "the chain is rebased"
+    );
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the replayed chain differs from the saved render"
+    );
+
+    // A saved soft checkpoint opens on its rendered planes.
+    let mut reopened = reopen(&path, "reopen_saved");
+    common::enter_editor(&mut reopened);
+    assert!(displayed_whole(&mut reopened) == saved_render(&path));
+}
+
+#[test]
+fn live_stroke_at_the_image_edge_matches_the_saved_render() {
+    let (mut c, _) = open_editor("live_edge");
+    set_size(&mut c, 20.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(1);
+    drag_ticked(&mut c, &[(2.0, 2.0), (12.0, 5.0)]);
+    c.select_frame(2);
+    drag_ticked(&mut c, &[(55.0, 57.0), (46.0, 50.0)]);
+    assert_eq!(ops(&c).len(), 2);
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "strokes across the image border"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Unsaved strokes are an in-memory op list over the saved position.
+// ---------------------------------------------------------------------
+
+#[test]
+fn brush_stroke_appends_soft_op() {
+    let (mut c, _) = open_editor("brush_soft_op");
+    set_size(&mut c, 14.0);
+    c.select_frame(2);
+    let view = c.brush_toolbar_view();
+    assert_ne!(view.size, 8.0, "a size other than the default");
+    let radius = view.size / 2.0;
+    for (at_slider, softness, x) in [(0.0, 0.0f32, 12.0), (1.0, 1.0, 36.0)] {
+        c.set_brush_softness_fraction(at_slider);
+        assert_eq!(c.brush_toolbar_view().soft / 100.0, softness);
+        drag(&mut c, &[(x, 20.0), (x + 6.0, 30.0)]);
+    }
+    assert_eq!(
+        ops(&c),
+        vec![
+            Op::BrushStroke {
+                source_id: 2,
+                path: vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
+                radius,
+                softness: 0.0,
+            },
+            Op::BrushStroke {
+                source_id: 2,
+                path: vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
+                radius,
+                softness: 1.0,
+            },
+        ]
+    );
+}
+
+/// `ops` over the sealed composite at `composite`, rendered whole by the
+/// same function an export of unsaved strokes goes through.
+fn pending_render(composite: &Path, root: &Path, sealed: &Sealed, ops: Vec<Op>) -> Vec<u16> {
+    let state = project::PendingState {
+        composite: composite.to_path_buf(),
+        ops,
+        sources: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
+        registration: sealed.registration.clone(),
+        reference: 0,
+        description: String::new(),
+    };
+    let image = project::CheckpointImage::prepare_pending(&state).expect("the state prepares");
+    let full = image.full();
+    let mut out = vec![0u16; (full.width * full.height * 3) as usize];
+    image
+        .render(None, full, &mut |band: &[u16], rect: Rect| {
+            let row = rect.width as usize * 3;
+            for y in 0..rect.height as usize {
+                let at = ((rect.y as usize + y) * full.width as usize + rect.x as usize) * 3;
+                out[at..at + row].copy_from_slice(&band[y * row..(y + 1) * row]);
+            }
+            Ok(())
+        })
+        .expect("the state renders");
+    out
+}
+
+#[test]
+fn undo_redo_moves_the_state_position() {
+    let (mut c, root) = open_editor("undo_redo_position");
+    let sealed = Sealed::read(&mut c, &root);
+    let composite = c.materialize_active_tab_planes().unwrap().0;
+    // The shown image must equal the render of the ops it stacks over the base.
+    let assert_renders = |c: &AppController, case: &str| {
+        let stacked = c.edit_session().unwrap().stack_ops();
+        assert!(
+            sealed.displayed(c) == pending_render(&composite, &root, &sealed, stacked),
+            "{case}: the shown image differs from the render of its ops"
+        );
+    };
+    set_size(&mut c, 16.0);
+    c.set_brush_softness_fraction(0.6);
+    for (frame, from, to) in [
+        (0, (10.0, 20.0), (40.0, 26.0)),
+        (1, (14.0, 30.0), (44.0, 22.0)),
+        (2, (12.0, 24.0), (42.0, 36.0)),
+    ] {
+        c.select_frame(frame);
+        drag(&mut c, &[from, to]);
+    }
+    let all = ops(&c);
+    assert_eq!(all.len(), 3);
+    assert_renders(&c, "three strokes");
+
+    for k in 1..=3 {
+        c.undo();
+        common::settle_region_renders(&mut c);
+        assert_eq!(ops(&c), all[..3 - k], "undo {k}");
+        assert_renders(&c, &format!("undo {k}"));
+    }
+    assert!(!c.edit_session().unwrap().can_undo());
+    c.take_rendered_regions();
+    c.undo();
+    common::settle_region_renders(&mut c);
+    assert!(ops(&c).is_empty() && c.take_rendered_regions().is_empty());
+    assert_renders(&c, "undo with nothing pending");
+    assert!(sealed.displayed(&c) == sealed.composite);
+
+    for k in 1..=3 {
+        c.redo();
+        common::settle_region_renders(&mut c);
+        assert_eq!(ops(&c), all[..k], "redo {k}, in order");
+        assert_renders(&c, &format!("redo {k}"));
+    }
+
+    c.undo();
+    c.undo();
+    common::settle_region_renders(&mut c);
+    assert!(c.edit_session().unwrap().can_redo());
+    c.select_frame(2);
+    drag(&mut c, &[(30.0, 8.0), (34.0, 14.0)]);
+    assert!(!c.edit_session().unwrap().can_redo(), "a stroke ends redo");
+    assert_eq!(ops(&c).len(), 2);
+    assert_eq!(ops(&c)[0], all[0]);
+    assert_renders(&c, "the new stroke after an undo");
+
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the saved render of the pending strokes"
+    );
+}
+
+#[test]
+fn pending_strokes_append_on_save() {
+    let (mut c, root) = open_editor("pending_append_on_save");
+    let sealed = Sealed::read(&mut c, &root);
+    set_size(&mut c, 12.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(0);
+    drag(&mut c, &[(40.0, 50.0), (50.0, 54.0)]);
+    let path = save_to_proposed(&mut c);
+    let before = fs::read(&path).unwrap();
+    let known = saved_ids(&path);
+
+    c.select_frame(1);
+    drag(&mut c, &[(10.0, 12.0), (30.0, 20.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
+    let pending = ops(&c);
+    assert_eq!(pending.len(), 2);
+    assert!(
+        fs::read(&path).unwrap() == before,
+        "two strokes write nothing"
+    );
+    c.request_close(0);
+    assert_eq!(
+        c.pending_close().expect("two strokes ask").body,
+        "2 unsaved brush strokes."
+    );
+    c.cancel_close();
+
+    let shown = sealed.displayed(&c);
+    assert!(c.save_active_project(|_| None));
+    let added = added_checkpoint(&path, &known);
+    assert_eq!(added.ops, pending);
+    assert!(
+        shown == saved_render(&path),
+        "the newest checkpoint renders the live view"
+    );
+
+    let mut reopened = reopen(&path, "pending_append_reopened");
+    common::enter_editor(&mut reopened);
+    assert!(displayed_whole(&mut reopened) == shown);
+}
+
+#[test]
+fn strokes_after_first_save_show_the_saved_render() {
+    let (mut c, root) = open_editor("strokes_after_first_save");
+    let sealed = Sealed::read(&mut c, &root);
+    let (held, _) = c.materialize_active_tab_planes().unwrap();
+    let path = save_to_proposed(&mut c);
+    assert!(!held.exists(), "a save removes the row's held composite");
+
+    set_size(&mut c, 12.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(1);
+    drag(&mut c, &[(40.0, 50.0), (50.0, 54.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(48.0, 40.0), (56.0, 28.0)]);
+    let strokes = ops(&c);
+    assert_eq!(strokes.len(), 2);
+    let info = c.edit_session().unwrap().info();
+
+    let _ = c.materialize_active_tab_planes();
+    common::settle_render(&mut c);
+    let shown = displayed_whole(&mut c);
+    assert!(c.save_active_project(|_| None));
+    let rendered = saved_render(&path);
+    let differing = shown.iter().zip(&rendered).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        differing, 0,
+        "the live view and the saved render differ in {differing} samples"
+    );
+    assert!(
+        shown == sealed.expected(&strokes, info),
+        "the live view differs from the reference blend"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_renders_after_its_composite_file_is_removed() {
+    let (mut c, root) = open_editor("session_composite_removed");
+    let sealed = Sealed::read(&mut c, &root);
+    let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
+    let scratch = root.join("copies");
+    fs::create_dir_all(&scratch).unwrap();
+    let (composite_copy, zmap_copy) = (scratch.join("composite.tif"), scratch.join("zmap.tif"));
+    fs::copy(&composite, &composite_copy).unwrap();
+    fs::copy(&zmap, &zmap_copy).unwrap();
+
+    let mut session = job::open_edit_session(
+        Some(&zmap_copy),
+        &composite_copy,
+        &(0..3)
+            .map(|i| root.join(format!("{i:02}.tif")))
+            .collect::<Vec<_>>(),
+        sealed.registration.clone(),
+        16,
+        job::host_budget(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a session over the copies opens");
+    fs::remove_file(&composite_copy).unwrap();
+    fs::remove_file(&zmap_copy).unwrap();
+
+    let region = Rect {
+        x: sealed.map.width - 16,
+        y: sealed.map.height - 16,
+        width: 16,
+        height: 16,
+    };
+    session
+        .render_region_now(&job::RegionRender {
+            region,
+            pre: job::PreImage::Base,
+            ops: Vec::new(),
+            ends_drag: false,
+        })
+        .expect("the removed composite is still read through its mapping");
+    let mut resident = vec![0u16; 16 * 16 * 3];
+    session.tiles.overlay_into(region, &mut resident);
+    let mut expected = Vec::new();
+    for y in region.y..region.y + region.height {
+        let at = ((y * sealed.map.width + region.x) * 3) as usize;
+        expected.extend_from_slice(&sealed.composite[at..at + 48]);
+    }
+    assert!(
+        resident == expected,
+        "the resident tile holds the composite"
+    );
+}
+
+#[test]
+fn strokes_on_a_reopened_project_show_the_saved_render() {
+    let (mut c, root) = open_editor("strokes_reopened");
+    let sealed = Sealed::read(&mut c, &root);
+    let path = save_to_proposed(&mut c);
+
+    let mut reopened = reopen(&path, "strokes_reopened_session");
+    reopened.set_resident_tile_size_for_test(16);
+    reopened.set_pane_geometry(LEFT, RIGHT);
+    common::enter_editor(&mut reopened);
+    let _ = reopened.materialize_active_tab_planes();
+    common::settle_render(&mut reopened);
+    let reread = Sealed::read_with(&mut reopened, &root, sealed.registration.clone());
+
+    set_size(&mut reopened, 9.0);
+    reopened.set_brush_softness_fraction(0.25);
+    reopened.select_frame(0);
+    drag(&mut reopened, &[(12.0, 10.0), (30.0, 22.0)]);
+    reopened.select_frame(2);
+    drag(&mut reopened, &[(40.0, 36.0), (52.0, 52.0)]);
+    let strokes = ops(&reopened);
+    assert_eq!(strokes.len(), 2);
+    let info = reopened.edit_session().unwrap().info();
+
+    let shown = displayed_whole(&mut reopened);
+    assert!(reopened.save_active_project(|_| None));
+    assert!(
+        shown == saved_render(&path),
+        "the live view differs from the saved render"
+    );
+    assert!(
+        shown == reread.expected(&strokes, info),
+        "the live view differs from the reference blend"
     );
 }

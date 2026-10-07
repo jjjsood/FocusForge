@@ -259,6 +259,63 @@ pub fn save_and_settle(
     wrote
 }
 
+/// Saves the active tab, which holds one fused run, fuses it again by
+/// another method and saves once more: the file, the older fuse's id and
+/// the head's. Opening verifies the head's Z-Map only; the older one is read
+/// when its row is shown.
+#[allow(dead_code)]
+pub fn save_two_fuses(controller: &mut AppController) -> (PathBuf, String, String) {
+    use focusforge_core::project::Project;
+
+    let mut target = None;
+    assert!(save_and_settle(controller, |proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    let path = target.expect("a never-saved tab asks where to save");
+    controller.set_fuse_algorithm("depth-map");
+    assert!(controller.start_fuse());
+    wait_for_settle(controller, Duration::from_secs(120));
+    assert!(controller.save_active_project(|_| panic!("a saved tab never asks where")));
+
+    let project = Project::open(&path).expect("the saved project opens");
+    let head = project.checkpoint().clone();
+    let older = head.parent.clone().expect("the second fuse has a parent");
+    let older_blob = &project
+        .history()
+        .get(&older)
+        .expect("the parent is saved")
+        .zmap_blob;
+    assert_ne!(
+        *older_blob, head.zmap_blob,
+        "the two methods map differently"
+    );
+    (path, older, head.id)
+}
+
+/// Rewrites the saved project at `path` with the entry of blob `hash`
+/// replaced by bytes no codec decodes: the project still opens when `hash`
+/// is not the head's Z-Map, and only a read of that blob fails.
+#[allow(dead_code)]
+pub fn corrupt_blob(path: &Path, hash: &str) {
+    use focusforge_core::project::container::{ContainerWriter, Index};
+
+    let target = format!("blobs/{hash}.zst");
+    let index = Index::read(path).expect("the project's container reads");
+    let rewritten = path.with_extension("rewritten");
+    let mut writer = ContainerWriter::create(&rewritten).expect("the copy is created");
+    for name in index.names() {
+        let bytes = if name == target {
+            b"not a zstd frame".to_vec()
+        } else {
+            index.read_entry(path, name).expect("the entry reads")
+        };
+        writer.put_bytes(name, &bytes).expect("the entry is copied");
+    }
+    writer.finish().expect("the copy is sealed");
+    std::fs::rename(&rewritten, path).expect("the copy replaces the project");
+}
+
 /// Answers the pending grouping question, blocks until its worker finishes,
 /// and settles it -- `AppController::answer_question` runs off-thread too,
 /// the same as [`open_and_settle`].
@@ -432,14 +489,15 @@ pub fn settle_session(controller: &mut AppController) {
     }
 }
 
-/// Polls `settle_recomposites` until no stroke, undo or redo is recompositing.
+/// Polls `settle_region_renders` until no stroke, undo or redo has a region render
+/// in flight.
 #[allow(dead_code)]
-pub fn settle_recomposites(controller: &mut AppController) {
+pub fn settle_region_renders(controller: &mut AppController) {
     let start = Instant::now();
-    while !controller.settle_recomposites() {
+    while !controller.settle_region_renders() {
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "the recomposites did not settle"
+            "the region renders did not settle"
         );
         std::thread::sleep(Duration::from_millis(5));
     }

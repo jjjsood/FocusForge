@@ -8,11 +8,12 @@
 //!
 //! Two properties this module exists to keep:
 //!
-//! - **The Z-Map gathers the image.** `-o` writes a per-pixel gather of the
-//!   checkpoint's own Z-Map over its verified source frames, encoded as
-//!   `--format` and its per-format flags say. The default
-//!   (`--format tiff --tiff-bits 16 --tiff-compression none`, which an
-//!   extension-less or `.tif`/`.tiff` `-o` also selects) writes a
+//! - **The stored image is exported.** `-o` writes the checkpoint's own
+//!   image, the one the viewer shows, encoded as `--format` and its
+//!   per-format flags say. An unedited checkpoint reads no source frame; an
+//!   edited one re-reads and verifies its fused ancestor's frames. The
+//!   default (`--format tiff --tiff-bits 16 --tiff-compression none`, which
+//!   an extension-less or `.tif`/`.tiff` `-o` also selects) writes a
 //!   twelve-tag uncompressed IFD.
 //! - **A warning, never a silence.** A project whose sources cannot be
 //!   resolved relatively names every one of them on stderr and still writes
@@ -38,6 +39,8 @@ use focusforge_core::project::{self, FuseRecord, Project};
 use focusforge_core::tile::HostBudget;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
+
+use crate::retouch::would_replace;
 
 /// Rows per streamed band, `export_frame`'s own band-wise write.
 const FRAME_BAND_ROWS: u32 = 256;
@@ -294,6 +297,8 @@ pub struct ExportReport {
 /// here so the error names the missing flag instead of clap's generic exit
 /// 2. `--frame-output` without `--frame` is refused the same way; `--frame`
 /// without `--frame-output` is already a clap usage error (`requires`).
+/// An output that names the project file itself is refused before anything
+/// is written.
 /// `checkpoint` is an id or unique id prefix, resolved against the
 /// project's own history; `None` renders the head -- `--frame-output` reads
 /// the same resolved checkpoint's own fuse state, not the project's head.
@@ -318,6 +323,20 @@ pub fn run(
     }
     if frame_output.is_some() && frame.is_none() {
         return fail("--frame-output requires --frame <index>");
+    }
+    for (flag, path) in [
+        ("-o", output),
+        ("--zmap", zmap),
+        ("--frame-output", frame_output),
+    ] {
+        if let Some(path) = path
+            && would_replace(path, project_path)
+        {
+            return fail(format!(
+                "{flag} {} is also the project file: refusing to overwrite it",
+                path.display()
+            ));
+        }
     }
 
     let export_options = match output {
@@ -350,8 +369,9 @@ pub fn run(
     if !unresolved.is_empty() {
         let warning = format!(
             "warning: {} source frame(s) unresolved -- not reachable from this project, either \
-             because the path was recorded as given or because it is no longer there. An image \
-             export re-reads every source frame and fails below if one is missing or changed:",
+             because the path was recorded as given or because it is no longer there. An \
+             unedited image export reads no source frame; an edited one re-reads its fused \
+             ancestor's frames and fails below if one is missing or changed:",
             unresolved.len()
         );
         eprintln!("{warning}");

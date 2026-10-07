@@ -156,15 +156,13 @@ impl Canvas {
         }
     }
 
-    /// Opens `composite`/`zmap` as `tab`'s own planes, logging failures rather
-    /// than panicking: a plane the pipeline itself just wrote
-    /// failing to reopen is an environment problem (a full disk, a
-    /// permissions change), not a bug worth crashing the window over. `tab`
-    /// is recorded even when the open fails, so an unreadable plane file is
-    /// not retried on every gesture. Reuses the renderer's own frame half
-    /// rather than replacing it, since it may already hold the tab's
-    /// selected frame.
-    fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
+    /// Opens `composite`, and `zmap` when present, as `tab`'s own planes,
+    /// logging failures rather than panicking: a plane the pipeline just
+    /// wrote failing to reopen is an environment problem, not a bug worth
+    /// crashing the window over. `tab` is recorded even when the open
+    /// fails, so an unreadable plane file is not retried on every gesture.
+    /// Reuses the renderer's own frame half, which may hold the tab's frame.
+    fn load(&mut self, tab: usize, composite: &Path, zmap: Option<&Path>) {
         self.tab = Some(tab);
         let renderer = self.renderer_mut();
         if let Err(err) = renderer.set_planes(composite, zmap) {
@@ -288,9 +286,9 @@ thread_local! {
     /// What a save worker's wake runs on the event loop: settle the save,
     /// then show its outcome.
     static SAVE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
-    /// What a recomposite worker's wake runs on the event loop: install the
-    /// gathered regions, then repaint.
-    static RECOMPOSITE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// What a region-render worker's wake runs on the event loop: install the
+    /// rendered regions, then repaint.
+    static REGION_RENDER_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The one optional detached pane. The source textures stay in `Canvas`;
     /// this window only binds the matching image on the shared device.
     static COMPARISON_WINDOW: RefCell<Option<Rc<ComparisonWindow>>> = const { RefCell::new(None) };
@@ -378,11 +376,7 @@ fn show_panes(
     app.set_frame_backdrop_w(rect.2);
     app.set_frame_backdrop_h(rect.3);
     let (backdrop, rect) = plane_draw
-        .and_then(|draw| {
-            let renderer = renderer?;
-            (renderer.plane() == PaneSource::Composite)
-                .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
-        })
+        .and_then(|draw| renderer?.backdrop_placement(Pane::Composite, &draw))
         .unwrap_or_default();
     app.set_backdrop(backdrop);
     app.set_backdrop_x(rect.0);
@@ -391,23 +385,12 @@ fn show_panes(
     app.set_backdrop_h(rect.3);
 
     let planes = plane_draw.and_then(|draw| {
-        let renderer = renderer?;
-        let plane = renderer.plane();
-        let placed = renderer.placement(plane.into(), &draw)?;
-        Some((draw, plane, placed))
+        let placed = renderer?.placement(Pane::Composite, &draw)?;
+        Some((draw, placed))
     });
     match planes {
-        Some((draw, plane, (image, dst))) => {
-            match plane {
-                PaneSource::Composite => {
-                    app.set_composite_source(image);
-                    app.set_zmap_source(slint::Image::default());
-                }
-                PaneSource::ZMap => {
-                    app.set_zmap_source(image);
-                    app.set_composite_source(slint::Image::default());
-                }
-            }
+        Some((draw, (image, dst))) => {
+            app.set_composite_source(image);
             app.set_image_x(dst.0);
             app.set_image_y(dst.1);
             app.set_image_w(dst.2);
@@ -420,7 +403,6 @@ fn show_panes(
         }
         None => {
             app.set_composite_source(slint::Image::default());
-            app.set_zmap_source(slint::Image::default());
             app.set_image_x(0.0);
             app.set_image_y(0.0);
             app.set_image_w(0.0);
@@ -483,8 +465,8 @@ fn show_comparison_pane(
             ));
             window.set_cursor_visible(cursor_hovered);
             let position = match detached {
+                PaneSource::Frame => cursor.frame_position,
                 PaneSource::Composite => cursor.composite_position,
-                PaneSource::ZMap => cursor.zmap_position,
             };
             window.set_cursor_x(position.0);
             window.set_cursor_y(position.1);
@@ -495,14 +477,12 @@ fn show_comparison_pane(
         // The backdrop of whichever pane is detached, placed by that pane's
         // draw; none clears it.
         let (backdrop, rect) = match detached {
-            PaneSource::Composite => {
+            PaneSource::Frame => {
                 frame_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
             }
-            PaneSource::ZMap => plane_draw.and_then(|draw| {
-                let renderer = renderer?;
-                (renderer.plane() == PaneSource::Composite)
-                    .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
-            }),
+            PaneSource::Composite => {
+                plane_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Composite, &draw))
+            }
         }
         .unwrap_or_default();
         window.set_backdrop(backdrop);
@@ -511,8 +491,7 @@ fn show_comparison_pane(
         window.set_backdrop_w(rect.2);
         window.set_backdrop_h(rect.3);
         match detached {
-            // Historical `Composite` names the selected-frame pane.
-            PaneSource::Composite => {
+            PaneSource::Frame => {
                 window.set_pane_label(frame_label.into());
                 window.set_bar_title("FocusForge — Frame".into());
                 window.set_message_lines(string_model(canvas.frame_refusal()));
@@ -540,15 +519,13 @@ fn show_comparison_pane(
                     }
                 }
             }
-            // Historical `ZMap` names the displayed composite pane.
-            PaneSource::ZMap => {
+            PaneSource::Composite => {
                 window.set_pane_label("Composite".into());
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
-                match plane_draw.and_then(|draw| {
-                    let renderer = renderer?;
-                    Some((draw, renderer.placement(renderer.plane().into(), &draw)?))
-                }) {
+                match plane_draw
+                    .and_then(|draw| Some((draw, renderer?.placement(Pane::Composite, &draw)?)))
+                {
                     Some((draw, (image, dst))) => {
                         window.set_source(image);
                         window.set_image_x(dst.0);
@@ -648,7 +625,7 @@ pub fn repaint(
             tab,
             composite,
             zmap,
-        } => canvas.borrow_mut().load(tab, &composite, &zmap),
+        } => canvas.borrow_mut().load(tab, &composite, zmap.as_deref()),
     }
 
     let (
@@ -692,7 +669,7 @@ pub fn repaint(
 
     let (frame_backdrop, plane_backdrop) = {
         let controller = controller.lock().unwrap();
-        // A live stroke or an unfinished recomposite changes the edit
+        // A live stroke or an unfinished region render changes the edit
         // generation every tick; the composite backdrop waits for them.
         (
             controller.frame_backdrop_draw(),
@@ -833,7 +810,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::LoadReady
         | ShellEvent::ImportReady
         | ShellEvent::SaveReady
-        | ShellEvent::RecompositeReady
+        | ShellEvent::RegionRenderReady
         | ShellEvent::CheckpointsChanged => InputSurface::Other,
         ShellEvent::ProjectsChanged
         | ShellEvent::TabScrollChanged
@@ -1053,8 +1030,8 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
 
 fn push_detached_pane(app: &AppWindow, controller: &AppController) {
     let detached = match controller.detached_pane() {
+        Some(PaneSource::Frame) => "frame",
         Some(PaneSource::Composite) => "composite",
-        Some(PaneSource::ZMap) => "zmap",
         None => "",
     };
     app.set_detached_pane(detached.into());
@@ -1082,13 +1059,13 @@ fn update_detached_geometry(
     let comparison = comparison_rect(window);
     let mut controller = controller.lock().unwrap();
     match controller.detached_pane() {
-        Some(PaneSource::Composite) => {
-            controller.set_pane_geometry_for(PaneSource::ZMap, right);
-            controller.set_pane_geometry_for(PaneSource::Composite, comparison);
+        Some(PaneSource::Frame) => {
+            controller.set_pane_geometry_for(PaneSource::Composite, right);
+            controller.set_pane_geometry_for(PaneSource::Frame, comparison);
         }
-        Some(PaneSource::ZMap) => {
-            controller.set_pane_geometry_for(PaneSource::Composite, left);
-            controller.set_pane_geometry_for(PaneSource::ZMap, comparison);
+        Some(PaneSource::Composite) => {
+            controller.set_pane_geometry_for(PaneSource::Frame, left);
+            controller.set_pane_geometry_for(PaneSource::Composite, comparison);
         }
         None => controller.set_pane_geometry(left, right),
     }
@@ -1975,10 +1952,10 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
         view.pick_color[2],
     ));
     app.set_cursor_visible(cursor_hovered(app));
+    app.set_cursor_frame_x(view.frame_position.0);
+    app.set_cursor_frame_y(view.frame_position.1);
     app.set_cursor_composite_x(view.composite_position.0);
     app.set_cursor_composite_y(view.composite_position.1);
-    app.set_cursor_zmap_x(view.zmap_position.0);
-    app.set_cursor_zmap_y(view.zmap_position.1);
 }
 
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,
@@ -2372,12 +2349,12 @@ pub fn install(
         let app_weak = app.as_weak();
         let controller = controller.clone();
         let canvas = canvas.clone();
-        RECOMPOSITE_HANDLER.with(|slot| {
+        REGION_RENDER_HANDLER.with(|slot| {
             *slot.borrow_mut() = Some(Rc::new(move || {
                 if let Some(app) = app_weak.upgrade() {
                     {
-                        let _settle = measurement_scope("gui_recomposite_settle");
-                        controller.lock().unwrap().settle_recomposites();
+                        let _settle = measurement_scope("gui_region_render_settle");
+                        controller.lock().unwrap().settle_region_renders();
                     }
                     repaint(&app, &controller, &canvas);
                 }
@@ -2675,14 +2652,14 @@ pub fn install(
             }
         }
     });
-    app.on_composite_undock_requested({
+    app.on_frame_undock_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             record_direct_input();
             let _undock = measurement_scope("gui_comparison_undock");
-            let pane = PaneSource::Composite;
+            let pane = PaneSource::Frame;
             controller.lock().unwrap().undock_requested(pane);
             if let Some(app) = app_weak.upgrade() {
                 push_detached_pane(&app, &controller.lock().unwrap());
@@ -2695,14 +2672,14 @@ pub fn install(
             }
         }
     });
-    app.on_zmap_undock_requested({
+    app.on_composite_undock_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             record_direct_input();
             let _undock = measurement_scope("gui_comparison_undock");
-            let pane = PaneSource::ZMap;
+            let pane = PaneSource::Composite;
             controller.lock().unwrap().undock_requested(pane);
             if let Some(app) = app_weak.upgrade() {
                 push_detached_pane(&app, &controller.lock().unwrap());
@@ -2777,11 +2754,11 @@ pub fn install(
                 let (left, right) = read_pane_geometry(&app);
                 let mut guard = controller.lock().unwrap();
                 match guard.detached_pane() {
-                    Some(PaneSource::Composite) => {
-                        guard.set_pane_geometry_for(PaneSource::ZMap, right)
+                    Some(PaneSource::Frame) => {
+                        guard.set_pane_geometry_for(PaneSource::Composite, right)
                     }
-                    Some(PaneSource::ZMap) => {
-                        guard.set_pane_geometry_for(PaneSource::Composite, left)
+                    Some(PaneSource::Composite) => {
+                        guard.set_pane_geometry_for(PaneSource::Frame, left)
                     }
                     None => guard.set_pane_geometry(left, right),
                 }
@@ -4246,10 +4223,10 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 handler();
             }
         }
-        // A recomposite worker parked its regions; the handler installed with
+        // A region-render worker parked its regions; the handler installed with
         // the window settles them and repaints.
-        ShellEvent::RecompositeReady => {
-            if let Some(handler) = RECOMPOSITE_HANDLER.with(|slot| slot.borrow().clone()) {
+        ShellEvent::RegionRenderReady => {
+            if let Some(handler) = REGION_RENDER_HANDLER.with(|slot| slot.borrow().clone()) {
                 handler();
             }
         }

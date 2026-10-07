@@ -28,26 +28,22 @@ build that lacks a field the current reader needs is refused when opened
   checkpoint.
 - `blobs/<hash>.zst` — the composite plane and the Z-Map planes, each named
   by a `blake3` hash taken over its uncompressed content, so a blob's name
-  attests to what it holds. A Z-Map is stored either in full or as a sparse
-  delta: the one rectangle that differs from the map it was edited from,
-  plus the hash of that base. A retouched checkpoint therefore costs the
-  size of its edit, not of the whole map.
+  attests to what it holds. Only a fused
+  checkpoint has planes of its own; a retouched checkpoint stores its
+  strokes alone, so it costs the size of its edit.
 - `checkpoints/<hash>.json` — one file per checkpoint: its parent, its op
-  log, the Z-Map blob it resolves to, the algorithm and parameters, a
+  log, the Z-Map blob of the fuse it descends from, the algorithm and parameters, a
   creation time and a hidden flag. A checkpoint a fuse produced also
   records that fuse's composite, alignment, crop, sources and metrics.
 
 ## Checkpoints
 
 Checkpoints form a tree. A fresh stack writes one with no parent and no
-ops; saving retouch ops (`focusforge-cli history apply --save`, or the
-window's **Save checkpoint**) adds a child holding those ops. Applying ops
-onto an older checkpoint starts a new branch from it. A checkpoint's Z-Map
-is replayed from its op log over its parent's map.
-
-Deltas are chained, so a full snapshot is written again once 32 deltas
-follow the last one, or once the deltas outweigh that snapshot's own
-compressed size. Opening a deep history never replays more than that.
+ops; saving retouch ops (`focusforge-cli retouch`, or the window's
+**Save checkpoint**) adds a child holding those ops. Appending ops to an
+older checkpoint starts a new branch from it. A checkpoint's image is the
+nearest fused ancestor's composite with the op logs on the way down blended
+over it, in order.
 
 Deleting a checkpoint hides it. A hidden checkpoint stays in the file for as
 long as a visible checkpoint is built on it, and is removed together with
@@ -60,7 +56,7 @@ Nothing outside the three paths above is ever written.
 ## Who reads it
 
 `focusforge-cli export` renders a checkpoint to an image or writes its
-Z-Map; `focusforge-cli history` lists, materializes, extends and prunes
+Z-Map; `focusforge-cli history` lists, extends and prunes
 checkpoints; `focusforge-cli review` reports the outcome and parameters the
 manifest recorded, streaming the Z-Map blob only to compute its coherence
 metric. `focusforge-cli cache` never touches a project — its `clear`
@@ -68,15 +64,15 @@ subcommand only empties the stage cache under `.scratch/stage-cache/`.
 
 ## Source frames
 
-A project stores the Z-Map, not pixels from the sources, so rendering an
-image from a checkpoint re-reads its source frames. Each is checked against
+A project stores no pixels from the sources, so rendering a retouched
+checkpoint re-reads its source frames; an unretouched one needs none. Each is checked against
 the content hash recorded when the project was written:
 
-- A frame that cannot be found makes `export -o` refuse, naming every
-  missing frame. `export --zmap` alone and the `history` subcommands need no
-  frames.
-- A frame whose content changed makes `export -o` refuse, naming it. The Z-Map
-  indices would select pixels from frames the project was not stacked from.
+- A frame that cannot be found makes a retouched `export -o` refuse, naming
+  every missing frame. An unretouched `export -o`, `export --zmap` alone and
+  the `history` subcommands need no frames.
+- A frame whose content changed makes a retouched `export -o` refuse, naming
+  it. The strokes would blend frames the project was not stacked from.
   `history` subcommands refuse the same way with exit code 9 unless
   `--accept-changed-sources` is passed, which prints a warning and proceeds.
 - In the window, a project with changed frames asks before opening and
@@ -97,7 +93,7 @@ name rather than opened partially:
 | truncated or incomplete file | 4 |
 | a referenced entry is missing | 6 |
 | a blob fails its hash check | 7 |
-| a dangling parent, a parent cycle, a stack fingerprint that disagrees with the recorded sources, a delta whose base is absent, or a checkpoint with ops but no parent | 8 |
+| a dangling parent, a parent cycle, a stack fingerprint that disagrees with the recorded sources, or a checkpoint with ops but no parent | 8 |
 
 A checkpoint with no ops must carry the record of its own fuse; one without
 it is refused as a damaged container. Any other failure exits 1. The

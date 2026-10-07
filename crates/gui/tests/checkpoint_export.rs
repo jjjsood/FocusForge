@@ -16,8 +16,10 @@ use focusforge_core::project::export::{
     ExportFormat, ExportOptions, MetadataOptions, export_checkpoint,
 };
 use focusforge_core::project::{
-    Metrics, Op, Point, Project, SealRequest, append_ops_onto, seal_at,
+    Metrics, Op, Plane, Point, Project, SealRequest, append_ops_onto, materialize_plane, seal_at,
 };
+use focusforge_core::retouch::blend;
+use focusforge_core::zmap::ZMapInfo;
 use focusforge_gui::checkpoints::local_date_and_time;
 use focusforge_gui::{AppController, OpenOutcome};
 
@@ -195,7 +197,6 @@ fn build_edited_with_samples(name: &str, samples_per_pixel: u32) -> Edited {
         }],
         None,
         t0 + 60,
-        focusforge_core::project::ZMapStorage::Bounded,
     )
     .unwrap()
     .checkpoint;
@@ -340,8 +341,14 @@ fn gui_export_equals_cli_export_and_cancel_writes_nothing() {
     let dir = common::tree("export_matches_cli_out");
     let out_path = dir.join("gui-export.tif");
     let picked = out_path.clone();
+    let ffp_before = fs::read(&edited.project).unwrap();
     controller.export_confirmed(move |_proposed| Some(picked.clone()));
     wait_export(&mut controller);
+    assert_eq!(
+        fs::read(&edited.project).unwrap(),
+        ffp_before,
+        "an export must not touch the project file"
+    );
     assert!(
         controller.export_copy().is_none(),
         "the modal closes once the write succeeds"
@@ -457,9 +464,10 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     .unwrap();
     assert_eq!(fs::read(&held_out).unwrap(), fs::read(&cli_out).unwrap());
 
-    // A tab with unsealed edits exports the gather of its edited indices,
-    // differing from its row's own export in exactly the edited pixels,
-    // and changes neither the session's op count nor the `.ffp` on disk.
+    // A tab with unsaved strokes exports its state through the one render:
+    // the second stroke changes exactly the samples its footprint covers, the
+    // session and the `.ffp` on disk stay as they were, and the image is the
+    // export of the same strokes once saved.
     let edited = build_edited("export_live_edits");
     let ffp_before = fs::read(&edited.project).unwrap();
     let mut controller = scratch_controller("export_live_edits");
@@ -467,22 +475,7 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     let root_row = row_index(&controller, &edited.root);
     controller.select_checkpoint_row(root_row);
     common::enter_editor(&mut controller);
-    // A fresh session (0 ops) replays to exactly the row's own Z-Map, so
-    // this is also what `baseline.tif` (the row's own, non-live export,
-    // below) gathers.
-    let indices_before = controller.edit_session().unwrap().indices().to_vec();
-
-    let dir = common::tree("export_live_edits_out");
-    controller.checkpoint_export_requested();
-    let baseline = dir.join("baseline.tif");
-    let picked = baseline.clone();
-    controller.export_confirmed(move |_proposed| Some(picked.clone()));
-    wait_export(&mut controller);
-
-    // Pixel (1, 1)'s own index in `build_edited`'s root Z-Map is `(1 * MW +
-    // 1) % FRAMES == 0`; painting a different source is what actually
-    // changes the gathered sample below, unlike `dab()`'s own source 0.
-    let repaint = Op::BrushStroke {
+    let first = Op::BrushStroke {
         source_id: 1,
         path: vec![Point { x: 1, y: 1 }],
         radius: 0.5,
@@ -491,9 +484,27 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     controller
         .edit_session_mut()
         .unwrap()
-        .append(repaint)
+        .append(first.clone())
         .expect("the stroke inside the map applies");
-    let indices_after = controller.edit_session().unwrap().indices().to_vec();
+
+    let dir = common::tree("export_live_edits_out");
+    controller.checkpoint_export_requested();
+    let baseline = dir.join("baseline.tif");
+    let picked = baseline.clone();
+    controller.export_confirmed(move |_proposed| Some(picked.clone()));
+    wait_export(&mut controller);
+
+    let repaint = Op::BrushStroke {
+        source_id: 2,
+        path: vec![Point { x: 1, y: 1 }],
+        radius: 0.5,
+        softness: 0.0,
+    };
+    controller
+        .edit_session_mut()
+        .unwrap()
+        .append(repaint.clone())
+        .expect("the stroke inside the map applies");
     let op_count_before = controller.edit_session().unwrap().op_count();
     let held_before = controller.held_checkpoints().len();
 
@@ -525,36 +536,122 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     let edited_samples = samples(&edited_out);
     assert_ne!(
         base_samples, edited_samples,
-        "the dab must change at least one sample"
+        "the repaint must change at least one sample"
     );
-
-    // The exact set of samples that may differ: every channel of every
-    // pixel whose gathered source index actually changed, derived
-    // structurally from the session's own Z-Map rather than assumed from
-    // the brush's radius.
     const SPP: usize = 3;
-    let expected: std::collections::HashSet<usize> = indices_before
-        .iter()
-        .zip(indices_after.iter())
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .flat_map(|(pixel, _)| (pixel * SPP)..(pixel * SPP + SPP))
+    let footprint = blend::footprint(&repaint, ZMapInfo::new(MW, MH, FRAMES as u32).unwrap())
+        .unwrap()
+        .expect("the stroke meets the map");
+    let inside: std::collections::HashSet<usize> = (footprint.y..footprint.y + footprint.height)
+        .flat_map(|y| {
+            (footprint.x..footprint.x + footprint.width).flat_map(move |x| {
+                let pixel = (y * MW + x) as usize;
+                (pixel * SPP)..(pixel * SPP + SPP)
+            })
+        })
         .collect();
-    assert!(
-        !expected.is_empty(),
-        "the stroke must change at least one Z-Map index"
-    );
-    let actual: std::collections::HashSet<usize> = base_samples
+    let changed: std::collections::HashSet<usize> = base_samples
         .iter()
         .zip(edited_samples.iter())
         .enumerate()
         .filter(|(_, (a, b))| a != b)
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(
-        actual, expected,
-        "exactly the edited pixels' samples must differ"
+    assert!(
+        changed.is_subset(&inside),
+        "only samples inside the repaint's footprint may differ: {changed:?} vs {inside:?}"
     );
+
+    // The same strokes appended to a copy of the project and exported as that
+    // checkpoint give the same file.
+    let copy = edited.project.with_file_name("appended.ffp");
+    fs::copy(&edited.project, &copy).unwrap();
+    let appended = append_ops_onto(
+        &copy,
+        &edited.root,
+        vec![first, repaint],
+        None,
+        1_756_468_980,
+    )
+    .unwrap()
+    .checkpoint;
+    let mut copy_project = Project::open(&copy).unwrap();
+    let appended_out = dir.join("appended.tif");
+    export_checkpoint(
+        &mut copy_project,
+        &appended,
+        &appended_out,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(&edited_out).unwrap(),
+        fs::read(&appended_out).unwrap(),
+        "the pending export is the saved export of the same strokes"
+    );
+
+    // A never-saved tab exports its pending strokes too, writing no project;
+    // after Save the same state exports the same samples.
+    let mut controller = scratch_controller("export_live_unsaved");
+    let frames = open_mantis64_tab(&mut controller, "export_live_unsaved", 2);
+    assert!(controller.start_fuse());
+    settle_all(&mut controller);
+    common::enter_editor(&mut controller);
+    controller
+        .edit_session_mut()
+        .unwrap()
+        .append(Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 30, y: 30 }],
+            radius: 8.0,
+            softness: 0.5,
+        })
+        .expect("the stroke inside the map applies");
+    let before: std::collections::BTreeSet<PathBuf> = fs::read_dir(&frames)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    controller.checkpoint_export_requested();
+    let unsaved_out = dir.join("unsaved.tif");
+    let picked = unsaved_out.clone();
+    controller.export_confirmed(move |_proposed| Some(picked.clone()));
+    wait_export(&mut controller);
+    assert!(
+        unsaved_out.exists(),
+        "a never-saved tab exports its strokes"
+    );
+    let after: std::collections::BTreeSet<PathBuf> = fs::read_dir(&frames)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(before, after, "the export writes no project");
+    assert_ne!(
+        samples(&unsaved_out),
+        samples(&held_out),
+        "the stroke must change the held result"
+    );
+
+    let saved_path = save_to_proposed(&mut controller);
+    let mut project = Project::open(&saved_path).unwrap();
+    let stroked = project
+        .history()
+        .all()
+        .iter()
+        .find(|checkpoint| !checkpoint.ops.is_empty())
+        .expect("Save appends the pending stroke")
+        .id
+        .clone();
+    let saved_out = dir.join("unsaved-saved.tif");
+    export_checkpoint(
+        &mut project,
+        &stroked,
+        &saved_out,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(samples(&unsaved_out), samples(&saved_out));
 }
 
 #[test]
@@ -602,35 +699,75 @@ fn refused_export_is_shown_in_the_modal() {
 }
 
 #[test]
-fn held_row_missing_source_is_refused_per_frame() {
-    // A held row has no stored fingerprint (plain paths, `seal.rs`'s
-    // `HeldCheckpoint::sources`), so it can only ever report `missing`, the
-    // same per-frame line format a saved row's `RenderSourcesUnavailable`
-    // produces -- via `ExportSourcesUnavailable`'s own real path.
-    let mut controller = scratch_controller("export_refused_held");
-    let root = open_mantis64_tab(&mut controller, "export_refused_held", 2);
+fn held_row_exports_from_a_never_saved_tab_without_its_sources() {
+    let mut controller = scratch_controller("export_held_no_sources");
+    let root = open_mantis64_tab(&mut controller, "export_held_no_sources", 2);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
     assert_eq!(controller.checkpoint_count(), Some(1));
 
-    fs::remove_file(root.join("00.tif")).unwrap();
+    // The frames go away; the tab has never been saved, so no `.ffp` exists.
+    let away = root.with_file_name("export_held_no_sources_away");
+    fs::rename(&root, &away).unwrap();
 
     controller.checkpoint_export_requested();
     let (_, what) = controller.export_copy().expect("the modal must still open");
     assert_eq!(what, "Exporting the unsaved fuse result held in this tab.");
-    let dir = common::tree("export_refused_held_out");
-    let out = dir.join("held-refused.tif");
-    let picked = out.clone();
+    let dir = common::tree("export_held_no_sources_out");
+    let held_out = dir.join("held.tif");
+    let picked = held_out.clone();
     controller.export_confirmed(move |_proposed| Some(picked.clone()));
     wait_export(&mut controller);
-
-    assert_eq!(controller.export_stage(), "refused");
-    assert_eq!(
-        controller.export_refusal_lines(),
-        &["00.tif — missing".to_string()]
+    assert!(
+        controller.export_copy().is_none(),
+        "the modal closes once the write succeeds"
     );
-    assert!(!out.exists());
-    assert!(!dir.join("held-refused.tif.partial").exists());
+    assert!(held_out.exists());
+    assert!(!dir.join("held.tif.partial").exists());
+    assert_eq!(controller.held_checkpoints().len(), 1);
+
+    // The same result after Save, exported through the CLI's entry point.
+    fs::rename(&away, &root).unwrap();
+    let saved_path = save_to_proposed(&mut controller);
+    let mut project = Project::open(&saved_path).unwrap();
+    let id = project.history().all()[0].id.clone();
+    let cli_out = dir.join("saved.tif");
+    export_checkpoint(
+        &mut project,
+        &id,
+        &cli_out,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(samples(&held_out), samples(&cli_out));
+}
+
+#[test]
+fn saved_unedited_row_exports_its_stored_composite_without_sources() {
+    let edited = build_edited("export_saved_no_sources");
+    let mut controller = scratch_controller("export_saved_no_sources");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
+    let ffp_before = fs::read(&edited.project).unwrap();
+    for path in &edited.sources {
+        fs::remove_file(path).unwrap();
+    }
+    let row = row_index(&controller, &edited.root);
+    controller.select_checkpoint_row(row);
+    controller.checkpoint_export_requested();
+    let dir = common::tree("export_saved_no_sources_out");
+    let out = dir.join("root.tif");
+    export_to(&mut controller, &out);
+    assert!(
+        controller.export_copy().is_none(),
+        "the modal closes once the write succeeds"
+    );
+
+    let mut project = Project::open(&edited.project).unwrap();
+    let stored = dir.join("stored.tif");
+    materialize_plane(&mut project, Plane::Composite, &stored).unwrap();
+    assert_eq!(samples(&out), samples(&stored));
+    assert_eq!(fs::read(&edited.project).unwrap(), ffp_before);
 }
 
 #[test]

@@ -75,25 +75,19 @@ pub(crate) fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<
 
 /// Op kinds in the order a summary lists them; the last catches any op kind
 /// the list does not name.
-const OP_NAMES: [(&str, &str); 5] = [
+const OP_NAMES: [(&str, &str); 2] = [
     ("brush stroke", "brush strokes"),
-    ("fill", "fills"),
-    ("region reset", "region resets"),
-    ("re-fuse", "re-fuses"),
     ("other change", "other changes"),
 ];
 
 /// The counted phrase a question about unsaved ops opens with, in digits and
-/// grouped by kind: "12 brush strokes and 2 fills".
+/// grouped by kind: "12 brush strokes and 2 other changes".
 pub(crate) fn op_summary<'a>(ops: impl IntoIterator<Item = &'a Op>) -> String {
     let mut counts = [0usize; OP_NAMES.len()];
     for op in ops {
         counts[match op {
             Op::BrushStroke { .. } => 0,
-            Op::FloodFill { .. } => 1,
-            Op::ResetRegion { .. } => 2,
-            Op::Refuse { .. } => 3,
-            _ => 4,
+            _ => 1,
         }] += 1;
     }
     counted_phrase(counts)
@@ -578,32 +572,6 @@ mod tests {
         }
     }
 
-    fn fill() -> Op {
-        Op::FloodFill {
-            seed: Default::default(),
-            source_id: 0,
-            tolerance: 0.0,
-        }
-    }
-
-    fn reset() -> Op {
-        Op::ResetRegion {
-            rect: focusforge_core::io::Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-        }
-    }
-
-    fn refuse() -> Op {
-        Op::Refuse {
-            algorithm: "a-stack-algorithm".to_string(),
-            params: Default::default(),
-        }
-    }
-
     #[test]
     fn an_op_summary_counts_in_digits_per_kind() {
         assert_eq!(op_summary(&[stroke(0)]), "1 brush stroke");
@@ -611,27 +579,14 @@ mod tests {
             op_summary(&[stroke(0), stroke(1), stroke(2)]),
             "3 brush strokes"
         );
-        assert_eq!(
-            op_summary(&[stroke(0), fill(), stroke(1)]),
-            "2 brush strokes and 1 fill",
-            "interleaved kinds still count per kind"
-        );
-        assert_eq!(
-            op_summary(&[reset(), stroke(0), refuse(), refuse()]),
-            "1 brush stroke, 1 region reset and 2 re-fuses"
-        );
-        assert_eq!(
-            op_summary(&[stroke(0), fill(), reset(), refuse()]),
-            "1 brush stroke, 1 fill, 1 region reset and 1 re-fuse"
-        );
         assert_eq!(op_summary(&[]), "");
     }
 
     #[test]
     fn an_op_kind_the_list_does_not_name_reads_as_other_changes() {
-        assert_eq!(counted_phrase([0, 0, 0, 0, 1]), "1 other change");
+        assert_eq!(counted_phrase([0, 1]), "1 other change");
         assert_eq!(
-            counted_phrase([2, 0, 0, 0, 3]),
+            counted_phrase([2, 3]),
             "2 brush strokes and 3 other changes"
         );
     }
@@ -660,6 +615,7 @@ mod tests {
                 composite_description: String::new(),
                 metrics: Metrics::default(),
                 created_at: 0,
+                compressed_composite: None,
             }),
             parent: None,
         }
@@ -671,7 +627,7 @@ mod tests {
         let held = [
             fused_entry(),
             ops_entry(vec![stroke(1)], Some(ParentRef::Entry(0))),
-            ops_entry(vec![stroke(2), fill()], Some(ParentRef::Entry(1))),
+            ops_entry(vec![stroke(2), stroke(4)], Some(ParentRef::Entry(1))),
             ops_entry(vec![stroke(3)], saved),
         ];
         assert_eq!(
@@ -686,7 +642,7 @@ mod tests {
         );
         assert_eq!(
             stroke_chain(&held, 2),
-            Some(vec![stroke(1), stroke(2), fill()]),
+            Some(vec![stroke(1), stroke(2), stroke(4)]),
             "two levels deep, oldest first"
         );
     }

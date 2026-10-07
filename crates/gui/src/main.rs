@@ -621,6 +621,10 @@ fn run_window<T: ComponentHandle + 'static>(
                         canvas
                             .borrow_mut()
                             .attach_device(next.clone(), queue.clone());
+                        controller
+                            .lock()
+                            .unwrap()
+                            .attach_blender(focusforge_gpu::blend::Blender::new(next, queue));
                         let controller = controller.clone();
                         let canvas = canvas.clone();
                         slint::Timer::single_shot(Duration::ZERO, move || {
@@ -635,6 +639,7 @@ fn run_window<T: ComponentHandle + 'static>(
                     let teardown = lifecycle.get();
                     let device = device.clone();
                     let canvas = canvas.clone();
+                    let controller = controller.clone();
                     let app_handle = app_handle.clone();
                     let lifecycle = lifecycle.clone();
                     slint::Timer::single_shot(Duration::ZERO, move || {
@@ -644,10 +649,12 @@ fn run_window<T: ComponentHandle + 'static>(
                         if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
                             app.set_frame_source(slint::Image::default());
                             app.set_composite_source(slint::Image::default());
-                            app.set_zmap_source(slint::Image::default());
                         }
                         if let Some(canvas) = canvas {
                             canvas.borrow_mut().detach_device();
+                        }
+                        if let Some(controller) = controller {
+                            controller.lock().unwrap().detach_blender();
                         }
                         *device.borrow_mut() = None;
                     });
@@ -774,12 +781,14 @@ fn run_window<T: ComponentHandle + 'static>(
     bridge::shutdown_windows();
     // Quitting never interrupts a write in progress.
     if let Some(controller) = &controller {
-        controller.lock().unwrap().finish_saves();
+        let mut controller = controller.lock().unwrap();
+        controller.finish_saves();
+        controller.finish_compactions();
+        controller.detach_blender();
     }
     if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
         app.set_frame_source(slint::Image::default());
         app.set_composite_source(slint::Image::default());
-        app.set_zmap_source(slint::Image::default());
     }
     if let Some(canvas) = canvas {
         canvas.borrow_mut().detach_device();
@@ -1035,8 +1044,8 @@ fn run(args: &Args) -> ExitCode {
                     if app.get_project_loaded() {
                         timer.stop();
                         match pane {
-                            UndockPane::Frame => app.invoke_composite_undock_requested(),
-                            UndockPane::Composite => app.invoke_zmap_undock_requested(),
+                            UndockPane::Frame => app.invoke_frame_undock_requested(),
+                            UndockPane::Composite => app.invoke_composite_undock_requested(),
                         }
                         if let Some(ms) = dock_after {
                             let app_weak = app.as_weak();
@@ -1050,10 +1059,10 @@ fn run(args: &Args) -> ExitCode {
                                             if let Some(app) = app_weak.upgrade() {
                                                 match pane {
                                                     UndockPane::Frame => {
-                                                        app.invoke_composite_undock_requested()
+                                                        app.invoke_frame_undock_requested()
                                                     }
                                                     UndockPane::Composite => {
-                                                        app.invoke_zmap_undock_requested()
+                                                        app.invoke_composite_undock_requested()
                                                     }
                                                 }
                                             }
