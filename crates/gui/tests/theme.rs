@@ -358,8 +358,8 @@ fn exported_components(code: &str) -> Vec<String> {
 }
 
 /// Every exported component under `ui/components/` is imported by the
-/// component sheet and instantiated there, so a component added later that
-/// the sheet does not draw fails here.
+/// component sheet and instantiated there; a component the sheet does not
+/// draw fails here.
 #[test]
 fn every_component_is_on_the_component_sheet() {
     let ui = common::ui_dir();

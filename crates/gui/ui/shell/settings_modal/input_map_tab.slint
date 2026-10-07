@@ -26,11 +26,9 @@ component FFInputTableRow inherits Rectangle {
         padding-bottom: Theme.space-1;
         spacing: Theme.space-2;
 
-        // The narrower content column two rows below fits fewer characters
-        // than the widest input combo and the widest action name at once on
-        // one line each; wrapping (rather than eliding) keeps every combo
-        // and action name readable, at the cost of some rows growing to two
-        // lines -- `min-height` above lets the row grow with them.
+        // The content column is too narrow for the widest input combo and
+        // action name on one line each. Text wraps rather than elides, and
+        // `min-height` above lets the row grow to two lines.
         Text {
             text: root.input-label;
             color: root.header ? Theme.text-muted : Theme.text-primary;
