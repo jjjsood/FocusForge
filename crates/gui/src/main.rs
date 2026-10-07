@@ -1044,8 +1044,8 @@ fn run(args: &Args) -> ExitCode {
                     if app.get_project_loaded() {
                         timer.stop();
                         match pane {
-                            UndockPane::Frame => app.invoke_composite_undock_requested(),
-                            UndockPane::Composite => app.invoke_zmap_undock_requested(),
+                            UndockPane::Frame => app.invoke_frame_undock_requested(),
+                            UndockPane::Composite => app.invoke_composite_undock_requested(),
                         }
                         if let Some(ms) = dock_after {
                             let app_weak = app.as_weak();
@@ -1059,10 +1059,10 @@ fn run(args: &Args) -> ExitCode {
                                             if let Some(app) = app_weak.upgrade() {
                                                 match pane {
                                                     UndockPane::Frame => {
-                                                        app.invoke_composite_undock_requested()
+                                                        app.invoke_frame_undock_requested()
                                                     }
                                                     UndockPane::Composite => {
-                                                        app.invoke_zmap_undock_requested()
+                                                        app.invoke_composite_undock_requested()
                                                     }
                                                 }
                                             }

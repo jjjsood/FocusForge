@@ -1168,8 +1168,8 @@ fn detached_main_pane_fills_the_canvas_on_either_side() {
     let app = app_at(1440, 900);
     app.set_show_empty_state(false);
     for (detached, remaining) in [
-        ("composite", "FFCanvas::pane-right"),
-        ("zmap", "FFCanvas::pane-left"),
+        ("frame", "FFCanvas::pane-right"),
+        ("composite", "FFCanvas::pane-left"),
     ] {
         app.set_detached_pane(detached.into());
         assert_rect(&app, remaining, (16.0, 92.0, 1148.0, 748.0));

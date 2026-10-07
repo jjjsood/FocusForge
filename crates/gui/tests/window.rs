@@ -190,8 +190,8 @@ fn undock_without_project_is_empty() {
 
     i_slint_backend_testing::init_no_event_loop();
     let mut controller = AppController::new();
-    controller.undock_requested(PaneSource::Composite);
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    controller.undock_requested(PaneSource::Frame);
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
 
     let window = ComparisonWindow::new().unwrap();
     assert!(!window.get_project_loaded());
@@ -216,12 +216,12 @@ fn dock_back_restores_two_panes() {
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
-    controller.undock_requested(PaneSource::Composite);
-    app.set_detached_pane("composite".into());
+    controller.undock_requested(PaneSource::Frame);
+    app.set_detached_pane("frame".into());
     assert_eq!(app.get_canvas_pane_left_width(), 0.0);
     assert_eq!(app.get_canvas_pane_right_width(), 1148.0);
 
-    controller.undocked_window_closed(PaneSource::Composite);
+    controller.undocked_window_closed(PaneSource::Frame);
     app.set_detached_pane("".into());
     assert_eq!(controller.detached_pane(), None);
     assert_eq!(app.get_canvas_pane_left_width(), 566.0);

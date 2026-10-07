@@ -48,8 +48,8 @@ pub enum CanvasFeed {
 /// Which pane a piece of canvas state belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSource {
+    Frame,
     Composite,
-    ZMap,
 }
 
 /// The display texture's size, the whole "allocated once, re-allocated only

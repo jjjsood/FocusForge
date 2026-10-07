@@ -1523,10 +1523,10 @@ fn both_brush_cursors_follow_either_pane() {
     };
     let (left_pos, left_size) = rect("pane-left");
     let (right_pos, _right_size) = rect("pane-right");
+    app.set_cursor_frame_x(40.0);
+    app.set_cursor_frame_y(left_size.height / 2.0);
     app.set_cursor_composite_x(40.0);
     app.set_cursor_composite_y(left_size.height / 2.0);
-    app.set_cursor_zmap_x(40.0);
-    app.set_cursor_zmap_y(left_size.height / 2.0);
 
     // Each clip container matches its own pane's rect exactly.
     for (clip_id, pane_id) in [

@@ -354,8 +354,8 @@ pub struct BrushCursorView {
     /// shown in the cursor's swatch.
     pub pick_color: [u8; 3],
     /// The shared source point projected into each pane's local coordinates.
+    pub frame_position: (f32, f32),
     pub composite_position: (f32, f32),
-    pub zmap_position: (f32, f32),
 }
 
 /// The diagnostics panel's own state: the two directories a bundle is
@@ -1198,8 +1198,8 @@ struct ShellState {
     panes: Option<(PaneRect, PaneRect)>,
     /// Last valid rect for each side, including a side whose window is
     /// detached and therefore does not report main-window resize callbacks.
+    frame_pane: Option<PaneRect>,
     composite_pane: Option<PaneRect>,
-    zmap_pane: Option<PaneRect>,
     /// The one pane outside the main window, if any.
     detached: Option<PaneSource>,
     /// A grouping question raised by [`AppController::open_paths`], and the
@@ -2705,15 +2705,6 @@ impl AppController {
         }
     }
 
-    /// `"Composite"` / `"Z-Map"` -- the label's geometry is fixed
-    /// elsewhere, not its text.
-    pub fn pane_label(&self, pane: crate::canvas::PaneSource) -> &'static str {
-        match pane {
-            crate::canvas::PaneSource::Composite => "Composite",
-            crate::canvas::PaneSource::ZMap => "Z-Map",
-        }
-    }
-
     /// A pane can leave the main window only while both panes are docked.
     pub fn undock_enabled(&self, _pane: PaneSource) -> bool {
         self.state.detached.is_none()
@@ -2864,12 +2855,12 @@ impl AppController {
         };
         let (pane, anchor) = self.anchor_pane();
         let gesture_pane = match pane {
-            PaneSource::Composite => left,
-            PaneSource::ZMap => right,
+            PaneSource::Frame => left,
+            PaneSource::Composite => right,
         };
         let other_pane = match pane {
-            PaneSource::Composite => right,
-            PaneSource::ZMap => left,
+            PaneSource::Frame => right,
+            PaneSource::Composite => left,
         };
         let detents = self.wheel_detents(Action::ZoomAtCursor, steps);
         let dir = detents.signum();
@@ -3003,8 +2994,8 @@ impl AppController {
             core_commands: paths.core,
             picking,
             pick_color: job::source_color(source, sources),
-            composite_position: viewport.from_source_in(source_point, left),
-            zmap_position: viewport.from_source_in(source_point, right),
+            frame_position: viewport.from_source_in(source_point, left),
+            composite_position: viewport.from_source_in(source_point, right),
         })
     }
 
@@ -3331,27 +3322,28 @@ impl AppController {
             return (pane, (x, y));
         }
         let Some((left, right)) = self.state.panes else {
-            return (PaneSource::Composite, (x, y));
+            return (PaneSource::Frame, (x, y));
         };
-        let (side, pane) =
-            if self.state.detached != Some(PaneSource::Composite) && pane_contains(left, x, y) {
-                (PaneSource::Composite, left)
-            } else if self.state.detached != Some(PaneSource::ZMap) && pane_contains(right, x, y) {
-                (PaneSource::ZMap, right)
-            } else {
-                match self.state.detached {
-                    Some(PaneSource::Composite) => (PaneSource::ZMap, right),
-                    Some(PaneSource::ZMap) => (PaneSource::Composite, left),
-                    None => {
-                        let mid = (left.x + left.width + right.x) / 2.0;
-                        if x < mid {
-                            (PaneSource::Composite, left)
-                        } else {
-                            (PaneSource::ZMap, right)
-                        }
+        let (side, pane) = if self.state.detached != Some(PaneSource::Frame)
+            && pane_contains(left, x, y)
+        {
+            (PaneSource::Frame, left)
+        } else if self.state.detached != Some(PaneSource::Composite) && pane_contains(right, x, y) {
+            (PaneSource::Composite, right)
+        } else {
+            match self.state.detached {
+                Some(PaneSource::Frame) => (PaneSource::Composite, right),
+                Some(PaneSource::Composite) => (PaneSource::Frame, left),
+                None => {
+                    let mid = (left.x + left.width + right.x) / 2.0;
+                    if x < mid {
+                        (PaneSource::Frame, left)
+                    } else {
+                        (PaneSource::Composite, right)
                     }
                 }
-            };
+            }
+        };
         (
             side,
             (
@@ -3373,8 +3365,8 @@ impl AppController {
     fn pane_rect(&self, pane: PaneSource) -> Option<PaneRect> {
         let (left, right) = self.state.panes?;
         Some(match pane {
-            PaneSource::Composite => left,
-            PaneSource::ZMap => right,
+            PaneSource::Frame => left,
+            PaneSource::Composite => right,
         })
     }
 
@@ -3388,18 +3380,18 @@ impl AppController {
             return;
         }
         match self.state.detached {
-            Some(PaneSource::Composite) => self.state.zmap_pane = Some(right),
-            Some(PaneSource::ZMap) => self.state.composite_pane = Some(left),
+            Some(PaneSource::Frame) => self.state.composite_pane = Some(right),
+            Some(PaneSource::Composite) => self.state.frame_pane = Some(left),
             None => {
-                self.state.composite_pane = Some(left);
-                self.state.zmap_pane = Some(right);
+                self.state.frame_pane = Some(left);
+                self.state.composite_pane = Some(right);
             }
         }
         self.install_pane_geometry();
     }
 
     fn install_pane_geometry(&mut self) {
-        let (Some(left), Some(right)) = (self.state.composite_pane, self.state.zmap_pane) else {
+        let (Some(left), Some(right)) = (self.state.frame_pane, self.state.composite_pane) else {
             return;
         };
         self.state.panes = Some((left, right));
@@ -3421,8 +3413,8 @@ impl AppController {
             return;
         }
         match pane {
+            PaneSource::Frame => self.state.frame_pane = Some(rect),
             PaneSource::Composite => self.state.composite_pane = Some(rect),
-            PaneSource::ZMap => self.state.zmap_pane = Some(rect),
         }
         self.install_pane_geometry();
     }

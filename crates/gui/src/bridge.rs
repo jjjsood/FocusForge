@@ -467,8 +467,8 @@ fn show_comparison_pane(
             ));
             window.set_cursor_visible(cursor_hovered);
             let position = match detached {
+                PaneSource::Frame => cursor.frame_position,
                 PaneSource::Composite => cursor.composite_position,
-                PaneSource::ZMap => cursor.zmap_position,
             };
             window.set_cursor_x(position.0);
             window.set_cursor_y(position.1);
@@ -479,10 +479,10 @@ fn show_comparison_pane(
         // The backdrop of whichever pane is detached, placed by that pane's
         // draw; none clears it.
         let (backdrop, rect) = match detached {
-            PaneSource::Composite => {
+            PaneSource::Frame => {
                 frame_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
             }
-            PaneSource::ZMap => {
+            PaneSource::Composite => {
                 plane_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Composite, &draw))
             }
         }
@@ -493,8 +493,7 @@ fn show_comparison_pane(
         window.set_backdrop_w(rect.2);
         window.set_backdrop_h(rect.3);
         match detached {
-            // Historical `Composite` names the selected-frame pane.
-            PaneSource::Composite => {
+            PaneSource::Frame => {
                 window.set_pane_label(frame_label.into());
                 window.set_bar_title("FocusForge — Frame".into());
                 window.set_message_lines(string_model(canvas.frame_refusal()));
@@ -522,8 +521,7 @@ fn show_comparison_pane(
                     }
                 }
             }
-            // Historical `ZMap` names the displayed composite pane.
-            PaneSource::ZMap => {
+            PaneSource::Composite => {
                 window.set_pane_label("Composite".into());
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
@@ -1034,8 +1032,8 @@ pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
 
 fn push_detached_pane(app: &AppWindow, controller: &AppController) {
     let detached = match controller.detached_pane() {
+        Some(PaneSource::Frame) => "frame",
         Some(PaneSource::Composite) => "composite",
-        Some(PaneSource::ZMap) => "zmap",
         None => "",
     };
     app.set_detached_pane(detached.into());
@@ -1063,13 +1061,13 @@ fn update_detached_geometry(
     let comparison = comparison_rect(window);
     let mut controller = controller.lock().unwrap();
     match controller.detached_pane() {
-        Some(PaneSource::Composite) => {
-            controller.set_pane_geometry_for(PaneSource::ZMap, right);
-            controller.set_pane_geometry_for(PaneSource::Composite, comparison);
+        Some(PaneSource::Frame) => {
+            controller.set_pane_geometry_for(PaneSource::Composite, right);
+            controller.set_pane_geometry_for(PaneSource::Frame, comparison);
         }
-        Some(PaneSource::ZMap) => {
-            controller.set_pane_geometry_for(PaneSource::Composite, left);
-            controller.set_pane_geometry_for(PaneSource::ZMap, comparison);
+        Some(PaneSource::Composite) => {
+            controller.set_pane_geometry_for(PaneSource::Frame, left);
+            controller.set_pane_geometry_for(PaneSource::Composite, comparison);
         }
         None => controller.set_pane_geometry(left, right),
     }
@@ -1956,10 +1954,10 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
         view.pick_color[2],
     ));
     app.set_cursor_visible(cursor_hovered(app));
+    app.set_cursor_frame_x(view.frame_position.0);
+    app.set_cursor_frame_y(view.frame_position.1);
     app.set_cursor_composite_x(view.composite_position.0);
     app.set_cursor_composite_y(view.composite_position.1);
-    app.set_cursor_zmap_x(view.zmap_position.0);
-    app.set_cursor_zmap_y(view.zmap_position.1);
 }
 
 /// Opens the Keep/Discard dialog while the active tab holds a parked run,
@@ -2656,14 +2654,14 @@ pub fn install(
             }
         }
     });
-    app.on_composite_undock_requested({
+    app.on_frame_undock_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             record_direct_input();
             let _undock = measurement_scope("gui_comparison_undock");
-            let pane = PaneSource::Composite;
+            let pane = PaneSource::Frame;
             controller.lock().unwrap().undock_requested(pane);
             if let Some(app) = app_weak.upgrade() {
                 push_detached_pane(&app, &controller.lock().unwrap());
@@ -2676,14 +2674,14 @@ pub fn install(
             }
         }
     });
-    app.on_zmap_undock_requested({
+    app.on_composite_undock_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
             record_direct_input();
             let _undock = measurement_scope("gui_comparison_undock");
-            let pane = PaneSource::ZMap;
+            let pane = PaneSource::Composite;
             controller.lock().unwrap().undock_requested(pane);
             if let Some(app) = app_weak.upgrade() {
                 push_detached_pane(&app, &controller.lock().unwrap());
@@ -2758,11 +2756,11 @@ pub fn install(
                 let (left, right) = read_pane_geometry(&app);
                 let mut guard = controller.lock().unwrap();
                 match guard.detached_pane() {
-                    Some(PaneSource::Composite) => {
-                        guard.set_pane_geometry_for(PaneSource::ZMap, right)
+                    Some(PaneSource::Frame) => {
+                        guard.set_pane_geometry_for(PaneSource::Composite, right)
                     }
-                    Some(PaneSource::ZMap) => {
-                        guard.set_pane_geometry_for(PaneSource::Composite, left)
+                    Some(PaneSource::Composite) => {
+                        guard.set_pane_geometry_for(PaneSource::Frame, left)
                     }
                     None => guard.set_pane_geometry(left, right),
                 }

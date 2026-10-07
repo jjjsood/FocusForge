@@ -20,7 +20,7 @@ export component FFCanvas inherits Rectangle {
     // The right pane's refusal -- see `FFPane::message-lines`.
     in property <[string]> composite-message-lines: [];
     in property <bool> undock-enabled: true;
-    // "composite" is the selected-frame pane; "zmap" is the composite pane.
+    // "frame" or "composite" names the pane outside the main window; empty while both are docked.
     in property <string> detached-pane: "";
     // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
     in property <bool> project-loaded: false;
@@ -71,10 +71,10 @@ export component FFCanvas inherits Rectangle {
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
     in property <bool> cursor-visible: false;
+    in property <length> cursor-frame-x;
+    in property <length> cursor-frame-y;
     in property <length> cursor-composite-x;
     in property <length> cursor-composite-y;
-    in property <length> cursor-zmap-x;
-    in property <length> cursor-zmap-y;
     out property <bool> pane-hovered: hit-area.has-hover
         && ((pane-left.visible && hit-area.mouse-x >= pane-left.x
                 && hit-area.mouse-x <= pane-left.x + pane-left.width
@@ -85,8 +85,8 @@ export component FFCanvas inherits Rectangle {
                 && hit-area.mouse-y >= pane-right.y
                 && hit-area.mouse-y <= pane-right.y + pane-right.height));
     callback pane-hover-changed();
+    callback frame-undock-requested();
     callback composite-undock-requested();
-    callback zmap-undock-requested();
     // The one input dispatch point's gesture forwards. No other `.slint`
     // file in the crate declares `scroll-event`, `pointer-event` or
     // `moved`. The two extra `length`s carry the wheel's own cursor
@@ -170,11 +170,11 @@ export component FFCanvas inherits Rectangle {
     pane-left := FFPane {
         x: ShellGeometry.pane-gutter;
         y: ShellGeometry.pane-gutter;
-        width: root.detached-pane == "zmap" ? parent.width - 2 * ShellGeometry.pane-gutter
-            : root.detached-pane == "composite" ? 0px
+        width: root.detached-pane == "composite" ? parent.width - 2 * ShellGeometry.pane-gutter
+            : root.detached-pane == "frame" ? 0px
             : (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
         height: parent.height - 2 * ShellGeometry.pane-gutter;
-        visible: root.detached-pane != "composite";
+        visible: root.detached-pane != "frame";
         source: root.frame-source;
         label: root.frame-label;
         message-lines: root.frame-message-lines;
@@ -194,7 +194,7 @@ export component FFCanvas inherits Rectangle {
         crop-w: root.frame-crop-w;
         crop-h: root.frame-crop-h;
         pixelated: root.pixelated;
-        undock-requested => { root.composite-undock-requested(); }
+        undock-requested => { root.frame-undock-requested(); }
     }
 
     // Centred inside the gutter between the panes, not added on top of it.
@@ -209,15 +209,15 @@ export component FFCanvas inherits Rectangle {
     }
 
     pane-right := FFPane {
-        x: root.detached-pane == "composite" ? ShellGeometry.pane-gutter
-            : root.detached-pane == "zmap" ? parent.width
+        x: root.detached-pane == "frame" ? ShellGeometry.pane-gutter
+            : root.detached-pane == "composite" ? parent.width
             : parent.width - ShellGeometry.pane-gutter - pane-left.width;
         y: ShellGeometry.pane-gutter;
-        width: root.detached-pane == "composite" ? parent.width - 2 * ShellGeometry.pane-gutter
-            : root.detached-pane == "zmap" ? 0px
+        width: root.detached-pane == "frame" ? parent.width - 2 * ShellGeometry.pane-gutter
+            : root.detached-pane == "composite" ? 0px
             : pane-left.width;
         height: pane-left.height;
-        visible: root.detached-pane != "zmap";
+        visible: root.detached-pane != "composite";
         source: root.composite-source;
         label: "Composite";
         message-lines: root.composite-message-lines;
@@ -237,13 +237,13 @@ export component FFCanvas inherits Rectangle {
         crop-w: root.crop-w;
         crop-h: root.crop-h;
         pixelated: root.pixelated;
-        undock-requested => { root.zmap-undock-requested(); }
+        undock-requested => { root.composite-undock-requested(); }
     }
 
     pane-placeholder := FFPanePlaceholder {
         x: pane-right.x + (pane-right.width - self.width) / 2;
         y: pane-right.y + (pane-right.height - self.height) / 2;
-        visible: root.project-loaded && !root.composite-ready && root.detached-pane != "zmap";
+        visible: root.project-loaded && !root.composite-ready && root.detached-pane != "composite";
     }
 
     brush-cursor-left-clip := Rectangle {
@@ -254,8 +254,8 @@ export component FFCanvas inherits Rectangle {
         clip: true;
 
         brush-cursor-left := FFBrushCursor {
-            x: root.cursor-composite-x - self.width / 2;
-            y: root.cursor-composite-y - self.height / 2;
+            x: root.cursor-frame-x - self.width / 2;
+            y: root.cursor-frame-y - self.height / 2;
             visible: root.show-brush-cursor;
             extent: root.cursor-extent;
             ring-commands: root.cursor-ring-commands;
@@ -273,8 +273,8 @@ export component FFCanvas inherits Rectangle {
         clip: true;
 
         brush-cursor-right := FFBrushCursor {
-            x: root.cursor-zmap-x - self.width / 2;
-            y: root.cursor-zmap-y - self.height / 2;
+            x: root.cursor-composite-x - self.width / 2;
+            y: root.cursor-composite-y - self.height / 2;
             visible: root.show-brush-cursor;
             extent: root.cursor-extent;
             ring-commands: root.cursor-ring-commands;

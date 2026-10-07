@@ -872,10 +872,10 @@ fn controller_events_reach_an_installed_sink() {
 
 #[test]
 fn undocking_refuses_the_last_pane_and_docks_back_idempotently() {
-    for detached in [PaneSource::Composite, PaneSource::ZMap] {
+    for detached in [PaneSource::Frame, PaneSource::Composite] {
         let other = match detached {
-            PaneSource::Composite => PaneSource::ZMap,
-            PaneSource::ZMap => PaneSource::Composite,
+            PaneSource::Frame => PaneSource::Composite,
+            PaneSource::Composite => PaneSource::Frame,
         };
         let mut controller = AppController::new();
         let events = record_events(&mut controller);
@@ -889,8 +889,8 @@ fn undocking_refuses_the_last_pane_and_docks_back_idempotently() {
         controller.undocked_window_closed(detached);
         controller.undocked_window_closed(detached);
 
+        assert!(controller.undock_enabled(PaneSource::Frame));
         assert!(controller.undock_enabled(PaneSource::Composite));
-        assert!(controller.undock_enabled(PaneSource::ZMap));
         assert_eq!(
             events.lock().unwrap().as_slice(),
             [
@@ -905,12 +905,12 @@ fn undocking_refuses_the_last_pane_and_docks_back_idempotently() {
 fn an_accepted_main_quit_closes_the_detached_window_first() {
     let mut controller = AppController::new();
     let events = record_events(&mut controller);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undock_requested(PaneSource::Composite);
     controller.window_close();
     assert_eq!(
         events.lock().unwrap().as_slice(),
         [
-            ShellEvent::PaneUndockRequested(PaneSource::ZMap),
+            ShellEvent::PaneUndockRequested(PaneSource::Composite),
             ShellEvent::DetachedWindowCloseRequested,
             ShellEvent::WindowCloseRequested,
         ]
@@ -929,7 +929,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
             ]
         );
     };
-    for detached in [PaneSource::Composite, PaneSource::ZMap] {
+    for detached in [PaneSource::Frame, PaneSource::Composite] {
         let mut immediate = AppController::new();
         immediate.undock_requested(detached);
         let events = record_events(&mut immediate);
@@ -939,14 +939,14 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
 
     let mut discard = controller_with_scratch("detached_quit_without_saving");
     open_fused_tab(&mut discard, "detached_quit_without_saving", 3);
-    discard.undock_requested(PaneSource::ZMap);
+    discard.undock_requested(PaneSource::Composite);
     let events = record_events(&mut discard);
     discard.quit_without_saving();
     assert_close_tail(&events);
 
     let mut save = controller_with_scratch("detached_save_all_quit");
     open_fused_tab(&mut save, "detached_save_all_quit", 3);
-    save.undock_requested(PaneSource::Composite);
+    save.undock_requested(PaneSource::Frame);
     let events = record_events(&mut save);
     save.window_close();
     let target = common::tree("detached_save_all_quit").join("saved.ffp");
@@ -955,7 +955,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
 
     let mut headless = controller_with_scratch("detached_save_all_quit_sync");
     open_fused_tab(&mut headless, "detached_save_all_quit_sync", 3);
-    headless.undock_requested(PaneSource::ZMap);
+    headless.undock_requested(PaneSource::Composite);
     let events = record_events(&mut headless);
     let target = common::tree("detached_save_all_quit_sync").join("saved.ffp");
     assert!(headless.save_all_and_quit(|_| Some(target.clone())));
@@ -968,13 +968,13 @@ fn cancelling_a_guarded_quit_keeps_the_detached_pane() {
     open_mantis64_tab(&mut controller, "detached_guarded_quit", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undock_requested(PaneSource::Composite);
     let events = record_events(&mut controller);
     controller.window_close();
     assert!(controller.pending_quit_copy().is_some());
     controller.cancel_quit();
     assert!(controller.pending_quit_copy().is_none());
-    assert!(!controller.undock_enabled(PaneSource::Composite));
+    assert!(!controller.undock_enabled(PaneSource::Frame));
     assert!(
         !events
             .lock()
@@ -989,13 +989,13 @@ fn cancelling_the_guarded_save_picker_keeps_the_detached_pane() {
     open_mantis64_tab(&mut controller, "detached_save_picker_cancel", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    controller.undock_requested(PaneSource::Composite);
+    controller.undock_requested(PaneSource::Frame);
     let events = record_events(&mut controller);
     controller.window_close();
     assert!(controller.pending_quit_copy().is_some());
     assert!(!controller.close_guard_secondary_pressed(|_| None));
     assert!(controller.pending_quit_copy().is_none());
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
     assert!(!events.lock().unwrap().iter().any(|event| matches!(
         event,
         ShellEvent::DetachedWindowCloseRequested | ShellEvent::WindowCloseRequested
@@ -1008,12 +1008,12 @@ fn failed_guarded_quit_save_keeps_the_detached_pane() {
     open_mantis64_tab(&mut controller, "detached_failed_quit_save", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undock_requested(PaneSource::Composite);
     let events = record_events(&mut controller);
     controller.window_close();
     let absent = common::tree("detached_failed_quit_save").join("absent/x.ffp");
     assert!(!controller.close_guard_secondary_pressed(|_| Some(absent.clone())));
-    assert!(!controller.undock_enabled(PaneSource::Composite));
+    assert!(!controller.undock_enabled(PaneSource::Frame));
     let events = events.lock().unwrap();
     assert!(!events.contains(&ShellEvent::DetachedWindowCloseRequested));
     assert!(!events.contains(&ShellEvent::WindowCloseRequested));
@@ -1040,7 +1040,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
 
     for width in [f32::NAN, 0.0, -1.0, f32::INFINITY] {
         controller.set_pane_geometry_for(
-            PaneSource::ZMap,
+            PaneSource::Composite,
             PaneRect {
                 x: 0.0,
                 y: 0.0,
@@ -1057,7 +1057,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
         width: 820.0,
         height: 600.0,
     };
-    controller.set_pane_geometry_for(PaneSource::ZMap, detached);
+    controller.set_pane_geometry_for(PaneSource::Composite, detached);
     let frame = controller.frame_draw().unwrap();
     let plane = controller.plane_draw().unwrap();
     assert!(frame.dst.2 <= left.width && frame.dst.3 <= left.height);
@@ -1066,7 +1066,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
 
 #[test]
 fn main_resize_keeps_each_detached_panes_last_geometry() {
-    for detached in [PaneSource::Composite, PaneSource::ZMap] {
+    for detached in [PaneSource::Frame, PaneSource::Composite] {
         let mut controller = controller_with_scratch(&format!("preserve_detached_{detached:?}"));
         open_mantis64_tab(
             &mut controller,
@@ -1086,8 +1086,8 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
             height: 400.0,
         };
         let (left, right) = match detached {
-            PaneSource::Composite => (narrow, roomy),
-            PaneSource::ZMap => (roomy, narrow),
+            PaneSource::Frame => (narrow, roomy),
+            PaneSource::Composite => (roomy, narrow),
         };
         controller.set_pane_geometry(left, right);
         controller.undock_requested(detached);
@@ -1106,15 +1106,15 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
             height: 200.0,
         };
         let (left, right) = match detached {
-            PaneSource::Composite => (replacement, resized_main),
-            PaneSource::ZMap => (resized_main, replacement),
+            PaneSource::Frame => (replacement, resized_main),
+            PaneSource::Composite => (resized_main, replacement),
         };
         controller.set_pane_geometry(left, right);
         assert_eq!(controller.detached_pane(), Some(detached));
 
         let draw = match detached {
-            PaneSource::Composite => controller.frame_draw().unwrap(),
-            PaneSource::ZMap => controller.plane_draw().unwrap(),
+            PaneSource::Frame => controller.frame_draw().unwrap(),
+            PaneSource::Composite => controller.plane_draw().unwrap(),
         };
         assert!(
             draw.dst.2 <= narrow.width,
@@ -1140,7 +1140,7 @@ fn detached_side_survives_resize_and_valid_mode_switches() {
         height: 250.0,
     };
     controller.set_pane_geometry(left, right);
-    controller.undock_requested(PaneSource::Composite);
+    controller.undock_requested(PaneSource::Frame);
     controller.set_pane_geometry(
         PaneRect {
             width: 900.0,
@@ -1149,36 +1149,36 @@ fn detached_side_survives_resize_and_valid_mode_switches() {
         },
         right,
     );
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
     assert!(controller.set_mode(ShellMode::Editor));
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
     assert!(controller.set_mode(ShellMode::Stacking));
-    assert_eq!(controller.detached_pane(), Some(PaneSource::Composite));
+    assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
 }
 
 #[test]
 fn side_geometry_arrives_before_open_in_either_order() {
     for (first, second) in [
-        (PaneSource::Composite, PaneSource::ZMap),
-        (PaneSource::ZMap, PaneSource::Composite),
+        (PaneSource::Frame, PaneSource::Composite),
+        (PaneSource::Composite, PaneSource::Frame),
     ] {
         let name = format!("geometry_order_{first:?}");
         let mut controller = controller_with_scratch(&name);
-        let composite = PaneRect {
+        let frame = PaneRect {
             x: 0.0,
             y: 0.0,
             width: 180.0,
             height: 320.0,
         };
-        let zmap = PaneRect {
+        let composite = PaneRect {
             x: 0.0,
             y: 0.0,
             width: 320.0,
             height: 180.0,
         };
         let rect = |side| match side {
+            PaneSource::Frame => frame,
             PaneSource::Composite => composite,
-            PaneSource::ZMap => zmap,
         };
         controller.set_pane_geometry_for(first, rect(first));
         assert!(controller.frame_draw().is_none());
@@ -1211,22 +1211,43 @@ fn detached_input_uses_its_own_local_coordinates() {
         },
     );
     let fitted = controller.zoom_readout();
-    controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 25.0, 25.0, Modifiers::NONE);
-    controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 25.0, 25.0, Modifiers::NONE);
-    controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 25.0, 25.0, Modifiers::NONE);
+    controller.wheel_for_pane(
+        PaneSource::Composite,
+        0.0,
+        60.0,
+        25.0,
+        25.0,
+        Modifiers::NONE,
+    );
+    controller.wheel_for_pane(
+        PaneSource::Composite,
+        0.0,
+        60.0,
+        25.0,
+        25.0,
+        Modifiers::NONE,
+    );
+    controller.wheel_for_pane(
+        PaneSource::Composite,
+        0.0,
+        60.0,
+        25.0,
+        25.0,
+        Modifiers::NONE,
+    );
     assert_ne!(controller.zoom_readout(), fitted);
     let before_pan = controller.plane_draw().unwrap();
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Middle,
         25.0,
         25.0,
         NO_MODS,
     );
-    controller.pointer_moved_for_pane(PaneSource::ZMap, -75.0, -75.0);
+    controller.pointer_moved_for_pane(PaneSource::Composite, -75.0, -75.0);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Middle,
         -75.0,
@@ -1248,7 +1269,7 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
     };
     controller.set_pane_geometry(pane, pane);
     for _ in 0..3 {
-        controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 40.0, 40.0, NO_MODS);
+        controller.wheel_for_pane(PaneSource::Composite, 0.0, 60.0, 40.0, 40.0, NO_MODS);
     }
     let before = controller.plane_draw().unwrap();
     controller.set_align_algorithm("");
@@ -1256,16 +1277,16 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
     assert!(controller.canvas_blocked());
 
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Middle,
         40.0,
         40.0,
         NO_MODS,
     );
-    controller.pointer_moved_for_pane(PaneSource::ZMap, 0.0, 0.0);
+    controller.pointer_moved_for_pane(PaneSource::Composite, 0.0, 0.0);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Middle,
         0.0,
@@ -1287,11 +1308,11 @@ fn detached_drag_ignores_another_windows_move_and_release() {
     };
     controller.set_pane_geometry(pane, pane);
     for _ in 0..3 {
-        controller.wheel_for_pane(PaneSource::ZMap, 0.0, 60.0, 40.0, 40.0, NO_MODS);
+        controller.wheel_for_pane(PaneSource::Composite, 0.0, 60.0, 40.0, 40.0, NO_MODS);
     }
     let before = controller.plane_draw().unwrap();
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Middle,
         40.0,
@@ -1300,10 +1321,10 @@ fn detached_drag_ignores_another_windows_move_and_release() {
     );
     controller.pointer_moved(0.0, 0.0);
     controller.pointer(PointerKind::Up, Button::Middle, 0.0, 0.0, NO_MODS);
-    controller.pointer_moved_for_pane(PaneSource::ZMap, 0.0, 0.0);
+    controller.pointer_moved_for_pane(PaneSource::Composite, 0.0, 0.0);
     assert_ne!(controller.plane_draw().unwrap().dst, before.dst);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Middle,
         0.0,
@@ -1323,7 +1344,7 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
     };
     controller.set_pane_geometry(overlap, overlap);
 
-    controller.undock_requested(PaneSource::Composite);
+    controller.undock_requested(PaneSource::Frame);
     let draw = controller.plane_draw().unwrap();
     let point = (
         draw.dst.0 + (20.5 - draw.src.0 as f32) * draw.dst.2 / draw.src.2 as f32,
@@ -1336,8 +1357,8 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
         [Op::BrushStroke { .. }]
     ));
 
-    controller.undocked_window_closed(PaneSource::Composite);
-    controller.undock_requested(PaneSource::ZMap);
+    controller.undocked_window_closed(PaneSource::Frame);
+    controller.undock_requested(PaneSource::Composite);
     let before = ops(&controller).len();
     controller.pointer(PointerKind::Down, Button::Left, point.0, point.1, NO_MODS);
     controller.pointer(PointerKind::Up, Button::Left, point.0, point.1, NO_MODS);
@@ -1347,7 +1368,7 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
 }
 
 #[test]
-fn editor_paints_from_an_unequal_detached_zmap_pane() {
+fn editor_paints_from_an_unequal_detached_composite_pane() {
     let (mut controller, _) = open_editor("unequal_detached_editor_paint");
     controller.set_pane_geometry(
         PaneRect {
@@ -1373,16 +1394,16 @@ fn editor_paints_from_an_unequal_detached_zmap_pane() {
     let start = local(20.0, 20.0);
     let end = local(30.0, 25.0);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Left,
         start.0,
         start.1,
         NO_MODS,
     );
-    controller.pointer_moved_for_pane(PaneSource::ZMap, end.0, end.1);
+    controller.pointer_moved_for_pane(PaneSource::Composite, end.0, end.1);
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Left,
         end.0,
@@ -1397,8 +1418,8 @@ fn editor_paints_from_an_unequal_detached_zmap_pane() {
 }
 
 #[test]
-fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
-    let (mut controller, _) = open_editor("unequal_zmap_pipette");
+fn unequal_composite_pipette_reads_the_exact_projected_source_index() {
+    let (mut controller, _) = open_editor("unequal_composite_pipette");
     let left = PaneRect {
         x: 0.0,
         y: 0.0,
@@ -1430,7 +1451,7 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
     );
     controller.toggle_pipette();
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Down,
         Button::Left,
         local.0,
@@ -1438,7 +1459,7 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
         NO_MODS,
     );
     controller.pointer_for_pane(
-        PaneSource::ZMap,
+        PaneSource::Composite,
         PointerKind::Up,
         Button::Left,
         local.0,
@@ -1449,8 +1470,8 @@ fn unequal_zmap_pipette_reads_the_exact_projected_source_index() {
 }
 
 #[test]
-fn editor_requires_a_real_unequal_zmap_hit_before_painting() {
-    let (mut controller, _) = open_editor("unequal_zmap_hit_test");
+fn editor_requires_a_real_unequal_composite_hit_before_painting() {
+    let (mut controller, _) = open_editor("unequal_composite_hit_test");
     let left = PaneRect {
         x: 0.0,
         y: 0.0,
@@ -4317,7 +4338,7 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
     assert_eq!(moved.extent, here.extent);
     assert_eq!(moved.ring_commands, here.ring_commands);
     assert_eq!(moved.core_commands, here.core_commands);
-    assert_ne!(moved.zmap_position, here.zmap_position);
+    assert_ne!(moved.composite_position, here.composite_position);
 }
 
 #[test]
@@ -4783,9 +4804,9 @@ fn assert_scene_point_matches(
     c.pointer(PointerKind::Move, Button::Left, point.0, point.1, NO_MODS);
     let cursor = c.brush_cursor_view().unwrap();
     let local = if other.x > home.x {
-        cursor.zmap_position
-    } else {
         cursor.composite_position
+    } else {
+        cursor.frame_position
     };
     let mirrored = (other.x + local.0, other.y + local.1);
     assert!(
@@ -4896,7 +4917,7 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
     let check_stage = |c: &mut AppController, right: PaneRect, stage: &str| {
         let start = at_pane(LEFT, 29.0, 30.0);
         c.pointer(PointerKind::Move, Button::Left, start.0, start.1, NO_MODS);
-        let mirrored = c.brush_cursor_view().unwrap().zmap_position;
+        let mirrored = c.brush_cursor_view().unwrap().composite_position;
         let mirror_dx = right.x + mirrored.0 - start.0;
         let mirror_dy = right.y + mirrored.1 - start.1;
         let left_path: Vec<(f32, f32)> = (0..4)
@@ -5007,8 +5028,8 @@ fn mirrored_cursor_shares_geometry() {
         after_size.extent, before.extent,
         "size changes the shared geometry"
     );
+    assert_eq!(after_size.frame_position, before.frame_position);
     assert_eq!(after_size.composite_position, before.composite_position);
-    assert_eq!(after_size.zmap_position, before.zmap_position);
 
     c.set_brush_softness_fraction(0.75);
     let after_soft = c.brush_cursor_view().unwrap();
@@ -5016,8 +5037,8 @@ fn mirrored_cursor_shares_geometry() {
         after_soft.core_commands, after_size.core_commands,
         "softness changes the core"
     );
+    assert_eq!(after_soft.frame_position, before.frame_position);
     assert_eq!(after_soft.composite_position, before.composite_position);
-    assert_eq!(after_soft.zmap_position, before.zmap_position);
 
     c.zoom_in();
     let after_zoom = c.brush_cursor_view().unwrap();
@@ -5032,10 +5053,7 @@ fn mirrored_cursor_shares_geometry() {
     assert_eq!(after_pointer.extent, after_zoom.extent);
     assert_eq!(after_pointer.ring_commands, after_zoom.ring_commands);
     assert_eq!(after_pointer.core_commands, after_zoom.core_commands);
-    assert_ne!(
-        after_pointer.composite_position,
-        after_zoom.composite_position
-    );
+    assert_ne!(after_pointer.frame_position, after_zoom.frame_position);
 }
 
 /// With the pipette armed, the left pane's hover and the right pane's hover
@@ -5064,8 +5082,8 @@ fn mirrored_cursor_marks_the_pipette_point() {
     );
 
     let right_point = (
-        RIGHT.x + left_hover.zmap_position.0,
-        RIGHT.y + left_hover.zmap_position.1,
+        RIGHT.x + left_hover.composite_position.0,
+        RIGHT.y + left_hover.composite_position.1,
     );
     c.pointer(
         PointerKind::Move,
