@@ -37,11 +37,12 @@ pub enum CanvasFeed {
     Keep,
     /// No tab is active, or the active tab has nothing sealed to show yet.
     Clear,
-    /// Open `composite`/`zmap` as `tab`'s own planes.
+    /// Open `composite`, and `zmap` when the row has a readable one, as
+    /// `tab`'s own planes.
     Load {
         tab: usize,
         composite: PathBuf,
-        zmap: PathBuf,
+        zmap: Option<PathBuf>,
     },
 }
 

@@ -2852,6 +2852,7 @@ fn a_first_fuse_writes_no_project_file() {
         CanvasFeed::Load {
             composite, zmap, ..
         } => {
+            let zmap = zmap.expect("a readable Z-Map feeds the canvas");
             for plane in [&composite, &zmap] {
                 assert!(plane.is_file());
                 assert!(
@@ -5819,6 +5820,46 @@ fn closing_the_window_during_a_save_all_quit_raises_no_second_question() {
         "the quit is already under way"
     );
     controller.finish_saves();
+}
+
+/// A saved row whose Z-Map blob fails to decode still gets its composite in
+/// the plane cache; no Z-Map file is left behind.
+#[test]
+fn checkpoint_planes_survive_an_unreadable_zmap() {
+    let mut controller = controller_with_frames("zmapless_planes", 2);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    let (project_path, id, head) = common::save_two_fuses(&mut controller);
+    let blob = Project::open(&project_path)
+        .unwrap()
+        .history()
+        .get(&id)
+        .unwrap()
+        .zmap_blob
+        .clone();
+    common::corrupt_blob(&project_path, &blob);
+    let scratch = common::tree("zmapless_planes_cache");
+
+    let (composite, zmap) = job::render_checkpoint_planes(&project_path, &scratch, &id)
+        .expect("the composite renders without its Z-Map");
+    assert!(composite.is_file());
+    assert_eq!(zmap, None, "no Z-Map is offered");
+    let cached = std::fs::read_dir(composite.parent().unwrap())
+        .unwrap()
+        .count();
+    assert_eq!(cached, 1, "no Z-Map file, whole or partial, is left");
+    let project = Project::open(&project_path).unwrap();
+    assert!(matches!(
+        job::cached_checkpoint_planes(&project, &scratch, &id).unwrap(),
+        job::CheckpointPlanes::Ready(_, None)
+    ));
+
+    let (_, head_zmap) =
+        job::render_checkpoint_planes(&project_path, &scratch, &head).expect("the head renders");
+    assert!(
+        head_zmap.is_some_and(|zmap| zmap.is_file()),
+        "the head keeps its Z-Map"
+    );
 }
 
 #[test]

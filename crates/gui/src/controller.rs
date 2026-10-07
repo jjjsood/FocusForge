@@ -542,14 +542,15 @@ enum RowPlanes {
     /// A saved row whose planes are not cached yet; the canvas keeps what
     /// it showed until they are.
     Pending,
-    Ready(PathBuf, PathBuf),
+    /// The composite, and the Z-Map unless it failed to read.
+    Ready(PathBuf, Option<PathBuf>),
     /// The right pane's refusal text, one entry per line.
     Refused(Vec<String>),
 }
 
 /// What the active tab can show in the right pane right now.
 enum TabPlanes {
-    Ready(PathBuf, PathBuf),
+    Ready(PathBuf, Option<PathBuf>),
     Pending,
     None,
 }
@@ -565,7 +566,7 @@ struct RenderSlot {
     outcome: Arc<Mutex<Option<RenderOutcome>>>,
 }
 
-type RenderOutcome = Result<(PathBuf, PathBuf), Vec<String>>;
+type RenderOutcome = Result<(PathBuf, Option<PathBuf>), Vec<String>>;
 
 /// The card-picture decodes in flight and where their workers park the
 /// results: tab id, the generation the decode was requested for, and the
@@ -1888,7 +1889,7 @@ impl AppController {
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
                 job::open_edit_session(
-                    &zmap,
+                    zmap.as_deref(),
                     &composite,
                     &frames,
                     registration,
@@ -2008,9 +2009,12 @@ impl AppController {
     }
 
     /// Whether the overlay can be drawn: the active tab's selected row
-    /// resolves to a fuse. The bottom bar greys the controls otherwise.
+    /// resolves to a fuse whose Z-Map did not fail to read. The bottom bar
+    /// greys the controls otherwise.
     pub fn overlay_available(&self) -> bool {
-        self.state.active().is_some_and(|tab| tab.fused().is_some())
+        self.state.active().is_some_and(|tab| {
+            tab.fused().is_some() && !matches!(tab.row_planes, Some(RowPlanes::Ready(_, None)))
+        })
     }
 
     /// Turns the `Composite` pane's rainbow overlay on or off.
@@ -2030,7 +2034,7 @@ impl AppController {
     /// table spans that fuse's sources; the ops are the strokes the image
     /// shows, the one being dragged included.
     pub fn overlay_draw(&self) -> Option<OverlayDraw> {
-        if !self.state.overlay.on {
+        if !self.state.overlay.on || !self.overlay_available() {
             return None;
         }
         let tab = self.state.active()?;
@@ -7131,12 +7135,12 @@ impl AppController {
 
     /// The active tab's current row's composite and Z-Map paths: a held
     /// row's own files, a saved row's pair in the plane cache. `None` with
-    /// no current row, while a saved row's cache is not fresh, or once it
-    /// refused.
+    /// no current row, while a saved row's cache is not fresh, once it
+    /// refused, or when the row has no readable Z-Map.
     pub fn materialize_active_tab_planes(&mut self) -> Option<(PathBuf, PathBuf)> {
         match self.active_tab_planes() {
-            TabPlanes::Ready(composite, zmap) => Some((composite, zmap)),
-            TabPlanes::Pending | TabPlanes::None => None,
+            TabPlanes::Ready(composite, Some(zmap)) => Some((composite, zmap)),
+            TabPlanes::Ready(_, None) | TabPlanes::Pending | TabPlanes::None => None,
         }
     }
 
@@ -7158,7 +7162,7 @@ impl AppController {
                 return TabPlanes::None;
             };
             if let Some(held) = fused_of(entry) {
-                return TabPlanes::Ready(held.composite.clone(), held.zmap.clone());
+                return TabPlanes::Ready(held.composite.clone(), Some(held.zmap.clone()));
             }
             // An op-bearing row shows the planes it was taken
             // from; the session's resident tiles carry its edits.
@@ -7172,7 +7176,7 @@ impl AppController {
                         .get(base)
                         .and_then(fused_of)
                         .map_or(TabPlanes::None, |held| {
-                            TabPlanes::Ready(held.composite.clone(), held.zmap.clone())
+                            TabPlanes::Ready(held.composite.clone(), Some(held.zmap.clone()))
                         });
                 }
                 Some(RowBase::Saved(id)) => key = id,

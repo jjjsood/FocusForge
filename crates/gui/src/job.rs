@@ -694,18 +694,18 @@ fn checkpoint_plane_paths(
 
 /// What a saved checkpoint needs before the canvas can show it.
 pub enum CheckpointPlanes {
-    /// Its composite and Z-Map, on disk.
-    Ready(PathBuf, PathBuf),
+    /// Its composite, on disk, and its Z-Map when one is cached.
+    Ready(PathBuf, Option<PathBuf>),
     /// Not cached yet: [`render_checkpoint_planes`] must run first, off the
     /// event-loop thread, since it decompresses planes and an op-bearing
     /// checkpoint re-hashes every source.
     NeedsRender,
 }
 
-/// A fused checkpoint's plane cache pair when both files are already newer
-/// than the `.ffp`; any other checkpoint, or a stale or missing pair,
-/// answers [`CheckpointPlanes::NeedsRender`]. Reads metadata only, never a
-/// plane.
+/// A fused checkpoint's cached planes when its composite is already newer
+/// than the `.ffp`; the Z-Map is carried only when it is as fresh. Any other
+/// checkpoint, or a stale or missing composite, answers
+/// [`CheckpointPlanes::NeedsRender`]. Reads metadata only, never a plane.
 pub fn cached_checkpoint_planes(
     project: &Project,
     scratch_root: &Path,
@@ -716,25 +716,26 @@ pub fn cached_checkpoint_planes(
     }
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project.path(), id);
     let ffp_modified = std::fs::metadata(project.path())?.modified()?;
-    if is_fresh(&composite, ffp_modified) && is_fresh(&zmap, ffp_modified) {
-        Ok(CheckpointPlanes::Ready(composite, zmap))
-    } else {
-        Ok(CheckpointPlanes::NeedsRender)
+    if !is_fresh(&composite, ffp_modified) {
+        return Ok(CheckpointPlanes::NeedsRender);
     }
+    let zmap = is_fresh(&zmap, ffp_modified).then_some(zmap);
+    Ok(CheckpointPlanes::Ready(composite, zmap))
 }
 
 /// Renders checkpoint `id` of the project at `project_path` into its plane
-/// cache pair, over a project opened on the calling thread. An op-bearing
+/// cache, over a project opened on the calling thread. An op-bearing
 /// checkpoint re-hashes its sources on every call and refuses on any
-/// missing or changed frame.
+/// missing or changed frame. A Z-Map that fails to materialize is logged and
+/// answered as `None`: the composite is the image, the map only analysis.
 pub fn render_checkpoint_planes(
     project_path: &Path,
     scratch_root: &Path,
     id: &str,
-) -> Result<(PathBuf, PathBuf), PlaneCacheError> {
+) -> Result<(PathBuf, Option<PathBuf>), PlaneCacheError> {
     let mut project = Project::open(project_path)?;
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project_path, id);
-    write_checkpoint_planes(&mut project, id, &composite, &zmap)?;
+    let zmap = write_checkpoint_planes(&mut project, id, &composite, zmap)?;
     Ok((composite, zmap))
 }
 
@@ -742,15 +743,26 @@ fn write_checkpoint_planes(
     project: &mut Project,
     id: &str,
     composite: &Path,
-    zmap: &Path,
-) -> Result<(), PlaneCacheError> {
+    zmap: PathBuf,
+) -> Result<Option<PathBuf>, PlaneCacheError> {
     if let Some(dir) = composite.parent() {
         std::fs::create_dir_all(dir)?;
     }
     project::render_checkpoint(project, id, composite)?;
     let checkpoint = project.history().get(id)?.clone();
-    project::materialize_zmap(project, &checkpoint, zmap)?;
-    Ok(())
+    match project::materialize_zmap(project, &checkpoint, &zmap) {
+        Ok(()) => Ok(Some(zmap)),
+        Err(err) => {
+            tracing::warn!(
+                project = %project.path().display(),
+                checkpoint = id,
+                error = %err,
+                "the Z-Map could not be read; the overlay is unavailable for this checkpoint"
+            );
+            let _ = std::fs::remove_file(&zmap);
+            Ok(None)
+        }
+    }
 }
 
 /// One `"missing: <path>"` / `"changed: <path> (found at <path>)"` detail
@@ -790,8 +802,8 @@ pub fn render_refusal_lines(err: &PlaneCacheError) -> Vec<String> {
 /// planes, or the right pane's refusal lines. A panicked worker refuses with
 /// the generic line rather than leaving its row pending.
 pub fn render_outcome(
-    result: std::thread::Result<Result<(PathBuf, PathBuf), PlaneCacheError>>,
-) -> Result<(PathBuf, PathBuf), Vec<String>> {
+    result: std::thread::Result<Result<(PathBuf, Option<PathBuf>), PlaneCacheError>>,
+) -> Result<(PathBuf, Option<PathBuf>), Vec<String>> {
     match result {
         Ok(rendered) => rendered.map_err(|err| render_refusal_lines(&err)),
         Err(_) => {
@@ -1038,8 +1050,11 @@ pub struct EditState {
     pending: Vec<Op>,
     /// The ops undone from `pending`, the most recent last.
     undone: Vec<Op>,
-    /// The stored Z-Map of the row being edited, read-only.
-    zmap: ZMapReader,
+    /// The stored Z-Map of the row being edited, read-only; `None` when it
+    /// could not be read.
+    zmap: Option<ZMapReader>,
+    /// The map's shape: the composite's extent over the frame set.
+    info: ZMapInfo,
     pub sources: Arc<dyn FrameReader>,
     pub registration: Registration,
     /// The composite the edits are blended over.
@@ -1186,13 +1201,14 @@ fn blend_region(
 impl EditState {
     /// The stored Z-Map's shape.
     pub fn info(&self) -> ZMapInfo {
-        self.zmap.info()
+        self.info
     }
 
-    /// The stored Z-Map's index at pixel (`x`, `y`); `None` outside the map or
-    /// when the read fails.
+    /// The stored Z-Map's index at pixel (`x`, `y`); `None` outside the map,
+    /// without a readable map or when the read fails.
     pub fn stored_source(&self, x: u32, y: u32) -> Option<u16> {
-        let info = self.info();
+        let zmap = self.zmap.as_ref()?;
+        let info = self.info;
         if x >= info.width() || y >= info.height() {
             return None;
         }
@@ -1203,7 +1219,7 @@ impl EditState {
             width: 1,
             height: 1,
         };
-        match self.zmap.read_tile_into(pixel, &mut index) {
+        match zmap.read_tile_into(pixel, &mut index) {
             Ok(()) => Some(index[0]),
             Err(error) => {
                 tracing::warn!(%error, x, y, "stored Z-Map read failed");
@@ -1441,7 +1457,7 @@ impl EditState {
 // The inputs are independent; none of them groups naturally with another.
 #[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
-    zmap: &Path,
+    zmap: Option<&Path>,
     composite: &Path,
     frames: &[PathBuf],
     registration: Registration,
@@ -1450,20 +1466,36 @@ pub fn open_edit_session(
     base_ops: Vec<Op>,
     chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
-    let reader = ZMapReader::open(zmap)?;
-    let info = reader.info();
-    // Each plane is mapped on its first read; the mapping outlives the file,
-    // which a save removes together with the row's other held files.
     let pixel = Rect {
         x: 0,
         y: 0,
         width: 1,
         height: 1,
     };
-    reader.read_tile_into(pixel, &mut [0u16; 1])?;
     let base = Arc::new(TiffStack::open_files(&[composite.to_path_buf()])?);
-    let mut first = vec![0u16; base.header(0).samples_per_pixel as usize];
+    let header = base.header(0);
+    let mut first = vec![0u16; header.samples_per_pixel as usize];
     base.read_tile_into(0, pixel, &mut first)?;
+    let info = ZMapInfo::new(
+        header.width,
+        header.height,
+        u32::try_from(frames.len()).unwrap_or(u32::MAX),
+    )?;
+    // Each plane is mapped on its first read; the mapping outlives the file,
+    // which a save removes together with the row's other held files. A map
+    // that fails to open or read costs the pipette its stored reading only.
+    let reader = zmap.and_then(|path| {
+        ZMapReader::open(path)
+            .and_then(|reader| {
+                reader
+                    .read_tile_into(pixel, &mut [0u16; 1])
+                    .map(|()| reader)
+            })
+            .map_err(|error| {
+                tracing::warn!(%error, path = %path.display(), "the Z-Map could not be opened");
+            })
+            .ok()
+    });
     let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
@@ -1476,6 +1508,7 @@ pub fn open_edit_session(
         pending: Vec::new(),
         undone: Vec::new(),
         zmap: reader,
+        info,
         sources,
         registration,
         base,

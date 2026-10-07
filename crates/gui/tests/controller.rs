@@ -4473,6 +4473,60 @@ fn pipette_reads_and_appends_nothing() {
     );
 }
 
+/// A saved fuse row whose Z-Map blob fails to decode still renders, opens
+/// the editor and takes strokes; only the overlay and the pipette's reading
+/// off every stroke are lost.
+#[test]
+fn zmap_unreadable_leaves_the_image_working() {
+    use focusforge_gui::canvas::CanvasFeed;
+
+    let mut c = controller_with_scratch("zmap_unreadable");
+    open_fused_tab(&mut c, "zmap_unreadable_frames", 3);
+    let (path, older, _head) = common::save_two_fuses(&mut c);
+    common::corrupt_blob(&path, &saved_zmap_blob(&path, &older));
+
+    let mut c = reopen(&path, "zmap_unreadable_reopened");
+    c.set_pane_geometry(LEFT, RIGHT);
+    c.set_overlay_on(true);
+    let row = row_index(&c, &older);
+    c.select_checkpoint_row(row);
+    assert!(matches!(c.canvas_feed(None), CanvasFeed::Clear));
+    assert!(c.overlay_available(), "the row's planes are still pending");
+    common::settle_render(&mut c);
+    match c.canvas_feed(None) {
+        CanvasFeed::Load {
+            composite, zmap, ..
+        } => {
+            assert!(composite.is_file(), "the composite loads");
+            assert_eq!(zmap, None, "without a Z-Map");
+        }
+        other => panic!("the settled row must load, got {other:?}"),
+    }
+    assert!(!c.overlay_available(), "no Z-Map, no overlay");
+    assert_eq!(c.overlay_draw(), None);
+
+    common::enter_editor(&mut c);
+    c.select_frame(1);
+    common::paint(
+        &mut c,
+        Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 20, y: 20 }],
+            radius: 4.0,
+            softness: 0.0,
+        },
+    );
+    assert_eq!(ops(&c).len(), 1, "a stroke appends");
+    let (sx, sy) = at(50.0, 50.0);
+    c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+    c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+    assert_eq!(
+        c.brush_source(),
+        Some(1),
+        "a pick off every stroke reads nothing"
+    );
+}
+
 #[test]
 fn pipette_reads_the_overlay() {
     let (mut c, _) = open_editor("pipette_overlay");
@@ -6092,7 +6146,7 @@ fn background_region_render_matches_the_synchronous_one() {
     // The same final ops composed synchronously: opened as a chain over the
     // same composite and frames.
     let mut fresh = job::open_edit_session(
-        &zmap,
+        Some(&zmap),
         &composite,
         &(0..3)
             .map(|i| root.join(format!("{i:02}.tif")))
@@ -7213,12 +7267,12 @@ fn a_failed_session_open_drops_back_to_stacking() {
     let name = "session_open_fails";
     let mut controller = controller_with_scratch(name);
     fused_twice_without_session(&mut controller, name);
-    let (_, zmap) = controller
+    let (composite, _) = controller
         .materialize_active_tab_planes()
         .expect("a held fused row has planes");
     fs::OpenOptions::new()
         .write(true)
-        .open(&zmap)
+        .open(&composite)
         .unwrap()
         .set_len(0)
         .unwrap();
@@ -7869,7 +7923,7 @@ fn a_session_renders_after_its_composite_file_is_removed() {
     fs::copy(&zmap, &zmap_copy).unwrap();
 
     let mut session = job::open_edit_session(
-        &zmap_copy,
+        Some(&zmap_copy),
         &composite_copy,
         &(0..3)
             .map(|i| root.join(format!("{i:02}.tif")))

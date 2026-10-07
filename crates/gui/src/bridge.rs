@@ -156,15 +156,13 @@ impl Canvas {
         }
     }
 
-    /// Opens `composite`/`zmap` as `tab`'s own planes, logging failures rather
-    /// than panicking: a plane the pipeline itself just wrote
-    /// failing to reopen is an environment problem (a full disk, a
-    /// permissions change), not a bug worth crashing the window over. `tab`
-    /// is recorded even when the open fails, so an unreadable plane file is
-    /// not retried on every gesture. Reuses the renderer's own frame half
-    /// rather than replacing it, since it may already hold the tab's
-    /// selected frame.
-    fn load(&mut self, tab: usize, composite: &Path, zmap: &Path) {
+    /// Opens `composite`, and `zmap` when present, as `tab`'s own planes,
+    /// logging failures rather than panicking: a plane the pipeline just
+    /// wrote failing to reopen is an environment problem, not a bug worth
+    /// crashing the window over. `tab` is recorded even when the open
+    /// fails, so an unreadable plane file is not retried on every gesture.
+    /// Reuses the renderer's own frame half, which may hold the tab's frame.
+    fn load(&mut self, tab: usize, composite: &Path, zmap: Option<&Path>) {
         self.tab = Some(tab);
         let renderer = self.renderer_mut();
         if let Err(err) = renderer.set_planes(composite, zmap) {
@@ -627,7 +625,7 @@ pub fn repaint(
             tab,
             composite,
             zmap,
-        } => canvas.borrow_mut().load(tab, &composite, &zmap),
+        } => canvas.borrow_mut().load(tab, &composite, zmap.as_deref()),
     }
 
     let (

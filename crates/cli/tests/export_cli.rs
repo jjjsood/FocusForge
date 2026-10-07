@@ -823,7 +823,7 @@ fn export_frame_out_of_range_is_refused_and_writes_nothing() {
 }
 
 #[test]
-fn export_zmap_of_a_checkpoint_matches_history_materialize() {
+fn export_zmap_of_a_checkpoint_matches_the_core_map() {
     let branched = build_branched("export_cli_zmap_checkpoint");
     let dir = common::tmp_dir("export_cli_zmap_checkpoint_out");
     let out = dir.join("branch-a-zmap.tif");
@@ -848,7 +848,7 @@ fn export_zmap_of_a_checkpoint_matches_history_materialize() {
     assert_eq!(
         std::fs::read(&out).unwrap(),
         std::fs::read(&expected).unwrap(),
-        "export --zmap must equal history materialize's own map byte for byte"
+        "export --zmap must equal core's own map byte for byte"
     );
 
     let json_out = dir.join("branch-a-zmap.json.tif");
@@ -870,7 +870,7 @@ fn export_zmap_of_a_checkpoint_matches_history_materialize() {
 }
 
 #[test]
-fn materialize_uses_the_checkpoints_own_geometry() {
+fn exported_zmap_uses_the_checkpoints_own_geometry() {
     let branched = build_branched("export_cli_own_geometry");
     let dir = common::tmp_dir("export_cli_own_geometry_out");
     let cwd = branched.project_path.parent().unwrap();
@@ -882,23 +882,11 @@ fn materialize_uses_the_checkpoints_own_geometry() {
         ("branch_b", &branched.branch_b),
     ] {
         let exported = dir.join(format!("{label}-export-zmap.tif"));
-        let materialized = dir.join(format!("{label}-materialize.tif"));
         let image = dir.join(format!("{label}.tif"));
         for (args, out) in [
             (
                 vec!["export", project_arg, "--checkpoint", id, "--zmap"],
                 &exported,
-            ),
-            (
-                vec![
-                    "history",
-                    "materialize",
-                    project_arg,
-                    "--checkpoint",
-                    id,
-                    "-o",
-                ],
-                &materialized,
             ),
             (
                 vec!["export", project_arg, "--checkpoint", id, "-o"],
@@ -915,13 +903,39 @@ fn materialize_uses_the_checkpoints_own_geometry() {
             );
         }
         let extent = branched_extent(&branched, id);
-        for map_path in [&exported, &materialized] {
-            let map = ZMapReader::open(map_path).unwrap();
-            assert_eq!(map.dimensions(), extent, "{label}: {map_path:?}");
-            assert_eq!(map.frame_count(), BFRAMES as u32, "{label}: {map_path:?}");
-        }
+        let map = ZMapReader::open(&exported).unwrap();
+        assert_eq!(map.dimensions(), extent, "{label}: map");
+        assert_eq!(map.frame_count(), BFRAMES as u32, "{label}: map");
         let stack = TiffStack::open_files(std::slice::from_ref(&image)).unwrap();
         assert_eq!(stack.dimensions(), extent, "{label}: image");
+    }
+}
+
+#[test]
+fn output_naming_the_project_is_refused() {
+    let branched = build_branched("export_cli_output_names_project");
+    let cwd = branched.project_path.parent().unwrap();
+    let project_arg = branched.project_path.to_str().unwrap();
+    let before = std::fs::read(&branched.project_path).unwrap();
+    for flags in [
+        vec!["-o", project_arg, "--format", "tiff"],
+        vec!["--zmap", project_arg],
+        vec!["--frame", "0", "--frame-output", project_arg],
+    ] {
+        let mut args = vec!["export", project_arg];
+        args.extend(flags.iter().copied());
+        let result = run_cli_in(cwd, &args);
+        assert!(!result.success, "{args:?} must be refused");
+        assert!(
+            result.stderr.contains("also the project file"),
+            "{args:?}: stderr: {}",
+            result.stderr
+        );
+        assert_eq!(
+            std::fs::read(&branched.project_path).unwrap(),
+            before,
+            "{args:?} must leave the project unchanged"
+        );
     }
 }
 

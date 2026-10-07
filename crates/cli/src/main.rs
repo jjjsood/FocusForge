@@ -297,8 +297,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List, materialize, delete or compact a project's checkpoints. Every
-    /// history operation is reachable through this command, headless.
+    /// List, delete or compact a project's checkpoints. Every history
+    /// operation is reachable through this command, headless.
     History {
         /// Accept a project whose recorded source frames' content changed
         /// since it was written, printing a warning instead of refusing.

@@ -2,7 +2,7 @@
 
 //! A real edit history over `fixtures/mantis-512`, driven only through the
 //! shipped binary: a laplacian stack, three chained checkpoints, one branch,
-//! one delete, then every visible checkpoint materialized in a fresh process.
+//! one delete, then every visible checkpoint's Z-Map exported in a fresh process.
 //! Each op checkpoint's map must equal the root's, compared by
 //! `tools/tiff-diff.py`, which shares no code with the writer under test, and
 //! its export must differ from the root's.
@@ -205,19 +205,18 @@ fn real_history_round_trips() {
 
     // Every command above is its own process; each map is read back now.
     for name in ["root", "c1", "c3", "b"] {
-        let materialized = after.join(format!("{name}.tif"));
+        let exported = after.join(format!("{name}.tif"));
         run_ok(
             &cwd,
             &[
-                "history",
-                "materialize",
+                "export",
                 arg(&project),
                 "--checkpoint",
                 &ids[name],
-                "-o",
-                arg(&materialized),
+                "--zmap",
+                arg(&exported),
             ],
         );
-        assert_identical(&materialized, &golden);
+        assert_identical(&exported, &golden);
     }
 }

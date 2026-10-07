@@ -171,8 +171,8 @@ fn list_prints_one_record_per_checkpoint() {
 }
 
 #[test]
-fn materialize_matches_core_replay() {
-    let (dir, project) = fresh_project("materialize_matches_core_replay");
+fn exported_zmap_matches_core_replay() {
+    let (dir, project) = fresh_project("exported_zmap_matches_core_replay");
     let root = root_id(&project);
 
     let before_root_zmap = dir.join("root-before.tif");
@@ -230,19 +230,18 @@ fn materialize_matches_core_replay() {
     );
     assert!(output.success, "stderr: {}", output.stderr);
 
-    // Materialize the non-head, op-bearing checkpoint through the CLI, and
+    // Export the non-head, op-bearing checkpoint's map through the CLI, and
     // compare against `core`'s own `materialize_zmap` of the same
     // checkpoint.
-    let cli_out = dir.join("materialize-child-a.tif");
+    let cli_out = dir.join("export-child-a.tif");
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &child_a_id,
-            "-o",
+            "--zmap",
             cli_out.to_str().unwrap(),
         ],
     );
@@ -259,16 +258,15 @@ fn materialize_matches_core_replay() {
     );
 
     // The root's own map never moved.
-    let root_out = dir.join("materialize-root.tif");
+    let root_out = dir.join("export-root.tif");
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &root,
-            "-o",
+            "--zmap",
             root_out.to_str().unwrap(),
         ],
     );
@@ -412,17 +410,15 @@ fn delete_hides_one_checkpoint_like_core() {
     let before_map = dir.join("tip-before.tif");
     let before_export = dir.join("tip-before-export.tif");
     let project_arg = project.to_str().unwrap();
-    for args in [
-        vec!["history", "materialize", project_arg],
-        vec!["export", project_arg],
-    ] {
-        let path = if args[0] == "export" {
-            &before_export
-        } else {
-            &before_map
-        };
-        let mut args = args;
-        args.extend(["--checkpoint", &tip, "-o", path.to_str().unwrap()]);
+    for (flag, path) in [("--zmap", &before_map), ("-o", &before_export)] {
+        let args = [
+            "export",
+            project_arg,
+            "--checkpoint",
+            &tip,
+            flag,
+            path.to_str().unwrap(),
+        ];
         let output = run(&dir, &args);
         assert!(output.success, "{args:?} stderr: {}", output.stderr);
     }
@@ -468,12 +464,11 @@ fn delete_hides_one_checkpoint_like_core() {
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &tip,
-            "-o",
+            "--zmap",
             after_map.to_str().unwrap(),
         ],
     );
@@ -508,12 +503,15 @@ fn delete_hides_one_checkpoint_like_core() {
     );
     let before = std::fs::read(&project).unwrap();
     for reference in [middle.as_str(), prefix] {
-        for args in [
-            vec!["history", "materialize", project.to_str().unwrap()],
-            vec!["export", project.to_str().unwrap()],
-        ] {
-            let mut args = args;
-            args.extend(["--checkpoint", reference, "-o", nowhere.to_str().unwrap()]);
+        for flag in ["--zmap", "-o"] {
+            let args = [
+                "export",
+                project.to_str().unwrap(),
+                "--checkpoint",
+                reference,
+                flag,
+                nowhere.to_str().unwrap(),
+            ];
             let output = run(&dir, &args);
             assert!(!output.success, "{args:?}");
             assert!(
@@ -636,22 +634,20 @@ fn unknown_checkpoint_id_is_refused() {
 
     // Unknown id.
     assert_refused(&[
-        "history",
-        "materialize",
+        "export",
         project.to_str().unwrap(),
         "--checkpoint",
         "not-a-real-id",
-        "-o",
+        "--zmap",
         dir.join("nope.tif").to_str().unwrap(),
     ]);
     // Ambiguous prefix.
     assert_refused(&[
-        "history",
-        "materialize",
+        "export",
         project.to_str().unwrap(),
         "--checkpoint",
         "",
-        "-o",
+        "--zmap",
         dir.join("nope.tif").to_str().unwrap(),
     ]);
     assert_refused(&[
@@ -674,12 +670,11 @@ fn unknown_checkpoint_id_is_refused() {
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &root[..8],
-            "-o",
+            "--zmap",
             dir.join("root.tif").to_str().unwrap(),
         ],
     );
@@ -701,12 +696,11 @@ fn records_on_stdout_progress_on_stderr() {
 
     assert_one_document(&["history", "list", project.to_str().unwrap(), "--json"]);
     assert_one_document(&[
-        "history",
-        "materialize",
+        "export",
         project.to_str().unwrap(),
         "--checkpoint",
         &root,
-        "-o",
+        "--zmap",
         dir.join("root.tif").to_str().unwrap(),
         "--json",
     ]);
@@ -729,12 +723,11 @@ fn records_on_stdout_progress_on_stderr() {
     let output = run(
         &dir,
         &[
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             "not-a-real-id",
-            "-o",
+            "--zmap",
             dir.join("nope.tif").to_str().unwrap(),
             "--json",
         ],
@@ -786,12 +779,11 @@ fn output_does_not_reveal_storage_kind() {
     for args in [
         vec!["history", "list", project.to_str().unwrap(), "--json"],
         vec![
-            "history",
-            "materialize",
+            "export",
             project.to_str().unwrap(),
             "--checkpoint",
             &child_id,
-            "-o",
+            "--zmap",
             dir.join("child.tif").to_str().unwrap(),
             "--json",
         ],
@@ -978,7 +970,7 @@ fn help_lists_every_command() {
 
     let output = run(&dir, &["history", "--help"]);
     assert!(output.success);
-    for name in ["list", "materialize", "delete", "compact"] {
+    for name in ["list", "delete", "compact"] {
         assert!(
             output.stdout.contains(name),
             "history --help missing {name}: {}",
@@ -986,9 +978,8 @@ fn help_lists_every_command() {
         );
     }
 
-    let subcommand_flags: [(&str, &[&str]); 4] = [
+    let subcommand_flags: [(&str, &[&str]); 3] = [
         ("list", &["--json"]),
-        ("materialize", &["--checkpoint", "--output", "--json"]),
         ("delete", &["--checkpoint", "--json"]),
         ("compact", &["--json"]),
     ];
@@ -1003,6 +994,33 @@ fn help_lists_every_command() {
             );
         }
     }
+}
+
+#[test]
+fn history_materialize_is_gone() {
+    let (dir, project) = fresh_project("history_materialize_is_gone");
+    let out = dir.join("zmap.tif");
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "materialize",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            "none",
+            "--output",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.success);
+    assert!(
+        output.stderr.contains("unrecognized subcommand"),
+        "stderr: {}",
+        output.stderr
+    );
+    assert!(!out.exists());
+    let help = run(&dir, &["history", "--help"]);
+    assert!(!help.stdout.contains("materialize"), "{}", help.stdout);
 }
 
 #[test]
@@ -1040,28 +1058,6 @@ fn history_apply_is_gone() {
         "history --help still lists apply: {}",
         help.stdout
     );
-}
-
-#[test]
-fn output_naming_the_project_is_refused() {
-    let (dir, project) = fresh_project("output_naming_the_project_is_refused");
-    let root = root_id(&project);
-    let before = std::fs::read(&project).unwrap();
-
-    let output = run(
-        &dir,
-        &[
-            "history",
-            "materialize",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &root,
-            "-o",
-            project.to_str().unwrap(),
-        ],
-    );
-    assert!(!output.success);
-    assert_eq!(std::fs::read(&project).unwrap(), before);
 }
 
 /// One small project sealed directly under `dir`, its three source frames

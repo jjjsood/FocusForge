@@ -17,7 +17,7 @@ use focusforge_core::TiffError;
 use focusforge_core::io::{FrameError, TiffStack};
 use focusforge_core::retouch::overlay_colors;
 use focusforge_core::tile::{HostBudget, Rect};
-use focusforge_core::zmap::{ZMapError, ZMapReader};
+use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
 use slint::wgpu_29::wgpu;
 
@@ -302,7 +302,7 @@ mod tests {
             .set_frame(&frame, None, crate::job::host_budget())
             .expect("fixture frame opens");
         planes_and_frame
-            .set_planes(&composite, &zmap)
+            .set_planes(&composite, Some(&zmap))
             .expect("fixture planes open");
         assert!(planes_and_frame.redraw_frame(&draw).is_none());
         assert!(planes_and_frame.redraw_planes(&draw, None, None).is_none());
@@ -444,7 +444,7 @@ mod tests {
         assert!(renderer.frame_pane.image.is_none());
 
         renderer
-            .set_planes(&composite, &zmap)
+            .set_planes(&composite, Some(&zmap))
             .expect("fixture planes open");
         assert!(
             renderer
@@ -453,7 +453,7 @@ mod tests {
         );
         assert!(renderer.composite_pane.display_texture.is_some());
         renderer
-            .set_planes(&composite, &zmap)
+            .set_planes(&composite, Some(&zmap))
             .expect("fixture planes re-open");
         assert!(renderer.composite_pane.display_texture.is_none());
         assert!(renderer.composite_pane.image.is_none());
@@ -569,7 +569,7 @@ mod tests {
     }
 }
 
-/// What can go wrong opening the two files a [`CanvasRenderer`] holds open
+/// What can go wrong opening the composite a [`CanvasRenderer`] holds open
 /// for the life of the loaded project.
 #[derive(Debug, thiserror::Error)]
 pub enum CanvasRendererError {
@@ -578,12 +578,6 @@ pub enum CanvasRendererError {
         path: PathBuf,
         #[source]
         source: TiffError,
-    },
-    #[error("failed to open Z-Map {}: {source}", path.display())]
-    ZMap {
-        path: PathBuf,
-        #[source]
-        source: ZMapError,
     },
 }
 
@@ -714,26 +708,29 @@ impl CanvasRenderer {
         Some((self.device.as_ref()?.clone(), self.queue.as_ref()?.clone()))
     }
 
-    /// Opens `composite`/`zmap` as this renderer's planes, replacing
-    /// whichever pair was open before, naming whichever file fails by name
-    /// rather than a generic I/O error. Atomic: a failed open leaves the
-    /// previous pair, if any, untouched.
+    /// Opens `composite`, and `zmap` when given, as this renderer's planes,
+    /// replacing whichever were open before. A composite that fails to open
+    /// is an error naming it, leaving the previous planes untouched. A Z-Map
+    /// that fails to open is logged and left closed: the composite draws
+    /// without it, and only the overlay is lost.
     pub fn set_planes(
         &mut self,
         composite_path: &Path,
-        zmap_path: &Path,
+        zmap_path: Option<&Path>,
     ) -> Result<(), CanvasRendererError> {
         let composite = TiffStack::open_files(std::slice::from_ref(&composite_path.to_path_buf()))
             .map_err(|source| CanvasRendererError::Composite {
                 path: composite_path.to_path_buf(),
                 source,
             })?;
-        let zmap = ZMapReader::open(zmap_path).map_err(|source| CanvasRendererError::ZMap {
-            path: zmap_path.to_path_buf(),
-            source,
-        })?;
+        self.zmap = zmap_path.and_then(|path| match ZMapReader::open(path) {
+            Ok(zmap) => Some(Arc::new(zmap)),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "the Z-Map could not be opened");
+                None
+            }
+        });
         self.composite = Some(Arc::new(composite));
-        self.zmap = Some(Arc::new(zmap));
         self.reset_planes();
         Ok(())
     }
@@ -779,8 +776,8 @@ impl CanvasRenderer {
     /// that pane already covers `draw.src`/`draw.step` under the same edit
     /// generation and overlay (whatever `dst` and `pixelated` now are; work
     /// still in flight for it is retired), with no planes or device, or an
-    /// out-of-bounds `draw.src`. A composite drawn under an edit session or
-    /// a three-sample overlay also reads the sealed Z-Map indices.
+    /// out-of-bounds `draw.src`. Only a three-sample overlay over an open
+    /// Z-Map also reads its indices; the composite draws without it.
     pub fn request_planes(
         &mut self,
         draw: &PaneDraw,
@@ -812,12 +809,12 @@ impl CanvasRenderer {
     ) -> Option<PaneJob> {
         self.device.as_ref()?;
         let composite = self.composite.as_ref()?.clone();
-        let zmap = self.zmap.as_ref()?.clone();
         let header = composite.header(0);
         let size = (header.width, header.height);
         let overlay = overlay.filter(|_| header.samples_per_pixel == 3);
-        let indices =
-            (generation.is_some() || overlay.is_some()).then_some(zmap as Arc<dyn PaneReader>);
+        let indices = overlay
+            .and(self.zmap.clone())
+            .map(|zmap| zmap as Arc<dyn PaneReader>);
         let state = EditState {
             generation,
             overlay: overlay.cloned(),
@@ -964,7 +961,7 @@ impl CanvasRenderer {
         let step = job.draw.step;
         let edited = edited.filter(|_| job.state.generation.is_some());
         match job.pane {
-            Pane::Composite if !sealed_indices.is_empty() => {
+            Pane::Composite => {
                 let merged = edited.map(|view| {
                     let mut merged = samples.to_vec();
                     crate::canvas::overlay_edited(
@@ -978,7 +975,7 @@ impl CanvasRenderer {
                 });
                 let composite = merged.as_deref().unwrap_or(samples);
                 match (&job.state.overlay, self.zmap.as_deref()) {
-                    (Some(overlay), Some(zmap)) => {
+                    (Some(overlay), Some(zmap)) if !sealed_indices.is_empty() => {
                         let mut colors = vec![[0u8; 3]; sealed_indices.len()];
                         overlay_colors(
                             &overlay.ops,

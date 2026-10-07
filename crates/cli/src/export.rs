@@ -40,6 +40,8 @@ use focusforge_core::tile::HostBudget;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
+use crate::retouch::would_replace;
+
 /// Rows per streamed band, `export_frame`'s own band-wise write.
 const FRAME_BAND_ROWS: u32 = 256;
 
@@ -295,6 +297,8 @@ pub struct ExportReport {
 /// here so the error names the missing flag instead of clap's generic exit
 /// 2. `--frame-output` without `--frame` is refused the same way; `--frame`
 /// without `--frame-output` is already a clap usage error (`requires`).
+/// An output that names the project file itself is refused before anything
+/// is written.
 /// `checkpoint` is an id or unique id prefix, resolved against the
 /// project's own history; `None` renders the head -- `--frame-output` reads
 /// the same resolved checkpoint's own fuse state, not the project's head.
@@ -319,6 +323,20 @@ pub fn run(
     }
     if frame_output.is_some() && frame.is_none() {
         return fail("--frame-output requires --frame <index>");
+    }
+    for (flag, path) in [
+        ("-o", output),
+        ("--zmap", zmap),
+        ("--frame-output", frame_output),
+    ] {
+        if let Some(path) = path
+            && would_replace(path, project_path)
+        {
+            return fail(format!(
+                "{flag} {} is also the project file: refusing to overwrite it",
+                path.display()
+            ));
+        }
     }
 
     let export_options = match output {

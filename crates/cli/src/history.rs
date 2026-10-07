@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `focusforge-cli history`: every checkpoint operation reachable headless --
-//! list, materialize one to a file, delete a checkpoint, and compact a
-//! project to its live checkpoints.
+//! list, delete a checkpoint, and compact a project to its live checkpoints.
 //!
 //! Each subcommand is a thin adapter over one `focusforge_core::project`
 //! entry point: argument parsing, a report and an exit code, no storage logic
@@ -10,20 +9,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
 
 use clap::{Args, Subcommand};
 use focusforge_core::project::{self, Checkpoint, History, Project, ProjectError};
 use serde::Serialize;
 
-use crate::retouch::would_replace;
-
 #[derive(Subcommand)]
 pub enum HistoryCommand {
     /// List every visible checkpoint, newest first.
     List(ListArgs),
-    /// Write one checkpoint's Z-Map to a file.
-    Materialize(MaterializeArgs),
     /// Delete one checkpoint: it is hidden, and dropped from the project once no
     /// visible checkpoint is built on it; its space is reclaimed by
     /// `history compact`. Refuses the last visible checkpoint.
@@ -38,21 +32,6 @@ pub struct ListArgs {
     /// The project to list.
     project: PathBuf,
     /// Emit the JSON document instead of human-readable text.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
-pub struct MaterializeArgs {
-    /// The project to read.
-    project: PathBuf,
-    /// The checkpoint to materialize -- any unique prefix of its id.
-    #[arg(long)]
-    checkpoint: String,
-    /// Where to write the Z-Map.
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
-    output: PathBuf,
-    /// Emit the JSON report instead of human-readable text.
     #[arg(long)]
     json: bool,
 }
@@ -81,13 +60,6 @@ pub struct CompactArgs {
 pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
     match command {
         HistoryCommand::List(args) => list(&args.project, args.json, accept_changed_sources),
-        HistoryCommand::Materialize(args) => materialize(
-            &args.project,
-            &args.checkpoint,
-            &args.output,
-            args.json,
-            accept_changed_sources,
-        ),
         HistoryCommand::Delete(args) => delete(
             &args.project,
             &args.checkpoint,
@@ -213,17 +185,6 @@ pub(crate) fn resolve_checkpoint<'a>(
     }
 }
 
-/// Refuses `output` when it resolves to `project_path` itself.
-fn refuse_if_names_project(output: &Path, project_path: &Path) -> Result<(), ExitCode> {
-    if would_replace(output, project_path) {
-        return Err(fail(format!(
-            "-o {} is also the project file: refusing to overwrite it",
-            output.display()
-        )));
-    }
-    Ok(())
-}
-
 /// One checkpoint's listed identity: never a storage-kind field, which
 /// `--json` output must never reveal.
 #[derive(Serialize)]
@@ -278,56 +239,6 @@ fn list(project_path: &Path, json: bool, accept_changed_sources: bool) -> ExitCo
                 focusforge_diagnostics::rfc3339(c.created_at),
             );
         }
-    }
-    ExitCode::SUCCESS
-}
-
-#[derive(Serialize)]
-struct MaterializeReport {
-    project: String,
-    checkpoint: String,
-    wrote: String,
-    wall_seconds: f64,
-}
-
-fn materialize(
-    project_path: &Path,
-    checkpoint_id: &str,
-    output: &Path,
-    json: bool,
-    accept_changed_sources: bool,
-) -> ExitCode {
-    let start = Instant::now();
-    if let Err(exit) = refuse_if_names_project(output, project_path) {
-        return exit;
-    }
-    let mut project = match open_for_history(project_path, accept_changed_sources) {
-        Ok(project) => project,
-        Err(exit) => return exit,
-    };
-    let checkpoint = match resolve_checkpoint(project.history(), project_path, checkpoint_id) {
-        Ok(checkpoint) => checkpoint.clone(),
-        Err(message) => return fail(message),
-    };
-    if let Err(err) = project::materialize_zmap(&mut project, &checkpoint, output) {
-        return fail(err);
-    }
-    let report = MaterializeReport {
-        project: project_path.display().to_string(),
-        checkpoint: checkpoint.id,
-        wrote: output.display().to_string(),
-        wall_seconds: start.elapsed().as_secs_f64(),
-    };
-    if json {
-        match serde_json::to_string_pretty(&report) {
-            Ok(text) => println!("{text}"),
-            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
-        }
-    } else {
-        println!(
-            "{}\nwrote: {} (checkpoint {})\nwall: {:.3}s",
-            report.project, report.wrote, report.checkpoint, report.wall_seconds
-        );
     }
     ExitCode::SUCCESS
 }

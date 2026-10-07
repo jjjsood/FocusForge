@@ -217,7 +217,7 @@ fn renderer_refuses_invalid_visible_draw_before_guarding() {
     let (composite, zmap) = golden_plane_files();
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
     let draw = PaneDraw {
         src: (0, 0, 16, 16),
         dst: (0.0, 0.0, 16.0, 16.0),
@@ -250,7 +250,7 @@ fn cached_redraw_refuses_invalid_visible_draw_without_losing_coverage() {
     let frame = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
     renderer
         .set_frame(&frame, None, job::host_budget())
         .expect("fixture frame opens");
@@ -319,7 +319,7 @@ fn pending_pan_keeps_retained_coverage_inside_current_crop_until_latest_publish(
     let (composite, zmap) = golden_plane_files();
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite, &zmap).unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
     let first = PaneDraw {
         src: (128, 128, 128, 128),
         dst: (0.0, 0.0, 128.0, 128.0),
@@ -805,6 +805,7 @@ fn an_opened_project_feeds_its_planes_once_the_render_settles() {
         CanvasFeed::Load {
             composite, zmap, ..
         } => {
+            let zmap = zmap.expect("a readable Z-Map feeds the canvas");
             assert!(composite.starts_with(&dir) && zmap.starts_with(&dir));
             assert!(composite.is_file() && zmap.is_file());
         }
@@ -1730,7 +1731,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
     renderer
-        .set_planes(&composite_path, &zmap_path)
+        .set_planes(&composite_path, Some(&zmap_path))
         .expect("golden planes open");
     renderer
         .set_frame(&frame_path, None, job::host_budget())
@@ -1889,7 +1890,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     // 5. `set_planes` on the unchanged draw invalidates the composite pane's
     // coverage; the next draw re-reads exactly it.
     renderer
-        .set_planes(&composite_path, &zmap_path)
+        .set_planes(&composite_path, Some(&zmap_path))
         .expect("golden planes re-open");
     let before = counters();
     renderer
@@ -2594,7 +2595,9 @@ fn stale_results_render_nothing() {
     let frame_path = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -2684,17 +2687,23 @@ fn stale_results_render_nothing() {
     let before_planes = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job");
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &before_planes, "set_planes");
     let before_clear = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job");
     renderer.clear_planes();
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &before_clear, "clear_planes");
 
     // A device change.
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     let before_device = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job after reset");
@@ -2790,7 +2799,9 @@ fn backdrop_is_read_once_per_content_change() {
     let frame_path = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -2877,6 +2888,106 @@ fn backdrop_is_read_once_per_content_change() {
     plane(&mut renderer, Some(2), Some(&overlay), "an overlay toggle");
 }
 
+/// The composite job of `renderer` for `generation` and `overlay`, exact or
+/// backdrop, issued over freshly set planes so no earlier publish covers it.
+fn composite_job(
+    renderer: &mut focusforge_gui::gpu_canvas::CanvasRenderer,
+    planes: (&Path, Option<&Path>),
+    generation: Option<u64>,
+    overlay: Option<&focusforge_gui::canvas::OverlayDraw>,
+    backdrop: bool,
+) -> focusforge_gui::canvas::PaneJob {
+    let exact = focusforge_gui::viewport::PaneDraw {
+        src: (0, 0, 64, 64),
+        dst: (0.0, 0.0, 64.0, 64.0),
+        crop: (0.0, 0.0, 64.0, 64.0),
+        pixelated: false,
+        step: NonZeroU32::MIN,
+    };
+    renderer
+        .set_planes(planes.0, planes.1)
+        .expect("the composite opens whatever the Z-Map is");
+    let job = if backdrop {
+        renderer.request_plane_backdrop(&backdrop_of(512, 512, 128.0), generation, overlay)
+    } else {
+        renderer.request_planes(&exact, generation, overlay)
+    };
+    job.unwrap_or_else(|| {
+        panic!("a composite job issues (backdrop {backdrop}, generation {generation:?})")
+    })
+}
+
+/// The composite pane draws without the Z-Map: absent, or a file that fails
+/// to open, its jobs issue and publish exact and backdrop, with and without
+/// an edit generation, and with the overlay requested, and none carries an
+/// index reader.
+#[test]
+fn display_ignores_the_zmap() {
+    use focusforge_gui::canvas::EditedView;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, _) = golden_plane_files();
+    let garbage = common::tree("display_ignores_the_zmap").join("zmap.tif");
+    fs::write(&garbage, b"not a Z-Map").unwrap();
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    let tiles = ResidentTiles::new(16, 512, 512, 3);
+    let view = EditedView { tiles: &tiles };
+    let overlay = focusforge_gui::canvas::OverlayDraw::for_opacity(8, 0.5);
+
+    for zmap in [None, Some(garbage.as_path())] {
+        for generation in [None, Some(tiles.generation())] {
+            for overlay in [None, Some(&overlay)] {
+                let label = format!("zmap {zmap:?}, generation {generation:?}");
+                let edited = generation.map(|_| &view);
+                for backdrop in [false, true] {
+                    let planes = (composite.as_path(), zmap);
+                    let job = composite_job(&mut renderer, planes, generation, overlay, backdrop);
+                    assert!(job.indices.is_none(), "{label}: no index reader");
+                    let published = renderer.publish_edited(&job, &job_samples(&job), &[], edited);
+                    assert!(
+                        published.is_some(),
+                        "{label}: the job publishes (backdrop {backdrop})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The index reader rides a composite job iff the overlay is on: an edit
+/// generation, the exact view and the backdrop alone never attach it.
+#[test]
+fn zmap_is_read_lazily() {
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, zmap) = golden_plane_files();
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    let overlay = focusforge_gui::canvas::OverlayDraw::for_opacity(8, 0.5);
+
+    for generation in [None, Some(1)] {
+        for overlay in [None, Some(&overlay)] {
+            for backdrop in [false, true] {
+                let planes = (composite.as_path(), Some(zmap.as_path()));
+                let job = composite_job(&mut renderer, planes, generation, overlay, backdrop);
+                assert_eq!(
+                    job.indices.is_some(),
+                    overlay.is_some(),
+                    "generation {generation:?}, overlay {}, backdrop {backdrop}",
+                    overlay.is_some()
+                );
+            }
+        }
+    }
+}
+
 /// A backdrop job issued before a source, frame, device or newer
 /// publish renders and uploads nothing, whichever of it and the exact
 /// results arrives first. Upload accounting is process-global, so this runs
@@ -2915,7 +3026,9 @@ fn backdrop_from_a_previous_content_is_refused() {
     let frame_path = common::fixture_frame("mantis-64", 0);
     let mut renderer = CanvasRenderer::new();
     renderer.attach_device(shared.device().clone(), shared.queue().clone());
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
@@ -2980,13 +3093,17 @@ fn backdrop_from_a_previous_content_is_refused() {
     let old = renderer
         .request_plane_backdrop(&plane_back, None, None)
         .expect("job");
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &old, "set_planes");
     let old = renderer
         .request_plane_backdrop(&plane_back, None, None)
         .expect("job");
     renderer.clear_planes();
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     refused(&mut renderer, &old, "clear_planes");
     let old = renderer
         .request_plane_backdrop(&plane_back, Some(1), None)
@@ -3017,7 +3134,9 @@ fn backdrop_follows_device_detach_and_attach() {
     let plane_back = backdrop_of(512, 512, 128.0);
 
     let mut renderer = CanvasRenderer::new();
-    renderer.set_planes(&composite_path, &zmap_path).unwrap();
+    renderer
+        .set_planes(&composite_path, Some(&zmap_path))
+        .unwrap();
     renderer
         .set_frame(&frame_path, None, job::host_budget())
         .unwrap();
