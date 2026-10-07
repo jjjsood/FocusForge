@@ -7503,3 +7503,127 @@ fn pending_strokes_append_on_save() {
     common::enter_editor(&mut reopened);
     assert!(displayed_whole(&mut reopened) == shown);
 }
+
+#[test]
+fn strokes_after_first_save_show_the_saved_render() {
+    let (mut c, root) = open_editor("strokes_after_first_save");
+    let sealed = Sealed::read(&mut c, &root);
+    let (held, _) = c.materialize_active_tab_planes().unwrap();
+    let path = save_to_proposed(&mut c);
+    assert!(!held.exists(), "a save removes the row's held composite");
+
+    set_size(&mut c, 12.0);
+    c.set_brush_softness_fraction(0.5);
+    c.select_frame(1);
+    drag(&mut c, &[(40.0, 50.0), (50.0, 54.0)]);
+    c.select_frame(2);
+    drag(&mut c, &[(48.0, 40.0), (56.0, 28.0)]);
+    let strokes = ops(&c);
+    assert_eq!(strokes.len(), 2);
+    let info = c.edit_session().unwrap().info();
+
+    let _ = c.materialize_active_tab_planes();
+    common::settle_render(&mut c);
+    let shown = displayed_whole(&mut c);
+    assert!(c.save_active_project(|_| None));
+    let rendered = saved_render(&path);
+    let differing = shown.iter().zip(&rendered).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        differing, 0,
+        "the live view and the saved render differ in {differing} samples"
+    );
+    assert!(
+        shown == sealed.expected(&strokes, info),
+        "the live view differs from the reference blend"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_renders_after_its_composite_file_is_removed() {
+    let (mut c, root) = open_editor("session_composite_removed");
+    let sealed = Sealed::read(&mut c, &root);
+    let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
+    let scratch = root.join("copies");
+    fs::create_dir_all(&scratch).unwrap();
+    let (composite_copy, zmap_copy) = (scratch.join("composite.tif"), scratch.join("zmap.tif"));
+    fs::copy(&composite, &composite_copy).unwrap();
+    fs::copy(&zmap, &zmap_copy).unwrap();
+
+    let mut session = job::open_edit_session(
+        &zmap_copy,
+        &composite_copy,
+        &(0..3)
+            .map(|i| root.join(format!("{i:02}.tif")))
+            .collect::<Vec<_>>(),
+        sealed.registration.clone(),
+        16,
+        job::host_budget(),
+        Vec::new(),
+    )
+    .expect("a session over the copies opens");
+    fs::remove_file(&composite_copy).unwrap();
+    fs::remove_file(&zmap_copy).unwrap();
+
+    let region = Rect {
+        x: sealed.map.width - 16,
+        y: sealed.map.height - 16,
+        width: 16,
+        height: 16,
+    };
+    session
+        .recomposite(&job::Recomposite {
+            region,
+            pre: job::PreImage::Base,
+            ops: Vec::new(),
+            ends_drag: false,
+        })
+        .expect("the removed composite is still read through its mapping");
+    let mut resident = vec![0u16; 16 * 16 * 3];
+    session.tiles.overlay_into(region, &mut resident);
+    let mut expected = Vec::new();
+    for y in region.y..region.y + region.height {
+        let at = ((y * sealed.map.width + region.x) * 3) as usize;
+        expected.extend_from_slice(&sealed.composite[at..at + 48]);
+    }
+    assert!(
+        resident == expected,
+        "the resident tile holds the composite"
+    );
+}
+
+#[test]
+fn strokes_on_a_reopened_project_show_the_saved_render() {
+    let (mut c, root) = open_editor("strokes_reopened");
+    let sealed = Sealed::read(&mut c, &root);
+    let path = save_to_proposed(&mut c);
+
+    let mut reopened = reopen(&path, "strokes_reopened_session");
+    reopened.set_resident_tile_size_for_test(16);
+    reopened.set_pane_geometry(LEFT, RIGHT);
+    common::enter_editor(&mut reopened);
+    let _ = reopened.materialize_active_tab_planes();
+    common::settle_render(&mut reopened);
+    let reread = Sealed::read_with(&mut reopened, &root, sealed.registration.clone());
+
+    set_size(&mut reopened, 9.0);
+    reopened.set_brush_softness_fraction(0.25);
+    reopened.select_frame(0);
+    drag(&mut reopened, &[(12.0, 10.0), (30.0, 22.0)]);
+    reopened.select_frame(2);
+    drag(&mut reopened, &[(40.0, 36.0), (52.0, 52.0)]);
+    let strokes = ops(&reopened);
+    assert_eq!(strokes.len(), 2);
+    let info = reopened.edit_session().unwrap().info();
+
+    let shown = displayed_whole(&mut reopened);
+    assert!(reopened.save_active_project(|_| None));
+    assert!(
+        shown == saved_render(&path),
+        "the live view differs from the saved render"
+    );
+    assert!(
+        shown == reread.expected(&strokes, info),
+        "the live view differs from the reference blend"
+    );
+}

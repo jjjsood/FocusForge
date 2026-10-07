@@ -1403,18 +1403,18 @@ pub fn open_edit_session(
 ) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
     let info = reader.info();
-    // The first read maps the file; the mapping outlives the file, which a
-    // save removes together with the row's other held files.
-    reader.read_tile_into(
-        Rect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        },
-        &mut [0u16; 1],
-    )?;
+    // Each plane is mapped on its first read; the mapping outlives the file,
+    // which a save removes together with the row's other held files.
+    let pixel = Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+    reader.read_tile_into(pixel, &mut [0u16; 1])?;
     let base = Arc::new(TiffStack::open_files(&[composite.to_path_buf()])?);
+    let mut first = vec![0u16; base.header(0).samples_per_pixel as usize];
+    base.read_tile_into(0, pixel, &mut first)?;
     let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
