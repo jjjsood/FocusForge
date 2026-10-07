@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A settings row: a label column and, beside it, a slot for its value or
+// control, over a 1 px rule.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFRowLabel } from "ff_row_label.slint";
+import { FFDivider } from "ff_divider.slint";
+
+export component FFSettingsRow inherits Rectangle {
+    in property <string> label: "";
+    // The slot's children start at the value column, or end at the row's
+    // right edge.
+    in property <bool> align-end: false;
+    // The last row of a section has no rule.
+    in property <bool> divider: true;
+
+    height: ShellGeometry.settings-row-height + (root.divider ? 1px : 0px);
+
+    FFRowLabel {
+        x: 0px;
+        y: (ShellGeometry.settings-row-height - self.height) / 2;
+        width: ShellGeometry.settings-label-width;
+        height: ShellGeometry.param-label-height;
+        label-text: root.label;
+    }
+
+    VerticalLayout {
+        x: ShellGeometry.settings-label-width;
+        width: parent.width - ShellGeometry.settings-label-width;
+        height: ShellGeometry.settings-row-height;
+        alignment: center;
+
+        HorizontalLayout {
+            alignment: root.align-end ? end : start;
+            spacing: Theme.space-1;
+
+            @children
+        }
+    }
+
+    if root.divider: FFDivider {
+        y: ShellGeometry.settings-row-height;
+        width: 100%;
+    }
+}

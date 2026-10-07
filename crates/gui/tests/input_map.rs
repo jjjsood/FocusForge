@@ -1075,7 +1075,6 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "gallery.slint",
     "ff_manifest_list.slint",
     "ff_modal_panel.slint",
-    "settings_modal.slint",
     "projects_overlay.slint",
 ];
 
@@ -1109,30 +1108,6 @@ fn no_handler_outside_the_dispatch_point() {
             !code.contains(".action("),
             "{}: maps a gesture to an Action outside the dispatch point",
             path.display()
-        );
-    }
-}
-
-#[test]
-fn nav_rail_has_six_entries_four_disabled() {
-    let path = common::ui_dir().join("shell").join("settings_modal.slint");
-    let contents = fs::read_to_string(&path).unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("FFNavRailEntry {").count(),
-        6,
-        "the nav rail must carry all six sections"
-    );
-    for label in ["General", "Performance", "Storage", "About"] {
-        assert!(
-            code.contains(&format!("label: \"{label}\";")),
-            "{label} must be present"
-        );
-    }
-    for label in ["Input map", "Diagnostics"] {
-        assert!(
-            code.contains(&format!("label: \"{label}\";")),
-            "{label} must be present"
         );
     }
 }

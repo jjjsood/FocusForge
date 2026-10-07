@@ -42,6 +42,27 @@ import { FFPaneLabel } from "components/ff_pane_label.slint";
 import { FFUndockControl } from "components/ff_undock_control.slint";
 import { FFWindowBar } from "components/ff_window_bar.slint";
 import { FFToast, FFCheckpointDelete } from "shell/dialogs.slint";
+import { FFModalPanel } from "components/ff_modal_panel.slint";
+import { FFTextField } from "components/ff_text_field.slint";
+import { FFNavRail } from "components/ff_nav_rail.slint";
+import { FFNavRailEntry } from "components/ff_nav_rail_entry.slint";
+import { FFSettingsSection } from "components/ff_settings_section.slint";
+import { FFSettingsRow } from "components/ff_settings_row.slint";
+import { FFSettingsPathRow } from "components/ff_settings_path_row.slint";
+import { FFSettingsActionRow } from "components/ff_settings_action_row.slint";
+
+// The settings modal's own ground, content width plus its padding.
+component SettingsGround inherits Rectangle {
+    width: ShellGeometry.settings-content-width + 2 * Theme.space-4;
+    height: lay.preferred-height;
+    background: Theme.surface-raised;
+
+    lay := VerticalLayout {
+        padding: Theme.space-4;
+        alignment: start;
+        @children
+    }
+}
 
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
@@ -150,6 +171,155 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "Settings: nav rail, entry default / hover / focus / selected"; }
+        FFNavRail {
+            height: ShellGeometry.settings-rail-top-inset + 4 * ShellGeometry.settings-rail-entry-height;
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+            }
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                hovered: true;
+            }
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                focused: true;
+            }
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                selected: true;
+            }
+        }
+
+        GroupHeading { text: "Settings: nav rail, the live entries"; }
+        FFNavRail {
+            height: ShellGeometry.settings-rail-top-inset + 2 * ShellGeometry.settings-rail-entry-height;
+            FFNavRailEntry {
+                label: "Input map";
+                icon-source: @image-url("../../../assets/icons/keyboard.svg");
+                selected: true;
+            }
+            FFNavRailEntry {
+                label: "Diagnostics";
+                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+            }
+        }
+
+        GroupHeading { text: "Settings: section, path rows (present, missing), toggle rows, field rows"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: ShellGeometry.settings-section-gap;
+
+                FFSettingsSection {
+                    heading: "LOCATIONS";
+                    FFSettingsPathRow { label: "Logs"; path: "~/.local/share/focusforge/logs"; }
+                    FFSettingsPathRow {
+                        label: "Crash reports";
+                        path: "~/.local/share/focusforge/crashes";
+                        missing: true;
+                    }
+                }
+                FFSettingsSection {
+                    heading: "PERFORMANCE";
+                    FFSettingsRow {
+                        label: "GPU processing";
+                        align-end: true;
+                        FFToggle { on: true; }
+                    }
+                    FFSettingsRow {
+                        label: "Host memory cap";
+                        align-end: true;
+                        FFField { width: ShellGeometry.settings-field-width; text: "No cap"; }
+                    }
+                    FFSettingsRow {
+                        label: "VRAM cap";
+                        align-end: true;
+                        divider: false;
+                        FFField { width: ShellGeometry.settings-field-width; text: "Unavailable"; disabled: true; }
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: toggle, on / off / on and disabled"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFToggle { on: true; }
+            FFToggle { }
+            FFToggle { on: true; disabled: true; }
+        }
+
+        GroupHeading { text: "Settings: action row, idle / busy / refused / succeeded / failed"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "CACHE";
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    button-text: "Clear cache";
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    button-text: "Clearing…";
+                    enabled: false;
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    button-text: "Clear cache";
+                    enabled: false;
+                    status-text: "A run is active. Clear the cache after it finishes.";
+                    status-tone: "warning";
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    button-text: "Clear cache";
+                    status-text: "Cleared 12 stage entries.";
+                    status-tone: "success";
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    button-text: "Clear cache";
+                    status-text: "Could not clear the stage cache: Permission denied (os error 13).";
+                    status-tone: "failure";
+                }
+            }
+        }
+
+        GroupHeading { text: "Text field: neutral, warning, failure, disabled"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; }
+            FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; tone: "warning"; }
+            FFTextField { field-width: 300px; text: "/nonexistent/focusforge-diagnostics.zip"; tone: "failure"; }
+            FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; enabled: false; }
+        }
+
+        GroupHeading { text: "Modal panel: plain, warning rule, caution rule"; }
+        for tone in ["none", "warning", "caution"]: Rectangle {
+            width: 500px;
+            height: 220px;
+            clip: true;
+            FFModalPanel {
+                modal-open: true;
+                tone-rule: tone;
+                panel-width: 440px;
+                panel-height: 180px;
+                FFHeading {
+                    x: Theme.space-4;
+                    y: Theme.space-4;
+                    text: "Panel, tone rule: " + tone;
+                }
+            }
+        }
 
         GroupHeading { text: "Pane chrome: default, hover, disabled"; }
         HorizontalLayout {

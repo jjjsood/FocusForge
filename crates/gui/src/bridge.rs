@@ -2893,17 +2893,12 @@ pub fn install(
         let app_weak = app.as_weak();
         move |section| {
             record_settings_input();
-            let parsed = match section.as_str() {
-                "general" => SettingsSection::General,
-                "performance" => SettingsSection::Performance,
-                "storage" => SettingsSection::Storage,
-                "diagnostics" => SettingsSection::Diagnostics,
-                "about" => SettingsSection::About,
-                _ => SettingsSection::InputMap,
+            let Some(parsed) = SettingsSection::from_slug(section.as_str()) else {
+                return;
             };
             controller.lock().unwrap().select_settings_section(parsed);
             if let Some(app) = app_weak.upgrade() {
-                app.set_settings_section(section);
+                app.set_settings_section(parsed.slug().into());
                 direct_publication_scope(InputSurface::Settings);
             }
         }
@@ -3031,7 +3026,7 @@ pub fn install(
             let open = controller.lock().unwrap().review_crashes();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
-                app.set_settings_section("diagnostics".into());
+                app.set_settings_section(SettingsSection::Diagnostics.slug().into());
                 push_crash_notice(&app, &controller);
                 push_diagnostics_view(&app, &controller);
                 direct_publication_scope(InputSurface::Other);

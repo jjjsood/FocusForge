@@ -869,13 +869,10 @@ fn install_input_table(
     if let Some(section) = &args.settings_section {
         controller.open_settings();
         app.set_settings_open(true);
-        let parsed = if section == "diagnostics" {
-            focusforge_gui::SettingsSection::Diagnostics
-        } else {
-            focusforge_gui::SettingsSection::InputMap
-        };
+        let parsed = focusforge_gui::SettingsSection::from_slug(section)
+            .expect("`--settings-section` was validated against the section list in `run`");
         controller.select_settings_section(parsed);
-        app.set_settings_section(section.clone().into());
+        app.set_settings_section(parsed.slug().into());
     }
 }
 
@@ -940,12 +937,12 @@ fn main() -> ExitCode {
 /// for a session ended because the graphics device was lost.
 fn run(args: &Args) -> ExitCode {
     if let Some(section) = &args.settings_section
-        && section != "input-map"
-        && section != "diagnostics"
+        && focusforge_gui::SettingsSection::from_slug(section).is_none()
     {
-        tracing::error!(
-            "--settings-section accepts \"input-map\" or \"diagnostics\", got {section:?}"
-        );
+        let accepted = focusforge_gui::SettingsSection::ALL
+            .map(|s| format!("{:?}", s.slug()))
+            .join(" or ");
+        tracing::error!("--settings-section accepts {accepted}, got {section:?}");
         return ExitCode::from(2);
     }
     if let Some(tab) = &args.dock_tab

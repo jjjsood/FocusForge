@@ -2995,6 +2995,25 @@ fn crash_notice_timeout_reports_nothing() {
 }
 
 #[test]
+fn settings_section_slugs_round_trip() {
+    let mut slugs = Vec::new();
+    for section in SettingsSection::ALL {
+        assert_eq!(SettingsSection::from_slug(section.slug()), Some(section));
+        slugs.push(section.slug());
+    }
+    let distinct: std::collections::HashSet<_> = slugs.iter().collect();
+    assert_eq!(distinct.len(), SettingsSection::ALL.len(), "{slugs:?}");
+
+    for refused in ["general", "", "nope", "Diagnostics"] {
+        assert_eq!(
+            SettingsSection::from_slug(refused),
+            None,
+            "{refused:?} must not fall back to a section"
+        );
+    }
+}
+
+#[test]
 fn crash_notice_review_opens_diagnostics() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = seed_notice_crashes(root.path());

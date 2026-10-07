@@ -69,17 +69,34 @@ pub enum DockTab {
     Settings,
 }
 
-/// The settings modal's nav-rail sections, top to bottom. Four of the six
-/// are disabled and cannot be selected.
+/// The settings modal's sections, top to bottom in the nav rail. [`ALL`]
+/// is the one list of them; each section has one slug, used by the rail's
+/// selection callback and by `--settings-section`.
+///
+/// [`ALL`]: SettingsSection::ALL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
-    General,
-    Performance,
-    Storage,
     #[default]
     InputMap,
     Diagnostics,
-    About,
+}
+
+impl SettingsSection {
+    /// Every section, in nav-rail order.
+    pub const ALL: [SettingsSection; 2] = [SettingsSection::InputMap, SettingsSection::Diagnostics];
+
+    /// The section's slug: lowercase, hyphen-separated.
+    pub fn slug(self) -> &'static str {
+        match self {
+            SettingsSection::InputMap => "input-map",
+            SettingsSection::Diagnostics => "diagnostics",
+        }
+    }
+
+    /// The section whose [`slug`](Self::slug) is exactly `slug`.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.slug() == slug)
+    }
 }
 
 /// Every event the shell can raise, reaching an installed sink through

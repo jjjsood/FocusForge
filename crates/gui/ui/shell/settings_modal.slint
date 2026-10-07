@@ -1,124 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The settings modal: reachable only through the bottom bar's gear. Ships
-// the six-section nav rail plus the `Input map` section's read-only
-// three-column table and its provenance line; the other four sections are
-// a mockup only -- nothing there is editable.
+// The settings modal: reachable only through the bottom bar's gear. The
+// frame -- header, nav rail and content host -- over one tab per section.
 
 import { Theme } from "../theme.slint";
+import { FFModalPanel } from "../components/ff_modal_panel.slint";
+import { FFHeading } from "../components/ff_heading.slint";
+import { FFDivider } from "../components/ff_divider.slint";
+import { FFIconButton } from "../components/ff_icon_button.slint";
+import { FFNavRail } from "../components/ff_nav_rail.slint";
+import { FFNavRailEntry } from "../components/ff_nav_rail_entry.slint";
 import { FFDiagnosticsPanel, FFManifestRow } from "settings_modal/diagnostics_panel.slint";
-export { FFManifestRow }
+import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
+export { FFManifestRow, InputRow }
 
-export struct InputRow {
-    input: string,
-    stacking: string,
-    editor: string,
-}
-
-component FFNavRailEntry inherits Rectangle {
-    in property <string> label: "";
-    in property <image> icon-source;
-    in property <bool> selected: false;
-    in property <bool> enabled: true;
-    callback clicked();
-
-    height: 32px;
-    background: root.selected ? Theme.surface-hover : transparent;
-    border-radius: Theme.radius-sm;
-
-    if root.selected: Rectangle {
-        x: 0px;
-        y: 0px;
-        width: 2px;
-        height: parent.height;
-        background: Theme.accent-default;
-    }
-
-    HorizontalLayout {
-        padding-left: Theme.space-3;
-        padding-right: Theme.space-3;
-        spacing: Theme.space-2;
-        alignment: start;
-
-        Image {
-            source: root.icon-source;
-            colorize: !root.enabled
-                ? Theme.text-disabled
-                : root.selected ? Theme.accent-default : Theme.text-secondary;
-            width: Theme.icon-md;
-            height: Theme.icon-md;
-            // A fixed height opts this child out of the layout's own
-            // vertical stretch, so it needs its own centering.
-            y: (parent.height - self.height) / 2;
-        }
-        Text {
-            text: root.label;
-            color: !root.enabled
-                ? Theme.text-disabled
-                : root.selected ? Theme.text-primary : Theme.text-secondary;
-            font-size: Theme.text-body.size;
-            font-weight: Theme.text-body.weight;
-            vertical-alignment: center;
-        }
-    }
-
-    area := TouchArea {
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
-    }
-}
-
-component FFInputTableRow inherits Rectangle {
-    in property <string> input-label: "";
-    in property <string> stacking-label: "";
-    in property <string> editor-label: "";
-    in property <bool> header: false;
-
-    min-height: 32px;
-
-    HorizontalLayout {
-        padding-left: Theme.space-3;
-        padding-right: Theme.space-3;
-        padding-top: Theme.space-1;
-        padding-bottom: Theme.space-1;
-        spacing: Theme.space-2;
-
-        // The narrower content column two rows below fits fewer characters
-        // than the widest input combo and the widest action name at once on
-        // one line each; wrapping (rather than eliding) keeps every combo
-        // and action name readable, at the cost of some rows growing to two
-        // lines -- `min-height` above lets the row grow with them.
-        Text {
-            text: root.input-label;
-            color: root.header ? Theme.text-muted : Theme.text-primary;
-            font-size: Theme.text-body.size;
-            font-weight: root.header ? Theme.text-section.weight : Theme.text-body.weight;
-            width: 42%;
-            wrap: word-wrap;
-            vertical-alignment: center;
-        }
-        Text {
-            text: root.stacking-label;
-            color: root.header ? Theme.text-muted : Theme.text-secondary;
-            font-size: Theme.text-body.size;
-            font-weight: root.header ? Theme.text-section.weight : Theme.text-body.weight;
-            width: 29%;
-            wrap: word-wrap;
-            vertical-alignment: center;
-        }
-        Text {
-            text: root.editor-label;
-            color: root.header ? Theme.text-muted : Theme.text-secondary;
-            font-size: Theme.text-body.size;
-            font-weight: root.header ? Theme.text-section.weight : Theme.text-body.weight;
-            width: 29%;
-            wrap: word-wrap;
-            vertical-alignment: center;
-        }
-    }
-}
-
-export component FFSettingsModal inherits Rectangle {
+export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
     in property <string> input-provenance: "";
@@ -147,188 +43,86 @@ export component FFSettingsModal inherits Rectangle {
     callback diagnostics-manifest-viewport-height-changed(length);
     callback diagnostics-manifest-scrolled(length);
 
-    visible: root.settings-open;
+    modal-open: root.settings-open;
+    panel-width: 680px;
+    panel-height: 520px;
+    clip-panel: true;
 
-    // Theme ships no dedicated scrim token, so an existing surface token
-    // dimmed with `with-alpha` stands in rather than a raw colour-function
-    // call -- `no_colour_literal_outside_the_theme` refuses both alike.
-    scrim := Rectangle {
-        width: 100%;
-        height: 100%;
-        background: Theme.surface-canvas.with-alpha(0.6);
+    rail := FFNavRail {
+        x: 0px;
+        y: 0px;
+        height: root.panel-height;
+        header-inset: 60px;
 
-        TouchArea {
-            width: 100%;
-            height: 100%;
-            scroll-event(e) => { accept }
+        FFNavRailEntry {
+            label: "Input map";
+            icon-source: @image-url("../../../../assets/icons/keyboard.svg");
+            selected: root.settings-section == "input-map";
+            clicked => { root.settings-section-selected("input-map"); }
+        }
+        FFNavRailEntry {
+            label: "Diagnostics";
+            icon-source: @image-url("../../../../assets/icons/triangle-alert.svg");
+            selected: root.settings-section == "diagnostics";
+            clicked => { root.settings-section-selected("diagnostics"); }
         }
     }
 
-    panel := Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        width: 680px;
-        height: 520px;
-        background: Theme.surface-raised;
-        border-radius: Theme.radius-lg;
-        clip: true;
+    FFHeading {
+        x: Theme.space-4 + Theme.space-1;
+        y: 0px;
+        height: 60px;
+        text: "Settings";
+    }
 
-        header := Rectangle {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            height: 60px;
+    header-rule := FFDivider {
+        x: 0px;
+        y: 59px;
+        width: root.panel-width;
+    }
 
-            Text {
-                x: Theme.space-4 + Theme.space-1;
-                text: "Settings";
-                color: Theme.text-primary;
-                font-size: Theme.text-title.size;
-                font-weight: Theme.text-title.weight;
-                vertical-alignment: center;
-                height: 100%;
-            }
+    close := FFIconButton {
+        x: root.panel-width - Theme.space-4 - Theme.space-1 - Theme.icon-md - self.pad;
+        y: (60px - self.height) / 2;
+        icon: @image-url("../../../../assets/icons/x.svg");
+        triggered => { root.settings-close-requested(); }
+    }
+
+    content := Rectangle {
+        x: rail.width;
+        y: 60px;
+        width: root.panel-width - rail.width;
+        height: root.panel-height - 60px;
+
+        if root.settings-section == "diagnostics": FFDiagnosticsPanel {
+            width: 100%;
+            height: 100%;
+            rows: root.diagnostics-rows;
+            note: root.diagnostics-note;
+            include-minidumps: root.diagnostics-include-minidumps;
+            destination: root.diagnostics-destination;
+            status: root.diagnostics-status;
+            message: root.diagnostics-message;
+            primary-label: root.diagnostics-primary-label;
+            busy: root.diagnostics-busy;
+            loading: root.diagnostics-loading;
+            manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+            manifest-content-height: root.diagnostics-manifest-content-height;
+            destination-scroll-offset: root.diagnostics-destination-scroll-offset;
+
+            minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+            destination-edited(t) => { root.diagnostics-destination-edited(t); }
+            destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+            primary-clicked => { root.diagnostics-primary-clicked(); }
+            manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+            manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+            manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+            manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
         }
 
-        header-rule := Rectangle {
-            x: 0px;
-            y: header.height;
-            width: parent.width;
-            height: 1px;
-            background: Theme.border-default;
-        }
-
-        nav-rail := Rectangle {
-            x: 0px;
-            y: header.height;
-            width: 190px;
-            height: parent.height - header.height;
-            background: Theme.surface-base;
-
-            VerticalLayout {
-                x: Theme.space-2;
-                y: Theme.space-4;
-                width: parent.width - 2 * Theme.space-2;
-                spacing: Theme.space-1;
-                alignment: start;
-
-                FFNavRailEntry {
-                    label: "General";
-                    icon-source: @image-url("../../../../assets/icons/settings.svg");
-                    enabled: false;
-                    clicked => { root.settings-section-selected("general"); }
-                }
-                FFNavRailEntry {
-                    label: "Performance";
-                    icon-source: @image-url("../../../../assets/icons/cpu.svg");
-                    enabled: false;
-                    clicked => { root.settings-section-selected("performance"); }
-                }
-                FFNavRailEntry {
-                    label: "Storage";
-                    icon-source: @image-url("../../../../assets/icons/hard-drive.svg");
-                    enabled: false;
-                    clicked => { root.settings-section-selected("storage"); }
-                }
-                FFNavRailEntry {
-                    label: "Input map";
-                    icon-source: @image-url("../../../../assets/icons/keyboard.svg");
-                    selected: root.settings-section == "input-map";
-                    clicked => { root.settings-section-selected("input-map"); }
-                }
-                FFNavRailEntry {
-                    label: "Diagnostics";
-                    icon-source: @image-url("../../../../assets/icons/triangle-alert.svg");
-                    selected: root.settings-section == "diagnostics";
-                    clicked => { root.settings-section-selected("diagnostics"); }
-                }
-                FFNavRailEntry {
-                    label: "About";
-                    icon-source: @image-url("../../../../assets/icons/info.svg");
-                    enabled: false;
-                    clicked => { root.settings-section-selected("about"); }
-                }
-            }
-        }
-
-        close := TouchArea {
-            x: parent.width - Theme.space-4 - Theme.space-1 - self.width;
-            y: (header.height - self.height) / 2;
-            width: Theme.icon-md;
-            height: Theme.icon-md;
-
-            clicked => { root.settings-close-requested(); }
-
-            Image {
-                source: @image-url("../../../../assets/icons/x.svg");
-                colorize: Theme.text-secondary;
-                width: Theme.icon-md;
-                height: Theme.icon-md;
-            }
-        }
-
-        content := Rectangle {
-            x: nav-rail.width;
-            y: header.height;
-            width: parent.width - nav-rail.width;
-            height: parent.height - header.height;
-
-            if root.settings-section == "diagnostics": FFDiagnosticsPanel {
-                width: 100%;
-                height: 100%;
-                rows: root.diagnostics-rows;
-                note: root.diagnostics-note;
-                include-minidumps: root.diagnostics-include-minidumps;
-                destination: root.diagnostics-destination;
-                status: root.diagnostics-status;
-                message: root.diagnostics-message;
-                primary-label: root.diagnostics-primary-label;
-                busy: root.diagnostics-busy;
-                loading: root.diagnostics-loading;
-                manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
-                manifest-content-height: root.diagnostics-manifest-content-height;
-                destination-scroll-offset: root.diagnostics-destination-scroll-offset;
-
-                minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
-                destination-edited(t) => { root.diagnostics-destination-edited(t); }
-                destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
-                primary-clicked => { root.diagnostics-primary-clicked(); }
-                manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
-                manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
-                manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
-                manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
-            }
-
-            if root.settings-section == "input-map": VerticalLayout {
-                padding: Theme.space-4;
-                spacing: Theme.space-2;
-
-                Text {
-                    text: "Input map";
-                    color: Theme.text-primary;
-                    font-size: Theme.text-title.size;
-                    font-weight: Theme.text-title.weight;
-                }
-
-                provenance := Text {
-                    text: root.input-provenance;
-                    color: Theme.text-muted;
-                    font-size: Theme.text-body.size;
-                }
-
-                FFInputTableRow {
-                    header: true;
-                    input-label: "Input";
-                    stacking-label: "Stacking";
-                    editor-label: "Editor";
-                }
-
-                for row[i] in root.input-rows: FFInputTableRow {
-                    input-label: row.input;
-                    stacking-label: row.stacking;
-                    editor-label: row.editor;
-                }
-            }
+        if root.settings-section == "input-map": FFInputMapTab {
+            input-rows: root.input-rows;
+            input-provenance: root.input-provenance;
         }
     }
 }

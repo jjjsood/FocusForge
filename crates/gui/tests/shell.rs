@@ -432,6 +432,248 @@ fn diagnostics_panel_loading() {
     assert_eq!(primary().accessible_enabled(), Some(true));
 }
 
+/// Tab component each section renders, by slug. Every other tab component is
+/// absent while a section is selected.
+const SETTINGS_TABS: [(&str, &str); 2] = [
+    ("input-map", "FFInputMapTab"),
+    ("diagnostics", "FFDiagnosticsPanel"),
+];
+
+/// The rail's entries top to bottom. A component's root element is reported
+/// once per element merged into its item, so entries are told apart by
+/// position.
+fn nav_rail_entries(app: &AppWindow) -> Vec<i_slint_backend_testing::ElementHandle> {
+    let mut entries: Vec<i_slint_backend_testing::ElementHandle> = Vec::new();
+    for handle in ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFNavRailEntry")
+        .find_all()
+    {
+        if entries
+            .iter()
+            .all(|seen| seen.absolute_position() != handle.absolute_position())
+        {
+            entries.push(handle);
+        }
+    }
+    entries
+}
+
+fn settings_slint_sources() -> Vec<(String, String)> {
+    let dir = common::ui_dir().join("shell");
+    let mut files = vec![dir.join("settings_modal.slint")];
+    files.extend(common::find_slint_files(&dir.join("settings_modal")));
+    files
+        .into_iter()
+        .map(|path| {
+            let code = common::strip_line_comments(&fs::read_to_string(&path).unwrap());
+            (path.display().to_string(), code)
+        })
+        .collect()
+}
+
+/// The rail carries one entry per live section, in `SettingsSection::ALL`
+/// order, whichever entry is selected, and activating an entry raises its
+/// slug.
+#[test]
+fn settings_nav_rail_lists_only_live_sections() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    let selected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_settings_section_selected({
+        let selected = selected.clone();
+        move |slug| selected.borrow_mut().push(slug.to_string())
+    });
+
+    let slugs: Vec<&str> = focusforge_gui::SettingsSection::ALL
+        .iter()
+        .map(|section| section.slug())
+        .collect();
+    for start in &slugs {
+        app.set_settings_section((*start).into());
+        let entries = nav_rail_entries(&app);
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.accessible_label().unwrap().to_string())
+            .collect();
+        assert_eq!(labels, ["Input map", "Diagnostics"], "from {start}");
+        assert_eq!(labels.len(), slugs.len());
+
+        selected.borrow_mut().clear();
+        for entry in &entries {
+            entry.invoke_accessible_default_action();
+        }
+        assert_eq!(*selected.borrow(), slugs, "from {start}");
+    }
+
+    for (path, code) in settings_slint_sources() {
+        assert!(!code.contains("General"), "{path} names a General tab");
+    }
+    let entry =
+        fs::read_to_string(common::ui_dir().join("components/ff_nav_rail_entry.slint")).unwrap();
+    assert!(
+        !common::strip_line_comments(&entry).contains("enabled"),
+        "a rail entry has no disabled state"
+    );
+}
+
+/// One mouse click activates an entry and leaves the keyboard focus ring
+/// off.
+#[test]
+fn a_mouse_click_on_a_rail_entry_selects_it_without_a_focus_ring() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    let selected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_settings_section_selected({
+        let selected = selected.clone();
+        move |slug| selected.borrow_mut().push(slug.to_string())
+    });
+
+    nav_rail_entries(&app)[1].mock_single_click(slint::platform::PointerEventButton::Left);
+
+    assert_eq!(*selected.borrow(), ["diagnostics"]);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFNavRailEntry::ring")
+            .find_first()
+            .is_none(),
+        "a mouse click must not draw the keyboard focus ring"
+    );
+}
+
+/// Tab reaches a rail entry and draws its ring; Return and Space then
+/// activate the focused entry, and any other key does not.
+#[test]
+fn return_and_space_activate_the_focused_rail_entry() {
+    use slint::platform::{Key, WindowEvent};
+
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    let selected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_settings_section_selected({
+        let selected = selected.clone();
+        move |slug| selected.borrow_mut().push(slug.to_string())
+    });
+    let press = |key: slint::SharedString| {
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
+    };
+    let ring_shown = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFNavRailEntry::ring")
+            .find_first()
+            .is_some()
+    };
+    let tab_to_ring = || {
+        for _ in 0..40 {
+            if ring_shown() {
+                return;
+            }
+            press(Key::Tab.into());
+        }
+        panic!("Tab never reached a rail entry");
+    };
+
+    tab_to_ring();
+    press("a".into());
+    assert!(selected.borrow().is_empty(), "a letter must not activate");
+    press(Key::Return.into());
+    assert_eq!(*selected.borrow(), ["input-map"]);
+
+    press(Key::Tab.into());
+    tab_to_ring();
+    press(" ".into());
+    assert_eq!(*selected.borrow(), ["input-map", "diagnostics"]);
+}
+
+/// Exactly the selected section's tab component is instantiated, and each
+/// tab is declared in its own file.
+#[test]
+fn settings_tabs_render_from_their_own_files() {
+    let slugs: Vec<&str> = focusforge_gui::SettingsSection::ALL
+        .iter()
+        .map(|section| section.slug())
+        .collect();
+    assert_eq!(slugs, SETTINGS_TABS.map(|(slug, _)| slug));
+
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    for (slug, shown) in SETTINGS_TABS {
+        app.set_settings_section(slug.into());
+        for (_, tab) in SETTINGS_TABS {
+            let found = ElementQuery::from_root(&app)
+                .match_descendants()
+                .match_type_name(tab)
+                .find_first()
+                .is_some();
+            assert_eq!(found, tab == shown, "{tab} under {slug}");
+        }
+    }
+
+    let tabs = common::ui_dir().join("shell").join("settings_modal");
+    for (file, component) in [
+        ("input_map_tab.slint", "FFInputMapTab"),
+        ("diagnostics_panel.slint", "FFDiagnosticsPanel"),
+    ] {
+        let code = common::strip_line_comments(&fs::read_to_string(tabs.join(file)).unwrap());
+        assert!(
+            code.contains(&format!("export component {component} ")),
+            "{file} must declare {component}"
+        );
+    }
+    let frame = common::strip_line_comments(
+        &fs::read_to_string(tabs.parent().unwrap().join("settings_modal.slint")).unwrap(),
+    );
+    assert_eq!(
+        frame.matches("component ").count(),
+        1,
+        "settings_modal.slint declares only FFSettingsModal"
+    );
+    assert!(frame.contains("export component FFSettingsModal "));
+}
+
+/// The frame is `FFModalPanel`'s panel: 680 x 520 and centred. The rail's
+/// ground starts at the panel top, the header rule crosses the full width
+/// and the entries start 72 px down on a 32 px pitch.
+#[test]
+fn settings_frame_sits_on_the_modal_panel() {
+    let frame = fs::read_to_string(common::ui_dir().join("shell/settings_modal.slint")).unwrap();
+    assert!(
+        !frame.contains("scroll-event("),
+        "the scrim is FFModalPanel's"
+    );
+
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let app = app_at(width, height);
+        app.set_settings_open(true);
+        let px = (width as f32 - 680.0) / 2.0;
+        let py = (height as f32 - 520.0) / 2.0;
+
+        assert_rect(&app, "FFModalPanel::panel", (px, py, 680.0, 520.0));
+        assert_rect(&app, "FFSettingsModal::rail", (px, py, 190.0, 520.0));
+        assert_rect(
+            &app,
+            "FFSettingsModal::header-rule",
+            (px, py + 59.0, 680.0, 1.0),
+        );
+        for (i, entry) in nav_rail_entries(&app).iter().enumerate() {
+            let pos = entry.absolute_position();
+            let size = entry.size();
+            let got = (pos.x, pos.y, size.width, size.height);
+            let expected = (px, py + 72.0 + 32.0 * i as f32, 190.0, 32.0);
+            assert!(
+                (got.0 - expected.0).abs() < EPS
+                    && (got.1 - expected.1).abs() < EPS
+                    && (got.2 - expected.2).abs() < EPS
+                    && (got.3 - expected.3).abs() < EPS,
+                "entry {i} at {width}x{height}: got {got:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
 /// The toast paints at the pane gutter under the tab strip and toolbar, at
 /// its fixed size, regardless of window width; with no notice pending, no
 /// element matches its id at all -- the conditional `if` never instantiates
