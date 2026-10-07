@@ -50,6 +50,7 @@ import { FFSettingsSection } from "components/ff_settings_section.slint";
 import { FFSettingsRow } from "components/ff_settings_row.slint";
 import { FFSettingsPathRow } from "components/ff_settings_path_row.slint";
 import { FFSettingsActionRow } from "components/ff_settings_action_row.slint";
+import { FFStatusText } from "components/ff_status_text.slint";
 import { FFInputTableRow } from "components/ff_input_table_row.slint";
 
 // The settings modal's own ground, content width plus its padding.
@@ -291,6 +292,31 @@ export component ThemeSheet inherits Window {
                     button-text: "Clear cache";
                     status-text: "Could not clear the stage cache: Permission denied (os error 13).";
                     status-tone: "failure";
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: status text, none / success / warning / failure, elided, wrapped"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: Theme.space-2;
+
+                FFStatusText { text: "Nothing to report."; }
+                FFStatusText { text: "Bundle created successfully."; tone: "success"; }
+                FFStatusText {
+                    text: "This file already exists. Creating the bundle will overwrite it.";
+                    tone: "warning";
+                }
+                FFStatusText { text: "Could not write the bundle. Nothing was written."; tone: "failure"; }
+                FFStatusText {
+                    text: "Could not write the bundle: the destination folder is read-only, the disk is full, or the path no longer exists, so nothing was written.";
+                    tone: "failure";
+                    overflow: elide;
+                }
+                FFStatusText {
+                    text: "Not redacted — binary memory contents. Marked in the list above. Share the bundle only with people who may see this machine's memory.";
+                    tone: "warning";
+                    wrap: word-wrap;
                 }
             }
         }

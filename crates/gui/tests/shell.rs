@@ -432,6 +432,121 @@ fn diagnostics_panel_loading() {
     assert_eq!(primary().accessible_enabled(), Some(true));
 }
 
+/// `FFDiagnosticsPanel`'s own rect, found by type since the settings frame
+/// gives its one instance no local id.
+fn diagnostics_panel_rect(app: &AppWindow) -> (f32, f32, f32, f32) {
+    let handle = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFDiagnosticsPanel")
+        .find_first()
+        .expect("no FFDiagnosticsPanel element found");
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    (pos.x, pos.y, size.width, size.height)
+}
+
+fn is_inside(inner: (f32, f32, f32, f32), outer: (f32, f32, f32, f32)) -> bool {
+    inner.0 >= outer.0 - EPS
+        && inner.1 >= outer.1 - EPS
+        && inner.0 + inner.2 <= outer.0 + outer.2 + EPS
+        && inner.1 + inner.3 <= outer.1 + outer.3 + EPS
+}
+
+/// A failure message and a destination far longer than their slots stay
+/// inside the slot and the panel, and leave the footer and the status slot
+/// where the idle panel has them.
+#[test]
+fn diagnostics_long_failure_message_keeps_the_footer() {
+    let message = "disk full ".repeat(20);
+    let destination = "/data/".repeat(50);
+    assert_eq!(message.chars().count(), 200);
+    assert_eq!(destination.chars().count(), 300);
+
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let app = app_at(width, height);
+        app.set_settings_open(true);
+        app.set_settings_section("diagnostics".into());
+        let footer = rect(&app, "FFDiagnosticsPanel::footer");
+        let slot = rect(&app, "FFDiagnosticsPanel::status-slot");
+
+        app.set_diagnostics_destination(destination.as_str().into());
+        app.set_diagnostics_status("failed".into());
+        app.set_diagnostics_message(message.as_str().into());
+
+        assert_rect(&app, "FFDiagnosticsPanel::footer", footer);
+        assert_rect(&app, "FFDiagnosticsPanel::status-slot", slot);
+        let panel = diagnostics_panel_rect(&app);
+        let shown = rect(&app, "FFDiagnosticsPanel::message");
+        assert!(
+            is_inside(shown, slot) && is_inside(shown, panel),
+            "message at {width}x{height}: {shown:?} must lie inside the slot {slot:?} and the panel {panel:?}"
+        );
+        let field = rect(&app, "FFDiagnosticsPanel::dest-field");
+        assert!(
+            is_inside(field, panel),
+            "dest-field at {width}x{height}: {field:?} must lie inside the panel {panel:?}"
+        );
+    }
+}
+
+fn ui_source(relative: &str) -> String {
+    common::strip_line_comments(&fs::read_to_string(common::ui_dir().join(relative)).unwrap())
+}
+
+/// The Diagnostics tab is layout over shared components: its heading, rows
+/// and status lines are the shared section, row and status text, it styles
+/// nothing itself, its footer sizes nothing, and its message elides to one
+/// line (geometry cannot show elision, so the source must).
+#[test]
+fn diagnostics_panel_composes_only_shared_components() {
+    let panel = ui_source("shell/settings_modal/diagnostics_panel.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "height: 20px",
+        "height: 22px",
+        "Theme.status-",
+    ] {
+        assert!(!panel.contains(needle), "the panel sets {needle:?}");
+    }
+    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFStatusText {"] {
+        assert!(panel.contains(shared), "the panel does not draw {shared}");
+    }
+
+    let footer = panel
+        .split("footer :=")
+        .nth(1)
+        .expect("the panel has a footer");
+    assert!(footer.trim_start().starts_with("HorizontalLayout"));
+    assert!(!footer.contains("px"), "the footer sizes nothing itself");
+
+    let message = panel
+        .split("message := FFStatusText")
+        .nth(1)
+        .expect("the panel has a message line")
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(
+        message.contains("overflow: elide"),
+        "the message must elide"
+    );
+}
+
+/// The action row's status line is the shared status text, so the status
+/// colours are written once, in the primitive.
+#[test]
+fn settings_action_row_draws_its_status_line_through_the_status_text() {
+    let row = ui_source("components/ff_settings_action_row.slint");
+    assert!(row.contains("FFStatusText {"));
+    for needle in [" Text {", "Theme.status-"] {
+        assert!(!row.contains(needle), "the action row writes {needle:?}");
+    }
+}
+
 /// Tab component each section renders, by slug. Every other tab component is
 /// absent while a section is selected.
 const SETTINGS_TABS: [(&str, &str); 2] = [
