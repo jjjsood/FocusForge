@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Wall-clock figures for saving a fusion, saving one retouch stroke, opening
-//! to the first displayed band and exporting the unedited and retouched state:
-//! a warm median and a cold (page-cache evicted) run each. The fixture test
-//! asserts no time; the `#[ignore]`d reference-stack test asserts the warm
-//! targets after printing every figure.
+//! Wall-clock figures, for each fusion method, for saving a fusion, saving one
+//! retouch stroke, opening to the first displayed band, exporting the unedited
+//! and retouched state and writing the retouched head's Z-Map: a warm median
+//! and a cold (page-cache evicted) run each. The fixture test asserts no time;
+//! the `#[ignore]`d reference-stack test asserts the warm targets after
+//! printing every figure.
 
 mod common;
 
@@ -17,7 +18,6 @@ use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, Opened, ParentRef,
     Plane, Point, Project,
 };
-use focusforge_core::registry;
 
 const WARM_RUNS: usize = 3;
 
@@ -26,6 +26,10 @@ const SAVE_AFTER_RETOUCH: &str = "save-after-retouch";
 const OPEN_TO_FIRST_IMAGE: &str = "open-to-first-image";
 const UNEDITED_EXPORT: &str = "unedited-export";
 const EDITED_EXPORT: &str = "edited-export";
+const ZMAP_MATERIALIZE: &str = "zmap-materialize";
+
+/// The registered stack algorithms every scenario runs for.
+const METHODS: [&str; 3] = ["laplacian", "weighted-average", "depth-map"];
 
 /// Warm targets in seconds for the full-frame stack.
 const TARGETS: [(&str, f64); 4] = [
@@ -36,6 +40,7 @@ const TARGETS: [(&str, f64); 4] = [
 ];
 
 struct Figure {
+    method: &'static str,
     scenario: &'static str,
     warm: f64,
 }
@@ -73,6 +78,7 @@ fn evict(_paths: &[PathBuf]) -> Result<usize, String> {
 /// the timed region, and `evict_set` is dropped from the page cache after it
 /// on the cold run; `timed` returns the duration it measured itself.
 fn measure<S>(
+    method: &'static str,
     scenario: &'static str,
     evict_set: &[PathBuf],
     mut setup: impl FnMut() -> S,
@@ -84,22 +90,27 @@ fn measure<S>(
         .collect();
     runs.sort_by(f64::total_cmp);
     let warm = runs[runs.len() / 2];
-    println!("{scenario} warm {warm:.3} s");
+    println!("{method} {scenario} warm {warm:.3} s");
 
     let state = setup();
     match evict(evict_set) {
         Ok(files) => {
             let cold = timed(state).as_secs_f64();
-            println!("{scenario} cold {cold:.3} s (evicted {files} files)");
+            println!("{method} {scenario} cold {cold:.3} s (evicted {files} files)");
         }
-        Err(reason) => println!("{scenario} cold n/a ({reason})"),
+        Err(reason) => println!("{method} {scenario} cold n/a ({reason})"),
     }
-    Figure { scenario, warm }
+    Figure {
+        method,
+        scenario,
+        warm,
+    }
 }
 
-/// The fused result of `frames` with the GUI's default settings, kept under
-/// the target directory so a rerun on unchanged frames skips the fusion.
-fn held_result(frames: &[PathBuf]) -> HeldCheckpoint {
+/// The fused result of `frames` by `algorithm_id` with the GUI's default
+/// settings, kept under the target directory so a rerun on unchanged frames
+/// skips the fusion. `laplacian` keeps the frames-only directory name.
+fn held_result(frames: &[PathBuf], algorithm_id: &str) -> HeldCheckpoint {
     let mut key = blake3::Hasher::new();
     for frame in frames {
         let meta = std::fs::metadata(frame).expect("a frame must be readable");
@@ -113,9 +124,15 @@ fn held_result(frames: &[PathBuf]) -> HeldCheckpoint {
         key.update(&mtime.to_le_bytes());
     }
     let key = key.finalize().to_hex();
+    let key = &key.as_str()[..16];
+    let name = if algorithm_id == "laplacian" {
+        key.to_string()
+    } else {
+        format!("{key}-{algorithm_id}")
+    };
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("save_timing_held")
-        .join(&key.as_str()[..16]);
+        .join(name);
     let hold = dir.join("held");
     let record = hold.join("held.json");
 
@@ -127,10 +144,9 @@ fn held_result(frames: &[PathBuf]) -> HeldCheckpoint {
         return held;
     }
 
-    println!("fusing {} frames", frames.len());
+    println!("fusing {} frames with {algorithm_id}", frames.len());
     let _ = std::fs::remove_dir_all(&dir);
-    let algorithm = registry::default_stack().expect("a default stack algorithm is registered");
-    let held = common::fuse_held(frames, algorithm.id(), true, &dir);
+    let held = common::fuse_held(frames, algorithm_id, true, &dir);
     // Written last: a fusion that stopped early leaves nothing a rerun trusts.
     std::fs::write(
         &record,
@@ -140,9 +156,11 @@ fn held_result(frames: &[PathBuf]) -> HeldCheckpoint {
     held
 }
 
-/// Runs the five scenarios over `frames`, leaving its files under `out`.
-fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
-    let held = held_result(frames);
+/// Runs the six scenarios over `frames` fused by `method`, leaving its files
+/// under `out`.
+fn run_scenarios(frames: &[PathBuf], method: &'static str, out: &Path) -> Vec<Figure> {
+    std::fs::create_dir_all(out).expect("the output directory must be creatable");
+    let held = held_result(frames, method);
     let fused = out.join("fused.ffp");
     let retouched = out.join("retouched.ffp");
     let with_frames = |extra: &[&Path]| -> Vec<PathBuf> {
@@ -155,6 +173,7 @@ fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
 
     let mut root_id = String::new();
     let save_after_fusion = measure(
+        method,
         SAVE_AFTER_FUSION,
         &with_frames(&[&held.composite, &held.zmap]),
         || {
@@ -189,6 +208,7 @@ fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
     };
     let mut head_id = String::new();
     let save_after_retouch = measure(
+        method,
         SAVE_AFTER_RETOUCH,
         &with_frames(&[&retouched]),
         || {
@@ -215,6 +235,7 @@ fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
     );
 
     let open_to_first_image = measure(
+        method,
         OPEN_TO_FIRST_IMAGE,
         &with_frames(&[&retouched]),
         || (),
@@ -241,6 +262,7 @@ fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
     let export = |scenario, project_path: &Path, id: &str, name: &str| {
         let target = out.join(name);
         measure(
+            method,
             scenario,
             &with_frames(&[project_path]),
             || {
@@ -264,12 +286,31 @@ fn run_scenarios(frames: &[PathBuf], out: &Path) -> Vec<Figure> {
     let unedited_export = export(UNEDITED_EXPORT, &fused, &root_id, "unedited.tif");
     let edited_export = export(EDITED_EXPORT, &retouched, &head_id, "edited.tif");
 
+    let zmap = out.join("zmap.tif");
+    let zmap_materialize = measure(
+        method,
+        ZMAP_MATERIALIZE,
+        &with_frames(&[&retouched]),
+        || {
+            let _ = std::fs::remove_file(&zmap);
+            Project::open(&retouched).expect("the project opens")
+        },
+        |mut project| {
+            let head = project.checkpoint().clone();
+            let start = Instant::now();
+            project::materialize_zmap(&mut project, &head, &zmap)
+                .expect("the head's Z-Map must materialize");
+            start.elapsed()
+        },
+    );
+
     vec![
         save_after_fusion,
         save_after_retouch,
         open_to_first_image,
         unedited_export,
         edited_export,
+        zmap_materialize,
     ]
 }
 
@@ -281,19 +322,23 @@ fn timings_on_fixture() {
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).expect("the output directory must be creatable");
 
-    let figures = run_scenarios(&frames, &out);
-    let names: Vec<_> = figures.iter().map(|f| f.scenario).collect();
-    assert_eq!(
-        names,
-        [
-            SAVE_AFTER_FUSION,
-            SAVE_AFTER_RETOUCH,
-            OPEN_TO_FIRST_IMAGE,
-            UNEDITED_EXPORT,
-            EDITED_EXPORT
-        ]
-    );
-    assert!(figures.iter().all(|f| f.warm > 0.0));
+    for method in METHODS {
+        let figures = run_scenarios(&frames, method, &out.join(method));
+        let names: Vec<_> = figures.iter().map(|f| f.scenario).collect();
+        assert_eq!(
+            names,
+            [
+                SAVE_AFTER_FUSION,
+                SAVE_AFTER_RETOUCH,
+                OPEN_TO_FIRST_IMAGE,
+                UNEDITED_EXPORT,
+                EDITED_EXPORT,
+                ZMAP_MATERIALIZE
+            ],
+            "{method}"
+        );
+        assert!(figures.iter().all(|f| f.warm > 0.0), "{method}");
+    }
 }
 
 /// Prints the multithreaded compression time and ratio of the reference
@@ -304,7 +349,7 @@ fn composite_compression_by_level() {
     let Some(frames) = reference_frames() else {
         return;
     };
-    let held = held_result(&frames);
+    let held = held_result(&frames, "laplacian");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("save_timing_levels");
     let _ = std::fs::remove_dir_all(&out);
     for level in 1..=3 {
@@ -350,13 +395,20 @@ fn timings_on_reference_stack() {
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).expect("the output directory must be creatable");
 
-    let figures = run_scenarios(&frames, &out);
-    let missed: Vec<String> = TARGETS
+    let figures: Vec<Figure> = METHODS
+        .into_iter()
+        .flat_map(|method| run_scenarios(&frames, method, &out.join(method)))
+        .collect();
+    let missed: Vec<String> = figures
         .iter()
-        .filter_map(|&(scenario, target)| {
-            let figure = figures.iter().find(|f| f.scenario == scenario)?;
-            (figure.warm > target)
-                .then(|| format!("{scenario} warm {:.3} s > {target:.1} s", figure.warm))
+        .filter_map(|figure| {
+            let &(_, target) = TARGETS.iter().find(|(name, _)| *name == figure.scenario)?;
+            (figure.warm > target).then(|| {
+                format!(
+                    "{} {} warm {:.3} s > {target:.1} s",
+                    figure.scenario, figure.method, figure.warm
+                )
+            })
         })
         .collect();
     assert!(
