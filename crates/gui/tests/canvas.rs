@@ -2084,7 +2084,7 @@ mod preparing {
 }
 
 // ---------------------------------------------------------------------
-// The edited view: resident recomposited tiles over the sealed planes.
+// The edited view: resident rendered tiles over the sealed planes.
 // ---------------------------------------------------------------------
 
 use std::num::NonZeroU32;
@@ -2153,8 +2153,8 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
     let generation = tiles.generation();
     tiles.install(region, &region_samples(&planes[1], region));
     assert_eq!(tiles.generation(), generation + 1, "one bump per call");
-    assert_eq!(tiles.take_recomposited(), vec![region]);
-    assert!(tiles.take_recomposited().is_empty(), "the log drains");
+    assert_eq!(tiles.take_rendered_regions(), vec![region]);
+    assert!(tiles.take_rendered_regions().is_empty(), "the log drains");
 
     // The overlay shows each texel's resident pixel wherever one was
     // installed: the region's, and the sealed sentinel everywhere else,

@@ -38,8 +38,8 @@ pub enum RetouchError {
     #[error("tile {tile:?} lies outside the map's extent")]
     TileOutsideMap { tile: Rect },
 
-    /// The index buffer handed to `apply` does not match the tile's area.
-    #[error("index buffer holds {actual} entries, expected {expected}")]
+    /// A sample buffer handed to `apply` does not match its rect's area.
+    #[error("sample buffer holds {actual} samples, expected {expected}")]
     TileBufferSize { expected: usize, actual: usize },
 
     /// A source reader failed to produce a frame's pixels.

@@ -5945,7 +5945,7 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
     );
 
     controller.pointer(PointerKind::Up, Button::Left, x, y, Modifiers::NONE);
-    common::settle_recomposites(&mut controller);
+    common::settle_region_renders(&mut controller);
     assert!(controller.edits_settled());
     // Releasing the stroke was itself a canvas action: the window restarts.
     controller.relax_admission(true, quiet);

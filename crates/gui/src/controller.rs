@@ -187,9 +187,9 @@ pub enum ShellEvent {
     /// A save's worker has parked its outcome
     /// ([`AppController::settle_save`]).
     SaveReady,
-    /// A recomposite worker has parked its gathered regions
-    /// ([`AppController::settle_recomposites`]).
-    RecompositeReady,
+    /// A region-render worker has parked its rendered regions
+    /// ([`AppController::settle_region_renders`]).
+    RegionRenderReady,
 }
 
 /// The native window that owns a chrome operation.
@@ -1751,40 +1751,40 @@ impl AppController {
         self.blender = blender;
     }
 
-    /// Installs the regions recomposite workers have parked, on the tab each
+    /// Installs the regions region-render workers have parked, on the tab each
     /// was queued for -- active or not -- and dispatches what queued behind
-    /// them. Returns `true` once no tab has a recomposite in flight.
-    pub fn settle_recomposites(&mut self) -> bool {
-        let wake = self.recomposite_wake();
+    /// them. Returns `true` once no tab has a region render in flight.
+    pub fn settle_region_renders(&mut self) -> bool {
+        let wake = self.region_render_wake();
         let mut idle = true;
         for tab in &mut self.state.projects {
             if let Some(edit) = tab.edit.as_mut() {
-                idle &= edit.settle_recomposite(&wake);
+                idle &= edit.settle_region_renders(&wake);
             }
         }
         idle
     }
 
-    /// What a recomposite worker runs once it has parked a batch: the
-    /// [`ShellEvent::RecompositeReady`] on this controller's sink.
-    fn recomposite_wake(&self) -> job::RecompositeWake {
+    /// What a region-render worker runs once it has parked a batch: the
+    /// [`ShellEvent::RegionRenderReady`] on this controller's sink.
+    fn region_render_wake(&self) -> job::RegionRenderWake {
         let sink = self.sink.clone();
         Arc::new(move || {
             if let Some(sink) = &sink {
-                sink(ShellEvent::RecompositeReady);
+                sink(ShellEvent::RegionRenderReady);
             }
         })
     }
 
     /// Drains the active tab's log of every region installed into its
     /// resident display tiles since the last call -- a queued region is
-    /// logged once [`Self::settle_recomposites`] installs it; empty with no
+    /// logged once [`Self::settle_region_renders`] installs it; empty with no
     /// edit session.
-    pub fn take_recomposited(&mut self) -> Vec<job::Rect> {
+    pub fn take_rendered_regions(&mut self) -> Vec<job::Rect> {
         self.state
             .active_mut()
             .and_then(|tab| tab.edit.as_mut())
-            .map(|edit| edit.tiles.take_recomposited())
+            .map(|edit| edit.tiles.take_rendered_regions())
             .unwrap_or_default()
     }
 
@@ -1961,7 +1961,7 @@ impl AppController {
     /// editor or switching tab mid-drag never leaves a half stroke on a tab
     /// nobody is drawing on anymore.
     fn discard_live_stroke(&mut self) {
-        let wake = self.recomposite_wake();
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3030,14 +3030,14 @@ impl AppController {
     }
 
     /// `Ctrl + Z`: steps the active tab's pending strokes back one op and
-    /// queues the region it returns for recompositing. Ignored while a
+    /// queues the region it returns for rendering. Ignored while a
     /// stroke is live.
     pub fn undo(&mut self) {
         self.undo_or_redo(job::EditState::undo, false);
     }
 
     /// `Ctrl + Shift + Z`: re-applies the most recently undone op and
-    /// queues the region it returns for recompositing. Ignored while a
+    /// queues the region it returns for rendering. Ignored while a
     /// stroke is live.
     pub fn redo(&mut self) {
         self.undo_or_redo(job::EditState::redo, true);
@@ -3052,7 +3052,7 @@ impl AppController {
         step: fn(&mut job::EditState) -> Option<Option<job::Rect>>,
         redo: bool,
     ) {
-        let wake = self.recomposite_wake();
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3077,13 +3077,13 @@ impl AppController {
             } else {
                 (job::PreImage::Base, edit.stack_ops())
             };
-            let recomposite = job::Recomposite {
+            let region_render = job::RegionRender {
                 region,
                 pre,
                 ops,
                 ends_drag: false,
             };
-            edit.queue_recomposite(recomposite, &wake);
+            edit.queue_region_render(region_render, &wake);
         }
         if tab.unsaved() != was_unsaved {
             self.emit(ShellEvent::ProjectsChanged);
@@ -3206,7 +3206,7 @@ impl AppController {
     /// repaint, never per motion event. A no-op with no live stroke or no
     /// motion since the last flush.
     pub fn flush_live_stroke(&mut self) {
-        let wake = self.recomposite_wake();
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3237,13 +3237,13 @@ impl AppController {
         let Some(region) = region else {
             return;
         };
-        let recomposite = job::Recomposite {
+        let region_render = job::RegionRender {
             region,
             pre: job::PreImage::Snapshot,
             ops: vec![so_far],
             ends_drag: false,
         };
-        edit.queue_recomposite(recomposite, &wake);
+        edit.queue_region_render(region_render, &wake);
         edit.stroke
             .as_mut()
             .expect("the stroke that produced this tick is still live")
@@ -3257,7 +3257,7 @@ impl AppController {
     /// pre-stroke samples with the resampled path blended over them.
     fn paint_end(&mut self) {
         self.flush_live_stroke();
-        let wake = self.recomposite_wake();
+        let wake = self.region_render_wake();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3558,7 +3558,7 @@ impl AppController {
     }
 
     /// Whether the active tab's edits have settled: no live stroke and no
-    /// recomposite queued or in flight. `true` with no edit session.
+    /// region render queued or in flight. `true` with no edit session.
     pub fn edits_settled(&self) -> bool {
         self.state
             .active()

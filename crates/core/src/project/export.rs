@@ -131,7 +131,7 @@ pub static TIFF_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "tiff-bits".to_string(),
             label: "Bit depth".to_string(),
-            help: "16-bit keeps every sample the Z-Map gather produced; 8-bit rounds \
+            help: "16-bit keeps every sample of the result image; 8-bit rounds \
                    each sample through the same conversion JPEG uses."
                 .to_string(),
             kind: ParamKind::Enum {
@@ -186,7 +186,7 @@ pub static PNG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "png-bits".to_string(),
             label: "Bit depth".to_string(),
-            help: "16-bit keeps every sample the Z-Map gather produced; 8-bit rounds \
+            help: "16-bit keeps every sample of the result image; 8-bit rounds \
                    each sample through the same conversion JPEG uses."
                 .to_string(),
             kind: ParamKind::Enum {

@@ -50,8 +50,8 @@ pub struct SealRequest<'a> {
     pub align: Option<AlignRecord>,
     /// Every frame's transform and the applied crop.
     pub registration: Registration,
-    /// The `ImageDescription` an export of the fused checkpoint's own
-    /// gather writes into its TIFF's IFD.
+    /// The `ImageDescription` an export of the fused checkpoint's unedited
+    /// result image writes into its TIFF's IFD.
     pub composite_description: String,
     pub label: Option<String>,
     pub metrics: Metrics,
@@ -270,7 +270,7 @@ pub enum ParentRef {
 pub enum InMemoryKind {
     /// A finished fuse's planes.
     Fused(HeldCheckpoint),
-    /// Ops replayed over the parent's Z-Map.
+    /// Ops rendered over the parent's result image.
     Ops { ops: Vec<Op>, created_at: i64 },
 }
 

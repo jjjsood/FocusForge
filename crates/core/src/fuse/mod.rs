@@ -37,8 +37,8 @@
 //! - **What the Z-Map means.** Laplacian: the level-0 winner (coarser levels
 //!   may select other frames). Weighted Average: the dominant contributor,
 //!   not the provenance of a blend. Depth Map: the source of the copied
-//!   pixel, so its composite equals the Z-Map gather. A source index is an
-//!   index into the stack, never a metric depth.
+//!   pixel, so each composite pixel is the indexed frame's own pixel. A
+//!   source index is an index into the stack, never a metric depth.
 //! - **Known limit.** Depth Map copies a whole source pixel, so under
 //!   exposure or tint drift between frames its colour is the one a single
 //!   frame had; it does not equalise photometry.

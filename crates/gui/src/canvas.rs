@@ -750,9 +750,9 @@ pub struct ResidentTiles {
     samples_per_pixel: u32,
     tiles: HashMap<(u32, u32), Tile>,
     generation: u64,
-    /// Every region installed since the last [`Self::take_recomposited`]
+    /// Every region installed since the last [`Self::take_rendered_regions`]
     /// -- a test's own window onto what actually redrew.
-    recomposited: Vec<Rect>,
+    rendered_regions: Vec<Rect>,
 }
 
 impl ResidentTiles {
@@ -765,26 +765,26 @@ impl ResidentTiles {
             samples_per_pixel,
             tiles: HashMap::new(),
             generation: 0,
-            recomposited: Vec::new(),
+            rendered_regions: Vec::new(),
         }
     }
 
     /// Bumped once per [`Self::install`] and per [`Self::touch`] -- the
-    /// renderer's own cue that the resident cache or the edited indices over
-    /// it changed since the last frame it drew.
+    /// renderer's own cue that the resident cache or the ops drawn over it
+    /// changed since the last frame it drew.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// Bumps [`Self::generation`] without changing a pixel: the edited
-    /// indices changed, so the overlay over these tiles must redraw.
+    /// Bumps [`Self::generation`] without changing a pixel: the ops
+    /// drawn over these tiles changed, so the overlay over them must redraw.
     pub fn touch(&mut self) {
         self.generation += 1;
     }
 
     /// Drains the log of every region installed since the last call.
-    pub fn take_recomposited(&mut self) -> Vec<Rect> {
-        std::mem::take(&mut self.recomposited)
+    pub fn take_rendered_regions(&mut self) -> Vec<Rect> {
+        std::mem::take(&mut self.rendered_regions)
     }
 
     /// The edited pixel at `(x, y)`, if an install has covered it --
@@ -925,7 +925,7 @@ impl ResidentTiles {
             }
         }
         self.generation += 1;
-        self.recomposited.push(region);
+        self.rendered_regions.push(region);
     }
 }
 

@@ -432,14 +432,15 @@ pub fn settle_session(controller: &mut AppController) {
     }
 }
 
-/// Polls `settle_recomposites` until no stroke, undo or redo is recompositing.
+/// Polls `settle_region_renders` until no stroke, undo or redo has a region render
+/// in flight.
 #[allow(dead_code)]
-pub fn settle_recomposites(controller: &mut AppController) {
+pub fn settle_region_renders(controller: &mut AppController) {
     let start = Instant::now();
-    while !controller.settle_recomposites() {
+    while !controller.settle_region_renders() {
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "the recomposites did not settle"
+            "the region renders did not settle"
         );
         std::thread::sleep(Duration::from_millis(5));
     }

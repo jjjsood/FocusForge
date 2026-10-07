@@ -3478,7 +3478,7 @@ fn drag_screen(controller: &mut AppController, screen: &[(f32, f32)]) {
         controller.pointer_moved(x, y);
     }
     release(controller, *screen.last().unwrap());
-    common::settle_recomposites(controller);
+    common::settle_region_renders(controller);
 }
 
 fn ops(controller: &AppController) -> Vec<Op> {
@@ -3494,7 +3494,7 @@ fn read_plane(path: &Path, rect: Rect) -> Vec<u16> {
 }
 
 /// The tab's sealed planes and raw frames, read straight from disk, plus the
-/// registration a stroke's own recomposite reads each raw frame through.
+/// registration a stroke's own region render reads each raw frame through.
 struct Sealed {
     map: Rect,
     indices: Vec<u16>,
@@ -3638,11 +3638,11 @@ fn drag_ticked(controller: &mut AppController, path: &[(f32, f32)]) {
         let (sx, sy) = at(x, y);
         controller.pointer_moved(sx, sy);
         controller.flush_live_stroke();
-        common::settle_recomposites(controller);
+        common::settle_region_renders(controller);
     }
     let last = path[path.len() - 1];
     release(controller, at(last.0, last.1));
-    common::settle_recomposites(controller);
+    common::settle_region_renders(controller);
 }
 
 fn rounded(points: &[(f32, f32)]) -> Vec<Point> {
@@ -3725,13 +3725,13 @@ fn drag_produces_one_brush_stroke() {
     c.pointer_moved(RIGHT.x + 50.0, 100.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 50.0, 100.0));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(ops(&c).len(), 3, "a drag starting on the left pane");
     assert!(
         matches!(ops(&c).last(), Some(Op::BrushStroke { source_id: 2, .. })),
         "it paints the selected source"
     );
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     let before = displayed_whole(&mut c);
 
     // In the band above the image, with a 1 px brush.
@@ -3740,7 +3740,7 @@ fn drag_produces_one_brush_stroke() {
     c.pointer_moved(RIGHT.x + 140.0, 20.0);
     c.flush_live_stroke();
     release(&mut c, (RIGHT.x + 140.0, 20.0));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(ops(&c).len(), 3, "a stroke wholly off the image");
     assert_eq!(displayed_whole(&mut c), before);
 }
@@ -4600,7 +4600,7 @@ fn live_overlay_follows_the_drag() {
     let (sx, sy) = at(30.0, 20.0);
     c.pointer_moved(sx, sy);
     c.flush_live_stroke();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     let held = c.overlay_draw().unwrap().ops;
     assert!(ops(&c).is_empty(), "the stroke is not an op while held");
     let [
@@ -4622,7 +4622,7 @@ fn live_overlay_follows_the_drag() {
     assert_eq!(mid[0], untouched[0], "far from the stroke the map shows");
 
     release(&mut c, at(30.0, 20.0));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(
         c.overlay_draw().unwrap().ops.to_vec(),
         c.edit_session().unwrap().drawn_ops(),
@@ -4938,7 +4938,7 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
             "{stage}: the right-pane stroke"
         );
         c.undo();
-        common::settle_recomposites(c);
+        common::settle_region_renders(c);
         assert_eq!(ops(c).len(), ops_before, "{stage}: undo");
 
         let frame_before = selected_frame_pixel(c, 29, 30);
@@ -4954,7 +4954,7 @@ fn mirrored_brush_paints_the_same_stroke_from_either_pane() {
             "{stage}: the left pane's frame is unchanged"
         );
         c.undo();
-        common::settle_recomposites(c);
+        common::settle_region_renders(c);
     };
 
     check_stage(&mut c, RIGHT, "at fit");
@@ -4992,7 +4992,7 @@ fn a_press_between_the_panes_opens_no_stroke() {
         c.pointer_moved(inside.0, inside.1);
         c.flush_live_stroke();
         release(&mut c, inside);
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         assert_eq!(ops(&c), before_ops, "a press in {case}");
     }
 }
@@ -5177,7 +5177,7 @@ fn undo_redo_bindings_and_silent_discard() {
     c.select_frame(2);
     drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
     let both = ops(&c);
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     let after_both = sealed.displayed(&c);
 
     for (undo_key, redo_key) in [("z", "Z"), ("Z", "z")] {
@@ -5186,14 +5186,14 @@ fn undo_redo_bindings_and_silent_discard() {
         assert!(c.brush_toolbar_view().can_redo);
         c.key(true, redo_key, CTRL_SHIFT);
         assert_eq!(ops(&c), both, "redo as {redo_key:?}");
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         assert!(sealed.displayed(&c) == after_both, "redo as {redo_key:?}");
     }
 
     c.key(true, "z", CTRL);
     c.key(true, "z", CTRL);
     assert!(ops(&c).is_empty(), "undo is exact");
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(
         sealed.displayed(&c) == sealed.composite,
         "the original composite"
@@ -5213,7 +5213,7 @@ fn undo_redo_bindings_and_silent_discard() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| !matches!(event, ShellEvent::Input(_) | ShellEvent::RecompositeReady))
+        .filter(|event| !matches!(event, ShellEvent::Input(_) | ShellEvent::RegionRenderReady))
         .cloned()
         .collect();
     assert_eq!(
@@ -5225,12 +5225,12 @@ fn undo_redo_bindings_and_silent_discard() {
     let now = ops(&c);
     c.key(true, "z", CTRL_SHIFT);
     assert_eq!(ops(&c), now, "nothing left to redo");
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     sealed.assert_shown(&c, "after the new stroke");
 }
 
 #[test]
-fn stroke_commit_recomposites_its_tick_rects() {
+fn stroke_commit_renders_its_tick_rects() {
     let (mut c, root) = open_editor("brush_commit");
     let sealed = Sealed::read(&mut c, &root);
     set_size(&mut c, 20.0);
@@ -5255,15 +5255,15 @@ fn stroke_commit_recomposites_its_tick_rects() {
             c.pointer_moved(x, y);
         }
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
-        let tick = c.take_recomposited();
-        assert_eq!(tick.len(), 1, "one recomposite per flush");
+        common::settle_region_renders(&mut c);
+        let tick = c.take_rendered_regions();
+        assert_eq!(tick.len(), 1, "one region render per flush");
         ticks.extend(tick);
     }
     release(&mut c, *screen.last().unwrap());
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
 
-    let commit = c.take_recomposited();
+    let commit = c.take_rendered_regions();
     let map = map_rect(&c);
     let op = ops(&c).pop().unwrap();
     let bbox = footprint(&op, info).unwrap().unwrap();
@@ -5289,20 +5289,20 @@ fn stroke_commit_recomposites_its_tick_rects() {
     sealed.assert_shown(&c, "after release");
 
     c.undo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(
-        c.take_recomposited(),
+        c.take_rendered_regions(),
         vec![bbox],
-        "undo recomposites its region"
+        "undo renders its region"
     );
     sealed.assert_shown(&c, "after undo");
     assert!(sealed.displayed(&c) == sealed.composite);
     c.redo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(
-        c.take_recomposited(),
+        c.take_rendered_regions(),
         vec![bbox],
-        "redo recomposites its region"
+        "redo renders its region"
     );
     sealed.assert_shown(&c, "after redo");
 }
@@ -5321,7 +5321,7 @@ fn every_edit_has_a_cli_equivalent() {
     drag(&mut c, &[(50.0, 8.0), (20.0, 58.0)]);
     let ops = ops(&c);
     assert_eq!(ops.len(), 2);
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
 
     let json = serde_json::to_string(&ops).unwrap();
     let parsed: Vec<Op> = serde_json::from_str(&json).unwrap();
@@ -5345,8 +5345,8 @@ fn live_stroke_previews_each_new_segment() {
     drag(&mut c, &[(8.0, 56.0)]);
     c.undo();
     c.select_frame(1);
-    common::settle_recomposites(&mut c);
-    c.take_recomposited();
+    common::settle_region_renders(&mut c);
+    c.take_rendered_regions();
     let session = |c: &AppController| {
         let s = c.edit_session().unwrap();
         (
@@ -5378,10 +5378,10 @@ fn live_stroke_previews_each_new_segment() {
         .collect();
     press(&mut c, at(trace[0].0, trace[0].1));
     c.flush_live_stroke();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(
-        c.take_recomposited().is_empty(),
-        "a flush with no motion recomposites nothing"
+        c.take_rendered_regions().is_empty(),
+        "a flush with no motion renders nothing"
     );
 
     let mut flushed = 0;
@@ -5407,11 +5407,11 @@ fn live_stroke_previews_each_new_segment() {
             assert_ne!(c.brush_source(), Some(source));
         }
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         let segment = stroke(rounded(&trace[flushed..=end]));
         let region = footprint(&segment, info).unwrap();
         assert_eq!(
-            c.take_recomposited(),
+            c.take_rendered_regions(),
             region.into_iter().collect::<Vec<_>>(),
             "flush {k}: exactly the new segment's footprint, once"
         );
@@ -5427,13 +5427,16 @@ fn live_stroke_previews_each_new_segment() {
             "flush {k}: the op list waits for release"
         );
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
-        assert!(c.take_recomposited().is_empty(), "flush {k}: nothing new");
+        common::settle_region_renders(&mut c);
+        assert!(
+            c.take_rendered_regions().is_empty(),
+            "flush {k}: nothing new"
+        );
         flushed = end;
     }
 
     release(&mut c, at(trace[44].0, trace[44].1));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     let mut live = LiveStroke::new(source, radius, softness, trace[0].0, trace[0].1);
     for w in trace.windows(2) {
         live.push(w[1].0 - w[0].0, w[1].1 - w[0].1);
@@ -5450,8 +5453,8 @@ fn live_stroke_previews_each_new_segment() {
     sealed.assert_shown(&c, "after release");
 }
 
-/// A brush stroke that paints frame `i` recomposites the composite from the
-/// frame-as-fused view -- the recomposited pixel under the stroke equals a
+/// A brush stroke that paints frame `i` renders the composite from the
+/// frame-as-fused view -- the pixel under the stroke equals a
 /// [`FrameSource`] read of that frame through `selected_frame_view` at the
 /// same point.
 ///
@@ -5467,7 +5470,7 @@ fn stroke_matches_left_pane() {
 
     let sealed = Sealed::read(&mut c, &root);
     let point = (20 * sealed.map.width + 20) as usize;
-    let recomposited = sealed.displayed(&c)[point * 3..point * 3 + 3].to_vec();
+    let stroked = sealed.displayed(&c)[point * 3..point * 3 + 3].to_vec();
 
     let view = c
         .selected_frame_view()
@@ -5495,8 +5498,8 @@ fn stroke_matches_left_pane() {
         .expect("the left pane's own point reads");
 
     assert_eq!(
-        recomposited, left_pixel,
-        "the recomposited pixel must equal the left pane's own read at the same point"
+        stroked, left_pixel,
+        "the stroked pixel must equal the left pane's own read at the same point"
     );
 }
 
@@ -5710,7 +5713,7 @@ fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
     assert_eq!(off.registration.equalization, None, "an explicit off wins");
 }
 
-/// On an equalized `depth-map` tab a stroke's recomposited pixel is the left
+/// On an equalized `depth-map` tab a stroke's rendered pixel is the left
 /// pane's read of that frame, and that read carries the frame's gain.
 #[test]
 fn equalized_stroke_matches_left_pane() {
@@ -5723,7 +5726,7 @@ fn equalized_stroke_matches_left_pane() {
     assert_ne!(gains[2], UNIT_GAIN, "frame 2 has a gain to apply");
 
     // A point the fuse took from another frame, so the stroke has to
-    // recomposite it rather than keep the sealed pixel.
+    // render it rather than keep the sealed pixel.
     let root = held.sources[0].parent().unwrap().to_path_buf();
     let sealed = Sealed::read(&mut c, &root);
     let width = sealed.map.width as usize;
@@ -5736,7 +5739,7 @@ fn equalized_stroke_matches_left_pane() {
     c.select_frame(2);
     set_size(&mut c, 8.0);
     drag(&mut c, &[(px as f32, py as f32)]);
-    let recomposited = sealed.displayed(&c)[at_index * 3..at_index * 3 + 3].to_vec();
+    let stroked = sealed.displayed(&c)[at_index * 3..at_index * 3 + 3].to_vec();
 
     let view = c
         .selected_frame_view()
@@ -5762,16 +5765,16 @@ fn equalized_stroke_matches_left_pane() {
             .expect("the point reads");
         pixel
     };
-    assert_eq!(recomposited, read(view), "stroke and left pane agree");
+    assert_eq!(stroked, read(view), "stroke and left pane agree");
     let ungained = read(FrameView {
         gain: UNIT_GAIN,
         ..view
     });
-    assert_ne!(recomposited, ungained, "the pixel carries the frame's gain");
+    assert_ne!(stroked, ungained, "the pixel carries the frame's gain");
 }
 
 // ---------------------------------------------------------------------
-// Recomposites run on a worker; the controller installs what they gather.
+// Region renders run on a worker; the controller installs what they render.
 // ---------------------------------------------------------------------
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
@@ -5907,14 +5910,14 @@ fn drag_unsettled(controller: &mut AppController, path: &[(f32, f32)]) {
     release(controller, *screen.last().unwrap());
 }
 
-/// Waits until `events` holds a `RecompositeReady`, i.e. a worker parked.
-fn wait_for_recomposite_ready(events: &Mutex<Vec<ShellEvent>>) {
+/// Waits until `events` holds a `RegionRenderReady`, i.e. a worker parked.
+fn wait_for_region_render_ready(events: &Mutex<Vec<ShellEvent>>) {
     let start = Instant::now();
     while !events
         .lock()
         .unwrap()
         .iter()
-        .any(|event| matches!(event, ShellEvent::RecompositeReady))
+        .any(|event| matches!(event, ShellEvent::RegionRenderReady))
     {
         assert!(
             start.elapsed() < Duration::from_secs(30),
@@ -5925,8 +5928,8 @@ fn wait_for_recomposite_ready(events: &Mutex<Vec<ShellEvent>>) {
 }
 
 #[test]
-fn a_stroke_recomposites_off_the_ui_thread() {
-    let (mut c, root) = open_editor("recomposite_off_thread");
+fn a_stroke_renders_off_the_ui_thread() {
+    let (mut c, root) = open_editor("region_render_off_thread");
     let sealed = Sealed::read(&mut c, &root);
     let gate = Gate::install(&mut c);
     set_size(&mut c, 12.0);
@@ -5948,7 +5951,7 @@ fn a_stroke_recomposites_off_the_ui_thread() {
         "the tick shows nothing until a worker installs it"
     );
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "the tick gathered nothing"
     );
 
@@ -5956,7 +5959,7 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     release(&mut c, *screen.last().unwrap());
     assert_eq!(ops(&c).len(), 1);
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "the commit gathered nothing"
     );
     let info = c.edit_session().unwrap().info();
@@ -5965,13 +5968,13 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     assert!(ops(&c).is_empty(), "the undo stepped at once");
     assert!(c.edit_session().unwrap().can_redo());
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "the undo gathered nothing"
     );
 
     gate.open();
-    common::settle_recomposites(&mut c);
-    let log = c.take_recomposited();
+    common::settle_region_renders(&mut c);
+    let log = c.take_rendered_regions();
     // The tick's region, then the release's re-render of each 16 px tile the
     // tick and the stroke meet (tile column by tile column), then the undo.
     let tick = log[0];
@@ -6005,10 +6008,10 @@ fn a_stroke_recomposites_off_the_ui_thread() {
     sealed.assert_shown(&c, "after the undo settles");
 }
 
-/// Edits count as settled only with no live stroke and no recomposite
+/// Edits count as settled only with no live stroke and no region render
 /// queued or in flight; a settle after the last install makes them settled.
 #[test]
-fn edits_settle_after_the_last_recomposite() {
+fn edits_settle_after_the_last_region_render() {
     let (mut c, _root) = open_editor("edits_settle");
     let gate = Gate::install(&mut c);
     set_size(&mut c, 12.0);
@@ -6027,22 +6030,22 @@ fn edits_settle_after_the_last_recomposite() {
     c.flush_live_stroke();
     assert!(
         !c.edits_settled(),
-        "a stroke tick with its recomposite in flight is not settled"
+        "a stroke tick with its region render in flight is not settled"
     );
 
     release(&mut c, *screen.last().unwrap());
     assert!(
         !c.edits_settled(),
-        "a committed stroke whose recomposite is unfinished is not settled"
+        "a committed stroke whose region render is unfinished is not settled"
     );
     assert!(
-        !c.settle_recomposites(),
+        !c.settle_region_renders(),
         "the gated worker has not parked its result"
     );
     assert!(!c.edits_settled(), "still in flight after a settle poll");
 
     gate.open();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(c.edits_settled(), "settled after the last install");
 
     drag(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
@@ -6050,8 +6053,8 @@ fn edits_settle_after_the_last_recomposite() {
 }
 
 #[test]
-fn background_recomposite_matches_the_synchronous_one() {
-    let name = "recomposite_matches_sync";
+fn background_region_render_matches_the_synchronous_one() {
+    let name = "region_render_matches_sync";
     let (mut c, root) = open_editor(name);
     let sealed = Sealed::read(&mut c, &root);
     let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
@@ -6077,9 +6080,9 @@ fn background_recomposite_matches_the_synchronous_one() {
     c.select_frame(2);
     drag_unsettled(&mut c, &[(5.0, 36.0), (50.0, 46.0)]);
     gate.open();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
 
-    let regions = c.take_recomposited();
+    let regions = c.take_rendered_regions();
     assert!(
         regions.windows(3).any(|w| w == [bbox(2), bbox(1), bbox(1)]),
         "the undos and the redo install their regions in order: {regions:?}"
@@ -6102,7 +6105,7 @@ fn background_recomposite_matches_the_synchronous_one() {
     )
     .expect("a second session over the same frames opens");
     assert_eq!(fresh.stack_ops(), ops(&c), "the same op list");
-    fresh.tiles.take_recomposited();
+    fresh.tiles.take_rendered_regions();
 
     let view = c.edited_view().unwrap();
     let shown = |tiles: &focusforge_gui::canvas::ResidentTiles| {
@@ -6112,14 +6115,14 @@ fn background_recomposite_matches_the_synchronous_one() {
     };
     assert!(
         shown(view.tiles) == shown(&fresh.tiles),
-        "the displayed image equals the synchronous recomposite's"
+        "the displayed image equals the synchronous render's"
     );
 }
 
 #[test]
-fn a_recomposite_for_a_replaced_session_is_dropped() {
+fn a_region_render_for_a_replaced_session_is_dropped() {
     // (a) A row restored while a stroke's regions are in flight.
-    let name = "recomposite_restored";
+    let name = "region_render_restored";
     let (mut c, root) = open_editor(name);
     let sealed = Sealed::read(&mut c, &root);
     let events = record_events(&mut c);
@@ -6135,16 +6138,16 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
         "the restored row's own chain"
     );
     gate.open();
-    wait_for_recomposite_ready(&events);
-    common::settle_recomposites(&mut c);
+    wait_for_region_render_ready(&events);
+    common::settle_region_renders(&mut c);
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "the replaced session's regions never reach the new one"
     );
     assert!(sealed.displayed(&c) == sealed.composite);
 
     // (b) A tab closed while its regions are in flight.
-    let name = "recomposite_closed";
+    let name = "region_render_closed";
     let (mut c, _) = open_editor(name);
     let events = record_events(&mut c);
     let gate = Gate::install(&mut c);
@@ -6153,12 +6156,12 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     drag_unsettled(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
     c.close_project(0);
     gate.open();
-    wait_for_recomposite_ready(&events);
-    common::settle_recomposites(&mut c);
+    wait_for_region_render_ready(&events);
+    common::settle_region_renders(&mut c);
     assert!(c.edit_session().is_none());
 
     // (c) A plain save is not a replacement: its regions land.
-    let name = "recomposite_saved";
+    let name = "region_render_saved";
     let (mut c, _) = open_editor(name);
     let gate = Gate::install(&mut c);
     set_size(&mut c, 8.0);
@@ -6166,15 +6169,15 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     drag_unsettled(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
     save_to_proposed(&mut c);
     gate.open();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(
-        !c.take_recomposited().is_empty(),
+        !c.take_rendered_regions().is_empty(),
         "the save kept the session, so its regions land"
     );
     assert!(!c.edit_session().unwrap().stack_ops().is_empty());
 
     // (d) A result for a switched-away tab lands on its own tab.
-    let name = "recomposite_switched";
+    let name = "region_render_switched";
     let (mut c, _) = open_editor(name);
     let events = record_events(&mut c);
     let gate = Gate::install(&mut c);
@@ -6183,22 +6186,22 @@ fn a_recomposite_for_a_replaced_session_is_dropped() {
     drag_unsettled(&mut c, &[(10.0, 10.0), (30.0, 20.0)]);
     open_mantis64_tab(&mut c, &format!("{name}_other"), 2);
     gate.open();
-    wait_for_recomposite_ready(&events);
-    common::settle_recomposites(&mut c);
+    wait_for_region_render_ready(&events);
+    common::settle_region_renders(&mut c);
     assert!(
-        c.take_recomposited().is_empty(),
+        c.take_rendered_regions().is_empty(),
         "nothing lands on the active tab"
     );
     c.select_project(0);
     assert!(
-        !c.take_recomposited().is_empty(),
+        !c.take_rendered_regions().is_empty(),
         "the first tab's tiles took its own regions"
     );
 }
 
 #[test]
-fn a_failed_background_recomposite_keeps_the_edit() {
-    let (mut c, root) = open_editor("recomposite_fails");
+fn a_failed_background_region_render_keeps_the_edit() {
+    let (mut c, root) = open_editor("region_render_fails");
     let sealed = Sealed::read(&mut c, &root);
     let gate = Gate::install(&mut c);
     gate.open();
@@ -6211,7 +6214,7 @@ fn a_failed_background_recomposite_keeps_the_edit() {
         drag(&mut c, &[(8.0, 12.0 + 8.0 * before as f32), (40.0, 20.0)]);
         assert_eq!(ops(&c).len(), before + 1, "{case}: the stroke stays");
         assert!(
-            c.take_recomposited().is_empty(),
+            c.take_rendered_regions().is_empty(),
             "{case}: nothing installed"
         );
         assert!(
@@ -6223,17 +6226,20 @@ fn a_failed_background_recomposite_keeps_the_edit() {
 
     c.undo();
     assert_eq!(ops(&c).len(), 1, "undo still steps the history");
-    common::settle_recomposites(&mut c);
-    c.take_recomposited();
+    common::settle_region_renders(&mut c);
+    c.take_rendered_regions();
 
     gate.set_fault(Fault::None);
     drag(&mut c, &[(10.0, 50.0), (44.0, 54.0)]);
-    assert!(!c.take_recomposited().is_empty(), "later strokes settle");
+    assert!(
+        !c.take_rendered_regions().is_empty(),
+        "later strokes settle"
+    );
     c.redo();
     c.undo();
     c.undo();
     c.undo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     sealed.assert_shown(&c, "after the history unwinds");
 }
 
@@ -6470,7 +6476,7 @@ fn assert_drag_blocked(c: &mut AppController, case: &str) {
     c.pointer_moved(at(20.0, 15.0).0, at(20.0, 15.0).1);
     release(c, at(20.0, 15.0));
     assert_eq!(ops(c), before_ops, "{case}: a blocked drag must add no op");
-    common::settle_recomposites(c);
+    common::settle_region_renders(c);
     assert!(
         displayed_whole(c) == before_image,
         "{case}: a blocked drag must not touch the image"
@@ -6999,7 +7005,7 @@ fn a_save_that_does_not_write_loses_nothing() {
     assert_eq!(saved_ids(&path).len(), 2, "a retry writes the same history");
 }
 
-/// Editing from an older, non-head checkpoint recomposites through that
+/// Editing from an older, non-head checkpoint renders through that
 /// checkpoint's own registration: the head here was fused without alignment
 /// or crop, the root with both.
 #[test]
@@ -7129,10 +7135,10 @@ fn entering_the_editor_opens_its_session_off_thread() {
     assert_eq!(session.stack_ops(), chained, "the chain is applied");
     assert_eq!(session.op_count(), 0, "the replay is rebased away");
     assert!(
-        !controller.take_recomposited().is_empty(),
+        !controller.take_rendered_regions().is_empty(),
         "the replay filled the resident tiles"
     );
-    common::settle_recomposites(&mut controller);
+    common::settle_region_renders(&mut controller);
     assert!(
         displayed_whole(&mut controller) != plain,
         "the replay painted the chain's pixels"
@@ -7464,10 +7470,10 @@ fn live_soft_edge_is_a_blend_not_a_dither() {
     let (sx, sy) = at(36.0, 30.0);
     c.pointer_moved(sx, sy);
     c.flush_live_stroke();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     check(&c, "during the drag");
     release(&mut c, at(36.0, 30.0));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(ops(&c), vec![stroke.clone()]);
     check(&c, "after release");
 }
@@ -7522,10 +7528,10 @@ fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevic
         let (sx, sy) = at(trace[end].0, trace[end].1);
         c.pointer_moved(sx, sy);
         c.flush_live_stroke();
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         let segment = stroke(rounded(&trace[end - 1..=end]));
         assert_eq!(
-            c.take_recomposited(),
+            c.take_rendered_regions(),
             footprint(&segment, info)
                 .unwrap()
                 .into_iter()
@@ -7540,7 +7546,7 @@ fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevic
         );
     }
     release(&mut c, at(trace[5].0, trace[5].1));
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     sealed.assert_shown(&c, "after release");
 }
 
@@ -7566,19 +7572,19 @@ fn undo_redo_restore_the_blended_samples() {
     let last_region = footprint(&all[2], info).unwrap().unwrap();
 
     c.undo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(c.edit_session().unwrap().op_count(), 2);
     assert!(
         sealed.displayed(&c) == first_two,
         "undo shows the first two"
     );
-    assert!(c.take_recomposited().ends_with(&[last_region]));
+    assert!(c.take_rendered_regions().ends_with(&[last_region]));
     c.redo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert_eq!(c.edit_session().unwrap().op_count(), 3);
     sealed.assert_shown(&c, "redo restores the third");
     c.undo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(
         sealed.displayed(&c) == first_two,
         "a second undo after the redo"
@@ -7735,28 +7741,28 @@ fn undo_redo_moves_the_state_position() {
 
     for k in 1..=3 {
         c.undo();
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         assert_eq!(ops(&c), all[..3 - k], "undo {k}");
         assert_renders(&c, &format!("undo {k}"));
     }
     assert!(!c.edit_session().unwrap().can_undo());
-    c.take_recomposited();
+    c.take_rendered_regions();
     c.undo();
-    common::settle_recomposites(&mut c);
-    assert!(ops(&c).is_empty() && c.take_recomposited().is_empty());
+    common::settle_region_renders(&mut c);
+    assert!(ops(&c).is_empty() && c.take_rendered_regions().is_empty());
     assert_renders(&c, "undo with nothing pending");
     assert!(sealed.displayed(&c) == sealed.composite);
 
     for k in 1..=3 {
         c.redo();
-        common::settle_recomposites(&mut c);
+        common::settle_region_renders(&mut c);
         assert_eq!(ops(&c), all[..k], "redo {k}, in order");
         assert_renders(&c, &format!("redo {k}"));
     }
 
     c.undo();
     c.undo();
-    common::settle_recomposites(&mut c);
+    common::settle_region_renders(&mut c);
     assert!(c.edit_session().unwrap().can_redo());
     c.select_frame(2);
     drag(&mut c, &[(30.0, 8.0), (34.0, 14.0)]);
@@ -7885,7 +7891,7 @@ fn a_session_renders_after_its_composite_file_is_removed() {
         height: 16,
     };
     session
-        .recomposite(&job::Recomposite {
+        .render_region_now(&job::RegionRender {
             region,
             pre: job::PreImage::Base,
             ops: Vec::new(),

@@ -288,9 +288,9 @@ thread_local! {
     /// What a save worker's wake runs on the event loop: settle the save,
     /// then show its outcome.
     static SAVE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
-    /// What a recomposite worker's wake runs on the event loop: install the
-    /// gathered regions, then repaint.
-    static RECOMPOSITE_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    /// What a region-render worker's wake runs on the event loop: install the
+    /// rendered regions, then repaint.
+    static REGION_RENDER_HANDLER: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// The one optional detached pane. The source textures stay in `Canvas`;
     /// this window only binds the matching image on the shared device.
     static COMPARISON_WINDOW: RefCell<Option<Rc<ComparisonWindow>>> = const { RefCell::new(None) };
@@ -671,7 +671,7 @@ pub fn repaint(
 
     let (frame_backdrop, plane_backdrop) = {
         let controller = controller.lock().unwrap();
-        // A live stroke or an unfinished recomposite changes the edit
+        // A live stroke or an unfinished region render changes the edit
         // generation every tick; the composite backdrop waits for them.
         (
             controller.frame_backdrop_draw(),
@@ -812,7 +812,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::LoadReady
         | ShellEvent::ImportReady
         | ShellEvent::SaveReady
-        | ShellEvent::RecompositeReady
+        | ShellEvent::RegionRenderReady
         | ShellEvent::CheckpointsChanged => InputSurface::Other,
         ShellEvent::ProjectsChanged
         | ShellEvent::TabScrollChanged
@@ -2351,12 +2351,12 @@ pub fn install(
         let app_weak = app.as_weak();
         let controller = controller.clone();
         let canvas = canvas.clone();
-        RECOMPOSITE_HANDLER.with(|slot| {
+        REGION_RENDER_HANDLER.with(|slot| {
             *slot.borrow_mut() = Some(Rc::new(move || {
                 if let Some(app) = app_weak.upgrade() {
                     {
-                        let _settle = measurement_scope("gui_recomposite_settle");
-                        controller.lock().unwrap().settle_recomposites();
+                        let _settle = measurement_scope("gui_region_render_settle");
+                        controller.lock().unwrap().settle_region_renders();
                     }
                     repaint(&app, &controller, &canvas);
                 }
@@ -4225,10 +4225,10 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 handler();
             }
         }
-        // A recomposite worker parked its regions; the handler installed with
+        // A region-render worker parked its regions; the handler installed with
         // the window settles them and repaints.
-        ShellEvent::RecompositeReady => {
-            if let Some(handler) = RECOMPOSITE_HANDLER.with(|slot| slot.borrow().clone()) {
+        ShellEvent::RegionRenderReady => {
+            if let Some(handler) = REGION_RENDER_HANDLER.with(|slot| slot.borrow().clone()) {
                 handler();
             }
         }

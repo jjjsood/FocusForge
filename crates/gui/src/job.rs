@@ -979,7 +979,7 @@ pub enum EditSessionError {
     Frames(#[from] FrameError),
 }
 
-/// What a recomposite starts from before its ops are blended over it.
+/// What a region render starts from before its ops are blended over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreImage {
     /// The base composite alone.
@@ -995,14 +995,14 @@ pub enum PreImage {
 /// ops blended over that in order, and whether it is the last job of a drag,
 /// after which the pre-drag samples are dropped.
 #[derive(Debug, Clone)]
-pub struct Recomposite {
+pub struct RegionRender {
     pub region: Rect,
     pub pre: PreImage,
     pub ops: Vec<Op>,
     pub ends_drag: bool,
 }
 
-/// What a recomposite worker renders: each region, in dispatch order, with
+/// What a region-render worker renders: each region, in dispatch order, with
 /// its samples or the reason it failed.
 type Rendered = Vec<(Rect, Result<Vec<u16>, String>)>;
 
@@ -1015,14 +1015,14 @@ struct Parked {
     ends_drag: bool,
 }
 
-/// Wakes the UI thread once a recomposite worker has parked its result.
-pub type RecompositeWake = Arc<dyn Fn() + Send + Sync>;
+/// Wakes the UI thread once a region-render worker has parked its result.
+pub type RegionRenderWake = Arc<dyn Fn() + Send + Sync>;
 
-/// One session's recomposite queue: jobs waiting for a worker, whether a
+/// One session's region-render queue: jobs waiting for a worker, whether a
 /// worker holds a batch, and where it parks the result.
 #[derive(Default)]
-struct Recomposites {
-    queued: Vec<Recomposite>,
+struct RegionRenders {
+    queued: Vec<RegionRender>,
     in_flight: bool,
     parked: Arc<Mutex<Option<Parked>>>,
 }
@@ -1059,7 +1059,7 @@ pub struct EditState {
     /// tile at a time; empty between drags.
     snapshot: crate::canvas::ResidentTiles,
     pub stroke: Option<crate::brush::LiveStroke>,
-    recomposites: Recomposites,
+    region_renders: RegionRenders,
 }
 
 /// A resident tile's default edge -- edits are small, so a fixed 256 px grid
@@ -1098,7 +1098,7 @@ struct RenderInput {
 /// drag then empties `snapshot`, whether it rendered or not.
 fn render_region(
     input: &RenderInput,
-    job: &Recomposite,
+    job: &RegionRender,
     local: &mut crate::canvas::ResidentTiles,
     snapshot: &mut crate::canvas::ResidentTiles,
 ) -> Result<Vec<u16>, String> {
@@ -1111,7 +1111,7 @@ fn render_region(
 
 fn blend_region(
     input: &RenderInput,
-    job: &Recomposite,
+    job: &RegionRender,
     local: &mut crate::canvas::ResidentTiles,
     snapshot: &mut crate::canvas::ResidentTiles,
 ) -> Result<Vec<u16>, String> {
@@ -1305,14 +1305,14 @@ impl EditState {
 
     /// Renders `job` on the calling thread straight into the resident tiles.
     /// The open-time replay uses it; a live edit goes through
-    /// [`Self::queue_recomposite`].
-    pub fn recomposite(&mut self, job: &Recomposite) -> Result<(), String> {
+    /// [`Self::queue_region_render`].
+    pub fn render_region_now(&mut self, job: &RegionRender) -> Result<(), String> {
         let input = self.render_input();
         render_region(&input, job, &mut self.tiles, &mut self.snapshot).map(|_| ())
     }
 
-    fn enqueue(&mut self, job: Recomposite) {
-        self.recomposites.queued.push(job);
+    fn enqueue(&mut self, job: RegionRender) {
+        self.region_renders.queued.push(job);
         self.tiles.touch();
     }
 
@@ -1320,51 +1320,53 @@ impl EditState {
     /// repaint picks the region up. Jobs queued while a worker holds a batch
     /// go out together when it is installed, rendered in queue order; `wake`
     /// runs on the worker once a batch is parked.
-    pub fn queue_recomposite(&mut self, job: Recomposite, wake: &RecompositeWake) {
+    pub fn queue_region_render(&mut self, job: RegionRender, wake: &RegionRenderWake) {
         self.enqueue(job);
-        if !self.recomposites.in_flight {
-            self.dispatch_recomposites(wake);
+        if !self.region_renders.in_flight {
+            self.dispatch_region_renders(wake);
         }
     }
 
     /// Ends a drag: queues every resident tile `touched` meets, each
     /// re-rendered from its pre-drag samples with `ops` blended over them;
     /// the last job drops the pre-drag samples.
-    pub fn end_drag(&mut self, touched: &[Rect], ops: Vec<Op>, wake: &RecompositeWake) {
+    pub fn end_drag(&mut self, touched: &[Rect], ops: Vec<Op>, wake: &RegionRenderWake) {
         let tiles = self.tiles.tile_rects(touched);
         let last = tiles.len().saturating_sub(1);
         for (at, region) in tiles.into_iter().enumerate() {
-            self.enqueue(Recomposite {
+            self.enqueue(RegionRender {
                 region,
                 pre: PreImage::Snapshot,
                 ops: ops.clone(),
                 ends_drag: at == last,
             });
         }
-        if !self.recomposites.in_flight {
-            self.dispatch_recomposites(wake);
+        if !self.region_renders.in_flight {
+            self.dispatch_region_renders(wake);
         }
     }
 
-    /// Whether no stroke is live and no recomposite is queued or in flight,
+    /// Whether no stroke is live and no region render is queued or in flight,
     /// so the resident tiles hold every edit.
     pub fn is_settled(&self) -> bool {
-        self.stroke.is_none() && self.recomposites.queued.is_empty() && !self.recomposites.in_flight
+        self.stroke.is_none()
+            && self.region_renders.queued.is_empty()
+            && !self.region_renders.in_flight
     }
 
     /// Installs the batch a worker has parked, in the order its jobs were
     /// queued, then dispatches whatever queued meanwhile. A region whose
     /// render failed is logged and leaves its tiles as they were. Returns
     /// `true` once nothing is in flight.
-    pub fn settle_recomposite(&mut self, wake: &RecompositeWake) -> bool {
+    pub fn settle_region_renders(&mut self, wake: &RegionRenderWake) -> bool {
         let parked = self
-            .recomposites
+            .region_renders
             .parked
             .lock()
-            .expect("no worker panicked while parking its recomposites")
+            .expect("no worker panicked while parking its region renders")
             .take();
         if let Some(parked) = parked {
-            self.recomposites.in_flight = false;
+            self.region_renders.in_flight = false;
             match parked.snapshot {
                 Some(snapshot) => self.snapshot = snapshot,
                 None if parked.ends_drag => self.snapshot.clear(),
@@ -1374,28 +1376,28 @@ impl EditState {
                 match result {
                     Ok(samples) => self.tiles.install(region, &samples),
                     Err(error) => {
-                        tracing::error!(%error, ?region, "background recomposite failed");
+                        tracing::error!(%error, ?region, "background region render failed");
                     }
                 }
             }
-            self.dispatch_recomposites(wake);
+            self.dispatch_region_renders(wake);
         }
-        !self.recomposites.in_flight
+        !self.region_renders.in_flight
     }
 
     /// Hands every queued job to one worker thread, with the resident tiles
     /// they meet as they are now, and marks the batch in flight.
-    fn dispatch_recomposites(&mut self, wake: &RecompositeWake) {
-        if self.recomposites.queued.is_empty() {
+    fn dispatch_region_renders(&mut self, wake: &RegionRenderWake) {
+        if self.region_renders.queued.is_empty() {
             return;
         }
-        let jobs: Vec<Recomposite> = self.recomposites.queued.drain(..).collect();
+        let jobs: Vec<RegionRender> = self.region_renders.queued.drain(..).collect();
         let regions: Vec<Rect> = jobs.iter().map(|job| job.region).collect();
         let (mut local, mut snapshot) = (self.tiles.subset(&regions), self.snapshot.clone());
         let ends_drag = jobs.iter().any(|job| job.ends_drag);
         let input = self.render_input();
-        self.recomposites.in_flight = true;
-        let parked = Arc::clone(&self.recomposites.parked);
+        self.region_renders.in_flight = true;
+        let parked = Arc::clone(&self.region_renders.parked);
         let wake = Arc::clone(wake);
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1415,7 +1417,7 @@ impl EditState {
                 Err(_) => Parked {
                     rendered: jobs
                         .iter()
-                        .map(|job| (job.region, Err("the recomposite worker panicked".into())))
+                        .map(|job| (job.region, Err("the region render worker panicked".into())))
                         .collect(),
                     snapshot: None,
                     ends_drag,
@@ -1423,7 +1425,8 @@ impl EditState {
             };
             *parked
                 .lock()
-                .expect("no worker panicked while parking its recomposites") = Some(parked_result);
+                .expect("no worker panicked while parking its region renders") =
+                Some(parked_result);
             wake();
         });
     }
@@ -1483,21 +1486,21 @@ pub fn open_edit_session(
         tiles,
         blender: None,
         stroke: None,
-        recomposites: Recomposites::default(),
+        region_renders: RegionRenders::default(),
     };
     for op in chain {
         match footprint(&op, info) {
             Ok(region) => {
                 edit.chain.push(op);
                 if let Some(region) = region {
-                    let job = Recomposite {
+                    let job = RegionRender {
                         region,
                         pre: PreImage::Base,
                         ops: edit.chain.clone(),
                         ends_drag: false,
                     };
-                    if let Err(error) = edit.recomposite(&job) {
-                        tracing::error!(%error, "restored stroke recomposite failed");
+                    if let Err(error) = edit.render_region_now(&job) {
+                        tracing::error!(%error, "restored stroke render failed");
                     }
                 }
             }
