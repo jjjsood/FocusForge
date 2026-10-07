@@ -1405,6 +1405,7 @@ impl EditState {
 /// ops, oldest first) is replayed over it and kept as the state's chain. An
 /// op that cannot be applied ends the replay; a region that cannot be
 /// rendered is skipped.
+// The inputs are independent; none of them groups naturally with another.
 #[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
     zmap: &Path,

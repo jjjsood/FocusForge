@@ -292,6 +292,11 @@ fn shows_source(alpha: u32) -> bool {
     alpha > OPAQUE / 2
 }
 
+/// `table`'s colour for `index`, clamped to the last entry.
+fn table_color(table: &[[u8; 3]], index: u16) -> [u8; 3] {
+    table[usize::from(index).min(table.len() - 1)]
+}
+
 /// The source of the latest valid stroke in `ops` whose alpha at `(x, y)`
 /// exceeds half of full coverage, `None` when no stroke reaches that far.
 pub fn top_source(ops: &[Op], info: ZMapInfo, x: u32, y: u32) -> Option<u16> {
@@ -320,9 +325,8 @@ pub fn overlay_colors(
     let rows = rect.height.div_ceil(step) as usize;
     debug_assert_eq!(indices.len(), columns * rows);
     debug_assert_eq!(out.len(), columns * rows);
-    let last = table.len() - 1;
     for (color, &index) in out.iter_mut().zip(indices) {
-        *color = table[usize::from(index).min(last)];
+        *color = table_color(table, index);
     }
     for op in ops {
         let Op::BrushStroke { source_id, .. } = op;
@@ -332,7 +336,7 @@ pub fn overlay_colors(
         let Some(active) = stroke_footprint(&stroke, info).and_then(|fp| rect.intersect(fp)) else {
             continue;
         };
-        let over = table[usize::from(*source_id).min(last)];
+        let over = table_color(table, *source_id);
         let ramp = Ramp::new(&stroke);
         let grid = SegmentGrid::new(&stroke, active);
         // Lattice samples inside `active`: sample `i` sits at `rect.x + i * step`.
