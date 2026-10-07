@@ -25,7 +25,7 @@ export component FFInputMapTab inherits Rectangle {
         FFSettingsSection {
             heading: "BINDINGS";
 
-            header := FFInputTableRow {
+            FFInputTableRow {
                 header: true;
                 input-label: "INPUT";
                 stacking-label: "STACKING";
@@ -33,7 +33,6 @@ export component FFInputMapTab inherits Rectangle {
             }
 
             for row in root.input-rows: FFInputTableRow {
-                divider: true;
                 input-label: row.input;
                 stacking-label: row.stacking;
                 editor-label: row.editor;
