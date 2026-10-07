@@ -282,8 +282,7 @@ fn a_reused_renderer_matches_cpu_after_shrinking_and_switching_channels() {
 /// The overlay entry point against `overlay_cpu`, on a crop of the golden
 /// composite + Z-Map whose sides are not multiples of 8, at every blend
 /// opacity the CLI exposes, with solo off and on, with a couple of pixels
-/// forced to `NO_SOURCE` and one soft
-/// stroke crossing the crop.
+/// forced to `NO_SOURCE` and one soft stroke crossing the crop.
 #[test]
 fn overlay_parity_matches_cpu() {
     let Some(shared) = shared_device_or_skip() else {
