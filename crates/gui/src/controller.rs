@@ -5,7 +5,7 @@
 //! `AppController`, whose method signatures name no Slint type, so the
 //! window's behaviour is reachable from `cargo test` without a window.
 //!
-//! The canvas methods below (`pane_label`, `undock_enabled`, `frame_count`,
+//! The canvas methods below (`undock_enabled`, `frame_count`,
 //! `frame_draw`, `plane_draw`, ...) live here rather than in `crate::canvas`
 //! so they can reach `ShellState`'s private fields; `crate::canvas` owns
 //! only the plain types and pure functions. The entry path's own state
