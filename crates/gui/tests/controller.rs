@@ -4123,6 +4123,7 @@ fn legend_has_no_mutation_affordances() {
 fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
     OverlayDraw {
         table: focusforge_core::zmap::overlay_table(sources, None),
+        ops: Arc::from([]),
         alpha: focusforge_core::display::alpha_from_opacity(opacity),
     }
 }
@@ -4241,6 +4242,7 @@ fn overlay_controls_match_the_render_parameters() {
         c.overlay_draw(),
         Some(OverlayDraw {
             table: focusforge_core::zmap::overlay_table(3, None),
+            ops: Arc::from([]),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
         }),
         "matches display::overlay_cpu's own blend, with no solo source"
@@ -4447,8 +4449,8 @@ fn pipette_reads_and_appends_nothing() {
 }
 
 #[test]
-fn pipette_reads_the_stored_map() {
-    let (mut c, _) = open_editor("pipette_stored_map");
+fn pipette_reads_the_overlay() {
+    let (mut c, _) = open_editor("pipette_overlay");
     let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
     let stored = read_whole_zmap(&zmap);
     let info = ZMapReader::open(&zmap).unwrap().info();
@@ -4474,30 +4476,246 @@ fn pipette_reads_the_stored_map() {
         "a stroke from another frame covers the pixel"
     );
 
-    let alt_click = |c: &mut AppController| {
-        let (sx, sy) = at(px, py);
+    // A pixel clear of the stroke whose stored frame is neither the painter's
+    // nor absent.
+    let (ox, oy, off) = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let source = stored[(y * width + x) as usize];
+            let clear = x.abs_diff(px as u32) > 16 || y.abs_diff(py as u32) > 16;
+            (clear && source != NO_SOURCE && source != painter).then_some((x, y, source))
+        })
+        .expect("the map names another frame clear of the stroke");
+    let (off_x, off_y) = (ox as f32, oy as f32);
+
+    let alt_click = |c: &mut AppController, (x, y): (f32, f32)| {
+        let (sx, sy) = at(x, y);
         c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
         c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
     };
-    alt_click(&mut c);
+    c.select_frame(usize::from(under));
+    alt_click(&mut c, (px, py));
     assert_eq!(
         c.brush_source(),
-        Some(under),
-        "Alt + click reads the stored map under the stroke"
+        Some(painter),
+        "Alt + click over the stroke reads the frame the overlay shows"
+    );
+    c.select_frame(usize::from(painter));
+    alt_click(&mut c, (off_x, off_y));
+    assert_eq!(
+        c.brush_source(),
+        Some(off),
+        "Alt + click off every stroke reads the stored map"
     );
 
-    c.select_frame(usize::from(painter));
+    c.select_frame(usize::from(under));
     c.toggle_pipette();
     let (sx, sy) = at(px, py);
     c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
     assert_eq!(
         c.brush_cursor_view().unwrap().pick_color,
-        job::source_color(under, c.frame_count().unwrap()),
-        "the armed cursor previews the stored source"
+        job::source_color(painter, c.frame_count().unwrap()),
+        "the armed cursor previews the overlay's frame"
+    );
+    let (sx, sy) = at(off_x, off_y);
+    c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+    assert_eq!(
+        c.brush_cursor_view().unwrap().pick_color,
+        job::source_color(off, c.frame_count().unwrap()),
+        "off the stroke the cursor previews the stored frame"
     );
     drag(&mut c, &[(px, py)]);
-    assert_eq!(c.brush_source(), Some(under), "the armed pick");
+    assert_eq!(c.brush_source(), Some(painter), "the armed pick");
     assert_eq!(ops(&c).len(), 1, "picking appends nothing");
+}
+
+/// The overlay's colour at every pixel of the map: the active tab's
+/// `overlay_draw()` over the stored indices at `zmap`.
+fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
+    let draw = c.overlay_draw().expect("the overlay is on");
+    let info = ZMapReader::open(zmap).unwrap().info();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: info.width(),
+        height: info.height(),
+    };
+    let stored = read_whole_zmap(zmap);
+    let mut colors = vec![[0u8; 3]; stored.len()];
+    focusforge_core::retouch::overlay_colors(
+        &draw.ops,
+        info,
+        whole,
+        NonZeroU32::MIN,
+        &draw.table,
+        &stored,
+        &mut colors,
+    );
+    colors
+}
+
+#[test]
+fn live_overlay_follows_the_drag() {
+    let (mut c, _) = open_editor("live_overlay_drag");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let width = info.width() as usize;
+    let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
+    c.set_overlay_on(true);
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.0);
+    let untouched = overlay_pixels(&c, &zmap);
+    assert!(
+        c.overlay_draw().unwrap().ops.is_empty(),
+        "no strokes, no ops"
+    );
+
+    c.select_frame(2);
+    press(&mut c, at(12.0, 20.0));
+    let (sx, sy) = at(30.0, 20.0);
+    c.pointer_moved(sx, sy);
+    c.flush_live_stroke();
+    common::settle_recomposites(&mut c);
+    let held = c.overlay_draw().unwrap().ops;
+    assert!(ops(&c).is_empty(), "the stroke is not an op while held");
+    let [
+        Op::BrushStroke {
+            source_id, path, ..
+        },
+    ] = &held[..]
+    else {
+        panic!("the held overlay draws the live stroke: {held:?}");
+    };
+    assert_eq!(*source_id, 2);
+    assert_eq!(
+        path.last(),
+        Some(&Point { x: 30, y: 20 }),
+        "its path so far"
+    );
+    let mid = overlay_pixels(&c, &zmap);
+    assert_eq!(mid[20 * width + 25], table[2], "the core shows the painter");
+    assert_eq!(mid[0], untouched[0], "far from the stroke the map shows");
+
+    release(&mut c, at(30.0, 20.0));
+    common::settle_recomposites(&mut c);
+    assert_eq!(
+        c.overlay_draw().unwrap().ops.to_vec(),
+        c.edit_session().unwrap().drawn_ops(),
+        "after release the overlay lists the session's drawn ops"
+    );
+    assert_eq!(ops(&c).len(), 1);
+
+    c.select_frame(1);
+    drag(&mut c, &[(24.0, 14.0), (24.0, 30.0)]);
+    let both = overlay_pixels(&c, &zmap);
+    assert_eq!(
+        both[24 * width + 24],
+        table[1],
+        "the later stroke is on top"
+    );
+    assert_eq!(both[20 * width + 14], table[2], "the first still shows");
+
+    c.undo();
+    assert_eq!(c.overlay_draw().unwrap().ops.len(), 1);
+    assert_eq!(
+        overlay_pixels(&c, &zmap)[24 * width + 24],
+        untouched[24 * width + 24],
+        "undo takes the later stroke's colour away"
+    );
+    c.redo();
+    assert_eq!(overlay_pixels(&c, &zmap), both, "redo restores it");
+}
+
+#[test]
+fn live_overlay_shows_the_selected_checkpoint() {
+    let (path, chain) = saved_chain("live_overlay_selected", &[20, 40]);
+    let saved_ops: Vec<Op> = saved(&path)
+        .history()
+        .op_chain(&chain[2])
+        .unwrap()
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(saved_ops.len(), 2);
+
+    let mut c = reopen(&path, "live_overlay_selected_reopened");
+    c.set_overlay_on(true);
+    let shown = |c: &AppController| c.overlay_draw().expect("the overlay is on").ops.to_vec();
+    c.select_checkpoint_row(row_index(&c, &chain[2]));
+    assert_eq!(shown(&c), saved_ops, "a saved row with no session");
+    c.select_checkpoint_row(row_index(&c, &chain[1]));
+    assert_eq!(shown(&c), saved_ops[..1], "its parent's chain");
+    c.select_checkpoint_row(row_index(&c, &chain[0]));
+    assert!(shown(&c).is_empty(), "the unedited root carries none");
+
+    c.select_checkpoint_row(row_index(&c, &chain[2]));
+    c.set_pane_geometry(LEFT, RIGHT);
+    common::enter_editor(&mut c);
+    assert_eq!(shown(&c), saved_ops, "entering the editor keeps them");
+    set_size(&mut c, 8.0);
+    c.select_frame(1);
+    drag(&mut c, &[(10.0, 44.0), (30.0, 44.0)]);
+    let with_new = shown(&c);
+    assert_eq!(with_new.len(), 3);
+    assert_eq!(with_new[..2], saved_ops[..]);
+    assert!(c.save_active_project(|_| None));
+    assert_eq!(shown(&c), with_new, "each stroke once after a save");
+
+    // A held op-bearing row draws its chain through its session.
+    let mut held = open_editor("live_overlay_held").0;
+    held.set_overlay_on(true);
+    set_size(&mut held, 8.0);
+    held.select_frame(1);
+    drag(&mut held, &[(12.0, 20.0), (36.0, 26.0)]);
+    held.select_frame(2);
+    drag(&mut held, &[(16.0, 34.0), (40.0, 30.0)]);
+    let strokes = ops(&held);
+    assert!(held.save_checkpoint());
+    let ops_row = row_index(&held, "held:1");
+    held.select_checkpoint_row(row_index(&held, "held:0"));
+    held.select_checkpoint_row(ops_row);
+    assert_eq!(shown(&held), strokes, "a held row with no session");
+    common::enter_editor(&mut held);
+    assert_eq!(shown(&held), strokes, "and through its session");
+}
+
+#[test]
+fn live_overlay_never_reaches_save_or_export() {
+    let scenario = |overlay: bool, name: &str| {
+        let (mut c, root) = open_editor(name);
+        let sealed = Sealed::read(&mut c, &root);
+        set_size(&mut c, 12.0);
+        c.set_brush_softness_fraction(0.5);
+        c.select_frame(0);
+        drag(&mut c, &[(40.0, 50.0), (50.0, 54.0)]);
+        let path = save_to_proposed(&mut c);
+        c.select_frame(1);
+        drag(&mut c, &[(10.0, 12.0), (30.0, 20.0)]);
+        c.select_frame(2);
+        drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
+        let before = fs::read(&path).unwrap();
+        c.set_overlay_on(true);
+        c.set_overlay_opacity_fraction(0.8);
+        c.set_overlay_on(false);
+        assert!(
+            fs::read(&path).unwrap() == before,
+            "toggling the overlay writes nothing"
+        );
+        c.set_overlay_on(overlay);
+        let shown = sealed.displayed(&c);
+        assert!(c.save_active_project(|_| None));
+        let render = saved_render(&path);
+        assert!(
+            shown == render,
+            "the live view and the saved render ignore the overlay"
+        );
+        (render, ops(&c).len(), saved(&path).checkpoint().ops.clone())
+    };
+    let off = scenario(false, "live_overlay_off");
+    let on = scenario(true, "live_overlay_on");
+    assert!(on.0 == off.0, "the render is the same with the overlay on");
+    assert_eq!(on.2, off.2, "the saved ops are the same");
+    assert_eq!(on.2.len(), 2);
 }
 
 #[test]
@@ -5857,6 +6075,7 @@ fn background_recomposite_matches_the_synchronous_one() {
         registration,
         16,
         job::host_budget(),
+        Vec::new(),
         ops(&c),
     )
     .expect("a second session over the same frames opens");
@@ -7559,6 +7778,7 @@ fn a_session_renders_after_its_composite_file_is_removed() {
         sealed.registration.clone(),
         16,
         job::host_budget(),
+        Vec::new(),
         Vec::new(),
     )
     .expect("a session over the copies opens");

@@ -85,7 +85,7 @@ impl DisplayTexture {
     }
 }
 
-/// The kernel's uniform: 16 bytes, far under
+/// The kernel's uniform: 20 bytes, far under
 /// `max_uniform_buffer_binding_size = 16 KiB`. Explicit `to_le_bytes`,
 /// never a `bytemuck` transmute -- the workspace denies `unsafe_code`,
 /// the same reason `crate::pack` gives.
@@ -96,19 +96,16 @@ struct Params {
     index_scale: u32,
     /// Only read by the `overlay` entry point; `render` leaves this at 0.
     alpha: u32,
-    /// Only read by the `overlay` entry point; `render` leaves this at 0.
-    table_len: u32,
 }
 
 impl Params {
-    fn to_bytes(&self) -> [u8; 24] {
-        let mut bytes = [0u8; 24];
+    fn to_bytes(&self) -> [u8; 20] {
+        let mut bytes = [0u8; 20];
         bytes[0..4].copy_from_slice(&self.width.to_le_bytes());
         bytes[4..8].copy_from_slice(&self.height.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.samples_per_pixel.to_le_bytes());
         bytes[12..16].copy_from_slice(&self.index_scale.to_le_bytes());
         bytes[16..20].copy_from_slice(&self.alpha.to_le_bytes());
-        bytes[20..24].copy_from_slice(&self.table_len.to_le_bytes());
         bytes
     }
 }
@@ -142,16 +139,15 @@ fn overlay_pipeline(device: &wgpu::Device) -> Pipeline {
             uniform_entry(1),
             storage_texture_entry(2),
             storage_entry(3, true),
-            storage_entry(4, true),
         ],
     )
 }
 
-/// Packs `table` into one little-endian `u32` per entry, `0x00BBGGRR` --
-/// the WGSL kernel's `color_table` layout.
-fn pack_table(table: &[[u8; 3]]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(table.len() * 4);
-    for &[r, g, b] in table {
+/// Packs `colors` into one little-endian `u32` per colour, `0x00BBGGRR` --
+/// the WGSL kernel's `overlay_colors` layout.
+fn pack_colors(colors: &[[u8; 3]]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(colors.len() * 4);
+    for &[r, g, b] in colors {
         let word = u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16);
         bytes.extend_from_slice(&word.to_le_bytes());
     }
@@ -160,7 +156,7 @@ fn pack_table(table: &[[u8; 3]]) -> Vec<u8> {
 
 /// Uploads `bytes` into a new [`create_storage_buffer`] via
 /// `queue.write_buffer`. Timed and byte-counted so every caller's upload
-/// cost is attributed, including [`render_overlay`]'s table buffer.
+/// cost is attributed, including [`render_overlay`]'s colour buffer.
 fn upload_storage(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -211,11 +207,11 @@ impl DisplayRenderer {
         let pipeline = tonemap_pipeline(device);
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("focusforge-gpu-display-params"),
-            size: 24,
+            size: 20,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        record_timing(TimingCounter::AllocationBytes, 24);
+        record_timing(TimingCounter::AllocationBytes, 20);
         record_timing(TimingCounter::AllocationOperations, 1);
         Self {
             pipeline,
@@ -283,7 +279,6 @@ impl DisplayRenderer {
             samples_per_pixel,
             index_scale,
             alpha: 0,
-            table_len: 0,
         };
         queue.write_buffer(&self.params_buffer, 0, &params.to_bytes());
 
@@ -320,30 +315,27 @@ impl DisplayRenderer {
     }
 }
 
-/// Blends `table`'s colour for each `indices` entry over `composite` at
-/// `alpha` (`0` transparent, `255` opaque) into `target`. `composite` is the
-/// recomposited three-sample-per-pixel image; `indices` are the Z-Map's raw
-/// `u16` samples in the same layout. `composite.len()` must equal
-/// `target.width() * target.height() * 3`; `indices.len()` must equal
+/// Blends each pixel's colour in `colors` over `composite` at `alpha` (`0`
+/// transparent, `255` opaque) into `target`. `composite` is the recomposited
+/// three-sample-per-pixel image. `composite.len()` must equal
+/// `target.width() * target.height() * 3`; `colors.len()` must equal
 /// `target.width() * target.height()`.
 pub fn render_overlay(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     target: &DisplayTexture,
     composite: &[u16],
-    indices: &[u16],
-    table: &[[u8; 3]],
+    colors: &[[u8; 3]],
     alpha: u8,
 ) {
     let _scope = measurement_scope("gpu_display_render_overlay");
     let composite_buffer =
         upload_samples(device, queue, composite, "focusforge-gpu-overlay-composite");
-    let indices_buffer = upload_samples(device, queue, indices, "focusforge-gpu-overlay-indices");
-    let table_buffer = upload_storage(
+    let colors_buffer = upload_storage(
         device,
         queue,
-        &pack_table(table),
-        "focusforge-gpu-overlay-table",
+        &pack_colors(colors),
+        "focusforge-gpu-overlay-colors",
     );
 
     let params = Params {
@@ -352,7 +344,6 @@ pub fn render_overlay(
         samples_per_pixel: 3,
         index_scale: 0,
         alpha: u32::from(alpha),
-        table_len: table.len() as u32,
     };
     let params_buffer = crate::pipeline::upload_params(device, queue, &params.to_bytes());
 
@@ -380,11 +371,7 @@ pub fn render_overlay(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: indices_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: table_buffer.as_entire_binding(),
+                resource: colors_buffer.as_entire_binding(),
             },
         ],
         target.width(),

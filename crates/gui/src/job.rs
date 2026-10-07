@@ -46,7 +46,7 @@ pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
-pub use focusforge_core::retouch::footprint;
+pub use focusforge_core::retouch::{footprint, top_source};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
 /// Which operation a failure belongs to, classified from the typed
@@ -1045,6 +1045,8 @@ pub struct EditState {
     pub base: Arc<TiffStack>,
     /// The file `base` reads.
     pub(crate) composite: PathBuf,
+    /// The ops already blended into `base`, oldest first.
+    base_ops: Vec<Op>,
     /// The ops the row stacks over `base` before the pending ones, oldest
     /// first.
     chain: Vec<Op>,
@@ -1254,6 +1256,16 @@ impl EditState {
         self.chain.iter().chain(&self.pending).cloned().collect()
     }
 
+    /// Every op the edited image shows, including those already in `base`:
+    /// the base ops, then [`Self::stack_ops`].
+    pub fn drawn_ops(&self) -> Vec<Op> {
+        self.base_ops
+            .iter()
+            .cloned()
+            .chain(self.stack_ops())
+            .collect()
+    }
+
     /// Makes the pending ops part of the chain and forgets the redo stack, so
     /// nothing is left to undo or redo.
     pub fn rebase(&mut self) {
@@ -1388,10 +1400,12 @@ impl EditState {
 }
 
 /// Builds an [`EditState`] over the whole map: `composite` is the image edits
-/// blend over, the resident cache is gridded at `tile_size` px, and `chain`
-/// (a row's ops, oldest first) is replayed over it and kept as the state's
-/// chain. An op that cannot be applied ends the replay; a region that cannot
-/// be rendered is skipped.
+/// blend over, the resident cache is gridded at `tile_size` px, `base_ops`
+/// are the ops `composite` already shows (oldest first), and `chain` (a row's
+/// ops, oldest first) is replayed over it and kept as the state's chain. An
+/// op that cannot be applied ends the replay; a region that cannot be
+/// rendered is skipped.
+#[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
     zmap: &Path,
     composite: &Path,
@@ -1399,6 +1413,7 @@ pub fn open_edit_session(
     registration: Registration,
     tile_size: u32,
     budget: HostBudget,
+    base_ops: Vec<Op>,
     chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
     let reader = ZMapReader::open(zmap)?;
@@ -1431,6 +1446,7 @@ pub fn open_edit_session(
         registration,
         base,
         composite: composite.to_path_buf(),
+        base_ops,
         chain: Vec::new(),
         snapshot: tiles.subset(&[]),
         tiles,

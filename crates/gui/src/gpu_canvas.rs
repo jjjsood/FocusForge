@@ -16,6 +16,7 @@ use focusforge_core::timing::measurement_scope;
 use focusforge_core::TiffError;
 use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::{FrameError, TiffStack};
+use focusforge_core::retouch::overlay_colors;
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapReader};
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
@@ -158,21 +159,13 @@ impl PaneTexture {
         width: u32,
         height: u32,
         composite: &[u16],
-        indices: &[u16],
-        overlay: &OverlayDraw,
+        colors: &[[u8; 3]],
+        alpha: u8,
     ) {
         let Some(texture) = self.ensure_texture(device, width, height) else {
             return;
         };
-        render_overlay(
-            device,
-            queue,
-            texture,
-            composite,
-            indices,
-            &overlay.table,
-            overlay.alpha,
-        );
+        render_overlay(device, queue, texture, composite, colors, alpha);
     }
 
     /// Applies the outcome of importing a newly (re)allocated texture. On
@@ -338,6 +331,7 @@ mod tests {
 
         let overlay = crate::canvas::OverlayDraw {
             table: focusforge_core::zmap::overlay_table(1, None),
+            ops: Arc::from([]),
             alpha: focusforge_core::display::alpha_from_opacity(0.65),
         };
         assert!(
@@ -1028,17 +1022,29 @@ impl CanvasRenderer {
                     merged
                 });
                 let composite = merged.as_deref().unwrap_or(samples);
-                match &job.state.overlay {
-                    Some(overlay) => texture.ensure_and_render_overlay(
-                        &device,
-                        &queue,
-                        width,
-                        height,
-                        composite,
-                        sealed_indices,
-                        overlay,
-                    ),
-                    None => texture.ensure_and_render(
+                match (&job.state.overlay, self.zmap.as_deref()) {
+                    (Some(overlay), Some(zmap)) => {
+                        let mut colors = vec![[0u8; 3]; sealed_indices.len()];
+                        overlay_colors(
+                            &overlay.ops,
+                            zmap.info(),
+                            rect,
+                            step,
+                            &overlay.table,
+                            sealed_indices,
+                            &mut colors,
+                        );
+                        texture.ensure_and_render_overlay(
+                            &device,
+                            &queue,
+                            width,
+                            height,
+                            composite,
+                            &colors,
+                            overlay.alpha,
+                        );
+                    }
+                    _ => texture.ensure_and_render(
                         renderer,
                         &device,
                         &queue,

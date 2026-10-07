@@ -8,6 +8,8 @@
 //! exact point-to-segment distance, so it is a pure function of the stroke and
 //! the pixel. Alpha is Q16 (`0..=65536`); the blend rounds to nearest.
 
+use std::num::NonZeroU32;
+
 use crate::algorithm::TileReader;
 use crate::project::{Op, Point};
 use crate::tile::Rect;
@@ -168,6 +170,14 @@ impl SegmentGrid {
         }
     }
 
+    /// The path segments listed for the cell holding the pixel `(x, y)`,
+    /// which must lie in the grid's region.
+    pub(super) fn segments_at(&self, x: u32, y: u32) -> &[u32] {
+        let column = ((x - self.region.x) / self.cell) as usize;
+        let row = ((y - self.region.y) / self.cell) as usize;
+        &self.cells[row * self.columns + column]
+    }
+
     /// Calls `visit(x, y, segments)` for every pixel of the region lying in a
     /// cell some segment can reach, with that cell's segment indices.
     pub(super) fn walk(&self, mut visit: impl FnMut(u32, u32, &[u32])) {
@@ -273,6 +283,81 @@ pub fn blend_sample(out: u16, src: u16, alpha: u32) -> u16 {
     debug_assert!(alpha <= OPAQUE, "alpha is Q16 in 0..=65536");
     let (out, src, alpha) = (u64::from(out), u64::from(src), u64::from(alpha));
     ((out * (u64::from(OPAQUE) - alpha) + src * alpha + 32768) >> 16) as u16
+}
+
+/// Whether a stroke with Q16 `alpha` shows its own source at a pixel: more
+/// than half of full coverage. The one rule [`top_source`] and
+/// [`overlay_colors`] share.
+fn shows_source(alpha: u32) -> bool {
+    alpha > OPAQUE / 2
+}
+
+/// The source of the latest valid stroke in `ops` whose alpha at `(x, y)`
+/// exceeds half of full coverage, `None` when no stroke reaches that far.
+pub fn top_source(ops: &[Op], info: ZMapInfo, x: u32, y: u32) -> Option<u16> {
+    ops.iter().rev().find_map(|op| {
+        let Op::BrushStroke { source_id, .. } = op;
+        shows_source(alpha(op, info, x, y).ok()?).then_some(*source_id)
+    })
+}
+
+/// Fills `out` with each sample's overlay colour over the `step`-th rows and
+/// columns of `rect`: `table`'s colour for the stored index in `indices`
+/// (clamped to the last entry), then, per valid stroke of `ops` in order, the
+/// stroke source's colour wherever the stroke shows its source (the rule of
+/// [`top_source`]). Cost follows the samples near each path.
+pub fn overlay_colors(
+    ops: &[Op],
+    info: ZMapInfo,
+    rect: Rect,
+    step: NonZeroU32,
+    table: &[[u8; 3]],
+    indices: &[u16],
+    out: &mut [[u8; 3]],
+) {
+    let step = step.get();
+    let columns = rect.width.div_ceil(step) as usize;
+    let rows = rect.height.div_ceil(step) as usize;
+    debug_assert_eq!(indices.len(), columns * rows);
+    debug_assert_eq!(out.len(), columns * rows);
+    let last = table.len() - 1;
+    for (color, &index) in out.iter_mut().zip(indices) {
+        *color = table[usize::from(index).min(last)];
+    }
+    for op in ops {
+        let Op::BrushStroke { source_id, .. } = op;
+        let Ok(stroke) = validate(op, info) else {
+            continue;
+        };
+        let Some(active) = stroke_footprint(&stroke, info).and_then(|fp| rect.intersect(fp)) else {
+            continue;
+        };
+        let over = table[usize::from(*source_id).min(last)];
+        let ramp = Ramp::new(&stroke);
+        let grid = SegmentGrid::new(&stroke, active);
+        // Lattice samples inside `active`: sample `i` sits at `rect.x + i * step`.
+        let first = |origin: u32, from: u32| (from - origin).div_ceil(step);
+        let end = |origin: u32, to: u32| (to - origin).div_ceil(step);
+        for j in first(rect.y, active.y)..end(rect.y, active.y + active.height) {
+            let y = rect.y + j * step;
+            for i in first(rect.x, active.x)..end(rect.x, active.x + active.width) {
+                let x = rect.x + i * step;
+                let segments = grid.segments_at(x, y);
+                if segments.is_empty() {
+                    continue;
+                }
+                let a = ramp.alpha(distance_16(
+                    &stroke,
+                    x,
+                    y,
+                    segments.iter().map(|&s| s as usize),
+                ));
+                if shows_source(a) {
+                    out[j as usize * columns + i as usize] = over;
+                }
+            }
+        }
+    }
 }
 
 /// Blends the stroke `op`'s source samples over `out`. `out` holds the
@@ -823,5 +908,206 @@ mod tests {
         let err = apply_strokes(info, out_rect, &mut out, &placed, &frames, (0, 0), 1).unwrap_err();
         assert!(matches!(err, RetouchError::Source(_)), "{err:?}");
         assert!(out.iter().all(|&s| s == 5), "a failed read writes nothing");
+    }
+
+    fn palette() -> Vec<[u8; 3]> {
+        crate::zmap::overlay_table(4, None)
+    }
+
+    /// Stored indices that differ from sample to sample, `NO_SOURCE` among them.
+    fn stored(len: usize) -> Vec<u16> {
+        (0..len)
+            .map(|i| {
+                if i % 11 == 0 {
+                    crate::zmap::NO_SOURCE
+                } else {
+                    (i % 4) as u16
+                }
+            })
+            .collect()
+    }
+
+    /// `(buffer index, x, y)` of every lattice sample of `rect` at `step`.
+    fn lattice(rect: Rect, step: u32) -> impl Iterator<Item = (usize, u32, u32)> {
+        let columns = rect.width.div_ceil(step);
+        let rows = rect.height.div_ceil(step);
+        (0..rows).flat_map(move |j| {
+            (0..columns).map(move |i| {
+                (
+                    (j * columns + i) as usize,
+                    rect.x + i * step,
+                    rect.y + j * step,
+                )
+            })
+        })
+    }
+
+    fn samples(rect: Rect, step: u32) -> usize {
+        (rect.width.div_ceil(step) * rect.height.div_ceil(step)) as usize
+    }
+
+    fn colors_over(
+        ops: &[Op],
+        map: ZMapInfo,
+        rect: Rect,
+        step: u32,
+        indices: &[u16],
+    ) -> Vec<[u8; 3]> {
+        let mut out = vec![[0u8; 3]; indices.len()];
+        overlay_colors(
+            ops,
+            map,
+            rect,
+            NonZeroU32::new(step).unwrap(),
+            &palette(),
+            indices,
+            &mut out,
+        );
+        out
+    }
+
+    /// Two overlapping soft strokes from frames 1 and 3 and one the map's
+    /// frame count refuses.
+    fn overlapping_strokes() -> Vec<Op> {
+        vec![
+            stroke_op(1, vec![pt(3, 5), pt(30, 20)], 7.0, 0.7),
+            stroke_op(3, vec![pt(8, 24), pt(35, 3)], 6.0, 0.5),
+            stroke_op(9, vec![pt(10, 10)], 4.0, 0.5),
+        ]
+    }
+
+    #[test]
+    fn overlay_colors_match_brute_force_cutoff() {
+        let map = info(40, 30);
+        let table = palette();
+        let last = table.len() - 1;
+        let mut ops = overlapping_strokes();
+        ops.push(stroke_op(2, vec![pt(-50, -50), pt(-40, -50)], 5.0, 0.5));
+        let rect = rect(2, 1, 35, 27);
+        for step in [1u32, 4] {
+            let indices = stored(samples(rect, step));
+            let out = colors_over(&ops, map, rect, step, &indices);
+            let mut painted = 0;
+            for (at, x, y) in lattice(rect, step) {
+                let mut expected = table[usize::from(indices[at]).min(last)];
+                for op in &ops {
+                    let Ok(a) = alpha(op, map, x, y) else {
+                        continue;
+                    };
+                    if a > 32768 {
+                        let Op::BrushStroke { source_id, .. } = op;
+                        expected = table[usize::from(*source_id).min(last)];
+                        painted += 1;
+                    }
+                }
+                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+            }
+            assert!(painted > 20, "the strokes cover samples at step {step}");
+        }
+    }
+
+    #[test]
+    fn overlay_colors_edges() {
+        let map = info(40, 30);
+        let table = palette();
+        let last = table.len() - 1;
+        let rect = rect(0, 0, 40, 30);
+        let indices = stored(40 * 30);
+        let plain: Vec<[u8; 3]> = indices
+            .iter()
+            .map(|&z| table[usize::from(z).min(last)])
+            .collect();
+        assert!(indices.contains(&crate::zmap::NO_SOURCE));
+        assert_eq!(colors_over(&[], map, rect, 1, &indices), plain, "no ops");
+
+        let refused = [
+            stroke_op(4, vec![pt(10, 10)], 5.0, 0.5),
+            stroke_op(1, Vec::new(), 5.0, 0.5),
+            stroke_op(1, vec![pt(10, 10)], -2.0, 0.5),
+            stroke_op(1, vec![pt(10, 10)], 5.0, 1.5),
+        ];
+        assert_eq!(colors_over(&refused, map, rect, 1, &indices), plain);
+
+        let mut ops = refused.to_vec();
+        ops.push(stroke_op(2, vec![pt(-3, 15), pt(4, 15)], 6.0, 0.4));
+        let out = colors_over(&ops, map, rect, 1, &indices);
+        let mut painted = 0;
+        for y in 0..30u32 {
+            for x in 0..40u32 {
+                let at = (y * 40 + x) as usize;
+                if out[at] != plain[at] {
+                    painted += 1;
+                    assert_eq!(out[at], table[2], "({x}, {y})");
+                    assert!(x < 12, "paint stays inside the stroke's reach: ({x}, {y})");
+                }
+            }
+        }
+        assert!(
+            painted > 0,
+            "the half-outside stroke paints its in-map part"
+        );
+        assert_eq!(out[15 * 40], table[2], "the in-map end is covered");
+    }
+
+    #[test]
+    fn top_source_takes_the_latest_majority_cover() {
+        let map = info(60, 30);
+        // Radius 10 with full softness: alpha falls from 65536 at the point.
+        let one = [stroke_op(1, vec![pt(10, 15)], 10.0, 1.0)];
+        let flip = (10..40)
+            .find(|&x| alpha(&one[0], map, x, 15).unwrap() <= 32768)
+            .expect("the edge falls to half");
+        for x in 10..flip {
+            assert_eq!(top_source(&one, map, x, 15), Some(1), "inside at {x}");
+        }
+        for x in flip..40 {
+            assert_eq!(top_source(&one, map, x, 15), None, "outside at {x}");
+        }
+
+        let two = [
+            stroke_op(1, vec![pt(10, 15)], 10.0, 1.0),
+            stroke_op(3, vec![pt(16, 15)], 10.0, 1.0),
+        ];
+        // The later stroke wins where it covers more than half, the earlier
+        // one where only it does.
+        assert_eq!(top_source(&two, map, 13, 15), Some(3), "both over half");
+        assert_eq!(top_source(&two, map, 11, 15), Some(1), "only the earlier");
+        assert_eq!(top_source(&two, map, 20, 15), Some(3), "only the later");
+        assert_eq!(top_source(&two, map, 21, 15), None);
+
+        let refused = [
+            stroke_op(1, vec![pt(10, 15)], 10.0, 1.0),
+            stroke_op(9, vec![pt(10, 15)], 10.0, 1.0),
+        ];
+        assert_eq!(
+            top_source(&refused, map, 10, 15),
+            Some(1),
+            "refused op skipped"
+        );
+    }
+
+    #[test]
+    fn top_source_agrees_with_overlay_colors() {
+        let map = info(40, 30);
+        let table = palette();
+        let last = table.len() - 1;
+        let ops = overlapping_strokes();
+        let rect = rect(2, 1, 35, 27);
+        for step in [1u32, 4] {
+            let indices = stored(samples(rect, step));
+            let out = colors_over(&ops, map, rect, step, &indices);
+            let mut shown = 0;
+            for (at, x, y) in lattice(rect, step) {
+                let expected = match top_source(&ops, map, x, y) {
+                    Some(source) => {
+                        shown += 1;
+                        table[usize::from(source).min(last)]
+                    }
+                    None => table[usize::from(indices[at]).min(last)],
+                };
+                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+            }
+            assert!(shown > 20, "the strokes cover samples at step {step}");
+        }
     }
 }

@@ -9,7 +9,7 @@ pub mod recomposite;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
-pub use blend::footprint;
+pub use blend::{footprint, overlay_colors, top_source};
 pub use recomposite::{Sources, named_frames, recomposite, recomposite_bands};
 
 /// Failures validating or applying an op against a Z-Map.

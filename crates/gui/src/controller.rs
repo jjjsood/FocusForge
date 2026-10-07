@@ -963,6 +963,50 @@ impl ProjectTab {
         }
     }
 
+    /// The ops the row's planes already show: a saved checkpoint's render
+    /// carries its own op chain; a fused in-memory row's planes carry none.
+    fn base_ops(&self) -> Vec<job::Op> {
+        let GuiProject::Opened(project) = &self.project else {
+            return Vec::new();
+        };
+        let Some(key) = self
+            .plane_key()
+            .filter(|key| checkpoints::held_index(key).is_none())
+        else {
+            return Vec::new();
+        };
+        project
+            .history()
+            .op_chain(&key)
+            .map(|ops| ops.into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every stroke the overlay draws: the ones in the row's planes, the
+    /// session's own and the stroke being dragged. With no session, the
+    /// row's planes' strokes and its in-memory ones.
+    fn overlay_ops(&self) -> Vec<job::Op> {
+        let Some(edit) = &self.edit else {
+            let held = self
+                .selected_checkpoint
+                .as_deref()
+                .and_then(checkpoints::held_index)
+                .and_then(|index| checkpoints::stroke_chain(&self.held, index))
+                .unwrap_or_default();
+            return self.base_ops().into_iter().chain(held).collect();
+        };
+        let mut ops = edit.drawn_ops();
+        if let Some(stroke) = &edit.stroke {
+            ops.push(job::Op::BrushStroke {
+                source_id: stroke.source(),
+                path: stroke.path_so_far(),
+                radius: stroke.radius(),
+                softness: stroke.softness(),
+            });
+        }
+        ops
+    }
+
     /// Drops the installed session, if any, and starts a new session
     /// generation so one still opening for the old state is dropped when it
     /// lands. Returns whether an installed session was dropped.
@@ -1801,6 +1845,7 @@ impl AppController {
             return SessionOpen::Unavailable;
         };
         let frames = tab.frames.clone();
+        let base_ops = tab.base_ops();
         let chain = tab
             .selected_checkpoint
             .as_deref()
@@ -1824,6 +1869,7 @@ impl AppController {
                     registration,
                     tile_size,
                     job::host_budget(),
+                    base_ops,
                     chain,
                 )
             })
@@ -1953,18 +1999,19 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// The `Composite` pane's overlay draw parameters, matching
-    /// `display::overlay_cpu`'s blend, in either mode -- `None` with the
-    /// overlay off or when the active tab's selected row has no fuse. The table spans that fuse's sources.
+    /// The `Composite` pane's overlay draw parameters -- `None` with the
+    /// overlay off or when the active tab's selected row has no fuse. The
+    /// table spans that fuse's sources; the ops are the strokes the image
+    /// shows, the one being dragged included.
     pub fn overlay_draw(&self) -> Option<OverlayDraw> {
         if !self.state.overlay.on {
             return None;
         }
-        let sources = self.state.active()?.fused()?.0.len();
-        Some(OverlayDraw::for_opacity(
-            sources as u32,
-            self.state.overlay.opacity,
-        ))
+        let tab = self.state.active()?;
+        let sources = tab.fused()?.0.len();
+        let mut draw = OverlayDraw::for_opacity(sources as u32, self.state.overlay.opacity);
+        draw.ops = tab.overlay_ops().into();
+        Some(draw)
     }
 
     /// In editor mode, gives a newly active editable tab its own edit
@@ -2898,8 +2945,9 @@ impl AppController {
 
     /// The brush cursor overlay's own view: extent and path commands built from the current brush
     /// size/softness scaled to on-screen px by the active tab's own viewport, the pipette's own
-    /// preview colour -- the Z-Map index under the pointer while armed or while `Alt` is held, the
-    /// selected source otherwise -- and projects that source point into both panes. `None` with no active tab, viewport or pane geometry, or while
+    /// preview colour -- the frame the overlay shows under the pointer while armed or while `Alt`
+    /// is held, the selected source otherwise -- and projects that source point into both panes.
+    /// `None` with no active tab, viewport or pane geometry, or while
     /// [`Self::canvas_blocked`] holds.
     pub fn brush_cursor_view(&self) -> Option<BrushCursorView> {
         if self.canvas_blocked() {
@@ -3026,11 +3074,10 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// Reads the Z-Map index under `local` (pane-local coordinates) --
-    /// shared by [`Self::pick_source_at`] (which commits it as the brush
-    /// source) and [`Self::brush_cursor_view`] (which only previews its
-    /// colour). `None` off the image, off the active tab's tile, or with
-    /// nothing to read; callers decide what `NO_SOURCE` means to them.
+    /// The frame the overlay shows under `local` (pane-local coordinates):
+    /// the latest stroke covering the pixel by more than half, else the
+    /// stored Z-Map's index. `None` off the image or with nothing to read;
+    /// callers decide what `NO_SOURCE` means to them.
     fn source_index_at(&self, pane: PaneSource, local: (f32, f32)) -> Option<u16> {
         let tab = self.state.active()?;
         let viewport = tab.viewport.as_ref()?;
@@ -3039,11 +3086,17 @@ impl AppController {
             return None;
         }
         let (x, y) = (sx.floor() as u32, sy.floor() as u32);
-        tab.edit.as_ref()?.stored_source(x, y)
+        let edit = tab.edit.as_ref()?;
+        let info = edit.info();
+        if x >= info.width() || y >= info.height() {
+            return None;
+        }
+        job::top_source(&edit.drawn_ops(), info, x, y).or_else(|| edit.stored_source(x, y))
     }
 
-    /// `Alt + click`, or the armed pipette's `Start`: reads the Z-Map index
-    /// under `local` (pane-local coordinates) and makes it the brush source.
+    /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
+    /// overlay shows under `local` (pane-local coordinates) and makes it the
+    /// brush source.
     /// `NO_SOURCE` and a point off the image leave the source unchanged.
     fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
         let Some(source) = self.source_index_at(pane, local) else {

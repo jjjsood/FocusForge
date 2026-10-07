@@ -17,19 +17,16 @@ struct Params {
     height: u32,
     samples_per_pixel: u32,
     index_scale: u32,
-    // Only read by `overlay`: `main` leaves both at 0.
+    // Only read by `overlay`; `main` leaves it at 0.
     alpha: u32,
-    table_len: u32,
 }
 
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
-// Only bound for `overlay`: the Z-Map's raw indices, packed two-per-`u32`
-// like `src`, and the host-built colour table, one packed-RGB `u32`
-// (`0x00BBGGRR`) per entry.
-@group(0) @binding(3) var<storage, read> zmap_indices: array<u32>;
-@group(0) @binding(4) var<storage, read> color_table: array<u32>;
+// Only bound for `overlay`: the host-composed overlay colour of each pixel,
+// one packed-RGB `u32` (`0x00BBGGRR`) per pixel.
+@group(0) @binding(3) var<storage, read> overlay_colors: array<u32>;
 
 // The 4x4 ordered (Bayer) dither matrix -- the WGSL twin of
 // `focusforge_core::display::BAYER_4X4`, values `0..=15`.
@@ -108,8 +105,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     textureStore(dst, vec2<i32>(i32(x), i32(y)), color);
 }
 
-// The overlay entry point: `color_table`'s entry for each pixel's Z-Map
-// index, blended over `src`'s composite at `params.alpha`, reusing the same
+// The overlay entry point: `overlay_colors`' colour for each pixel, blended
+// over `src`'s composite at `params.alpha`, reusing the same
 // reduction and packed-sample addressing as `main`. `focusforge_core`'s
 // `overlay_cpu` is this kernel's twin, operator for operator.
 @compute @workgroup_size(8, 8)
@@ -125,18 +122,10 @@ fn overlay(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let base_g = reduce16to8(sample_at(i * 3u + 1u), x, y);
     let base_b = reduce16to8(sample_at(i * 3u + 2u), x, y);
 
-    let index_word = zmap_indices[i / 2u];
-    var index: u32;
-    if (i % 2u == 0u) {
-        index = index_word & 0xffffu;
-    } else {
-        index = index_word >> 16u;
-    }
-    let last = params.table_len - 1u;
-    let table_word = color_table[min(index, last)];
-    let over_r = table_word & 0xffu;
-    let over_g = (table_word >> 8u) & 0xffu;
-    let over_b = (table_word >> 16u) & 0xffu;
+    let color_word = overlay_colors[i];
+    let over_r = color_word & 0xffu;
+    let over_g = (color_word >> 8u) & 0xffu;
+    let over_b = (color_word >> 16u) & 0xffu;
 
     let alpha = params.alpha;
     let r = (base_r * (255u - alpha) + over_r * alpha + 127u) / 255u;

@@ -123,15 +123,7 @@ impl CheckpointImage {
         let record = project.fuse_state(id)?;
 
         let composite = record.composite.clone();
-        let chain = project.history().ancestors(id)?;
-        // `chain` runs from the checkpoint down to the root; the ops apply
-        // oldest first.
-        let applied = chain.iter().take_while(|c| !c.ops.is_empty()).count();
-        let ops: Vec<&Op> = chain[..applied]
-            .iter()
-            .rev()
-            .flat_map(|c| c.ops.iter())
-            .collect();
+        let ops = project.history().op_chain(id)?;
         if ops.is_empty() {
             return Ok(Self::shaped(&composite, Body::Fused(record.composite)));
         }

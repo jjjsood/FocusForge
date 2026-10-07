@@ -21,6 +21,7 @@ use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
+use focusforge_core::project::Op;
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
@@ -947,20 +948,23 @@ pub struct EditedView<'a> {
     pub tiles: &'a ResidentTiles,
 }
 
-/// The `Composite` pane's overlay draw parameters -- the table and alpha
+/// The `Composite` pane's overlay draw parameters: the colour table, the
+/// strokes drawn over the stored Z-Map's colours and the alpha
 /// `display::overlay_cpu` blends with.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverlayDraw {
     pub table: Vec<[u8; 3]>,
+    pub ops: Arc<[Op]>,
     pub alpha: u8,
 }
 
 impl OverlayDraw {
     /// The overlay's own palette table for `sources` frames, with nothing
-    /// soloed, and `opacity`'s (`0.0..=1.0`) alpha.
+    /// soloed, no strokes and `opacity`'s (`0.0..=1.0`) alpha.
     pub fn for_opacity(sources: u32, opacity: f32) -> Self {
         Self {
             table: overlay_table(sources, None),
+            ops: Arc::from([]),
             alpha: alpha_from_opacity(opacity),
         }
     }

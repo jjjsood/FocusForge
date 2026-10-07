@@ -253,6 +253,19 @@ impl History {
         }
     }
 
+    /// The ops a render of `id` applies, oldest first: those of the unbroken
+    /// run of op-bearing checkpoints from `id` down, since a fused checkpoint
+    /// holds the planes the ops above it blend over.
+    pub fn op_chain(&self, id: &str) -> Result<Vec<&Op>, ProjectError> {
+        let chain = self.ancestors(id)?;
+        let applied = chain.iter().take_while(|c| !c.ops.is_empty()).count();
+        Ok(chain[..applied]
+            .iter()
+            .rev()
+            .flat_map(|c| c.ops.iter())
+            .collect())
+    }
+
     /// The direct children of `id`.
     pub fn children(&self, id: &str) -> Vec<&Checkpoint> {
         self.children
