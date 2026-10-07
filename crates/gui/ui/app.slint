@@ -214,14 +214,13 @@ export component AppWindow inherits Window {
         save-checkpoint-requested => { root.save-checkpoint-requested(); }
     }
 
-    // Both images are `in` properties set from Rust
+    // The images are `in` properties set from Rust
     // (`crates/gui/src/gpu_canvas.rs`) once a project is loaded -- the wgpu
     // texture is never computed here.
     in property <image> composite-source;
-    in property <image> zmap-source;
     // The selected source frame (`src/gpu_canvas.rs::redraw_frame`) -- the
     // left pane's own image, label and refusal text, independent of the
-    // composite/Z-Map pair above.
+    // composite above.
     in property <image> frame-source;
     in property <string> frame-label: "";
     // Each pane's refusal, one entry per line: the selected frame's on the
@@ -348,7 +347,6 @@ export component AppWindow inherits Window {
             width: 100%;
             height: 100%;
             composite-source: root.composite-source;
-            zmap-source: root.zmap-source;
             frame-source: root.frame-source;
             frame-label: root.frame-label;
             frame-message-lines: root.frame-message-lines;

@@ -378,11 +378,7 @@ fn show_panes(
     app.set_frame_backdrop_w(rect.2);
     app.set_frame_backdrop_h(rect.3);
     let (backdrop, rect) = plane_draw
-        .and_then(|draw| {
-            let renderer = renderer?;
-            (renderer.plane() == PaneSource::Composite)
-                .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
-        })
+        .and_then(|draw| renderer?.backdrop_placement(Pane::Composite, &draw))
         .unwrap_or_default();
     app.set_backdrop(backdrop);
     app.set_backdrop_x(rect.0);
@@ -391,23 +387,12 @@ fn show_panes(
     app.set_backdrop_h(rect.3);
 
     let planes = plane_draw.and_then(|draw| {
-        let renderer = renderer?;
-        let plane = renderer.plane();
-        let placed = renderer.placement(plane.into(), &draw)?;
-        Some((draw, plane, placed))
+        let placed = renderer?.placement(Pane::Composite, &draw)?;
+        Some((draw, placed))
     });
     match planes {
-        Some((draw, plane, (image, dst))) => {
-            match plane {
-                PaneSource::Composite => {
-                    app.set_composite_source(image);
-                    app.set_zmap_source(slint::Image::default());
-                }
-                PaneSource::ZMap => {
-                    app.set_zmap_source(image);
-                    app.set_composite_source(slint::Image::default());
-                }
-            }
+        Some((draw, (image, dst))) => {
+            app.set_composite_source(image);
             app.set_image_x(dst.0);
             app.set_image_y(dst.1);
             app.set_image_w(dst.2);
@@ -420,7 +405,6 @@ fn show_panes(
         }
         None => {
             app.set_composite_source(slint::Image::default());
-            app.set_zmap_source(slint::Image::default());
             app.set_image_x(0.0);
             app.set_image_y(0.0);
             app.set_image_w(0.0);
@@ -498,11 +482,9 @@ fn show_comparison_pane(
             PaneSource::Composite => {
                 frame_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Frame, &draw))
             }
-            PaneSource::ZMap => plane_draw.and_then(|draw| {
-                let renderer = renderer?;
-                (renderer.plane() == PaneSource::Composite)
-                    .then(|| renderer.backdrop_placement(Pane::Composite, &draw))?
-            }),
+            PaneSource::ZMap => {
+                plane_draw.and_then(|draw| renderer?.backdrop_placement(Pane::Composite, &draw))
+            }
         }
         .unwrap_or_default();
         window.set_backdrop(backdrop);
@@ -545,10 +527,9 @@ fn show_comparison_pane(
                 window.set_pane_label("Composite".into());
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
-                match plane_draw.and_then(|draw| {
-                    let renderer = renderer?;
-                    Some((draw, renderer.placement(renderer.plane().into(), &draw)?))
-                }) {
+                match plane_draw
+                    .and_then(|draw| Some((draw, renderer?.placement(Pane::Composite, &draw)?)))
+                {
                     Some((draw, (image, dst))) => {
                         window.set_source(image);
                         window.set_image_x(dst.0);

@@ -14,7 +14,6 @@ use std::sync::Arc;
 use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
-use focusforge_core::display::zmap_index_scale;
 use focusforge_core::io::{FrameError, TiffStack};
 use focusforge_core::retouch::overlay_colors;
 use focusforge_core::tile::{HostBudget, Rect};
@@ -23,8 +22,8 @@ use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
 use slint::wgpu_29::wgpu;
 
 use crate::canvas::{
-    EditState, EditedView, FrameView, OverlayDraw, Pane, PaneJob, PaneReader, PaneSource,
-    StampFloor, TextureSpec,
+    EditState, EditedView, FrameView, OverlayDraw, Pane, PaneJob, PaneReader, StampFloor,
+    TextureSpec,
 };
 use crate::viewport::{ImageSize, PaneDraw};
 
@@ -141,12 +140,11 @@ impl PaneTexture {
         height: u32,
         src: &[u16],
         samples_per_pixel: u32,
-        index_scale: u32,
     ) {
         let Some(texture) = self.ensure_texture(device, width, height) else {
             return;
         };
-        renderer.render(device, queue, texture, src, samples_per_pixel, index_scale);
+        renderer.render(device, queue, texture, src, samples_per_pixel, 0);
     }
 
     /// [`Self::ensure_and_render`]'s overlay-blend twin: the composite pane's
@@ -318,12 +316,9 @@ mod tests {
         assert!(planes_and_frame.zmap.is_some());
         assert!(planes_and_frame.composite_pane.display_texture.is_none());
         assert!(planes_and_frame.composite_pane.image.is_none());
-        assert!(planes_and_frame.zmap_pane.display_texture.is_none());
-        assert!(planes_and_frame.zmap_pane.image.is_none());
         assert!(planes_and_frame.frame_pane.display_texture.is_none());
         assert!(planes_and_frame.frame_pane.image.is_none());
         assert!(planes_and_frame.composite_pane.coverage.is_none());
-        assert!(planes_and_frame.zmap_pane.coverage.is_none());
         assert!(planes_and_frame.frame_pane.coverage.is_none());
         planes_and_frame.attach_device(shared.device().clone(), shared.queue().clone());
         assert!(planes_and_frame.redraw_frame(&draw).is_some());
@@ -592,12 +587,14 @@ pub enum CanvasRendererError {
     },
 }
 
-/// The two planes' GPU-owned state, the frame pane's own, the one
+/// The composite pane's GPU-owned state, the frame pane's own, the one
 /// [`DisplayRenderer`] every pane renders through, and the CPU scratch the
 /// synchronous redraws read into. A pane's read is a [`PaneJob`] (none when
 /// its [`PaneTexture`] already covers the draw) that [`Self::publish`] renders
-/// once its samples exist; the `redraw_*` methods do both in place. The planes
-/// are optional: a tab with nothing sealed still gets a frame pane.
+/// once its samples exist; the `redraw_*` methods do both in place. The
+/// sealed composite and Z-Map are optional: a tab with nothing sealed still
+/// gets a frame pane. The Z-Map is the index source for the overlay and the
+/// pipette and is never drawn as a pane of its own.
 pub struct CanvasRenderer {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
@@ -606,18 +603,12 @@ pub struct CanvasRenderer {
     composite: Option<Arc<TiffStack>>,
     zmap: Option<Arc<ZMapReader>>,
     composite_pane: PaneTexture,
-    zmap_pane: PaneTexture,
-    index_scale: Option<u32>,
-    /// Which plane [`Self::redraw_planes`] reads and renders; default
-    /// [`PaneSource::Composite`], changed only through [`Self::select_plane`].
-    plane: PaneSource,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
     /// The low-detail whole-image textures drawn beneath each pane's exact
     /// one.
     frame_backdrop: PaneTexture,
     composite_backdrop: PaneTexture,
-    zmap_backdrop: PaneTexture,
     /// The last stamp issued: every job takes the next one, and a reset
     /// refuses everything up to the current value.
     stamp: u64,
@@ -640,14 +631,10 @@ impl CanvasRenderer {
             composite: None,
             zmap: None,
             composite_pane: PaneTexture::default(),
-            zmap_pane: PaneTexture::default(),
-            index_scale: None,
-            plane: PaneSource::Composite,
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
             frame_backdrop: PaneTexture::default(),
             composite_backdrop: PaneTexture::default(),
-            zmap_backdrop: PaneTexture::default(),
             stamp: 0,
         }
     }
@@ -657,13 +644,12 @@ impl CanvasRenderer {
         self.stamp
     }
 
-    /// Empties both plane panes and refuses every job issued so far for them.
+    /// Empties the composite pane and its backdrop and refuses every job
+    /// issued so far for them.
     fn reset_planes(&mut self) {
         let stamp = self.next_stamp();
         self.composite_pane = PaneTexture::fresh(stamp);
-        self.zmap_pane = PaneTexture::fresh(stamp);
         self.composite_backdrop = PaneTexture::fresh(stamp);
-        self.zmap_backdrop = PaneTexture::fresh(stamp);
     }
 
     /// Empties the frame pane and refuses every job issued so far for it.
@@ -677,7 +663,6 @@ impl CanvasRenderer {
         match (pane, backdrop) {
             (Pane::Frame, true) => &mut self.frame_backdrop,
             (Pane::Composite, true) => &mut self.composite_backdrop,
-            (Pane::ZMap, true) => &mut self.zmap_backdrop,
             (pane, false) => self.pane_mut(pane),
         }
     }
@@ -686,7 +671,6 @@ impl CanvasRenderer {
         match pane {
             Pane::Frame => &mut self.frame_pane,
             Pane::Composite => &mut self.composite_pane,
-            Pane::ZMap => &mut self.zmap_pane,
         }
     }
 
@@ -694,36 +678,17 @@ impl CanvasRenderer {
         match pane {
             Pane::Frame => &self.frame_pane,
             Pane::Composite => &self.composite_pane,
-            Pane::ZMap => &self.zmap_pane,
         }
     }
 
     fn source_size(&self, pane: Pane) -> Option<(u32, u32)> {
         match pane {
             Pane::Frame => self.frame.dimensions(),
-            Pane::Composite | Pane::ZMap => {
+            Pane::Composite => {
                 let header = self.composite.as_ref()?.header(0);
                 Some((header.width, header.height))
             }
         }
-    }
-
-    /// The plane [`Self::redraw_planes`] and [`Self::request_planes`] draw.
-    pub fn plane(&self) -> PaneSource {
-        self.plane
-    }
-
-    /// Selects which plane [`Self::redraw_planes`] reads and renders; jobs
-    /// issued for either plane before this call are refused.
-    pub fn select_plane(&mut self, plane: PaneSource) {
-        let stamp = self.next_stamp();
-        self.composite_pane.floor.reset(stamp);
-        self.zmap_pane.floor.reset(stamp);
-        for backdrop in [&mut self.composite_backdrop, &mut self.zmap_backdrop] {
-            backdrop.floor.reset(stamp);
-            backdrop.requested = None;
-        }
-        self.plane = plane;
     }
 
     /// Uses Slint's surface-compatible device for future canvas draws,
@@ -767,7 +732,6 @@ impl CanvasRenderer {
             path: zmap_path.to_path_buf(),
             source,
         })?;
-        self.index_scale = Some(zmap_index_scale(zmap.frame_count()));
         self.composite = Some(Arc::new(composite));
         self.zmap = Some(Arc::new(zmap));
         self.reset_planes();
@@ -778,7 +742,6 @@ impl CanvasRenderer {
     pub fn clear_planes(&mut self) {
         self.composite = None;
         self.zmap = None;
-        self.index_scale = None;
         self.reset_planes();
     }
 
@@ -812,12 +775,11 @@ impl CanvasRenderer {
         self.reset_frame();
     }
 
-    /// The job that brings the selected plane's pane to `draw`, `None` when
+    /// The job that brings the composite pane to `draw`, `None` when
     /// that pane already covers `draw.src`/`draw.step` under the same edit
     /// generation and overlay (whatever `dst` and `pixelated` now are; work
     /// still in flight for it is retired), with no planes or device, or an
-    /// out-of-bounds `draw.src`. The unselected plane is never requested. A
-    /// composite drawn under an edit session or a three-sample overlay also
+    /// out-of-bounds `draw.src`. A composite drawn under an edit session or a three-sample overlay also
     /// reads the sealed Z-Map indices.
     pub fn request_planes(
         &mut self,
@@ -828,7 +790,7 @@ impl CanvasRenderer {
         self.plane_job(draw, generation, overlay, false)
     }
 
-    /// The job that brings the selected plane's backdrop to `draw`, the
+    /// The job that brings the composite pane's backdrop to `draw`, the
     /// whole image at a coarse step. `None` when the backdrop covers that
     /// content or a job for it was already issued -- a pan or zoom never
     /// asks again -- and otherwise as [`Self::request_planes`].
@@ -851,17 +813,8 @@ impl CanvasRenderer {
         self.device.as_ref()?;
         let composite = self.composite.as_ref()?.clone();
         let zmap = self.zmap.as_ref()?.clone();
-        let pane = Pane::from(self.plane);
         let header = composite.header(0);
         let size = (header.width, header.height);
-        if pane == Pane::ZMap {
-            let state = EditState {
-                generation,
-                overlay: None,
-            };
-            let index_scale = self.index_scale?;
-            return self.request(pane, backdrop, draw, size, zmap, index_scale, None, state);
-        }
         let overlay = overlay.filter(|_| header.samples_per_pixel == 3);
         let indices =
             (generation.is_some() || overlay.is_some()).then_some(zmap as Arc<dyn PaneReader>);
@@ -869,7 +822,15 @@ impl CanvasRenderer {
             generation,
             overlay: overlay.cloned(),
         };
-        self.request(pane, backdrop, draw, size, composite, 0, indices, state)
+        self.request(
+            Pane::Composite,
+            backdrop,
+            draw,
+            size,
+            composite,
+            indices,
+            state,
+        )
     }
 
     /// The job that brings the frame pane to `draw`; `None` as
@@ -894,7 +855,6 @@ impl CanvasRenderer {
             draw,
             frame_size,
             reader,
-            0,
             None,
             EditState::default(),
         )
@@ -908,7 +868,6 @@ impl CanvasRenderer {
         draw: &PaneDraw,
         source_size: (u32, u32),
         reader: Arc<dyn PaneReader>,
-        index_scale: u32,
         indices: Option<Arc<dyn PaneReader>>,
         state: EditState,
     ) -> Option<PaneJob> {
@@ -947,7 +906,6 @@ impl CanvasRenderer {
             draw: guarded,
             stamp,
             reader,
-            index_scale,
             indices,
             state,
             backdrop,
@@ -964,9 +922,8 @@ impl CanvasRenderer {
     /// the pane's image. `sealed_indices` is the sealed Z-Map over the same
     /// texels (empty when the job read none). `edited`, present on a job
     /// issued under an edit generation, overlays the composite with the
-    /// resident tiles' gathered pixel wherever its index differs; the Z-Map
-    /// pane and the job's own overlay draw the stored map, the overlay
-    /// blending the rainbow over a three-sample composite. `None`, with
+    /// resident tiles' gathered pixel wherever its index differs; the job's
+    /// own overlay blends the rainbow over a three-sample composite. `None`, with
     /// nothing rendered or uploaded, when the job is stale -- issued before a
     /// source, plane or device change or before a newer job for the pane
     /// published -- or when there is no device.
@@ -990,10 +947,8 @@ impl CanvasRenderer {
         let texture = match (job.pane, job.backdrop) {
             (Pane::Frame, false) => &mut self.frame_pane,
             (Pane::Composite, false) => &mut self.composite_pane,
-            (Pane::ZMap, false) => &mut self.zmap_pane,
             (Pane::Frame, true) => &mut self.frame_backdrop,
             (Pane::Composite, true) => &mut self.composite_backdrop,
-            (Pane::ZMap, true) => &mut self.zmap_backdrop,
         };
         if texture.covers(job.draw.src, job.draw.step, &job.state) {
             return Some(texture.image());
@@ -1052,7 +1007,6 @@ impl CanvasRenderer {
                         height,
                         composite,
                         samples_per_pixel,
-                        0,
                     ),
                 }
             }
@@ -1064,7 +1018,6 @@ impl CanvasRenderer {
                 height,
                 samples,
                 samples_per_pixel,
-                job.index_scale,
             ),
         }
         texture.mark_covered(job.draw.src, job.draw.step, job.state.clone());
@@ -1095,7 +1048,6 @@ impl CanvasRenderer {
         let backdrop = match pane {
             Pane::Frame => &self.frame_backdrop,
             Pane::Composite => &self.composite_backdrop,
-            Pane::ZMap => &self.zmap_backdrop,
         };
         Self::placed(backdrop, draw)
     }
@@ -1126,15 +1078,13 @@ impl CanvasRenderer {
         image
     }
 
-    /// Re-reads and re-uploads `draw.src` for the currently selected plane
-    /// alone, returning its `slint::Image` and which plane it is. A no-op
-    /// when that pane already covers `draw.src`/`draw.step` under the same
-    /// edit generation and overlay, whatever `dst`/`pixelated` now are; the
-    /// unselected plane is never read. `edited`, present, overlays the
+    /// Re-reads and re-uploads `draw.src` for the composite pane, returning
+    /// its `slint::Image`. A no-op when that pane already covers
+    /// `draw.src`/`draw.step` under the same edit generation and overlay,
+    /// whatever `dst`/`pixelated` now are. `edited`, present, overlays the
     /// composite with the resident tiles' gathered pixel wherever its index
-    /// differs and draws the Z-Map from the edited indices; `overlay`,
-    /// present on a three-sample composite, blends the rainbow overlay in
-    /// place of the plain render. `None` with no planes open, an
+    /// differs; `overlay`, present on a three-sample composite, blends the
+    /// rainbow overlay in place of the plain render. `None` with no planes open, an
     /// out-of-bounds `draw.src`, or a failed read (coverage stays untouched
     /// on that path).
     pub fn redraw_planes(
@@ -1142,18 +1092,16 @@ impl CanvasRenderer {
         draw: &PaneDraw,
         edited: Option<EditedView>,
         overlay: Option<&OverlayDraw>,
-    ) -> Option<(slint::Image, PaneSource)> {
+    ) -> Option<slint::Image> {
         let _scope = measurement_scope("gui_plane_redraw");
-        let plane = self.plane;
-        if !visible_draw_fits(self.source_size(plane.into())?, draw) {
+        if !visible_draw_fits(self.source_size(Pane::Composite)?, draw) {
             return None;
         }
         let generation = edited.as_ref().map(|view| view.tiles.generation());
-        let image = match self.request_planes(draw, generation, overlay) {
-            Some(job) => self.read_and_publish(job, edited.as_ref())?,
-            None => self.covered_image(plane.into(), draw)?,
-        };
-        Some((image, plane))
+        match self.request_planes(draw, generation, overlay) {
+            Some(job) => self.read_and_publish(job, edited.as_ref()),
+            None => self.covered_image(Pane::Composite, draw),
+        }
     }
 
     /// Re-reads and re-uploads `draw.src` for the frame pane, decimated as in

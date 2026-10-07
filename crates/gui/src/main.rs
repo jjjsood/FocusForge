@@ -644,7 +644,6 @@ fn run_window<T: ComponentHandle + 'static>(
                         if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
                             app.set_frame_source(slint::Image::default());
                             app.set_composite_source(slint::Image::default());
-                            app.set_zmap_source(slint::Image::default());
                         }
                         if let Some(canvas) = canvas {
                             canvas.borrow_mut().detach_device();
@@ -781,7 +780,6 @@ fn run_window<T: ComponentHandle + 'static>(
     if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
         app.set_frame_source(slint::Image::default());
         app.set_composite_source(slint::Image::default());
-        app.set_zmap_source(slint::Image::default());
     }
     if let Some(canvas) = canvas {
         canvas.borrow_mut().detach_device();

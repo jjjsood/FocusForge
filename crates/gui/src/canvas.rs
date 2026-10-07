@@ -398,16 +398,6 @@ impl PaneReader for ZMapReader {
 pub enum Pane {
     Frame,
     Composite,
-    ZMap,
-}
-
-impl From<PaneSource> for Pane {
-    fn from(plane: PaneSource) -> Self {
-        match plane {
-            PaneSource::Composite => Pane::Composite,
-            PaneSource::ZMap => Pane::ZMap,
-        }
-    }
 }
 
 /// One pane's view to read: what to read, the stamp it was issued under and
@@ -418,8 +408,6 @@ pub struct PaneJob {
     pub draw: PaneDraw,
     pub stamp: u64,
     pub reader: Arc<dyn PaneReader>,
-    /// Z-Map index scale for the display kernel; 0 for image sources.
-    pub index_scale: u32,
     /// The sealed Z-Map, read alongside a composite whose edit generation or
     /// overlay [`Self::state`] names; `None` when the sealed pixels draw as is.
     pub indices: Option<Arc<dyn PaneReader>>,

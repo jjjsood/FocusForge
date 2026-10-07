@@ -1694,7 +1694,6 @@ fn golden_plane_files() -> (PathBuf, PathBuf) {
 #[test]
 fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
-    use focusforge_gui::canvas::PaneSource;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
     use focusforge_gui::viewport::{ImageSize, PaneDraw};
     use std::num::NonZeroU32;
@@ -1765,7 +1764,6 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
     };
     let composite_spp = samples_per_pixel(&composite_path);
     let frame_spp = samples_per_pixel(&frame_path);
-    let zmap_spp = 1;
     let plane_image = image_size(&composite_path);
     let frame_image = image_size(&frame_path);
 
@@ -1888,48 +1886,15 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         "zoom",
     );
 
-    // 5. Selecting the Z-Map plane for the first time at this content reads
-    // and uploads exactly it.
-    renderer.select_plane(PaneSource::ZMap);
-    let before = counters();
-    let (_, plane) = renderer
-        .redraw_planes(&zoomed, None, None)
-        .expect("Z-Map plane draws");
-    assert_eq!(plane, PaneSource::ZMap);
-    let after = counters();
-    assert_one_plane(
-        before,
-        after,
-        &zoomed
-            .guarded(plane_image, u32::MAX)
-            .expect("an unbounded test texture fits"),
-        zmap_spp,
-        "first Z-Map select",
-    );
-
-    // Selecting back to Composite at the same content is a no-op: its own
-    // coverage is still current, and the Z-Map is not touched either.
-    renderer.select_plane(PaneSource::Composite);
-    let before = counters();
-    let (_, plane) = renderer
-        .redraw_planes(&zoomed, None, None)
-        .expect("composite plane draws");
-    assert_eq!(plane, PaneSource::Composite);
-    let after = counters();
-    assert_steady(before, after, "select back to composite");
-    assert_nothing_read(before, after, "select back to composite");
-
-    // 6. `set_planes` on the unchanged draw invalidates both panes' own
-    // coverage; the next draw (composite still selected) re-reads exactly
-    // that one plane.
+    // 5. `set_planes` on the unchanged draw invalidates the composite pane's
+    // coverage; the next draw re-reads exactly it.
     renderer
         .set_planes(&composite_path, &zmap_path)
         .expect("golden planes re-open");
     let before = counters();
-    let (_, plane) = renderer
+    renderer
         .redraw_planes(&zoomed, None, None)
         .expect("composite plane draws again");
-    assert_eq!(plane, PaneSource::Composite);
     let after = counters();
     assert_one_plane(
         before,
@@ -1941,7 +1906,7 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         "post set_planes",
     );
 
-    // 7. `set_frame` on the frame's unchanged draw invalidates its coverage;
+    // 6. `set_frame` on the frame's unchanged draw invalidates its coverage;
     // the next frame draw re-reads exactly the frame.
     renderer
         .set_frame(&frame_path, None, job::host_budget())
@@ -2073,7 +2038,6 @@ mod preparing {
             },
             stamp,
             reader: reader.clone(),
-            index_scale: 0,
             indices: None,
             state: Default::default(),
             backdrop: false,
@@ -2513,25 +2477,22 @@ fn stale_stamps_are_refused_in_any_arrival_order() {
 fn prepared_samples_match_a_direct_read() {
     use focusforge_core::io::TiffStack;
     use focusforge_core::tile::Rect;
-    use focusforge_core::zmap::ZMapReader;
     use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
     use focusforge_gui::viewport::PaneDraw;
     use preparing::take_stamp;
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
-    let (composite_path, zmap_path) = golden_plane_files();
+    let (composite_path, _) = golden_plane_files();
     let frame_path = common::fixture_frame("mantis-64", 0);
     let frame = Arc::new(TiffStack::open_files(&[frame_path]).expect("frame opens"));
     let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
-    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
 
     let preparer = Preparer::new(|| {});
     let mut stamp = 0;
     let mut check = |pane: Pane,
                      reader: Arc<dyn PaneReader>,
                      size: (u32, u32),
-                     index_scale: u32,
                      direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
         let odd = |extent: u32| (extent - 4) | 1;
         let rects = [(1, 3, odd(size.0), odd(size.1)), (0, 0, size.0, size.1)];
@@ -2564,7 +2525,6 @@ fn prepared_samples_match_a_direct_read() {
                     draw,
                     stamp,
                     reader: reader.clone(),
-                    index_scale,
                     indices: None,
                     state: Default::default(),
                     backdrop: false,
@@ -2584,7 +2544,6 @@ fn prepared_samples_match_a_direct_read() {
         Pane::Frame,
         frame.clone(),
         frame.dimensions(),
-        0,
         &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
     );
     let composite_size = composite.dimensions();
@@ -2592,25 +2551,17 @@ fn prepared_samples_match_a_direct_read() {
         Pane::Composite,
         composite.clone(),
         composite_size,
-        0,
         &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
-    );
-    check(
-        Pane::ZMap,
-        zmap.clone(),
-        composite_size,
-        1,
-        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
     );
 }
 
-/// A job requested before a source switch, close, plane selection, device
+/// A job requested before a source switch, close, device
 /// change or a newer publish renders and uploads nothing. Upload accounting
 /// is process-global, so this runs alone in a child.
 #[test]
 fn stale_results_render_nothing() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
-    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::canvas::PaneJob;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
     use focusforge_gui::viewport::PaneDraw;
     use std::num::NonZeroU32;
@@ -2742,17 +2693,6 @@ fn stale_results_render_nothing() {
     renderer.set_planes(&composite_path, &zmap_path).unwrap();
     refused(&mut renderer, &before_clear, "clear_planes");
 
-    // A plane selection.
-    let before_select = renderer
-        .request_planes(&draw(7), None, None)
-        .expect("plane job");
-    renderer.select_plane(PaneSource::ZMap);
-    refused(&mut renderer, &before_select, "select_plane");
-    let zmap_job = renderer
-        .request_planes(&draw(7), None, None)
-        .expect("Z-Map job");
-    accepted(&mut renderer, &zmap_job, "Z-Map after the selection");
-
     // A device change.
     renderer.set_planes(&composite_path, &zmap_path).unwrap();
     let before_device = renderer
@@ -2805,7 +2745,7 @@ fn backdrop_of(width: u32, height: u32, pane: f32) -> focusforge_gui::viewport::
 /// reads.
 #[test]
 fn backdrop_is_read_once_per_content_change() {
-    use focusforge_gui::canvas::{OverlayDraw, Pane, PaneSource, Preparer};
+    use focusforge_gui::canvas::{OverlayDraw, Pane, Preparer};
     use focusforge_gui::gpu_canvas::CanvasRenderer;
     use preparing::*;
 
@@ -2935,27 +2875,16 @@ fn backdrop_is_read_once_per_content_change() {
     plane(&mut renderer, Some(2), None, "the next edit generation");
     let overlay = OverlayDraw::for_opacity(8, 0.5);
     plane(&mut renderer, Some(2), Some(&overlay), "an overlay toggle");
-
-    renderer.select_plane(PaneSource::ZMap);
-    let selected = renderer
-        .request_plane_backdrop(&plane_back, None, None)
-        .expect("a plane selection issues one job for the Z-Map");
-    assert_eq!(selected.pane, Pane::ZMap);
-    assert!(
-        renderer
-            .request_plane_backdrop(&plane_back, None, None)
-            .is_none()
-    );
 }
 
-/// A backdrop job issued before a source, frame, plane, device or newer
+/// A backdrop job issued before a source, frame, device or newer
 /// publish renders and uploads nothing, whichever of it and the exact
 /// results arrives first. Upload accounting is process-global, so this runs
 /// alone in a child.
 #[test]
 fn backdrop_from_a_previous_content_is_refused() {
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
-    use focusforge_gui::canvas::{PaneJob, PaneSource};
+    use focusforge_gui::canvas::PaneJob;
     use focusforge_gui::gpu_canvas::CanvasRenderer;
 
     const CHILD: &str = "FOCUSFORGE_GUI_STALE_BACKDROP_ACCOUNTING_CHILD";
@@ -3059,16 +2988,6 @@ fn backdrop_from_a_previous_content_is_refused() {
     renderer.clear_planes();
     renderer.set_planes(&composite_path, &zmap_path).unwrap();
     refused(&mut renderer, &old, "clear_planes");
-    let old = renderer
-        .request_plane_backdrop(&plane_back, None, None)
-        .expect("job");
-    renderer.select_plane(PaneSource::ZMap);
-    refused(&mut renderer, &old, "select_plane");
-    let zmap_job = renderer
-        .request_plane_backdrop(&plane_back, None, None)
-        .expect("Z-Map job");
-    accepted(&mut renderer, &zmap_job, "the Z-Map after the selection");
-
     let old = renderer
         .request_plane_backdrop(&plane_back, Some(1), None)
         .expect("job");
@@ -3177,17 +3096,15 @@ fn backdrop_follows_device_detach_and_attach() {
 /// does, at the step `backdrop_draw` chose.
 #[test]
 fn backdrop_samples_match_a_direct_read() {
-    use focusforge_core::zmap::ZMapReader;
     use focusforge_gui::canvas::{Pane, PaneJob, PaneReader, Preparer};
     use preparing::take_stamp;
     use std::sync::Arc;
 
-    let (composite_path, zmap_path) = golden_plane_files();
+    let (composite_path, _) = golden_plane_files();
     let frame = Arc::new(
         TiffStack::open_files(&[common::fixture_frame("mantis-64", 0)]).expect("frame opens"),
     );
     let composite = Arc::new(TiffStack::open_files(&[composite_path]).expect("composite opens"));
-    let zmap = Arc::new(ZMapReader::open(&zmap_path).expect("Z-Map opens"));
 
     let (width, height) = (1u32, 40u32);
     let column: Vec<u16> = (0..height).map(|i| (i * 311 % 1009) as u16).collect();
@@ -3222,7 +3139,6 @@ fn backdrop_samples_match_a_direct_read() {
                      pane: Pane,
                      reader: Arc<dyn PaneReader>,
                      size: (u32, u32),
-                     index_scale: u32,
                      direct: &dyn Fn(Rect, NonZeroU32, &mut [u16])| {
         // An image smaller than the pane, then panes it needs coarser reads for.
         for pane_side in [4.0 * size.0.max(size.1) as f32, 16.0, 7.0, 3.0] {
@@ -3259,7 +3175,6 @@ fn backdrop_samples_match_a_direct_read() {
                 draw,
                 stamp,
                 reader: reader.clone(),
-                index_scale,
                 indices: None,
                 state: Default::default(),
                 backdrop: true,
@@ -3283,7 +3198,6 @@ fn backdrop_samples_match_a_direct_read() {
         Pane::Frame,
         frame.clone(),
         frame.dimensions(),
-        0,
         &|rect, step, out| frame.read_tile_step_into(0, rect, step, out).unwrap(),
     );
     let size = composite.dimensions();
@@ -3292,23 +3206,13 @@ fn backdrop_samples_match_a_direct_read() {
         Pane::Composite,
         composite.clone(),
         size,
-        0,
         &|rect, step, out| composite.read_tile_step_into(0, rect, step, out).unwrap(),
-    );
-    check(
-        "mantis-512 Z-Map",
-        Pane::ZMap,
-        zmap.clone(),
-        size,
-        1,
-        &|rect, step, out| zmap.read_tile_step_into(rect, step, out).unwrap(),
     );
     check(
         "one-pixel-wide image",
         Pane::Frame,
         thin.clone(),
         (width, height),
-        0,
         &|rect, step, out| thin.read_tile_step_into(0, rect, step, out).unwrap(),
     );
 }
