@@ -316,7 +316,7 @@ impl DisplayRenderer {
 }
 
 /// Blends each pixel's colour in `colors` over `composite` at `alpha` (`0`
-/// transparent, `255` opaque) into `target`. `composite` is the recomposited
+/// transparent, `255` opaque) into `target`. `composite` is the edited
 /// three-sample-per-pixel image. `composite.len()` must equal
 /// `target.width() * target.height() * 3`; `colors.len()` must equal
 /// `target.width() * target.height()`.

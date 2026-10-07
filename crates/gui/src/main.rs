@@ -621,6 +621,10 @@ fn run_window<T: ComponentHandle + 'static>(
                         canvas
                             .borrow_mut()
                             .attach_device(next.clone(), queue.clone());
+                        controller
+                            .lock()
+                            .unwrap()
+                            .attach_blender(focusforge_gpu::blend::Blender::new(next, queue));
                         let controller = controller.clone();
                         let canvas = canvas.clone();
                         slint::Timer::single_shot(Duration::ZERO, move || {
@@ -635,6 +639,7 @@ fn run_window<T: ComponentHandle + 'static>(
                     let teardown = lifecycle.get();
                     let device = device.clone();
                     let canvas = canvas.clone();
+                    let controller = controller.clone();
                     let app_handle = app_handle.clone();
                     let lifecycle = lifecycle.clone();
                     slint::Timer::single_shot(Duration::ZERO, move || {
@@ -647,6 +652,9 @@ fn run_window<T: ComponentHandle + 'static>(
                         }
                         if let Some(canvas) = canvas {
                             canvas.borrow_mut().detach_device();
+                        }
+                        if let Some(controller) = controller {
+                            controller.lock().unwrap().detach_blender();
                         }
                         *device.borrow_mut() = None;
                     });
@@ -776,6 +784,7 @@ fn run_window<T: ComponentHandle + 'static>(
         let mut controller = controller.lock().unwrap();
         controller.finish_saves();
         controller.finish_compactions();
+        controller.detach_blender();
     }
     if let Some(app) = app_handle.and_then(|app| app.upgrade()) {
         app.set_frame_source(slint::Image::default());

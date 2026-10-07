@@ -82,8 +82,8 @@
 //! **The composite is a blend; the Z-Map is not the blend's provenance in
 //! full.** It records the pixel's **dominant contributor**: `argmax_f
 //! weight_f(p)` over the eligible frames, **strictly greater** so the
-//! **lowest index wins an exact tie** -- identical to `laplacian`'s tie-break. Retouch recomposites from
-//! the Z-Map plus source textures; that reconstruction recovers exactly one
+//! **lowest index wins an exact tie** -- identical to `laplacian`'s tie-break.
+//! Reading each pixel from the frame the Z-Map names recovers exactly one
 //! frame's pixels, never the blend the user actually saw, so this Z-Map is
 //! *not* sufficient to reconstruct this algorithm's own composite -- the
 //! one place in the project where that gap is real rather than

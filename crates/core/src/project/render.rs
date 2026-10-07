@@ -545,6 +545,7 @@ fn blend_bands<'a, 'b>(
             warping,
             origin,
             samples_per_pixel,
+            blend::apply,
         )
         .map_err(|err| ProjectError::container(context, err))?;
         sink(&blended, rect)

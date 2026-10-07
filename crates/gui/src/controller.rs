@@ -43,6 +43,7 @@ use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
+use focusforge_gpu::blend::Blender;
 
 pub use crate::entry::{
     EntryError, GroupingQuestion, GuiProject, ImportRefused, LocateTarget, OpenAs, OpenOutcome,
@@ -1657,6 +1658,9 @@ pub struct AppController {
     /// by default, so a headless test controller never probes an adapter;
     /// [`main`](crate) turns this on for the real window.
     gpu_fusion: bool,
+    /// The blend kernel on the display device, handed to every edit session
+    /// while the device is attached.
+    blender: Option<Blender>,
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -1724,6 +1728,27 @@ impl AppController {
     /// instead of the default, so a small image's strokes cross tile edges.
     pub fn set_resident_tile_size_for_test(&mut self, size: u32) {
         self.resident_tile_size_for_test = Some(size);
+    }
+
+    /// Blends live strokes on `blender`'s device from here on, in every
+    /// open editor session and in each opened later; a stroke the kernel
+    /// refuses still renders on the CPU.
+    pub fn attach_blender(&mut self, blender: Blender) {
+        self.set_blender(Some(blender));
+    }
+
+    /// Returns every editor session to blending on the CPU.
+    pub fn detach_blender(&mut self) {
+        self.set_blender(None);
+    }
+
+    fn set_blender(&mut self, blender: Option<Blender>) {
+        for tab in &mut self.state.projects {
+            if let Some(edit) = tab.edit.as_mut() {
+                edit.set_blender(blender.clone());
+            }
+        }
+        self.blender = blender;
     }
 
     /// Installs the regions recomposite workers have parked, on the tab each
@@ -1909,7 +1934,8 @@ impl AppController {
             }
             self.state.canvas_dirty = true;
             match result {
-                Ok(edit) => {
+                Ok(mut edit) => {
+                    edit.set_blender(self.blender.clone());
                     tab.edit = Some(edit);
                     self.emit(ShellEvent::EditorChanged);
                 }

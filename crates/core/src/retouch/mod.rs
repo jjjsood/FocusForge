@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The soft brush stroke blended over an image from a source frame, and the
-//! recomposite of a Z-Map's indices into one.
+//! The soft brush stroke blended over an image from a source frame.
 
 pub mod blend;
-pub mod recomposite;
 
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
 pub use blend::{footprint, overlay_colors, top_source};
-pub use recomposite::{Sources, named_frames, recomposite, recomposite_bands};
 
 /// Failures validating or applying an op against a Z-Map.
 #[derive(Debug, thiserror::Error)]
@@ -45,7 +42,7 @@ pub enum RetouchError {
     #[error("index buffer holds {actual} entries, expected {expected}")]
     TileBufferSize { expected: usize, actual: usize },
 
-    /// A recomposite's source reader failed to produce a frame's pixels.
+    /// A source reader failed to produce a frame's pixels.
     #[error(transparent)]
     Source(#[from] crate::algorithm::AlgorithmError),
 

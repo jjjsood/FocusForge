@@ -267,6 +267,14 @@ impl Ramp {
     }
 }
 
+/// The radius and core of `op`'s mask in sixteenths of a pixel: the rounded
+/// values [`apply`] measures its distances against, for a blend that
+/// reproduces it.
+pub fn mask_ramp(op: &Op, info: ZMapInfo) -> Result<(u64, u64), RetouchError> {
+    let ramp = Ramp::new(&validate(op, info)?);
+    Ok((ramp.radius, ramp.core))
+}
+
 /// The Q16 alpha (`0..=65536`) the stroke `op` gives the pixel `(x, y)`,
 /// testing every segment: the definition [`apply`] reproduces with segment
 /// culling.
@@ -434,7 +442,10 @@ pub struct PlacedStroke<'a> {
 /// over the part of `out_rect` its footprint meets, shifted by `origin` (the
 /// crop offset between map and frame coordinates); a stroke clear of
 /// `out_rect` reads nothing. A failed frame read is [`RetouchError::Source`]
-/// and leaves `out` as the strokes before it made it.
+/// and leaves `out` as the strokes before it made it. Each stroke is blended
+/// by `blend`, called as [`apply`] is: [`apply`] itself, or a blend with the
+/// same result.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_strokes(
     info: ZMapInfo,
     out_rect: Rect,
@@ -443,6 +454,15 @@ pub fn apply_strokes(
     frames: &dyn TileReader,
     origin: (u32, u32),
     spp: usize,
+    mut blend: impl FnMut(
+        &Op,
+        ZMapInfo,
+        Rect,
+        &mut [u16],
+        Rect,
+        &[u16],
+        usize,
+    ) -> Result<(), RetouchError>,
 ) -> Result<(), RetouchError> {
     let mut frame: Vec<u16> = Vec::new();
     for stroke in strokes {
@@ -456,7 +476,7 @@ pub fn apply_strokes(
             ..region
         };
         frames.read_tile_into(stroke.frame, at_frame, &mut frame)?;
-        apply(stroke.op, info, out_rect, out, region, &frame, spp)?;
+        blend(stroke.op, info, out_rect, out, region, &frame, spp)?;
     }
     Ok(())
 }
@@ -834,6 +854,82 @@ mod tests {
     }
 
     #[test]
+    fn apply_strokes_hands_each_region_to_the_blend_it_is_given() {
+        let info = info(40, 30);
+        let out_rect = rect(5, 4, 30, 20);
+        let frames = Ramps {
+            width: 64,
+            frames: 3,
+        };
+        let ops = [
+            stroke_op(0, vec![pt(12, 10), pt(24, 14)], 6.0, 0.5),
+            stroke_op(2, vec![pt(20, 8), pt(14, 18)], 5.0, 1.0),
+        ];
+        let placed: Vec<PlacedStroke> = ops
+            .iter()
+            .zip([0, 2])
+            .map(|(op, frame)| PlacedStroke {
+                op,
+                frame,
+                footprint: footprint(op, info).unwrap().unwrap(),
+            })
+            .collect();
+        let mut out = vec![9u16; 30 * 20];
+        let mut calls = Vec::new();
+        apply_strokes(
+            info,
+            out_rect,
+            &mut out,
+            &placed,
+            &frames,
+            (0, 0),
+            1,
+            |op, _, _, out, region, src, spp| {
+                calls.push((op.clone(), region, src.len(), spp));
+                out.fill(1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2, "one call per stroke");
+        for ((op, region, len, spp), stroke) in calls.iter().zip(&placed) {
+            assert_eq!(op, stroke.op);
+            assert_eq!(*region, stroke.footprint.intersect(out_rect).unwrap());
+            assert_eq!(*len, (region.width * region.height) as usize);
+            assert_eq!(*spp, 1);
+        }
+        assert!(
+            out.iter().all(|&s| s == 1),
+            "the injected blend wrote `out`"
+        );
+    }
+
+    #[test]
+    fn mask_ramp_is_the_ramp_the_blend_uses() {
+        let info = info(64, 64);
+        for radius in [1.5f32, 12.0, 40.0] {
+            for softness in [0.0f32, 0.3, 1.0] {
+                let op = stroke_op(0, vec![pt(10, 10)], radius, softness);
+                let ramp = Ramp::new(&validate(&op, info).unwrap());
+                assert_eq!(
+                    mask_ramp(&op, info).unwrap(),
+                    (ramp.radius, ramp.core),
+                    "radius {radius} softness {softness}"
+                );
+            }
+        }
+        let op = stroke_op(0, vec![pt(10, 10)], 12.0, 0.0);
+        assert_eq!(mask_ramp(&op, info).unwrap(), (192, 192));
+        let op = stroke_op(0, vec![pt(10, 10)], 12.0, 1.0);
+        assert_eq!(mask_ramp(&op, info).unwrap(), (192, 0));
+        let bad = stroke_op(9, vec![pt(10, 10)], 12.0, 0.5);
+        assert!(matches!(
+            mask_ramp(&bad, info),
+            Err(RetouchError::SourceOutOfRange { .. })
+        ));
+    }
+
+    #[test]
     fn strokes_blend_in_order_from_their_frames_at_the_crop_origin() {
         let info = info(40, 30);
         let out_rect = rect(5, 4, 30, 20);
@@ -881,7 +977,7 @@ mod tests {
         assert_ne!(expected, base, "the strokes must blend something");
 
         let mut out = base.clone();
-        apply_strokes(info, out_rect, &mut out, &placed, &frames, origin, 1).unwrap();
+        apply_strokes(info, out_rect, &mut out, &placed, &frames, origin, 1, apply).unwrap();
         assert_eq!(out, expected);
 
         let mut untouched = base.clone();
@@ -890,7 +986,17 @@ mod tests {
             frame: 0,
             footprint: rect(0, 0, 3, 3),
         }];
-        apply_strokes(info, out_rect, &mut untouched, &far, &frames, origin, 1).unwrap();
+        apply_strokes(
+            info,
+            out_rect,
+            &mut untouched,
+            &far,
+            &frames,
+            origin,
+            1,
+            apply,
+        )
+        .unwrap();
         assert_eq!(untouched, base, "a stroke off the rect writes nothing");
     }
 
@@ -909,7 +1015,8 @@ mod tests {
             footprint: footprint(&op, info).unwrap().unwrap(),
         }];
         let mut out = vec![5u16; 40 * 30];
-        let err = apply_strokes(info, out_rect, &mut out, &placed, &frames, (0, 0), 1).unwrap_err();
+        let err = apply_strokes(info, out_rect, &mut out, &placed, &frames, (0, 0), 1, apply)
+            .unwrap_err();
         assert!(matches!(err, RetouchError::Source(_)), "{err:?}");
         assert!(out.iter().all(|&s| s == 5), "a failed read writes nothing");
     }

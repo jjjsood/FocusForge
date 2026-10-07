@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm};
+use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::gpu::{AlignBackend, TileBackend};
@@ -32,9 +32,10 @@ pub use focusforge_core::project::export::{
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
-use focusforge_core::retouch::{RetouchError, Sources, blend};
+use focusforge_core::retouch::{RetouchError, blend};
 pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
+use focusforge_gpu::blend::Blender;
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
 /// can hold and drive these through the `job::` path alone.
@@ -1051,6 +1052,9 @@ pub struct EditState {
     /// first.
     chain: Vec<Op>,
     pub tiles: crate::canvas::ResidentTiles,
+    /// The blend kernel on the display device, while one is attached; a
+    /// region renders on the CPU without it.
+    blender: Option<Blender>,
     /// The resident samples as they were when the drag in progress began, a
     /// tile at a time; empty between drags.
     snapshot: crate::canvas::ResidentTiles,
@@ -1063,24 +1067,19 @@ pub struct EditState {
 pub const RESIDENT_TILE_SIZE: u32 = 256;
 
 /// Runs `f` over `reader`'s frames each read through its recorded transform,
-/// at the registration's own crop origin -- the same view the left pane
+/// with the registration's own crop origin -- the same view the left pane
 /// draws, so a stroke transfers exactly what it showed.
 fn with_registered_sources<R>(
     reader: &dyn FrameReader,
     registration: &Registration,
-    f: impl FnOnce(&Sources) -> R,
+    f: impl FnOnce(&dyn TileReader, (u32, u32)) -> R,
 ) -> R {
     let frame = reader.dimensions();
     let samples_per_pixel = reader.frame(0).samples_per_pixel;
     let transforms = registration.transforms(reader.len());
     let gained = GainReader::new(reader, registration.gains());
     let warped = WarpingReader::new(&gained, frame, samples_per_pixel, transforms);
-    f(&Sources {
-        reader: &warped,
-        frame_count: reader.len() as u32,
-        samples_per_pixel,
-        origin: registration.origin(),
-    })
+    f(&warped, registration.origin())
 }
 
 /// What rendering a region reads, apart from the resident samples.
@@ -1090,6 +1089,7 @@ struct RenderInput {
     registration: Registration,
     info: ZMapInfo,
     samples_per_pixel: usize,
+    blender: Option<Blender>,
 }
 
 /// Renders `job`: the pre-image's samples over its region with its ops
@@ -1144,15 +1144,38 @@ fn blend_region(
             });
         }
     }
-    with_registered_sources(&*input.sources, &input.registration, |sources| {
+    // A stroke the device cannot blend, or any device failure, goes through
+    // the CPU blend, which leaves the same samples.
+    let mut device_failed = false;
+    let mut blend_stroke = |op: &Op,
+                            info: ZMapInfo,
+                            out_rect: Rect,
+                            out: &mut [u16],
+                            region: Rect,
+                            src: &[u16],
+                            spp: usize| {
+        if let Some(blender) = &input.blender {
+            match blender.apply(op, info, out_rect, out, region, src, spp) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !std::mem::replace(&mut device_failed, true) {
+                        tracing::warn!(%error, ?region, "device blend failed; blending on the CPU");
+                    }
+                }
+            }
+        }
+        blend::apply(op, info, out_rect, out, region, src, spp)
+    };
+    with_registered_sources(&*input.sources, &input.registration, |reader, origin| {
         blend::apply_strokes(
             input.info,
             region,
             &mut out,
             &placed,
-            sources.reader,
-            sources.origin,
+            reader,
+            origin,
             spp,
+            &mut blend_stroke,
         )
     })
     .map_err(|error| error.to_string())?;
@@ -1247,7 +1270,14 @@ impl EditState {
             registration: self.registration.clone(),
             info: self.info(),
             samples_per_pixel: self.sources.frame(0).samples_per_pixel as usize,
+            blender: self.blender.clone(),
         }
+    }
+
+    /// Blends later regions on `blender`'s device, or on the CPU for `None`.
+    /// A batch already dispatched keeps the blender it was dispatched with.
+    pub fn set_blender(&mut self, blender: Option<Blender>) {
+        self.blender = blender;
     }
 
     /// Every op the edited image shows over `base`: the row's chain, then the
@@ -1451,6 +1481,7 @@ pub fn open_edit_session(
         chain: Vec::new(),
         snapshot: tiles.subset(&[]),
         tiles,
+        blender: None,
         stroke: None,
         recomposites: Recomposites::default(),
     };

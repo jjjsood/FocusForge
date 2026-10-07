@@ -19,7 +19,7 @@ pub struct LiveStroke {
     softness: f32,
     points: Vec<(f32, f32)>,
     flushed: usize,
-    /// Every tick's own recomposited region, oldest first -- empty until a
+    /// Every tick's own re-rendered region, oldest first -- empty until a
     /// caller records one.
     pub tick_rects: Vec<Rect>,
 }

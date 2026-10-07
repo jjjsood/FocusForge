@@ -922,7 +922,7 @@ impl CanvasRenderer {
     /// the pane's image. `sealed_indices` is the sealed Z-Map over the same
     /// texels (empty when the job read none). `edited`, present on a job
     /// issued under an edit generation, overlays the composite with the
-    /// resident tiles' gathered pixel wherever its index differs; the job's
+    /// resident tiles' pixel wherever one is held; the job's
     /// own overlay blends the rainbow over a three-sample composite. `None`,
     /// with nothing rendered or uploaded, when the job is stale -- issued
     /// before a source, plane or device change or before a newer job for the
@@ -1082,8 +1082,8 @@ impl CanvasRenderer {
     /// its `slint::Image`. A no-op when that pane already covers
     /// `draw.src`/`draw.step` under the same edit generation and overlay,
     /// whatever `dst`/`pixelated` now are. `edited`, present, overlays the
-    /// composite with the resident tiles' gathered pixel wherever its index
-    /// differs; `overlay`, present on a three-sample composite, blends the
+    /// composite with the resident tiles' pixel wherever one is
+    /// held; `overlay`, present on a three-sample composite, blends the
     /// rainbow overlay in place of the plain render. `None` with no planes
     /// open, an out-of-bounds `draw.src`, or a failed read (coverage stays
     /// untouched on that path).

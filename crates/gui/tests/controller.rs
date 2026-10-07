@@ -13,6 +13,10 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
 use focusforge_core::project::{self, Op, Point, Project};
 use focusforge_core::zmap::ZMapReader;
+use focusforge_gpu::blend::Blender;
+use focusforge_gpu::device::SharedDevice;
+#[cfg(feature = "gpu-tests")]
+use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gui::canvas::PaneSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
 
@@ -7297,41 +7301,95 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
 // never paints what the canvas shows.
 // ---------------------------------------------------------------------
 
-#[test]
-fn live_view_after_release_equals_the_saved_render() {
+/// The strokes the live-view tests paint: three softness classes, each a
+/// press-and-release dab then a ticked drag from another frame.
+fn paint_scripted_strokes(c: &mut AppController) {
+    set_size(c, 10.0);
+    for (i, softness) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
+        c.set_brush_softness_fraction(softness);
+        c.select_frame((i + 1) % 3);
+        let x = 8.0 + 16.0 * i as f32;
+        drag(c, &[(x, 10.0)]);
+        drag_ticked(
+            c,
+            &[
+                (x - 4.0, 24.0),
+                (x + 4.0, 32.0),
+                (x - 3.0, 40.0),
+                (x + 5.0, 52.0),
+            ],
+        );
+    }
+    assert_eq!(ops(c).len(), 6);
+}
+
+/// Gives `c` the blend kernel on `device`, when there is one.
+fn attach_blend_device(c: &mut AppController, device: Option<&SharedDevice>) {
+    if let Some(shared) = device {
+        c.attach_blender(Blender::new(shared.device(), shared.queue()));
+    }
+}
+
+/// Paints [`paint_scripted_strokes`] in an editor over three frames, equalized
+/// or not, and checks the released live view against the saved render.
+fn live_view_matches_saved_render(prefix: &str, device: Option<&SharedDevice>) {
     for equalized in [false, true] {
-        let name = if equalized {
-            "live_equals_saved_equalized"
-        } else {
-            "live_equals_saved"
-        };
+        let name = format!("{prefix}{}", if equalized { "_equalized" } else { "" });
         let mut c = if equalized {
-            open_equalized_editor(name, 3)
+            open_equalized_editor(&name, 3)
         } else {
-            open_editor(name).0
+            open_editor(&name).0
         };
-        set_size(&mut c, 10.0);
-        for (i, softness) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
-            c.set_brush_softness_fraction(softness);
-            c.select_frame((i + 1) % 3);
-            let x = 8.0 + 16.0 * i as f32;
-            drag(&mut c, &[(x, 10.0)]);
-            drag_ticked(
-                &mut c,
-                &[
-                    (x - 4.0, 24.0),
-                    (x + 4.0, 32.0),
-                    (x - 3.0, 40.0),
-                    (x + 5.0, 52.0),
-                ],
-            );
-        }
-        assert_eq!(ops(&c).len(), 6);
+        attach_blend_device(&mut c, device);
+        paint_scripted_strokes(&mut c);
         let shown = displayed_whole(&mut c);
         let path = save_to_proposed(&mut c);
         assert!(
             shown == saved_render(&path),
             "equalized {equalized}: the live view differs from the saved render"
+        );
+    }
+}
+
+#[test]
+fn live_view_after_release_equals_the_saved_render() {
+    live_view_matches_saved_render("live_equals_saved", None);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_stroke_on_the_device_matches_the_saved_render() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    live_view_matches_saved_render("live_equals_saved_device", Some(shared));
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_stroke_on_the_device_matches_the_host_blend() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    for equalized in [false, true] {
+        let shown = |device: Option<&SharedDevice>, name: &str| {
+            let mut c = if equalized {
+                open_equalized_editor(name, 3)
+            } else {
+                open_editor(name).0
+            };
+            attach_blend_device(&mut c, device);
+            paint_scripted_strokes(&mut c);
+            displayed_whole(&mut c)
+        };
+        let on_device = shown(
+            Some(shared),
+            &format!("live_host_vs_device_{equalized}_gpu"),
+        );
+        let on_host = shown(None, &format!("live_host_vs_device_{equalized}_cpu"));
+        assert!(
+            on_device == on_host,
+            "equalized {equalized}: the device blend differs from the host blend sample for sample"
         );
     }
 }
@@ -7398,7 +7456,24 @@ fn live_soft_edge_is_a_blend_not_a_dither() {
 
 #[test]
 fn live_tick_reblends_only_its_segment_footprint() {
-    let (mut c, root) = open_editor("live_tick");
+    live_tick_reblends_only_its_footprint("live_tick", None);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_tick_on_the_device_reblends_only_its_segment_footprint() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    live_tick_reblends_only_its_footprint("live_tick_device", Some(shared));
+}
+
+/// Drags a path that doubles back, a tick at a time: each tick renders one
+/// region, the newest segment's footprint, and shows the path so far over the
+/// pre-stroke samples.
+fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevice>) {
+    let (mut c, root) = open_editor(name);
+    attach_blend_device(&mut c, device);
     let sealed = Sealed::read(&mut c, &root);
     let info = c.edit_session().unwrap().info();
     set_size(&mut c, 12.0);
