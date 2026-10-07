@@ -9,8 +9,8 @@ mod common;
 
 use std::fs;
 
-use focusforge_gui::AppWindow;
-use i_slint_backend_testing::ElementQuery;
+use focusforge_gui::{AppController, AppWindow};
+use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
 use slint::ComponentHandle;
 
 /// A headless `AppWindow`, sized explicitly -- `TestingWindow::size()`
@@ -669,6 +669,172 @@ fn settings_frame_sits_on_the_modal_panel() {
                     && (got.2 - expected.2).abs() < EPS
                     && (got.3 - expected.3).abs() < EPS,
                 "entry {i} at {width}x{height}: got {got:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
+/// A window on the Input map section, its rows filled from `controller` the
+/// way the running app fills them.
+fn input_map_window(width: u32, height: u32, controller: &AppController) -> AppWindow {
+    let app = app_at(width, height);
+    let rows: Vec<focusforge_gui::InputRow> = controller
+        .input_rows()
+        .into_iter()
+        .map(|r| focusforge_gui::InputRow {
+            input: r.input.into(),
+            stacking: r.stacking.into(),
+            editor: r.editor.into(),
+        })
+        .collect();
+    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    app.set_settings_open(true);
+    app.set_settings_section("input-map".into());
+    app
+}
+
+fn input_map_tab(app: &AppWindow) -> ElementHandle {
+    ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFInputMapTab")
+        .find_first()
+        .expect("no FFInputMapTab element found")
+}
+
+/// The elements `query` matches, one per position (a component's root is
+/// reported once per element merged into its item), top to bottom.
+fn by_position(query: ElementQuery) -> Vec<ElementHandle> {
+    let mut found: Vec<ElementHandle> = Vec::new();
+    for handle in query.find_all() {
+        if found
+            .iter()
+            .all(|seen| seen.absolute_position() != handle.absolute_position())
+        {
+            found.push(handle);
+        }
+    }
+    found.sort_by(|a, b| a.absolute_position().y.total_cmp(&b.absolute_position().y));
+    found
+}
+
+/// The header row, then one row per binding, as `[input, stacking, editor]`
+/// cell texts.
+fn input_map_cells(tab: &ElementHandle) -> Vec<[String; 3]> {
+    let column = |id: &str| -> Vec<String> {
+        by_position(tab.query_descendants().match_id(id))
+            .iter()
+            .map(|cell| cell.accessible_label().unwrap().to_string())
+            .collect()
+    };
+    let input = column("FFInputTableRow::input-cell");
+    let stacking = column("FFInputTableRow::stacking-cell");
+    let editor = column("FFInputTableRow::editor-cell");
+    assert_eq!(input.len(), stacking.len());
+    assert_eq!(input.len(), editor.len());
+    input
+        .into_iter()
+        .zip(stacking)
+        .zip(editor)
+        .map(|((input, stacking), editor)| [input, stacking, editor])
+        .collect()
+}
+
+/// With the section open, the tab shows its heading, the column header and
+/// then exactly the controller's rows in order, cell for cell. Run on the
+/// shipped table and on one with a binding changed, so a table written into
+/// the tab fails.
+#[test]
+fn input_map_tab_shows_the_controller_rows() {
+    let shipped = AppController::new();
+    let mut changed = AppController::new();
+    let mut table = focusforge_gui::input_map::InputTable::default();
+    table.bindings[0].stacking = Some(focusforge_gui::input_map::Action::PanHorizontal);
+    changed.install_input_table(table);
+    assert_ne!(
+        shipped.input_rows(),
+        changed.input_rows(),
+        "the changed binding must show in the rows"
+    );
+
+    for controller in [&shipped, &changed] {
+        let app = input_map_window(1440, 900, controller);
+        let tab = input_map_tab(&app);
+
+        let headings: Vec<String> = tab
+            .query_descendants()
+            .match_type_name("FFSectionHeading")
+            .find_first()
+            .expect("the tab has no section heading")
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::Text)
+            .find_all()
+            .iter()
+            .map(|text| text.accessible_label().unwrap().to_string())
+            .collect();
+        assert_eq!(headings, ["BINDINGS"]);
+
+        let mut expected = vec![["INPUT".to_string(), "STACKING".into(), "EDITOR".into()]];
+        expected.extend(
+            controller
+                .input_rows()
+                .into_iter()
+                .map(|row| [row.input, row.stacking, row.editor]),
+        );
+        assert_eq!(input_map_cells(&tab), expected);
+    }
+}
+
+/// A 1 px rule sits directly under the header and under every row, the last
+/// one included.
+#[test]
+fn input_map_table_draws_a_rule_under_every_row() {
+    let controller = AppController::new();
+    let app = input_map_window(1440, 900, &controller);
+    let tab = input_map_tab(&app);
+    let cells = by_position(
+        tab.query_descendants()
+            .match_id("FFInputTableRow::input-cell"),
+    );
+    let rules = by_position(tab.query_descendants().match_type_name("FFDivider"));
+    assert_eq!(rules.len(), cells.len(), "one rule per table row");
+
+    for (i, (cell, rule)) in cells.iter().zip(&rules).enumerate() {
+        let below = cell.absolute_position().y + cell.size().height;
+        let next = cells
+            .get(i + 1)
+            .map_or(f32::INFINITY, |next| next.absolute_position().y);
+        let y = rule.absolute_position().y;
+        assert!(
+            y >= below - EPS && y < next,
+            "row {i}: rule at {y} is not between the row's end {below} and the next row {next}"
+        );
+        assert_eq!(rule.size().height, 1.0, "row {i}: the rule is 1 px tall");
+    }
+}
+
+/// Every table row stays inside the settings content area, horizontally and
+/// above its bottom edge.
+#[test]
+fn input_map_rows_stay_inside_the_content_area() {
+    let controller = AppController::new();
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let app = input_map_window(width, height, &controller);
+        let (cx, cy, cw, ch) = rect(&app, "FFSettingsModal::content");
+        let rows = by_position(
+            input_map_tab(&app)
+                .query_descendants()
+                .match_id("FFInputTableRow::input-cell"),
+        );
+        assert_eq!(rows.len(), controller.input_rows().len() + 1);
+        for (i, cell) in rows.iter().enumerate() {
+            let pos = cell.absolute_position();
+            let size = cell.size();
+            assert!(
+                pos.x >= cx - EPS
+                    && pos.x + size.width <= cx + cw + EPS
+                    && pos.y + size.height <= cy + ch + EPS,
+                "row {i} at {width}x{height}: cell {pos:?} {size:?} leaves the content {:?}",
+                (cx, cy, cw, ch)
             );
         }
     }

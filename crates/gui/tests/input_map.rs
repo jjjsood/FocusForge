@@ -814,7 +814,7 @@ fn undo_and_redo_are_blocked_under_the_settings_modal() {
         stacking: None,
         editor: Some(Action::Undo),
     });
-    editor.install_input_table(table, input_config::Provenance::Defaults);
+    editor.install_input_table(table);
     editor.key(true, "y", Modifiers { ctrl: true, ..NONE });
     assert!(events.lock().unwrap().is_empty());
 
@@ -973,7 +973,7 @@ fn edit_mode_overrides_are_table_driven() {
     let mut rebound = AppController::new_with_mode_for_test(ShellMode::Editor);
     let (events, cb) = sink();
     rebound.set_sink(cb);
-    rebound.install_input_table(loaded.table, loaded.provenance);
+    rebound.install_input_table(loaded.table);
     let (size, soft) = brush(&rebound);
     rebound.wheel(0.0, 60.0, 0.0, 0.0, shift);
     assert_eq!(
@@ -1109,6 +1109,85 @@ fn no_handler_outside_the_dispatch_point() {
             "{}: maps a gesture to an Action outside the dispatch point",
             path.display()
         );
+    }
+}
+
+/// The names `code` declares as components, exported or not.
+fn declared_components(code: &str) -> Vec<&str> {
+    code.lines()
+        .map(str::trim_start)
+        .map(|line| line.strip_prefix("export ").unwrap_or(line))
+        .filter_map(|line| line.strip_prefix("component "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect()
+}
+
+/// Whether `code` writes a number straight before `px` or `%`.
+fn has_unit_literal(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    (1..bytes.len()).any(|i| {
+        bytes[i - 1].is_ascii_digit() && (bytes[i] == b'%' || bytes[i..].starts_with(b"px"))
+    })
+}
+
+/// The Input map tab is layout over shared components: one component, no
+/// styling or size of its own, the table row declared once under
+/// `components/`. Neither the tab nor the row can edit a binding.
+#[test]
+fn input_map_tab_uses_only_shared_settings_components() {
+    let ui = common::ui_dir();
+    let read = |path: &PathBuf| common::strip_line_comments(&fs::read_to_string(path).unwrap());
+    let row_path = ui.join("components/ff_input_table_row.slint");
+    let tab = read(&ui.join("shell/settings_modal/input_map_tab.slint"));
+    let row = read(&row_path);
+
+    assert_eq!(declared_components(&tab), ["FFInputMapTab"]);
+    assert_eq!(
+        tab.matches("struct ").count(),
+        1,
+        "the tab declares only the `InputRow` struct"
+    );
+    for import in tab.lines().filter(|line| line.starts_with("import ")) {
+        assert!(
+            import.contains("\"../../components/") || import.contains("\"../../theme.slint\""),
+            "the tab imports only shared components and the theme: {import}"
+        );
+    }
+    for shared in ["FFSettingsSection {", "FFInputTableRow {"] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+    for needle in [
+        "font-size",
+        "font-weight",
+        "color",
+        "background",
+        "border-",
+        "width",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle}");
+    }
+    assert!(!has_unit_literal(&tab), "the tab writes a px or % literal");
+
+    let declaring: Vec<PathBuf> = common::find_slint_files(&ui)
+        .into_iter()
+        .filter(|path| declared_components(&read(path)).contains(&"FFInputTableRow"))
+        .collect();
+    assert_eq!(declaring, [row_path]);
+
+    for (file, code) in [
+        ("input_map_tab.slint", &tab),
+        ("ff_input_table_row.slint", &row),
+    ] {
+        for needle in [
+            "TouchArea",
+            "FocusScope",
+            "TextInput",
+            "LineEdit",
+            "callback",
+            "=>",
+        ] {
+            assert!(!code.contains(needle), "{file} is not read-only: {needle}");
+        }
     }
 }
 

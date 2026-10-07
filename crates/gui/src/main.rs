@@ -852,7 +852,7 @@ fn install_input_table(
     }
 
     let mut controller = controller.lock().unwrap();
-    controller.install_input_table(loaded.table, loaded.provenance);
+    controller.install_input_table(loaded.table);
 
     let rows: Vec<focusforge_gui::InputRow> = controller
         .input_rows()
@@ -864,7 +864,6 @@ fn install_input_table(
         })
         .collect();
     app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    app.set_input_provenance(controller.input_provenance_line().into());
 
     if let Some(section) = &args.settings_section {
         controller.open_settings();

@@ -50,6 +50,7 @@ import { FFSettingsSection } from "components/ff_settings_section.slint";
 import { FFSettingsRow } from "components/ff_settings_row.slint";
 import { FFSettingsPathRow } from "components/ff_settings_path_row.slint";
 import { FFSettingsActionRow } from "components/ff_settings_action_row.slint";
+import { FFInputTableRow } from "components/ff_input_table_row.slint";
 
 // The settings modal's own ground, content width plus its padding.
 component SettingsGround inherits Rectangle {
@@ -291,6 +292,32 @@ export component ThemeSheet inherits Window {
                     status-text: "Could not clear the stage cache: Permission denied (os error 13).";
                     status-tone: "failure";
                 }
+            }
+        }
+
+        GroupHeading { text: "Input table: header, one-line row, wrapped row, last row without rule"; }
+        SettingsGround {
+            FFInputTableRow {
+                header: true;
+                input-label: "INPUT";
+                stacking-label: "STACKING";
+                editor-label: "EDITOR";
+            }
+            FFInputTableRow {
+                input-label: "wheel";
+                stacking-label: "zoom-at-cursor";
+                editor-label: "zoom-at-cursor";
+            }
+            FFInputTableRow {
+                input-label: "alt+left-click";
+                stacking-label: "pick-source-under-pointer";
+                editor-label: "pick-source-under-pointer";
+            }
+            FFInputTableRow {
+                divider: false;
+                input-label: "ctrl+z / ctrl+shift+z";
+                stacking-label: "—";
+                editor-label: "undo / redo";
             }
         }
 

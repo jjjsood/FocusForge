@@ -3397,7 +3397,6 @@ const ALT: Modifiers = Modifiers {
 /// Binds `Alt + Wheel` to the brush softness in editor mode; the shipped
 /// table leaves softness without a wheel binding.
 fn bind_softness_to_alt_wheel(controller: &mut AppController) {
-    use focusforge_gui::input_config::Provenance;
     use focusforge_gui::input_map::{Action, Binding, InputTable, Trigger};
     let mut table = InputTable::default();
     table.bindings.push(Binding {
@@ -3405,7 +3404,7 @@ fn bind_softness_to_alt_wheel(controller: &mut AppController) {
         stacking: None,
         editor: Some(Action::BrushSoftness),
     });
-    controller.install_input_table(table, Provenance::Defaults);
+    controller.install_input_table(table);
 }
 
 /// The active tab's whole fused map.

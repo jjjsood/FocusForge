@@ -133,6 +133,10 @@ export global ShellGeometry {
     // The status line under an action row: the gap above it, then one line.
     out property <length> settings-status-gap: 6px;
     out property <length> settings-status-height: 15px;
+    // The table header: the column titles' top down to the rule under them,
+    // then the gap above the first row.
+    out property <length> settings-table-header-height: 18px;
+    out property <length> settings-table-header-gap: 3px;
 
     // Two primitive sizes shared wherever something else needs to lay out
     // against them, rather than assuming the primitive's own literal.

@@ -535,7 +535,6 @@ export component AppWindow inherits Window {
     // `AppController::open_settings`/`close_settings`.
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
-    in property <string> input-provenance: "";
     in property <string> settings-section: "input-map";
     callback settings-open-requested();
     callback settings-close-requested();
@@ -686,7 +685,6 @@ export component AppWindow inherits Window {
         height: root.height;
         settings-open: root.settings-open;
         input-rows: root.input-rows;
-        input-provenance: root.input-provenance;
         settings-section: root.settings-section;
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;

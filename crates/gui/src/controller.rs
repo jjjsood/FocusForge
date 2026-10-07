@@ -32,7 +32,6 @@ use crate::diagnostics::{
 use crate::entry;
 use crate::export_settings::{self, ExportChoice, ExportView};
 use crate::images;
-use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
@@ -243,7 +242,6 @@ struct DragState {
 #[derive(Debug, Clone, Default)]
 struct InputState {
     table: InputTable,
-    provenance: Provenance,
     space_held: bool,
     /// `Alt` as the last hover move reported it -- shows the pipette cursor
     /// while held; it arms nothing.
@@ -2766,9 +2764,8 @@ impl AppController {
 
     /// Installs the input table `input_config::load` resolved -- called
     /// once at startup, before any gesture is dispatched.
-    pub fn install_input_table(&mut self, table: InputTable, provenance: Provenance) {
+    pub fn install_input_table(&mut self, table: InputTable) {
         self.state.input.table = table;
-        self.state.input.provenance = provenance;
     }
 
     /// Applies `event` ([`Self::apply_action`]) and raises
@@ -3827,22 +3824,6 @@ impl AppController {
 
     pub fn input_rows(&self) -> Vec<InputRowView> {
         self.state.input.table.display_rows()
-    }
-
-    /// The settings modal's one section-level provenance line.
-    pub fn input_provenance_line(&self) -> String {
-        match &self.state.input.provenance {
-            Provenance::Defaults => {
-                "Loaded from the shipped defaults (0 rows overridden)".to_string()
-            }
-            Provenance::File { path, overridden } => {
-                let noun = if *overridden == 1 { "row" } else { "rows" };
-                format!(
-                    "Loaded from {} ({overridden} {noun} overridden)",
-                    path.display()
-                )
-            }
-        }
     }
 
     pub fn open_settings(&mut self) -> bool {

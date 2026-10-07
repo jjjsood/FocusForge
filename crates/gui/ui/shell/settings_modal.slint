@@ -17,7 +17,6 @@ export { FFManifestRow, InputRow }
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
-    in property <string> input-provenance: "";
     in property <string> settings-section: "input-map";
     callback settings-close-requested();
     callback settings-section-selected(string);
@@ -122,7 +121,6 @@ export component FFSettingsModal inherits FFModalPanel {
 
         if root.settings-section == "input-map": FFInputMapTab {
             input-rows: root.input-rows;
-            input-provenance: root.input-provenance;
         }
     }
 }
