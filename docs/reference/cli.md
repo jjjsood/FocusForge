@@ -14,8 +14,8 @@ focusforge-cli <COMMAND>
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
 | [`export`](#export) | renders a checkpoint to a TIFF, PNG or JPEG image, and/or writes its Z-Map or one source frame |
-| [`retouch`](#retouch) | applies an op list to a Z-Map and writes the edited map |
-| [`history`](#history) | lists, materializes, extends and deletes a project's checkpoints |
+| [`retouch`](#retouch) | appends an op list of brush strokes to a project as new checkpoints |
+| [`history`](#history) | lists, deletes and compacts a project's checkpoints |
 | [`align`](#align) | computes and reports each frame's transform, without fusing |
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
@@ -713,11 +713,12 @@ Turns a checkpoint of a project into image files: the image with `-o`, the
 Z-Map with `--zmap`, one source frame warped and cropped to the composite's
 own extent (with the recorded brightness gain, when the run equalized) with
 `--frame`/`--frame-output` — any combination, at least one required. The image
-is always rendered from the checkpoint's Z-Map, gathering each pixel from the
-source frame its index names, read through the recorded brightness gains when
-the run equalized, so an edited checkpoint exports as edited. Rendering
-re-reads the source frames and checks each against the hash recorded in the
-project. See
+is rendered from the checkpoint's stored composite with the strokes on the
+way down blended over it, so a retouched checkpoint exports as retouched. An
+unretouched checkpoint needs no source frames; a retouched one re-reads the
+nearest fused ancestor's and checks each against the hash recorded in the
+project. `-o`, `--zmap` and `--frame-output` are refused when one names the
+opened project. See
 [`reference/project-format.md`](project-format.md) for what `<PROJECT>` (a
 `.ffp` file) holds.
 
@@ -753,7 +754,7 @@ focusforge-cli export mantis-64.ffp --checkpoint 5b71 --zmap zmap-5b71.tif
 ```
 
 A source frame that cannot be found, or whose content changed since the
-project was written, makes `-o` and `--frame-output` refuse, naming every
+project was written, makes a retouched `-o` and `--frame-output` refuse, naming every
 such frame; nothing is written. `--zmap` alone never reads a source frame.
 The `.partial` file a run writes into is renamed only when the write
 completes.
@@ -788,24 +789,20 @@ blob hash mismatch, 8 a broken link between checkpoints, `1` anything
 else). If a source frame's content changed since the project was written,
 every subcommand refuses with exit 9 naming the frames;
 `--accept-changed-sources` proceeds with a warning instead. Frames that
-cannot be found only produce a warning: the history and Z-Maps are intact.
+cannot be found only produce a warning: the history is intact.
 
 | subcommand | does |
 |---|---|
 | `list <PROJECT> [--json]` | prints every visible checkpoint, newest first: id, parent, algorithm and creation time. `--json` emits `{"checkpoints": [{"id", "parent", "algorithm", "created_at"}]}`, `created_at` in Unix seconds |
-| `materialize <PROJECT> --checkpoint <ID> -o <FILE> [--json]` | writes that checkpoint's Z-Map as a TIFF; never overwrites the project |
-| `apply <PROJECT> --ops <FILE> [--from <ID>] [--save] [-o <FILE>] [--json]` | applies an op list read from `--ops` (`{"ops": [...]}`, the shape described in [`guide/retouch.md`](../guide/retouch.md)) onto `--from` (default: the head). `--save` seals the result as a new child checkpoint, which branches the tree when `--from` is not the head; `-o` writes the edited Z-Map. At least one of the two is required; with both, the map written is the sealed checkpoint's |
 | `delete <PROJECT> --checkpoint <ID> [--json]` | hides a checkpoint and removes it from the file once no visible checkpoint is built on it. Refuses the last visible checkpoint |
+| `compact <PROJECT> [--json]` | rewrites the project to its live checkpoints only and reports the bytes reclaimed |
 
 ```
 focusforge-cli history list mantis-64.ffp
-focusforge-cli history apply mantis-64.ffp --ops ops.json --save
 focusforge-cli history delete mantis-64.ffp --checkpoint 5b71
 ```
 
-`apply --json` reports `project`, `from`, `checkpoint` (the sealed id, `null`
-without `--save`), `wrote`, `ops` and `wall_seconds`; `materialize --json`
-reports `project`, `checkpoint`, `wrote` and `wall_seconds`; `delete --json`
+`delete --json`
 reports `project`, `hidden`, `removed` (every checkpoint taken out of the
 file) and `head`. The list's JSON carries no version field, like every
 project and op file.
@@ -813,49 +810,40 @@ project and op file.
 ## `retouch`
 
 ```
-focusforge-cli retouch [OPTIONS] --zmap <FILE> --ops <FILE> --out <FILE>
+focusforge-cli retouch [OPTIONS] --ops <FILE> <PROJECT>
 ```
 
-Applies an op list to a Z-Map and writes the edited map. Every editing
-capability the window offers is reachable through this one command,
+Appends an op list to a project as new checkpoints, one per op, each the
+previous one's child: on the head, or on `--from` as a branch. Every
+editing capability the window offers is reachable through this command,
 headless — see [`guide/retouch.md`](../guide/retouch.md) for the op list's
-JSON shape and a full walkthrough.
+JSON shape. Render a result with [`export --checkpoint`](#export).
 
 | flag | meaning |
 |---|---|
-| `--zmap <FILE>` | the Z-Map to edit |
-| `--ops <FILE>` | the op list to apply, in the persisted `Op` JSON shape; positions in error messages count from 0 in list order |
-| `--out <FILE>` | where to write the edited Z-Map; required, and never the same file as `--zmap` |
-| `--undo <N>` | undo this many ops off the end of the list before writing (default `0`) |
-| `--redo <N>` | redo this many undone ops, never more than `--undo` (default `0`) |
-| `--frames <DIR>` | directory of source frames to recomposite `--render`/`--overlay` from; required by either |
-| `--render <FILE>` | write the recomposited image at the edited map's undo/redo position — a per-pixel gather from `--frames`, CPU only |
-| `--overlay <FILE>` | blend the rainbow overlay over the recomposited image and write it as an 8-bit RGBA PNG |
-| `--opacity <FLOAT>` | the overlay's blend opacity, `0.0`–`1.0` (default `0.65`) |
-| `--solo <INDEX>` | highlight this 0-based source index in the overlay — the numbering an op's `source_id` uses — and desaturate every other source |
+| `<PROJECT>` | the project to append to |
+| `--ops <FILE>` | the op list: a JSON array of ops in the persisted `Op` shape. A brush stroke blends frame `source_id` over the image along its path, fully within `radius * (1 - softness)` and fading linearly to nothing at `radius` |
+| `--from <ID>` | the checkpoint to append under, an id or a unique id prefix; defaults to the head |
+| `--name <NAME>` | names the last appended checkpoint |
 | `--json` | emit a JSON report instead of human-readable text |
 
 ```
-$ focusforge-cli retouch --zmap zmap.tif --ops stroke-list.json --out edited.tif
-zmap: zmap.tif
-ops: stroke-list.json (3 in list, 3 applied)
-pixels changed: 9608
-wrote: edited.tif
-wall: 0.035s
+$ focusforge-cli retouch frames.ffp --ops stroke-list.json
+frames.ffp
+from: 5b71c0d2...
+checkpoints: 9e03..., a417...
+ops: 2
+wall: 0.012s
 ```
 
 An op that fails to validate — an unsupported tag, or a value outside what
 the op accepts — refuses the whole run before anything is written, naming
-the op's 0-based position in the list. `--out` and any of `--render`/
-`--overlay` are refused if they would overwrite `--zmap`, each other, or a
-source frame.
+the op's 0-based position in the list.
 
 ### `--json`
 
-`--json` reports `zmap`, `ops`, `ops_in_list`, `ops_applied`,
-`pixels_changed`, `wrote`, `wall_seconds`, `rendered` (the `--render` path
-written, `null` when omitted) and `overlay` (the `--overlay` path written,
-`null` when omitted).
+`--json` reports `project`, `from`, `checkpoints` (the new ids in op order),
+`ops` and `wall_seconds`.
 
 ## `review`
 

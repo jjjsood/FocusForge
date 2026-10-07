@@ -24,9 +24,9 @@ the canvas once a load has been running for half a second.
 ## The window
 
 A tab strip runs across the top, one tab per open project plus a `+` tab for
-starting another. Below it, the left canvas pane shows the source frame
-selected in **Images**; the right pane shows the composite or Z-Map after a
-fuse. Both panes pan and zoom together. A dock along the side switches
+starting another. Below it, the left canvas pane, **Frame**, shows the source frame
+selected in **Images**; the right pane, **Composite**, shows the result after
+a fuse. Both panes pan and zoom together. A dock along the side switches
 between two tabs of its own:
 
 - **Images** lists every frame in fuse order, with its legend color and
@@ -58,7 +58,7 @@ reports a clear error instead of choosing a different backend.
 
 ## Staying responsive
 
-Loading frame planes, saving a project, loading one and recompositing after
+Loading frame planes, saving a project, loading one and blending
 a brush stroke all run off the window's thread, so the window keeps
 responding while they work. While you pan, zoom or paint, a running fuse or
 alignment holds back to a quarter of the machine's threads (at least one) and
@@ -148,8 +148,8 @@ dialog offers:
 **Export** then opens the system save dialog and writes the image, with
 progress shown in the dialog. The format and each format's last settings are remembered in
 `settings.toml`'s `[export]` table once an export succeeds. The image is
-rendered from the Z-Map, so the source frames are read again and checked;
-an export that cannot proceed says why instead of writing, naming each
+rendered from the stored composite with any strokes blended over it; a
+retouched result reads the source frames again and checks them. An export that cannot proceed says why instead of writing, naming each
 missing or changed frame, an image too large for the format (JPEG is limited
 to 65,535 pixels per side), or a format the image cannot be saved in (PNG
 and JPEG hold grey or RGB images only). A refusal for missing or changed
@@ -159,8 +159,8 @@ same path.
 ## Retouching a result
 
 Once a tab has fused, the **STACKING / EDITOR** switch in the dock lights up
-its **EDITOR** half; switching to it turns the right pane into a paintable
-composite with a brush, a pipette and a rainbow source legend. See
+its **EDITOR** half; switching to it turns the **Composite** pane into a paintable
+result with a brush, a pipette and a rainbow source legend. See
 [`guide/retouch.md`](retouch.md) for the full workflow.
 
 ## Switching between projects

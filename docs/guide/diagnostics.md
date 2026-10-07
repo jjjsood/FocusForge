@@ -101,7 +101,7 @@ there is no extra step between one export and the next.
 ## Profiling the window
 
 The GUI can write a Chrome-trace file of its own activity: input, redraws,
-canvas publication, saves and recomposites. Build it with the `trace`
+canvas publication, saves and stroke renders. Build it with the `trace`
 feature and name the output file:
 
 ```

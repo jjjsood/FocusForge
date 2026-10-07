@@ -4,13 +4,13 @@
 
 ```
 crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
-               Z-Map and its retouch op log (brush strokes, undo/redo, the
-               rainbow overlay palette), the job engine (pause/resume/cancel
+               Z-Map, the retouch op log and its brush-stroke blend, the
+               rainbow overlay palette, the job engine (pause/resume/cancel
                over tile-sized work units), the stage cache, grouping
                proposals, the `.ffp` project container and its
-               checkpoint history (op log replay, sparse delta blobs,
-               image export in TIFF, PNG and JPEG)
-crates/gpu/    the shared wgpu device, WGSL fusion/warp kernels and the
+               checkpoint history (op log, render from the stored
+               composite, image export in TIFF, PNG and JPEG)
+crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
                startup discovers the device's usable VRAM budget, mirroring
@@ -27,7 +27,8 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, projects overlay, settings modal), a wgpu-backed
                canvas that renders a composite/Z-Map pair and, in editor
-               mode, a brush and pipette over a live recomposite, a fuse
+               mode, a brush and pipette over live strokes blended
+               on the GPU with a CPU fallback, a fuse
                worker that drives `crates/core`'s own job engine on a
                background thread, a load worker that walks a folder and
                decodes a thumbnail off the event-loop thread, and a
@@ -53,7 +54,7 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   driver.
 - `focusforge-cli`: `clap`, `serde`/`serde_json`, `toml`, `signal-hook`
   (SIGINT/SIGUSR1 handling for `stack`'s pause/resume/cancel controls), `png`
-  (`retouch --overlay`'s PNG output), and the same `gpu` feature forwarded
+  (read back by the export tests), and the same `gpu` feature forwarded
   to enable `--no-gpu` and the automatic GPU path on `stack`/`align`.
 - `focusforge-gui`: `slint = "~1.17"` (`default-features = false`, features
   `std`, `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`,
@@ -88,9 +89,9 @@ the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
 control loop, the stage cache, grouping proposals and the `.ffp` project
-container's read/write round trip, the retouch op log (brush strokes,
-undo/redo, the rainbow overlay palette) replayed against a whole-map
-oracle, the checkpoint history (sparse delta blobs, snapshot cadence,
+container's read/write round trip, the retouch op log (brush strokes, the
+rainbow overlay palette) and the render of a checkpoint's state, the
+checkpoint history (append-only saves,
 branching, delete and import validation, the export formats), and the
 `focusforge-cli
 stack`/`align`/`algorithms`/`export`/`retouch`/`history`/`review`/`cache`/`diagnostics`
