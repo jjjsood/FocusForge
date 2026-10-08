@@ -25,7 +25,7 @@ pub fn last_report() -> Option<PathBuf> {
 }
 
 /// Where a data directory keeps its crash evidence.
-pub(crate) fn crash_dir(data_dir: &Path) -> PathBuf {
+pub fn crash_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("crashes")
 }
 

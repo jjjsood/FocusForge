@@ -22,8 +22,8 @@ export { ComparisonWindow }
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
-import { FFSettingsModal, InputRow, FFManifestRow } from "shell/settings_modal.slint";
-export { InputRow, FFManifestRow }
+import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
@@ -535,11 +535,22 @@ export component AppWindow inherits Window {
     // `AppController::open_settings`/`close_settings`.
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
-    in property <string> input-provenance: "";
-    in property <string> settings-section: "input-map";
+    in property <string> settings-section: "performance";
     callback settings-open-requested();
     callback settings-close-requested();
     callback settings-section-selected(string);
+
+    in property <PerformanceState> performance;
+    callback performance-gpu-toggled(bool);
+    callback performance-host-cap-edited(string);
+    callback performance-vram-cap-edited(string);
+    callback performance-host-cap-cursor-moved(length, length);
+    callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <StorageState> storage;
+    callback storage-clear-requested();
+
+    in property <AboutState> about;
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -686,8 +697,10 @@ export component AppWindow inherits Window {
         height: root.height;
         settings-open: root.settings-open;
         input-rows: root.input-rows;
-        input-provenance: root.input-provenance;
         settings-section: root.settings-section;
+        performance: root.performance;
+        storage: root.storage;
+        about: root.about;
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;
         diagnostics-include-minidumps: root.diagnostics-include-minidumps;
@@ -703,6 +716,12 @@ export component AppWindow inherits Window {
 
         settings-close-requested => { root.settings-close-requested(); }
         settings-section-selected(s) => { root.settings-section-selected(s); }
+        performance-gpu-toggled(on) => { root.performance-gpu-toggled(on); }
+        performance-host-cap-edited(t) => { root.performance-host-cap-edited(t); }
+        performance-vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+        performance-host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
+        performance-vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        storage-clear-requested => { root.storage-clear-requested(); }
         diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
         diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
         diagnostics-destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }

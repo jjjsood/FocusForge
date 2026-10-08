@@ -64,7 +64,7 @@ struct Args {
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Opens the settings modal on the named section at startup:
-    /// `input-map` or `diagnostics`.
+    /// `performance`, `storage`, `input-map`, `diagnostics` or `about`.
     #[arg(long)]
     settings_section: Option<String>,
     /// Selects the dock's tab row at startup: `images` or `settings`.
@@ -852,7 +852,7 @@ fn install_input_table(
     }
 
     let mut controller = controller.lock().unwrap();
-    controller.install_input_table(loaded.table, loaded.provenance);
+    controller.install_input_table(loaded.table);
 
     let rows: Vec<focusforge_gui::InputRow> = controller
         .input_rows()
@@ -864,18 +864,14 @@ fn install_input_table(
         })
         .collect();
     app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
-    app.set_input_provenance(controller.input_provenance_line().into());
 
     if let Some(section) = &args.settings_section {
         controller.open_settings();
         app.set_settings_open(true);
-        let parsed = if section == "diagnostics" {
-            focusforge_gui::SettingsSection::Diagnostics
-        } else {
-            focusforge_gui::SettingsSection::InputMap
-        };
+        let parsed = focusforge_gui::SettingsSection::from_slug(section)
+            .expect("`--settings-section` was validated against the section list in `run`");
         controller.select_settings_section(parsed);
-        app.set_settings_section(section.clone().into());
+        app.set_settings_section(parsed.slug().into());
     }
 }
 
@@ -894,21 +890,27 @@ fn install_diagnostics(
     focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
 
-/// Loads the `Recent` list from the same config directory `install_input_table`
-/// resolves and installs it on `controller`. A directory that fails to
-/// resolve leaves the list empty for the session, never a reason the window
-/// fails to open.
+/// Loads the `Recent` list, the export choice and the performance settings
+/// from the same config directory `install_input_table` resolves and installs
+/// them on `controller`. A directory that fails to resolve leaves the list
+/// empty and the performance settings at their defaults (GPU processing on)
+/// for the session, never a reason the window fails to open.
 fn install_recent(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
     args: &Args,
 ) {
     let Some(config_dir) = resolve_config_dir(args) else {
+        controller.lock().unwrap().install_performance(
+            focusforge_gui::performance_settings::PerformanceSettings::default(),
+        );
         return;
     };
     let entries = focusforge_gui::recent::load(&config_dir);
     let choice = focusforge_gui::export_settings::load(&config_dir);
+    let performance = focusforge_gui::performance_settings::load(&config_dir);
     let mut controller = controller.lock().unwrap();
     controller.install_export_choice(choice);
+    controller.install_performance(performance);
     controller.install_recent(entries, config_dir);
 }
 
@@ -940,12 +942,12 @@ fn main() -> ExitCode {
 /// for a session ended because the graphics device was lost.
 fn run(args: &Args) -> ExitCode {
     if let Some(section) = &args.settings_section
-        && section != "input-map"
-        && section != "diagnostics"
+        && focusforge_gui::SettingsSection::from_slug(section).is_none()
     {
-        tracing::error!(
-            "--settings-section accepts \"input-map\" or \"diagnostics\", got {section:?}"
-        );
+        let accepted = focusforge_gui::SettingsSection::ALL
+            .map(|s| format!("{:?}", s.slug()))
+            .join(" or ");
+        tracing::error!("--settings-section accepts {accepted}, got {section:?}");
         return ExitCode::from(2);
     }
     if let Some(tab) = &args.dock_tab
@@ -965,8 +967,7 @@ fn run(args: &Args) -> ExitCode {
     // Built before `select_backend`: the drop route (`bridge::DropHandler`)
     // installs on the `BackendSelector` chain before any window exists, and
     // needs the same renderer cell every other open path feeds.
-    let mut controller_state = AppController::new();
-    controller_state.set_gpu_fusion(true);
+    let controller_state = AppController::new();
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
@@ -1000,6 +1001,9 @@ fn run(args: &Args) -> ExitCode {
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app);
         install_recent(&controller, args);
+        bridge::push_performance_view(&app, &controller);
+        bridge::push_storage_view(&app, &controller);
+        bridge::push_about_view(&app);
 
         if let Some(state) = &args.toolbar_state {
             apply_toolbar_state_preview(&app, state.as_str());

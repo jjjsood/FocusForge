@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A settings row with one action button on the right and, always reserved
+// beneath it, a one-line status slot in the helper's column.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFRowLabel } from "ff_row_label.slint";
+import { FFRowText } from "ff_row_text.slint";
+import { FFButton } from "ff_button.slint";
+import { FFStatusText } from "ff_status_text.slint";
+
+export component FFSettingsActionRow inherits VerticalLayout {
+    in property <string> label: "";
+    // Wraps in the column between the label and the button.
+    in property <string> helper: "";
+    in property <string> button-text: "";
+    in property <bool> enabled: true;
+    in property <string> status-text: "";
+    // "none" | "success" | "warning" | "failure".
+    in property <string> status-tone: "none";
+    callback clicked();
+
+    spacing: 0px;
+
+    Rectangle {
+        // The label's own centring offset, kept above and below a helper
+        // taller than one line.
+        property <length> pad: (ShellGeometry.settings-row-height - ShellGeometry.param-label-height) / 2;
+
+        height: max(ShellGeometry.settings-row-height, 2 * self.pad + helper-text.preferred-height);
+
+        label := FFRowLabel {
+            x: 0px;
+            y: parent.pad;
+            width: ShellGeometry.settings-label-width;
+            height: ShellGeometry.param-label-height;
+            label-text: root.label;
+        }
+
+        helper-text := FFRowText {
+            x: ShellGeometry.settings-label-width;
+            y: parent.pad;
+            width: parent.width - ShellGeometry.settings-label-width - ShellGeometry.settings-action-button-width - Theme.space-4;
+            text: root.helper;
+            muted: true;
+            wrap: word-wrap;
+            vertical-alignment: top;
+        }
+
+        FFButton {
+            x: parent.width - self.width;
+            y: (ShellGeometry.settings-row-height - self.height) / 2;
+            width: ShellGeometry.settings-action-button-width;
+            compact: true;
+            text: root.button-text;
+            enabled: root.enabled;
+            clicked => { root.clicked(); }
+        }
+    }
+
+    Rectangle {
+        height: ShellGeometry.settings-status-gap + ShellGeometry.settings-status-height;
+
+        status := FFStatusText {
+            x: ShellGeometry.settings-label-width;
+            y: ShellGeometry.settings-status-gap;
+            width: parent.width - ShellGeometry.settings-label-width;
+            height: ShellGeometry.settings-status-height;
+            text: root.status-text;
+            tone: root.status-tone;
+            overflow: elide;
+        }
+    }
+}

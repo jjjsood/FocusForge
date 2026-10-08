@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+// One rail entry: icon and label, an accent bar on the left edge when
+// selected, a 1 px accent ring when focused.
+export component FFNavRailEntry inherits Rectangle {
+    in property <string> label: "";
+    in property <image> icon-source;
+    in property <bool> selected: false;
+    // Drawn without the pointer or the keyboard being there, as `FFField`'s
+    // own `hovered` and `focused` are.
+    in property <bool> hovered: false;
+    in property <bool> focused: false;
+    callback clicked();
+
+    height: ShellGeometry.settings-rail-entry-height;
+    background: root.selected || root.hovered || area.has-hover ? Theme.surface-hover : transparent;
+    accessible-role: tab;
+    accessible-label: root.label;
+    accessible-checked: root.selected;
+    accessible-action-default => { root.clicked(); }
+
+    key := FocusScope {
+        focus-on-click: false;
+        KeyBinding {
+            keys: @keys(Return);
+            activated => { root.clicked(); }
+        }
+        KeyBinding {
+            keys: @keys(Space);
+            activated => { root.clicked(); }
+        }
+    }
+
+    area := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Image {
+        x: ShellGeometry.settings-rail-icon-x;
+        y: (parent.height - self.height) / 2;
+        source: root.icon-source;
+        colorize: root.selected ? Theme.accent-default : Theme.text-secondary;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+    }
+    Text {
+        x: ShellGeometry.settings-rail-label-x;
+        height: 100%;
+        text: root.label;
+        color: root.selected ? Theme.text-primary : Theme.text-secondary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        vertical-alignment: center;
+    }
+
+    if root.selected: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 2px;
+        height: parent.height;
+        background: Theme.accent-default;
+    }
+    if root.focused || key.has-focus: ring := Rectangle {
+        width: 100%;
+        height: 100%;
+        border-width: 1px;
+        border-color: Theme.accent-default;
+    }
+}

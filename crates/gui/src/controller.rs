@@ -32,12 +32,12 @@ use crate::diagnostics::{
 use crate::entry;
 use crate::export_settings::{self, ExportChoice, ExportView};
 use crate::images;
-use crate::input_config::Provenance;
 use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
+use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
 use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
@@ -69,17 +69,135 @@ pub enum DockTab {
     Settings,
 }
 
-/// The settings modal's nav-rail sections, top to bottom. Four of the six
-/// are disabled and cannot be selected.
+/// The settings modal's sections, top to bottom in the nav rail. [`ALL`]
+/// is the one list of them; each section has one slug, used by the rail's
+/// selection callback and by `--settings-section`.
+///
+/// [`ALL`]: SettingsSection::ALL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
-    General,
+    #[default]
     Performance,
     Storage,
-    #[default]
     InputMap,
     Diagnostics,
     About,
+}
+
+impl SettingsSection {
+    /// Every section, in nav-rail order.
+    pub const ALL: [SettingsSection; 5] = [
+        SettingsSection::Performance,
+        SettingsSection::Storage,
+        SettingsSection::InputMap,
+        SettingsSection::Diagnostics,
+        SettingsSection::About,
+    ];
+
+    /// The section's slug: lowercase, hyphen-separated.
+    pub fn slug(self) -> &'static str {
+        match self {
+            SettingsSection::Performance => "performance",
+            SettingsSection::Storage => "storage",
+            SettingsSection::InputMap => "input-map",
+            SettingsSection::Diagnostics => "diagnostics",
+            SettingsSection::About => "about",
+        }
+    }
+
+    /// The section whose [`slug`](Self::slug) is exactly `slug`.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.slug() == slug)
+    }
+}
+
+/// One location the Storage tab lists.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoragePath {
+    /// The path as shown, the home directory written `~`; empty when the
+    /// location did not resolve.
+    pub path: String,
+    /// The location resolved but does not exist yet.
+    pub missing: bool,
+    /// Whether the location resolved at all.
+    pub available: bool,
+}
+
+/// How a Storage tab status line is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageTone {
+    None,
+    Success,
+    Warning,
+    Failure,
+}
+
+impl StorageTone {
+    /// The tone name `FFStatusText` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageTone::None => "none",
+            StorageTone::Success => "success",
+            StorageTone::Warning => "warning",
+            StorageTone::Failure => "failure",
+        }
+    }
+}
+
+/// Everything the Storage tab shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageView {
+    pub settings_file: StoragePath,
+    pub logs: StoragePath,
+    pub crashes: StoragePath,
+    pub scratch: StoragePath,
+    /// Whether the clear button can be pressed.
+    pub clear_enabled: bool,
+    pub status: String,
+    pub status_tone: StorageTone,
+}
+
+/// Shown while a run is live and the clear is refused.
+const STORAGE_REFUSAL: &str = "A run is active.";
+
+/// An error's text without a trailing ` (os error N)` and a closing period,
+/// so a line built from it ends in exactly one period.
+fn plain_cause(text: &str) -> &str {
+    text.strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" (os error "))
+        .filter(|(_, code)| !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(text, |(head, _)| head)
+        .trim_end_matches('.')
+}
+
+/// The four locations a window session uses, from the directories it
+/// resolved. `home` only changes how a path is written, never which one.
+pub fn storage_view(
+    config_dir: Option<&Path>,
+    data_dir: Option<&Path>,
+    scratch_root: &Path,
+    home: Option<&Path>,
+) -> StorageView {
+    let row = |path: Option<PathBuf>| {
+        path.map_or_else(StoragePath::default, |path| StoragePath {
+            missing: !path.exists(),
+            available: true,
+            path: match home.and_then(|home| path.strip_prefix(home).ok()) {
+                Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+                Some(rest) => Path::new("~").join(rest).display().to_string(),
+                None => path.display().to_string(),
+            },
+        })
+    };
+    StorageView {
+        settings_file: row(config_dir.map(|dir| dir.join(crate::settings::FILE_NAME))),
+        logs: row(data_dir.map(focusforge_diagnostics::log_dir)),
+        crashes: row(data_dir.map(focusforge_diagnostics::crash_dir)),
+        scratch: row(Some(scratch_root.to_path_buf())),
+        clear_enabled: true,
+        status: String::new(),
+        status_tone: StorageTone::None,
+    }
 }
 
 /// Every event the shell can raise, reaching an installed sink through
@@ -226,7 +344,6 @@ struct DragState {
 #[derive(Debug, Clone, Default)]
 struct InputState {
     table: InputTable,
-    provenance: Provenance,
     space_held: bool,
     /// `Alt` as the last hover move reported it -- shows the pipette cursor
     /// while held; it arms nothing.
@@ -1608,12 +1725,12 @@ fn field_scroll_margin(viewport_width: f32) -> f32 {
 
 /// The horizontal scroll offset that keeps a cursor at `cursor_x` (measured
 /// from the field's unscrolled left edge) inside `[0, viewport_width]`,
-/// shifting `current_offset` by the least amount needed --
-/// [`AppController::diagnostics_destination_cursor_moved`]'s only helper.
+/// shifting `current_offset` by the least amount needed. The offset is never
+/// positive: the text does not move right of its origin.
 fn clamp_field_scroll(cursor_x: f32, current_offset: f32, viewport_width: f32) -> f32 {
     let margin = field_scroll_margin(viewport_width);
     if cursor_x + current_offset < margin {
-        margin - cursor_x
+        (margin - cursor_x).min(0.0)
     } else if cursor_x + current_offset > viewport_width - margin {
         viewport_width - margin - cursor_x
     } else {
@@ -1655,10 +1772,25 @@ pub struct AppController {
     checkpoint_generation: u64,
     /// The newest generation [`Self::take_checkpoint_flash`] handed out.
     checkpoint_flash_played: u64,
-    /// Whether a fuse run may use the headless GPU backend at all -- `false`
-    /// by default, so a headless test controller never probes an adapter;
-    /// [`main`](crate) turns this on for the real window.
-    gpu_fusion: bool,
+    /// The Performance tab's settings, read by every run this controller
+    /// starts. A controller from [`AppController::new`] has GPU processing
+    /// off, so a headless test never probes an adapter; the window installs
+    /// the loaded value ([`Self::install_performance`]).
+    performance: PerformanceSettings,
+    /// Cap field text that did not parse, shown until the next edit; the
+    /// cap in `performance` stays as it was.
+    rejected_caps: RejectedCaps,
+    /// The VRAM cap was edited after this session's device budget settled,
+    /// so the edit applies from the next launch.
+    vram_pending: bool,
+    /// [`Self::fusion_backend`]'s line from the newest run that settled.
+    last_backend_line: Option<String>,
+    /// How far each Performance cap field's entry is scrolled, kept by
+    /// [`Self::host_memory_cap_cursor_moved`] and [`Self::vram_cap_cursor_moved`].
+    host_cap_scroll_x: f32,
+    vram_cap_scroll_x: f32,
+    /// The Storage tab's newest clear result: its status line and tone.
+    storage_result: Option<(String, StorageTone)>,
     /// The blend kernel on the display device, handed to every edit session
     /// while the device is attached.
     blender: Option<Blender>,
@@ -1705,6 +1837,7 @@ impl AppController {
     /// window is ever resized.
     pub fn new() -> Self {
         let mut controller = Self::default();
+        controller.performance.gpu = false;
         controller.state.tab_region_width = Self::BASE_TAB_REGION_WIDTH;
         controller
     }
@@ -2749,9 +2882,8 @@ impl AppController {
 
     /// Installs the input table `input_config::load` resolved -- called
     /// once at startup, before any gesture is dispatched.
-    pub fn install_input_table(&mut self, table: InputTable, provenance: Provenance) {
+    pub fn install_input_table(&mut self, table: InputTable) {
         self.state.input.table = table;
-        self.state.input.provenance = provenance;
     }
 
     /// Applies `event` ([`Self::apply_action`]) and raises
@@ -3810,22 +3942,6 @@ impl AppController {
 
     pub fn input_rows(&self) -> Vec<InputRowView> {
         self.state.input.table.display_rows()
-    }
-
-    /// The settings modal's one section-level provenance line.
-    pub fn input_provenance_line(&self) -> String {
-        match &self.state.input.provenance {
-            Provenance::Defaults => {
-                "Loaded from the shipped defaults (0 rows overridden)".to_string()
-            }
-            Provenance::File { path, overridden } => {
-                let noun = if *overridden == 1 { "row" } else { "rows" };
-                format!(
-                    "Loaded from {} ({overridden} {noun} overridden)",
-                    path.display()
-                )
-            }
-        }
     }
 
     pub fn open_settings(&mut self) -> bool {
@@ -6510,7 +6626,7 @@ impl AppController {
     /// and a promotion out of the queue both call, so a queued tab's request
     /// is built at the moment it starts rather than at the moment it was
     /// queued. `None` only if `index` no longer names an open tab.
-    fn fuse_request_for(&self, index: usize) -> Option<job::JobRequest> {
+    pub fn job_request_for(&self, index: usize) -> Option<job::JobRequest> {
         let tab = self.state.projects.get(index)?;
         let frames = tab.included_frames();
         let scratch_root = self.scratch_root();
@@ -6528,14 +6644,150 @@ impl AppController {
             align_lax: true,
             crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
             equalize: settings_panel::equalization_bound(&tab.fuse_id, &tab.project_values),
-            gpu: self.gpu_fusion,
+            gpu: self.performance.gpu,
+            max_host_memory: self.performance.max_host_memory_bytes(),
+            max_vram: self.performance.max_vram_bytes(),
         })
     }
 
     /// Turns GPU-backed fusion on or off for every run this controller
-    /// starts from here on -- never mid-run.
+    /// starts from here on -- never mid-run -- and saves the choice when a
+    /// config directory is installed.
     pub fn set_gpu_fusion(&mut self, gpu_fusion: bool) {
-        self.gpu_fusion = gpu_fusion;
+        self.performance.gpu = gpu_fusion;
+        self.save_performance();
+    }
+
+    /// Applies the host-memory cap field's text to the next run and saves it.
+    /// Empty means no cap; text that does not parse as a size leaves the
+    /// stored cap and marks the field invalid.
+    pub fn set_host_memory_cap(&mut self, text: &str) {
+        match performance_settings::parse_cap(text) {
+            Ok(cap) => {
+                self.performance.max_host_memory = cap;
+                self.rejected_caps.host_memory = None;
+                self.save_performance();
+            }
+            Err(_) => self.rejected_caps.host_memory = Some(text.to_string()),
+        }
+    }
+
+    /// [`Self::set_host_memory_cap`] for the VRAM cap. Once the session's
+    /// device budget has settled an edit is saved but applies only from the
+    /// next launch, and the view says so.
+    pub fn set_vram_cap(&mut self, text: &str) {
+        match performance_settings::parse_cap(text) {
+            Ok(cap) => {
+                self.performance.max_vram = cap;
+                self.rejected_caps.vram = None;
+                self.vram_pending |= focusforge_gpu::harness::vram_cap_settled();
+                self.save_performance();
+            }
+            Err(_) => self.rejected_caps.vram = Some(text.to_string()),
+        }
+    }
+
+    /// The host-memory cap field's cursor moved to `cursor_x`, measured from
+    /// the entry's own unscrolled left edge; `viewport_width` is the field's
+    /// visible text width. Scrolls the entry by the least amount that keeps
+    /// the cursor in view; [`Self::performance_view`] reports the offset.
+    pub fn host_memory_cap_cursor_moved(&mut self, cursor_x: f32, viewport_width: f32) {
+        self.host_cap_scroll_x =
+            clamp_field_scroll(cursor_x, self.host_cap_scroll_x, viewport_width);
+    }
+
+    /// [`Self::host_memory_cap_cursor_moved`] for the VRAM cap field.
+    pub fn vram_cap_cursor_moved(&mut self, cursor_x: f32, viewport_width: f32) {
+        self.vram_cap_scroll_x =
+            clamp_field_scroll(cursor_x, self.vram_cap_scroll_x, viewport_width);
+    }
+
+    /// Installs the settings loaded at startup.
+    pub fn install_performance(&mut self, settings: PerformanceSettings) {
+        self.performance = settings;
+    }
+
+    /// Saves `performance` when a config directory is installed; a failed
+    /// save is logged, never an error.
+    fn save_performance(&self) {
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = performance_settings::save(dir, &self.performance)
+        {
+            tracing::warn!(error = %e, "the performance settings could not be saved");
+        }
+    }
+
+    /// What the Performance tab shows. Reads settled state only: the device
+    /// budget is `NotProbed` until a run has brought the backend up, and
+    /// building the view never opens an adapter.
+    pub fn performance_view(&self) -> performance_settings::PerformanceView {
+        let device = match focusforge_gpu::harness::settled_backend() {
+            None => DeviceState::NotProbed,
+            Some(Ok(backend)) => DeviceState::Ready(backend.device_budget().bytes()),
+            Some(Err(_)) => DeviceState::NoAdapter,
+        };
+        let backend_line = self
+            .fusion_backend()
+            .or_else(|| self.last_backend_line.clone());
+        let mut view = performance_settings::view(
+            &self.performance,
+            &self.rejected_caps,
+            job::host_budget().bytes(),
+            device,
+            backend_line.as_deref(),
+            self.vram_pending,
+        );
+        view.host_cap.scroll_offset = self.host_cap_scroll_x;
+        view.vram_cap.scroll_offset = self.vram_cap_scroll_x;
+        view
+    }
+
+    /// What the Storage tab shows: the four locations, whether the clear can
+    /// run, and the refusal while a run is live or else the newest result.
+    pub fn storage_view(&self) -> StorageView {
+        let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+        let mut view = storage_view(
+            self.state.config_dir.as_deref(),
+            self.state.diagnostics.data_dir.as_deref(),
+            &self.scratch_root(),
+            home.as_deref(),
+        );
+        if self.any_job_running() {
+            view.clear_enabled = false;
+            view.status = STORAGE_REFUSAL.to_string();
+            view.status_tone = StorageTone::Warning;
+        } else if let Some((status, tone)) = &self.storage_result {
+            view.status.clone_from(status);
+            view.status_tone = *tone;
+        }
+        view
+    }
+
+    /// Empties the stage cache and keeps the outcome for [`Self::storage_view`].
+    /// Does nothing while any run is live: a background tab's run reads and
+    /// writes the same cache.
+    pub fn clear_stage_cache(&mut self) {
+        if self.any_job_running() {
+            return;
+        }
+        self.storage_result = Some(match job::clear_stage_cache(&self.scratch_root()) {
+            Ok(1) => ("Cleared 1 stage entry.".to_string(), StorageTone::Success),
+            Ok(count) => (
+                format!("Cleared {count} stage entries."),
+                StorageTone::Success,
+            ),
+            Err(err) => {
+                tracing::warn!(error = %err, "the stage cache could not be cleared");
+                let cause = match &err {
+                    job::StageCacheError::Io { source, .. } => source.to_string(),
+                    job::StageCacheError::Json { source, .. } => source.to_string(),
+                };
+                (
+                    format!("Could not clear the cache: {}.", plain_cause(&cause)),
+                    StorageTone::Failure,
+                )
+            }
+        });
     }
 
     /// The live run's own [`job::resolve_backend`] account, `None` before it
@@ -6639,7 +6891,7 @@ impl AppController {
         if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        let Some(request) = self.fuse_request_for(index) else {
+        let Some(request) = self.job_request_for(index) else {
             return false;
         };
         self.run_request(index, request)
@@ -6882,6 +7134,9 @@ impl AppController {
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
         let observer = self.job.observer.take().unwrap_or_default();
+        if let Some(line) = observer.backend_line() {
+            self.last_backend_line = Some(line);
+        }
         let settled = job::settle(handle.join(), &observer);
         self.job.control = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
@@ -6982,7 +7237,7 @@ impl AppController {
                 self.refuse_missing_frame(&missing);
                 continue;
             }
-            let Some(request) = self.fuse_request_for(index) else {
+            let Some(request) = self.job_request_for(index) else {
                 continue;
             };
             if self.run_request(index, request) {
@@ -8732,4 +8987,31 @@ fn notice_line(skipped: &[PathBuf]) -> Option<String> {
         skipped.len(),
         if skipped.len() == 1 { "" } else { "s" }
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_cause;
+
+    #[test]
+    fn plain_cause_drops_the_os_error_tail_and_a_closing_period() {
+        assert_eq!(
+            plain_cause("Permission denied (os error 13)"),
+            "Permission denied"
+        );
+        assert_eq!(
+            plain_cause("Access is denied. (os error 5)"),
+            "Access is denied"
+        );
+        assert_eq!(
+            plain_cause("expected value at line 1 column 1"),
+            "expected value at line 1 column 1"
+        );
+        assert_eq!(
+            plain_cause("unexpected end of file."),
+            "unexpected end of file"
+        );
+        assert_eq!(plain_cause("odd (os error x)"), "odd (os error x)");
+        assert_eq!(plain_cause("odd (os error )"), "odd (os error )");
+    }
 }

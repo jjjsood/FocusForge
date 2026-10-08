@@ -154,7 +154,7 @@ stack, tests and the gate to run before sending a change.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE). FocusForge is GPLv3 because Slint
+GPL-3.0-only. See [LICENSE](LICENSE). FocusForge is GPLv3 because Slint
 is used under its GPLv3 licensing option, which is what makes the whole
 application GPLv3 rather than a more permissive license; dependency licenses
 are held to a compatible allowlist and enforced by `cargo deny check

@@ -9,8 +9,8 @@ mod common;
 
 use std::fs;
 
-use focusforge_gui::AppWindow;
-use i_slint_backend_testing::ElementQuery;
+use focusforge_gui::{AppController, AppWindow};
+use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
 use slint::ComponentHandle;
 
 /// A headless `AppWindow`, sized explicitly -- `TestingWindow::size()`
@@ -177,8 +177,9 @@ fn checkpoint_panel_touches_no_storage() {
     // `focusforge_core` directly. `checkpoints.rs` reads the history the
     // panel lists, beside `job.rs`, which reads its planes, and `brush.rs`,
     // which builds the stored stroke's path in core's own point type.
-    // Excluded by name: this test's own subject is the checkpoint panel,
-    // not the whole crate.
+    // `performance_settings.rs` parses its cap strings with core's size
+    // syntax. Excluded by name: this test's own subject is the checkpoint
+    // panel, not the whole crate.
     let canvas_files = [
         "checkpoints.rs",
         "brush.rs",
@@ -191,6 +192,7 @@ fn checkpoint_panel_touches_no_storage() {
         "job.rs",
         "images.rs",
         "overlay.rs",
+        "performance_settings.rs",
         "recent.rs",
         "settings.rs",
     ];
@@ -430,6 +432,860 @@ fn diagnostics_panel_loading() {
 
     app.set_diagnostics_loading(false);
     assert_eq!(primary().accessible_enabled(), Some(true));
+}
+
+/// `FFDiagnosticsPanel`'s own rect, found by type since the settings frame
+/// gives its one instance no local id.
+fn diagnostics_panel_rect(app: &AppWindow) -> (f32, f32, f32, f32) {
+    let handle = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFDiagnosticsPanel")
+        .find_first()
+        .expect("no FFDiagnosticsPanel element found");
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    (pos.x, pos.y, size.width, size.height)
+}
+
+fn is_inside(inner: (f32, f32, f32, f32), outer: (f32, f32, f32, f32)) -> bool {
+    inner.0 >= outer.0 - EPS
+        && inner.1 >= outer.1 - EPS
+        && inner.0 + inner.2 <= outer.0 + outer.2 + EPS
+        && inner.1 + inner.3 <= outer.1 + outer.3 + EPS
+}
+
+/// A failure message and a destination far longer than their slots stay
+/// inside the slot and the panel, and leave the footer and the status slot
+/// where the idle panel has them.
+#[test]
+fn diagnostics_long_failure_message_keeps_the_footer() {
+    let message = "disk full ".repeat(20);
+    let destination = "/data/".repeat(50);
+    assert_eq!(message.chars().count(), 200);
+    assert_eq!(destination.chars().count(), 300);
+
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let app = app_at(width, height);
+        app.set_settings_open(true);
+        app.set_settings_section("diagnostics".into());
+        let footer = rect(&app, "FFDiagnosticsPanel::footer");
+        let slot = rect(&app, "FFDiagnosticsPanel::status-slot");
+
+        app.set_diagnostics_destination(destination.as_str().into());
+        app.set_diagnostics_status("failed".into());
+        app.set_diagnostics_message(message.as_str().into());
+
+        assert_rect(&app, "FFDiagnosticsPanel::footer", footer);
+        assert_rect(&app, "FFDiagnosticsPanel::status-slot", slot);
+        let panel = diagnostics_panel_rect(&app);
+        let shown = rect(&app, "FFDiagnosticsPanel::message");
+        assert!(
+            is_inside(shown, slot) && is_inside(shown, panel),
+            "message at {width}x{height}: {shown:?} must lie inside the slot {slot:?} and the panel {panel:?}"
+        );
+        let field = rect(&app, "FFDiagnosticsPanel::dest-field");
+        assert!(
+            is_inside(field, panel),
+            "dest-field at {width}x{height}: {field:?} must lie inside the panel {panel:?}"
+        );
+    }
+}
+
+fn ui_source(relative: &str) -> String {
+    common::strip_line_comments(&fs::read_to_string(common::ui_dir().join(relative)).unwrap())
+}
+
+/// A row's text can take the accent colour, and the component sheet draws
+/// that tone, a wrapped paragraph and the 6 px gap between paragraphs.
+#[test]
+fn row_text_accent_and_paragraph_gap_are_on_the_sheet() {
+    let row_text = ui_source("components/ff_row_text.slint");
+    assert!(row_text.contains("in property <bool> accent: false;"));
+    assert!(row_text.contains("Theme.accent-default"));
+
+    let geometry = ui_source("geometry.slint");
+    assert!(geometry.contains("settings-paragraph-gap: 6px;"));
+
+    let sheet = ui_source("theme_sheet.slint");
+    for needle in [
+        "accent: true;",
+        "wrap: word-wrap;",
+        "spacing: ShellGeometry.settings-paragraph-gap;",
+    ] {
+        assert!(sheet.contains(needle), "the sheet does not draw {needle:?}");
+    }
+}
+
+/// The Diagnostics tab is layout over shared components: its heading, rows
+/// and status lines are the shared section, row and status text, it styles
+/// nothing itself, its footer sizes nothing, and its message elides to one
+/// line (geometry cannot show elision, so the source must).
+#[test]
+fn diagnostics_panel_composes_only_shared_components() {
+    let panel = ui_source("shell/settings_modal/diagnostics_panel.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "height: 20px",
+        "height: 22px",
+        "Theme.status-",
+    ] {
+        assert!(!panel.contains(needle), "the panel sets {needle:?}");
+    }
+    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFStatusText {"] {
+        assert!(panel.contains(shared), "the panel does not draw {shared}");
+    }
+
+    let footer = panel
+        .split("footer :=")
+        .nth(1)
+        .expect("the panel has a footer");
+    assert!(footer.trim_start().starts_with("HorizontalLayout"));
+    assert!(!footer.contains("px"), "the footer sizes nothing itself");
+
+    let message = panel
+        .split("message := FFStatusText")
+        .nth(1)
+        .expect("the panel has a message line")
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(
+        message.contains("overflow: elide"),
+        "the message must elide"
+    );
+}
+
+/// The action row's status line is the shared status text, so the status
+/// colours are written once, in the primitive.
+#[test]
+fn settings_action_row_draws_its_status_line_through_the_status_text() {
+    let row = ui_source("components/ff_settings_action_row.slint");
+    assert!(row.contains("FFStatusText {"));
+    for needle in [" Text {", "Theme.status-"] {
+        assert!(!row.contains(needle), "the action row writes {needle:?}");
+    }
+}
+
+/// The action row's status line starts where the helper text does and runs to
+/// the row's right edge: the content width less the label column.
+#[test]
+fn settings_action_row_status_line_starts_in_the_helper_column() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("storage".into());
+    let helper = rect(&app, "FFSettingsActionRow::helper-text");
+    let status = rect(&app, "FFSettingsActionRow::status");
+    assert!(
+        (status.0 - helper.0).abs() < EPS,
+        "status x {} but helper x {}",
+        status.0,
+        helper.0
+    );
+    assert!(
+        (status.2 - 306.0).abs() < EPS,
+        "status width {}, expected 446 - 140",
+        status.2
+    );
+}
+
+/// The path row elides a long path to the value column, leaves the
+/// `not created yet` suffix whole, and draws an unresolved location as a
+/// muted word in place of the path (geometry cannot show elision, so the
+/// source must).
+#[test]
+fn settings_path_row_elides_its_path_and_marks_an_unresolved_location() {
+    let row = ui_source("components/ff_settings_path_row.slint");
+    let block = |opening: &str| {
+        row.split(opening)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the path row has no {opening:?}"))
+            .split('}')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    let path = block("if root.available: FFRowText {");
+    assert!(path.contains("text: root.path"));
+    assert!(path.contains("overflow: elide"), "the path must elide");
+    let suffix = block("if root.available && root.missing: FFRowText {");
+    assert!(suffix.contains("not created yet"));
+    assert!(!suffix.contains("overflow"), "the suffix stays whole");
+    let unavailable = block("if !root.available: FFRowText {");
+    assert!(unavailable.contains("muted: true"));
+    assert!(unavailable.contains("\"Unavailable\""));
+    assert!(row.contains("in property <bool> available: true;"));
+}
+
+/// Tab component each section renders, by slug. Every other tab component is
+/// absent while a section is selected.
+const SETTINGS_TABS: [(&str, &str); 5] = [
+    ("performance", "FFPerformanceTab"),
+    ("storage", "FFStorageTab"),
+    ("input-map", "FFInputMapTab"),
+    ("diagnostics", "FFDiagnosticsPanel"),
+    ("about", "FFAboutTab"),
+];
+
+/// The rail's entries top to bottom. A component's root element is reported
+/// once per element merged into its item, so entries are told apart by
+/// position.
+fn nav_rail_entries(app: &AppWindow) -> Vec<i_slint_backend_testing::ElementHandle> {
+    let mut entries: Vec<i_slint_backend_testing::ElementHandle> = Vec::new();
+    for handle in ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFNavRailEntry")
+        .find_all()
+    {
+        if entries
+            .iter()
+            .all(|seen| seen.absolute_position() != handle.absolute_position())
+        {
+            entries.push(handle);
+        }
+    }
+    entries
+}
+
+fn settings_slint_sources() -> Vec<(String, String)> {
+    let dir = common::ui_dir().join("shell");
+    let mut files = vec![dir.join("settings_modal.slint")];
+    files.extend(common::find_slint_files(&dir.join("settings_modal")));
+    files
+        .into_iter()
+        .map(|path| {
+            let code = common::strip_line_comments(&fs::read_to_string(&path).unwrap());
+            (path.display().to_string(), code)
+        })
+        .collect()
+}
+
+/// Opening Settings without choosing a section (the gear) shows Performance:
+/// the window's initial section is the controller's default, and the rail
+/// marks that entry selected.
+#[test]
+fn settings_open_with_performance_selected() {
+    let app = app_at(1440, 900);
+    assert_eq!(
+        app.get_settings_section().as_str(),
+        focusforge_gui::SettingsSection::default().slug()
+    );
+    app.set_settings_open(true);
+    let checked: Vec<Option<bool>> = nav_rail_entries(&app)
+        .iter()
+        .map(|entry| entry.accessible_checked())
+        .collect();
+    assert_eq!(
+        checked,
+        [
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false)
+        ]
+    );
+}
+
+/// The rail carries one entry per live section, in `SettingsSection::ALL`
+/// order, whichever entry is selected, and activating an entry raises its
+/// slug.
+#[test]
+fn settings_nav_rail_lists_only_live_sections() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    let selected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_settings_section_selected({
+        let selected = selected.clone();
+        move |slug| selected.borrow_mut().push(slug.to_string())
+    });
+
+    let slugs: Vec<&str> = focusforge_gui::SettingsSection::ALL
+        .iter()
+        .map(|section| section.slug())
+        .collect();
+    for start in &slugs {
+        app.set_settings_section((*start).into());
+        let entries = nav_rail_entries(&app);
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.accessible_label().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Performance",
+                "Storage",
+                "Input map",
+                "Diagnostics",
+                "About"
+            ],
+            "from {start}"
+        );
+        assert_eq!(labels.len(), slugs.len());
+
+        selected.borrow_mut().clear();
+        for entry in &entries {
+            entry.invoke_accessible_default_action();
+        }
+        assert_eq!(*selected.borrow(), slugs, "from {start}");
+    }
+
+    for (path, code) in settings_slint_sources() {
+        assert!(!code.contains("\"General\""), "{path} names a General tab");
+    }
+    let entry =
+        fs::read_to_string(common::ui_dir().join("components/ff_nav_rail_entry.slint")).unwrap();
+    assert!(
+        !common::strip_line_comments(&entry).contains("enabled"),
+        "a rail entry has no disabled state"
+    );
+}
+
+/// One mouse click activates an entry and leaves the keyboard focus ring
+/// off.
+#[test]
+fn a_mouse_click_on_a_rail_entry_selects_it_without_a_focus_ring() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    let selected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_settings_section_selected({
+        let selected = selected.clone();
+        move |slug| selected.borrow_mut().push(slug.to_string())
+    });
+
+    nav_rail_entries(&app)[1].mock_single_click(slint::platform::PointerEventButton::Left);
+
+    assert_eq!(*selected.borrow(), ["storage"]);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFNavRailEntry::ring")
+            .find_first()
+            .is_none(),
+        "a mouse click must not draw the keyboard focus ring"
+    );
+}
+
+/// Tab reaches a rail entry and draws its ring; Return and Space then
+/// activate the focused entry, and any other key does not.
+#[test]
+fn return_and_space_activate_the_focused_rail_entry() {
+    use slint::platform::{Key, WindowEvent};
+
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    let selected = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_settings_section_selected({
+        let selected = selected.clone();
+        move |slug| selected.borrow_mut().push(slug.to_string())
+    });
+    let press = |key: slint::SharedString| {
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
+    };
+    let ring_shown = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFNavRailEntry::ring")
+            .find_first()
+            .is_some()
+    };
+    let tab_to_ring = || {
+        for _ in 0..40 {
+            if ring_shown() {
+                return;
+            }
+            press(Key::Tab.into());
+        }
+        panic!("Tab never reached a rail entry");
+    };
+
+    tab_to_ring();
+    press("a".into());
+    assert!(selected.borrow().is_empty(), "a letter must not activate");
+    press(Key::Return.into());
+    assert_eq!(*selected.borrow(), ["performance"]);
+
+    press(Key::Tab.into());
+    tab_to_ring();
+    press(" ".into());
+    assert_eq!(*selected.borrow(), ["performance", "storage"]);
+}
+
+/// Exactly the selected section's tab component is instantiated, and each
+/// tab is declared in its own file.
+#[test]
+fn settings_tabs_render_from_their_own_files() {
+    let slugs: Vec<&str> = focusforge_gui::SettingsSection::ALL
+        .iter()
+        .map(|section| section.slug())
+        .collect();
+    assert_eq!(slugs, SETTINGS_TABS.map(|(slug, _)| slug));
+
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    for (slug, shown) in SETTINGS_TABS {
+        app.set_settings_section(slug.into());
+        for (_, tab) in SETTINGS_TABS {
+            let found = ElementQuery::from_root(&app)
+                .match_descendants()
+                .match_type_name(tab)
+                .find_first()
+                .is_some();
+            assert_eq!(found, tab == shown, "{tab} under {slug}");
+        }
+    }
+
+    let tabs = common::ui_dir().join("shell").join("settings_modal");
+    for (file, component) in [
+        ("performance_tab.slint", "FFPerformanceTab"),
+        ("storage_tab.slint", "FFStorageTab"),
+        ("input_map_tab.slint", "FFInputMapTab"),
+        ("diagnostics_panel.slint", "FFDiagnosticsPanel"),
+        ("about_tab.slint", "FFAboutTab"),
+    ] {
+        let code = common::strip_line_comments(&fs::read_to_string(tabs.join(file)).unwrap());
+        assert!(
+            code.contains(&format!("export component {component} ")),
+            "{file} must declare {component}"
+        );
+    }
+    let frame = common::strip_line_comments(
+        &fs::read_to_string(tabs.parent().unwrap().join("settings_modal.slint")).unwrap(),
+    );
+    assert_eq!(
+        frame.matches("component ").count(),
+        1,
+        "settings_modal.slint declares only FFSettingsModal"
+    );
+    assert!(frame.contains("export component FFSettingsModal "));
+}
+
+/// The frame is `FFModalPanel`'s panel: 680 x 520 and centred. The rail's
+/// ground starts at the panel top, the header rule crosses the full width
+/// and the entries start 72 px down on a 32 px pitch.
+#[test]
+fn settings_frame_sits_on_the_modal_panel() {
+    let frame = fs::read_to_string(common::ui_dir().join("shell/settings_modal.slint")).unwrap();
+    assert!(
+        !frame.contains("scroll-event("),
+        "the scrim is FFModalPanel's"
+    );
+
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let app = app_at(width, height);
+        app.set_settings_open(true);
+        let px = (width as f32 - 680.0) / 2.0;
+        let py = (height as f32 - 520.0) / 2.0;
+
+        assert_rect(&app, "FFModalPanel::panel", (px, py, 680.0, 520.0));
+        assert_rect(&app, "FFSettingsModal::rail", (px, py, 190.0, 520.0));
+        assert_rect(
+            &app,
+            "FFSettingsModal::header-rule",
+            (px, py + 59.0, 680.0, 1.0),
+        );
+        for (i, entry) in nav_rail_entries(&app).iter().enumerate() {
+            let pos = entry.absolute_position();
+            let size = entry.size();
+            let got = (pos.x, pos.y, size.width, size.height);
+            let expected = (px, py + 72.0 + 32.0 * i as f32, 190.0, 32.0);
+            assert!(
+                (got.0 - expected.0).abs() < EPS
+                    && (got.1 - expected.1).abs() < EPS
+                    && (got.2 - expected.2).abs() < EPS
+                    && (got.3 - expected.3).abs() < EPS,
+                "entry {i} at {width}x{height}: got {got:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
+/// The `{ ... }` body of the first element declared as `id := ` in `code`.
+fn element_block<'a>(code: &'a str, id: &str) -> &'a str {
+    let start = code
+        .find(&format!("{id} := "))
+        .unwrap_or_else(|| panic!("no element `{id}` in the source"));
+    let open = start + code[start..].find('{').expect("element without a body");
+    let mut depth = 0;
+    for (i, c) in code[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &code[open..open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after `{id}`");
+}
+
+/// The header height, the header's horizontal inset and the tabs' content
+/// inset are each written once, as geometry tokens, and read from there.
+#[test]
+fn settings_modal_reads_the_header_and_inset_tokens() {
+    let sources = settings_slint_sources();
+    let frame = &sources
+        .iter()
+        .find(|(path, _)| path.ends_with("shell/settings_modal.slint"))
+        .expect("the modal frame source")
+        .1;
+    for literal in ["60px", "59px"] {
+        assert!(
+            !frame.contains(literal),
+            "settings_modal.slint still writes {literal}"
+        );
+    }
+    for token in ["settings-header-height", "settings-header-inset-x"] {
+        assert!(
+            frame.contains(&format!("ShellGeometry.{token}")),
+            "settings_modal.slint must read ShellGeometry.{token}"
+        );
+    }
+
+    for (path, code) in &sources {
+        assert!(
+            !code.contains("Theme.space-4 + Theme.space-1"),
+            "{path} still spells a 20 px inset from theme spacing"
+        );
+        assert!(
+            !code.contains("padding-right: Theme.space-6"),
+            "{path} still spells the 24 px right inset from theme spacing"
+        );
+    }
+    for (path, code) in sources
+        .iter()
+        .filter(|(p, _)| p.contains("settings_modal/"))
+    {
+        let mut sides = vec!["left", "right", "top"];
+        if !path.ends_with("diagnostics_panel.slint") {
+            sides.push("bottom");
+        }
+        for side in sides {
+            assert!(
+                code.contains(&format!("ShellGeometry.settings-content-inset-{side}")),
+                "{path} must read the {side} content inset token"
+            );
+        }
+        for line in code
+            .lines()
+            .filter(|l| l.trim_start().starts_with("padding-"))
+        {
+            assert!(
+                !line.contains(" + ") && !line.contains("px"),
+                "{path}: padding sized by an expression or a literal: {line}"
+            );
+        }
+    }
+
+    let list = ui_source("components/ff_manifest_list.slint");
+    let value = element_block(&list, "value-text");
+    assert!(
+        !value.contains("width:") && !value.contains("overflow"),
+        "the value text must size to its text: {value}"
+    );
+    assert!(element_block(&list, "name-text").contains("overflow: elide"));
+}
+
+/// Every section's content host sits right of the rail and under the
+/// header, and its first section starts at the content inset.
+#[test]
+fn settings_tabs_keep_their_content_inset() {
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let px = (width as f32 - 680.0) / 2.0;
+        let py = (height as f32 - 520.0) / 2.0;
+        for (slug, _) in SETTINGS_TABS {
+            let app = app_at(width, height);
+            app.set_settings_open(true);
+            app.set_settings_section(slug.into());
+
+            assert_rect(
+                &app,
+                "FFSettingsModal::content",
+                (px + 190.0, py + 60.0, 490.0, 460.0),
+            );
+            let first = by_position(
+                ElementQuery::from_root(&app)
+                    .match_descendants()
+                    .match_type_name("FFSettingsSection"),
+            )
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{slug}: no FFSettingsSection"));
+            let (pos, size) = (first.absolute_position(), first.size());
+            let got = (pos.x, pos.y, size.width);
+            let expected = (px + 210.0, py + 76.0, 446.0);
+            assert!(
+                (got.0 - expected.0).abs() < EPS
+                    && (got.1 - expected.1).abs() < EPS
+                    && (got.2 - expected.2).abs() < EPS,
+                "{slug} at {width}x{height}: first section {got:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
+fn manifest_row_with(name: &str, value: &str, not_redacted: bool) -> focusforge_gui::FFManifestRow {
+    focusforge_gui::FFManifestRow {
+        name: name.into(),
+        value: value.into(),
+        not_redacted,
+    }
+}
+
+/// A manifest row's value keeps its whole text and sits at the clip area's
+/// right edge; the name takes the rest and never reaches under the value or
+/// the scrollbar, however long it is.
+#[test]
+fn manifest_list_value_is_never_clipped() {
+    let long_name = format!(
+        "crashes/crash-2026-09-18T09-03-12-{}.dmp",
+        "focusforge-gui-pid-48213".repeat(2)
+    );
+    assert!(long_name.chars().count() >= 70);
+    let rows = vec![
+        manifest_row_with("adapter.json", "1 KB", false),
+        manifest_row_with("crashes/crash-a.dmp", "2.4 MB · not redacted", true),
+        manifest_row_with("crashes/crash-b.dmp", "1023.9 MB · not redacted", true),
+        manifest_row_with(&long_name, "2.4 MB · not redacted", true),
+    ];
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("diagnostics".into());
+    app.set_diagnostics_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![manifest_row("one.json")])).into(),
+    );
+    let one_row_list = manifest_list_rect(&app);
+
+    app.set_diagnostics_manifest_content_height(px_for_rows(rows.len()));
+    app.set_diagnostics_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    assert_eq!(manifest_list_rect(&app), one_row_list);
+
+    let find = |id: &str| by_position(ElementQuery::from_root(&app).match_id(id));
+    let names = find("FFManifestList::name-text");
+    let values = find("FFManifestList::value-text");
+    assert_eq!((names.len(), values.len()), (4, 4));
+    let clip = rect(&app, "FFManifestList::clip-area");
+    let scrollbar = rect(&app, "FFManifestList::scrollbar");
+
+    let width = |i: usize| values[i].size().width;
+    assert!(
+        width(0) < 110.0 && 110.0 < width(1) && width(1) < width(2),
+        "value widths must follow their text: {} < 110 < {} < {}",
+        width(0),
+        width(1),
+        width(2)
+    );
+    assert!(
+        (width(1) - width(3)).abs() < EPS,
+        "the same text, the same width"
+    );
+
+    for (i, (name, value)) in names.iter().zip(&values).enumerate() {
+        let (n, v) = (name.absolute_position(), value.absolute_position());
+        let value_right = v.x + value.size().width;
+        assert!(
+            (n.x - clip.0).abs() < EPS,
+            "row {i}: name starts at {}, clip at {}",
+            n.x,
+            clip.0
+        );
+        assert!(
+            n.x + name.size().width <= v.x + EPS,
+            "row {i}: name ends at {} past the value at {}",
+            n.x + name.size().width,
+            v.x
+        );
+        assert!(
+            (value_right - (clip.0 + clip.2)).abs() < EPS,
+            "row {i}: value ends at {value_right}, clip area at {}",
+            clip.0 + clip.2
+        );
+        assert!(
+            scrollbar.0 >= value_right,
+            "row {i}: value ends at {value_right}, under the scrollbar at {}",
+            scrollbar.0
+        );
+    }
+}
+
+/// Content height of `rows` manifest rows: 18 px each, 8 px apart.
+fn px_for_rows(rows: usize) -> f32 {
+    18.0 * rows as f32 + 8.0 * rows.saturating_sub(1) as f32
+}
+
+/// A window on the Input map section, its rows filled from `controller` the
+/// way the running app fills them.
+fn input_map_window(width: u32, height: u32, controller: &AppController) -> AppWindow {
+    let app = app_at(width, height);
+    let rows: Vec<focusforge_gui::InputRow> = controller
+        .input_rows()
+        .into_iter()
+        .map(|r| focusforge_gui::InputRow {
+            input: r.input.into(),
+            stacking: r.stacking.into(),
+            editor: r.editor.into(),
+        })
+        .collect();
+    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    app.set_settings_open(true);
+    app.set_settings_section("input-map".into());
+    app
+}
+
+fn input_map_tab(app: &AppWindow) -> ElementHandle {
+    ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFInputMapTab")
+        .find_first()
+        .expect("no FFInputMapTab element found")
+}
+
+/// The elements `query` matches, one per position (a component's root is
+/// reported once per element merged into its item), top to bottom.
+fn by_position(query: ElementQuery) -> Vec<ElementHandle> {
+    let mut found: Vec<ElementHandle> = Vec::new();
+    for handle in query.find_all() {
+        if found
+            .iter()
+            .all(|seen| seen.absolute_position() != handle.absolute_position())
+        {
+            found.push(handle);
+        }
+    }
+    found.sort_by(|a, b| a.absolute_position().y.total_cmp(&b.absolute_position().y));
+    found
+}
+
+/// The header row, then one row per binding, as `[input, stacking, editor]`
+/// cell texts.
+fn input_map_cells(tab: &ElementHandle) -> Vec<[String; 3]> {
+    let column = |id: &str| -> Vec<String> {
+        by_position(tab.query_descendants().match_id(id))
+            .iter()
+            .map(|cell| cell.accessible_label().unwrap().to_string())
+            .collect()
+    };
+    let input = column("FFInputTableRow::input-cell");
+    let stacking = column("FFInputTableRow::stacking-cell");
+    let editor = column("FFInputTableRow::editor-cell");
+    assert_eq!(input.len(), stacking.len());
+    assert_eq!(input.len(), editor.len());
+    input
+        .into_iter()
+        .zip(stacking)
+        .zip(editor)
+        .map(|((input, stacking), editor)| [input, stacking, editor])
+        .collect()
+}
+
+/// With the section open, the tab shows its heading, the column header and
+/// then exactly the controller's rows in order, cell for cell. Run on the
+/// shipped table and on one with a binding changed, so a table written into
+/// the tab fails.
+#[test]
+fn input_map_tab_shows_the_controller_rows() {
+    let shipped = AppController::new();
+    let mut changed = AppController::new();
+    let mut table = focusforge_gui::input_map::InputTable::default();
+    table.bindings[0].stacking = Some(focusforge_gui::input_map::Action::PanHorizontal);
+    changed.install_input_table(table);
+    assert_ne!(
+        shipped.input_rows(),
+        changed.input_rows(),
+        "the changed binding must show in the rows"
+    );
+
+    for controller in [&shipped, &changed] {
+        let app = input_map_window(1440, 900, controller);
+        let tab = input_map_tab(&app);
+
+        let headings: Vec<String> = tab
+            .query_descendants()
+            .match_type_name("FFSectionHeading")
+            .find_first()
+            .expect("the tab has no section heading")
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::Text)
+            .find_all()
+            .iter()
+            .map(|text| text.accessible_label().unwrap().to_string())
+            .collect();
+        assert_eq!(headings, ["BINDINGS"]);
+
+        let mut expected = vec![["INPUT".to_string(), "STACKING".into(), "EDITOR".into()]];
+        expected.extend(
+            controller
+                .input_rows()
+                .into_iter()
+                .map(|row| [row.input, row.stacking, row.editor]),
+        );
+        assert_eq!(input_map_cells(&tab), expected);
+    }
+}
+
+/// A 1 px rule sits directly under the header and under every row, the last
+/// one included.
+#[test]
+fn input_map_table_draws_a_rule_under_every_row() {
+    let controller = AppController::new();
+    let app = input_map_window(1440, 900, &controller);
+    let tab = input_map_tab(&app);
+    let cells = by_position(
+        tab.query_descendants()
+            .match_id("FFInputTableRow::input-cell"),
+    );
+    let rules = by_position(tab.query_descendants().match_type_name("FFDivider"));
+    assert_eq!(rules.len(), cells.len(), "one rule per table row");
+
+    for (i, (cell, rule)) in cells.iter().zip(&rules).enumerate() {
+        let below = cell.absolute_position().y + cell.size().height;
+        let next = cells
+            .get(i + 1)
+            .map_or(f32::INFINITY, |next| next.absolute_position().y);
+        let y = rule.absolute_position().y;
+        assert!(
+            y >= below - EPS && y < next,
+            "row {i}: rule at {y} is not between the row's end {below} and the next row {next}"
+        );
+        assert_eq!(rule.size().height, 1.0, "row {i}: the rule is 1 px tall");
+    }
+}
+
+/// Every table row stays inside the settings content area, horizontally and
+/// above its bottom edge.
+#[test]
+fn input_map_rows_stay_inside_the_content_area() {
+    let controller = AppController::new();
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let app = input_map_window(width, height, &controller);
+        let (cx, cy, cw, ch) = rect(&app, "FFSettingsModal::content");
+        let rows = by_position(
+            input_map_tab(&app)
+                .query_descendants()
+                .match_id("FFInputTableRow::input-cell"),
+        );
+        assert_eq!(rows.len(), controller.input_rows().len() + 1);
+        for (i, cell) in rows.iter().enumerate() {
+            let pos = cell.absolute_position();
+            let size = cell.size();
+            assert!(
+                pos.x >= cx - EPS
+                    && pos.x + size.width <= cx + cw + EPS
+                    && pos.y + size.height <= cy + ch + EPS,
+                "row {i} at {width}x{height}: cell {pos:?} {size:?} leaves the content {:?}",
+                (cx, cy, cw, ch)
+            );
+        }
+    }
 }
 
 /// The toast paints at the pane gutter under the tab strip and toolbar, at
@@ -1177,4 +2033,528 @@ fn detached_main_pane_fills_the_canvas_on_either_side() {
     app.set_detached_pane("".into());
     assert_rect(&app, "FFCanvas::pane-left", (16.0, 92.0, 566.0, 748.0));
     assert_rect(&app, "FFCanvas::pane-right", (598.0, 92.0, 566.0, 748.0));
+}
+
+// --- Performance tab -------------------------------------------------------
+
+type SharedController = std::sync::Arc<std::sync::Mutex<AppController>>;
+
+fn performance_window(controller: &SharedController) -> AppWindow {
+    let app = app_at(1440, 900);
+    focusforge_gui::bridge::push_performance_view(&app, controller);
+    app.set_settings_open(true);
+    app.set_settings_section("performance".into());
+    app
+}
+
+fn performance_tab(app: &AppWindow) -> ElementHandle {
+    ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFPerformanceTab")
+        .find_first()
+        .expect("no FFPerformanceTab element found")
+}
+
+/// Whether the tab's switch draws as on: the knob rests at the right end.
+fn performance_switch_is_on(tab: &ElementHandle) -> bool {
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_secs(1));
+    let toggle = by_position(tab.query_descendants().match_type_name("FFToggle"));
+    let knob = by_position(tab.query_descendants().match_id("FFToggle::knob"));
+    assert_eq!(knob.len(), 1, "the tab has exactly one switch");
+    knob[0].absolute_position().x - toggle[0].absolute_position().x > 10.0
+}
+
+fn performance_cap_inputs(tab: &ElementHandle) -> Vec<ElementHandle> {
+    by_position(tab.query_descendants().match_id("FFTextField::input"))
+}
+
+fn performance_row_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFRowText"))
+        .iter()
+        .map(|text| text.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn performance_placeholders(tab: &ElementHandle) -> Vec<String> {
+    by_position(
+        tab.query_descendants()
+            .match_type_name("FFTextField")
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|text| text.accessible_label().unwrap_or_default().to_string())
+    .collect()
+}
+
+/// The tab draws what the controller's view holds: the switch, both cap
+/// fields (or their placeholders) and the three read-only figures, whichever
+/// way the stored settings are.
+#[test]
+fn performance_tab_shows_the_controller_view() {
+    let mut on = AppController::new();
+    on.set_gpu_fusion(true);
+    let mut capped = AppController::new();
+    capped.set_gpu_fusion(false);
+    capped.set_host_memory_cap("2GiB");
+    capped.set_vram_cap("512MiB");
+
+    for (controller, gpu, caps) in [(on, true, ["", ""]), (capped, false, ["2GiB", "512MiB"])] {
+        let view = controller.performance_view();
+        assert_eq!(view.gpu, gpu);
+        let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+        let app = performance_window(&shared);
+        let tab = performance_tab(&app);
+
+        assert_eq!(performance_switch_is_on(&tab), gpu);
+        let texts: Vec<String> = performance_cap_inputs(&tab)
+            .iter()
+            .map(|input| input.accessible_value().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(texts, caps);
+        let placeholders = performance_placeholders(&tab);
+        if gpu {
+            assert_eq!(placeholders, ["No cap", "No cap"]);
+        } else {
+            assert!(placeholders.is_empty(), "{placeholders:?}");
+        }
+        assert_eq!(
+            performance_row_texts(&tab),
+            [
+                view.backend.as_str(),
+                view.host_budget.as_str(),
+                view.vram_budget.as_str()
+            ]
+        );
+        assert_eq!(view.vram_budget, "Not probed yet");
+    }
+}
+
+/// The tab is layout over shared components: its sections, rows, switch,
+/// fields and note are the shared ones, and it styles nothing itself.
+#[test]
+fn performance_tab_composes_only_shared_components() {
+    let tab = ui_source("shell/settings_modal/performance_tab.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "Theme.status-",
+        "Theme.text-",
+        "Theme.surface-",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle:?}");
+    }
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsRow {",
+        "FFToggle {",
+        "FFTextField {",
+        "FFRowText {",
+        "FFStatusText {",
+    ] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+}
+
+// --- Storage tab -----------------------------------------------------------
+
+fn storage_window(controller: &SharedController) -> AppWindow {
+    let app = app_at(1440, 900);
+    focusforge_gui::bridge::push_storage_view(&app, controller);
+    app.set_settings_open(true);
+    app.set_settings_section("storage".into());
+    app
+}
+
+fn storage_tab(app: &AppWindow) -> ElementHandle {
+    ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFStorageTab")
+        .find_first()
+        .expect("no FFStorageTab element found")
+}
+
+/// The tab's row texts, top to bottom: each location's path, its suffix or
+/// the unavailable word, then the action row's helper.
+fn storage_row_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFRowText"))
+        .iter()
+        .map(|text| text.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn storage_button(tab: &ElementHandle) -> ElementHandle {
+    let mut buttons = by_position(tab.query_descendants().match_type_name("FFButton"));
+    assert_eq!(buttons.len(), 1, "the tab has exactly one button");
+    buttons.remove(0)
+}
+
+fn storage_status_line(tab: &ElementHandle) -> String {
+    let lines = by_position(tab.query_descendants().match_type_name("FFStatusText"));
+    assert_eq!(lines.len(), 1, "the tab has exactly one status line");
+    lines[0].accessible_label().unwrap_or_default().to_string()
+}
+
+/// The tab draws what the controller's view holds: the four locations with a
+/// suffix on a directory not created yet, the button's enabled state and the
+/// status line, and the button raises the clear request only while enabled.
+#[test]
+fn storage_tab_shows_the_controller_view() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("shown-config");
+    let data = root.path().join("shown-data");
+    for dir in [&config, &data.join("logs"), &data.join("scratch")] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(config.join("settings.toml"), "").unwrap();
+    let mut controller = AppController::new();
+    controller.install_recent(Vec::new(), config);
+    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_scratch_root_for_test(data.join("scratch"));
+
+    let view = controller.storage_view();
+    assert!(view.crashes.missing && !view.logs.missing && !view.scratch.missing);
+    let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = storage_window(&shared);
+    let tab = storage_tab(&app);
+
+    assert_eq!(
+        storage_row_texts(&tab),
+        [
+            view.settings_file.path.as_str(),
+            view.logs.path.as_str(),
+            view.crashes.path.as_str(),
+            "· not created yet",
+            view.scratch.path.as_str(),
+            "Deletes cached fuse stages.",
+        ]
+    );
+    assert!(view.crashes.path.contains("shown-data") && view.crashes.path.ends_with("crashes"));
+    let button = storage_button(&tab);
+    assert_eq!(button.accessible_label().as_deref(), Some("Clear cache"));
+    assert_eq!(button.accessible_enabled(), Some(true));
+    assert_eq!(storage_status_line(&tab), "");
+
+    let requested = std::rc::Rc::new(std::cell::Cell::new(0));
+    app.on_storage_clear_requested({
+        let requested = requested.clone();
+        move || requested.set(requested.get() + 1)
+    });
+    button.mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(requested.get(), 1, "an enabled button asks for the clear");
+
+    let mut state = app.get_storage();
+    state.clear_enabled = false;
+    state.status = "A run is active.".into();
+    state.status_tone = "warning".into();
+    app.set_storage(state);
+    assert_eq!(button.accessible_enabled(), Some(false));
+    assert_eq!(storage_status_line(&tab), "A run is active.");
+    button.mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(requested.get(), 1, "a disabled button asks for nothing");
+}
+
+/// With no config or data directory the rows read `Unavailable` and the
+/// scratch row keeps its path; a clear's result reaches the status line.
+#[test]
+fn storage_tab_shows_unresolved_locations_and_the_last_result() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.path().to_path_buf());
+    controller.clear_stage_cache();
+    let view = controller.storage_view();
+    let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = storage_window(&shared);
+    let tab = storage_tab(&app);
+
+    assert_eq!(
+        storage_row_texts(&tab),
+        [
+            "Unavailable",
+            "Unavailable",
+            "Unavailable",
+            view.scratch.path.as_str(),
+            "Deletes cached fuse stages.",
+        ]
+    );
+    assert_eq!(storage_status_line(&tab), "Cleared 0 stage entries.");
+    assert_eq!(app.get_storage().status_tone.as_str(), "success");
+}
+
+/// The tab is layout over shared components: its sections, path rows and
+/// action row are the shared ones, and it styles nothing itself.
+#[test]
+fn storage_tab_composes_only_shared_components() {
+    let tab = ui_source("shell/settings_modal/storage_tab.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "Theme.status-",
+        "Theme.text-",
+        "Theme.surface-",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle:?}");
+    }
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsPathRow {",
+        "FFSettingsActionRow {",
+    ] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+}
+
+fn type_into(app: &AppWindow, text: &str) {
+    use slint::platform::WindowEvent;
+    for ch in text.chars() {
+        let key: slint::SharedString = ch.to_string().into();
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
+    }
+}
+
+/// Clicking the switch asks for the opposite setting, and typing in a cap
+/// field reports every edit with the cursor's new position.
+#[test]
+fn performance_controls_report_to_their_callbacks() {
+    let controller = AppController::new();
+    let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = performance_window(&shared);
+    let tab = performance_tab(&app);
+
+    let toggled = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
+    app.on_performance_gpu_toggled({
+        let toggled = toggled.clone();
+        move |on| toggled.borrow_mut().push(on)
+    });
+    let host_edits = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_host_cap_edited({
+        let edits = host_edits.clone();
+        move |text| edits.borrow_mut().push(text.to_string())
+    });
+    let vram_edits = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_vram_cap_edited({
+        let edits = vram_edits.clone();
+        move |text| edits.borrow_mut().push(text.to_string())
+    });
+    let cursors = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(char, f32, f32)>::new()));
+    app.on_performance_host_cap_cursor_moved({
+        let cursors = cursors.clone();
+        move |x, w| cursors.borrow_mut().push(('h', x, w))
+    });
+    app.on_performance_vram_cap_cursor_moved({
+        let cursors = cursors.clone();
+        move |x, w| cursors.borrow_mut().push(('v', x, w))
+    });
+
+    let before = performance_switch_is_on(&tab);
+    tab.query_descendants()
+        .match_id("FFToggle::area")
+        .find_first()
+        .expect("the switch has a touch area")
+        .mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(*toggled.borrow(), [!before]);
+
+    let inputs = performance_cap_inputs(&tab);
+    inputs[0].mock_single_click(slint::platform::PointerEventButton::Left);
+    type_into(&app, "2G");
+    inputs[1].mock_single_click(slint::platform::PointerEventButton::Left);
+    type_into(&app, "5");
+    assert_eq!(*host_edits.borrow(), ["2", "2G"]);
+    assert_eq!(*vram_edits.borrow(), ["5"]);
+
+    let cursors = cursors.borrow();
+    let host: Vec<_> = cursors.iter().filter(|c| c.0 == 'h').collect();
+    let vram: Vec<_> = cursors.iter().filter(|c| c.0 == 'v').collect();
+    assert!(
+        host.last().is_some_and(|c| c.1 > 0.0),
+        "typing moves the host cursor right: {host:?}"
+    );
+    assert!(
+        vram.last().is_some_and(|c| c.1 > 0.0),
+        "typing moves the VRAM cursor right: {vram:?}"
+    );
+    let visible = 136.0 - 2.0 * 6.0;
+    assert!(
+        cursors.iter().all(|c| (c.2 - visible).abs() < EPS),
+        "the visible width is the field less its two insets: {cursors:?}"
+    );
+}
+
+/// A cap entry longer than the field scrolls to keep the cursor in view,
+/// and Home brings the start back.
+#[test]
+fn performance_cap_entry_scrolls_to_follow_the_cursor() {
+    use slint::platform::{Key, WindowEvent};
+
+    let controller: SharedController =
+        std::sync::Arc::new(std::sync::Mutex::new(AppController::new()));
+    let app = app_at(1440, 900);
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_settings_open(true);
+    app.set_settings_section("performance".into());
+    focusforge_gui::bridge::push_performance_view(&app, &controller);
+    let tab = performance_tab(&app);
+
+    for field in 0..2 {
+        performance_cap_inputs(&tab)[field]
+            .mock_single_click(slint::platform::PointerEventButton::Left);
+        let rest = performance_cap_inputs(&tab)[field].absolute_position().x;
+
+        type_into(&app, "12345");
+        assert_eq!(
+            performance_cap_inputs(&tab)[field].absolute_position().x,
+            rest,
+            "field {field}: a short entry does not scroll"
+        );
+
+        type_into(&app, &"1234567890".repeat(4));
+        let scrolled = performance_cap_inputs(&tab)[field].absolute_position().x;
+        assert!(
+            scrolled < rest - 20.0,
+            "field {field}: a long entry scrolls left, rest {rest}, now {scrolled}"
+        );
+
+        app.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Home.into(),
+        });
+        app.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Home.into(),
+        });
+        assert_eq!(
+            performance_cap_inputs(&tab)[field].absolute_position().x,
+            rest,
+            "field {field}: Home shows the start of the entry again"
+        );
+    }
+}
+
+// --- About tab -------------------------------------------------------------
+
+const ABOUT_REDISTRIBUTE: &str = "FocusForge is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License.";
+const ABOUT_WARRANTY: &str = "This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full license text.";
+
+fn about_window() -> AppWindow {
+    let app = app_at(1440, 900);
+    focusforge_gui::bridge::push_about_view(&app);
+    app.set_settings_open(true);
+    app.set_settings_section("about".into());
+    app
+}
+
+/// The text the About tab draws, one string per line of the tab: a row is its
+/// label and value joined by ` | `, a heading or paragraph stands alone.
+fn about_rows(app: &AppWindow) -> Vec<String> {
+    let tab = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    let mut texts: Vec<(f32, f32, String)> = Vec::new();
+    for handle in tab
+        .query_descendants()
+        .match_accessible_role(AccessibleRole::Text)
+        .find_all()
+    {
+        let pos = handle.absolute_position();
+        if texts.iter().all(|(x, y, _)| (*x, *y) != (pos.x, pos.y)) {
+            let label = handle.accessible_label().unwrap_or_default().to_string();
+            texts.push((pos.x, pos.y, label));
+        }
+    }
+    texts.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut lines: Vec<(f32, Vec<(f32, String)>)> = Vec::new();
+    for (x, y, label) in texts {
+        match lines.last_mut() {
+            Some((top, line)) if y - *top < 8.0 => line.push((x, label)),
+            _ => lines.push((y, vec![(x, label)])),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(_, mut line)| {
+            line.sort_by(|a, b| a.0.total_cmp(&b.0));
+            line.into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect()
+}
+
+/// The version and the source come from the build, the licence and the notice
+/// are fixed text; a state set from outside is drawn as given, so neither
+/// build value is a literal in the tab.
+#[test]
+fn about_tab_shows_the_build_metadata() {
+    let app = about_window();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let rows = about_rows(&app);
+    let (source_row, rest) = rows.split_last().expect("the tab draws rows");
+    let source = source_row
+        .strip_prefix("Source | ")
+        .expect("the last row is Source");
+    assert!(!source.is_empty());
+    assert_eq!(
+        format!("https://{source}"),
+        env!("CARGO_PKG_REPOSITORY"),
+        "the source is the repository without its scheme"
+    );
+    let notice = |version: &str| -> Vec<String> {
+        vec![
+            "FOCUSFORGE".to_string(),
+            format!("Version | {version}"),
+            "License | GPL-3.0".to_string(),
+            "NOTICE".to_string(),
+            "Copyright © 2026 Johannes Sood".to_string(),
+            ABOUT_REDISTRIBUTE.to_string(),
+            ABOUT_WARRANTY.to_string(),
+        ]
+    };
+    assert_eq!(rest, notice(version));
+
+    app.set_about(focusforge_gui::AboutState {
+        version: "9.9.9".into(),
+        source: "example.org/x".into(),
+    });
+    let rows = about_rows(&app);
+    let (source_row, rest) = rows.split_last().unwrap();
+    assert_eq!(source_row, "Source | example.org/x");
+    assert_eq!(rest, notice("9.9.9"));
+}
+
+/// The tab is layout over shared components: its sections, rows and texts are
+/// the shared ones, and it styles nothing itself.
+#[test]
+fn about_tab_composes_only_shared_components() {
+    let tab = ui_source("shell/settings_modal/about_tab.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "Theme.status-",
+        "Theme.text-",
+        "Theme.surface-",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle:?}");
+    }
+    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFRowText {"] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
 }

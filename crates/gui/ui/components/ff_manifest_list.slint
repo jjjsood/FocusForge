@@ -67,7 +67,7 @@ export component FFManifestList inherits Rectangle {
 
             for row[i] in root.rows: HorizontalLayout {
                 height: 18px;
-                Text {
+                name-text := Text {
                     text: row.name;
                     color: Theme.text-secondary;
                     font-size: Theme.text-body.size;
@@ -75,13 +75,13 @@ export component FFManifestList inherits Rectangle {
                     overflow: elide;
                     horizontal-stretch: 1;
                 }
-                Text {
+                value-text := Text {
                     text: row.value;
                     color: row.not-redacted ? Theme.status-warning : Theme.text-muted;
                     font-size: Theme.text-body.size;
                     vertical-alignment: center;
                     horizontal-alignment: right;
-                    width: 110px;
+                    horizontal-stretch: 0;
                 }
             }
 

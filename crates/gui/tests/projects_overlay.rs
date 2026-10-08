@@ -13,7 +13,6 @@ use focusforge_core::io::Rect;
 use focusforge_core::params::ParamValues;
 use focusforge_core::project;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
-use focusforge_gui::input_config::Provenance;
 use focusforge_gui::input_map::{Action, Binding, InputTable, Modifiers, Trigger};
 use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
@@ -983,7 +982,7 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
             editor: Some(Action::ZoomAtCursor),
         });
     }
-    controller.install_input_table(table, Provenance::Defaults);
+    controller.install_input_table(table);
 
     // The overlay closed: the rebind still cannot shadow the chords.
     assert!(!controller.projects_overlay_open());

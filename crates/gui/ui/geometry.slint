@@ -115,6 +115,39 @@ export global ShellGeometry {
     out property <length> more-height: 32px;
     out property <length> more-gap: 12px;
 
+    // The settings modal's flat rows and nav rail: a row is 34 px over a 1 px
+    // rule, its label column 140 px, its content 446 px wide.
+    out property <length> settings-content-width: 446px;
+    out property <length> settings-rail-width: 190px;
+    out property <length> settings-rail-entry-height: 32px;
+    out property <length> settings-rail-top-inset: 12px;
+    out property <length> settings-rail-icon-x: 16px;
+    out property <length> settings-rail-label-x: 40px;
+    out property <length> settings-row-height: 34px;
+    out property <length> settings-label-width: 140px;
+    // A section heading's own height, down to the top of its first row.
+    out property <length> settings-heading-height: 26px;
+    out property <length> settings-section-gap: 22px;
+    out property <length> settings-field-width: 136px;
+    out property <length> settings-action-button-width: 112px;
+    // The status line under an action row: the gap above it, then one line.
+    out property <length> settings-status-gap: 6px;
+    out property <length> settings-status-height: 15px;
+    // The gap between stacked paragraphs inside a settings section.
+    out property <length> settings-paragraph-gap: 6px;
+    // The table header: the column titles' top down to the rule under them,
+    // then the gap above the first row.
+    out property <length> settings-table-header-height: 18px;
+    out property <length> settings-table-header-gap: 3px;
+    // The modal's header band, and the insets of the content under it: with
+    // `settings-content-width` they fill the content host's width.
+    out property <length> settings-header-height: 60px;
+    out property <length> settings-header-inset-x: 20px;
+    out property <length> settings-content-inset-left: 20px;
+    out property <length> settings-content-inset-right: 24px;
+    out property <length> settings-content-inset-top: 16px;
+    out property <length> settings-content-inset-bottom: 16px;
+
     // Two primitive sizes shared wherever something else needs to lay out
     // against them, rather than assuming the primitive's own literal.
     out property <length> scrollbar-width: 6px; // `FFScrollbar`'s own width.

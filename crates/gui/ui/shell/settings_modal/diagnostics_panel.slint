@@ -12,6 +12,11 @@ import { FFToggle } from "../../components/ff_toggle.slint";
 import { FFTextField } from "../../components/ff_text_field.slint";
 import { FFProgressBar } from "../../components/ff_progress_bar.slint";
 import { FFButton } from "../../components/ff_button.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFSettingsRow } from "../../components/ff_settings_row.slint";
+import { FFRowLabel } from "../../components/ff_row_label.slint";
+import { FFStatusText } from "../../components/ff_status_text.slint";
+import { FFDivider } from "../../components/ff_divider.slint";
 
 export { FFManifestRow }
 
@@ -40,103 +45,107 @@ export component FFDiagnosticsPanel inherits Rectangle {
     callback manifest-scrolled(length);
 
     property <bool> is-writing: root.status == "writing";
-    property <color> message-color: root.status == "written"
-        ? Theme.status-success
-        : root.status == "failed" ? Theme.status-failure : Theme.status-warning;
+    property <string> message-tone: root.status == "written"
+        ? "success"
+        : root.status == "failed" ? "failure" : "warning";
     property <string> field-tone: (root.status == "existing-file" || root.status == "failed")
         ? "warning"
         : "neutral";
 
     VerticalLayout {
-        padding-left: Theme.space-4 + Theme.space-1;
-        padding-right: Theme.space-6;
-        padding-top: Theme.space-4;
-        padding-bottom: Theme.space-4;
-        spacing: Theme.space-4;
+        VerticalLayout {
+            padding-left: ShellGeometry.settings-content-inset-left;
+            padding-right: ShellGeometry.settings-content-inset-right;
+            padding-top: ShellGeometry.settings-content-inset-top;
+            spacing: Theme.space-3;
+            alignment: start;
+            vertical-stretch: 1;
 
-        Text {
-            text: "DIAGNOSTICS";
-            color: Theme.text-muted;
-            font-size: Theme.text-body.size;
-            font-weight: Theme.text-section.weight;
-        }
+            FFSettingsSection {
+                heading: "DIAGNOSTICS";
+                spacing: Theme.space-1;
 
-        FFManifestList {
-            rows: root.rows;
-            note: root.note;
-            content-height: root.manifest-content-height;
-            scroll-offset: root.manifest-scroll-offset;
-            pointer(kind, y) => { root.manifest-scrollbar-pointer(kind, y); }
-            dragged(y) => { root.manifest-scrollbar-dragged(y); }
-            viewport-height-changed(h) => { root.manifest-viewport-height-changed(h); }
-            scrolled(delta) => { root.manifest-scrolled(delta); }
-        }
+                FFManifestList {
+                    rows: root.rows;
+                    note: root.note;
+                    content-height: root.manifest-content-height;
+                    scroll-offset: root.manifest-scroll-offset;
+                    pointer(kind, y) => { root.manifest-scrollbar-pointer(kind, y); }
+                    dragged(y) => { root.manifest-scrollbar-dragged(y); }
+                    viewport-height-changed(h) => { root.manifest-viewport-height-changed(h); }
+                    scrolled(delta) => { root.manifest-scrolled(delta); }
+                }
 
-        toggle-row := HorizontalLayout {
-            height: 20px;
-            Text {
-                text: "Include minidumps";
-                color: Theme.text-primary;
-                font-size: Theme.text-body.size;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
+                FFSettingsRow {
+                    label: "Include minidumps";
+                    align-end: true;
+                    divider: false;
+
+                    FFToggle {
+                        on: root.include-minidumps;
+                        disabled: root.busy;
+                        toggled => { root.minidumps-toggled(!root.include-minidumps); }
+                    }
+                }
+
+                FFStatusText {
+                    text: "Not redacted — binary memory contents. Marked in the list above.";
+                    tone: "warning";
+                    wrap: word-wrap;
+                    opacity: root.include-minidumps ? 1.0 : 0.0;
+                }
             }
-            FFToggle {
-                on: root.include-minidumps;
-                disabled: root.busy;
-                toggled => { root.minidumps-toggled(!root.include-minidumps); }
+
+            FFDivider { }
+
+            FFRowLabel {
+                label-text: "Save to";
+
+                // The field grows by 2 px on every edge when emphasised; its
+                // slot keeps the unemphasised height.
+                Rectangle {
+                    height: ShellGeometry.field-height;
+
+                    dest-field := FFTextField {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        text: root.destination;
+                        enabled: !root.busy;
+                        tone: root.field-tone;
+                        field-width: parent.width;
+                        scroll-offset: root.destination-scroll-offset;
+                        edited(text) => { root.destination-edited(text); }
+                        cursor-moved(x, w) => { root.destination-cursor-moved(x, w); }
+                    }
+                }
+            }
+
+            status-slot := Rectangle {
+                height: ShellGeometry.settings-status-height;
+
+                message := FFStatusText {
+                    width: parent.width;
+                    height: parent.height;
+                    text: root.message;
+                    tone: root.message-tone;
+                    overflow: elide;
+                    opacity: root.is-writing ? 0.0 : 1.0;
+                }
+                FFProgressBar {
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width;
+                    indeterminate: root.is-writing;
+                    opacity: root.is-writing ? 1.0 : 0.0;
+                }
             }
         }
 
-        Text {
-            text: "Not redacted — binary memory contents. Marked in the list above.";
-            color: Theme.status-warning;
-            font-size: Theme.text-body.size;
-            opacity: root.include-minidumps ? 1.0 : 0.0;
-            wrap: word-wrap;
-        }
-
-        Rectangle {
-            height: 1px;
-            background: Theme.border-default;
-        }
-
-        Text {
-            text: "Save to";
-            color: Theme.text-secondary;
-            font-size: Theme.text-body.size;
-        }
-
-        dest-field := FFTextField {
-            text: root.destination;
-            enabled: !root.busy;
-            tone: root.field-tone;
-            field-width: parent.width - Theme.space-4 - Theme.space-1 - Theme.space-6;
-            scroll-offset: root.destination-scroll-offset;
-            edited(text) => { root.destination-edited(text); }
-            cursor-moved(x, w) => { root.destination-cursor-moved(x, w); }
-        }
-
-        status-slot := Rectangle {
-            height: 22px;
-
-            Text {
-                text: root.message;
-                color: root.message-color;
-                font-size: Theme.text-body.size;
-                opacity: root.is-writing ? 0.0 : 1.0;
-                vertical-alignment: center;
-            }
-            FFProgressBar {
-                y: (parent.height - self.height) / 2;
-                width: parent.width;
-                indeterminate: root.is-writing;
-                opacity: root.is-writing ? 1.0 : 0.0;
-            }
-        }
+        FFDivider { }
 
         footer := HorizontalLayout {
-            height: ShellGeometry.toolbar-button-height;
+            padding-right: ShellGeometry.settings-content-inset-right;
+            padding-top: Theme.space-3;
+            padding-bottom: Theme.space-6;
             alignment: end;
 
             bundle-primary := FFButton {

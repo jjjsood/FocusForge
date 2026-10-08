@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The Storage section's content: the four locations the app uses and the
+// stage cache clear.
+
+import { ShellGeometry } from "../../geometry.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFSettingsPathRow } from "../../components/ff_settings_path_row.slint";
+import { FFSettingsActionRow } from "../../components/ff_settings_action_row.slint";
+
+export struct StoragePathState {
+    path: string,
+    missing: bool,
+    available: bool,
+}
+
+export struct StorageState {
+    settings-file: StoragePathState,
+    logs: StoragePathState,
+    crashes: StoragePathState,
+    scratch: StoragePathState,
+    clear-enabled: bool,
+    status: string,
+    // "none" | "success" | "warning" | "failure".
+    status-tone: string,
+}
+
+export component FFStorageTab inherits Rectangle {
+    in property <StorageState> storage;
+    callback clear-requested();
+
+    VerticalLayout {
+        padding-left: ShellGeometry.settings-content-inset-left;
+        padding-right: ShellGeometry.settings-content-inset-right;
+        padding-top: ShellGeometry.settings-content-inset-top;
+        padding-bottom: ShellGeometry.settings-content-inset-bottom;
+        spacing: ShellGeometry.settings-section-gap;
+        alignment: start;
+
+        FFSettingsSection {
+            heading: "LOCATIONS";
+
+            FFSettingsPathRow {
+                label: "Settings file";
+                path: root.storage.settings-file.path;
+                missing: root.storage.settings-file.missing;
+                available: root.storage.settings-file.available;
+            }
+            FFSettingsPathRow {
+                label: "Logs";
+                path: root.storage.logs.path;
+                missing: root.storage.logs.missing;
+                available: root.storage.logs.available;
+            }
+            FFSettingsPathRow {
+                label: "Crash reports";
+                path: root.storage.crashes.path;
+                missing: root.storage.crashes.missing;
+                available: root.storage.crashes.available;
+            }
+            FFSettingsPathRow {
+                label: "Scratch";
+                path: root.storage.scratch.path;
+                missing: root.storage.scratch.missing;
+                available: root.storage.scratch.available;
+            }
+        }
+
+        FFSettingsSection {
+            heading: "CACHE";
+
+            FFSettingsActionRow {
+                label: "Stage cache";
+                helper: "Deletes cached fuse stages.";
+                button-text: "Clear cache";
+                enabled: root.storage.clear-enabled;
+                status-text: root.storage.status;
+                status-tone: root.storage.status-tone;
+                clicked => { root.clear-requested(); }
+            }
+        }
+    }
+}

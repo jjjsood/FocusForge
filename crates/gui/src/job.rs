@@ -41,7 +41,7 @@ use focusforge_gpu::blend::Blender;
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::equalize::UNIT_GAIN;
-pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
+pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCacheError};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
@@ -147,6 +147,12 @@ pub struct JobRequest {
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
     pub gpu: bool,
+    /// A ceiling on the host-memory budget the run derives; it only lowers
+    /// it. `None` leaves the derived budget.
+    pub max_host_memory: Option<u64>,
+    /// A ceiling on the device budget the first GPU use probes; it only
+    /// lowers it, and only the first use in a process takes effect.
+    pub max_vram: Option<u64>,
 }
 
 /// How often the pipeline's poll thread ticks progress -- the window's
@@ -206,15 +212,20 @@ pub fn resolve_request(request: &JobRequest) -> Result<Algorithms, String> {
 /// Resolves whether a run of `fuse_id` may use the headless GPU backend, and
 /// a one-line account of the choice either way. `gpu = false` reports the
 /// policy without probing an adapter; a device already lost earlier this
-/// session falls back to the host rather than reusing it.
-pub fn resolve_backend(fuse_id: &str, gpu: bool) -> (Option<&'static dyn TileBackend>, String) {
+/// session falls back to the host rather than reusing it. `max_vram` caps the
+/// device budget when this call is the first to probe it.
+pub fn resolve_backend(
+    fuse_id: &str,
+    gpu: bool,
+    max_vram: Option<u64>,
+) -> (Option<&'static dyn TileBackend>, String) {
     if !gpu {
         return (
             None,
             "fusion backend: cpu — GPU processing is off".to_string(),
         );
     }
-    let (backend, message) = focusforge_gpu::harness::backend_for(fuse_id, false, None);
+    let (backend, message) = focusforge_gpu::harness::backend_for(fuse_id, false, max_vram);
     match backend {
         Some(backend) if backend.device_lost() => (
             None,
@@ -248,7 +259,8 @@ pub fn spawn(
     observer: Arc<GuiObserver>,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
     std::thread::spawn(move || {
-        let (backend, backend_line) = resolve_backend(&request.fuse_id, request.gpu);
+        let (backend, backend_line) =
+            resolve_backend(&request.fuse_id, request.gpu, request.max_vram);
         tracing::info!("{backend_line}");
         observer.set_backend_line(backend_line);
         let align_backend = resolve_align_backend(&request, &algorithms, &observer);
@@ -259,29 +271,7 @@ pub fn spawn(
                 None
             }
         };
-        let align = algorithms.align.map(|algorithm| AlignRequest {
-            algorithm,
-            explicit: request.align_values,
-            lax: request.align_lax,
-        });
-        let fuse_request = FuseRequest {
-            frames: request.frames,
-            output: FuseOutput::Hold(request.hold_dir),
-            scratch_root: request.scratch_root,
-            staging_key: request.staging_key,
-            algorithm: algorithms.fuse,
-            explicit: request.fuse_values,
-            align,
-            crop: request.crop,
-            equalize: request.equalize,
-            tile_size: None,
-            max_host_memory: None,
-            backend,
-            align_backend,
-            resume: false,
-            cache: true,
-            poll: POLL,
-        };
+        let fuse_request = fuse_request(request, &algorithms, backend, align_backend);
         pipeline::run(
             &fuse_request,
             observer.as_ref(),
@@ -291,21 +281,62 @@ pub fn spawn(
     })
 }
 
+/// Empties the stage cache under `scratch_root` and returns how many entries
+/// it held. Nothing else under the scratch root is touched.
+pub fn clear_stage_cache(scratch_root: &Path) -> Result<usize, StageCacheError> {
+    StageCache::open(scratch_root)?.clear()
+}
+
+/// The pipeline request a window run makes of `request`, with the backends
+/// [`resolve_backend`] and [`resolve_align_backend`] chose.
+pub fn fuse_request(
+    request: JobRequest,
+    algorithms: &Algorithms,
+    backend: Option<&'static dyn TileBackend>,
+    align_backend: Option<&'static dyn AlignBackend>,
+) -> FuseRequest {
+    let align = algorithms.align.map(|algorithm| AlignRequest {
+        algorithm,
+        explicit: request.align_values,
+        lax: request.align_lax,
+    });
+    FuseRequest {
+        frames: request.frames,
+        output: FuseOutput::Hold(request.hold_dir),
+        scratch_root: request.scratch_root,
+        staging_key: request.staging_key,
+        algorithm: algorithms.fuse,
+        explicit: request.fuse_values,
+        align,
+        crop: request.crop,
+        equalize: request.equalize,
+        tile_size: None,
+        max_host_memory: request.max_host_memory,
+        backend,
+        align_backend,
+        resume: false,
+        cache: true,
+        poll: POLL,
+    }
+}
+
 /// The accelerator a run's align stage may use: the lazy GPU backend when GPU
 /// processing is on and the aligner has a GPU path, unless its device was
 /// lost earlier this session. The adapter comes up only when a level is
 /// large enough to offload; the observer reads its name back for the run's
 /// alignment summary.
-fn resolve_align_backend(
+pub fn resolve_align_backend(
     request: &JobRequest,
     algorithms: &Algorithms,
     observer: &GuiObserver,
 ) -> Option<&'static dyn AlignBackend> {
     let algorithm = algorithms.align.filter(|_| request.gpu)?;
-    let (lazy, _) =
-        focusforge_gpu::harness::align_backend_for(algorithm.id(), false, None, |line| {
-            tracing::info!("{line}")
-        });
+    let (lazy, _) = focusforge_gpu::harness::align_backend_for(
+        algorithm.id(),
+        false,
+        request.max_vram,
+        |line| tracing::info!("{line}"),
+    );
     let lazy = lazy?;
     if lazy.lost() {
         tracing::info!("alignment backend: cpu — the GPU device was lost earlier in this session");

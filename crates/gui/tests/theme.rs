@@ -344,3 +344,58 @@ fn inter_is_the_font_family_and_ships_beside_the_theme() {
         );
     }
 }
+
+/// Names after `export component` in `code`.
+fn exported_components(code: &str) -> Vec<String> {
+    code.split("export component ")
+        .skip(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect()
+        })
+        .collect()
+}
+
+/// Every exported component under `ui/components/` is imported by the
+/// component sheet and instantiated there; a component the sheet does not
+/// draw fails here.
+#[test]
+fn every_component_is_on_the_component_sheet() {
+    let ui = common::ui_dir();
+    let sheet =
+        common::strip_line_comments(&fs::read_to_string(ui.join("theme_sheet.slint")).unwrap());
+    let imports: Vec<&str> = sheet
+        .split("import ")
+        .skip(1)
+        .map(|statement| statement.split(';').next().unwrap())
+        .collect();
+
+    let mut checked = 0;
+    let mut missing = Vec::new();
+    for path in common::find_slint_files(&ui.join("components")) {
+        let code = common::strip_line_comments(&fs::read_to_string(&path).unwrap());
+        let file = path.file_name().unwrap().to_str().unwrap();
+        for name in exported_components(&code) {
+            checked += 1;
+            let imported = imports.iter().any(|statement| {
+                statement.contains(&format!("components/{file}"))
+                    && statement
+                        .split(['{', '}', ','])
+                        .any(|imported| imported.trim() == name)
+            });
+            let drawn =
+                sheet.contains(&format!(" {name} {{")) || sheet.contains(&format!("\n{name} {{"));
+            if !imported || !drawn {
+                missing.push(format!(
+                    "{file}: {name} (imported {imported}, drawn {drawn})"
+                ));
+            }
+        }
+    }
+    assert!(checked >= 40, "the scan found only {checked} components");
+    assert!(
+        missing.is_empty(),
+        "not on the component sheet: {missing:?}"
+    );
+}

@@ -188,24 +188,48 @@ window with unsaved work — including through the window manager, e.g.
 Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
 **Quit without saving**. Dismissing either question leaves everything open.
 
+## The settings window
+
+The gear at the bottom of the window opens the settings window, which has
+five tabs:
+
+- **Performance** switches GPU processing on or off, shows the backend the
+  last run resolved, and takes an optional **Host memory cap** and **VRAM
+  cap** in the size syntax of `--max-host-memory` and `--max-vram` (for
+  example `8GiB`). A cap only lowers a budget; the **Host budget** and
+  **VRAM budget** rows show the budgets in effect. A field holding an
+  unparsable size is flagged. A changed VRAM cap applies from the next start.
+- **Storage** lists where the settings file, the logs, the crash reports and
+  the scratch directory live, and marks one that does not exist yet. **Clear
+  cache** deletes the cached fuse stages.
+- **Input map** lists every stacking and editor action alongside the input
+  bound to it, and where that binding came from: the shipped defaults or the
+  settings file. See [Keyboard and mouse bindings](#keyboard-and-mouse-bindings).
+- **Diagnostics** shows the file list a diagnostics bundle would hold and
+  creates it; see [`guide/diagnostics.md`](diagnostics.md).
+- **About** shows the version, the licence (GPL-3.0), the copyright and
+  warranty notice, and the source repository.
+
+`focusforge-gui --settings-section performance|storage|input-map|diagnostics|about`
+opens the window on that tab at startup.
+
 ## Keyboard and mouse bindings
 
-The gear at the bottom of the window opens a settings panel whose **Input
-map** section lists every stacking and editor action alongside the input
-bound to it, and where that binding came from — the shipped defaults or the
-settings file. The bindings live in the `[input]` table of `settings.toml`,
-edited by hand rather than through the window; the panel is the read-only
-view of what took effect. A table with any problem is refused whole and the
-defaults apply, with the problem named: an unknown trigger or action, a
-duplicate trigger, or a trigger the map has no row for such as `alt+wheel`.
-Alt is not a wheel modifier; it is only the pipette.
+The **Input map** tab is the read-only view of the bindings that took
+effect. They live in the `[input]` table of `settings.toml`,
+edited by hand rather than through the window. A table with any problem is
+refused whole and the defaults apply, with the problem named: an unknown
+trigger or action, a duplicate trigger, or a trigger the map has no row for
+such as `alt+wheel`. Alt is not a wheel modifier; it is only the pipette.
 
 ## The settings file
 
 `settings.toml` in the platform's per-user config directory holds
 everything the window remembers, one table per concern: `[recent]` (the
 rail's recent projects, up to five, each row needing its `path`), `[input]`
-(the bindings above) and `[export]` (the export dialog's last choice). The
+(the bindings above), `[export]` (the export dialog's last choice) and
+`[performance]` (`gpu = true|false`, and optional `max-host-memory` and
+`max-vram` size strings, as set on the Performance tab). The
 file has no version. Writing one table leaves the others, and any comments
 in them, as they were; a file that is not valid TOML is left untouched
 rather than overwritten. `--config-dir <DIR>` makes the window read and

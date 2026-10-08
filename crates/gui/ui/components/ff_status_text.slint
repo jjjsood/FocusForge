@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A line of status text in body type; `tone` picks its colour. Width, height
+// and overflow are the caller's.
+
+import { Theme } from "../theme.slint";
+
+export component FFStatusText inherits Text {
+    // "none" | "success" | "warning" | "failure".
+    in property <string> tone: "none";
+
+    color: root.tone == "success" ? Theme.status-success
+        : root.tone == "warning" ? Theme.status-warning
+        : root.tone == "failure" ? Theme.status-failure
+        : Theme.text-muted;
+    font-size: Theme.text-body.size;
+    font-weight: Theme.text-body.weight;
+    vertical-alignment: center;
+}

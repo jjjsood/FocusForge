@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A settings row showing one filesystem path, elided at its end, with a note for
+// a directory not created yet and an unavailable state for an unresolved one.
+
+import { FFSettingsRow } from "ff_settings_row.slint";
+import { FFRowText } from "ff_row_text.slint";
+
+export component FFSettingsPathRow inherits FFSettingsRow {
+    in property <string> path: "";
+    in property <bool> missing: false;
+    in property <bool> available: true;
+
+    if root.available: FFRowText {
+        text: root.path;
+        overflow: elide;
+    }
+    if root.available && root.missing: FFRowText {
+        muted: true;
+        text: "· not created yet";
+    }
+    if !root.available: FFRowText {
+        muted: true;
+        text: "Unavailable";
+    }
+}

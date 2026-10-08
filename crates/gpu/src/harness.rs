@@ -22,7 +22,7 @@ use crate::budget::{
     dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
     tile_shortfall_message,
 };
-use crate::device::{GpuError, SharedDevice, block_on, shared_device};
+use crate::device::{GpuError, SharedDevice, block_on, settled_device, shared_device};
 use crate::ecc::{self, EccState};
 use crate::errors;
 use crate::fuse::{self, FusionPipelines};
@@ -449,6 +449,26 @@ pub fn gpu_backend() -> Result<&'static GpuBackend, &'static GpuError> {
     gpu_backend_capped(None)
 }
 
+/// The backend this process has settled on, `None` while no caller has asked
+/// for one. A failed device is reported as its stored `Err` even though
+/// [`gpu_backend_capped`] returned before setting the backend. Reads only:
+/// asking never opens an adapter.
+pub fn settled_backend() -> Option<Result<&'static GpuBackend, &'static GpuError>> {
+    match settled_device() {
+        Some(Err(err)) => Some(Err(err)),
+        _ => GPU_BACKEND.get().map(Result::as_ref),
+    }
+}
+
+/// Whether this process's VRAM cap is fixed: the backend was probed, the lazy
+/// align backend took its `max_vram` at its first use, or the device failed.
+/// A cap given after that has no effect. Reads only.
+pub fn vram_cap_settled() -> bool {
+    GPU_BACKEND.get().is_some()
+        || LAZY_ALIGN_BACKEND.get().is_some()
+        || matches!(settled_device(), Some(Err(_)))
+}
+
 /// Resolves whether a stack run over `algorithm_id` takes the GPU path, and
 /// a one-line, human-readable account of the choice either way. This crate
 /// ships a WGSL port of exactly one stacking algorithm, so every other id
@@ -579,7 +599,10 @@ fn cpu_fallback_line(reason: &GpuError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LazyAlignBackend, align_backend_for, backend_for, cpu_fallback_line};
+    use super::{
+        LazyAlignBackend, align_backend_for, backend_for, cpu_fallback_line, settled_backend,
+        vram_cap_settled,
+    };
     use crate::device::GpuError;
     use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
     use focusforge_core::align::PyramidalEcc;
@@ -647,5 +670,16 @@ mod tests {
                 assert!(message.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn reading_the_settled_state_never_brings_the_adapter_up() {
+        assert!(settled_backend().is_none());
+        assert!(!vram_cap_settled());
+
+        let (lazy, _) = align_backend_for(PyramidalEcc.id(), false, None, |_| {});
+        assert!(lazy.is_some());
+        assert!(vram_cap_settled(), "the lazy align backend fixed its cap");
+        assert!(settled_backend().is_none(), "no backend was probed");
     }
 }

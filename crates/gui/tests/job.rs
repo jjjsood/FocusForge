@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
-use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
 use focusforge_core::project::{self, Op, Point, Project};
 use focusforge_core::registry;
@@ -4420,14 +4420,14 @@ fn the_card_counts_the_listed_checkpoints() {
 
 #[test]
 fn fusion_backend_off_reports_gpu_disabled() {
-    let (backend, line) = job::resolve_backend("depth-map", false);
+    let (backend, line) = job::resolve_backend("depth-map", false, None);
     assert!(backend.is_none());
     assert_eq!(line, "fusion backend: cpu — GPU processing is off");
 }
 
 #[test]
 fn fusion_backend_on_depth_map_reports_no_gpu_implementation() {
-    let (backend, line) = job::resolve_backend("depth-map", true);
+    let (backend, line) = job::resolve_backend("depth-map", true, None);
     assert!(backend.is_none());
     assert_eq!(
         line,
@@ -4437,7 +4437,7 @@ fn fusion_backend_on_depth_map_reports_no_gpu_implementation() {
 
 #[test]
 fn fusion_backend_on_dummy_stack_reports_no_gpu_implementation() {
-    let (backend, line) = job::resolve_backend("dummy-stack", true);
+    let (backend, line) = job::resolve_backend("dummy-stack", true, None);
     assert!(backend.is_none());
     assert_eq!(
         line,
@@ -4535,6 +4535,180 @@ fn fusion_backend_reports_on_run_gallery_action() {
         DEPTH_MAP_CPU_LINE
     );
     common::wait_for_settle(&mut controller, Duration::from_secs(60));
+}
+
+// ---------------------------------------------------------------------
+// The Performance settings reach the run: the request the controller
+// builds, the `FuseRequest` made from it and the host budget that results.
+// ---------------------------------------------------------------------
+
+#[test]
+fn performance_reaches_job_request() {
+    let mut controller = controller_with_frames("performance_request", 2);
+    let request = controller.job_request_for(0).expect("tab 0 is open");
+    assert!(!request.gpu, "a headless controller never probes");
+    assert_eq!((request.max_host_memory, request.max_vram), (None, None));
+
+    for gpu in [true, false] {
+        controller.set_gpu_fusion(gpu);
+        controller.set_host_memory_cap("3GiB");
+        controller.set_vram_cap("512MiB");
+        let request = controller.job_request_for(0).expect("tab 0 is open");
+        assert_eq!(request.gpu, gpu);
+        assert_eq!(request.max_host_memory, Some(3 << 30));
+        assert_eq!(request.max_vram, Some(512 << 20));
+        let algorithms = job::resolve_request(&request).unwrap();
+        if !gpu {
+            let observer = job::GuiObserver::new();
+            assert!(job::resolve_align_backend(&request, &algorithms, &observer).is_none());
+        }
+        let fuse = job::fuse_request(request, &algorithms, None, None);
+        assert_eq!(fuse.max_host_memory, Some(3 << 30));
+    }
+
+    controller.set_host_memory_cap("");
+    controller.set_vram_cap("");
+    let request = controller.job_request_for(0).expect("tab 0 is open");
+    assert_eq!((request.max_host_memory, request.max_vram), (None, None));
+    let algorithms = job::resolve_request(&request).unwrap();
+    assert_eq!(
+        job::fuse_request(request, &algorithms, None, None).max_host_memory,
+        None
+    );
+
+    let (backend, line) = job::resolve_backend("laplacian", false, Some(1));
+    assert!(backend.is_none());
+    assert_eq!(line, "fusion backend: cpu — GPU processing is off");
+}
+
+#[test]
+fn performance_host_cap_only_lowers() {
+    struct Noop;
+    impl StageObserver for Noop {}
+
+    let derived = job::host_budget().bytes();
+    let provenance = |name: &str, cap: Option<u64>| {
+        let mut controller = controller_with_frames(name, 3);
+        controller.set_gpu_fusion(false);
+        if let Some(cap) = cap {
+            controller.set_host_memory_cap(&cap.to_string());
+        }
+        let request = controller.job_request_for(0).expect("tab 0 is open");
+        let algorithms = job::resolve_request(&request).unwrap();
+        let request = job::fuse_request(request, &algorithms, None, None);
+        let outcome = pipeline::run(
+            &request,
+            &Noop,
+            focusforge_core::job::JobControl::new(),
+            None,
+        )
+        .expect("the run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        report.budget_provenance
+    };
+
+    let uncapped = provenance("performance_cap_none", None);
+    assert_ne!(uncapped, Provenance::Explicit);
+    assert_eq!(
+        provenance("performance_cap_half", Some(derived / 2)),
+        Provenance::Explicit,
+        "a cap below the derived budget lowers it"
+    );
+    assert_eq!(
+        provenance("performance_cap_max", Some(u64::MAX)),
+        uncapped,
+        "a cap above the derived budget changes nothing"
+    );
+}
+
+#[test]
+fn performance_backend_line_survives_the_run() {
+    let mut controller = controller_with_frames("performance_backend_line", 2);
+    controller.set_gpu_fusion(true);
+    controller.set_fuse_algorithm("depth-map");
+    assert_eq!(controller.performance_view().backend, "");
+    assert!(controller.start_fuse());
+    wait_for_backend_line(&controller, Duration::from_secs(30));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    assert_eq!(controller.fusion_backend(), None, "the observer is gone");
+    assert_eq!(
+        controller.performance_view().backend,
+        "cpu — depth-map has no GPU implementation"
+    );
+}
+
+#[test]
+fn the_performance_tab_is_refreshed_when_a_run_settles() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = controller_with_frames("performance_settle_push", 2);
+    controller.set_gpu_fusion(true);
+    controller.set_fuse_algorithm("depth-map");
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_settings_open(true);
+    app.set_settings_section("performance".into());
+    focusforge_gui::bridge::push_performance_view(&app, &controller);
+    assert_eq!(app.get_performance().backend, "");
+
+    app.invoke_fuse_requested();
+    common::settle_via_job_timer(&controller, Duration::from_secs(120));
+
+    assert_eq!(
+        app.get_performance().backend,
+        "cpu — depth-map has no GPU implementation",
+        "the backend row must not stay stale after the run"
+    );
+}
+
+/// The Storage tab refuses the clear while a run is live and offers it again
+/// when the run settles, without the modal being reopened.
+#[test]
+fn the_storage_tab_is_refreshed_when_a_run_settles() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller_with_frames("storage_settle_push", 2)));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_settings_open(true);
+    app.set_settings_section("storage".into());
+
+    app.invoke_fuse_requested();
+    focusforge_gui::bridge::push_storage_view(&app, &controller);
+    assert!(
+        !app.get_storage().clear_enabled,
+        "a live run refuses the clear"
+    );
+    assert_eq!(app.get_storage().status.as_str(), "A run is active.");
+
+    common::settle_via_job_timer(&controller, Duration::from_secs(120));
+
+    assert!(
+        app.get_storage().clear_enabled,
+        "the button must not stay disabled after the run"
+    );
+    assert_eq!(app.get_storage().status.as_str(), "");
 }
 
 // ---------------------------------------------------------------------

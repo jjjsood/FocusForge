@@ -85,52 +85,98 @@ fn startup_line_reaches_the_log_file_before_the_settings_section_exit() {
     );
 }
 
-#[test]
-fn the_settings_section_refusal_reaches_the_log_and_prints_once() {
-    let mut cmd = common::gui_bin("diagnostics_refusal");
-    let data_dir = cmd
-        .get_envs()
-        .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
-        .and_then(|(_, v)| v)
-        .map(std::path::PathBuf::from)
-        .expect("gui_bin always sets FOCUSFORGE_DATA_DIR");
-
-    let output = cmd
-        .args(["--settings-section", "nope"])
-        .output()
-        .expect("failed to run focusforge-gui");
-
-    let refusal = "--settings-section accepts \"input-map\" or \"diagnostics\", got \"nope\"";
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn live_slugs() -> Vec<&'static str> {
+    let slugs: Vec<&'static str> = focusforge_gui::SettingsSection::ALL
+        .iter()
+        .map(|section| section.slug())
+        .collect();
     assert_eq!(
-        stderr.matches(refusal).count(),
-        1,
-        "the refusal must print exactly once, got: {stderr}"
+        slugs,
+        [
+            "performance",
+            "storage",
+            "input-map",
+            "diagnostics",
+            "about"
+        ]
     );
-
-    let log_path = data_dir
-        .join("focusforge")
-        .join("logs")
-        .join("focusforge.jsonl");
-    let contents = std::fs::read_to_string(&log_path)
-        .unwrap_or_else(|e| panic!("log file must exist at {}: {e}", log_path.display()));
-    assert!(
-        contents.lines().any(|line| {
-            let record: serde_json::Value =
-                serde_json::from_str(line).expect("every log line is JSON");
-            record["level"] == "ERROR" && record["message"].as_str().is_some_and(|m| m == refusal)
-        }),
-        "no ERROR record carries the refusal: {contents}"
-    );
+    slugs
 }
 
-/// Windowed: `--settings-section` values that are not refused go on to open
-/// a real window, unlike `nope` above, so this needs a compositor
-/// (`common::has_display`) -- everything else in this file exits before a
-/// window is created.
 #[test]
-fn the_settings_section_accepts_input_map_and_diagnostics() {
-    for section in ["input-map", "diagnostics"] {
+fn settings_section_argument_refuses_retired_and_unknown_slugs() {
+    for value in ["general", "nope"] {
+        let mut cmd = common::gui_bin(&format!("diagnostics_refusal_{value}"));
+        let data_dir = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "FOCUSFORGE_DATA_DIR")
+            .and_then(|(_, v)| v)
+            .map(std::path::PathBuf::from)
+            .expect("gui_bin always sets FOCUSFORGE_DATA_DIR");
+
+        let output = cmd
+            .args(["--settings-section", value])
+            .output()
+            .expect("failed to run focusforge-gui");
+        assert_eq!(output.status.code(), Some(2), "{value}");
+
+        let got = format!("got {value:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches(&got).count(),
+            1,
+            "the refusal must print exactly once, got: {stderr}"
+        );
+
+        let log_path = data_dir
+            .join("focusforge")
+            .join("logs")
+            .join("focusforge.jsonl");
+        let contents = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|e| panic!("log file must exist at {}: {e}", log_path.display()));
+        let errors: Vec<String> = contents
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("every log line is JSON")
+            })
+            .filter(|record| record["level"] == "ERROR")
+            .map(|record| record["message"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(errors.len(), 1, "one ERROR record, got {errors:?}");
+        for slug in live_slugs() {
+            assert!(
+                errors[0].contains(&format!("{slug:?}")),
+                "the refusal must name {slug:?}: {}",
+                errors[0]
+            );
+        }
+        assert!(errors[0].ends_with(&got), "{}", errors[0]);
+    }
+}
+
+#[test]
+fn settings_section_argument_help_names_every_live_tab() {
+    let output = common::gui_bin("diagnostics_help")
+        .arg("--help")
+        .output()
+        .expect("failed to run focusforge-gui");
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    let section = help
+        .split("--settings-section")
+        .nth(1)
+        .and_then(|rest| rest.split("--dock-tab").next())
+        .expect("--help describes --settings-section");
+    for slug in live_slugs() {
+        assert!(section.contains(slug), "--help must name {slug}: {section}");
+    }
+}
+
+/// Windowed: every accepted value goes on to open a real window, unlike the
+/// refused ones above, so this needs a compositor (`common::has_display`).
+#[test]
+fn settings_section_argument_opens_every_live_tab() {
+    for section in live_slugs() {
         if !common::has_display() {
             println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
             return;

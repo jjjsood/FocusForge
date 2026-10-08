@@ -23,7 +23,8 @@ use crate::canvas::{
 };
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, LocateTarget, OpenAs,
-    OpenOutcome, SettingsSection, ShellEvent, ShellMode, WindowChromeIntent, WindowTarget,
+    OpenOutcome, SettingsSection, ShellEvent, ShellMode, StoragePath, WindowChromeIntent,
+    WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -34,10 +35,11 @@ use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
 use crate::generated::{
-    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
-    FFManifestRow, ImageRowView as GeneratedImageRow, ProjectCardView as GeneratedProjectCard,
-    ProjectTabView, RecentRowView as GeneratedRecentRow, SectionHeadView,
-    SettingsRow as GeneratedSettingsRow,
+    AboutState, AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow,
+    ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow, PerformanceCap,
+    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    StoragePathState, StorageState,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -1382,6 +1384,89 @@ pub fn push_diagnostics_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
     app.set_diagnostics_destination_scroll_offset(view.destination_scroll_offset);
 }
 
+/// Which Performance cap field the user is typing in.
+#[derive(Clone, Copy)]
+enum EditedCap {
+    HostMemory,
+    Vram,
+}
+
+/// Rebuilds the Performance tab's whole view from the controller and pushes
+/// it into the window. The view is built under the controller lock and
+/// pushed after the guard drops.
+pub fn push_performance_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    push_performance(app, controller, None);
+}
+
+/// [`push_performance_view`] that leaves the text of the field being typed in
+/// as the window has it, so a push never rewrites what the user is typing.
+fn push_performance(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    editing: Option<EditedCap>,
+) {
+    let view = controller.lock().unwrap().performance_view();
+    let cap = |field: &crate::performance_settings::CapField| PerformanceCap {
+        text: field.text.as_str().into(),
+        placeholder: field.placeholder.into(),
+        invalid: field.invalid,
+        enabled: field.enabled,
+        scroll_offset: field.scroll_offset,
+    };
+    let mut state = PerformanceState {
+        gpu: view.gpu,
+        gpu_enabled: view.gpu_enabled,
+        backend: view.backend.into(),
+        host_cap: cap(&view.host_cap),
+        vram_cap: cap(&view.vram_cap),
+        host_budget: view.host_budget.into(),
+        vram_budget: view.vram_budget.into(),
+        vram_budget_known: view.vram_budget_known,
+        note: view.note.into(),
+    };
+    let shown = app.get_performance();
+    match editing {
+        Some(EditedCap::HostMemory) => state.host_cap.text = shown.host_cap.text,
+        Some(EditedCap::Vram) => state.vram_cap.text = shown.vram_cap.text,
+        None => {}
+    }
+    app.set_performance(state);
+}
+
+/// Rebuilds the Storage tab's whole view from the controller and pushes it
+/// into the window. The view is built under the controller lock and pushed
+/// after the guard drops.
+pub fn push_storage_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let view = controller.lock().unwrap().storage_view();
+    let path = |row: StoragePath| StoragePathState {
+        path: row.path.into(),
+        missing: row.missing,
+        available: row.available,
+    };
+    app.set_storage(StorageState {
+        settings_file: path(view.settings_file),
+        logs: path(view.logs),
+        crashes: path(view.crashes),
+        scratch: path(view.scratch),
+        clear_enabled: view.clear_enabled,
+        status: view.status.into(),
+        status_tone: view.status_tone.as_str().into(),
+    });
+}
+
+/// Pushes the About tab's view into the window: the build's version and
+/// repository, the repository shown without its scheme.
+pub fn push_about_view(app: &AppWindow) {
+    let repository = env!("CARGO_PKG_REPOSITORY");
+    app.set_about(AboutState {
+        version: env!("CARGO_PKG_VERSION").into(),
+        source: repository
+            .strip_prefix("https://")
+            .unwrap_or(repository)
+            .into(),
+    });
+}
+
 /// Pushes the crash notice's own two properties into the window -- mirrors
 /// [`push_diagnostics_view`] for the toast.
 pub fn push_crash_notice(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
@@ -1606,6 +1691,20 @@ fn start_job_timer(
             let controller = controller.lock().unwrap();
             push_settings_panel(&app, &controller);
             push_images_panel(&app, &controller);
+        }
+        if !live
+            && app.get_settings_open()
+            && app.get_settings_section().as_str() == SettingsSection::Performance.slug()
+        {
+            // The finished run's backend line replaces the one on show.
+            push_performance_view(&app, &controller);
+        }
+        if !live
+            && app.get_settings_open()
+            && app.get_settings_section().as_str() == SettingsSection::Storage.slug()
+        {
+            // The finished run lifts the clear's refusal.
+            push_storage_view(&app, &controller);
         }
         if !live && let Some(t) = timer_slot.borrow().as_ref() {
             t.stop();
@@ -2869,6 +2968,8 @@ pub fn install(
             let open = controller.lock().unwrap().open_settings();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
+                push_performance_view(&app, &controller);
+                push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
                 repaint(&app, &controller, &canvas);
             }
@@ -2893,18 +2994,96 @@ pub fn install(
         let app_weak = app.as_weak();
         move |section| {
             record_settings_input();
-            let parsed = match section.as_str() {
-                "general" => SettingsSection::General,
-                "performance" => SettingsSection::Performance,
-                "storage" => SettingsSection::Storage,
-                "diagnostics" => SettingsSection::Diagnostics,
-                "about" => SettingsSection::About,
-                _ => SettingsSection::InputMap,
+            let Some(parsed) = SettingsSection::from_slug(section.as_str()) else {
+                return;
             };
             controller.lock().unwrap().select_settings_section(parsed);
             if let Some(app) = app_weak.upgrade() {
-                app.set_settings_section(section);
+                app.set_settings_section(parsed.slug().into());
+                push_performance_view(&app, &controller);
+                push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
+            }
+        }
+    });
+    app.on_storage_clear_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().clear_stage_cache();
+            if let Some(app) = app_weak.upgrade() {
+                push_storage_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_performance_gpu_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().set_gpu_fusion(on);
+            if let Some(app) = app_weak.upgrade() {
+                push_performance_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_performance_host_cap_edited({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |text| {
+            record_surface_input(InputSurface::Other);
+            controller
+                .lock()
+                .unwrap()
+                .set_host_memory_cap(text.as_str());
+            if let Some(app) = app_weak.upgrade() {
+                push_performance(&app, &controller, Some(EditedCap::HostMemory));
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_performance_vram_cap_edited({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |text| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().set_vram_cap(text.as_str());
+            if let Some(app) = app_weak.upgrade() {
+                push_performance(&app, &controller, Some(EditedCap::Vram));
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_performance_host_cap_cursor_moved({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |cursor_x, viewport_width| {
+            record_surface_input(InputSurface::Other);
+            controller
+                .lock()
+                .unwrap()
+                .host_memory_cap_cursor_moved(cursor_x, viewport_width);
+            if let Some(app) = app_weak.upgrade() {
+                push_performance(&app, &controller, Some(EditedCap::HostMemory));
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_performance_vram_cap_cursor_moved({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |cursor_x, viewport_width| {
+            record_surface_input(InputSurface::Other);
+            controller
+                .lock()
+                .unwrap()
+                .vram_cap_cursor_moved(cursor_x, viewport_width);
+            if let Some(app) = app_weak.upgrade() {
+                push_performance(&app, &controller, Some(EditedCap::Vram));
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });
@@ -3031,7 +3210,7 @@ pub fn install(
             let open = controller.lock().unwrap().review_crashes();
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
-                app.set_settings_section("diagnostics".into());
+                app.set_settings_section(SettingsSection::Diagnostics.slug().into());
                 push_crash_notice(&app, &controller);
                 push_diagnostics_view(&app, &controller);
                 direct_publication_scope(InputSurface::Other);

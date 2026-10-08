@@ -18,7 +18,7 @@ use focusforge_gpu::device::SharedDevice;
 #[cfg(feature = "gpu-tests")]
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gui::canvas::PaneSource;
-use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
+use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
 /// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
@@ -2863,6 +2863,10 @@ fn diagnostics_destination_field_scrolls_to_keep_cursor_visible() {
         "the cursor must land back inside the visible width after scrolling left: cursor 2 + offset {offset}"
     );
 
+    // The cursor at the very start never pushes the text right of its origin.
+    controller.diagnostics_destination_cursor_moved(0.0, 100.0);
+    assert_eq!(controller.diagnostics_destination_scroll_offset(), 0.0);
+
     // A cursor that is already inside the visible width leaves the offset
     // untouched.
     let mut steady = AppController::new();
@@ -2992,6 +2996,43 @@ fn crash_notice_timeout_reports_nothing() {
         "the evidence must still be pending after a timeout"
     );
     assert_eq!(after.crash_notice_count(), count_before);
+}
+
+#[test]
+fn settings_section_slugs_round_trip() {
+    let mut slugs = Vec::new();
+    for section in SettingsSection::ALL {
+        assert_eq!(SettingsSection::from_slug(section.slug()), Some(section));
+        slugs.push(section.slug());
+    }
+    let distinct: std::collections::HashSet<_> = slugs.iter().collect();
+    assert_eq!(distinct.len(), SettingsSection::ALL.len(), "{slugs:?}");
+    assert_eq!(
+        slugs,
+        [
+            "performance",
+            "storage",
+            "input-map",
+            "diagnostics",
+            "about"
+        ]
+    );
+
+    for refused in ["general", "", "nope", "Diagnostics", "About"] {
+        assert_eq!(
+            SettingsSection::from_slug(refused),
+            None,
+            "{refused:?} must not fall back to a section"
+        );
+    }
+}
+
+#[test]
+fn settings_open_on_performance_by_default() {
+    assert_eq!(SettingsSection::default(), SettingsSection::Performance);
+    let mut controller = AppController::new();
+    assert!(controller.open_settings());
+    assert_eq!(controller.settings_section(), SettingsSection::Performance);
 }
 
 #[test]
@@ -3378,7 +3419,6 @@ const ALT: Modifiers = Modifiers {
 /// Binds `Alt + Wheel` to the brush softness in editor mode; the shipped
 /// table leaves softness without a wheel binding.
 fn bind_softness_to_alt_wheel(controller: &mut AppController) {
-    use focusforge_gui::input_config::Provenance;
     use focusforge_gui::input_map::{Action, Binding, InputTable, Trigger};
     let mut table = InputTable::default();
     table.bindings.push(Binding {
@@ -3386,7 +3426,7 @@ fn bind_softness_to_alt_wheel(controller: &mut AppController) {
         stacking: None,
         editor: Some(Action::BrushSoftness),
     });
-    controller.install_input_table(table, Provenance::Defaults);
+    controller.install_input_table(table);
 }
 
 /// The active tab's whole fused map.
@@ -7998,5 +8038,425 @@ fn strokes_on_a_reopened_project_show_the_saved_render() {
     assert!(
         shown == reread.expected(&strokes, info),
         "the live view differs from the reference blend"
+    );
+}
+
+// The two tests below read process-wide GPU state through the accessors that
+// never open an adapter. No test in this binary runs a GPU fuse, so neither
+// depends on the other's order.
+
+#[test]
+fn performance_readout_does_not_probe() {
+    let controller = AppController::new();
+    let view = controller.performance_view();
+    assert!(
+        focusforge_gpu::harness::settled_backend().is_none(),
+        "building the view must not bring a backend up"
+    );
+    assert_eq!(view.vram_budget, performance_settings::NOT_PROBED);
+    assert_eq!(view.backend, "");
+    assert!(view.host_budget.ends_with("iB"), "{}", view.host_budget);
+    assert!(view.vram_cap.enabled && view.gpu_enabled);
+    assert_eq!(view.note, "");
+}
+
+#[test]
+fn performance_vram_cap_pending_note() {
+    use focusforge_core::algorithm::AlignAlgorithm;
+
+    let config = tempfile::tempdir().unwrap();
+    let mut controller = controller_with_scratch("performance_vram_note");
+    open_mantis64_tab(&mut controller, "performance_vram_note", 2);
+    controller.install_recent(Vec::new(), config.path().to_path_buf());
+
+    controller.set_vram_cap("1GiB");
+    assert_eq!(controller.performance_view().note, "");
+    assert_eq!(
+        controller.job_request_for(0).unwrap().max_vram,
+        Some(1 << 30),
+        "an edit before the cap settles reaches the next run"
+    );
+
+    let (lazy, _) = focusforge_gpu::harness::align_backend_for(
+        focusforge_core::align::PyramidalEcc.id(),
+        false,
+        None,
+        |_| {},
+    );
+    assert!(lazy.is_some());
+    assert!(focusforge_gpu::harness::vram_cap_settled());
+    assert!(focusforge_gpu::harness::settled_backend().is_none());
+
+    controller.set_vram_cap("2GiB");
+    assert_eq!(
+        controller.performance_view().note,
+        performance_settings::VRAM_PENDING_NOTE
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(2 << 30),
+        "the edit is saved for the next launch"
+    );
+
+    controller.set_vram_cap("8G");
+    let view = controller.performance_view();
+    assert_eq!(
+        (view.vram_cap.text.as_str(), view.vram_cap.invalid),
+        ("8G", true)
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(2 << 30),
+        "text that does not parse leaves the stored cap"
+    );
+}
+
+#[test]
+fn performance_cap_field_scrolls_to_keep_the_cursor_visible() {
+    let mut controller = AppController::new();
+    let offsets = |controller: &AppController| {
+        let view = controller.performance_view();
+        (view.host_cap.scroll_offset, view.vram_cap.scroll_offset)
+    };
+    assert_eq!(
+        offsets(&controller),
+        (0.0, 0.0),
+        "a fresh view is unscrolled"
+    );
+
+    controller.host_memory_cap_cursor_moved(140.0, 100.0);
+    let (host, vram) = offsets(&controller);
+    assert!(
+        (0.0..=100.0).contains(&(140.0 + host)) && host < 0.0,
+        "the cursor lands back inside the field, got offset {host}"
+    );
+    assert_eq!(vram, 0.0, "the other field stays where it was");
+
+    controller.vram_cap_cursor_moved(150.0, 120.0);
+    let (host_after, vram) = offsets(&controller);
+    assert_eq!(host_after, host, "the host field keeps its own offset");
+    assert!((0.0..=120.0).contains(&(150.0 + vram)) && vram < 0.0);
+
+    controller.host_memory_cap_cursor_moved(0.0, 100.0);
+    controller.vram_cap_cursor_moved(0.0, 120.0);
+    assert_eq!(
+        offsets(&controller),
+        (0.0, 0.0),
+        "the cursor back at the start shows the start, never right of it"
+    );
+}
+
+use focusforge_gui::{StoragePath, StorageTone, StorageView, storage_view};
+
+/// A `<root>/focusforge`-shaped config and data directory pair under `root`.
+fn storage_dirs(root: &Path) -> (PathBuf, PathBuf) {
+    (root.join("config/focusforge"), root.join("data/focusforge"))
+}
+
+#[test]
+fn storage_view_shows_the_four_locations() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, data) = storage_dirs(root.path());
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("settings.toml"), "").unwrap();
+    fs::create_dir_all(data.join("logs")).unwrap();
+    let scratch = data.join("scratch");
+
+    let view = storage_view(Some(&config), Some(&data), &scratch, None);
+    let shown = |row: &StoragePath| (row.path.clone(), row.missing, row.available);
+    assert_eq!(
+        shown(&view.settings_file),
+        (
+            config.join("settings.toml").display().to_string(),
+            false,
+            true
+        )
+    );
+    assert_eq!(
+        shown(&view.logs),
+        (data.join("logs").display().to_string(), false, true)
+    );
+    assert_eq!(
+        shown(&view.crashes),
+        (data.join("crashes").display().to_string(), true, true),
+        "an absent directory is marked missing"
+    );
+    assert_eq!(
+        shown(&view.scratch),
+        (scratch.display().to_string(), true, true)
+    );
+
+    // Other directories give other rows: nothing is remembered between calls.
+    let (config2, data2) = storage_dirs(&root.path().join("second"));
+    let view2 = storage_view(Some(&config2), Some(&data2), &data2.join("scratch"), None);
+    assert_eq!(
+        view2.settings_file.path,
+        config2.join("settings.toml").display().to_string()
+    );
+    assert_eq!(view2.logs.path, data2.join("logs").display().to_string());
+    assert!(view2.logs.missing && view2.settings_file.missing);
+}
+
+#[test]
+fn storage_view_takes_its_rows_from_the_installed_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, data) = storage_dirs(&root.path().join("installed-marker"));
+    let mut controller = AppController::new();
+    controller.install_recent(Vec::new(), config.clone());
+    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_scratch_root_for_test(data.join("scratch"));
+
+    let view = controller.storage_view();
+    for (row, leaf) in [
+        (&view.settings_file, "settings.toml"),
+        (&view.logs, "logs"),
+        (&view.crashes, "crashes"),
+        (&view.scratch, "scratch"),
+    ] {
+        assert!(row.available, "{leaf} resolved");
+        assert!(
+            row.path.contains("installed-marker") && row.path.ends_with(leaf),
+            "{leaf} row shows {:?}",
+            row.path
+        );
+    }
+}
+
+#[test]
+fn storage_view_without_directories() {
+    let fallback = std::env::temp_dir().join("focusforge-scratch");
+    let none = storage_view(None, None, &fallback, None);
+    for row in [&none.settings_file, &none.logs, &none.crashes] {
+        assert!(
+            !row.available && row.path.is_empty() && !row.missing,
+            "{row:?}"
+        );
+    }
+    assert!(none.scratch.available);
+    assert_eq!(none.scratch.path, fallback.display().to_string());
+
+    let root = tempfile::tempdir().unwrap();
+    let (config, data) = storage_dirs(root.path());
+    let no_data = storage_view(Some(&config), None, &fallback, None);
+    assert!(no_data.settings_file.available);
+    assert!(!no_data.logs.available && !no_data.crashes.available);
+
+    let no_config = storage_view(None, Some(&data), &fallback, None);
+    assert!(!no_config.settings_file.available);
+    assert!(no_config.logs.available && no_config.crashes.available);
+}
+
+#[test]
+fn storage_view_abbreviates_the_home_directory() {
+    let home = Path::new("/home/someone");
+    let config = home.join(".config/focusforge");
+    let data = Path::new("/srv/data/focusforge");
+    let scratch = home.join(".local/scratch");
+    let view = storage_view(Some(&config), Some(data), &scratch, Some(home));
+    assert_eq!(
+        view.settings_file.path,
+        "~/.config/focusforge/settings.toml"
+    );
+    assert_eq!(view.scratch.path, "~/.local/scratch");
+    assert_eq!(
+        view.logs.path, "/srv/data/focusforge/logs",
+        "a path outside the home directory stays absolute"
+    );
+
+    let sibling = storage_view(None, None, Path::new("/home/someone2/scratch"), Some(home));
+    assert_eq!(
+        sibling.scratch.path, "/home/someone2/scratch",
+        "a sibling directory sharing the home name's prefix is not under it"
+    );
+    let at_home = storage_view(None, None, home, Some(home));
+    assert_eq!(at_home.scratch.path, "~");
+}
+
+/// Writes one stage-cache entry file under `<scratch>/stage-cache/<stage>/`.
+fn seed_stage_entry(scratch: &Path, stage: &str, name: &str) {
+    let dir = scratch.join("stage-cache").join(stage);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), b"{}").unwrap();
+}
+
+/// A file in each scratch sibling the clear must leave alone.
+fn seed_scratch_siblings(scratch: &Path) -> Vec<PathBuf> {
+    ["resume", "projects", "planes"]
+        .into_iter()
+        .map(|dir| {
+            let sentinel = scratch.join(dir).join("sentinel");
+            fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+            fs::write(&sentinel, b"keep").unwrap();
+            sentinel
+        })
+        .collect()
+}
+
+fn storage_status(controller: &AppController) -> (String, StorageTone) {
+    let view: StorageView = controller.storage_view();
+    (view.status, view.status_tone)
+}
+
+#[test]
+fn storage_clear_removes_only_stage_entries() {
+    let scratch = tempfile::tempdir().unwrap();
+    let scratch = scratch.path();
+    seed_stage_entry(scratch, "align", "0123456789abcdef.json");
+    seed_stage_entry(scratch, "align", "fedcba9876543210.json");
+    seed_stage_entry(scratch, "other", "00000000000000aa.json");
+    let sentinels = seed_scratch_siblings(scratch);
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.to_path_buf());
+    controller.clear_stage_cache();
+
+    assert_eq!(
+        storage_status(&controller),
+        ("Cleared 3 stage entries.".to_string(), StorageTone::Success)
+    );
+    assert!(
+        fs::read_dir(scratch.join("stage-cache"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "no stage entry directory is left"
+    );
+    for sentinel in &sentinels {
+        assert!(sentinel.exists(), "{} was removed", sentinel.display());
+    }
+
+    seed_stage_entry(scratch, "align", "0123456789abcdef.json");
+    controller.clear_stage_cache();
+    assert_eq!(storage_status(&controller).0, "Cleared 1 stage entry.");
+}
+
+#[test]
+fn storage_clear_on_an_empty_scratch_root() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.path().to_path_buf());
+    assert!(!scratch.path().join("stage-cache").exists());
+
+    controller.clear_stage_cache();
+
+    assert_eq!(
+        storage_status(&controller),
+        ("Cleared 0 stage entries.".to_string(), StorageTone::Success)
+    );
+}
+
+#[test]
+fn storage_clear_is_refused_while_a_run_is_live() {
+    let scratch = common::tree("storage_refused_scratch");
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.clone());
+    seed_stage_entry(&scratch, "align", "0123456789abcdef.json");
+    let sentinels = seed_scratch_siblings(&scratch);
+    assert_eq!(
+        storage_status(&controller),
+        (String::new(), StorageTone::None),
+        "nothing to report before any clear"
+    );
+    assert!(controller.storage_view().clear_enabled);
+
+    open_mantis64_tab(&mut controller, "storage_refused_a", 2);
+    open_mantis64_tab(&mut controller, "storage_refused_b", 2);
+    controller.select_project(0);
+    assert!(controller.start_fuse());
+    controller.select_project(1);
+    assert!(!controller.job_running(), "the front tab holds no run");
+    assert!(controller.any_job_running(), "a background tab does");
+
+    let view = controller.storage_view();
+    assert!(!view.clear_enabled);
+    assert_eq!(
+        (view.status.as_str(), view.status_tone),
+        ("A run is active.", StorageTone::Warning)
+    );
+    controller.clear_stage_cache();
+    assert!(
+        scratch
+            .join("stage-cache/align/0123456789abcdef.json")
+            .exists(),
+        "the refused call removed an entry"
+    );
+    for sentinel in &sentinels {
+        assert!(sentinel.exists());
+    }
+    assert_eq!(
+        controller.storage_view().status_tone,
+        StorageTone::Warning,
+        "a refused call reports no result"
+    );
+
+    settle_all(&mut controller);
+    let view = controller.storage_view();
+    assert!(view.clear_enabled, "the button is enabled again");
+    assert_eq!(
+        (view.status.as_str(), view.status_tone),
+        ("", StorageTone::None)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_clear_failure_is_the_status_line() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restores the directory's write bit so the temp dir can be removed
+    /// even when an assertion fails.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    let scratch = tempfile::tempdir().unwrap();
+    seed_stage_entry(scratch.path(), "align", "0123456789abcdef.json");
+    let stage_cache = scratch.path().join("stage-cache");
+    let _restore = Restore(stage_cache.clone());
+    fs::set_permissions(&stage_cache, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(stage_cache.join(".probe"), b"").is_ok() {
+        eprintln!("skipping: this filesystem does not enforce directory permissions");
+        return;
+    }
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.path().to_path_buf());
+    let rows_before = controller.storage_view();
+    controller.clear_stage_cache();
+
+    let (status, tone) = storage_status(&controller);
+    assert_eq!(tone, StorageTone::Failure);
+    assert_eq!(status, "Could not clear the cache: Permission denied.");
+    assert!(
+        !status.contains(scratch.path().to_str().unwrap()),
+        "the line names no path"
+    );
+    let rows_after = controller.storage_view();
+    assert_eq!(rows_after.settings_file, rows_before.settings_file);
+    assert_eq!(rows_after.scratch, rows_before.scratch);
+    assert!(rows_after.clear_enabled, "the controller keeps working");
+}
+
+/// A cause that is not a permission error reads the same way: the io text
+/// without its `(os error N)` tail, ending in one period.
+#[cfg(unix)]
+#[test]
+fn storage_clear_failure_line_names_the_cause_without_the_os_error_code() {
+    let scratch = tempfile::tempdir().unwrap();
+    fs::write(scratch.path().join("stage-cache"), b"not a directory").unwrap();
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.path().to_path_buf());
+    controller.clear_stage_cache();
+
+    assert_eq!(
+        storage_status(&controller),
+        (
+            "Could not clear the cache: File exists.".to_string(),
+            StorageTone::Failure
+        )
     );
 }

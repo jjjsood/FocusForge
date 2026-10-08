@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A vertical rail of selectable entries over the base ground, closed on its
+// right edge by a 1 px rule.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFNavRail inherits Rectangle {
+    // Height of a header drawn over the rail's top: the right rule and the
+    // first entry start below it.
+    in property <length> header-inset: 0px;
+
+    width: ShellGeometry.settings-rail-width;
+    background: Theme.surface-base;
+
+    VerticalLayout {
+        padding-top: root.header-inset + ShellGeometry.settings-rail-top-inset;
+        spacing: 0px;
+        alignment: start;
+
+        @children
+    }
+
+    Rectangle {
+        x: parent.width - self.width;
+        y: root.header-inset;
+        width: 1px;
+        height: parent.height - root.header-inset;
+        background: Theme.border-default;
+    }
+}
