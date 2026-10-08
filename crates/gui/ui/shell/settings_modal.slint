@@ -14,7 +14,8 @@ import { FFDiagnosticsPanel, FFManifestRow } from "settings_modal/diagnostics_pa
 import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
 import { FFPerformanceTab, PerformanceCap, PerformanceState } from "settings_modal/performance_tab.slint";
 import { FFStorageTab, StoragePathState, StorageState } from "settings_modal/storage_tab.slint";
-export { FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+import { AboutState, FFAboutTab } from "settings_modal/about_tab.slint";
+export { AboutState, FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
@@ -32,6 +33,8 @@ export component FFSettingsModal inherits FFModalPanel {
 
     in property <StorageState> storage;
     callback storage-clear-requested();
+
+    in property <AboutState> about;
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -88,6 +91,12 @@ export component FFSettingsModal inherits FFModalPanel {
             icon-source: @image-url("../../../../assets/icons/triangle-alert.svg");
             selected: root.settings-section == "diagnostics";
             clicked => { root.settings-section-selected("diagnostics"); }
+        }
+        FFNavRailEntry {
+            label: "About";
+            icon-source: @image-url("../../../../assets/icons/info.svg");
+            selected: root.settings-section == "about";
+            clicked => { root.settings-section-selected("about"); }
         }
     }
 
@@ -165,6 +174,12 @@ export component FFSettingsModal inherits FFModalPanel {
 
         if root.settings-section == "input-map": FFInputMapTab {
             input-rows: root.input-rows;
+        }
+
+        if root.settings-section == "about": FFAboutTab {
+            width: 100%;
+            height: 100%;
+            about: root.about;
         }
     }
 }

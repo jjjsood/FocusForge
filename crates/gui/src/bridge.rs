@@ -35,10 +35,11 @@ use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
 use crate::generated::{
-    AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
-    FFManifestRow, ImageRowView as GeneratedImageRow, PerformanceCap, PerformanceState,
-    ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
-    SectionHeadView, SettingsRow as GeneratedSettingsRow, StoragePathState, StorageState,
+    AboutState, AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow,
+    ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow, PerformanceCap,
+    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    StoragePathState, StorageState,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -1450,6 +1451,19 @@ pub fn push_storage_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>
         clear_enabled: view.clear_enabled,
         status: view.status.into(),
         status_tone: view.status_tone.as_str().into(),
+    });
+}
+
+/// Pushes the About tab's view into the window: the build's version and
+/// repository, the repository shown without its scheme.
+pub fn push_about_view(app: &AppWindow) {
+    let repository = env!("CARGO_PKG_REPOSITORY");
+    app.set_about(AboutState {
+        version: env!("CARGO_PKG_VERSION").into(),
+        source: repository
+            .strip_prefix("https://")
+            .unwrap_or(repository)
+            .into(),
     });
 }
 

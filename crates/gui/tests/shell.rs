@@ -495,6 +495,27 @@ fn ui_source(relative: &str) -> String {
     common::strip_line_comments(&fs::read_to_string(common::ui_dir().join(relative)).unwrap())
 }
 
+/// A row's text can take the accent colour, and the component sheet draws
+/// that tone, a wrapped paragraph and the 6 px gap between paragraphs.
+#[test]
+fn row_text_accent_and_paragraph_gap_are_on_the_sheet() {
+    let row_text = ui_source("components/ff_row_text.slint");
+    assert!(row_text.contains("in property <bool> accent: false;"));
+    assert!(row_text.contains("Theme.accent-default"));
+
+    let geometry = ui_source("geometry.slint");
+    assert!(geometry.contains("settings-paragraph-gap: 6px;"));
+
+    let sheet = ui_source("theme_sheet.slint");
+    for needle in [
+        "accent: true;",
+        "wrap: word-wrap;",
+        "spacing: ShellGeometry.settings-paragraph-gap;",
+    ] {
+        assert!(sheet.contains(needle), "the sheet does not draw {needle:?}");
+    }
+}
+
 /// The Diagnostics tab is layout over shared components: its heading, rows
 /// and status lines are the shared section, row and status text, it styles
 /// nothing itself, its footer sizes nothing, and its message elides to one
@@ -602,11 +623,12 @@ fn settings_path_row_elides_its_path_and_marks_an_unresolved_location() {
 
 /// Tab component each section renders, by slug. Every other tab component is
 /// absent while a section is selected.
-const SETTINGS_TABS: [(&str, &str); 4] = [
+const SETTINGS_TABS: [(&str, &str); 5] = [
     ("performance", "FFPerformanceTab"),
     ("storage", "FFStorageTab"),
     ("input-map", "FFInputMapTab"),
     ("diagnostics", "FFDiagnosticsPanel"),
+    ("about", "FFAboutTab"),
 ];
 
 /// The rail's entries top to bottom. A component's root element is reported
@@ -657,7 +679,16 @@ fn settings_open_with_performance_selected() {
         .iter()
         .map(|entry| entry.accessible_checked())
         .collect();
-    assert_eq!(checked, [Some(true), Some(false), Some(false), Some(false)]);
+    assert_eq!(
+        checked,
+        [
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(false)
+        ]
+    );
 }
 
 /// The rail carries one entry per live section, in `SettingsSection::ALL`
@@ -686,7 +717,13 @@ fn settings_nav_rail_lists_only_live_sections() {
             .collect();
         assert_eq!(
             labels,
-            ["Performance", "Storage", "Input map", "Diagnostics"],
+            [
+                "Performance",
+                "Storage",
+                "Input map",
+                "Diagnostics",
+                "About"
+            ],
             "from {start}"
         );
         assert_eq!(labels.len(), slugs.len());
@@ -699,7 +736,7 @@ fn settings_nav_rail_lists_only_live_sections() {
     }
 
     for (path, code) in settings_slint_sources() {
-        assert!(!code.contains("General"), "{path} names a General tab");
+        assert!(!code.contains("\"General\""), "{path} names a General tab");
     }
     let entry =
         fs::read_to_string(common::ui_dir().join("components/ff_nav_rail_entry.slint")).unwrap();
@@ -810,6 +847,7 @@ fn settings_tabs_render_from_their_own_files() {
         ("storage_tab.slint", "FFStorageTab"),
         ("input_map_tab.slint", "FFInputMapTab"),
         ("diagnostics_panel.slint", "FFDiagnosticsPanel"),
+        ("about_tab.slint", "FFAboutTab"),
     ] {
         let code = common::strip_line_comments(&fs::read_to_string(tabs.join(file)).unwrap());
         assert!(
@@ -2185,5 +2223,122 @@ fn performance_cap_entry_scrolls_to_follow_the_cursor() {
             rest,
             "field {field}: Home shows the start of the entry again"
         );
+    }
+}
+
+// --- About tab -------------------------------------------------------------
+
+const ABOUT_REDISTRIBUTE: &str = "FocusForge is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License.";
+const ABOUT_WARRANTY: &str = "This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full license text.";
+
+fn about_window() -> AppWindow {
+    let app = app_at(1440, 900);
+    focusforge_gui::bridge::push_about_view(&app);
+    app.set_settings_open(true);
+    app.set_settings_section("about".into());
+    app
+}
+
+/// The text the About tab draws, one string per line of the tab: a row is its
+/// label and value joined by ` | `, a heading or paragraph stands alone.
+fn about_rows(app: &AppWindow) -> Vec<String> {
+    let tab = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    let mut texts: Vec<(f32, f32, String)> = Vec::new();
+    for handle in tab
+        .query_descendants()
+        .match_accessible_role(AccessibleRole::Text)
+        .find_all()
+    {
+        let pos = handle.absolute_position();
+        if texts.iter().all(|(x, y, _)| (*x, *y) != (pos.x, pos.y)) {
+            let label = handle.accessible_label().unwrap_or_default().to_string();
+            texts.push((pos.x, pos.y, label));
+        }
+    }
+    texts.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut lines: Vec<(f32, Vec<(f32, String)>)> = Vec::new();
+    for (x, y, label) in texts {
+        match lines.last_mut() {
+            Some((top, line)) if y - *top < 8.0 => line.push((x, label)),
+            _ => lines.push((y, vec![(x, label)])),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(_, mut line)| {
+            line.sort_by(|a, b| a.0.total_cmp(&b.0));
+            line.into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect()
+}
+
+/// The version and the source come from the build, the licence and the notice
+/// are fixed text; a state set from outside is drawn as given, so neither
+/// build value is a literal in the tab.
+#[test]
+fn about_tab_shows_the_build_metadata() {
+    let app = about_window();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let rows = about_rows(&app);
+    let (source_row, rest) = rows.split_last().expect("the tab draws rows");
+    let source = source_row
+        .strip_prefix("Source | ")
+        .expect("the last row is Source");
+    assert!(!source.is_empty());
+    assert_eq!(
+        format!("https://{source}"),
+        env!("CARGO_PKG_REPOSITORY"),
+        "the source is the repository without its scheme"
+    );
+    let notice = |version: &str| -> Vec<String> {
+        vec![
+            "FOCUSFORGE".to_string(),
+            format!("Version | {version}"),
+            "License | GPL-3.0".to_string(),
+            "NOTICE".to_string(),
+            "Copyright © 2026 Johannes Sood".to_string(),
+            ABOUT_REDISTRIBUTE.to_string(),
+            ABOUT_WARRANTY.to_string(),
+        ]
+    };
+    assert_eq!(rest, notice(version));
+
+    app.set_about(focusforge_gui::AboutState {
+        version: "9.9.9".into(),
+        source: "example.org/x".into(),
+    });
+    let rows = about_rows(&app);
+    let (source_row, rest) = rows.split_last().unwrap();
+    assert_eq!(source_row, "Source | example.org/x");
+    assert_eq!(rest, notice("9.9.9"));
+}
+
+/// The tab is layout over shared components: its sections, rows and texts are
+/// the shared ones, and it styles nothing itself.
+#[test]
+fn about_tab_composes_only_shared_components() {
+    let tab = ui_source("shell/settings_modal/about_tab.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "Theme.status-",
+        "Theme.text-",
+        "Theme.surface-",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle:?}");
+    }
+    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFRowText {"] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
 }

@@ -22,8 +22,8 @@ export { ComparisonWindow }
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
-import { FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
-export { InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
@@ -550,6 +550,8 @@ export component AppWindow inherits Window {
     in property <StorageState> storage;
     callback storage-clear-requested();
 
+    in property <AboutState> about;
+
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
     in property <bool> diagnostics-include-minidumps: false;
@@ -698,6 +700,7 @@ export component AppWindow inherits Window {
         settings-section: root.settings-section;
         performance: root.performance;
         storage: root.storage;
+        about: root.about;
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;
         diagnostics-include-minidumps: root.diagnostics-include-minidumps;

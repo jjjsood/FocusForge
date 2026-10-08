@@ -488,6 +488,52 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Settings: row text, plain / muted / accent"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "ROW TEXT";
+                FFSettingsRow {
+                    label: "Plain";
+                    FFRowText { text: "12 files"; }
+                }
+                FFSettingsRow {
+                    label: "Muted";
+                    FFRowText { text: "Unavailable"; muted: true; }
+                }
+                FFSettingsRow {
+                    label: "Accent";
+                    divider: false;
+                    FFRowText { text: "example.org/project"; accent: true; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: wrapped paragraphs 6 px apart, then a Source row with an accent value and no rule"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "NOTICE";
+
+                VerticalLayout {
+                    spacing: ShellGeometry.settings-paragraph-gap;
+
+                    FFRowText { text: "Copyright © 2026 Johannes Sood"; wrap: word-wrap; }
+                    FFRowText {
+                        text: "FocusForge is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License.";
+                        wrap: word-wrap;
+                    }
+                    FFRowText {
+                        text: "This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full license text.";
+                        wrap: word-wrap;
+                    }
+                    FFSettingsRow {
+                        label: "Source";
+                        divider: false;
+                        FFRowText { text: "example.org/project"; accent: true; }
+                    }
+                }
+            }
+        }
+
         GroupHeading { text: "Input table: header, one-line row, wrapped row, last row without rule"; }
         SettingsGround {
             FFInputTableRow {

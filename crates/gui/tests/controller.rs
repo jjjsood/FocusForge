@@ -3009,10 +3009,16 @@ fn settings_section_slugs_round_trip() {
     assert_eq!(distinct.len(), SettingsSection::ALL.len(), "{slugs:?}");
     assert_eq!(
         slugs,
-        ["performance", "storage", "input-map", "diagnostics"]
+        [
+            "performance",
+            "storage",
+            "input-map",
+            "diagnostics",
+            "about"
+        ]
     );
 
-    for refused in ["general", "", "nope", "Diagnostics"] {
+    for refused in ["general", "", "nope", "Diagnostics", "About"] {
         assert_eq!(
             SettingsSection::from_slug(refused),
             None,

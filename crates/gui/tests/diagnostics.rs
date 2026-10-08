@@ -92,7 +92,13 @@ fn live_slugs() -> Vec<&'static str> {
         .collect();
     assert_eq!(
         slugs,
-        ["performance", "storage", "input-map", "diagnostics"]
+        [
+            "performance",
+            "storage",
+            "input-map",
+            "diagnostics",
+            "about"
+        ]
     );
     slugs
 }

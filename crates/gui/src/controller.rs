@@ -81,15 +81,17 @@ pub enum SettingsSection {
     Storage,
     InputMap,
     Diagnostics,
+    About,
 }
 
 impl SettingsSection {
     /// Every section, in nav-rail order.
-    pub const ALL: [SettingsSection; 4] = [
+    pub const ALL: [SettingsSection; 5] = [
         SettingsSection::Performance,
         SettingsSection::Storage,
         SettingsSection::InputMap,
         SettingsSection::Diagnostics,
+        SettingsSection::About,
     ];
 
     /// The section's slug: lowercase, hyphen-separated.
@@ -99,6 +101,7 @@ impl SettingsSection {
             SettingsSection::Storage => "storage",
             SettingsSection::InputMap => "input-map",
             SettingsSection::Diagnostics => "diagnostics",
+            SettingsSection::About => "about",
         }
     }
 
