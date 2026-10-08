@@ -10,7 +10,7 @@ Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
-  window, the dock's `Images` panel and the four-section `Settings` panel, running and controlling
+  window, the dock's `Images` panel and the four-section `Settings` panel, the five-tab settings window, running and controlling
   a fuse, saving the held result, exporting an image, switching between open
   projects and the settings file
 - [`guide/stacking.md`](guide/stacking.md) — stacking TIFF or supported RAW
