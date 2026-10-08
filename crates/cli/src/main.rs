@@ -20,7 +20,6 @@ use serde::Serialize;
 
 mod algorithms;
 mod align;
-mod bytes;
 mod diagnostics;
 mod export;
 #[cfg(feature = "gpu")]
@@ -188,7 +187,7 @@ enum Command {
         #[arg(
             long = "max-host-memory",
             value_name = "SIZE",
-            value_parser = crate::bytes::parse_byte_size
+            value_parser = focusforge_core::bytes::parse_byte_size
         )]
         max_host_memory: Option<u64>,
         /// A **ceiling only** on the adaptive device (VRAM) budget: it can
@@ -200,7 +199,7 @@ enum Command {
         #[arg(
             long = "max-vram",
             value_name = "SIZE",
-            value_parser = crate::bytes::parse_byte_size
+            value_parser = focusforge_core::bytes::parse_byte_size
         )]
         max_vram: Option<u64>,
         /// Read parameter values from a TOML preset: the `algo` and
@@ -340,7 +339,7 @@ enum Command {
         #[arg(
             long = "max-host-memory",
             value_name = "SIZE",
-            value_parser = crate::bytes::parse_byte_size
+            value_parser = focusforge_core::bytes::parse_byte_size
         )]
         max_host_memory: Option<u64>,
         /// A **ceiling only** on the adaptive device (VRAM) budget, for the
@@ -352,7 +351,7 @@ enum Command {
         #[arg(
             long = "max-vram",
             value_name = "SIZE",
-            value_parser = crate::bytes::parse_byte_size
+            value_parser = focusforge_core::bytes::parse_byte_size
         )]
         max_vram: Option<u64>,
         /// Print no progress at all. `align` has no fuse-tile units to

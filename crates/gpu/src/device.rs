@@ -313,6 +313,12 @@ pub fn shared_device() -> Result<&'static SharedDevice, &'static GpuError> {
     SHARED.get_or_init(init).as_ref()
 }
 
+/// The process-wide device if a caller already initialised it; never
+/// initialises it.
+pub(crate) fn settled_device() -> Option<Result<&'static SharedDevice, &'static GpuError>> {
+    SHARED.get().map(Result::as_ref)
+}
+
 /// `shared_device()`, but on failure prints `SKIP: no usable GPU adapter --
 /// <error>` and returns `None` instead of propagating the error -- the one
 /// place a test learns there is no GPU. Tests call this and `return` early so

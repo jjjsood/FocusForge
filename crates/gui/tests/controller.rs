@@ -18,7 +18,7 @@ use focusforge_gpu::device::SharedDevice;
 #[cfg(feature = "gpu-tests")]
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gui::canvas::PaneSource;
-use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode};
+use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
 /// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
@@ -2863,6 +2863,10 @@ fn diagnostics_destination_field_scrolls_to_keep_cursor_visible() {
         "the cursor must land back inside the visible width after scrolling left: cursor 2 + offset {offset}"
     );
 
+    // The cursor at the very start never pushes the text right of its origin.
+    controller.diagnostics_destination_cursor_moved(0.0, 100.0);
+    assert_eq!(controller.diagnostics_destination_scroll_offset(), 0.0);
+
     // A cursor that is already inside the visible width leaves the offset
     // untouched.
     let mut steady = AppController::new();
@@ -3003,6 +3007,7 @@ fn settings_section_slugs_round_trip() {
     }
     let distinct: std::collections::HashSet<_> = slugs.iter().collect();
     assert_eq!(distinct.len(), SettingsSection::ALL.len(), "{slugs:?}");
+    assert_eq!(slugs, ["performance", "input-map", "diagnostics"]);
 
     for refused in ["general", "", "nope", "Diagnostics"] {
         assert_eq!(
@@ -3011,6 +3016,14 @@ fn settings_section_slugs_round_trip() {
             "{refused:?} must not fall back to a section"
         );
     }
+}
+
+#[test]
+fn settings_open_on_performance_by_default() {
+    assert_eq!(SettingsSection::default(), SettingsSection::Performance);
+    let mut controller = AppController::new();
+    assert!(controller.open_settings());
+    assert_eq!(controller.settings_section(), SettingsSection::Performance);
 }
 
 #[test]
@@ -8016,5 +8029,110 @@ fn strokes_on_a_reopened_project_show_the_saved_render() {
     assert!(
         shown == reread.expected(&strokes, info),
         "the live view differs from the reference blend"
+    );
+}
+
+// The two tests below read process-wide GPU state through the accessors that
+// never open an adapter. No test in this binary runs a GPU fuse, so neither
+// depends on the other's order.
+
+#[test]
+fn performance_readout_does_not_probe() {
+    let controller = AppController::new();
+    let view = controller.performance_view();
+    assert!(
+        focusforge_gpu::harness::settled_backend().is_none(),
+        "building the view must not bring a backend up"
+    );
+    assert_eq!(view.vram_budget, performance_settings::NOT_PROBED);
+    assert_eq!(view.backend, "");
+    assert!(view.host_budget.ends_with("iB"), "{}", view.host_budget);
+    assert!(view.vram_cap.enabled && view.gpu_enabled);
+    assert_eq!(view.note, "");
+}
+
+#[test]
+fn performance_vram_cap_pending_note() {
+    use focusforge_core::algorithm::AlignAlgorithm;
+
+    let config = tempfile::tempdir().unwrap();
+    let mut controller = controller_with_scratch("performance_vram_note");
+    open_mantis64_tab(&mut controller, "performance_vram_note", 2);
+    controller.install_recent(Vec::new(), config.path().to_path_buf());
+
+    controller.set_vram_cap("1GiB");
+    assert_eq!(controller.performance_view().note, "");
+    assert_eq!(
+        controller.job_request_for(0).unwrap().max_vram,
+        Some(1 << 30),
+        "an edit before the cap settles reaches the next run"
+    );
+
+    let (lazy, _) = focusforge_gpu::harness::align_backend_for(
+        focusforge_core::align::PyramidalEcc.id(),
+        false,
+        None,
+        |_| {},
+    );
+    assert!(lazy.is_some());
+    assert!(focusforge_gpu::harness::vram_cap_settled());
+    assert!(focusforge_gpu::harness::settled_backend().is_none());
+
+    controller.set_vram_cap("2GiB");
+    assert_eq!(
+        controller.performance_view().note,
+        performance_settings::VRAM_PENDING_NOTE
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(2 << 30),
+        "the edit is saved for the next launch"
+    );
+
+    controller.set_vram_cap("8G");
+    let view = controller.performance_view();
+    assert_eq!(
+        (view.vram_cap.text.as_str(), view.vram_cap.invalid),
+        ("8G", true)
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(2 << 30),
+        "text that does not parse leaves the stored cap"
+    );
+}
+
+#[test]
+fn performance_cap_field_scrolls_to_keep_the_cursor_visible() {
+    let mut controller = AppController::new();
+    let offsets = |controller: &AppController| {
+        let view = controller.performance_view();
+        (view.host_cap.scroll_offset, view.vram_cap.scroll_offset)
+    };
+    assert_eq!(
+        offsets(&controller),
+        (0.0, 0.0),
+        "a fresh view is unscrolled"
+    );
+
+    controller.host_memory_cap_cursor_moved(140.0, 100.0);
+    let (host, vram) = offsets(&controller);
+    assert!(
+        (0.0..=100.0).contains(&(140.0 + host)) && host < 0.0,
+        "the cursor lands back inside the field, got offset {host}"
+    );
+    assert_eq!(vram, 0.0, "the other field stays where it was");
+
+    controller.vram_cap_cursor_moved(150.0, 120.0);
+    let (host_after, vram) = offsets(&controller);
+    assert_eq!(host_after, host, "the host field keeps its own offset");
+    assert!((0.0..=120.0).contains(&(150.0 + vram)) && vram < 0.0);
+
+    controller.host_memory_cap_cursor_moved(0.0, 100.0);
+    controller.vram_cap_cursor_moved(0.0, 120.0);
+    assert_eq!(
+        offsets(&controller),
+        (0.0, 0.0),
+        "the cursor back at the start shows the start, never right of it"
     );
 }

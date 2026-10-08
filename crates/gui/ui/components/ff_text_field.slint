@@ -3,12 +3,14 @@
 // A text field: `tone` colours the outline for the two states a caller
 // reports (warning, failure); otherwise it is the neutral border. Focus
 // grows the control by 2 px on every edge, like every focusable control.
-// Only height follows state; width is the caller's.
+// Only height follows state; width is the caller's. `placeholder` is muted
+// text drawn only while the input itself is empty; typing replaces it.
 
 import { Theme } from "../theme.slint";
 
 export component FFTextField inherits Rectangle {
     in property <string> text: "";
+    in property <string> placeholder: "";
     in property <bool> enabled: true;
     in property <string> tone: "neutral"; // "neutral" | "warning" | "failure"
     in property <length> field-width: 110px;
@@ -38,6 +40,17 @@ export component FFTextField inherits Rectangle {
     border-color: root.outline;
     opacity: root.enabled ? 1.0 : 0.5;
     clip: true;
+
+    if input.text == "" && root.placeholder != "": Text {
+        x: Theme.space-2;
+        width: root.viewport-width;
+        height: parent.height;
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        vertical-alignment: center;
+        overflow: elide;
+    }
 
     input := TextInput {
         x: Theme.space-2 + root.scroll-offset;

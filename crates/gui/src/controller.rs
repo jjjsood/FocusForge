@@ -37,6 +37,7 @@ use crate::input_map::{
 };
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
+use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
 use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
@@ -76,17 +77,23 @@ pub enum DockTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
     #[default]
+    Performance,
     InputMap,
     Diagnostics,
 }
 
 impl SettingsSection {
     /// Every section, in nav-rail order.
-    pub const ALL: [SettingsSection; 2] = [SettingsSection::InputMap, SettingsSection::Diagnostics];
+    pub const ALL: [SettingsSection; 3] = [
+        SettingsSection::Performance,
+        SettingsSection::InputMap,
+        SettingsSection::Diagnostics,
+    ];
 
     /// The section's slug: lowercase, hyphen-separated.
     pub fn slug(self) -> &'static str {
         match self {
+            SettingsSection::Performance => "performance",
             SettingsSection::InputMap => "input-map",
             SettingsSection::Diagnostics => "diagnostics",
         }
@@ -1623,12 +1630,12 @@ fn field_scroll_margin(viewport_width: f32) -> f32 {
 
 /// The horizontal scroll offset that keeps a cursor at `cursor_x` (measured
 /// from the field's unscrolled left edge) inside `[0, viewport_width]`,
-/// shifting `current_offset` by the least amount needed --
-/// [`AppController::diagnostics_destination_cursor_moved`]'s only helper.
+/// shifting `current_offset` by the least amount needed. The offset is never
+/// positive: the text does not move right of its origin.
 fn clamp_field_scroll(cursor_x: f32, current_offset: f32, viewport_width: f32) -> f32 {
     let margin = field_scroll_margin(viewport_width);
     if cursor_x + current_offset < margin {
-        margin - cursor_x
+        (margin - cursor_x).min(0.0)
     } else if cursor_x + current_offset > viewport_width - margin {
         viewport_width - margin - cursor_x
     } else {
@@ -1670,10 +1677,23 @@ pub struct AppController {
     checkpoint_generation: u64,
     /// The newest generation [`Self::take_checkpoint_flash`] handed out.
     checkpoint_flash_played: u64,
-    /// Whether a fuse run may use the headless GPU backend at all -- `false`
-    /// by default, so a headless test controller never probes an adapter;
-    /// [`main`](crate) turns this on for the real window.
-    gpu_fusion: bool,
+    /// The Performance tab's settings, read by every run this controller
+    /// starts. A controller from [`AppController::new`] has GPU processing
+    /// off, so a headless test never probes an adapter; the window installs
+    /// the loaded value ([`Self::install_performance`]).
+    performance: PerformanceSettings,
+    /// Cap field text that did not parse, shown until the next edit; the
+    /// cap in `performance` stays as it was.
+    rejected_caps: RejectedCaps,
+    /// The VRAM cap was edited after this session's device budget settled,
+    /// so the edit applies from the next launch.
+    vram_pending: bool,
+    /// [`Self::fusion_backend`]'s line from the newest run that settled.
+    last_backend_line: Option<String>,
+    /// How far each Performance cap field's entry is scrolled, kept by
+    /// [`Self::host_memory_cap_cursor_moved`] and [`Self::vram_cap_cursor_moved`].
+    host_cap_scroll_x: f32,
+    vram_cap_scroll_x: f32,
     /// The blend kernel on the display device, handed to every edit session
     /// while the device is attached.
     blender: Option<Blender>,
@@ -1720,6 +1740,7 @@ impl AppController {
     /// window is ever resized.
     pub fn new() -> Self {
         let mut controller = Self::default();
+        controller.performance.gpu = false;
         controller.state.tab_region_width = Self::BASE_TAB_REGION_WIDTH;
         controller
     }
@@ -6508,7 +6529,7 @@ impl AppController {
     /// and a promotion out of the queue both call, so a queued tab's request
     /// is built at the moment it starts rather than at the moment it was
     /// queued. `None` only if `index` no longer names an open tab.
-    fn fuse_request_for(&self, index: usize) -> Option<job::JobRequest> {
+    pub fn job_request_for(&self, index: usize) -> Option<job::JobRequest> {
         let tab = self.state.projects.get(index)?;
         let frames = tab.included_frames();
         let scratch_root = self.scratch_root();
@@ -6526,14 +6547,102 @@ impl AppController {
             align_lax: true,
             crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
             equalize: settings_panel::equalization_bound(&tab.fuse_id, &tab.project_values),
-            gpu: self.gpu_fusion,
+            gpu: self.performance.gpu,
+            max_host_memory: self.performance.max_host_memory_bytes(),
+            max_vram: self.performance.max_vram_bytes(),
         })
     }
 
     /// Turns GPU-backed fusion on or off for every run this controller
-    /// starts from here on -- never mid-run.
+    /// starts from here on -- never mid-run -- and saves the choice when a
+    /// config directory is installed.
     pub fn set_gpu_fusion(&mut self, gpu_fusion: bool) {
-        self.gpu_fusion = gpu_fusion;
+        self.performance.gpu = gpu_fusion;
+        self.save_performance();
+    }
+
+    /// Applies the host-memory cap field's text to the next run and saves it.
+    /// Empty means no cap; text that does not parse as a size leaves the
+    /// stored cap and marks the field invalid.
+    pub fn set_host_memory_cap(&mut self, text: &str) {
+        match performance_settings::parse_cap(text) {
+            Ok(cap) => {
+                self.performance.max_host_memory = cap;
+                self.rejected_caps.host_memory = None;
+                self.save_performance();
+            }
+            Err(_) => self.rejected_caps.host_memory = Some(text.to_string()),
+        }
+    }
+
+    /// [`Self::set_host_memory_cap`] for the VRAM cap. Once the session's
+    /// device budget has settled an edit is saved but applies only from the
+    /// next launch, and the view says so.
+    pub fn set_vram_cap(&mut self, text: &str) {
+        match performance_settings::parse_cap(text) {
+            Ok(cap) => {
+                self.performance.max_vram = cap;
+                self.rejected_caps.vram = None;
+                self.vram_pending |= focusforge_gpu::harness::vram_cap_settled();
+                self.save_performance();
+            }
+            Err(_) => self.rejected_caps.vram = Some(text.to_string()),
+        }
+    }
+
+    /// The host-memory cap field's cursor moved to `cursor_x`, measured from
+    /// the entry's own unscrolled left edge; `viewport_width` is the field's
+    /// visible text width. Scrolls the entry by the least amount that keeps
+    /// the cursor in view; [`Self::performance_view`] reports the offset.
+    pub fn host_memory_cap_cursor_moved(&mut self, cursor_x: f32, viewport_width: f32) {
+        self.host_cap_scroll_x =
+            clamp_field_scroll(cursor_x, self.host_cap_scroll_x, viewport_width);
+    }
+
+    /// [`Self::host_memory_cap_cursor_moved`] for the VRAM cap field.
+    pub fn vram_cap_cursor_moved(&mut self, cursor_x: f32, viewport_width: f32) {
+        self.vram_cap_scroll_x =
+            clamp_field_scroll(cursor_x, self.vram_cap_scroll_x, viewport_width);
+    }
+
+    /// Installs the settings loaded at startup.
+    pub fn install_performance(&mut self, settings: PerformanceSettings) {
+        self.performance = settings;
+    }
+
+    /// Saves `performance` when a config directory is installed; a failed
+    /// save is logged, never an error.
+    fn save_performance(&self) {
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = performance_settings::save(dir, &self.performance)
+        {
+            tracing::warn!(error = %e, "the performance settings could not be saved");
+        }
+    }
+
+    /// What the Performance tab shows. Reads settled state only: the device
+    /// budget is `NotProbed` until a run has brought the backend up, and
+    /// building the view never opens an adapter.
+    pub fn performance_view(&self) -> performance_settings::PerformanceView {
+        let device = match focusforge_gpu::harness::settled_backend() {
+            None => DeviceState::NotProbed,
+            Some(Ok(backend)) => DeviceState::Ready(backend.device_budget().bytes()),
+            Some(Err(_)) => DeviceState::NoAdapter,
+        };
+        let backend_line = self
+            .fusion_backend()
+            .or_else(|| self.last_backend_line.clone());
+        let mut view = performance_settings::view(
+            &self.performance,
+            &self.rejected_caps,
+            job::host_budget().bytes(),
+            device,
+            backend_line.as_deref(),
+            self.vram_pending,
+        );
+        view.host_cap.scroll_offset = self.host_cap_scroll_x;
+        view.vram_cap.scroll_offset = self.vram_cap_scroll_x;
+        view
     }
 
     /// The live run's own [`job::resolve_backend`] account, `None` before it
@@ -6637,7 +6746,7 @@ impl AppController {
         if let Some(enqueued) = self.try_enqueue(id) {
             return enqueued;
         }
-        let Some(request) = self.fuse_request_for(index) else {
+        let Some(request) = self.job_request_for(index) else {
             return false;
         };
         self.run_request(index, request)
@@ -6880,6 +6989,9 @@ impl AppController {
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
         let observer = self.job.observer.take().unwrap_or_default();
+        if let Some(line) = observer.backend_line() {
+            self.last_backend_line = Some(line);
+        }
         let settled = job::settle(handle.join(), &observer);
         self.job.control = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
@@ -6980,7 +7092,7 @@ impl AppController {
                 self.refuse_missing_frame(&missing);
                 continue;
             }
-            let Some(request) = self.fuse_request_for(index) else {
+            let Some(request) = self.job_request_for(index) else {
                 continue;
             };
             if self.run_request(index, request) {

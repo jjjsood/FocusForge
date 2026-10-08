@@ -66,6 +66,27 @@ component SettingsGround inherits Rectangle {
     }
 }
 
+// A text field in a settings row's value slot. The slot keeps the field's
+// unemphasised size, so its focus growth stays centred.
+component CapFieldSlot inherits Rectangle {
+    in property <string> text: "";
+    in property <string> placeholder: "";
+    in property <string> tone: "neutral";
+    in property <bool> enabled: true;
+    width: ShellGeometry.settings-field-width;
+    height: ShellGeometry.field-height;
+
+    FFTextField {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        placeholder: root.placeholder;
+        tone: root.tone;
+        enabled: root.enabled;
+        field-width: parent.width;
+    }
+}
+
 component ColourSwatch inherits Rectangle {
     in property <color> swatch;
     in property <string> label;
@@ -212,37 +233,156 @@ export component ThemeSheet inherits Window {
             }
         }
 
-        GroupHeading { text: "Settings: section, path rows (present, missing), toggle rows, field rows"; }
+        GroupHeading { text: "Settings: section, path rows (present, missing)"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LOCATIONS";
+                FFSettingsPathRow { label: "Logs"; path: "~/.local/share/focusforge/logs"; }
+                FFSettingsPathRow {
+                    label: "Crash reports";
+                    path: "~/.local/share/focusforge/crashes";
+                    missing: true;
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, default (toggle on, backend, empty caps showing the placeholder, budgets, note)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
 
                 FFSettingsSection {
-                    heading: "LOCATIONS";
-                    FFSettingsPathRow { label: "Logs"; path: "~/.local/share/focusforge/logs"; }
-                    FFSettingsPathRow {
-                        label: "Crash reports";
-                        path: "~/.local/share/focusforge/crashes";
-                        missing: true;
-                    }
-                }
-                FFSettingsSection {
-                    heading: "PERFORMANCE";
+                    heading: "PROCESSING";
                     FFSettingsRow {
                         label: "GPU processing";
                         align-end: true;
                         FFToggle { on: true; }
                     }
                     FFSettingsRow {
+                        label: "Backend";
+                        FFRowText { text: "gpu — NVIDIA GeForce RTX 5070 Ti"; overflow: elide; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: Theme.space-4;
+
+                    FFSettingsSection {
+                        heading: "LIMITS";
+                        FFSettingsRow {
+                            label: "Host memory cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "No cap"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "No cap"; }
+                        }
+                        FFSettingsRow {
+                            label: "Host budget";
+                            FFRowText { text: "48.0 GiB"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM budget";
+                            FFRowText { text: "15.4 GiB"; }
+                        }
+                    }
+                    FFStatusText {
+                        height: ShellGeometry.settings-status-height;
+                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, states (toggle off, long backend elided, cap typed, cap failure tone, budget not probed yet)"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: ShellGeometry.settings-section-gap;
+
+                FFSettingsSection {
+                    heading: "PROCESSING";
+                    FFSettingsRow {
+                        label: "GPU processing";
+                        align-end: true;
+                        FFToggle { }
+                    }
+                    FFSettingsRow {
+                        label: "Backend";
+                        FFRowText {
+                            text: "cpu — no usable GPU adapter: no suitable adapter was found; continuing on the CPU path";
+                            overflow: elide;
+                        }
+                    }
+                }
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
                         label: "Host memory cap";
                         align-end: true;
-                        FFField { width: ShellGeometry.settings-field-width; text: "No cap"; }
+                        CapFieldSlot { placeholder: "No cap"; text: "2GiB"; }
                     }
                     FFSettingsRow {
                         label: "VRAM cap";
                         align-end: true;
-                        divider: false;
-                        FFField { width: ShellGeometry.settings-field-width; text: "Unavailable"; disabled: true; }
+                        CapFieldSlot { placeholder: "No cap"; text: "8G"; tone: "failure"; }
+                    }
+                    FFSettingsRow {
+                        label: "Host budget";
+                        FFRowText { text: "48.0 GiB"; }
+                    }
+                    FFSettingsRow {
+                        label: "VRAM budget";
+                        FFRowText { text: "Not probed yet"; muted: true; }
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, no adapter (toggle on and disabled, cpu backend, VRAM cap disabled with Unavailable, budget Unavailable, note)"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: ShellGeometry.settings-section-gap;
+
+                FFSettingsSection {
+                    heading: "PROCESSING";
+                    FFSettingsRow {
+                        label: "GPU processing";
+                        align-end: true;
+                        FFToggle { on: true; disabled: true; }
+                    }
+                    FFSettingsRow {
+                        label: "Backend";
+                        FFRowText { text: "cpu — no GPU adapter found"; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: Theme.space-4;
+
+                    FFSettingsSection {
+                        heading: "LIMITS";
+                        FFSettingsRow {
+                            label: "Host memory cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "No cap"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "Unavailable"; enabled: false; }
+                        }
+                        FFSettingsRow {
+                            label: "Host budget";
+                            FFRowText { text: "48.0 GiB"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM budget";
+                            FFRowText { text: "Unavailable"; muted: true; }
+                        }
+                    }
+                    FFStatusText {
+                        height: ShellGeometry.settings-status-height;
+                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
                     }
                 }
             }
@@ -347,13 +487,14 @@ export component ThemeSheet inherits Window {
             }
         }
 
-        GroupHeading { text: "Text field: neutral, warning, failure, disabled"; }
+        GroupHeading { text: "Text field: neutral, warning, failure, disabled, empty with placeholder"; }
         VerticalLayout {
             spacing: Theme.space-2;
             FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; }
             FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; tone: "warning"; }
             FFTextField { field-width: 300px; text: "/nonexistent/focusforge-diagnostics.zip"; tone: "failure"; }
             FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; enabled: false; }
+            FFTextField { field-width: 300px; placeholder: "No destination chosen"; }
         }
 
         GroupHeading { text: "Modal panel: plain, warning rule, caution rule"; }

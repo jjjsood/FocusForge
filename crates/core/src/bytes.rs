@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! A suffixed, human-readable byte-size `clap` value parser, shared between
-//! `--max-host-memory` and `--max-vram`. Hand-written rather than a crate
-//! dependency: ~30 lines plus tests is smaller than the licence and
-//! `deny.toml` review a new dependency would need.
+//! A suffixed, human-readable byte-size parser: the one syntax of the
+//! `--max-host-memory` and `--max-vram` flags and of the size strings in the
+//! settings file. Hand-written rather than a crate dependency: ~30 lines plus
+//! tests is smaller than the licence and `deny.toml` review a new dependency
+//! would need.
 
 const ACCEPTED: &str =
     "accepted suffixes: B, KB/KiB, MB/MiB, GB/GiB, TB/TiB (or no suffix for bytes)";

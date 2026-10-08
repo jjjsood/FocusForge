@@ -2,11 +2,11 @@
 
 //! The one file every persisted GUI setting saves through:
 //! `<config_dir>/settings.toml`, one top-level table per concern
-//! (`[recent]`, `[input]`, `[export]`). Each concern (`crate::recent`,
-//! `crate::input_config`) reads its own key out of the whole file and, on
-//! save, replaces only that key -- a hand-edited sibling table, comments
-//! included, is never touched. No `use slint::` anywhere in this file
-//! (`input_modules_are_slint_free`).
+//! (`[recent]`, `[input]`, `[export]`, `[performance]`). Each concern
+//! (`crate::recent`, `crate::input_config`) reads its own key out of the
+//! whole file and, on save, replaces only that key -- a hand-edited sibling
+//! table, comments included, is never touched. No `use slint::` anywhere in
+//! this file (`input_modules_are_slint_free`).
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -12,14 +12,22 @@ import { FFNavRail } from "../components/ff_nav_rail.slint";
 import { FFNavRailEntry } from "../components/ff_nav_rail_entry.slint";
 import { FFDiagnosticsPanel, FFManifestRow } from "settings_modal/diagnostics_panel.slint";
 import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
-export { FFManifestRow, InputRow }
+import { FFPerformanceTab, PerformanceCap, PerformanceState } from "settings_modal/performance_tab.slint";
+export { FFManifestRow, InputRow, PerformanceCap, PerformanceState }
 
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
-    in property <string> settings-section: "input-map";
+    in property <string> settings-section: "performance";
     callback settings-close-requested();
     callback settings-section-selected(string);
+
+    in property <PerformanceState> performance;
+    callback performance-gpu-toggled(bool);
+    callback performance-host-cap-edited(string);
+    callback performance-vram-cap-edited(string);
+    callback performance-host-cap-cursor-moved(length, length);
+    callback performance-vram-cap-cursor-moved(length, length);
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -53,6 +61,12 @@ export component FFSettingsModal inherits FFModalPanel {
         height: root.panel-height;
         header-inset: 60px;
 
+        FFNavRailEntry {
+            label: "Performance";
+            icon-source: @image-url("../../../../assets/icons/cpu.svg");
+            selected: root.settings-section == "performance";
+            clicked => { root.settings-section-selected("performance"); }
+        }
         FFNavRailEntry {
             label: "Input map";
             icon-source: @image-url("../../../../assets/icons/keyboard.svg");
@@ -117,6 +131,18 @@ export component FFSettingsModal inherits FFModalPanel {
             manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
             manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
             manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+        }
+
+        if root.settings-section == "performance": FFPerformanceTab {
+            width: 100%;
+            height: 100%;
+            performance: root.performance;
+
+            gpu-toggled(on) => { root.performance-gpu-toggled(on); }
+            host-cap-edited(t) => { root.performance-host-cap-edited(t); }
+            vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+            host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
+            vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
         }
 
         if root.settings-section == "input-map": FFInputMapTab {

@@ -177,8 +177,9 @@ fn checkpoint_panel_touches_no_storage() {
     // `focusforge_core` directly. `checkpoints.rs` reads the history the
     // panel lists, beside `job.rs`, which reads its planes, and `brush.rs`,
     // which builds the stored stroke's path in core's own point type.
-    // Excluded by name: this test's own subject is the checkpoint panel,
-    // not the whole crate.
+    // `performance_settings.rs` parses its cap strings with core's size
+    // syntax. Excluded by name: this test's own subject is the checkpoint
+    // panel, not the whole crate.
     let canvas_files = [
         "checkpoints.rs",
         "brush.rs",
@@ -191,6 +192,7 @@ fn checkpoint_panel_touches_no_storage() {
         "job.rs",
         "images.rs",
         "overlay.rs",
+        "performance_settings.rs",
         "recent.rs",
         "settings.rs",
     ];
@@ -549,7 +551,8 @@ fn settings_action_row_draws_its_status_line_through_the_status_text() {
 
 /// Tab component each section renders, by slug. Every other tab component is
 /// absent while a section is selected.
-const SETTINGS_TABS: [(&str, &str); 2] = [
+const SETTINGS_TABS: [(&str, &str); 3] = [
+    ("performance", "FFPerformanceTab"),
     ("input-map", "FFInputMapTab"),
     ("diagnostics", "FFDiagnosticsPanel"),
 ];
@@ -587,6 +590,24 @@ fn settings_slint_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Opening Settings without choosing a section (the gear) shows Performance:
+/// the window's initial section is the controller's default, and the rail
+/// marks that entry selected.
+#[test]
+fn settings_open_with_performance_selected() {
+    let app = app_at(1440, 900);
+    assert_eq!(
+        app.get_settings_section().as_str(),
+        focusforge_gui::SettingsSection::default().slug()
+    );
+    app.set_settings_open(true);
+    let checked: Vec<Option<bool>> = nav_rail_entries(&app)
+        .iter()
+        .map(|entry| entry.accessible_checked())
+        .collect();
+    assert_eq!(checked, [Some(true), Some(false), Some(false)]);
+}
+
 /// The rail carries one entry per live section, in `SettingsSection::ALL`
 /// order, whichever entry is selected, and activating an entry raises its
 /// slug.
@@ -611,7 +632,11 @@ fn settings_nav_rail_lists_only_live_sections() {
             .iter()
             .map(|entry| entry.accessible_label().unwrap().to_string())
             .collect();
-        assert_eq!(labels, ["Input map", "Diagnostics"], "from {start}");
+        assert_eq!(
+            labels,
+            ["Performance", "Input map", "Diagnostics"],
+            "from {start}"
+        );
         assert_eq!(labels.len(), slugs.len());
 
         selected.borrow_mut().clear();
@@ -644,7 +669,7 @@ fn a_mouse_click_on_a_rail_entry_selects_it_without_a_focus_ring() {
         move |slug| selected.borrow_mut().push(slug.to_string())
     });
 
-    nav_rail_entries(&app)[1].mock_single_click(slint::platform::PointerEventButton::Left);
+    nav_rail_entries(&app)[2].mock_single_click(slint::platform::PointerEventButton::Left);
 
     assert_eq!(*selected.borrow(), ["diagnostics"]);
     assert!(
@@ -695,12 +720,12 @@ fn return_and_space_activate_the_focused_rail_entry() {
     press("a".into());
     assert!(selected.borrow().is_empty(), "a letter must not activate");
     press(Key::Return.into());
-    assert_eq!(*selected.borrow(), ["input-map"]);
+    assert_eq!(*selected.borrow(), ["performance"]);
 
     press(Key::Tab.into());
     tab_to_ring();
     press(" ".into());
-    assert_eq!(*selected.borrow(), ["input-map", "diagnostics"]);
+    assert_eq!(*selected.borrow(), ["performance", "input-map"]);
 }
 
 /// Exactly the selected section's tab component is instantiated, and each
@@ -729,6 +754,7 @@ fn settings_tabs_render_from_their_own_files() {
 
     let tabs = common::ui_dir().join("shell").join("settings_modal");
     for (file, component) in [
+        ("performance_tab.slint", "FFPerformanceTab"),
         ("input_map_tab.slint", "FFInputMapTab"),
         ("diagnostics_panel.slint", "FFDiagnosticsPanel"),
     ] {
@@ -1700,4 +1726,260 @@ fn detached_main_pane_fills_the_canvas_on_either_side() {
     app.set_detached_pane("".into());
     assert_rect(&app, "FFCanvas::pane-left", (16.0, 92.0, 566.0, 748.0));
     assert_rect(&app, "FFCanvas::pane-right", (598.0, 92.0, 566.0, 748.0));
+}
+
+// --- Performance tab -------------------------------------------------------
+
+type SharedController = std::sync::Arc<std::sync::Mutex<AppController>>;
+
+fn performance_window(controller: &SharedController) -> AppWindow {
+    let app = app_at(1440, 900);
+    focusforge_gui::bridge::push_performance_view(&app, controller);
+    app.set_settings_open(true);
+    app.set_settings_section("performance".into());
+    app
+}
+
+fn performance_tab(app: &AppWindow) -> ElementHandle {
+    ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFPerformanceTab")
+        .find_first()
+        .expect("no FFPerformanceTab element found")
+}
+
+/// Whether the tab's switch draws as on: the knob rests at the right end.
+fn performance_switch_is_on(tab: &ElementHandle) -> bool {
+    i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_secs(1));
+    let toggle = by_position(tab.query_descendants().match_type_name("FFToggle"));
+    let knob = by_position(tab.query_descendants().match_id("FFToggle::knob"));
+    assert_eq!(knob.len(), 1, "the tab has exactly one switch");
+    knob[0].absolute_position().x - toggle[0].absolute_position().x > 10.0
+}
+
+fn performance_cap_inputs(tab: &ElementHandle) -> Vec<ElementHandle> {
+    by_position(tab.query_descendants().match_id("FFTextField::input"))
+}
+
+fn performance_row_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFRowText"))
+        .iter()
+        .map(|text| text.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn performance_placeholders(tab: &ElementHandle) -> Vec<String> {
+    by_position(
+        tab.query_descendants()
+            .match_type_name("FFTextField")
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|text| text.accessible_label().unwrap_or_default().to_string())
+    .collect()
+}
+
+/// The tab draws what the controller's view holds: the switch, both cap
+/// fields (or their placeholders) and the three read-only figures, whichever
+/// way the stored settings are.
+#[test]
+fn performance_tab_shows_the_controller_view() {
+    let mut on = AppController::new();
+    on.set_gpu_fusion(true);
+    let mut capped = AppController::new();
+    capped.set_gpu_fusion(false);
+    capped.set_host_memory_cap("2GiB");
+    capped.set_vram_cap("512MiB");
+
+    for (controller, gpu, caps) in [(on, true, ["", ""]), (capped, false, ["2GiB", "512MiB"])] {
+        let view = controller.performance_view();
+        assert_eq!(view.gpu, gpu);
+        let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+        let app = performance_window(&shared);
+        let tab = performance_tab(&app);
+
+        assert_eq!(performance_switch_is_on(&tab), gpu);
+        let texts: Vec<String> = performance_cap_inputs(&tab)
+            .iter()
+            .map(|input| input.accessible_value().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(texts, caps);
+        let placeholders = performance_placeholders(&tab);
+        if gpu {
+            assert_eq!(placeholders, ["No cap", "No cap"]);
+        } else {
+            assert!(placeholders.is_empty(), "{placeholders:?}");
+        }
+        assert_eq!(
+            performance_row_texts(&tab),
+            [
+                view.backend.as_str(),
+                view.host_budget.as_str(),
+                view.vram_budget.as_str()
+            ]
+        );
+        assert_eq!(view.vram_budget, "Not probed yet");
+    }
+}
+
+/// The tab is layout over shared components: its sections, rows, switch,
+/// fields and note are the shared ones, and it styles nothing itself.
+#[test]
+fn performance_tab_composes_only_shared_components() {
+    let tab = ui_source("shell/settings_modal/performance_tab.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "Theme.status-",
+        "Theme.text-",
+        "Theme.surface-",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle:?}");
+    }
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsRow {",
+        "FFToggle {",
+        "FFTextField {",
+        "FFRowText {",
+        "FFStatusText {",
+    ] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+}
+
+fn type_into(app: &AppWindow, text: &str) {
+    use slint::platform::WindowEvent;
+    for ch in text.chars() {
+        let key: slint::SharedString = ch.to_string().into();
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
+    }
+}
+
+/// Clicking the switch asks for the opposite setting, and typing in a cap
+/// field reports every edit with the cursor's new position.
+#[test]
+fn performance_controls_report_to_their_callbacks() {
+    let controller = AppController::new();
+    let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = performance_window(&shared);
+    let tab = performance_tab(&app);
+
+    let toggled = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
+    app.on_performance_gpu_toggled({
+        let toggled = toggled.clone();
+        move |on| toggled.borrow_mut().push(on)
+    });
+    let host_edits = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_host_cap_edited({
+        let edits = host_edits.clone();
+        move |text| edits.borrow_mut().push(text.to_string())
+    });
+    let vram_edits = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_vram_cap_edited({
+        let edits = vram_edits.clone();
+        move |text| edits.borrow_mut().push(text.to_string())
+    });
+    let cursors = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(char, f32, f32)>::new()));
+    app.on_performance_host_cap_cursor_moved({
+        let cursors = cursors.clone();
+        move |x, w| cursors.borrow_mut().push(('h', x, w))
+    });
+    app.on_performance_vram_cap_cursor_moved({
+        let cursors = cursors.clone();
+        move |x, w| cursors.borrow_mut().push(('v', x, w))
+    });
+
+    let before = performance_switch_is_on(&tab);
+    tab.query_descendants()
+        .match_id("FFToggle::area")
+        .find_first()
+        .expect("the switch has a touch area")
+        .mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(*toggled.borrow(), [!before]);
+
+    let inputs = performance_cap_inputs(&tab);
+    inputs[0].mock_single_click(slint::platform::PointerEventButton::Left);
+    type_into(&app, "2G");
+    inputs[1].mock_single_click(slint::platform::PointerEventButton::Left);
+    type_into(&app, "5");
+    assert_eq!(*host_edits.borrow(), ["2", "2G"]);
+    assert_eq!(*vram_edits.borrow(), ["5"]);
+
+    let cursors = cursors.borrow();
+    let host: Vec<_> = cursors.iter().filter(|c| c.0 == 'h').collect();
+    let vram: Vec<_> = cursors.iter().filter(|c| c.0 == 'v').collect();
+    assert!(
+        host.last().is_some_and(|c| c.1 > 0.0),
+        "typing moves the host cursor right: {host:?}"
+    );
+    assert!(
+        vram.last().is_some_and(|c| c.1 > 0.0),
+        "typing moves the VRAM cursor right: {vram:?}"
+    );
+    let visible = 136.0 - 2.0 * 6.0;
+    assert!(
+        cursors.iter().all(|c| (c.2 - visible).abs() < EPS),
+        "the visible width is the field less its two insets: {cursors:?}"
+    );
+}
+
+/// A cap entry longer than the field scrolls to keep the cursor in view,
+/// and Home brings the start back.
+#[test]
+fn performance_cap_entry_scrolls_to_follow_the_cursor() {
+    use slint::platform::{Key, WindowEvent};
+
+    let controller: SharedController =
+        std::sync::Arc::new(std::sync::Mutex::new(AppController::new()));
+    let app = app_at(1440, 900);
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_settings_open(true);
+    app.set_settings_section("performance".into());
+    focusforge_gui::bridge::push_performance_view(&app, &controller);
+    let tab = performance_tab(&app);
+
+    for field in 0..2 {
+        performance_cap_inputs(&tab)[field]
+            .mock_single_click(slint::platform::PointerEventButton::Left);
+        let rest = performance_cap_inputs(&tab)[field].absolute_position().x;
+
+        type_into(&app, "12345");
+        assert_eq!(
+            performance_cap_inputs(&tab)[field].absolute_position().x,
+            rest,
+            "field {field}: a short entry does not scroll"
+        );
+
+        type_into(&app, &"1234567890".repeat(4));
+        let scrolled = performance_cap_inputs(&tab)[field].absolute_position().x;
+        assert!(
+            scrolled < rest - 20.0,
+            "field {field}: a long entry scrolls left, rest {rest}, now {scrolled}"
+        );
+
+        app.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Home.into(),
+        });
+        app.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Home.into(),
+        });
+        assert_eq!(
+            performance_cap_inputs(&tab)[field].absolute_position().x,
+            rest,
+            "field {field}: Home shows the start of the entry again"
+        );
+    }
 }

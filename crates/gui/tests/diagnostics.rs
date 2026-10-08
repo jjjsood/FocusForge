@@ -86,10 +86,12 @@ fn startup_line_reaches_the_log_file_before_the_settings_section_exit() {
 }
 
 fn live_slugs() -> Vec<&'static str> {
-    focusforge_gui::SettingsSection::ALL
+    let slugs: Vec<&'static str> = focusforge_gui::SettingsSection::ALL
         .iter()
         .map(|section| section.slug())
-        .collect()
+        .collect();
+    assert_eq!(slugs, ["performance", "input-map", "diagnostics"]);
+    slugs
 }
 
 #[test]
