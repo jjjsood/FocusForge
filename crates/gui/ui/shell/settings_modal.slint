@@ -13,7 +13,8 @@ import { FFNavRailEntry } from "../components/ff_nav_rail_entry.slint";
 import { FFDiagnosticsPanel, FFManifestRow } from "settings_modal/diagnostics_panel.slint";
 import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
 import { FFPerformanceTab, PerformanceCap, PerformanceState } from "settings_modal/performance_tab.slint";
-export { FFManifestRow, InputRow, PerformanceCap, PerformanceState }
+import { FFStorageTab, StoragePathState, StorageState } from "settings_modal/storage_tab.slint";
+export { FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
@@ -28,6 +29,9 @@ export component FFSettingsModal inherits FFModalPanel {
     callback performance-vram-cap-edited(string);
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <StorageState> storage;
+    callback storage-clear-requested();
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -66,6 +70,12 @@ export component FFSettingsModal inherits FFModalPanel {
             icon-source: @image-url("../../../../assets/icons/cpu.svg");
             selected: root.settings-section == "performance";
             clicked => { root.settings-section-selected("performance"); }
+        }
+        FFNavRailEntry {
+            label: "Storage";
+            icon-source: @image-url("../../../../assets/icons/hard-drive.svg");
+            selected: root.settings-section == "storage";
+            clicked => { root.settings-section-selected("storage"); }
         }
         FFNavRailEntry {
             label: "Input map";
@@ -143,6 +153,14 @@ export component FFSettingsModal inherits FFModalPanel {
             vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
             host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
             vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        }
+
+        if root.settings-section == "storage": FFStorageTab {
+            width: 100%;
+            height: 100%;
+            storage: root.storage;
+
+            clear-requested => { root.storage-clear-requested(); }
         }
 
         if root.settings-section == "input-map": FFInputMapTab {

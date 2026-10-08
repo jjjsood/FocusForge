@@ -233,16 +233,43 @@ export component ThemeSheet inherits Window {
             }
         }
 
-        GroupHeading { text: "Settings: section, path rows (present, missing)"; }
+        GroupHeading { text: "Settings: section, path rows (present, present, missing, present)"; }
         SettingsGround {
             FFSettingsSection {
                 heading: "LOCATIONS";
+                FFSettingsPathRow {
+                    label: "Settings file";
+                    path: "~/.config/focusforge/settings.toml";
+                }
                 FFSettingsPathRow { label: "Logs"; path: "~/.local/share/focusforge/logs"; }
                 FFSettingsPathRow {
                     label: "Crash reports";
                     path: "~/.local/share/focusforge/crashes";
                     missing: true;
                 }
+                FFSettingsPathRow {
+                    label: "Scratch";
+                    path: "~/.local/share/focusforge/scratch";
+                    divider: false;
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: path rows, long path elided, long path and missing (suffix whole), unavailable"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LOCATIONS";
+                FFSettingsPathRow {
+                    label: "Scratch";
+                    path: "/mnt/photography/2026/mantis-series/session-three/focusforge/scratch";
+                }
+                FFSettingsPathRow {
+                    label: "Scratch";
+                    path: "/mnt/photography/2026/mantis-series/session-three/focusforge/scratch";
+                    missing: true;
+                }
+                FFSettingsPathRow { label: "Settings file"; available: false; }
+                FFSettingsPathRow { label: "Logs"; available: false; divider: false; }
             }
         }
 
@@ -403,26 +430,26 @@ export component ThemeSheet inherits Window {
                 heading: "CACHE";
                 FFSettingsActionRow {
                     label: "Stage cache";
-                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    helper: "Deletes cached fuse stages.";
                     button-text: "Clear cache";
                 }
                 FFSettingsActionRow {
                     label: "Stage cache";
-                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    helper: "Deletes cached fuse stages.";
                     button-text: "Clearing…";
                     enabled: false;
                 }
                 FFSettingsActionRow {
                     label: "Stage cache";
-                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    helper: "Deletes cached fuse stages.";
                     button-text: "Clear cache";
                     enabled: false;
-                    status-text: "A run is active. Clear the cache after it finishes.";
+                    status-text: "A run is active.";
                     status-tone: "warning";
                 }
                 FFSettingsActionRow {
                     label: "Stage cache";
-                    helper: "Removes cached fuse stages; the next run rebuilds them.";
+                    helper: "Deletes cached fuse stages.";
                     button-text: "Clear cache";
                     status-text: "Cleared 12 stage entries.";
                     status-tone: "success";
@@ -430,7 +457,7 @@ export component ThemeSheet inherits Window {
                 FFSettingsActionRow {
                     label: "Stage cache";
                     button-text: "Clear cache";
-                    status-text: "Could not clear the stage cache: Permission denied (os error 13).";
+                    status-text: "Could not clear the cache: Permission denied.";
                     status-tone: "failure";
                 }
             }

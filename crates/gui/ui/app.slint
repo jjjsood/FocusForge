@@ -22,8 +22,8 @@ export { ComparisonWindow }
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
-import { FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState } from "shell/settings_modal.slint";
-export { InputRow, FFManifestRow, PerformanceCap, PerformanceState }
+import { FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
@@ -547,6 +547,9 @@ export component AppWindow inherits Window {
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
 
+    in property <StorageState> storage;
+    callback storage-clear-requested();
+
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
     in property <bool> diagnostics-include-minidumps: false;
@@ -694,6 +697,7 @@ export component AppWindow inherits Window {
         input-rows: root.input-rows;
         settings-section: root.settings-section;
         performance: root.performance;
+        storage: root.storage;
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;
         diagnostics-include-minidumps: root.diagnostics-include-minidumps;
@@ -714,6 +718,7 @@ export component AppWindow inherits Window {
         performance-vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
         performance-host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
         performance-vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        storage-clear-requested => { root.storage-clear-requested(); }
         diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
         diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
         diagnostics-destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }

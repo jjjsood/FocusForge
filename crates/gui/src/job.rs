@@ -41,7 +41,7 @@ use focusforge_gpu::blend::Blender;
 /// can hold and drive these through the `job::` path alone.
 pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::equalize::UNIT_GAIN;
-pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage};
+pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCacheError};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::Op;
 pub use focusforge_core::project::{
@@ -279,6 +279,12 @@ pub fn spawn(
             stage_cache.as_ref(),
         )
     })
+}
+
+/// Empties the stage cache under `scratch_root` and returns how many entries
+/// it held. Nothing else under the scratch root is touched.
+pub fn clear_stage_cache(scratch_root: &Path) -> Result<usize, StageCacheError> {
+    StageCache::open(scratch_root)?.clear()
 }
 
 /// The pipeline request a window run makes of `request`, with the backends

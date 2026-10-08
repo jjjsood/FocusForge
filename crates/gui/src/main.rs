@@ -64,7 +64,7 @@ struct Args {
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Opens the settings modal on the named section at startup:
-    /// `performance`, `input-map` or `diagnostics`.
+    /// `performance`, `storage`, `input-map` or `diagnostics`.
     #[arg(long)]
     settings_section: Option<String>,
     /// Selects the dock's tab row at startup: `images` or `settings`.
@@ -1002,6 +1002,7 @@ fn run(args: &Args) -> ExitCode {
         bridge::install_crash_notice(&controller, &app);
         install_recent(&controller, args);
         bridge::push_performance_view(&app, &controller);
+        bridge::push_storage_view(&app, &controller);
 
         if let Some(state) = &args.toolbar_state {
             apply_toolbar_state_preview(&app, state.as_str());

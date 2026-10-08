@@ -4673,6 +4673,44 @@ fn the_performance_tab_is_refreshed_when_a_run_settles() {
     );
 }
 
+/// The Storage tab refuses the clear while a run is live and offers it again
+/// when the run settles, without the modal being reopened.
+#[test]
+fn the_storage_tab_is_refreshed_when_a_run_settles() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller_with_frames("storage_settle_push", 2)));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_settings_open(true);
+    app.set_settings_section("storage".into());
+
+    app.invoke_fuse_requested();
+    focusforge_gui::bridge::push_storage_view(&app, &controller);
+    assert!(
+        !app.get_storage().clear_enabled,
+        "a live run refuses the clear"
+    );
+    assert_eq!(app.get_storage().status.as_str(), "A run is active.");
+
+    common::settle_via_job_timer(&controller, Duration::from_secs(120));
+
+    assert!(
+        app.get_storage().clear_enabled,
+        "the button must not stay disabled after the run"
+    );
+    assert_eq!(app.get_storage().status.as_str(), "");
+}
+
 // ---------------------------------------------------------------------
 // The run's alignment account: the notice text, the logged line, the
 // reuse of a cached alignment and the backend a small GPU-on stack reports.

@@ -90,7 +90,10 @@ fn live_slugs() -> Vec<&'static str> {
         .iter()
         .map(|section| section.slug())
         .collect();
-    assert_eq!(slugs, ["performance", "input-map", "diagnostics"]);
+    assert_eq!(
+        slugs,
+        ["performance", "storage", "input-map", "diagnostics"]
+    );
     slugs
 }
 

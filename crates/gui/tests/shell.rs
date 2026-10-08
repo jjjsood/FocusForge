@@ -549,10 +549,62 @@ fn settings_action_row_draws_its_status_line_through_the_status_text() {
     }
 }
 
+/// The action row's status line starts where the helper text does and runs to
+/// the row's right edge: the content width less the label column.
+#[test]
+fn settings_action_row_status_line_starts_in_the_helper_column() {
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("storage".into());
+    let helper = rect(&app, "FFSettingsActionRow::helper-text");
+    let status = rect(&app, "FFSettingsActionRow::status");
+    assert!(
+        (status.0 - helper.0).abs() < EPS,
+        "status x {} but helper x {}",
+        status.0,
+        helper.0
+    );
+    assert!(
+        (status.2 - 306.0).abs() < EPS,
+        "status width {}, expected 446 - 140",
+        status.2
+    );
+}
+
+/// The path row elides a long path to the value column, leaves the
+/// `not created yet` suffix whole, and draws an unresolved location as a
+/// muted word in place of the path (geometry cannot show elision, so the
+/// source must).
+#[test]
+fn settings_path_row_elides_its_path_and_marks_an_unresolved_location() {
+    let row = ui_source("components/ff_settings_path_row.slint");
+    let block = |opening: &str| {
+        row.split(opening)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the path row has no {opening:?}"))
+            .split('}')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    let path = block("if root.available: FFRowText {");
+    assert!(path.contains("text: root.path"));
+    assert!(path.contains("overflow: elide"), "the path must elide");
+    let suffix = block("if root.available && root.missing: FFRowText {");
+    assert!(suffix.contains("not created yet"));
+    assert!(!suffix.contains("overflow"), "the suffix stays whole");
+    let unavailable = block("if !root.available: FFRowText {");
+    assert!(unavailable.contains("muted: true"));
+    assert!(unavailable.contains("\"Unavailable\""));
+    assert!(row.contains("in property <bool> available: true;"));
+}
+
 /// Tab component each section renders, by slug. Every other tab component is
 /// absent while a section is selected.
-const SETTINGS_TABS: [(&str, &str); 3] = [
+const SETTINGS_TABS: [(&str, &str); 4] = [
     ("performance", "FFPerformanceTab"),
+    ("storage", "FFStorageTab"),
     ("input-map", "FFInputMapTab"),
     ("diagnostics", "FFDiagnosticsPanel"),
 ];
@@ -605,7 +657,7 @@ fn settings_open_with_performance_selected() {
         .iter()
         .map(|entry| entry.accessible_checked())
         .collect();
-    assert_eq!(checked, [Some(true), Some(false), Some(false)]);
+    assert_eq!(checked, [Some(true), Some(false), Some(false), Some(false)]);
 }
 
 /// The rail carries one entry per live section, in `SettingsSection::ALL`
@@ -634,7 +686,7 @@ fn settings_nav_rail_lists_only_live_sections() {
             .collect();
         assert_eq!(
             labels,
-            ["Performance", "Input map", "Diagnostics"],
+            ["Performance", "Storage", "Input map", "Diagnostics"],
             "from {start}"
         );
         assert_eq!(labels.len(), slugs.len());
@@ -669,9 +721,9 @@ fn a_mouse_click_on_a_rail_entry_selects_it_without_a_focus_ring() {
         move |slug| selected.borrow_mut().push(slug.to_string())
     });
 
-    nav_rail_entries(&app)[2].mock_single_click(slint::platform::PointerEventButton::Left);
+    nav_rail_entries(&app)[1].mock_single_click(slint::platform::PointerEventButton::Left);
 
-    assert_eq!(*selected.borrow(), ["diagnostics"]);
+    assert_eq!(*selected.borrow(), ["storage"]);
     assert!(
         ElementQuery::from_root(&app)
             .match_id("FFNavRailEntry::ring")
@@ -725,7 +777,7 @@ fn return_and_space_activate_the_focused_rail_entry() {
     press(Key::Tab.into());
     tab_to_ring();
     press(" ".into());
-    assert_eq!(*selected.borrow(), ["performance", "input-map"]);
+    assert_eq!(*selected.borrow(), ["performance", "storage"]);
 }
 
 /// Exactly the selected section's tab component is instantiated, and each
@@ -755,6 +807,7 @@ fn settings_tabs_render_from_their_own_files() {
     let tabs = common::ui_dir().join("shell").join("settings_modal");
     for (file, component) in [
         ("performance_tab.slint", "FFPerformanceTab"),
+        ("storage_tab.slint", "FFStorageTab"),
         ("input_map_tab.slint", "FFInputMapTab"),
         ("diagnostics_panel.slint", "FFDiagnosticsPanel"),
     ] {
@@ -1847,6 +1900,157 @@ fn performance_tab_composes_only_shared_components() {
         "FFTextField {",
         "FFRowText {",
         "FFStatusText {",
+    ] {
+        assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+}
+
+// --- Storage tab -----------------------------------------------------------
+
+fn storage_window(controller: &SharedController) -> AppWindow {
+    let app = app_at(1440, 900);
+    focusforge_gui::bridge::push_storage_view(&app, controller);
+    app.set_settings_open(true);
+    app.set_settings_section("storage".into());
+    app
+}
+
+fn storage_tab(app: &AppWindow) -> ElementHandle {
+    ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFStorageTab")
+        .find_first()
+        .expect("no FFStorageTab element found")
+}
+
+/// The tab's row texts, top to bottom: each location's path, its suffix or
+/// the unavailable word, then the action row's helper.
+fn storage_row_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFRowText"))
+        .iter()
+        .map(|text| text.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn storage_button(tab: &ElementHandle) -> ElementHandle {
+    let mut buttons = by_position(tab.query_descendants().match_type_name("FFButton"));
+    assert_eq!(buttons.len(), 1, "the tab has exactly one button");
+    buttons.remove(0)
+}
+
+fn storage_status_line(tab: &ElementHandle) -> String {
+    let lines = by_position(tab.query_descendants().match_type_name("FFStatusText"));
+    assert_eq!(lines.len(), 1, "the tab has exactly one status line");
+    lines[0].accessible_label().unwrap_or_default().to_string()
+}
+
+/// The tab draws what the controller's view holds: the four locations with a
+/// suffix on a directory not created yet, the button's enabled state and the
+/// status line, and the button raises the clear request only while enabled.
+#[test]
+fn storage_tab_shows_the_controller_view() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("shown-config");
+    let data = root.path().join("shown-data");
+    for dir in [&config, &data.join("logs"), &data.join("scratch")] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(config.join("settings.toml"), "").unwrap();
+    let mut controller = AppController::new();
+    controller.install_recent(Vec::new(), config);
+    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_scratch_root_for_test(data.join("scratch"));
+
+    let view = controller.storage_view();
+    assert!(view.crashes.missing && !view.logs.missing && !view.scratch.missing);
+    let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = storage_window(&shared);
+    let tab = storage_tab(&app);
+
+    assert_eq!(
+        storage_row_texts(&tab),
+        [
+            view.settings_file.path.as_str(),
+            view.logs.path.as_str(),
+            view.crashes.path.as_str(),
+            "· not created yet",
+            view.scratch.path.as_str(),
+            "Deletes cached fuse stages.",
+        ]
+    );
+    assert!(view.crashes.path.contains("shown-data") && view.crashes.path.ends_with("crashes"));
+    let button = storage_button(&tab);
+    assert_eq!(button.accessible_label().as_deref(), Some("Clear cache"));
+    assert_eq!(button.accessible_enabled(), Some(true));
+    assert_eq!(storage_status_line(&tab), "");
+
+    let requested = std::rc::Rc::new(std::cell::Cell::new(0));
+    app.on_storage_clear_requested({
+        let requested = requested.clone();
+        move || requested.set(requested.get() + 1)
+    });
+    button.mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(requested.get(), 1, "an enabled button asks for the clear");
+
+    let mut state = app.get_storage();
+    state.clear_enabled = false;
+    state.status = "A run is active.".into();
+    state.status_tone = "warning".into();
+    app.set_storage(state);
+    assert_eq!(button.accessible_enabled(), Some(false));
+    assert_eq!(storage_status_line(&tab), "A run is active.");
+    button.mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(requested.get(), 1, "a disabled button asks for nothing");
+}
+
+/// With no config or data directory the rows read `Unavailable` and the
+/// scratch row keeps its path; a clear's result reaches the status line.
+#[test]
+fn storage_tab_shows_unresolved_locations_and_the_last_result() {
+    let scratch = tempfile::tempdir().unwrap();
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(scratch.path().to_path_buf());
+    controller.clear_stage_cache();
+    let view = controller.storage_view();
+    let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = storage_window(&shared);
+    let tab = storage_tab(&app);
+
+    assert_eq!(
+        storage_row_texts(&tab),
+        [
+            "Unavailable",
+            "Unavailable",
+            "Unavailable",
+            view.scratch.path.as_str(),
+            "Deletes cached fuse stages.",
+        ]
+    );
+    assert_eq!(storage_status_line(&tab), "Cleared 0 stage entries.");
+    assert_eq!(app.get_storage().status_tone.as_str(), "success");
+}
+
+/// The tab is layout over shared components: its sections, path rows and
+/// action row are the shared ones, and it styles nothing itself.
+#[test]
+fn storage_tab_composes_only_shared_components() {
+    let tab = ui_source("shell/settings_modal/storage_tab.slint");
+    for needle in [
+        " Text {",
+        "color:",
+        "font-",
+        "background",
+        "border-",
+        "Theme.status-",
+        "Theme.text-",
+        "Theme.surface-",
+    ] {
+        assert!(!tab.contains(needle), "the tab sets {needle:?}");
+    }
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsPathRow {",
+        "FFSettingsActionRow {",
     ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }

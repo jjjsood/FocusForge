@@ -23,7 +23,8 @@ use crate::canvas::{
 };
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, JobView, LocateTarget, OpenAs,
-    OpenOutcome, SettingsSection, ShellEvent, ShellMode, WindowChromeIntent, WindowTarget,
+    OpenOutcome, SettingsSection, ShellEvent, ShellMode, StoragePath, WindowChromeIntent,
+    WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -37,7 +38,7 @@ use crate::generated::{
     AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
     FFManifestRow, ImageRowView as GeneratedImageRow, PerformanceCap, PerformanceState,
     ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
-    SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    SectionHeadView, SettingsRow as GeneratedSettingsRow, StoragePathState, StorageState,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -1431,6 +1432,27 @@ fn push_performance(
     app.set_performance(state);
 }
 
+/// Rebuilds the Storage tab's whole view from the controller and pushes it
+/// into the window. The view is built under the controller lock and pushed
+/// after the guard drops.
+pub fn push_storage_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let view = controller.lock().unwrap().storage_view();
+    let path = |row: StoragePath| StoragePathState {
+        path: row.path.into(),
+        missing: row.missing,
+        available: row.available,
+    };
+    app.set_storage(StorageState {
+        settings_file: path(view.settings_file),
+        logs: path(view.logs),
+        crashes: path(view.crashes),
+        scratch: path(view.scratch),
+        clear_enabled: view.clear_enabled,
+        status: view.status.into(),
+        status_tone: view.status_tone.as_str().into(),
+    });
+}
+
 /// Pushes the crash notice's own two properties into the window -- mirrors
 /// [`push_diagnostics_view`] for the toast.
 pub fn push_crash_notice(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
@@ -1662,6 +1684,13 @@ fn start_job_timer(
         {
             // The finished run's backend line replaces the one on show.
             push_performance_view(&app, &controller);
+        }
+        if !live
+            && app.get_settings_open()
+            && app.get_settings_section().as_str() == SettingsSection::Storage.slug()
+        {
+            // The finished run lifts the clear's refusal.
+            push_storage_view(&app, &controller);
         }
         if !live && let Some(t) = timer_slot.borrow().as_ref() {
             t.stop();
@@ -2926,6 +2955,7 @@ pub fn install(
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_open(open);
                 push_performance_view(&app, &controller);
+                push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
                 repaint(&app, &controller, &canvas);
             }
@@ -2957,7 +2987,20 @@ pub fn install(
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_section(parsed.slug().into());
                 push_performance_view(&app, &controller);
+                push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
+            }
+        }
+    });
+    app.on_storage_clear_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().clear_stage_cache();
+            if let Some(app) = app_weak.upgrade() {
+                push_storage_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
             }
         }
     });

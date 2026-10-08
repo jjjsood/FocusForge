@@ -78,14 +78,16 @@ pub enum DockTab {
 pub enum SettingsSection {
     #[default]
     Performance,
+    Storage,
     InputMap,
     Diagnostics,
 }
 
 impl SettingsSection {
     /// Every section, in nav-rail order.
-    pub const ALL: [SettingsSection; 3] = [
+    pub const ALL: [SettingsSection; 4] = [
         SettingsSection::Performance,
+        SettingsSection::Storage,
         SettingsSection::InputMap,
         SettingsSection::Diagnostics,
     ];
@@ -94,6 +96,7 @@ impl SettingsSection {
     pub fn slug(self) -> &'static str {
         match self {
             SettingsSection::Performance => "performance",
+            SettingsSection::Storage => "storage",
             SettingsSection::InputMap => "input-map",
             SettingsSection::Diagnostics => "diagnostics",
         }
@@ -102,6 +105,95 @@ impl SettingsSection {
     /// The section whose [`slug`](Self::slug) is exactly `slug`.
     pub fn from_slug(slug: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|section| section.slug() == slug)
+    }
+}
+
+/// One location the Storage tab lists.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoragePath {
+    /// The path as shown, the home directory written `~`; empty when the
+    /// location did not resolve.
+    pub path: String,
+    /// The location resolved but does not exist yet.
+    pub missing: bool,
+    /// Whether the location resolved at all.
+    pub available: bool,
+}
+
+/// How a Storage tab status line is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageTone {
+    None,
+    Success,
+    Warning,
+    Failure,
+}
+
+impl StorageTone {
+    /// The tone name `FFStatusText` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageTone::None => "none",
+            StorageTone::Success => "success",
+            StorageTone::Warning => "warning",
+            StorageTone::Failure => "failure",
+        }
+    }
+}
+
+/// Everything the Storage tab shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageView {
+    pub settings_file: StoragePath,
+    pub logs: StoragePath,
+    pub crashes: StoragePath,
+    pub scratch: StoragePath,
+    /// Whether the clear button can be pressed.
+    pub clear_enabled: bool,
+    pub status: String,
+    pub status_tone: StorageTone,
+}
+
+/// Shown while a run is live and the clear is refused.
+const STORAGE_REFUSAL: &str = "A run is active.";
+
+/// An error's text without a trailing ` (os error N)` and a closing period,
+/// so a line built from it ends in exactly one period.
+fn plain_cause(text: &str) -> &str {
+    text.strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" (os error "))
+        .filter(|(_, code)| !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(text, |(head, _)| head)
+        .trim_end_matches('.')
+}
+
+/// The four locations a window session uses, from the directories it
+/// resolved. `home` only changes how a path is written, never which one.
+pub fn storage_view(
+    config_dir: Option<&Path>,
+    data_dir: Option<&Path>,
+    scratch_root: &Path,
+    home: Option<&Path>,
+) -> StorageView {
+    let row = |path: Option<PathBuf>| {
+        path.map_or_else(StoragePath::default, |path| StoragePath {
+            missing: !path.exists(),
+            available: true,
+            path: match home.and_then(|home| path.strip_prefix(home).ok()) {
+                Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+                Some(rest) => Path::new("~").join(rest).display().to_string(),
+                None => path.display().to_string(),
+            },
+        })
+    };
+    StorageView {
+        settings_file: row(config_dir.map(|dir| dir.join(crate::settings::FILE_NAME))),
+        logs: row(data_dir.map(focusforge_diagnostics::log_dir)),
+        crashes: row(data_dir.map(focusforge_diagnostics::crash_dir)),
+        scratch: row(Some(scratch_root.to_path_buf())),
+        clear_enabled: true,
+        status: String::new(),
+        status_tone: StorageTone::None,
     }
 }
 
@@ -1694,6 +1786,8 @@ pub struct AppController {
     /// [`Self::host_memory_cap_cursor_moved`] and [`Self::vram_cap_cursor_moved`].
     host_cap_scroll_x: f32,
     vram_cap_scroll_x: f32,
+    /// The Storage tab's newest clear result: its status line and tone.
+    storage_result: Option<(String, StorageTone)>,
     /// The blend kernel on the display device, handed to every edit session
     /// while the device is attached.
     blender: Option<Blender>,
@@ -6645,6 +6739,54 @@ impl AppController {
         view
     }
 
+    /// What the Storage tab shows: the four locations, whether the clear can
+    /// run, and the refusal while a run is live or else the newest result.
+    pub fn storage_view(&self) -> StorageView {
+        let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+        let mut view = storage_view(
+            self.state.config_dir.as_deref(),
+            self.state.diagnostics.data_dir.as_deref(),
+            &self.scratch_root(),
+            home.as_deref(),
+        );
+        if self.any_job_running() {
+            view.clear_enabled = false;
+            view.status = STORAGE_REFUSAL.to_string();
+            view.status_tone = StorageTone::Warning;
+        } else if let Some((status, tone)) = &self.storage_result {
+            view.status.clone_from(status);
+            view.status_tone = *tone;
+        }
+        view
+    }
+
+    /// Empties the stage cache and keeps the outcome for [`Self::storage_view`].
+    /// Does nothing while any run is live: a background tab's run reads and
+    /// writes the same cache.
+    pub fn clear_stage_cache(&mut self) {
+        if self.any_job_running() {
+            return;
+        }
+        self.storage_result = Some(match job::clear_stage_cache(&self.scratch_root()) {
+            Ok(1) => ("Cleared 1 stage entry.".to_string(), StorageTone::Success),
+            Ok(count) => (
+                format!("Cleared {count} stage entries."),
+                StorageTone::Success,
+            ),
+            Err(err) => {
+                tracing::warn!(error = %err, "the stage cache could not be cleared");
+                let cause = match &err {
+                    job::StageCacheError::Io { source, .. } => source.to_string(),
+                    job::StageCacheError::Json { source, .. } => source.to_string(),
+                };
+                (
+                    format!("Could not clear the cache: {}.", plain_cause(&cause)),
+                    StorageTone::Failure,
+                )
+            }
+        });
+    }
+
     /// The live run's own [`job::resolve_backend`] account, `None` before it
     /// has resolved or once the run has settled ([`Self::settle_job`] clears
     /// the observer).
@@ -8842,4 +8984,31 @@ fn notice_line(skipped: &[PathBuf]) -> Option<String> {
         skipped.len(),
         if skipped.len() == 1 { "" } else { "s" }
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_cause;
+
+    #[test]
+    fn plain_cause_drops_the_os_error_tail_and_a_closing_period() {
+        assert_eq!(
+            plain_cause("Permission denied (os error 13)"),
+            "Permission denied"
+        );
+        assert_eq!(
+            plain_cause("Access is denied. (os error 5)"),
+            "Access is denied"
+        );
+        assert_eq!(
+            plain_cause("expected value at line 1 column 1"),
+            "expected value at line 1 column 1"
+        );
+        assert_eq!(
+            plain_cause("unexpected end of file."),
+            "unexpected end of file"
+        );
+        assert_eq!(plain_cause("odd (os error x)"), "odd (os error x)");
+        assert_eq!(plain_cause("odd (os error )"), "odd (os error )");
+    }
 }

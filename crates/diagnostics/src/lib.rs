@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::prelude::*;
 
-pub use crash::rfc3339;
+pub use crash::{crash_dir, rfc3339};
 pub use native::run_monitor;
 use ring::Ring;
 use rotating::RotatingFile;
@@ -131,9 +131,14 @@ impl std::fmt::Display for NoFileSink {
     }
 }
 
+/// Where a data directory keeps its log files.
+pub fn log_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("logs")
+}
+
 fn open_file_sink(data_dir: Option<&Path>) -> Result<(RotatingFile, PathBuf), NoFileSink> {
     let data_dir = data_dir.ok_or(NoFileSink::NoDataDir)?;
-    let log_dir = data_dir.join("logs");
+    let log_dir = log_dir(data_dir);
     let log_path = log_dir.join("focusforge.jsonl");
     RotatingFile::open(&log_path, MAX_LOG_BYTES, KEEP_ROTATED)
         .map(|writer| (writer, log_path))
@@ -456,5 +461,22 @@ mod tests {
         assert!(!filter.would_enable("some_third_party_crate", &Level::INFO));
         assert!(filter.would_enable("focusforge_core", &Level::DEBUG));
         assert!(!filter.would_enable("focusforge_core", &Level::TRACE));
+    }
+
+    #[test]
+    fn the_log_file_opens_inside_log_dir() {
+        let data = tempfile::tempdir().unwrap();
+        let (_writer, path) = open_file_sink(Some(data.path()))
+            .map_err(|e| e.to_string())
+            .unwrap();
+        assert_eq!(path.parent(), Some(log_dir(data.path()).as_path()));
+        assert!(path.exists(), "{} was not created", path.display());
+    }
+
+    #[test]
+    fn log_dir_and_crash_dir_are_distinct_children_of_the_data_dir() {
+        let data = Path::new("/data/focusforge");
+        assert_eq!(log_dir(data), data.join("logs"));
+        assert_eq!(crash_dir(data), data.join("crashes"));
     }
 }

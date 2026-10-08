@@ -15,6 +15,7 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 use crate::crash::{crash_dir, read_dir_sorted, rfc3339};
+use crate::log_dir;
 
 /// What the home directory and the user name are replaced with.
 const HOME_PLACEHOLDER: &str = "[home]";
@@ -264,7 +265,7 @@ fn collect(options: &Options) -> (Vec<Entry>, Vec<String>) {
         return (entries, excluded);
     };
 
-    for (path, name) in read_dir_sorted(&data_dir.join("logs")) {
+    for (path, name) in read_dir_sorted(&log_dir(data_dir)) {
         if is_log_name(&name) {
             entries.push(Entry {
                 name: format!("logs/{name}"),
