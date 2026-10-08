@@ -906,6 +906,222 @@ fn settings_frame_sits_on_the_modal_panel() {
     }
 }
 
+/// The `{ ... }` body of the first element declared as `id := ` in `code`.
+fn element_block<'a>(code: &'a str, id: &str) -> &'a str {
+    let start = code
+        .find(&format!("{id} := "))
+        .unwrap_or_else(|| panic!("no element `{id}` in the source"));
+    let open = start + code[start..].find('{').expect("element without a body");
+    let mut depth = 0;
+    for (i, c) in code[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &code[open..open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after `{id}`");
+}
+
+/// The header height, the header's horizontal inset and the tabs' content
+/// inset are each written once, as geometry tokens, and read from there.
+#[test]
+fn settings_modal_reads_the_header_and_inset_tokens() {
+    let sources = settings_slint_sources();
+    let frame = &sources
+        .iter()
+        .find(|(path, _)| path.ends_with("shell/settings_modal.slint"))
+        .expect("the modal frame source")
+        .1;
+    for literal in ["60px", "59px"] {
+        assert!(
+            !frame.contains(literal),
+            "settings_modal.slint still writes {literal}"
+        );
+    }
+    for token in ["settings-header-height", "settings-header-inset-x"] {
+        assert!(
+            frame.contains(&format!("ShellGeometry.{token}")),
+            "settings_modal.slint must read ShellGeometry.{token}"
+        );
+    }
+
+    for (path, code) in &sources {
+        assert!(
+            !code.contains("Theme.space-4 + Theme.space-1"),
+            "{path} still spells a 20 px inset from theme spacing"
+        );
+        assert!(
+            !code.contains("padding-right: Theme.space-6"),
+            "{path} still spells the 24 px right inset from theme spacing"
+        );
+    }
+    for (path, code) in sources
+        .iter()
+        .filter(|(p, _)| p.contains("settings_modal/"))
+    {
+        let mut sides = vec!["left", "right", "top"];
+        if !path.ends_with("diagnostics_panel.slint") {
+            sides.push("bottom");
+        }
+        for side in sides {
+            assert!(
+                code.contains(&format!("ShellGeometry.settings-content-inset-{side}")),
+                "{path} must read the {side} content inset token"
+            );
+        }
+        for line in code
+            .lines()
+            .filter(|l| l.trim_start().starts_with("padding-"))
+        {
+            assert!(
+                !line.contains(" + ") && !line.contains("px"),
+                "{path}: padding sized by an expression or a literal: {line}"
+            );
+        }
+    }
+
+    let list = ui_source("components/ff_manifest_list.slint");
+    let value = element_block(&list, "value-text");
+    assert!(
+        !value.contains("width:") && !value.contains("overflow"),
+        "the value text must size to its text: {value}"
+    );
+    assert!(element_block(&list, "name-text").contains("overflow: elide"));
+}
+
+/// Every section's content host sits right of the rail and under the
+/// header, and its first section starts at the content inset.
+#[test]
+fn settings_tabs_keep_their_content_inset() {
+    for (width, height) in [(1440u32, 900u32), (1100, 700)] {
+        let px = (width as f32 - 680.0) / 2.0;
+        let py = (height as f32 - 520.0) / 2.0;
+        for (slug, _) in SETTINGS_TABS {
+            let app = app_at(width, height);
+            app.set_settings_open(true);
+            app.set_settings_section(slug.into());
+
+            assert_rect(
+                &app,
+                "FFSettingsModal::content",
+                (px + 190.0, py + 60.0, 490.0, 460.0),
+            );
+            let first = by_position(
+                ElementQuery::from_root(&app)
+                    .match_descendants()
+                    .match_type_name("FFSettingsSection"),
+            )
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{slug}: no FFSettingsSection"));
+            let (pos, size) = (first.absolute_position(), first.size());
+            let got = (pos.x, pos.y, size.width);
+            let expected = (px + 210.0, py + 76.0, 446.0);
+            assert!(
+                (got.0 - expected.0).abs() < EPS
+                    && (got.1 - expected.1).abs() < EPS
+                    && (got.2 - expected.2).abs() < EPS,
+                "{slug} at {width}x{height}: first section {got:?}, expected {expected:?}"
+            );
+        }
+    }
+}
+
+fn manifest_row_with(name: &str, value: &str, not_redacted: bool) -> focusforge_gui::FFManifestRow {
+    focusforge_gui::FFManifestRow {
+        name: name.into(),
+        value: value.into(),
+        not_redacted,
+    }
+}
+
+/// A manifest row's value keeps its whole text and sits at the clip area's
+/// right edge; the name takes the rest and never reaches under the value or
+/// the scrollbar, however long it is.
+#[test]
+fn manifest_list_value_is_never_clipped() {
+    let long_name = format!(
+        "crashes/crash-2026-09-18T09-03-12-{}.dmp",
+        "focusforge-gui-pid-48213".repeat(2)
+    );
+    assert!(long_name.chars().count() >= 70);
+    let rows = vec![
+        manifest_row_with("adapter.json", "1 KB", false),
+        manifest_row_with("crashes/crash-a.dmp", "2.4 MB · not redacted", true),
+        manifest_row_with("crashes/crash-b.dmp", "1023.9 MB · not redacted", true),
+        manifest_row_with(&long_name, "2.4 MB · not redacted", true),
+    ];
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("diagnostics".into());
+    app.set_diagnostics_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![manifest_row("one.json")])).into(),
+    );
+    let one_row_list = manifest_list_rect(&app);
+
+    app.set_diagnostics_manifest_content_height(px_for_rows(rows.len()));
+    app.set_diagnostics_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    assert_eq!(manifest_list_rect(&app), one_row_list);
+
+    let find = |id: &str| by_position(ElementQuery::from_root(&app).match_id(id));
+    let names = find("FFManifestList::name-text");
+    let values = find("FFManifestList::value-text");
+    assert_eq!((names.len(), values.len()), (4, 4));
+    let clip = rect(&app, "FFManifestList::clip-area");
+    let scrollbar = rect(&app, "FFManifestList::scrollbar");
+
+    let width = |i: usize| values[i].size().width;
+    assert!(
+        width(0) < 110.0 && 110.0 < width(1) && width(1) < width(2),
+        "value widths must follow their text: {} < 110 < {} < {}",
+        width(0),
+        width(1),
+        width(2)
+    );
+    assert!(
+        (width(1) - width(3)).abs() < EPS,
+        "the same text, the same width"
+    );
+
+    for (i, (name, value)) in names.iter().zip(&values).enumerate() {
+        let (n, v) = (name.absolute_position(), value.absolute_position());
+        let value_right = v.x + value.size().width;
+        assert!(
+            (n.x - clip.0).abs() < EPS,
+            "row {i}: name starts at {}, clip at {}",
+            n.x,
+            clip.0
+        );
+        assert!(
+            n.x + name.size().width <= v.x + EPS,
+            "row {i}: name ends at {} past the value at {}",
+            n.x + name.size().width,
+            v.x
+        );
+        assert!(
+            (value_right - (clip.0 + clip.2)).abs() < EPS,
+            "row {i}: value ends at {value_right}, clip area at {}",
+            clip.0 + clip.2
+        );
+        assert!(
+            scrollbar.0 >= value_right,
+            "row {i}: value ends at {value_right}, under the scrollbar at {}",
+            scrollbar.0
+        );
+    }
+}
+
+/// Content height of `rows` manifest rows: 18 px each, 8 px apart.
+fn px_for_rows(rows: usize) -> f32 {
+    18.0 * rows as f32 + 8.0 * rows.saturating_sub(1) as f32
+}
+
 /// A window on the Input map section, its rows filled from `controller` the
 /// way the running app fills them.
 fn input_map_window(width: u32, height: u32, controller: &AppController) -> AppWindow {

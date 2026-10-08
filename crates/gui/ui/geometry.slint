@@ -139,6 +139,14 @@ export global ShellGeometry {
     // then the gap above the first row.
     out property <length> settings-table-header-height: 18px;
     out property <length> settings-table-header-gap: 3px;
+    // The modal's header band, and the insets of the content under it: with
+    // `settings-content-width` they fill the content host's width.
+    out property <length> settings-header-height: 60px;
+    out property <length> settings-header-inset-x: 20px;
+    out property <length> settings-content-inset-left: 20px;
+    out property <length> settings-content-inset-right: 24px;
+    out property <length> settings-content-inset-top: 16px;
+    out property <length> settings-content-inset-bottom: 16px;
 
     // Two primitive sizes shared wherever something else needs to lay out
     // against them, rather than assuming the primitive's own literal.

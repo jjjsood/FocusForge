@@ -1149,8 +1149,10 @@ fn input_map_tab_uses_only_shared_settings_components() {
     );
     for import in tab.lines().filter(|line| line.starts_with("import ")) {
         assert!(
-            import.contains("\"../../components/") || import.contains("\"../../theme.slint\""),
-            "the tab imports only shared components and the theme: {import}"
+            import.contains("\"../../components/")
+                || import.contains("\"../../theme.slint\"")
+                || import.contains("\"../../geometry.slint\""),
+            "the tab imports only shared components, the theme and the geometry: {import}"
         );
     }
     for shared in ["FFSettingsSection {", "FFInputTableRow {"] {

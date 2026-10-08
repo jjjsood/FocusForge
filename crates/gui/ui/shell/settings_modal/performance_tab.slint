@@ -41,10 +41,10 @@ export component FFPerformanceTab inherits Rectangle {
     callback vram-cap-cursor-moved(length, length);
 
     VerticalLayout {
-        padding-left: Theme.space-4 + Theme.space-1;
-        padding-right: Theme.space-6;
-        padding-top: Theme.space-4;
-        padding-bottom: Theme.space-4;
+        padding-left: ShellGeometry.settings-content-inset-left;
+        padding-right: ShellGeometry.settings-content-inset-right;
+        padding-top: ShellGeometry.settings-content-inset-top;
+        padding-bottom: ShellGeometry.settings-content-inset-bottom;
         spacing: ShellGeometry.settings-section-gap;
         alignment: start;
 

@@ -4,6 +4,7 @@
 // frame -- header, nav rail and content host -- over one tab per section.
 
 import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
 import { FFModalPanel } from "../components/ff_modal_panel.slint";
 import { FFHeading } from "../components/ff_heading.slint";
 import { FFDivider } from "../components/ff_divider.slint";
@@ -66,7 +67,7 @@ export component FFSettingsModal inherits FFModalPanel {
         x: 0px;
         y: 0px;
         height: root.panel-height;
-        header-inset: 60px;
+        header-inset: ShellGeometry.settings-header-height;
 
         FFNavRailEntry {
             label: "Performance";
@@ -101,30 +102,30 @@ export component FFSettingsModal inherits FFModalPanel {
     }
 
     FFHeading {
-        x: Theme.space-4 + Theme.space-1;
+        x: ShellGeometry.settings-header-inset-x;
         y: 0px;
-        height: 60px;
+        height: ShellGeometry.settings-header-height;
         text: "Settings";
     }
 
     header-rule := FFDivider {
         x: 0px;
-        y: 59px;
+        y: ShellGeometry.settings-header-height - self.height;
         width: root.panel-width;
     }
 
     close := FFIconButton {
-        x: root.panel-width - Theme.space-4 - Theme.space-1 - Theme.icon-md - self.pad;
-        y: (60px - self.height) / 2;
+        x: root.panel-width - ShellGeometry.settings-header-inset-x - Theme.icon-md - self.pad;
+        y: (ShellGeometry.settings-header-height - self.height) / 2;
         icon: @image-url("../../../../assets/icons/x.svg");
         triggered => { root.settings-close-requested(); }
     }
 
     content := Rectangle {
         x: rail.width;
-        y: 60px;
+        y: ShellGeometry.settings-header-height;
         width: root.panel-width - rail.width;
-        height: root.panel-height - 60px;
+        height: root.panel-height - ShellGeometry.settings-header-height;
 
         if root.settings-section == "diagnostics": FFDiagnosticsPanel {
             width: 100%;

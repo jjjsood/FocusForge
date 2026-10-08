@@ -927,6 +927,7 @@ export component ThemeSheet inherits Window {
         HorizontalLayout {
             spacing: Theme.space-4;
             FFManifestList {
+                height: 170px;
                 rows: [
                     { name: "diagnostics.log", value: "412 KB", not-redacted: false },
                     { name: "diagnostics.log.1", value: "1.0 MB", not-redacted: false },
@@ -935,6 +936,11 @@ export component ThemeSheet inherits Window {
                     {
                         name: "crash-2026-09-18T09-03-12.dmp",
                         value: "8.2 MB · not redacted",
+                        not-redacted: true,
+                    },
+                    {
+                        name: "crashes/crash-2026-09-18T09-03-12-focusforge-gui-pid-48213-thread-main.dmp",
+                        value: "2.4 MB · not redacted",
                         not-redacted: true,
                     },
                 ];
