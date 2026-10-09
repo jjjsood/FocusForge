@@ -15,6 +15,8 @@ use focusforge_core::io::{
     ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
     all_frame_paths, classify_header, has_extension, is_frame_path,
 };
+use focusforge_core::params::ParamValues;
+use focusforge_core::project::Project;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -107,7 +109,7 @@ fn verbosity(cli: &Cli) -> i8 {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print TIFF or RAW metadata for a file, or for every frame in a directory.
+    /// Print project, TIFF or RAW metadata for a file, or for every frame in a directory.
     Info {
         /// Path to a file or directory.
         path: PathBuf,
@@ -794,6 +796,24 @@ struct InfoReport {
     files: Vec<FileReport>,
 }
 
+/// The `info --json` document for a saved project.
+#[derive(Serialize)]
+struct ProjectInfoReport {
+    path: String,
+    bytes: u64,
+    producer: String,
+    created_at: i64,
+    checkpoint_id: String,
+    checkpoint_label: Option<String>,
+    algorithm: String,
+    params: ParamValues,
+    width: u32,
+    height: u32,
+    channels: u32,
+    source_count: usize,
+    visible_checkpoint_count: usize,
+}
+
 fn byte_order_str(order: ByteOrder) -> &'static str {
     match order {
         ByteOrder::Little => "II",
@@ -811,6 +831,10 @@ fn info(path: &Path, json: bool) -> ExitCode {
         Ok(metadata) => metadata,
         Err(err) => return fail(format!("cannot read {}: {err}", path.display())),
     };
+
+    if metadata.is_file() && has_extension(path, &["ffp"]) {
+        return info_project(path, metadata.len(), json);
+    }
 
     let is_directory = metadata.is_dir();
     let paths: Vec<PathBuf> = if is_directory {
@@ -841,6 +865,76 @@ fn info(path: &Path, json: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn info_project(path: &Path, bytes: u64, json: bool) -> ExitCode {
+    let project = match Project::open(path) {
+        Ok(project) => project,
+        Err(err) => {
+            return fail_with_code(
+                format!("cannot inspect {}: {err}", path.display()),
+                history::exit_code_for(&err),
+            );
+        }
+    };
+    let checkpoint = project.checkpoint();
+    let fused = match project.fuse_state(&checkpoint.id) {
+        Ok(fused) => fused,
+        Err(err) => {
+            return fail_with_code(
+                format!("cannot inspect {}: {err}", path.display()),
+                history::exit_code_for(&err),
+            );
+        }
+    };
+    let report = ProjectInfoReport {
+        path: path.display().to_string(),
+        bytes,
+        producer: project.manifest().producer.clone(),
+        created_at: project.manifest().created_at,
+        checkpoint_id: checkpoint.id.clone(),
+        checkpoint_label: checkpoint.label.clone(),
+        algorithm: checkpoint.algorithm.clone(),
+        params: checkpoint.params.clone(),
+        width: fused.composite.width,
+        height: fused.composite.height,
+        channels: fused.composite.samples_per_pixel,
+        source_count: project.manifest().sources.len(),
+        visible_checkpoint_count: project.history().visible().len(),
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        let params = match serde_json::to_string(&report.params) {
+            Ok(params) => params,
+            Err(err) => return fail(format!("failed to serialize parameters: {err}")),
+        };
+        print_project_human(&report, &params);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_project_human(report: &ProjectInfoReport, params: &str) {
+    println!("{}", report.path);
+    println!("  bytes: {}", report.bytes);
+    println!("  producer: {}", report.producer);
+    println!("  created_at: {}", report.created_at);
+    println!("  checkpoint: {}", report.checkpoint_id);
+    println!(
+        "  checkpoint label: {}",
+        report.checkpoint_label.as_deref().unwrap_or("none")
+    );
+    println!("  algorithm: {}", report.algorithm);
+    println!("  params: {params}");
+    println!("  width: {}", report.width);
+    println!("  height: {}", report.height);
+    println!("  channels: {}", report.channels);
+    println!("  sources: {}", report.source_count);
+    println!("  visible checkpoints: {}", report.visible_checkpoint_count);
 }
 
 fn is_raw_path(path: &Path) -> bool {

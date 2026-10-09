@@ -102,13 +102,15 @@ CPU and `--cpu` does not exist as a flag.
 
 ```bash
 target/release/focusforge-cli info path/to/frames/
+target/release/focusforge-cli info path/to/project.ffp
 ```
 
-Prints one block per frame in the directory. TIFF entries show size, depth,
-byte order, compression and strip layout;
-RAW entries show decoder metadata without developing pixels. The report ends
-with a frame count, total size and a uniform-layout verdict. Add `--json` for
-the same report as machine-readable JSON.
+For a project file, prints stored project facts after structural and head
+Z-Map validation without reading source frames. For a directory, prints one
+block per frame. TIFF entries show size, depth, byte order, compression and
+strip layout; RAW entries show decoder metadata without developing pixels. The
+report ends with a frame count, total size and a uniform-layout verdict. Add
+`--json` for the same report as machine-readable JSON.
 
 RAW frames use `rawler` as the only decoder. Files it cannot read return an
 error; there is no decoder fallback.

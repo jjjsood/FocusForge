@@ -55,13 +55,18 @@ next run prints a one-line notice before doing anything else — see
 focusforge-cli info [--json] <PATH>
 ```
 
-Prints TIFF or RAW metadata for a single file, or for every matching file directly inside a
+Prints saved-project facts, TIFF metadata or RAW metadata for a single file, or for every matching file directly inside a
 directory (or inside a `frames/` subdirectory of it, when that exists).
 TIFF entries use `.tif`/`.tiff`; RAW entries use the extensions supported by
 the bundled decoder. Extensions are matched case-insensitively and entries are
-not recursed into further. `info` reads headers only — it never opens a tile
-or develops a pixel, which is why it can report on the 16 GB, 62-file reference stack
+not recursed into further. For TIFF and RAW, `info` reads headers only — it
+never opens a tile or develops a pixel, which is why it can report on the 16 GB, 62-file reference stack
 in well under a second.
+
+For a regular `.ffp` file, `info` reports the stored producer, creation time,
+head checkpoint, fusion settings, composite shape, source count and visible
+checkpoint count. It validates the project structure and head Z-Map hash, but
+does not read source frames or render a composite.
 
 `PATH` may be a single file or a directory:
 

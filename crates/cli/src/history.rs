@@ -80,7 +80,7 @@ pub fn run(command: HistoryCommand) -> ExitCode {
 /// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a
 /// dangling parent, a parent cycle, a fingerprint disagreement, ops with no
 /// parent to record them against). Anything else stays the generic 1.
-fn exit_code_for(err: &ProjectError) -> u8 {
+pub(crate) fn exit_code_for(err: &ProjectError) -> u8 {
     match err {
         ProjectError::NotAProject { .. } => 3,
         ProjectError::Truncated { .. } => 4,
