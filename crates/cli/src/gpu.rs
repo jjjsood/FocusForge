@@ -94,13 +94,13 @@ fn announce_align_backend(line: &str) {
 }
 
 fn announce_align_backend_quiet(line: &str) {
-    if should_print_align_announcement(line, true) {
+    if should_print_align_announcement(line) {
         eprintln!("{line}");
     }
 }
 
-fn should_print_align_announcement(line: &str, quiet: bool) -> bool {
-    !quiet || !line.starts_with("alignment offloads")
+fn should_print_align_announcement(line: &str) -> bool {
+    !line.starts_with("alignment offloads")
 }
 
 #[cfg(test)]
@@ -110,16 +110,14 @@ mod tests {
     #[test]
     fn quiet_suppresses_the_successful_lazy_adapter_announcement() {
         assert!(!should_print_align_announcement(
-            "alignment offloads large levels to test adapter; device budget 1 bytes",
-            true
+            "alignment offloads large levels to test adapter; device budget 1 bytes"
         ));
     }
 
     #[test]
     fn quiet_retains_a_lazy_adapter_fallback_reason() {
         assert!(should_print_align_announcement(
-            "GPU adapter unavailable; continuing on the CPU",
-            true
+            "GPU adapter unavailable; continuing on the CPU"
         ));
     }
 }
