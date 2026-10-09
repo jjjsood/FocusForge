@@ -497,10 +497,10 @@ prevent.
 }
 ```
 
-This run softened alignment failures to an identity fallback, which is why
+This run uses the default identity fallback, which is why
 `align.failure_count` is nonzero and one alignment's `status` is
 `"diverged"` yet the run still completed — see
-[`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default).
+[`guide/alignment.md`](../guide/alignment.md#registration-failures-use-identity-fallback).
 
 ## `align`
 
@@ -536,7 +536,7 @@ exit 1, naming every failed frame.
 ```
 $ focusforge-cli align path/to/frames --algorithm pyramidal-ecc
 path/to/frames (8 frames)
-pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=strict failures=0)
+pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=lax failures=0)
 rho = ECC correlation in [-1, 1], not a pixel distance
 00.tif    tx=+12.41 ty=-3.07 scale=1.000842 rot=+0.0131deg  converged iters=12 rho=0.9814
 ...
