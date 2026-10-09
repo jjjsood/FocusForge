@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import hashlib
 import json
 import os
@@ -12,10 +13,10 @@ import time
 
 import numpy as np
 
-from . import focus_score, fusion
+from . import focus_score, fusion, index_field
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import _twin_disagreements, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context
+from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack
 
 
 def _digest(value: np.ndarray) -> str:
@@ -30,6 +31,72 @@ def _render_cases(root: Path, seed: SeedTriple, allow_holdout: bool, prepare: ob
             case, _data, _paths = prepare(root, family.name, member, seed, allow_holdout)
             written.append(str(case))
     return written
+
+
+def _frozen_index_calibration(document: dict[str, object]) -> dict[str, object]:
+    """Return calibration values frozen into the execution registration."""
+    calibration = document.get("calibration")
+    if not isinstance(calibration, dict) or calibration.get("state") != "measured":
+        raise ValueError("registration does not contain frozen index-field calibration")
+    thresholds = calibration.get("thresholds")
+    if not isinstance(thresholds, dict) or set(thresholds) != {"1", "2", "4"}:
+        raise ValueError("registration calibration thresholds are invalid")
+    try:
+        if (int(calibration["eligible_count"]) < 1 or not isinstance(calibration["raw_score_digest"], str)
+                or len(calibration["raw_score_digest"]) != 64):
+            raise ValueError
+        normalized = {key: float(value) for key, value in thresholds.items()}
+        if any(not math.isfinite(value) or value <= 0.0 for value in normalized.values()):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("registration calibration values are invalid") from error
+    return {**calibration, "thresholds": normalized}
+
+
+def _validate_index_command(registration_path: Path, runs: Path, allowances: Path, source: str | None,
+                            prepared: Path | None, rect: str | None, require_calibration: bool) -> dict[str, object]:
+    """Reject incomplete field-experiment bindings before output creation."""
+    if not registration_path.is_file() or not (runs / "baseline.json").is_file() or not allowances.is_file():
+        raise ValueError("--registration, --runs baseline.json, and --allowances are required")
+    try:
+        document = json.loads(registration_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError("registration is not valid JSON") from error
+    if document.get("arm") != "index-field" or document.get("execution_ready") is not True:
+        raise ValueError("registration does not authorize index-field execution")
+    package = Path(__file__).parent
+    names = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py")
+    current = {f"spikes/stacking_experiments/{name}": hashlib.sha256((package / name).read_bytes()).hexdigest() for name in names}
+    if document.get("execution_module_sha256") != current:
+        raise ValueError("registration does not bind the current index-field implementation")
+    if hashlib.sha256((runs / "baseline.json").read_bytes()).hexdigest() != document.get("baseline_sha256"):
+        raise ValueError("baseline records do not match the registration")
+    focus_score._validate_baseline_inputs(runs / "baseline.json")
+    if hashlib.sha256(allowances.read_bytes()).hexdigest() != document.get("allowances_sha256"):
+        raise ValueError("allowances do not match the registration")
+    if source is None:
+        if prepared is not None or rect is not None:
+            raise ValueError("--prepared and --rect require --source stack")
+    elif prepared is None or not prepared.is_file() or rect not in (None, "1878,1056,1024,1024"):
+        raise ValueError("--source stack requires the registered preparation manifest and rectangle")
+    else:
+        _validate_preparation(prepared, source)
+        real = document.get("real_preparation")
+        if not isinstance(real, dict) or real.get("manifest_sha256") != hashlib.sha256(prepared.read_bytes()).hexdigest():
+            raise ValueError("preparation manifest does not match the registration")
+    configurations, controls = document.get("configurations"), document.get("controls")
+    if not isinstance(configurations, list) or not isinstance(controls, list):
+        raise ValueError("registration configuration shape is invalid")
+    expected_controls = {"C0", "C0r", "N1"}
+    if {item.get("rung") for item in controls if isinstance(item, dict)} != expected_controls:
+        raise ValueError("registration control ladder is invalid")
+    if len(configurations) != 12 or any(not isinstance(item, dict) or item.get("rung") not in {"A1", "A2", "A3", "A4"}
+                                      or item.get("threshold_multiplier") not in (1, 2, 4) or item.get("smoothing_radius") != 5
+                                      for item in configurations):
+        raise ValueError("registration candidate ladder is invalid")
+    if require_calibration:
+        _frozen_index_calibration(document)
+    return document
 
 
 def self_check(allowances: Path | None = None) -> int:
@@ -128,6 +195,10 @@ def self_check(allowances: Path | None = None) -> int:
         print(f"focus score {name}: ok")
     for name in focus_configuration_checks():
         print(f"focus score {name}: ok")
+    for name in index_field.self_checks():
+        print(f"{name}: ok")
+    for check in index_field_tile_checks():
+        print(f"{check['name']}: ok {json.dumps(check, sort_keys=True)}")
     if allowances is None:
         print("detectors: allowances required")
     else:
@@ -176,6 +247,18 @@ def main(argv: list[str] | None = None) -> int:
     focus.add_argument("--source", choices=("stack",))
     focus.add_argument("--prepared")
     focus.add_argument("--rect")
+    index = sub.add_parser("index-field")
+    index.add_argument("--split", choices=("training",), default="training")
+    index.add_argument("--registration", required=True)
+    index.add_argument("--runs", required=True)
+    index.add_argument("--allowances", required=True)
+    index.add_argument("--out", required=True)
+    index.add_argument("--family")
+    index.add_argument("--replay-only", action="store_true")
+    index.add_argument("--calibration-only", action="store_true")
+    index.add_argument("--source", choices=("stack",))
+    index.add_argument("--prepared")
+    index.add_argument("--rect")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -211,6 +294,50 @@ def main(argv: list[str] | None = None) -> int:
                                                                "support_controls": focus_score.radius10_support_checks(), "stack": stack,
                                                                "budget": budget}, indent=2, sort_keys=True) + "\n")
         print(f"replay records: {len(records)}")
+        return 0
+    if args.command == "index-field":
+        registration_path, runs, allowances = Path(args.registration), Path(args.runs), Path(args.allowances)
+        try:
+            document = _validate_index_command(registration_path, runs, allowances, args.source,
+                                               Path(args.prepared) if args.prepared else None, args.rect,
+                                               not args.replay_only and not args.calibration_only)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.family and args.family not in {family.name for family in FAMILIES if family.fusion_baseline}:
+            parser.error("--family must name a registered fusion family")
+        if args.calibration_only and document.get("calibration", {}).get("state") == "measured":
+            parser.error("registration already contains frozen index-field calibration")
+        started = time.monotonic()
+        budget = {"session_cap_seconds": 7200, "total_cap_seconds": 21600, "total_enforcement": "external aggregate",
+                  "started_monotonic": started, "exhausted": False}
+        output = Path(args.out)
+        if args.calibration_only:
+            output.mkdir(parents=True, exist_ok=True)
+            calibration = index_calibration(runs)
+            (output / "calibration.json").write_text(json.dumps(calibration, indent=2, sort_keys=True) + "\n")
+            replay, candidates, stack, full_references = [], [], None, []
+        else:
+            replay = index_replay_controls(runs)
+            output.mkdir(parents=True, exist_ok=True)
+            configurations = document["controls"] + document["configurations"]
+            calibration = _frozen_index_calibration(document) if not args.replay_only else None
+        if args.replay_only:
+            calibration, candidates, stack, full_references = None, [], None, []
+        elif args.calibration_only:
+            pass
+        elif args.source == "stack":
+            stack = run_index_stack(output, args.source, Path(args.prepared), args.rect, configurations, calibration)
+            candidates, full_references = stack["rows"], []
+        else:
+            candidates = run_index_configurations(runs, output, configurations, allowances, calibration, budget, args.family)
+            stack = None
+            full_references = [] if args.family else run_index_full_references(runs, output, configurations, calibration, budget)
+        budget["measured_seconds"] = time.monotonic() - started
+        (output / "comparison.json").write_text(json.dumps({"command": sys.argv if argv is None else [sys.argv[0], *argv],
+            "registration_sha256": hashlib.sha256(registration_path.read_bytes()).hexdigest(), "replay": replay,
+            "calibration": calibration, "candidate_rows": candidates, "full_reference_rows": full_references,
+            "stack": stack, "budget": budget}, indent=2, sort_keys=True) + "\n")
+        print(f"replay records: {len(replay)}")
         return 0
     if args.command == "baseline":
         root = Path(args.out)

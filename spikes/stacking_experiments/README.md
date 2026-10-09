@@ -6,6 +6,7 @@ Run from the repository root:
 python3 -m spikes.stacking_experiments --self-check
 python3 -m spikes.stacking_experiments registration --out .scratch/stacking-controls/registration/protocol.json
 python3 -m spikes.stacking_experiments focus-score --split training --registration /path/to/protocol.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/focus-score/replay
+python3 -m spikes.stacking_experiments index-field --split training --registration /path/to/index-field-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/index-field/replay
 python3 -m spikes.stacking_experiments baseline --split training --out .scratch/stacking-controls
 python3 -m spikes.stacking_experiments cases --seed 101,201,301 --out .scratch/stacking-controls
 python3 -m spikes.stacking_experiments cases --seed 111,211,311 --out .scratch/sealed-check
@@ -23,3 +24,5 @@ The hold-out command without `--allow-holdout` intentionally exits nonzero befor
 The registration command records six scene families, three independent seed axes, metrics, allowance procedure, and advancement rules. CPU baseline runs record host RSS; VRAM is recorded as not used. Cold and warm labels are used only when measured.
 
 `focus-score` validates the frozen comparison registration and inputs before creating output. A bound execution hash is required before a replay or comparison can run.
+
+`index-field` validates its own execution registration before writing output. Its replay mode checks the retained current Depth Map rows; a normal training run records the one frozen flat-noise calibration, controls, field arrays, rounded labels, and image measurements. `--family` restricts a focused training run to one registered family.

@@ -21,7 +21,7 @@ from typing import Iterable
 import numpy as np
 import PIL
 
-from . import fusion, metrics
+from . import fusion, index_field, metrics
 from .protocol import FAMILIES, FRAME_COUNT, REAL_CROPS, TRAINING_SEEDS, SeedTriple, require_seed
 from .scenes import SceneData, family_members, render_family
 
@@ -51,7 +51,7 @@ def provenance(inputs: Iterable[Path]) -> dict[str, object]:
     """Capture stable local executable and interpreter identifiers."""
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     cli = ROOT / "target" / "debug" / "focusforge-cli"
-    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py")
+    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py")
     cpu_model = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), platform.processor())
     return {"revision": revision, "cli_sha256": sha256_path(cli) if cli.exists() else None,
             "input_sha256": {path.name: sha256_path(path) for path in inputs},
@@ -977,6 +977,316 @@ def run_focus_stack(root: Path, source: str, prepared: Path, rect_text: str | No
             "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"], "coverage": coverage_proof,
             "input_sha256": {path.name: sha256_path(path) for path in inputs}, "rows": rows, "montages": montages,
             "wall_seconds": time.monotonic() - started, "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+
+
+def index_calibration(root: Path) -> dict[str, object]:
+    """Measure the registered flat-noise p99 once before field candidates."""
+    rows = json.loads((root / "baseline.json").read_text())
+    row = next(item for item in rows if item["repeat"] == 0 and item["method"] == "depth-map"
+               and item["family"] == "flat-noise" and item["member"] == "noise-250"
+               and item["seed"] == TRAINING_SEEDS[0].text() and item["tile"] == 512)
+    frames, coverage = _focus_inputs(row)
+    inputs = index_field.field_inputs(frames, coverage)
+    family = next(item for item in FAMILIES if item.name == "flat-noise")
+    data = render_family(family, TRAINING_SEEDS[0], "noise-250")
+    y0, y1, x0, x1 = data.metadata["flat"]
+    region = np.where(inputs.eligibility[:, y0 + 8:y1 - 8, x0 + 8:x1 - 8], inputs.raw_scores[:, y0 + 8:y1 - 8, x0 + 8:x1 - 8], -np.inf)
+    values = np.max(region, axis=0)
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        raise ValueError("calibration noise interior has no eligible raw-score samples")
+    p99 = float(np.percentile(finite, 99, method="linear"))
+    return {"family": "flat-noise", "member": "noise-250", "seed": TRAINING_SEEDS[0].text(),
+            "region_yx": [y0 + 8, y1 - 8, x0 + 8, x1 - 8], "eligible_count": int(finite.size),
+            "raw_score_digest": sha256(finite.astype(np.float32).tobytes()).hexdigest(), "p99": p99,
+            "method": "linear", "thresholds": {str(multiplier): p99 * multiplier for multiplier in (1, 2, 4)}}
+
+
+def _index_tiled(frames: np.ndarray, coverage: np.ndarray | None, threshold: float, rung: str,
+                 plan: dict[str, object]) -> index_field.FieldResult:
+    """Build a field per recorded halo tile without changing the fixed margin."""
+    vertical, horizontal, margin = list(plan["vertical"]), list(plan["horizontal"]), int(plan["margin"])
+    if not vertical and not horizontal:
+        return index_field.build_field(frames, coverage, threshold, rung)
+    height, width = frames.shape[1:3]
+    composite = np.zeros_like(frames[0], dtype=np.uint16)
+    field = np.zeros((height, width), dtype=np.float32)
+    trusted = np.zeros((height, width), dtype=bool)
+    filled = np.zeros((height, width), dtype=bool)
+    unresolved = np.zeros((height, width), dtype=bool)
+    fallback = np.zeros((height, width), dtype=bool)
+    no_source = np.zeros((height, width), dtype=bool)
+    for y0, y1 in zip(_tile_edges(height, horizontal), _tile_edges(height, horizontal)[1:]):
+        for x0, x1 in zip(_tile_edges(width, vertical), _tile_edges(width, vertical)[1:]):
+            oy0, oy1, ox0, ox1 = max(0, y0 - margin), min(height, y1 + margin), max(0, x0 - margin), min(width, x1 + margin)
+            crop_coverage = None if coverage is None else coverage[:, oy0:oy1, ox0:ox1]
+            result = index_field.build_field(frames[:, oy0:oy1, ox0:ox1], crop_coverage, threshold, rung)
+            local_y, local_x = slice(y0 - oy0, y1 - oy0), slice(x0 - ox0, x1 - ox0)
+            target = np.s_[y0:y1, x0:x1]
+            composite[target], field[target] = result.composite[local_y, local_x], result.field[local_y, local_x]
+            trusted[target], filled[target], unresolved[target] = result.trusted[local_y, local_x], result.filled[local_y, local_x], result.unresolved[local_y, local_x]
+            fallback[target], no_source[target] = result.adjacent_fallback[local_y, local_x], result.no_source[local_y, local_x]
+    return index_field.FieldResult(composite, field, trusted, filled, unresolved, fallback, no_source)
+
+
+def index_replay_controls(root: Path) -> list[dict[str, object]]:
+    """Require exact C0 replay on the 60 retained Depth Map rows."""
+    rows = json.loads((root / "baseline.json").read_text())
+    records = []
+    for row in (item for item in rows if item["repeat"] == 0 and item["method"] == "depth-map"):
+        frames, coverage = _focus_inputs(row)
+        result = index_field.build_field(frames, coverage, 0.0, "C0")
+        image, zmap = gff.read_u16(Path(str(row["composite"]))), gff.read_zmap(Path(str(row["zmap"])))
+        delta = np.abs(result.composite.astype(np.int64) - image.astype(np.int64))
+        if delta.max() != 0 or not np.array_equal(np.rint(result.field).astype(np.uint16), zmap):
+            raise AssertionError(f"index C0 replay mismatch: {row['family']}/{row['member']} {row['seed']} t{row['tile']}")
+        records.append({"family": row["family"], "member": row["member"], "seed": row["seed"], "tile": row["tile"],
+                        "image_max_abs": 0, "zmap_equal": True})
+    if len(records) != 60:
+        raise AssertionError(f"expected 60 depth-map replay rows, got {len(records)}")
+    return records
+
+
+def index_field_tile_checks() -> list[dict[str, int | str]]:
+    """Exercise forced tiled field construction without asserting false parity."""
+    random = np.random.default_rng(2703)
+    frames = random.integers(0, 65536, size=(2, 96, 96, 3), dtype=np.uint16)
+    coverage = np.ones(frames.shape[:3], dtype=bool)
+    coverage[:, 40:56, 40:56] = False
+    plan = tile_boundaries(96, 96, 64, 16, 1)
+    whole = index_field.build_field(frames, coverage, 0.0, "A3")
+    tiled = _index_tiled(frames, coverage, 0.0, "A3", plan)
+    delta = np.abs(whole.composite.astype(np.int64) - tiled.composite.astype(np.int64))
+    untrusted = _index_tiled(frames, np.ones_like(coverage), float("inf"), "A3", plan)
+    c0 = _index_tiled(frames, np.ones_like(coverage), 0.0, "C0", plan)
+    if not np.array_equal(untrusted.composite, c0.composite) or not untrusted.unresolved.all():
+        raise AssertionError("forced tiled unresolved fallback control failed")
+    all_unknown = _index_tiled(frames, np.zeros_like(coverage), 0.0, "A3", plan)
+    if not all_unknown.no_source.all() or all_unknown.composite.any():
+        raise AssertionError("forced tiled all-unknown control failed")
+    ramp = np.add.outer(np.arange(96, dtype=np.float32), np.arange(96, dtype=np.float32))
+    trusted = np.ones((96, 96), dtype=bool)
+    trusted[40:56, 40:56] = False
+    ramp_whole = index_field.fill_indices(ramp, trusted)
+    ramp_tiled = np.zeros_like(ramp)
+    for y0, y1 in zip(_tile_edges(96, list(plan["horizontal"])), _tile_edges(96, list(plan["horizontal"]))[1:]):
+        for x0, x1 in zip(_tile_edges(96, list(plan["vertical"])), _tile_edges(96, list(plan["vertical"]))[1:]):
+            oy0, oy1, ox0, ox1 = max(0, y0 - 16), min(96, y1 + 16), max(0, x0 - 16), min(96, x1 + 16)
+            filled = index_field.fill_indices(ramp[oy0:oy1, ox0:ox1], trusted[oy0:oy1, ox0:ox1])
+            ramp_tiled[y0:y1, x0:x1] = filled.field[y0 - oy0:y1 - oy0, x0 - ox0:x1 - ox0]
+    ramp_delta = np.abs(ramp_whole.field - ramp_tiled)
+    return [{"name": "index-field-forced-tile", "max_abs": int(delta.max()),
+             "different_samples": int((delta != 0).sum()), "field_different_pixels": int((whole.field != tiled.field).sum()),
+             "ramp_hole_max_abs": float(ramp_delta[40:56, 40:56].max()),
+             "vertical_origins": ",".join(str(value) for value in plan["vertical"]),
+             "horizontal_origins": ",".join(str(value) for value in plan["horizontal"]), "margin": int(plan["margin"])}]
+
+
+def _field_partitions(result: index_field.FieldResult, depth: np.ndarray, truth_support: np.ndarray) -> dict[str, object]:
+    output: dict[str, object] = {}
+    for name, mask in (("trusted", result.trusted), ("filled", result.filled), ("unresolved", result.unresolved)):
+        mask = mask & ~result.no_source & truth_support
+        values = np.abs(result.field[mask] - depth[mask])
+        output[name] = ({"count": int(values.size), "mean_abs": float(values.mean()),
+                         "p90_abs": float(np.percentile(values, 90, method="linear"))}
+                        if values.size else {"count": 0, "mean_abs": None, "p90_abs": None, "reason": "empty partition"})
+    return output
+
+
+def _index_tile_phase(row: dict[str, object], plan: dict[str, object], height: int, width: int) -> dict[str, object]:
+    origin = row.get("global_origin_xy", [0, 0])
+    if not isinstance(origin, list) or len(origin) != 2:
+        origin = [0, 0]
+    margin = int(plan["margin"])
+    reads = []
+    for y0, y1 in zip(_tile_edges(height, list(plan["horizontal"])), _tile_edges(height, list(plan["horizontal"]))[1:]):
+        for x0, x1 in zip(_tile_edges(width, list(plan["vertical"])), _tile_edges(width, list(plan["vertical"]))[1:]):
+            ox0, oy0 = max(0, x0 - margin), max(0, y0 - margin)
+            ox1, oy1 = min(width, x1 + margin), min(height, y1 + margin)
+            global_x, global_y = int(origin[0]) + ox0, int(origin[1]) + oy0
+            reads.append({"global_xywh": [global_x, global_y, ox1 - ox0, oy1 - oy0],
+                          "phase_xy": [global_x % 8, global_y % 8]})
+    return {"global_origin_xy": origin, "period": 8, "read_windows": reads,
+            "vertical_cut_x": [int(value) for value in plan["vertical"]],
+            "horizontal_cut_y": [int(value) for value in plan["horizontal"]], "margin": margin}
+
+
+def _index_dependency_bounds(rung: str, margin: int) -> dict[str, int | bool]:
+    if rung in {"C0", "C0r", "N1"}:
+        sample, coverage = 16, 16
+    elif rung == "A1":
+        sample, coverage = 16, 22
+    elif rung in {"A2", "A3"}:
+        sample, coverage = 44, 50
+    elif rung == "A4":
+        sample, coverage = 44, 44
+    else:
+        raise ValueError(f"unknown index-field rung: {rung}")
+    return {"sample_read_reach": sample, "coverage_mask_reach": coverage, "fixed_tile_margin": margin,
+            "sample_within_margin": sample <= margin, "coverage_within_margin": coverage <= margin}
+
+
+def run_index_configurations(root: Path, output: Path, configurations: list[dict[str, object]], allowances_path: Path,
+                             calibration: dict[str, object], budget: dict[str, object], family_filter: str | None = None) -> list[dict[str, object]]:
+    """Run field controls and registered candidates over retained Depth Map inputs."""
+    rows = [item for item in json.loads((root / "baseline.json").read_text()) if item["repeat"] == 0 and item["method"] == "depth-map"
+            and (family_filter is None or item["family"] == family_filter)]
+    allowances = json.loads(allowances_path.read_text())
+    records: list[dict[str, object]] = []
+    for configuration in configurations:
+        multiplier = int(configuration.get("threshold_multiplier", 1))
+        threshold = float(calibration["thresholds"].get(str(multiplier), 0.0))
+        for row in rows:
+            if time.monotonic() - float(budget["started_monotonic"]) >= 7200:
+                budget["exhausted"] = True
+                budget.setdefault("deferred_configurations", []).append(configuration["id"])
+                return records
+            started = time.monotonic()
+            frames, coverage = _focus_inputs(row)
+            plan = row["tile_boundaries"]
+            rung = str(configuration["rung"])
+            result = _index_tiled(frames, coverage, threshold, rung, plan)
+            whole = index_field.build_field(frames, coverage, threshold, rung)
+            directory = output / str(configuration["id"]) / run_key(f"{row['family']}-{row['member']}", SeedTriple.parse(str(row["seed"])), "depth-map", int(row["tile"]), 0)
+            directory.mkdir(parents=True, exist_ok=True)
+            composite, zmap, field_path = directory / "composite.tif", directory / "zmap.tif", directory / "field.npy"
+            gff.write_u16(composite, result.composite)
+            labels = np.where(result.no_source, fusion.NO_SOURCE, np.rint(result.field).clip(0, 65535)).astype(np.uint16)
+            gff.write_u16(zmap, labels[..., None])
+            np.save(field_path, result.field)
+            family = next(item for item in FAMILIES if item.name == row["family"])
+            data = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+            image_delta = np.abs(result.composite.astype(np.int64) - whole.composite.astype(np.int64))
+            field_delta = np.abs(result.field - whole.field)
+            rounded_delta = np.where(result.no_source, fusion.NO_SOURCE, np.rint(result.field).clip(0, 65535)).astype(np.uint16) != np.where(
+                whole.no_source, fusion.NO_SOURCE, np.rint(whole.field).clip(0, 65535)
+            ).astype(np.uint16)
+            tile_difference = {"max_abs": int(image_delta.max()), "different_samples": int((image_delta != 0).sum()),
+                               "field_max_abs": float(field_delta.max()), "field_different_pixels": int((field_delta != 0).sum()),
+                               "rounded_label_different_pixels": int(rounded_delta.sum()),
+                               **_index_tile_phase(row, plan, result.composite.shape[0], result.composite.shape[1])}
+            metric_row = {**row, "comp": str(composite), "zmap": str(zmap), "tile_boundaries": plan,
+                          "tile_difference": tile_difference}
+            source = gff.TiffSource(row["actual_source_frames"], row["actual_coverage"]) if "actual_source_frames" in row else _source(Path(str(row["case"])))
+            image_metrics, metadata = _record_metrics(data, str(row["family"]), str(row["member"]), metric_row, composite, zmap, source, plan)
+            label = {name: image_metrics.pop(name) for name in ("label_exact", "label_within_one", "label_mad")}
+            partition_depth, partition_support = data.depth, np.ones(data.depth.shape, dtype=bool)
+            if row["family"] == "invalid-borders" and row["member"] == "aligned-coverage":
+                _, partition_depth, partition_support = _rebase_truth(data, int(row["alignment"]["reference"]))
+            records.append({"configuration_id": configuration["id"], "rung": rung, "matched_control": configuration.get("matched_control"),
+                            "classification": configuration.get("classification", "control"), "can_advance": configuration.get("can_advance", False),
+                            "family": row["family"], "member": row["member"], "seed": row["seed"], "method": "depth-map", "tile": row["tile"],
+                            "threshold": threshold, "eligibility_pixels": int((~result.no_source).sum()), "excluded_pixels": int(result.no_source.sum()),
+                            "trusted_pixels": int(result.trusted.sum()), "filled_pixels": int(result.filled.sum()), "unresolved_pixels": int(result.unresolved.sum()),
+                            "adjacent_fallback_pixels": int(result.adjacent_fallback.sum()), "composite": str(composite), "zmap": str(zmap), "field": str(field_path),
+                            "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap), "field_sha256": sha256_path(field_path),
+                            "image_metrics": image_metrics, "label_metrics": label,
+                            "continuous_partitions": _field_partitions(result, partition_depth, partition_support),
+                            "tile_difference": tile_difference,
+                            "tile_boundaries": plan, "tile_read_bound": tile_read_bound(result.composite.shape[1], result.composite.shape[0], plan),
+                            "dependency_bounds": _index_dependency_bounds(rung, int(plan["margin"])),
+                            "wall_seconds": time.monotonic() - started, "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                            "input_identity": row.get("input_sha256"), "baseline_composite_sha256": row.get("composite_sha256"),
+                            "allowance_keys": [item for item in allowances if item["family"] == row["family"] and item["member"] == row["member"] and item["method"] == "depth-map" and item["tile"] == row["tile"]], **metadata})
+    return records
+
+
+def run_index_full_references(root: Path, output: Path, configurations: list[dict[str, object]],
+                              calibration: dict[str, object], budget: dict[str, object]) -> list[dict[str, object]]:
+    """Write the fixed whole-image three-coarse-visit diagnostic subset."""
+    rows = [item for item in json.loads((root / "baseline.json").read_text()) if item["repeat"] == 0
+            and item["method"] == "depth-map" and item["family"] == "thin-hairs" and item["member"] == "default"
+            and item["seed"] == TRAINING_SEEDS[0].text() and item["tile"] == 512]
+    if len(rows) != 1:
+        raise AssertionError("full-depth reference input is not uniquely registered")
+    row = rows[0]
+    frames, coverage = _focus_inputs(row)
+    records = []
+    for configuration in (item for item in configurations if item["rung"] in {"A1", "A2", "A3"}):
+        if time.monotonic() - float(budget["started_monotonic"]) >= 7200:
+            budget["exhausted"] = True
+            budget.setdefault("deferred_full_references", []).append(configuration["id"])
+            return records
+        threshold = float(calibration["thresholds"][str(configuration["threshold_multiplier"])])
+        depth = index_field.full_fill_depth(frames.shape[1], frames.shape[2])
+        result = index_field.build_field(frames, coverage, threshold, str(configuration["rung"]), fill_depth=depth)
+        work = output / "full-reference" / str(configuration["id"])
+        work.mkdir(parents=True, exist_ok=True)
+        composite, zmap, field_path = work / "composite.tif", work / "zmap.tif", work / "field.npy"
+        gff.write_u16(composite, result.composite)
+        labels = np.where(result.no_source, fusion.NO_SOURCE, np.rint(result.field).clip(0, 65535)).astype(np.uint16)
+        gff.write_u16(zmap, labels[..., None])
+        np.save(field_path, result.field)
+        records.append({"configuration_id": configuration["id"], "rung": configuration["rung"], "threshold": threshold,
+                        "reference_only": True, "can_advance": False, "family": row["family"], "member": row["member"],
+                        "seed": row["seed"], "tile": row["tile"], "fill_depth": depth, "coarse_visits": index_field.FILL_COARSE_VISITS,
+                        "sweeps_per_visit": index_field.FILL_SWEEPS, "composite": str(composite), "zmap": str(zmap), "field": str(field_path),
+                        "dependency_bounds": {"sample_read_reach": "whole-image", "coverage_mask_reach": "whole-image",
+                                              "fixed_tile_margin": None, "reference_only": True},
+                        "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap), "field_sha256": sha256_path(field_path),
+                        "trusted_pixels": int(result.trusted.sum()), "filled_pixels": int(result.filled.sum()),
+                        "unresolved_pixels": int(result.unresolved.sum())})
+    return records
+
+
+def run_index_stack(root: Path, source: str, prepared: Path, rect_text: str | None,
+                    configurations: list[dict[str, object]], calibration: dict[str, object]) -> dict[str, object]:
+    """Evaluate C0 and A3 field variants on one validated aligned real crop."""
+    rect = _registered_rect(source, rect_text)
+    manifest = _validate_preparation(prepared, source)
+    retained_path = prepared.parents[3] / "stacking-crops" / source / "crops.json"
+    retained = json.loads(retained_path.read_text()) if retained_path.is_file() else []
+    retained_c0 = next((row for row in retained if row.get("method") == "depth-map"
+                        and row.get("prepared_manifest_sha256") == sha256_path(prepared)
+                        and row.get("alignment_report_sha256") == manifest["alignment_report_sha256"]
+                        and row.get("rect_xywh") == list(rect)), None)
+    if retained_c0 is None:
+        raise ValueError("retained current Depth Map crop does not match the preparation")
+    _directory, inputs, coverage_proof = _crop_prepared_inputs(root, source, prepared, rect)
+    frames = np.stack([gff.read_u16(path) for path in inputs])
+    coverage = np.ones(frames.shape[:3], dtype=bool)
+    selected = [item for item in configurations if item["rung"] == "C0" or item["rung"] == "A3"]
+    rows = []
+    for configuration in selected:
+        multiplier = int(configuration.get("threshold_multiplier", 1))
+        threshold = float(calibration["thresholds"].get(str(multiplier), 0.0))
+        result = index_field.build_field(frames, coverage, threshold, str(configuration["rung"]))
+        work = root / "stack" / str(configuration["id"])
+        work.mkdir(parents=True, exist_ok=True)
+        composite, zmap, field_path = work / "composite.tif", work / "zmap.tif", work / "field.npy"
+        gff.write_u16(composite, result.composite)
+        labels = np.where(result.no_source, fusion.NO_SOURCE, np.rint(result.field).clip(0, 65535)).astype(np.uint16)
+        gff.write_u16(zmap, labels[..., None])
+        np.save(field_path, result.field)
+        replay = None
+        if configuration["rung"] == "C0":
+            delta = np.abs(result.composite.astype(np.int64) - gff.read_u16(Path(str(retained_c0["composite"]))).astype(np.int64))
+            same = np.array_equal(np.rint(result.field).astype(np.uint16), gff.read_zmap(Path(str(retained_c0["zmap"]))))
+            if delta.max() != 0 or not same:
+                raise AssertionError("index C0 real replay mismatch")
+            replay = {"composite_max_sample_difference": 0, "zmap_equal": True,
+                      "retained_composite_sha256": retained_c0["composite_sha256"], "retained_zmap_sha256": retained_c0["zmap_sha256"]}
+        rows.append({"configuration_id": configuration["id"], "rung": configuration["rung"], "threshold": threshold,
+                     "rect_xywh": list(rect), "coverage": coverage_proof, "prepared_manifest_sha256": sha256_path(prepared),
+                     "alignment_report_sha256": manifest["alignment_report_sha256"], "raw_inputs": manifest["raw_inputs"],
+                     "aligned_inputs": manifest["aligned_inputs"], "composite": str(composite), "zmap": str(zmap), "field": str(field_path),
+                     "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap), "field_sha256": sha256_path(field_path),
+                     "trusted_pixels": int(result.trusted.sum()), "filled_pixels": int(result.filled.sum()),
+                     "unresolved_pixels": int(result.unresolved.sum()), "adjacent_fallback_pixels": int(result.adjacent_fallback.sum()),
+                     "dependency_bounds": _index_dependency_bounds(str(configuration["rung"]), 16),
+                     "truth_metrics": "not computed", "replay": replay})
+    c0 = next((row for row in rows if row["rung"] == "C0"), None)
+    montages = []
+    if c0 is not None:
+        for row in rows:
+            if row["rung"] == "A3":
+                montage = root / "stack" / f"{row['configuration_id']}-current-vs-candidate.png"
+                gff.montage(str(montage), (0, rect[3], 0, rect[2]), [Path(str(c0["composite"])), Path(str(row["composite"]))])
+                montages.append({"configuration_id": row["configuration_id"], "path": str(montage), "sha256": sha256_path(montage)})
+    return {"source": source, "rect_xywh": list(rect), "prepared_manifest": str(prepared.resolve()),
+            "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
+            "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"], "coverage": coverage_proof,
+            "input_sha256": {path.name: sha256_path(path) for path in inputs}, "rows": rows, "montages": montages}
 
 
 def _control_effect(clean: float, value: float, higher_is_better: bool) -> float:
