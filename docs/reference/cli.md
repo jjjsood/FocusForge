@@ -775,7 +775,7 @@ for the `-o` image: `exif`, `icc`, `xmp`, `iptc` each a status string, plus
 ## `history`
 
 ```
-focusforge-cli history [--accept-changed-sources] <COMMAND>
+focusforge-cli history <COMMAND>
 ```
 
 Reads and changes a project's checkpoint tree without a window. Every
@@ -787,14 +787,15 @@ A project is validated when it is opened. A damaged one is refused by name
 with its own exit code (3 not a project, 4 truncated, 6 a missing entry, 7 a
 blob hash mismatch, 8 a broken link between checkpoints, `1` anything
 else). If a source frame's content changed since the project was written,
-every subcommand refuses with exit 9 naming the frames;
-`--accept-changed-sources` proceeds with a warning instead. Frames that
+`list` and `delete` refuse with exit 9 naming the frames; their
+`--accept-changed-sources` flag proceeds with a warning instead. `compact`
+never accepts that flag. Frames that
 cannot be found only produce a warning: the history is intact.
 
 | subcommand | does |
 |---|---|
-| `list <PROJECT> [--json]` | prints every visible checkpoint, newest first: id, parent, algorithm and creation time. `--json` emits `{"checkpoints": [{"id", "parent", "algorithm", "created_at"}]}`, `created_at` in Unix seconds |
-| `delete <PROJECT> --checkpoint <ID> [--json]` | hides a checkpoint and removes it from the file once no visible checkpoint is built on it. Refuses the last visible checkpoint |
+| `list <PROJECT> [--json] [--accept-changed-sources]` | prints every visible checkpoint, newest first: id, parent, algorithm and creation time. `--json` emits `{"checkpoints": [{"id", "parent", "algorithm", "created_at"}]}`, `created_at` in Unix seconds |
+| `delete <PROJECT> --checkpoint <ID> [--json] [--accept-changed-sources]` | hides a checkpoint and removes it from the file once no visible checkpoint is built on it. Refuses the last visible checkpoint |
 | `compact <PROJECT> [--json]` | rewrites the project to its live checkpoints only and reports the bytes reclaimed |
 
 ```
@@ -884,7 +885,7 @@ resolved).
 ## `cache`
 
 ```
-focusforge-cli cache [--json]
+focusforge-cli cache clear [--json]
 ```
 
 Removes every entry from the stage cache under `.scratch/stage-cache/`, the
@@ -894,7 +895,7 @@ store `stack` reads and writes to skip a repeated alignment solve — see
 cancelled run's recoverable work.
 
 ```
-$ focusforge-cli cache
+$ focusforge-cli cache clear
 removed 1 stage cache entry
 ```
 

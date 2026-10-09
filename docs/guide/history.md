@@ -71,5 +71,6 @@ re-stacking the frames produces a current project.
 If the source frames were moved or changed since the project was written,
 the window asks before opening and offers **Locate frames…**, which accepts
 a folder only when its files hash to what the project recorded. On the
-command line, `--accept-changed-sources` proceeds with a warning. Details:
+command line, `history list` and `history delete` accept
+`--accept-changed-sources` to proceed with a warning. Details:
 [the project format](../reference/project-format.md#source-frames).

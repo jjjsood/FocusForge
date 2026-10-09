@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use focusforge_core::io::{
     ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
     all_frame_paths, classify_header, has_extension, is_frame_path,
@@ -301,10 +301,6 @@ enum Command {
     /// List, delete or compact a project's checkpoints. Every history
     /// operation is reachable through this command, headless.
     History {
-        /// Accept a project whose recorded source frames' content changed
-        /// since it was written, printing a warning instead of refusing.
-        #[arg(long = "accept-changed-sources", global = true)]
-        accept_changed_sources: bool,
         #[command(subcommand)]
         command: history::HistoryCommand,
     },
@@ -397,10 +393,13 @@ enum Command {
     /// Remove every entry from the stage cache under
     /// `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any
     /// project.
+    #[command(subcommand_required = true)]
     Cache {
         /// Emit the JSON report instead of human-readable text.
-        #[arg(long)]
+        #[arg(long, global = true)]
         json: bool,
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     /// Package this installation's logs, crash reports, system summary,
     /// graphics adapter record, effective configuration and version into
@@ -421,6 +420,12 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Remove every entry from the stage cache.
+    Clear,
+}
+
 /// The subcommand's own name, as the job span carries it in the log.
 fn command_name(command: &Command) -> &'static str {
     match command {
@@ -437,13 +442,72 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
+const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
+    ("Processing", &["stack", "align", "retouch", "export"]),
+    ("Inspection", &["info", "review", "algorithms"]),
+    ("Maintenance", &["history", "cache", "diagnostics"]),
+];
+
+fn categorized_root_help_template(
+    command: &clap::Command,
+    categories: &[(&str, &[&str])],
+) -> Result<String, String> {
+    let visible: Vec<_> = command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+        .collect();
+    let mut grouped = String::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (heading, names) in categories {
+        grouped.push_str(heading);
+        grouped.push_str(":\n");
+        for &name in *names {
+            let subcommand = visible
+                .iter()
+                .find(|subcommand| subcommand.get_name() == name)
+                .ok_or_else(|| format!("root help category names missing command `{name}`"))?;
+            if !seen.insert(name) {
+                return Err(format!("root help category names `{name}` more than once"));
+            }
+            let about = subcommand
+                .get_about()
+                .ok_or_else(|| format!("root command `{name}` needs an about"))?;
+            grouped.push_str(&format!("  {name:12} {about}\n"));
+        }
+        grouped.push('\n');
+    }
+    for subcommand in visible {
+        if !seen.contains(subcommand.get_name()) {
+            return Err(format!(
+                "root help category has no entry for visible command `{}`",
+                subcommand.get_name()
+            ));
+        }
+    }
+    Ok(format!(
+        "{{before-help}}{{name}} {{version}}\n{{about}}\n\n{{usage-heading}} {{usage}}\n\n{grouped}Examples:\n  focusforge-cli stack frames/ --algorithm laplacian\n  focusforge-cli history list project.ffp\n\n{{options}}{{after-help}}"
+    ))
+}
+
+fn root_help_template(command: &clap::Command) -> Result<String, String> {
+    categorized_root_help_template(command, &ROOT_CATEGORIES)
+}
+
+fn parse_cli() -> Cli {
+    let command = Cli::command();
+    let template =
+        root_help_template(&command).expect("every visible root command must be categorized");
+    let matches = command.help_template(template).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never reaches the application's own work.
     if let Some(code) = focusforge_diagnostics::run_monitor() {
         return ExitCode::from(code as u8);
     }
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let data_dir = focusforge_diagnostics::data_dir_from_env();
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: data_dir.clone(),
@@ -552,10 +616,7 @@ fn main() -> ExitCode {
             name,
             json,
         } => retouch::run(&project, &ops, from.as_deref(), name.as_deref(), json),
-        Command::History {
-            command,
-            accept_changed_sources,
-        } => history::run(command, accept_changed_sources),
+        Command::History { command } => history::run(command),
         Command::Align {
             dir,
             algo,
@@ -600,7 +661,10 @@ fn main() -> ExitCode {
             )
         }
         Command::Review { dir, json } => review::run(&dir, json),
-        Command::Cache { json } => cache_clear(json),
+        Command::Cache {
+            json,
+            command: CacheCommand::Clear,
+        } => cache_clear(json),
         Command::Diagnostics {
             output,
             include_minidumps,
@@ -1140,6 +1204,68 @@ mod tests {
     fn parser_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn root_help_categories_cover_unique_metadata_commands() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let help = root_help_template(&command).expect("root categories cover every command");
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            let about = subcommand.get_about().expect("visible command needs about");
+            assert!(
+                help.contains(&format!("  {:12} {about}", subcommand.get_name())),
+                "{} must use its clap about",
+                subcommand.get_name()
+            );
+        }
+
+        let duplicate = [("Duplicate", &["stack", "stack"][..])];
+        assert!(
+            categorized_root_help_template(&command, &duplicate)
+                .expect_err("duplicate category entries must fail")
+                .contains("more than once")
+        );
+
+        let missing = [("Missing", &["stack"][..])];
+        assert!(
+            categorized_root_help_template(&command, &missing)
+                .expect_err("incomplete categories must fail")
+                .contains("no entry")
+        );
+
+        let unmapped = command
+            .clone()
+            .subcommand(clap::Command::new("unmapped").about("Unmapped test"));
+        assert!(
+            root_help_template(&unmapped)
+                .expect_err("new visible command must fail category coverage")
+                .contains("unmapped")
+        );
+
+        let with_hidden = command.clone().subcommand(
+            clap::Command::new("hidden-test")
+                .about("Hidden test command")
+                .hide(true),
+        );
+        let hidden_help = root_help_template(&with_hidden)
+            .expect("hidden command must not require a product category");
+        assert!(!hidden_help.contains("hidden-test"));
+        assert!(!hidden_help.contains("Hidden test command"));
+        assert!(
+            !command
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_name() == "help"),
+            "generated help must not be a product category entry"
+        );
+        let generated_help = Cli::command()
+            .try_get_matches_from(["focusforge-cli", "help", "history", "list"])
+            .expect_err("generated help must remain parseable");
+        assert_eq!(generated_help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     /// Every export `ParamDesc` id is a `--<id>` flag on `export` whose help

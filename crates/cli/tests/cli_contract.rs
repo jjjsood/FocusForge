@@ -212,7 +212,7 @@ fn quiet_is_global_before_or_after_subcommand() {
         &["history", "compact"][..],
         &["align"][..],
         &["review"][..],
-        &["cache"][..],
+        &["cache", "clear"][..],
         &["diagnostics"][..],
     ] {
         for quiet in ["-q", "--quiet"] {
@@ -229,6 +229,67 @@ fn quiet_is_global_before_or_after_subcommand() {
                 assert!(output.status.success(), "quiet must parse: {args:?}");
             }
         }
+    }
+}
+
+#[test]
+fn root_help_groups_product_commands_from_metadata() {
+    for args in [
+        ["--help"].as_slice(),
+        ["-h"].as_slice(),
+        ["help"].as_slice(),
+    ] {
+        let output = common::cli_bin("cli_contract")
+            .args(args)
+            .output()
+            .expect("CLI must run");
+        assert!(output.status.success(), "{args:?}");
+        let help = String::from_utf8_lossy(&output.stdout);
+        for heading in ["Processing:", "Inspection:", "Maintenance:"] {
+            assert!(help.contains(heading), "{heading} missing from {help}");
+        }
+        for example in [
+            "Examples:",
+            "  focusforge-cli stack frames/ --algorithm laplacian",
+            "  focusforge-cli history list project.ffp",
+        ] {
+            assert!(help.contains(example), "{example} missing from {help}");
+        }
+        for command in [
+            "stack",
+            "align",
+            "retouch",
+            "export",
+            "info",
+            "review",
+            "algorithms",
+            "history",
+            "cache",
+            "diagnostics",
+        ] {
+            let listed = help
+                .lines()
+                .filter(|line| {
+                    line.trim_start()
+                        .strip_prefix(command)
+                        .is_some_and(|rest| rest.starts_with(' '))
+                })
+                .count();
+            assert_eq!(listed, 1, "{command}: {help}");
+        }
+    }
+
+    for args in [
+        ["help", "history", "list"].as_slice(),
+        ["cache", "clear", "--help"].as_slice(),
+        ["--version"].as_slice(),
+        ["-V"].as_slice(),
+    ] {
+        let output = common::cli_bin("cli_contract")
+            .args(args)
+            .output()
+            .expect("CLI must run");
+        assert!(output.status.success(), "{args:?}");
     }
 }
 

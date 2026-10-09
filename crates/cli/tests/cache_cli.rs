@@ -462,7 +462,31 @@ fn no_cache_flag_forces_a_recompute() {
 
 // --- cache clear --------------------------------------------------------
 
-/// `cache` empties the stage cache and touches nothing else: a
+#[test]
+fn cache_without_action_deletes_nothing() {
+    let cwd = tmp_dir("cache_cli_without_action");
+    let entry = cwd
+        .join(".scratch")
+        .join("stage-cache")
+        .join("align")
+        .join("sentinel.json");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, b"stage cache").unwrap();
+    let resume = cwd.join(".scratch").join("resume").join("sentinel");
+    std::fs::create_dir_all(resume.parent().unwrap()).unwrap();
+    std::fs::write(&resume, b"resume").unwrap();
+
+    for args in [["cache"].as_slice(), ["cache", "--json"].as_slice()] {
+        let output = run_cli_in(&cwd, args);
+        assert_eq!(output.code, Some(2), "stderr: {}", output.stderr);
+        assert!(output.stderr.contains("clear"), "stderr: {}", output.stderr);
+        assert!(output.stdout.is_empty(), "stdout: {}", output.stdout);
+        assert_eq!(std::fs::read(&entry).unwrap(), b"stage cache");
+        assert_eq!(std::fs::read(&resume).unwrap(), b"resume");
+    }
+}
+
+/// `cache clear` empties the stage cache and touches nothing else: a
 /// cancelled run's resume ledger, the sealed project, the run manifest and
 /// the tile scheduler's staging directory under `.scratch/projects/` all
 /// survive byte for byte (or, for a directory, simply survive).
@@ -514,7 +538,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
         "the leftover staging directory must be visible before the clear"
     );
 
-    let clear = run_cli_in(&cwd, &["cache", "--json"]);
+    let clear = run_cli_in(&cwd, &["cache", "clear", "--json"]);
     assert!(clear.success, "stderr: {}", clear.stderr);
     let clear_report: serde_json::Value = serde_json::from_str(&clear.stdout).expect("--json");
     assert_eq!(clear_report["removed"], 1);
@@ -524,6 +548,25 @@ fn cache_clear_removes_entries_and_nothing_else() {
         0,
         "cache clear must empty the stage cache"
     );
+
+    let empty = run_cli_in(&cwd, &["cache", "clear"]);
+    assert!(empty.success, "stderr: {}", empty.stderr);
+    assert!(
+        empty.stdout.contains("removed 0"),
+        "stdout: {}",
+        empty.stdout
+    );
+
+    let align_cache = cwd.join(".scratch").join("stage-cache").join("align");
+    std::fs::create_dir_all(&align_cache).unwrap();
+    std::fs::write(align_cache.join("first.json"), b"first").unwrap();
+    std::fs::write(align_cache.join("second.json"), b"second").unwrap();
+    let multiple = run_cli_in(&cwd, &["cache", "clear", "--json"]);
+    assert!(multiple.success, "stderr: {}", multiple.stderr);
+    let multiple_report: serde_json::Value =
+        serde_json::from_str(&multiple.stdout).expect("--json");
+    assert_eq!(multiple_report["removed"], 2);
+    assert_eq!(cache_entry_count(&cwd), 0);
 
     assert_eq!(
         std::fs::read(ledger_dir.join("job.json")).unwrap(),
