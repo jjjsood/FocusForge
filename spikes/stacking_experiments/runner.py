@@ -21,7 +21,7 @@ from typing import Iterable
 import numpy as np
 import PIL
 
-from . import consistency, fusion, index_field, metrics
+from . import coefficient_shrinkage, consistency, fusion, index_field, metrics
 from .protocol import FAMILIES, FRAME_COUNT, REAL_CROPS, TRAINING_SEEDS, SeedTriple, require_seed
 from .scenes import SceneData, family_members, render_family
 
@@ -32,6 +32,7 @@ for directory in (GFF_DIR, SYNTH_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 import gff_fusion as gff  # noqa: E402
+from synth_stack import blur  # noqa: E402
 
 METHODS = ("laplacian", "weighted-average", "depth-map")
 TILES = (512, 1024)
@@ -1390,6 +1391,207 @@ def _selection_source(row: dict[str, object]) -> object:
     if "actual_source_frames" in row:
         return gff.TiffSource(row["actual_source_frames"], row.get("actual_coverage"))
     return gff.TiffSource(gff.frame_paths(Path(str(row["case"]))))
+
+
+def _noise_allowance(allowances: list[dict[str, object]], row: dict[str, object]) -> float | None:
+    """Return the frozen flat-noise match tolerance for one retained key."""
+    matches = [item for item in allowances if item.get("family") == row["family"] and item.get("member") == row["member"]
+               and item.get("method") == "laplacian" and item.get("tile") == row["tile"] and item.get("metric") == "flat_noise"]
+    return None if len(matches) != 1 else float(matches[0]["allowance"])
+
+
+def _noise_record(output: Path, row: dict[str, object], identifier: str, kind: str, result: coefficient_shrinkage.ShrinkResult,
+                  image: np.ndarray, source: object, data: SceneData, counters: dict[str, int], match: dict[str, object] | None = None) -> dict[str, object]:
+    """Persist one shrinkage output with immutable selection hashes and shared metrics."""
+    directory = output / identifier / run_key(f"{row['family']}-{row['member']}", SeedTriple.parse(str(row["seed"])), "laplacian", int(row["tile"]), int(row["repeat"]))
+    directory.mkdir(parents=True, exist_ok=True)
+    composite, zmap = directory / "composite.tif", directory / "zmap.tif"
+    gff.write_u16(composite, image)
+    gff.write_u16(zmap, result.zmap[..., None])
+    metric_row = {**row, "comp": str(composite), "zmap": str(zmap), "tile_boundaries": row["tile_boundaries"]}
+    metric_row.pop("tile_difference", None)
+    image_metrics, metadata = _record_metrics(data, str(row["family"]), str(row["member"]), metric_row, composite, zmap, source, row["tile_boundaries"])
+    metadata["metric_unavailable"]["tile_difference"] = "training output fused whole-input; no paired tile comparison"
+    return {"configuration_id": identifier, "classification": kind, "family": row["family"], "member": row["member"],
+            "seed": row["seed"], "tile": row["tile"], "repeat": row["repeat"], "composite": str(composite), "zmap": str(zmap),
+            "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap),
+            "raw_winner_sha256": [sha256(part.tobytes()).hexdigest() for part in result.raw_winners],
+            "final_winner_sha256": [sha256(part.tobytes()).hexdigest() for part in result.final_winners],
+            "residual_sha256": sha256(result.residual.tobytes()).hexdigest(),
+            "thresholds": list(result.thresholds), "stream_reads": counters,
+            "image_metrics": image_metrics, "unavailable_metrics": metadata["metric_unavailable"], "match": match}
+
+
+def run_noise_shrinkage_configurations(root: Path, output: Path, allowances_path: Path,
+                                       multipliers: tuple[int, ...] = (1, 2, 4, 8), family_filter: str | None = None) -> list[dict[str, object]]:
+    """Evaluate registered shrinkage and cached finite controls for retained training inputs."""
+    baseline = json.loads((root / "baseline.json").read_text())
+    rows = [row for row in baseline if row["method"] == "laplacian" and row["repeat"] == 0
+            and (family_filter is None or row["family"] == family_filter)]
+    expected = 60 if family_filter is None else 20
+    if len(rows) != expected:
+        raise AssertionError(f"noise-shrinkage input count is {len(rows)}, expected {expected}")
+    allowances = json.loads(allowances_path.read_text())
+    records: list[dict[str, object]] = []
+    gaussian_strengths = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+    attenuation_strengths = (0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875)
+    rendered: dict[tuple[str, str, str], SceneData] = {}
+    for row in rows:
+        source = _selection_source(row)
+        key = (str(row["family"]), str(row["member"]), str(row["seed"]))
+        data = rendered.get(key)
+        if data is None:
+            family = next(item for item in FAMILIES if item.name == row["family"])
+            original = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+            data = SceneData(np.empty((0,), dtype=np.uint16), original.truth, original.depth, original.metadata)
+            del original
+            rendered[key] = data
+        identity, identity_counts = coefficient_shrinkage.fuse_streaming(source, 0.0)
+        retained = gff.read_u16(Path(str(row["composite"])))
+        if not np.array_equal(identity.composite, retained) or not np.array_equal(identity.zmap, gff.read_zmap(Path(str(row["zmap"])))):
+            raise AssertionError("threshold-zero shrinkage does not replay retained Details")
+        identity_record = _noise_record(output, row, "shrink-identity", "control", identity, identity.composite, source, data, identity_counts)
+        records.append(identity_record)
+        candidates: dict[int, tuple[coefficient_shrinkage.ShrinkResult, dict[str, object]]] = {}
+        for multiplier in multipliers:
+            result, result_counts = coefficient_shrinkage.fuse_streaming(source, float(multiplier))
+            if (any(not np.array_equal(left, right) for left, right in zip(identity.raw_winners, result.raw_winners))
+                    or any(not np.array_equal(left, right) for left, right in zip(identity.final_winners, result.final_winners))
+                    or not np.array_equal(identity.residual, result.residual)):
+                raise AssertionError("shrinkage changed selection or residual")
+            candidates[multiplier] = (result, _noise_record(output, row, f"shrink-m{multiplier}", "candidate", result, result.composite, source, data, result_counts))
+            records.append(candidates[multiplier][1])
+        def flat(image: np.ndarray) -> float | None:
+            if row["family"] != "flat-noise":
+                return None
+            return metrics.measure(image, data.truth, data.metadata, source, tuple(row["tile_boundaries"]["vertical"]), tuple(row["tile_boundaries"]["horizontal"])).get("flat_noise")
+        gaussian_trials = [(strength, flat(fusion.quantize_u16(blur(identity.composite.astype(np.float64), strength)))) for strength in gaussian_strengths]
+        attenuation_trials: list[tuple[float, coefficient_shrinkage.ShrinkResult, dict[str, int], float | None]] = []
+        for strength in attenuation_strengths:
+            result, result_counts = coefficient_shrinkage.fuse_streaming(source, 0.0, attenuation=strength)
+            attenuation_trials.append((strength, result, result_counts, flat(result.composite)))
+        tolerance = _noise_allowance(allowances, row)
+        for multiplier, (candidate, record) in candidates.items():
+            target = record["image_metrics"].get("flat_noise")
+            gaussian = coefficient_shrinkage.match_strength(target if isinstance(target, (float, int)) else None, gaussian_trials)
+            attenuated = coefficient_shrinkage.match_strength(target if isinstance(target, (float, int)) else None, [(strength, value) for strength, _result, _counts, value in attenuation_trials])
+            for control_id, selected, trials in (("gaussian", gaussian, gaussian_trials), ("attenuation", attenuated, [(strength, value) for strength, _result, _counts, value in attenuation_trials])):
+                match = {"target": target, "trials": [{"strength": strength, "flat_noise": value} for strength, value in trials], "allowance": tolerance}
+                if selected is None or tolerance is None or selected[2] > tolerance:
+                    match.update({"status": "unmatched", "selected": None if selected is None else {"strength": selected[0], "flat_noise": selected[1], "error": selected[2]}})
+                    records.append({"configuration_id": f"shrink-m{multiplier}-{control_id}", "classification": "control",
+                                    "family": row["family"], "member": row["member"], "seed": row["seed"], "tile": row["tile"],
+                                    "repeat": row["repeat"], "composite": None, "zmap": None, "match": match,
+                                    "raw_winner_sha256": [sha256(part.tobytes()).hexdigest() for part in candidate.raw_winners],
+                                    "final_winner_sha256": [sha256(part.tobytes()).hexdigest() for part in candidate.final_winners],
+                                    "residual_sha256": sha256(candidate.residual.tobytes()).hexdigest(), "stream_reads": record["stream_reads"]})
+                    continue
+                match.update({"status": "matched", "selected": {"strength": selected[0], "flat_noise": selected[1], "error": selected[2]}})
+                if control_id == "gaussian":
+                    image = fusion.quantize_u16(blur(identity.composite.astype(np.float64), selected[0]))
+                    control = identity
+                else:
+                    control, control_counts, _value = next((result, counts, value) for strength, result, counts, value in attenuation_trials if strength == selected[0])
+                    image = control.composite
+                if control_id == "gaussian":
+                    control_counts = identity_counts
+                records.append(_noise_record(output, row, f"shrink-m{multiplier}-{control_id}", "control", control, image, source, data, control_counts, match))
+    return records
+
+
+def noise_shrinkage_weighted_references(root: Path, family_filter: str | None = None) -> list[dict[str, object]]:
+    """Reuse frozen Weighted Average rows beside shrinkage outputs."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text()) if row["method"] == "weighted-average"
+            and row["repeat"] == 0 and (family_filter is None or row["family"] == family_filter)]
+    expected = 60 if family_filter is None else 20
+    if len(rows) != expected:
+        raise AssertionError(f"Weighted Average reference count is {len(rows)}, expected {expected}")
+    return rows
+
+
+def _real_noise_stat(image: np.ndarray) -> float | None:
+    """Measure a robust high-pass luma spread without synthetic truth."""
+    luma = image.astype(np.float64).mean(2)
+    high_pass = luma - blur(luma[..., None], 1.0)[..., 0]
+    if not np.isfinite(high_pass).all():
+        return None
+    return float(np.median(np.abs(high_pass - np.median(high_pass))) / 0.6745)
+
+
+def run_noise_shrinkage_stack(output: Path, source_name: str, prepared: Path, rect_text: str | None) -> dict[str, object]:
+    """Render aligned real shrinkage context with diagnostic-only control matching."""
+    rect = _registered_rect(source_name, rect_text)
+    manifest = _validate_preparation(prepared, source_name)
+    directory, paths, coverage = _crop_prepared_inputs(output, source_name, prepared, rect)
+    source = gff.TiffSource(paths)
+    identity, _counts = coefficient_shrinkage.fuse_streaming(source, 0.0)
+    retained_path = prepared.parents[3] / "stacking-crops" / source_name / "crops.json"
+    retained = json.loads(retained_path.read_text()) if retained_path.is_file() else []
+    current = next((row for row in retained if row.get("method") == "laplacian" and row.get("prepared_manifest_sha256") == sha256_path(prepared)
+                    and row.get("rect_xywh") == list(rect)), None)
+    if current is None or not np.array_equal(identity.composite, gff.read_u16(Path(str(current["composite"])))) or not np.array_equal(identity.zmap, gff.read_zmap(Path(str(current["zmap"])))):
+        raise ValueError("real threshold-zero replay does not match retained current Details crop")
+    gaussian_strengths, attenuation_strengths = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0), (0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875)
+    gaussian_trials = [(strength, _real_noise_stat(fusion.quantize_u16(blur(identity.composite.astype(np.float64), strength)))) for strength in gaussian_strengths]
+    attenuation_trials = [(strength, *coefficient_shrinkage.fuse_streaming(source, 0.0, attenuation=strength)) for strength in attenuation_strengths]
+    rows: list[dict[str, object]] = []
+    def record(identifier: str, classification: str, result: coefficient_shrinkage.ShrinkResult, image: np.ndarray,
+               diagnostic: dict[str, object] | None = None) -> dict[str, object]:
+        work = directory / identifier
+        work.mkdir(parents=True, exist_ok=True)
+        composite, zmap = work / "composite.tif", work / "zmap.tif"
+        gff.write_u16(composite, image)
+        gff.write_u16(zmap, result.zmap[..., None])
+        return {"configuration_id": identifier, "classification": classification, "rect_xywh": list(rect), "global_origin_xy": coverage["global_origin_xy"],
+                "coverage": coverage, "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
+                "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"], "composite": str(composite), "zmap": str(zmap),
+                "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap), "raw_winner_sha256": [sha256(item.tobytes()).hexdigest() for item in result.raw_winners],
+                "final_winner_sha256": [sha256(item.tobytes()).hexdigest() for item in result.final_winners], "residual_sha256": sha256(result.residual.tobytes()).hexdigest(), "thresholds": list(result.thresholds),
+                "real_noise_diagnostic": diagnostic, "truth_metrics": "not computed"}
+    rows.append(record("shrink-identity", "control", identity, identity.composite, {"status": "diagnostic-only", "value": _real_noise_stat(identity.composite)}))
+    montages = []
+    for multiplier in (1, 2, 4, 8):
+        candidate, _counts = coefficient_shrinkage.fuse_streaming(source, float(multiplier))
+        target = _real_noise_stat(candidate.composite)
+        gaussian = coefficient_shrinkage.match_strength(target, gaussian_trials)
+        attenuation = coefficient_shrinkage.match_strength(target, [(strength, _real_noise_stat(result.composite)) for strength, result, _counts in attenuation_trials])
+        if gaussian is None or attenuation is None:
+            raise ValueError("real diagnostic support is unavailable")
+        candidate_row = record(f"shrink-m{multiplier}", "candidate", candidate, candidate.composite, {"status": "diagnostic-only", "value": target})
+        gaussian_image = fusion.quantize_u16(blur(identity.composite.astype(np.float64), gaussian[0]))
+        gaussian_row = record(f"shrink-m{multiplier}-gaussian", "control", identity, gaussian_image,
+                              {"status": "diagnostic-only", "target": target, "strength": gaussian[0], "value": gaussian[1], "absolute_error": gaussian[2]})
+        attenuation_result = next(result for strength, result, _counts in attenuation_trials if strength == attenuation[0])
+        attenuation_row = record(f"shrink-m{multiplier}-attenuation", "control", attenuation_result, attenuation_result.composite,
+                                 {"status": "diagnostic-only", "target": target, "strength": attenuation[0], "value": attenuation[1], "absolute_error": attenuation[2]})
+        rows.extend((candidate_row, gaussian_row, attenuation_row))
+        montage = output / "stack" / f"shrink-m{multiplier}-baseline-candidate-controls.png"
+        montage.parent.mkdir(parents=True, exist_ok=True)
+        gff.montage(str(montage), (0, source.h, 0, source.w), [Path(rows[0]["composite"]), Path(candidate_row["composite"]), Path(gaussian_row["composite"]), Path(attenuation_row["composite"])])
+        montages.append(str(montage))
+    return {"rows": rows, "montages": montages}
+
+
+def noise_shrinkage_resource_controls(root: Path) -> list[dict[str, object]]:
+    """Measure file-backed stream reads for registered frame-count controls."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text())
+            if row["family"] == "flat-noise" and row["member"] == "noise-250" and row["method"] == "laplacian"
+            and row["tile"] == 512 and row["repeat"] == 0]
+    if len(rows) != 5:
+        raise ValueError("resource control needs five retained flat-noise inputs")
+    paths = [Path(path) for path in gff.frame_paths(Path(str(rows[0]["case"])))]
+    if len(paths) != 8:
+        raise ValueError("resource control needs eight file-backed frames")
+    records = []
+    for count in (2, 8, 16):
+        selected = (paths * ((count + len(paths) - 1) // len(paths)))[:count]
+        source = gff.TiffSource(selected)
+        result, counters = coefficient_shrinkage.fuse_streaming(source, 1.0)
+        records.append({"frame_count": count, "physical_input_files": len({str(path) for path in selected}),
+                        "sample_reads": counters["sample_reads"], "mask_reads": counters["total_mask_reads"],
+                        "source_reads": list(source.reads), "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                        "composite_sha256": sha256(result.composite.tobytes()).hexdigest(), "thresholds": list(result.thresholds)})
+    return records
 
 
 def _selection_rule(configuration: dict[str, object]) -> str:

@@ -8,6 +8,8 @@ python3 -m spikes.stacking_experiments registration --out .scratch/stacking-cont
 python3 -m spikes.stacking_experiments focus-score --split training --registration /path/to/protocol.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/focus-score/replay
 python3 -m spikes.stacking_experiments index-field --split training --registration /path/to/index-field-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/index-field/replay
 python3 -m spikes.stacking_experiments selection-consistency --split training --registration /path/to/selection-consistency-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/selection-consistency/replay
+python3 -m spikes.stacking_experiments noise-shrinkage --self-check
+python3 -m spikes.stacking_experiments noise-shrinkage --split training --registration /path/to/noise-shrinkage-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --out .scratch/noise-shrinkage/training
 python3 -m spikes.stacking_experiments baseline --split training --out .scratch/stacking-controls
 python3 -m spikes.stacking_experiments cases --seed 101,201,301 --out .scratch/stacking-controls
 python3 -m spikes.stacking_experiments cases --seed 111,211,311 --out .scratch/sealed-check
@@ -29,3 +31,5 @@ The registration command records six scene families, three independent seed axes
 `index-field` validates its own execution registration before writing output. Its replay mode checks the retained current Depth Map rows; a normal training run records the one frozen flat-noise calibration, controls, field arrays, rounded labels, and image measurements. `--family` restricts a focused training run to one registered family.
 
 `selection-consistency` uses immutable raw Details winner maps. Its streamed path reads frame samples twice and reads masks separately; its small all-frame oracle is limited to identity checks.
+
+`noise-shrinkage` selects the same Details tuples before applying a global per-level threshold. Its zero multiplier is an exact bypass; nonzero controls are chosen only from the registered finite strength lists.

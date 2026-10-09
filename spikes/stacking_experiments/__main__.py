@@ -13,10 +13,10 @@ import time
 
 import numpy as np
 
-from . import consistency, focus_score, fusion, index_field
+from . import coefficient_shrinkage, consistency, focus_score, fusion, index_field
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
+from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
 
 
 def _digest(value: np.ndarray) -> str:
@@ -221,6 +221,54 @@ def _validate_selection_command(registration_path: Path, runs: Path, allowances:
     return document
 
 
+def _validate_noise_shrinkage_command(registration_path: Path, runs: Path, allowances: Path,
+                                      source: str | None, prepared: Path | None, rect: str | None) -> dict[str, object]:
+    """Reject unbound shrinkage execution before an output directory exists."""
+    if not registration_path.is_file() or not (runs / "baseline.json").is_file() or not allowances.is_file():
+        raise ValueError("--registration, --runs baseline.json, and --allowances are required")
+    try:
+        document = json.loads(registration_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError("registration is not valid JSON") from error
+    if document.get("arm") != "noise-shrinkage" or document.get("execution_ready") is not True:
+        raise ValueError("registration does not authorize noise-shrinkage execution")
+    package = Path(__file__).parent
+    names = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py", "coefficient_shrinkage.py")
+    current = {f"spikes/stacking_experiments/{name}": hashlib.sha256((package / name).read_bytes()).hexdigest() for name in names}
+    if document.get("execution_module_sha256") != current:
+        raise ValueError("registration does not bind the current noise-shrinkage implementation")
+    if hashlib.sha256((runs / "baseline.json").read_bytes()).hexdigest() != document.get("baseline_sha256"):
+        raise ValueError("baseline records do not match the registration")
+    focus_score._validate_baseline_inputs(runs / "baseline.json")
+    if hashlib.sha256(allowances.read_bytes()).hexdigest() != document.get("allowances_sha256"):
+        raise ValueError("allowances do not match the registration")
+    expected_threshold = {"energy": "sum_c coefficient_c^2 in f64 squared units", "estimator": "per frame and level: MAD of covered finite coefficient components / 0.6745; median across frames; threshold is multiplier times squared estimate", "exclude": ["NO_SOURCE", "outside coverage", "non-finite coefficient"], "empty_support": "unavailable", "zero_multiplier": "explicit exact f32 bypass"}
+    expected_controls = {"baseline": "unshrunk selected details", "gaussian_blur": {"strengths": [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]}, "uniform_detail_attenuation": {"strengths": [0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]}, "match_metric": "flat_noise from truth-residual luma standard deviation", "selection": "evaluate every strength; choose least absolute error; listed order breaks ties", "failure": "unavailable metric, missing region, empty support or unmatched control forces Defer"}
+    expected_seeds = ["101,201,301", "102,202,302", "103,203,303", "104,204,304", "105,205,305"]
+    expected_matrix = {"candidate_multipliers": 4, "controls_per_candidate": 2, "identity": 1, "reference": "Weighted Average", "quality_output": "blocked until final exact source binding", "training_record_slots": 780, "training_input_keys": 60, "flat_repeat_record_slots": 260, "flat_repeat_keys": 20, "weighted_references_training": 60, "weighted_references_repeat": 20, "real_record_slots": 13, "real_montages": 4, "unmatched": "record retained with explicit reasons; absent rendering is not an output image"}
+    expected_matching = {"metric": "flat_noise", "source": "unchanged frozen allowances", "key": ["family", "member", "laplacian", "tile", "flat_noise"], "accept": "absolute error <= keyed allowance", "missing_key": "unmatched; Defer"}
+    expected_noise_free = {"kind": "constructed constant two-frame RGB; zero injected noise", "shape_hwc": [193, 197, 3], "sample_value": 32768, "coverage": ["all-valid", "two-pixel all-frame border invalid"], "multipliers": [0, 1, 2, 4, 8], "result_checks": 10, "criterion": "decoded composite and Zmap exactly equal threshold-zero reference, stronger than any nonnegative tolerance", "limit": "constant-input boundary proof; not a new canonical quality family or an arbitrary noise-free structure safety claim"}
+    if (document.get("method") != "laplacian" or document.get("multipliers") != [0, 1, 2, 4, 8] or document.get("levels") != 5 or document.get("score_radii") != [8, 4, 2, 1, 1]
+            or document.get("equalize") is not False or document.get("threshold") != expected_threshold or document.get("controls") != expected_controls
+            or document.get("training") != {"seeds": expected_seeds, "tiles": [512, 1024], "holdout": "sealed"}
+            or document.get("matching_tolerance") != expected_matching or document.get("output_matrix") != expected_matrix
+            or document.get("controlled_noise_free") != expected_noise_free):
+        raise ValueError("registration shrinkage ladder is invalid")
+    if source is None:
+        if prepared is not None or rect is not None:
+            raise ValueError("--prepared and --rect require --source stack")
+    else:
+        if prepared is None or rect not in (None, "1878,1056,1024,1024"):
+            raise ValueError("--source stack requires the registered preparation manifest and rectangle")
+        _validate_preparation(prepared, source)
+        real = document.get("real")
+        expected_diagnostic = {"luma": "arithmetic mean of RGB channels in uint16 sample units", "statistic": "MAD(Y - blur(Y, sigma=1.0)) / 0.6745 over covered ROI", "search": "same fixed control strength grids; minimum absolute error; listed order breaks ties", "status": "diagnostic-only", "guard": "no synthetic truth, canonical allowance or numeric matched-pass claim", "missing_support": "unavailable; Defer"}
+        if not isinstance(real, dict) or real.get("prepared_manifest_sha256") != hashlib.sha256(prepared.read_bytes()).hexdigest() or real.get("alignment_report_sha256") != _validate_preparation(prepared, source).get("alignment_report_sha256") or real.get("rect_xywh") != [1878, 1056, 1024, 1024] or real.get("diagnostic") != expected_diagnostic:
+            raise ValueError("preparation manifest does not match the registration")
+    document["_validated_registration_sha256"] = hashlib.sha256(registration_path.read_bytes()).hexdigest()
+    return document
+
+
 def self_check(allowances: Path | None = None) -> int:
     validate_registration()
     preparation_self_check()
@@ -400,6 +448,17 @@ def main(argv: list[str] | None = None) -> int:
     selection.add_argument("--source", choices=("stack",))
     selection.add_argument("--prepared")
     selection.add_argument("--rect")
+    shrinkage = sub.add_parser("noise-shrinkage")
+    shrinkage.add_argument("--self-check", dest="shrinkage_self_check", action="store_true")
+    shrinkage.add_argument("--split", choices=("training",), default="training")
+    shrinkage.add_argument("--registration")
+    shrinkage.add_argument("--runs")
+    shrinkage.add_argument("--allowances")
+    shrinkage.add_argument("--out")
+    shrinkage.add_argument("--source", choices=("stack",))
+    shrinkage.add_argument("--prepared")
+    shrinkage.add_argument("--rect")
+    shrinkage.add_argument("--repeat-flat", action="store_true")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -408,6 +467,35 @@ def main(argv: list[str] | None = None) -> int:
         if args.out:
             Path(args.out).write_text(document + "\n")
         print(document)
+        return 0
+    if args.command == "noise-shrinkage":
+        if args.shrinkage_self_check:
+            for name in coefficient_shrinkage.self_checks():
+                print(f"{name}: ok")
+            return 0
+        if not all((args.registration, args.runs, args.allowances, args.out)):
+            parser.error("--registration, --runs, --allowances, and --out are required")
+        if args.source == "stack" and not os.environ.get("FOCUSFORGE_REFERENCE_STACK"):
+            print("FOCUSFORGE_REFERENCE_STACK: real work skipped")
+            return 0
+        try:
+            document = _validate_noise_shrinkage_command(Path(args.registration), Path(args.runs), Path(args.allowances), args.source,
+                                                         Path(args.prepared) if args.prepared else None, args.rect)
+        except ValueError as error:
+            parser.error(str(error))
+        output = Path(args.out)
+        output.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        stack = run_noise_shrinkage_stack(output, args.source, Path(args.prepared), args.rect) if args.source == "stack" else None
+        family = "flat-noise" if args.repeat_flat else None
+        replay = run_selection_replay(Path(args.runs)) if stack is None and not args.repeat_flat else []
+        rows = stack["rows"] if stack is not None else run_noise_shrinkage_configurations(Path(args.runs), output, Path(args.allowances), family_filter=family)
+        references = [] if stack is not None else noise_shrinkage_weighted_references(Path(args.runs), family)
+        resources = [] if stack is not None or args.repeat_flat else noise_shrinkage_resource_controls(Path(args.runs))
+        (output / "comparison.json").write_text(json.dumps({"command": sys.argv if argv is None else [sys.argv[0], *argv],
+            "registration_sha256": document["_validated_registration_sha256"], "replay": replay, "candidate_rows": rows, "weighted_references": references, "resource_controls": resources, "stack": stack,
+            "budget": {"measured_seconds": time.monotonic() - started}}, indent=2, sort_keys=True) + "\n")
+        print(f"candidate rows: {len(rows)}")
         return 0
     if args.command == "focus-score":
         command_started = time.monotonic()
