@@ -13,10 +13,10 @@ import time
 
 import numpy as np
 
-from . import focus_score, fusion, index_field
+from . import consistency, focus_score, fusion, index_field
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack
+from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
 
 
 def _digest(value: np.ndarray) -> str:
@@ -96,6 +96,128 @@ def _validate_index_command(registration_path: Path, runs: Path, allowances: Pat
         raise ValueError("registration candidate ladder is invalid")
     if require_calibration:
         _frozen_index_calibration(document)
+    return document
+
+
+def _frozen_selection_width_guards(document: dict[str, object]) -> dict[str, object]:
+    """Return exactly the eight candidate guards fixed before candidate runs."""
+    calibration = document.get("width_calibration")
+    if not isinstance(calibration, dict) or calibration.get("state") != "measured":
+        raise ValueError("registration does not contain frozen width guards")
+    guards = calibration.get("allowances")
+    if not isinstance(guards, list) or len(guards) != 8:
+        raise ValueError("registration width guards are invalid")
+    expected = {(width, tile, metric) for width in (1, 2) for tile in (512, 1024)
+                for metric in ("hair_retention", "hair_label_exact")}
+    actual = set()
+    for guard in guards:
+        if not isinstance(guard, dict):
+            raise ValueError("registration width guard is invalid")
+        key = (guard.get("width"), guard.get("tile"), guard.get("metric"))
+        value = guard.get("allowance")
+        if key in actual or key not in expected or guard.get("direction") != "higher" or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError("registration width guard is invalid")
+        seed_spread, repeat_spread = guard.get("seed_spread"), guard.get("repeat_spread")
+        if not isinstance(seed_spread, (int, float)) or not isinstance(repeat_spread, (int, float)) or not math.isfinite(float(seed_spread)) or not math.isfinite(float(repeat_spread)) or float(value) != max(float(seed_spread), float(repeat_spread)):
+            raise ValueError("registration width guard derivation is invalid")
+        actual.add(key)
+    if actual != expected:
+        raise ValueError("registration width guard keys are incomplete")
+    inputs = calibration.get("inputs")
+    expected_inputs = {(seed.text(), tile, repeat) for seed in TRAINING_SEEDS for tile in (512, 1024) for repeat in (0, 1)}
+    if not isinstance(inputs, list) or len(inputs) != 20:
+        raise ValueError("registration width guard inputs are invalid")
+    seen = set()
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise ValueError("registration width guard input is invalid")
+        key = (item.get("seed"), item.get("tile"), item.get("repeat"))
+        if key in seen or key not in expected_inputs or not isinstance(item.get("input_sha256"), dict) or not all(
+                isinstance(item.get(name), str) and item[name] for name in ("composite_sha256", "zmap_sha256", "segment_mask_sha256", "support_mask_sha256", "normalization")):
+            raise ValueError("registration width guard input is invalid")
+        seen.add(key)
+    if seen != expected_inputs:
+        raise ValueError("registration width guard inputs are incomplete")
+    return calibration
+
+
+def _validate_selection_command(registration_path: Path, runs: Path, allowances: Path, source: str | None,
+                                prepared: Path | None, rect: str | None, calibration_only: bool,
+                                require_width_guards: bool) -> dict[str, object]:
+    """Bind a consistency run to its frozen inputs before output creation."""
+    if not registration_path.is_file() or not (runs / "baseline.json").is_file() or not allowances.is_file():
+        raise ValueError("--registration, --runs baseline.json, and --allowances are required")
+    try:
+        document = json.loads(registration_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError("registration is not valid JSON") from error
+    if document.get("arm") != "selection-consistency" or (not calibration_only and document.get("execution_ready") is not True):
+        raise ValueError("registration does not authorize selection-consistency execution")
+    package = Path(__file__).parent
+    names = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py")
+    current = {f"spikes/stacking_experiments/{name}": hashlib.sha256((package / name).read_bytes()).hexdigest() for name in names}
+    if document.get("execution_module_sha256") != current:
+        raise ValueError("registration does not bind the current selection-consistency implementation")
+    if hashlib.sha256((runs / "baseline.json").read_bytes()).hexdigest() != document.get("baseline_sha256"):
+        raise ValueError("baseline records do not match the registration")
+    focus_score._validate_baseline_inputs(runs / "baseline.json")
+    if hashlib.sha256(allowances.read_bytes()).hexdigest() != document.get("allowances_sha256"):
+        raise ValueError("allowances do not match the registration")
+    candidates = document.get("configurations")
+    controls = document.get("controls")
+    expected_candidates = [
+        ("consistency-majority-all", "majority-3x3-all", 192, 156),
+        ("consistency-isolated-all", "isolated-all", 192, 156),
+        ("consistency-cross-scale", "cross-scale-raw-parent", 192, 148),
+        ("consistency-isolated-level0", "isolated-level0", 192, 140),
+    ]
+    if not isinstance(candidates, list) or len(candidates) != 4 or not all(isinstance(item, dict) for item in candidates) or [(item.get("id"), item.get("rule"), item.get("expanded_margin"), item.get("dependency_bound_pixels"))
+                                            for item in candidates] != expected_candidates or any(
+                                                item.get("classification") != "candidate" or item.get("can_advance") is not True
+                                                for item in candidates):
+        raise ValueError("registration candidate configuration is invalid")
+    expected_controls = [
+        ("consistency-identity", "identity", None, "control", 160, 140),
+        ("consistency-destructive", "mode-9x9-all", None, "negative-control", 224, 204),
+        ("consistency-random-majority-all", "matched-random", "consistency-majority-all", "control", None, "global; no local cone claim"),
+        ("consistency-random-isolated-all", "matched-random", "consistency-isolated-all", "control", None, "global; no local cone claim"),
+        ("consistency-random-cross-scale", "matched-random", "consistency-cross-scale", "control", None, "global; no local cone claim"),
+        ("consistency-random-isolated-level0", "matched-random", "consistency-isolated-level0", "control", None, "global; no local cone claim"),
+    ]
+    if not isinstance(controls, list) or len(controls) != 6 or not all(isinstance(item, dict) for item in controls) or [(item.get("id"), item.get("rule"), item.get("matched_candidate"), item.get("classification"),
+                                           item.get("expanded_margin"), item.get("dependency_bound_pixels"))
+                                          for item in controls] != expected_controls or any(
+                                              item.get("can_advance") is not False for item in controls if isinstance(item, dict)):
+        raise ValueError("registration control configuration is invalid")
+    random_control = document.get("random_control")
+    if not isinstance(random_control, dict) or random_control.get("bit_generator") != "PCG64" or random_control.get("position_order") != "immutable global level coordinates, C-order row-major" or random_control.get("tile_in_seed") is not False or random_control.get("seed_rule") != "uint64 little-endian first8bytes SHA256 of UTF8 consistency-random-v1|family|member|seedtext|candidate_id|level|purpose" or random_control.get("purposes") != ["sources", "positions"] or random_control.get("independent_from") != "scene layout/texture/noise RNG streams":
+        raise ValueError("registration random-control configuration is invalid")
+    if document.get("levels") != 5 or document.get("score_radii") != [8, 4, 2, 1, 1] or document.get("current_tile_margin") != 160 or document.get("tiles") != [512, 1024] or document.get("equalize") is not False or document.get("candidate_count") != 4 or document.get("control_rule_count") != 3 or document.get("configuration_cap") != 7 or document.get("output_configuration_count") != 10:
+        raise ValueError("registration fixed selection controls are invalid")
+    if source is None:
+        if prepared is not None or rect is not None:
+            raise ValueError("--prepared and --rect require --source stack")
+    elif prepared is None or rect not in (None, "1878,1056,1024,1024"):
+        raise ValueError("--source stack requires the registered preparation manifest and rectangle")
+    else:
+        manifest = _validate_preparation(prepared, source)
+        real = document.get("real_preparation")
+        if not isinstance(real, dict) or real.get("manifest_sha256") != hashlib.sha256(prepared.read_bytes()).hexdigest() or real.get("report_sha256") != manifest.get("alignment_report_sha256"):
+            raise ValueError("preparation does not match the registration")
+    if require_width_guards:
+        _frozen_selection_width_guards(document)
+        artifact = document.get("width_calibration_artifact")
+        if not isinstance(artifact, dict) or artifact.get("path") != ".scratch/selection-consistency/calibration/width-calibration.json" or not isinstance(artifact.get("sha256"), str):
+            raise ValueError("registration width guard artifact is invalid")
+        artifact_path = Path(str(artifact["path"]))
+        if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact["sha256"]:
+            raise ValueError("registration width guard artifact is missing or stale")
+        try:
+            if json.loads(artifact_path.read_text()) != document["width_calibration"]:
+                raise ValueError("registration width guard artifact does not match")
+        except json.JSONDecodeError as error:
+            raise ValueError("registration width guard artifact is invalid JSON") from error
+    document["_validated_registration_sha256"] = hashlib.sha256(registration_path.read_bytes()).hexdigest()
     return document
 
 
@@ -197,6 +319,13 @@ def self_check(allowances: Path | None = None) -> int:
         print(f"focus score {name}: ok")
     for name in index_field.self_checks():
         print(f"{name}: ok")
+    for name in consistency.self_checks():
+        print(f"{name}: ok")
+    for record in selection_tile_self_checks():
+        print(f"{record['name']}: ok {json.dumps(record, sort_keys=True)}")
+    if allowances is not None:
+        for record in selection_streaming_resource_controls(Path(".scratch/stacking-controls")):
+            print(f"streaming resource N={record['frame_count']}: reads={record['sample_reads']} rss_kb={record['peak_rss_kb']}")
     for check in index_field_tile_checks():
         print(f"{check['name']}: ok {json.dumps(check, sort_keys=True)}")
     if allowances is None:
@@ -259,6 +388,18 @@ def main(argv: list[str] | None = None) -> int:
     index.add_argument("--source", choices=("stack",))
     index.add_argument("--prepared")
     index.add_argument("--rect")
+    selection = sub.add_parser("selection-consistency")
+    selection.add_argument("--split", choices=("training",), default="training")
+    selection.add_argument("--registration", required=True)
+    selection.add_argument("--runs", required=True)
+    selection.add_argument("--allowances", required=True)
+    selection.add_argument("--out", required=True)
+    selection.add_argument("--family")
+    selection.add_argument("--replay-only", action="store_true")
+    selection.add_argument("--calibration-only", action="store_true")
+    selection.add_argument("--source", choices=("stack",))
+    selection.add_argument("--prepared")
+    selection.add_argument("--rect")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -338,6 +479,52 @@ def main(argv: list[str] | None = None) -> int:
             "calibration": calibration, "candidate_rows": candidates, "full_reference_rows": full_references,
             "stack": stack, "budget": budget}, indent=2, sort_keys=True) + "\n")
         print(f"replay records: {len(replay)}")
+        return 0
+    if args.command == "selection-consistency":
+        try:
+            document = _validate_selection_command(Path(args.registration), Path(args.runs), Path(args.allowances), args.source,
+                                                   Path(args.prepared) if args.prepared else None, args.rect, args.calibration_only,
+                                                   not args.calibration_only and not args.replay_only)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.family and args.family != "flat-noise":
+            parser.error("--family supports flat-noise only for the registered repeat")
+        if args.calibration_only:
+            if document.get("width_calibration", {}).get("state") == "measured":
+                parser.error("registration already contains frozen width guards")
+            output = Path(args.out)
+            output.mkdir(parents=True, exist_ok=True)
+            calibration = selection_width_allowances(selection_width_measurements(Path(args.runs)))
+            (output / "width-calibration.json").write_text(json.dumps(calibration, indent=2, sort_keys=True) + "\n")
+            print("width guard rows: 8")
+            return 0
+        output = Path(args.out)
+        output.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        budget = {"session_cap_seconds": 7200, "total_cap_seconds": 21600, "total_enforcement": "external aggregate",
+                  "started_monotonic": started, "exhausted": False}
+        replay = run_selection_replay(Path(args.runs), budget) if args.family is None and args.source is None else []
+        if args.replay_only:
+            candidates, stack = [], None
+        elif args.source == "stack":
+            if time.monotonic() - started >= 7200:
+                budget["exhausted"] = True
+                budget["deferred"] = ["real crop"]
+                candidates, stack = [], None
+            else:
+                candidates, stack = [], run_selection_stack(output, args.source, Path(args.prepared), args.rect,
+                                                             document["configurations"], document["controls"])
+        else:
+            candidates = run_selection_configurations(Path(args.runs), output, document["configurations"], document["controls"],
+                                                      Path(args.allowances), args.family, budget)
+            stack = None
+        budget["measured_seconds"] = time.monotonic() - started
+        (output / "comparison.json").write_text(json.dumps({"command": sys.argv if argv is None else [sys.argv[0], *argv],
+            "registration_sha256": document["_validated_registration_sha256"], "replay": replay,
+            "width_guards": document["width_calibration"], "candidate_rows": candidates, "stack": stack,
+            "budget": budget}, indent=2, sort_keys=True) + "\n")
+        print(f"replay records: {len(replay)}")
+        print(f"candidate rows: {len(candidates)}")
         return 0
     if args.command == "baseline":
         root = Path(args.out)

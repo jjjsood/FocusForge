@@ -21,7 +21,7 @@ from typing import Iterable
 import numpy as np
 import PIL
 
-from . import fusion, index_field, metrics
+from . import consistency, fusion, index_field, metrics
 from .protocol import FAMILIES, FRAME_COUNT, REAL_CROPS, TRAINING_SEEDS, SeedTriple, require_seed
 from .scenes import SceneData, family_members, render_family
 
@@ -51,7 +51,7 @@ def provenance(inputs: Iterable[Path]) -> dict[str, object]:
     """Capture stable local executable and interpreter identifiers."""
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     cli = ROOT / "target" / "debug" / "focusforge-cli"
-    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py")
+    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py")
     cpu_model = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), platform.processor())
     return {"revision": revision, "cli_sha256": sha256_path(cli) if cli.exists() else None,
             "input_sha256": {path.name: sha256_path(path) for path in inputs},
@@ -1189,6 +1189,446 @@ def run_index_configurations(root: Path, output: Path, configurations: list[dict
                             "input_identity": row.get("input_sha256"), "baseline_composite_sha256": row.get("composite_sha256"),
                             "allowance_keys": [item for item in allowances if item["family"] == row["family"] and item["member"] == row["member"] and item["method"] == "depth-map" and item["tile"] == row["tile"]], **metadata})
     return records
+
+
+def _selection_budget_remaining(budget: dict[str, object], deferred: str) -> bool:
+    """Stop at the registered session boundary and retain the completed rows."""
+    if time.monotonic() - float(budget["started_monotonic"]) < float(budget["session_cap_seconds"]):
+        return True
+    budget["exhausted"] = True
+    budget.setdefault("deferred", []).append(deferred)
+    return False
+
+
+def run_selection_replay(root: Path, budget: dict[str, object] | None = None) -> list[dict[str, object]]:
+    """Replay retained Details rows through the bounded streaming identity path."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text())
+            if row["repeat"] == 0 and row["method"] == "laplacian"]
+    records = []
+    for row in rows:
+        if budget is not None and not _selection_budget_remaining(budget, "retained Details replay"):
+            return records
+        source = _selection_source(row)
+        result, counters = consistency.fuse_streaming(source, "identity")
+        composite = gff.read_u16(Path(str(row["composite"])))
+        zmap = gff.read_zmap(Path(str(row["zmap"])))
+        image_delta = np.abs(result.composite.astype(np.int64) - composite.astype(np.int64))
+        if image_delta.max() != 0 or not np.array_equal(result.zmap, zmap):
+            raise AssertionError("streaming identity does not match retained Details output")
+        records.append({"family": row["family"], "member": row["member"], "seed": row["seed"], "tile": row["tile"],
+                        "composite_sha256": row["composite_sha256"], "zmap_sha256": row["zmap_sha256"],
+                        "raw_winner_sha256": [sha256(plane.tobytes()).hexdigest() for plane in result.raw_winners],
+                        "final_winner_sha256": [sha256(plane.tobytes()).hexdigest() for plane in result.final_winners],
+                        "stream_reads": counters})
+    if len(records) != 60:
+        raise AssertionError("registered Details replay must contain 60 rows")
+    return records
+
+
+def selection_streaming_resource_controls(root: Path) -> list[dict[str, object]]:
+    """Run separate TIFF-backed child controls without constructing an all-frame array."""
+    rows = json.loads((root / "baseline.json").read_text())
+    row = next((item for item in rows if item["family"] == "thin-hairs" and item["method"] == "laplacian"
+                and item["repeat"] == 0 and item["tile"] == 512), None)
+    if row is None:
+        raise ValueError("retained Details source is required for resource controls")
+    case = (ROOT / str(row["case"])).resolve()
+    script = """
+import json
+import resource
+import sys
+sys.path.insert(0, "spikes/guided-filter-fusion")
+from spikes.stacking_experiments import consistency
+import gff_fusion as gff
+paths = gff.frame_paths(sys.argv[1])
+count = int(sys.argv[2])
+source = gff.TiffSource((paths * ((count + len(paths) - 1) // len(paths)))[:count])
+_result, counters = consistency.fuse_streaming(source, "identity")
+print(json.dumps({"frame_count": count, "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                  "sample_reads": counters["sample_reads"], "extra_mask_pass_reads": counters["extra_mask_pass_reads"],
+                  "total_mask_reads": counters["total_mask_reads"]}, sort_keys=True))
+"""
+    records = []
+    for count in (2, 8, 16):
+        process = subprocess.run([sys.executable, "-c", script, str(case), str(count)], cwd=ROOT, capture_output=True, text=True)
+        if process.returncode:
+            raise RuntimeError(f"streaming resource control exit {process.returncode}: {process.stderr[-1000:]}")
+        try:
+            record = json.loads(process.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("streaming resource control did not return JSON") from error
+        records.append(record)
+    if [item.get("frame_count") for item in records if isinstance(item, dict)] != [2, 8, 16]:
+        raise RuntimeError("streaming resource controls are incomplete")
+    for record in records:
+        if record["sample_reads"] != record["frame_count"] * 2 or record["extra_mask_pass_reads"] != 0:
+            raise AssertionError("streaming resource controls do not report two sample passes")
+    return records
+
+
+def selection_tile_self_checks() -> list[dict[str, object]]:
+    """Force odd partial reads beyond the current 192-pixel tile interior."""
+    height, width = 545, 547
+    ramp = np.arange(height * width, dtype=np.uint32).reshape(height, width)
+    frames = np.stack([np.stack([(ramp + 911 * frame + 37 * channel) % 65536
+                                 for channel in range(3)], axis=-1).astype(np.uint16)
+                       for frame in range(3)])
+    masks = np.ones((3, height, width), dtype=bool)
+    masks[1, 273, 271] = False
+    source = gff.ArraySource(frames, masks)
+    records = []
+    for rule, expanded_margin in (("identity", 160), ("majority-all", 192), ("isolated-all", 192),
+                                  ("cross-scale", 192), ("destructive", 224)):
+        whole, _whole_counts = consistency.fuse_streaming(source, rule)
+        current, current_counts, current_plan = consistency.fuse_tiled(source, rule, 512, 160)
+        expanded, expanded_counts, expanded_plan = consistency.fuse_tiled(source, rule, 512, expanded_margin)
+        current_delta = _selection_tile_difference(whole, current)
+        expanded_delta = _selection_tile_difference(whole, expanded)
+        current_exact = rule != "destructive"
+        if current_exact and any(value != 0 for value in (current_delta["max_abs"], current_delta["zmap_different_pixels"],
+                                                            *current_delta["per_level_winner_different_pixels"], *current_delta["per_level_raw_different_pixels"])):
+            raise AssertionError(f"current tile parity failed for {rule}")
+        if any(value != 0 for value in (expanded_delta["max_abs"], expanded_delta["zmap_different_pixels"],
+                                        *expanded_delta["per_level_winner_different_pixels"], *expanded_delta["per_level_raw_different_pixels"])):
+            raise AssertionError(f"expanded tile parity failed for {rule}")
+        windows = current_plan["windows"]
+        if len(windows) < 2 or not any(window["read_xywh"][2] < width or window["read_xywh"][3] < height for window in windows):
+            raise AssertionError("forced tile control did not contain a partial read")
+        records.append({"name": f"selection-tile-{rule}", "shape": [height, width],
+                        "mask_pixels": int((~masks).sum()), "current_160": {"plan": current_plan, "difference": current_delta, "stream_reads": current_counts},
+                        "expanded": {"plan": expanded_plan, "difference": expanded_delta, "stream_reads": expanded_counts}})
+    return records
+
+
+def selection_width_allowances(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Derive the fixed width guards from retained thin-hair baseline measurements."""
+    if len(rows) != 20:
+        raise ValueError("width calibration requires exactly 20 retained baseline rows")
+    seeds = {seed.text() for seed in TRAINING_SEEDS}
+    grouped: dict[tuple[int, int, str], list[tuple[str, int, float]]] = defaultdict(list)
+    bindings = []
+    for row in rows:
+        if row.get("family") != "thin-hairs" or row.get("method") != "laplacian" or int(row.get("tile", 0)) not in TILES:
+            raise ValueError("width calibration row is not a retained thin-hair Details row")
+        seed, repeat = str(row.get("seed")), int(row.get("repeat", -1))
+        if seed not in seeds or repeat not in REPEATS or not isinstance(row.get("input_sha256"), dict) or not isinstance(row.get("composite_sha256"), str) or not all(
+                isinstance(row.get(key), str) and row[key] for key in ("zmap_sha256", "segment_mask_sha256", "support_mask_sha256", "normalization")):
+            raise ValueError("width calibration input binding is incomplete")
+        values = row.get("width_metrics")
+        if not isinstance(values, dict):
+            raise ValueError("width calibration row lacks width metrics")
+        for width in (1, 2):
+            metrics_for_width = values.get(str(width))
+            if not isinstance(metrics_for_width, dict):
+                raise ValueError("width calibration is missing one width")
+            for metric in ("hair_retention", "hair_label_exact"):
+                value = metrics_for_width.get(metric)
+                if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValueError("width calibration metric is invalid")
+                grouped[(width, int(row["tile"]), metric)].append((seed, repeat, float(value)))
+        bindings.append({"seed": seed, "tile": int(row["tile"]), "repeat": repeat, "input_sha256": row["input_sha256"],
+                         "composite_sha256": row["composite_sha256"], "zmap_sha256": row.get("zmap_sha256"),
+                         "segment_mask_sha256": row.get("segment_mask_sha256"), "support_mask_sha256": row.get("support_mask_sha256"),
+                         "normalization": row.get("normalization")})
+    allowances = []
+    for key in sorted(grouped):
+        samples = grouped[key]
+        if len(samples) != 10 or {seed for seed, _repeat, _value in samples} != seeds:
+            raise ValueError("width calibration samples are incomplete")
+        by_seed: dict[str, dict[int, float]] = defaultdict(dict)
+        for seed, repeat, value in samples:
+            if repeat in by_seed[seed]:
+                raise ValueError("width calibration has duplicate seed/repeat values")
+            by_seed[seed][repeat] = value
+        if any(set(values) != set(REPEATS) for values in by_seed.values()):
+            raise ValueError("width calibration repeat pairing is incomplete")
+        seed_values = [values[0] for values in by_seed.values()]
+        seed_spread = max(seed_values) - min(seed_values)
+        repeat_spread = max(abs(values[0] - values[1]) for values in by_seed.values())
+        allowances.append({"width": key[0], "tile": key[1], "metric": key[2], "direction": "higher",
+                           "seed_spread": seed_spread, "repeat_spread": repeat_spread,
+                           "allowance": max(seed_spread, repeat_spread),
+                           "per_seed_repeat_values": {seed: values for seed, values in sorted(by_seed.items())}})
+    if len(allowances) != 8:
+        raise ValueError("width calibration must produce eight guard rows")
+    return {"state": "measured", "allowances": allowances, "inputs": bindings}
+
+
+def selection_width_measurements(root: Path) -> list[dict[str, object]]:
+    """Measure fixed one- and two-pixel hair guards from retained Details outputs."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text())
+            if row["family"] == "thin-hairs" and row["method"] == "laplacian"]
+    measured = []
+    family = next(item for item in FAMILIES if item.name == "thin-hairs")
+    for row in rows:
+        data = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+        image, labels = gff.read_u16(Path(str(row["composite"]))), gff.read_zmap(Path(str(row["zmap"])))
+        values: dict[str, dict[str, float]] = {}
+        masks: dict[str, str] = {}
+        support = (labels != fusion.NO_SOURCE) & np.isfinite(data.depth)
+        for width in (1, 2):
+            segments = [hair for hair in data.metadata["hairs"] if abs(int(hair[1][1]) - int(hair[1][0])) == width]
+            mask = np.zeros(labels.shape, dtype=bool)
+            for kind, line, _before, _after, extent in segments:
+                if kind == "h":
+                    mask[line[0]:line[1], extent[0]:extent[1]] = True
+                else:
+                    mask[extent[0]:extent[1], line[0]:line[1]] = True
+            reference = gff.hair_contrast(data.truth.mean(2), segments)
+            observed = gff.hair_contrast(image.mean(2), segments)
+            values[str(width)] = {"hair_retention": float((observed / reference).mean()),
+                                  "hair_label_exact": float((labels[mask & support] == np.rint(data.depth[mask & support]).astype(np.uint16)).mean())}
+            masks[str(width)] = sha256(mask.tobytes()).hexdigest()
+        measured.append({**row, "width_metrics": values, "segment_mask_sha256": sha256(json.dumps(masks, sort_keys=True).encode()).hexdigest(), "segment_masks_sha256": masks,
+                         "support_mask_sha256": sha256(support.tobytes()).hexdigest(),
+                         "normalization": "gff.hair_contrast observed/reference by exact line width"})
+    return measured
+
+
+def _selection_source(row: dict[str, object]) -> object:
+    """Open one retained Details input without loading its frame set at once."""
+    if "actual_source_frames" in row:
+        return gff.TiffSource(row["actual_source_frames"], row.get("actual_coverage"))
+    return gff.TiffSource(gff.frame_paths(Path(str(row["case"]))))
+
+
+def _selection_rule(configuration: dict[str, object]) -> str:
+    """Translate registered names to the bounded selection implementation."""
+    rules = {"majority-3x3-all": "majority-all", "isolated-all": "isolated-all",
+             "cross-scale-raw-parent": "cross-scale", "isolated-level0": "isolated-level0",
+             "identity": "identity", "mode-9x9-all": "destructive"}
+    try:
+        return rules[str(configuration["rule"])]
+    except KeyError as error:
+        raise ValueError("configuration has no tiled consistency rule") from error
+
+
+def _selection_width_metrics(data: SceneData, result: consistency.SelectionResult,
+                             baseline_labels: np.ndarray) -> tuple[dict[str, dict[str, float]], dict[str, str]]:
+    """Measure each fixed hair width using the same contrast normalization as calibration."""
+    values: dict[str, dict[str, float]] = {}
+    hashes: dict[str, str] = {}
+    support = (baseline_labels != fusion.NO_SOURCE) & np.isfinite(data.depth)
+    labels = np.rint(data.depth).clip(0, 65535).astype(np.uint16)
+    for width in (1, 2):
+        hairs = [hair for hair in data.metadata["hairs"] if abs(int(hair[1][1]) - int(hair[1][0])) == width]
+        mask = np.zeros(result.zmap.shape, dtype=bool)
+        for kind, line, _before, _after, extent in hairs:
+            if kind == "h":
+                mask[line[0]:line[1], extent[0]:extent[1]] = True
+            else:
+                mask[extent[0]:extent[1], line[0]:line[1]] = True
+        active = mask & support
+        reference = gff.hair_contrast(data.truth.mean(2), hairs)
+        observed = gff.hair_contrast(result.composite.mean(2), hairs)
+        values[str(width)] = {"hair_retention": float((observed / reference).mean()),
+                              "hair_label_exact": float((result.zmap[active] == labels[active]).mean())}
+        hashes[str(width)] = sha256(mask.tobytes()).hexdigest()
+    return values, hashes
+
+
+def _selection_tile_difference(one: consistency.SelectionResult, tiled: consistency.SelectionResult) -> dict[str, object]:
+    """Keep image, level map and raw-map equality separate in the audit record."""
+    image = np.abs(one.composite.astype(np.int64) - tiled.composite.astype(np.int64))
+    levels = [int(np.count_nonzero(left != right)) for left, right in zip(one.final_winners, tiled.final_winners)]
+    raw = [int(np.count_nonzero(left != right)) for left, right in zip(one.raw_winners, tiled.raw_winners)]
+    return {"max_abs": int(image.max()), "different_samples": int((image != 0).sum()),
+            "zmap_different_pixels": int(np.count_nonzero(one.zmap != tiled.zmap)),
+            "per_level_winner_different_pixels": levels, "per_level_raw_different_pixels": raw}
+
+
+def _selection_map_audit(result: consistency.SelectionResult) -> dict[str, object]:
+    """Record immutable and final maps without treating either as an image metric."""
+    return {"raw_winner_sha256": [sha256(plane.tobytes()).hexdigest() for plane in result.raw_winners],
+            "final_winner_sha256": [sha256(plane.tobytes()).hexdigest() for plane in result.final_winners],
+            "per_level_changed_coefficients": consistency.changed_counts(list(result.raw_winners), list(result.final_winners))}
+
+
+def _selection_result_record(output: Path, row: dict[str, object], configuration: dict[str, object],
+                             result: consistency.SelectionResult, counters: dict[str, int],
+                             plan: dict[str, object] | None, tile_measurements: dict[str, object] | None,
+                             allowances: list[dict[str, object]]) -> dict[str, object]:
+    """Persist one configuration row and its truth metrics when the input is synthetic."""
+    directory = output / str(configuration["id"]) / run_key(f"{row['family']}-{row['member']}",
+                                                               SeedTriple.parse(str(row["seed"])), "laplacian",
+                                                               int(row["tile"]), int(row["repeat"]))
+    directory.mkdir(parents=True, exist_ok=True)
+    composite, zmap = directory / "composite.tif", directory / "zmap.tif"
+    gff.write_u16(composite, result.composite)
+    gff.write_u16(zmap, result.zmap[..., None])
+    raw_hashes = [sha256(plane.tobytes()).hexdigest() for plane in result.raw_winners]
+    final_hashes = [sha256(plane.tobytes()).hexdigest() for plane in result.final_winners]
+    record: dict[str, object] = {"configuration_id": configuration["id"], "rule": configuration["rule"],
+        "matched_candidate": configuration.get("matched_candidate"), "classification": configuration["classification"],
+        "can_advance": configuration["can_advance"], "family": row["family"], "member": row["member"],
+        "seed": row["seed"], "tile": row["tile"], "repeat": row["repeat"], "method": "laplacian",
+        "composite": str(composite), "zmap": str(zmap), "composite_sha256": sha256_path(composite),
+        "zmap_sha256": sha256_path(zmap), "raw_winner_sha256": raw_hashes, "final_winner_sha256": final_hashes,
+        "per_level_changed_coefficients": consistency.changed_counts(list(result.raw_winners), list(result.final_winners)),
+        "stream_reads": counters, "input_identity": row.get("input_sha256"),
+        "baseline_composite_sha256": row.get("composite_sha256"), "baseline_zmap_sha256": row.get("zmap_sha256"),
+        "tile_boundaries": plan, "tile_measurements": tile_measurements,
+        "allowance_keys": [item for item in allowances if item["family"] == row["family"] and item["member"] == row["member"]
+                           and item["method"] == "laplacian" and item["tile"] == row["tile"]],
+        "wall_seconds": 0.0, "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+    family = next(item for item in FAMILIES if item.name == row["family"])
+    data = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+    source = _selection_source(row)
+    metric_row = {**row, "comp": str(composite), "zmap": str(zmap), "tile_boundaries": plan or row["tile_boundaries"]}
+    metric_row.pop("tile_difference", None)
+    if tile_measurements is not None:
+        metric_row["tile_difference"] = tile_measurements["current_160"]["difference"]
+    image_metrics, metadata = _record_metrics(data, str(row["family"]), str(row["member"]), metric_row,
+                                               composite, zmap, source, metric_row["tile_boundaries"])
+    record["label_metrics"] = {key: image_metrics.pop(key) for key in ("label_exact", "label_within_one", "label_mad")}
+    record["image_metrics"] = image_metrics
+    record["unavailable_metrics"] = metadata["metric_unavailable"]
+    if tile_measurements is None:
+        record["tile_difference"] = None
+        record["tile_difference_unavailable"] = "global random control has no finite tile experiment"
+    else:
+        record["tile_difference"] = tile_measurements["current_160"]["difference"]
+    if row["family"] == "thin-hairs":
+        baseline_labels = gff.read_zmap(Path(str(row["zmap"])))
+        widths, masks = _selection_width_metrics(data, result, baseline_labels)
+        record["width_metrics"] = widths
+        record["width_segment_masks_sha256"] = masks
+        record["width_support_mask_sha256"] = sha256(((baseline_labels != fusion.NO_SOURCE) & np.isfinite(data.depth)).tobytes()).hexdigest()
+    return {**record, **metadata}
+
+
+def run_selection_configurations(root: Path, output: Path, configurations: list[dict[str, object]],
+                                 controls: list[dict[str, object]], allowances_path: Path,
+                                 family_filter: str | None = None, budget: dict[str, object] | None = None) -> list[dict[str, object]]:
+    """Evaluate all registered consistency outputs from one immutable Details source per key."""
+    all_rows = json.loads((root / "baseline.json").read_text())
+    rows = [row for row in all_rows if row["method"] == "laplacian" and row["repeat"] == 0
+            and (family_filter is None or row["family"] == family_filter)]
+    expected = 60 if family_filter is None else 20
+    if len(rows) != expected:
+        raise AssertionError(f"selection input count is {len(rows)}, expected {expected}")
+    allowances = json.loads(allowances_path.read_text())
+    registered = [*controls[:2], *configurations, *controls[2:]]
+    records: list[dict[str, object]] = []
+    for row in rows:
+        if budget is not None and not _selection_budget_remaining(budget, f"{row['family']}/{row['member']}/{row['seed']}/t{row['tile']}"):
+            return records
+        case_started = time.monotonic()
+        source = _selection_source(row)
+        results = consistency.fuse_configurations(source, configurations, controls, str(row["family"]), str(row["member"]), str(row["seed"]))
+        shared_selection_seconds = time.monotonic() - case_started
+        if set(results) != {str(item["id"]) for item in registered}:
+            raise AssertionError("selection result configuration set does not match registration")
+        persisted_counts: dict[str, list[int]] = {}
+        for configuration in registered:
+            if budget is not None and not _selection_budget_remaining(budget, f"{configuration['id']} after {row['family']}/{row['seed']}"):
+                return records
+            measurement_started = time.monotonic()
+            result, counters = results[str(configuration["id"])]
+            plan = None
+            tile_measurements = None
+            if configuration["rule"] != "matched-random":
+                current, current_counts, current_plan = consistency.fuse_tiled(source, _selection_rule(configuration), int(row["tile"]), 160)
+                expanded_margin = int(configuration["expanded_margin"])
+                expanded, expanded_counts, expanded_plan = consistency.fuse_tiled(source, _selection_rule(configuration), int(row["tile"]), expanded_margin)
+                plan = current_plan
+                tile_measurements = {"whole": _selection_map_audit(result),
+                                     "current_160": {"difference": _selection_tile_difference(result, current), "maps": _selection_map_audit(current), "stream_reads": current_counts, "plan": current_plan},
+                                     "expanded": {"difference": _selection_tile_difference(result, expanded), "maps": _selection_map_audit(expanded), "stream_reads": expanded_counts, "plan": expanded_plan}}
+                current_difference = tile_measurements["current_160"]["difference"]
+                expanded_difference = tile_measurements["expanded"]["difference"]
+                if configuration["rule"] != "mode-9x9-all" and any(value != 0 for value in (
+                        current_difference["max_abs"], current_difference["zmap_different_pixels"],
+                        *current_difference["per_level_winner_different_pixels"], *current_difference["per_level_raw_different_pixels"])):
+                    raise AssertionError(f"current tile parity failed for {configuration['id']}")
+                if any(value != 0 for value in (expanded_difference["max_abs"], expanded_difference["zmap_different_pixels"],
+                                                 *expanded_difference["per_level_winner_different_pixels"], *expanded_difference["per_level_raw_different_pixels"])):
+                    raise AssertionError(f"expanded tile parity failed for {configuration['id']}")
+                result, counters = current, current_counts
+                persisted_counts[str(configuration["id"])] = consistency.changed_counts(list(result.raw_winners), list(result.final_winners))
+            else:
+                matched = str(configuration["matched_candidate"])
+                matched_counts = persisted_counts.get(matched)
+                actual = consistency.changed_counts(list(result.raw_winners), list(result.final_winners))
+                if matched_counts is None or actual != matched_counts:
+                    raise AssertionError(f"paired random counts do not match {matched}")
+            record = _selection_result_record(output, row, configuration, result, counters, plan, tile_measurements, allowances)
+            if configuration["rule"] == "matched-random":
+                record["matched_per_level_changed_coefficients"] = persisted_counts[str(configuration["matched_candidate"])]
+            record["shared_selection_seconds"] = shared_selection_seconds
+            record["measurement_seconds"] = time.monotonic() - measurement_started
+            record["case_elapsed_seconds"] = time.monotonic() - case_started
+            records.append(record)
+    if budget is None or not budget["exhausted"]:
+        if len(records) != expected * 10:
+            raise AssertionError("selection output count does not match registered matrix")
+    return records
+
+
+def run_selection_stack(output: Path, source_name: str, prepared: Path, rect_text: str | None,
+                        configurations: list[dict[str, object]], controls: list[dict[str, object]]) -> dict[str, object]:
+    """Evaluate ten registered outputs on one strict aligned crop without synthetic truth claims."""
+    rect = _registered_rect(source_name, rect_text)
+    manifest = _validate_preparation(prepared, source_name)
+    directory, paths, coverage = _crop_prepared_inputs(output, source_name, prepared, rect)
+    source = gff.TiffSource(paths)
+    results = consistency.fuse_configurations(source, configurations, controls, source_name, "aligned-roi", "registered")
+    registered = [*controls[:2], *configurations, *controls[2:]]
+    rows = []
+    for configuration in registered:
+        result, counters = results[str(configuration["id"])]
+        work = directory / str(configuration["id"])
+        work.mkdir(parents=True, exist_ok=True)
+        composite, zmap = work / "composite.tif", work / "zmap.tif"
+        gff.write_u16(composite, result.composite)
+        gff.write_u16(zmap, result.zmap[..., None])
+        rows.append({"configuration_id": configuration["id"], "rule": configuration["rule"],
+                     "classification": configuration["classification"], "can_advance": configuration["can_advance"],
+                     "rect_xywh": list(rect), "global_origin_xy": coverage["global_origin_xy"], "coverage": coverage,
+                     "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
+                     "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"],
+                     "composite": str(composite), "zmap": str(zmap), "composite_sha256": sha256_path(composite),
+                     "zmap_sha256": sha256_path(zmap), "raw_winner_sha256": [sha256(part.tobytes()).hexdigest() for part in result.raw_winners],
+                     "final_winner_sha256": [sha256(part.tobytes()).hexdigest() for part in result.final_winners],
+                     "per_level_changed_coefficients": consistency.changed_counts(list(result.raw_winners), list(result.final_winners)),
+                     "stream_reads": counters, "truth_metrics": "not computed"})
+    if len(rows) != 10:
+        raise AssertionError("real selection output count does not match registration")
+    by_id = {str(row["configuration_id"]): row for row in rows}
+    for row in rows:
+        if row["rule"] != "matched-random":
+            continue
+        matched = next(item for item in controls if item["id"] == row["configuration_id"])["matched_candidate"]
+        expected = by_id[str(matched)]["per_level_changed_coefficients"]
+        if row["per_level_changed_coefficients"] != expected:
+            raise AssertionError(f"real paired random counts do not match {matched}")
+        row["matched_per_level_changed_coefficients"] = expected
+    identity = next(row for row in rows if row["configuration_id"] == "consistency-identity")
+    retained_path = prepared.parents[3] / "stacking-crops" / source_name / "crops.json"
+    retained = json.loads(retained_path.read_text()) if retained_path.is_file() else []
+    current = next((row for row in retained if row.get("method") == "laplacian"
+                    and row.get("prepared_manifest_sha256") == sha256_path(prepared)
+                    and row.get("rect_xywh") == list(rect)), None)
+    if current is None:
+        raise ValueError("retained current Details crop does not match the preparation")
+    image_delta = np.abs(gff.read_u16(Path(identity["composite"])).astype(np.int64)
+                         - gff.read_u16(Path(str(current["composite"]))).astype(np.int64))
+    labels_equal = np.array_equal(gff.read_zmap(Path(identity["zmap"])), gff.read_zmap(Path(str(current["zmap"]))))
+    if image_delta.max() != 0 or not labels_equal:
+        raise AssertionError("real streaming identity does not match retained current Details crop")
+    identity["retained_current_replay"] = {"composite_max_sample_difference": 0, "zmap_equal": True,
+                                           "retained_composite_sha256": current["composite_sha256"],
+                                           "retained_zmap_sha256": current["zmap_sha256"]}
+    montages = []
+    for row in rows:
+        if row["classification"] == "candidate":
+            image = output / "stack" / f"{row['configuration_id']}-current-vs-candidate.png"
+            image.parent.mkdir(parents=True, exist_ok=True)
+            gff.montage(str(image), (0, rect[3], 0, rect[2]), [Path(identity["composite"]), Path(row["composite"])])
+            montages.append({"configuration_id": row["configuration_id"], "path": str(image), "sha256": sha256_path(image)})
+    return {"source": source_name, "rect_xywh": list(rect), "prepared_manifest": str(prepared.resolve()),
+            "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
+            "coverage": coverage, "rows": rows, "montages": montages}
 
 
 def run_index_full_references(root: Path, output: Path, configurations: list[dict[str, object]],
