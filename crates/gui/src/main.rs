@@ -533,6 +533,12 @@ fn select_backend(
             toast_timer,
         ));
     if let Err(e) = selector.select() {
+        #[cfg(target_os = "linux")]
+        tracing::error!(
+            "cannot open the {} display (check DISPLAY and WAYLAND_DISPLAY): {e}",
+            display_backend.label()
+        );
+        #[cfg(not(target_os = "linux"))]
         tracing::error!("{e}");
         return Err(ExitCode::from(1));
     }
