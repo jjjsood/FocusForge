@@ -350,20 +350,17 @@ fn out_of_range_parameter_is_rejected() {
     let cwd = tmp_dir("out_of_range_parameter_is_rejected");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let out = run_cli_in(
-        &cwd,
-        &[
-            "stack",
-            missing_dir,
-            "-o",
-            out_dir.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--set",
-            "levels=999",
-            "--cpu",
-        ],
-    );
+    let args = common::push_no_gpu(vec![
+        "stack",
+        missing_dir,
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--set",
+        "levels=999",
+    ]);
+    let out = run_cli_in(&cwd, &args);
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -385,26 +382,24 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
     let cwd = tmp_dir("refuses_levels_the_tile_geometry_cannot_plan");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
+    let input = mantis_512_dir();
     let output = out_dir.join("refuses_levels_the_tile_geometry_cannot_plan.tif");
     let zmap = out_dir.join("refuses_levels_the_tile_geometry_cannot_plan-zmap.tif");
-    let out = run_cli_in(
-        &cwd,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            out_dir.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--set",
-            "levels=7",
-            "--tile-size",
-            "512",
-            "--no-align",
-            "--no-crop",
-            "--cpu",
-        ],
-    );
+    let args = common::push_no_gpu(vec![
+        "stack",
+        input.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--set",
+        "levels=7",
+        "--tile-size",
+        "512",
+        "--no-align",
+        "--no-crop",
+    ]);
+    let out = run_cli_in(&cwd, &args);
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
