@@ -5,6 +5,7 @@ Run from the repository root:
 ```text
 python3 -m spikes.stacking_experiments --self-check
 python3 -m spikes.stacking_experiments registration --out .scratch/stacking-controls/registration/protocol.json
+python3 -m spikes.stacking_experiments focus-score --split training --registration /path/to/protocol.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/focus-score/replay
 python3 -m spikes.stacking_experiments baseline --split training --out .scratch/stacking-controls
 python3 -m spikes.stacking_experiments cases --seed 101,201,301 --out .scratch/stacking-controls
 python3 -m spikes.stacking_experiments cases --seed 111,211,311 --out .scratch/sealed-check
@@ -20,3 +21,5 @@ The hold-out command without `--allow-holdout` intentionally exits nonzero befor
 `prepare-real` aligns the registered full-resolution files with CPU pyramidal ECC, rotation-scale mode, an anchor reference and the middle frame. It writes a strict preparation manifest binding source headers and hashes, report, transforms, statuses, warped TIFFs, command exit, wall time and RSS. `crops` requires that manifest, verifies it again, proves all sources cover the registered aligned-reference rectangle, then reads only that rectangle from the aligned TIFFs. Synthetic co-registered cases use their registered no-alignment geometry.
 
 The registration command records six scene families, three independent seed axes, metrics, allowance procedure, and advancement rules. CPU baseline runs record host RSS; VRAM is recorded as not used. Cold and warm labels are used only when measured.
+
+`focus-score` validates the frozen comparison registration and inputs before creating output. A bound execution hash is required before a replay or comparison can run.

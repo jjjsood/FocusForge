@@ -11,9 +11,11 @@ import math
 import os
 from pathlib import Path
 import platform
+import resource
 import shutil
 import subprocess
 import sys
+import time
 from typing import Iterable
 
 import numpy as np
@@ -49,7 +51,7 @@ def provenance(inputs: Iterable[Path]) -> dict[str, object]:
     """Capture stable local executable and interpreter identifiers."""
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     cli = ROOT / "target" / "debug" / "focusforge-cli"
-    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py")
+    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py")
     cpu_model = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), platform.processor())
     return {"revision": revision, "cli_sha256": sha256_path(cli) if cli.exists() else None,
             "input_sha256": {path.name: sha256_path(path) for path in inputs},
@@ -145,6 +147,15 @@ def tile_boundaries(width: int, height: int, tile: int, margin: int, levels: int
         raise ValueError("reported tile support has no interior")
     return {"margin": margin, "levels": levels, "interior": interior,
             "vertical": _axis_boundaries(width, interior, margin), "horizontal": _axis_boundaries(height, interior, margin)}
+
+
+def tile_read_bound(width: int, height: int, plan: dict[str, object]) -> dict[str, int]:
+    """Return the largest halo-expanded read implied by a tile plan."""
+    margin = int(plan["margin"])
+    def maximum(length: int, boundaries: list[object]) -> int:
+        edges = _tile_edges(length, boundaries)
+        return max(min(length, end + margin) - max(0, start - margin) for start, end in zip(edges, edges[1:]))
+    return {"width": maximum(width, list(plan["vertical"])), "height": maximum(height, list(plan["horizontal"]))}
 
 
 def _case_metrics(comp: Path, zmap: Path, data: SceneData, source: object, boundaries: dict[str, object]) -> dict[str, float | None]:
@@ -504,6 +515,470 @@ def run_focused_twins(root: Path) -> list[dict[str, object]]:
     return out
 
 
+def _focus_inputs(row: dict[str, object]) -> tuple[np.ndarray, np.ndarray | None]:
+    paths = row.get("actual_source_frames") or gff.frame_paths(Path(str(row["case"])))
+    frames = np.stack([gff.read_u16(path) for path in paths])
+    coverage_path = row.get("actual_coverage")
+    coverage = np.load(str(coverage_path)) if coverage_path else None
+    return frames, coverage
+
+
+def _focus_fuse(frames: np.ndarray, coverage: np.ndarray | None, method: str, score: object = None,
+                eligibility_reach: int | None = None, score_radius: int = 4) -> fusion.FusionResult:
+    if method == "laplacian":
+        return fusion.details(frames, coverage, levels=5, radius=8, score=score)
+    if method == "weighted-average":
+        return fusion.weighted_average(frames, coverage, radius=16, score=score)
+    if method == "depth-map":
+        return fusion.depth_map_replay(frames, coverage, score_radius=score_radius, smooth_radius=8,
+                                       eligibility_reach=eligibility_reach, score=score)
+    raise ValueError(f"unknown fusion method: {method}")
+
+
+def _tile_edges(length: int, boundaries: list[object]) -> list[int]:
+    return [0, *(int(value) for value in boundaries), length]
+
+
+def _tiled_focus(frames: np.ndarray, coverage: np.ndarray | None, method: str, vertical: list[object],
+                 horizontal: list[object], margin: int, score: object = None,
+                 eligibility_reach: int | None = None, score_radius: int = 4) -> fusion.FusionResult:
+    """Fuse recorded interiors from halo-expanded tiles."""
+    if not vertical and not horizontal:
+        return _focus_fuse(frames, coverage, method, score, eligibility_reach, score_radius)
+    height, width = frames.shape[1:3]
+    composite = np.zeros_like(frames[0], dtype=np.uint16)
+    winners = np.full((height, width), fusion.NO_SOURCE, dtype=np.uint16)
+    eligible = np.zeros((frames.shape[0], height, width), dtype=bool)
+    for y0, y1 in zip(_tile_edges(height, horizontal), _tile_edges(height, horizontal)[1:]):
+        for x0, x1 in zip(_tile_edges(width, vertical), _tile_edges(width, vertical)[1:]):
+            outer_y0, outer_y1 = max(0, y0 - margin), min(height, y1 + margin)
+            outer_x0, outer_x1 = max(0, x0 - margin), min(width, x1 + margin)
+            crop_coverage = None if coverage is None else coverage[:, outer_y0:outer_y1, outer_x0:outer_x1]
+            crop = _focus_fuse(frames[:, outer_y0:outer_y1, outer_x0:outer_x1], crop_coverage, method, score, eligibility_reach, score_radius)
+            local_y, local_x = slice(y0 - outer_y0, y1 - outer_y0), slice(x0 - outer_x0, x1 - outer_x0)
+            composite[y0:y1, x0:x1] = crop.composite[local_y, local_x]
+            winners[y0:y1, x0:x1] = crop.winners[local_y, local_x]
+            eligible[:, y0:y1, x0:x1] = crop.eligible[:, local_y, local_x]
+    return fusion.FusionResult(composite, winners, eligible)
+
+
+def focus_tile_plan(row: dict[str, object], height: int, width: int, eligibility_reach: int | None = None,
+                    score_radius: int = 4) -> dict[str, object]:
+    """Expand a recorded plan only when a registered Depth Map arm needs more halo."""
+    recorded = row["tile_boundaries"]
+    if str(row["method"]) != "depth-map":
+        return recorded
+    required = max(int(recorded["margin"]), score_radius + 8, int(eligibility_reach or 0))
+    if required == int(recorded["margin"]):
+        return recorded
+    planned = tile_boundaries(width, height, int(row["tile"]), required, int(recorded["levels"]))
+    read = tile_read_bound(width, height, planned)
+    if max(read.values()) > int(row["tile"]):
+        raise AssertionError("candidate tile plan exceeds its registered tile size")
+    return planned
+
+
+def focus_replay(row: dict[str, object], score: object = None, eligibility_reach: int | None = None,
+                 score_radius: int = 4, return_plan: bool = False) -> fusion.FusionResult | tuple[fusion.FusionResult, dict[str, object]]:
+    """Run one registered method with a halo sufficient for the selected score and mask."""
+    frames, coverage = _focus_inputs(row)
+    plan = focus_tile_plan(row, frames.shape[1], frames.shape[2], eligibility_reach, score_radius)
+    result = _tiled_focus(frames, coverage, str(row["method"]), list(plan["vertical"]), list(plan["horizontal"]),
+                          int(plan["margin"]), score, eligibility_reach, score_radius)
+    return (result, plan) if return_plan else result
+
+
+def focus_tile_checks() -> list[dict[str, int | str]]:
+    """Check candidate fusion against a forced 512-pixel interior split."""
+    from . import focus_score
+
+    random = np.random.default_rng(27)
+    frames = random.integers(0, 65536, size=(2, 544, 544, 3), dtype=np.uint16)
+    coverage = np.ones(frames.shape[:3], dtype=bool)
+    coverage[:, 272, 272] = False
+    checks: list[tuple[str, bool, dict[str, int]]] = []
+    for method in METHODS:
+        one = _focus_fuse(frames, coverage, method, focus_score.detrended)
+        tiled = _tiled_focus(frames, coverage, method, [192, 384], [192, 384], 160, focus_score.detrended)
+        delta = np.abs(one.composite.astype(np.int64) - tiled.composite.astype(np.int64))
+        same_winners = np.array_equal(one.winners, tiled.winners)
+        if method in ("weighted-average", "depth-map"):
+            ok = bool(delta.max() == 0 and same_winners)
+        else:
+            ok = bool(delta.max() <= 1 and same_winners)
+        checks.append((f"focus-tile512-{method}", ok, {"max_abs": int(delta.max()),
+                                                          "different_samples": int((delta != 0).sum()),
+                                                          "zmap_different_pixels": int((one.winners != tiled.winners).sum())}))
+    radius10_frames = random.integers(0, 65536, size=(2, 1024, 1024, 3), dtype=np.uint16)
+    radius10_coverage = np.ones(radius10_frames.shape[:3], dtype=bool)
+    radius10_coverage[:, 512, 512] = False
+    radius10_row = {"method": "depth-map", "tile": 512,
+                    "tile_boundaries": tile_boundaries(1024, 1024, 512, 16, 1)}
+    radius10_arms = (("r10-e16", focus_score.detrended, 10, 16, 18), ("r10-e18", focus_score.detrended, 10, 18, 18),
+                     ("current-r4-e16", focus_score.current, 4, 16, 16), ("current-r4-e18", focus_score.current, 4, 18, 18))
+    for name, score, radius, eligibility_reach, expected_margin in radius10_arms:
+        radius10_plan = focus_tile_plan(radius10_row, 1024, 1024, eligibility_reach, radius)
+        radius10_one = _focus_fuse(radius10_frames, radius10_coverage, "depth-map", score, eligibility_reach, radius)
+        radius10_tiled = _tiled_focus(radius10_frames, radius10_coverage, "depth-map", list(radius10_plan["vertical"]),
+                                      list(radius10_plan["horizontal"]), int(radius10_plan["margin"]), score, eligibility_reach, radius)
+        radius10_delta = np.abs(radius10_one.composite.astype(np.int64) - radius10_tiled.composite.astype(np.int64))
+        radius10_read = tile_read_bound(1024, 1024, radius10_plan)
+        checks.append(("focus-tile512-r10-halo" if name == "r10-e18" else f"focus-tile512-{name}-halo",
+                       bool(radius10_delta.max() == 0 and np.array_equal(radius10_one.winners, radius10_tiled.winners)
+                            and np.array_equal(radius10_one.eligible, radius10_tiled.eligible)
+                            and radius10_plan["margin"] == expected_margin
+                            and (radius10_plan["interior"] == 476 if expected_margin == 18 else radius10_plan["interior"] == 480)
+                            and max(radius10_read.values()) == 512),
+                       {"max_abs": int(radius10_delta.max()), "different_samples": int((radius10_delta != 0).sum()),
+                        "zmap_different_pixels": int((radius10_one.winners != radius10_tiled.winners).sum()),
+                        "eligibility_different_pixels": int((radius10_one.eligible != radius10_tiled.eligible).sum()),
+                        "max_read": max(radius10_read.values())}))
+    failed = [name for name, ok, _values in checks if not ok]
+    if failed:
+        raise AssertionError(", ".join(failed))
+    return [{"name": name, **values} for name, _ok, values in checks]
+
+
+def replay_control_checks() -> list[str]:
+    """Prove image, winner, and eligibility replay changes are rejected."""
+    frames = np.arange(2 * 33 * 35 * 3, dtype=np.float32).reshape(2, 33, 35, 3)
+    coverage = np.ones(frames.shape[:3], dtype=bool)
+    replay = _focus_fuse(frames, coverage, "depth-map")
+    checks = []
+    for name, altered in (
+        ("replay-image-rejected", fusion.FusionResult(replay.composite.copy(), replay.winners, replay.eligible)),
+        ("replay-winner-rejected", fusion.FusionResult(replay.composite, replay.winners.copy(), replay.eligible)),
+        ("replay-eligibility-rejected", fusion.FusionResult(replay.composite, replay.winners, replay.eligible.copy())),
+    ):
+        if name == "replay-image-rejected":
+            altered.composite[0, 0, 0] += np.uint16(1)
+        elif name == "replay-winner-rejected":
+            altered.winners[0, 0] = fusion.NO_SOURCE
+        else:
+            altered.eligible[0, 0, 0] = False
+        rejected = not (np.array_equal(replay.composite, altered.composite) and np.array_equal(replay.winners, altered.winners)
+                        and np.array_equal(replay.eligible, altered.eligible))
+        checks.append((name, rejected))
+    failed = [name for name, ok in checks if not ok]
+    if failed:
+        raise AssertionError(", ".join(failed))
+    return [name for name, _ok in checks]
+
+
+def focus_configuration_checks() -> list[str]:
+    """Exercise every registered configuration shape on a tiny known stack."""
+    from . import focus_score
+
+    frames = np.arange(2 * 35 * 37 * 3, dtype=np.float32).reshape(2, 35, 37, 3)
+    coverage = np.ones(frames.shape[:3], dtype=bool)
+    configurations = [("laplacian", "current", 8), ("laplacian", "detrended-std", 8), ("laplacian", "luma-laplacian", 8),
+                      ("laplacian", "plain-variance", 8), ("weighted-average", "current", 16),
+                      ("weighted-average", "detrended-std", 16), ("weighted-average", "luma-laplacian", 16),
+                      ("weighted-average", "plain-variance", 16), ("depth-map", "current", 4),
+                      ("depth-map", "detrended-std", 4), ("depth-map", "luma-laplacian", 4),
+                      ("depth-map", "plain-variance", 4), ("depth-map", "detrended-std", 10),
+                      ("depth-map", "detrended-std", 10), ("weighted-average", "adaptive-detrended-std", 16),
+                      ("depth-map", "adaptive-detrended-std", 4), ("depth-map", "current", 4), ("depth-map", "current", 4)]
+    for method, score_name, radius in configurations:
+        score = focus_score.adaptive_detrended((4, 8, 16) if method == "weighted-average" else (1, 2, 4)) if score_name == "adaptive-detrended-std" else focus_score.score_by_name(score_name)
+        result = _focus_fuse(frames, coverage, method, score, 18 if radius == 10 and method == "depth-map" else None, radius)
+        if result.composite.shape != frames.shape[1:] or result.winners.shape != frames.shape[1:3]:
+            raise AssertionError("registered focus configuration shape mismatch")
+    return ["focus-configurations-18"]
+
+
+def replay_focus_baselines(root: Path) -> list[dict[str, object]]:
+    """Require exact current-score images and source maps before candidate rows."""
+    rows = json.loads((root / "baseline.json").read_text())
+    selected = [row for row in rows if row["repeat"] == 0]
+    if len(selected) != 180:
+        raise ValueError(f"expected 180 baseline replay rows, got {len(selected)}")
+    records = []
+    for row in selected:
+        result = focus_replay(row)
+        image = gff.read_u16(Path(str(row["composite"])))
+        zmap = gff.read_zmap(Path(str(row["zmap"])))
+        image_delta = np.abs(result.composite.astype(np.int64) - image.astype(np.int64))
+        if image_delta.max() != 0 or not np.array_equal(result.winners, zmap):
+            raise AssertionError(f"current replay mismatch: {row['family']}/{row['member']} {row['seed']} {row['method']} t{row['tile']}")
+        details = None
+        if row["method"] == "laplacian":
+            frames, coverage = _focus_inputs(row)
+            view = fusion.pyramid_views(frames, 5, coverage=coverage)
+            details = [{"level": level, "score_radius": part.score_radius, "reach": part.reach,
+                        "eligible_pixels": int(part.eligible.any(axis=0).sum()),
+                        "winner_sha256": sha256(part.winners.tobytes()).hexdigest()}
+                       for level, part in enumerate(view.levels)]
+        records.append({"family": row["family"], "member": row["member"], "seed": row["seed"],
+                        "method": row["method"], "tile": row["tile"], "composite_max_sample_difference": 0,
+                        "zmap_equal": True, "eligible_pixels": int(result.eligible.any(axis=0).sum()),
+                        "input_identity": row.get("input_sha256"), "command": row.get("cmd"),
+                        "details_one_tile_intermediates": details})
+    return records
+
+
+def focus_configuration(row: dict[str, object], configuration: dict[str, object],
+                        return_plan: bool = False) -> fusion.FusionResult | tuple[fusion.FusionResult, dict[str, object]]:
+    """Run one registered candidate or control on one frozen baseline input."""
+    from . import focus_score
+
+    score_name = str(configuration["score"])
+    score = focus_score.adaptive_detrended(tuple(configuration["radii"])) if score_name == "adaptive-detrended-std" else focus_score.score_by_name(score_name)
+    method = str(configuration["method"])
+    if method == "laplacian":
+        return focus_replay(row, score=score, return_plan=return_plan)
+    if method == "weighted-average":
+        return focus_replay(row, score=score, return_plan=return_plan)
+    if method == "depth-map":
+        radius = int(configuration.get("score_radius", max(configuration.get("radii", (4,)))))
+        prepared = dict(row)
+        prepared["method"] = method
+        return focus_replay(prepared, score, configuration.get("eligibility_reach"), radius, return_plan)
+    raise ValueError(f"unknown fusion method: {method}")
+
+
+def depth_full_score_reach(configuration: dict[str, object], radius: int) -> int:
+    """Return the complete current or candidate Depth Map score footprint."""
+    if "full_score_reach" in configuration:
+        return int(configuration["full_score_reach"])
+    return (2 * radius if str(configuration.get("score")) in ("current", "luma-laplacian") else radius) + 8
+
+
+def run_focus_configurations(root: Path, output: Path, configurations: list[dict[str, object]], allowances_path: Path,
+                             budget: dict[str, object]) -> list[dict[str, object]]:
+    """Write per-input comparison rows after current replay has passed."""
+    rows = json.loads((root / "baseline.json").read_text())
+    selected = [row for row in rows if row["repeat"] == 0]
+    allowance_rows = json.loads(allowances_path.read_text())
+    runtime = provenance(())
+    records = []
+    for configuration in configurations:
+        if time.monotonic() - float(budget["started_monotonic"]) >= 7200:
+            budget["exhausted"] = True
+            budget.setdefault("deferred_configurations", []).append(configuration["id"])
+            return records
+        for row in selected:
+            if time.monotonic() - float(budget["started_monotonic"]) >= 7200:
+                budget["exhausted"] = True
+                budget.setdefault("deferred_configurations", []).append(configuration["id"])
+                return records
+            row_started = time.monotonic()
+            if row["method"] != configuration["method"]:
+                continue
+            result, candidate_plan = focus_configuration(row, configuration, return_plan=True)
+            if row.get("actual_coverage"):
+                coverage = np.load(str(row["actual_coverage"]))
+                if configuration["method"] == "weighted-average":
+                    full_reach = 20
+                elif configuration["method"] == "depth-map":
+                    full_reach = depth_full_score_reach(configuration, int(configuration.get("score_radius", max(configuration.get("radii", (4,))))))
+                else:
+                    full_reach = None
+                if full_reach is None:
+                    details_support = [{"level": level, "reach": fusion.level_reach(level, 8),
+                                        "eligible_pixels": int(fusion.per_level_eligible(coverage, level, 8).any(axis=0).sum())}
+                                       for level in range(5)]
+                    required = fusion.per_level_eligible(coverage, 0, 8)
+                else:
+                    details_support = None
+                    required = np.stack([fusion.eligible(mask, full_reach) for mask in coverage])
+            else:
+                required = np.ones_like(result.eligible, dtype=bool)
+                details_support = None
+            unsupported_by_frame = (result.eligible & ~required).sum(axis=(1, 2)).astype(int).tolist()
+            unsupported_support_count = int(sum(unsupported_by_frame))
+            if configuration.get("can_advance") and unsupported_support_count:
+                raise AssertionError(f"unsafe candidate support: {configuration['id']}")
+            directory = output / str(configuration["id"]) / run_key(f"{row['family']}-{row['member']}", SeedTriple.parse(str(row["seed"])), str(row["method"]), int(row["tile"]), 0)
+            directory.mkdir(parents=True, exist_ok=True)
+            composite, zmap = directory / "composite.tif", directory / "zmap.tif"
+            gff.write_u16(composite, result.composite)
+            gff.write_u16(zmap, result.winners[..., None])
+            family = next(item for item in FAMILIES if item.name == row["family"])
+            data = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+            metric_row = {**row, "comp": str(composite), "zmap": str(zmap), "tile_boundaries": candidate_plan}
+            metric_row.pop("tile_difference", None)
+            source = gff.TiffSource(row["actual_source_frames"], row["actual_coverage"]) if "actual_source_frames" in row else _source(Path(str(row["case"])))
+            image_metrics, record_metadata = _record_metrics(data, str(row["family"]), str(row["member"]), metric_row,
+                                                               composite, zmap, source, candidate_plan)
+            label = {name: image_metrics.pop(name) for name in ("label_exact", "label_within_one", "label_mad")}
+            records.append({"configuration_id": configuration["id"], "matched_control": configuration.get("matched_control"),
+                            "classification": configuration.get("classification", "control"), "can_advance": configuration.get("can_advance", False),
+                            "family": row["family"], "member": row["member"], "seed": row["seed"], "method": row["method"], "tile": row["tile"],
+                            "eligibility_pixels": int(result.eligible.any(axis=0).sum()), "excluded_pixels": int((~result.eligible.any(axis=0)).sum()),
+                            "composite": str(composite), "zmap": str(zmap), "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap),
+                            "image_metrics": image_metrics, "label_metrics": label, **record_metadata,
+                            "unavailable_metrics": {name: "unavailable for this input" for name, value in image_metrics.items() if value is None},
+                            "unsupported_support_count": unsupported_support_count, "input_identity": row.get("input_sha256"),
+                            "baseline_composite_sha256": row.get("composite_sha256"), "runtime": runtime,
+                            "unsupported_support_by_frame": unsupported_by_frame, "wall_seconds": time.monotonic() - row_started,
+                            "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                            "configuration": configuration, "details_support_guard": details_support,
+                            "tile_boundaries": candidate_plan,
+                            "tile_read_bound": tile_read_bound(result.composite.shape[1], result.composite.shape[0], candidate_plan),
+                            "allowance_keys": [item for item in allowance_rows if item["family"] == row["family"] and item["member"] == row["member"]
+                                               and item["method"] == row["method"] and item["tile"] == row["tile"]]})
+    groups: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
+    for record in records:
+        groups[(record["configuration_id"], record["family"], record["member"], record["seed"], record["method"])].append(record)
+    for group in groups.values():
+        by_tile = {int(record["tile"]): record for record in group}
+        if set(by_tile) != {512, 1024}:
+            continue
+        first, second = by_tile[512], by_tile[1024]
+        image_delta = np.abs(gff.read_u16(Path(str(first["composite"]))).astype(np.int64) - gff.read_u16(Path(str(second["composite"]))).astype(np.int64))
+        zmap_delta = gff.read_zmap(Path(str(first["zmap"]))) != gff.read_zmap(Path(str(second["zmap"])))
+        tile_difference = {"max_abs": int(image_delta.max()), "different_samples": int((image_delta != 0).sum()),
+                           "zmap_different_pixels": int(zmap_delta.sum())}
+        for record in group:
+            record["tile_difference"] = tile_difference
+            record["image_metrics"]["tile_difference"] = float(tile_difference["max_abs"])
+    return records
+
+
+def focus_support_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Compare boundary arms and controls only where both selected a source."""
+    output = []
+    for candidate_id in ("depth-map-detrended-std-r10-e16", "depth-map-detrended-std-r10-e18"):
+        candidate_rows = [record for record in records if record["configuration_id"] == candidate_id]
+        for candidate in candidate_rows:
+            control_id = str(candidate["matched_control"])
+            control = next((record for record in records if record["configuration_id"] == control_id
+                            and all(record.get(key) == candidate.get(key) for key in ("family", "member", "seed", "tile", "method"))), None)
+            if control is None:
+                continue
+            candidate_map = gff.read_zmap(Path(str(candidate["zmap"])))
+            control_map = gff.read_zmap(Path(str(control["zmap"])))
+            common = (candidate_map != fusion.NO_SOURCE) & (control_map != fusion.NO_SOURCE)
+            image_delta = np.abs(gff.read_u16(Path(str(candidate["composite"]))).astype(np.int64)
+                                 - gff.read_u16(Path(str(control["composite"]))).astype(np.int64))
+            candidate_metrics = candidate.get("image_metrics", {})
+            control_metrics = control.get("image_metrics", {})
+            output.append({"candidate": candidate_id, "matched_control": control_id, "family": candidate.get("family"),
+                           "member": candidate.get("member"), "seed": candidate.get("seed"), "tile": candidate.get("tile"),
+                           "common_eligible_pixels": int(common.sum()), "candidate_eligible_pixels": candidate["eligibility_pixels"],
+                           "control_eligible_pixels": control["eligibility_pixels"], "excluded_pixels": candidate["excluded_pixels"],
+                           "winner_changes": int((candidate_map[common] != control_map[common]).sum()),
+                           "unsupported_support_count": candidate["unsupported_support_count"],
+                           "common_image_max_abs": int(image_delta[common].max()) if common.any() else 0,
+                           "common_image_different_samples": int((image_delta[common] != 0).sum()),
+                           "border_contamination_delta": None if candidate_metrics.get("border_contamination") is None or control_metrics.get("border_contamination") is None
+                           else float(candidate_metrics["border_contamination"] - control_metrics["border_contamination"]),
+                           "border_contamination_scope": "full eligible image" if candidate_metrics else "unavailable without truth"})
+    e16 = [record for record in records if record["configuration_id"] == "depth-map-detrended-std-r10-e16"]
+    for diagnostic in e16:
+        guarded = next((record for record in records if record["configuration_id"] == "depth-map-detrended-std-r10-e18"
+                        and all(record.get(key) == diagnostic.get(key) for key in ("family", "member", "seed", "tile", "method"))), None)
+        if guarded is None:
+            continue
+        diagnostic_map = gff.read_zmap(Path(str(diagnostic["zmap"])))
+        guarded_map = gff.read_zmap(Path(str(guarded["zmap"])))
+        common = (diagnostic_map != fusion.NO_SOURCE) & (guarded_map != fusion.NO_SOURCE)
+        image_delta = np.abs(gff.read_u16(Path(str(diagnostic["composite"]))).astype(np.int64)
+                             - gff.read_u16(Path(str(guarded["composite"]))).astype(np.int64))
+        output.append({"comparison": "r10-e16-vs-e18", "family": diagnostic.get("family"), "member": diagnostic.get("member"),
+                       "seed": diagnostic.get("seed"), "tile": diagnostic.get("tile"), "common_eligible_pixels": int(common.sum()),
+                       "e16_excluded_pixels": diagnostic["excluded_pixels"], "e18_excluded_pixels": guarded["excluded_pixels"],
+                       "winner_changes": int((diagnostic_map[common] != guarded_map[common]).sum()),
+                       "common_image_max_abs": int(image_delta[common].max()) if common.any() else 0,
+                       "common_image_different_samples": int((image_delta[common] != 0).sum()),
+                       "e16_unsupported_support_count": diagnostic["unsupported_support_count"],
+                       "e18_unsupported_support_count": guarded["unsupported_support_count"]})
+    return output
+
+
+def run_focus_stack(root: Path, source: str, prepared: Path, rect_text: str | None,
+                    configurations: list[dict[str, object]], budget: dict[str, object]) -> dict[str, object]:
+    """Replay current and registered scores from one validated aligned real crop."""
+    from . import focus_score
+
+    rect = _registered_rect(source, rect_text)
+    directory, inputs, coverage_proof = _crop_prepared_inputs(root, source, prepared, rect)
+    manifest = _validate_preparation(prepared, source)
+    frames = np.stack([gff.read_u16(path) for path in inputs])
+    coverage = np.ones(frames.shape[:3], dtype=bool)
+    retained_path = prepared.parents[3] / "stacking-crops" / source / "crops.json"
+    retained = json.loads(retained_path.read_text()) if retained_path.is_file() else []
+    retained_by_method = {str(row.get("method")): row for row in retained
+                          if row.get("prepared_manifest_sha256") == sha256_path(prepared)
+                          and row.get("alignment_report_sha256") == manifest["alignment_report_sha256"]
+                          and row.get("rect_xywh") == list(rect)}
+    if set(retained_by_method) != set(METHODS):
+        raise ValueError("retained current real replays do not match the prepared crop")
+    started = time.monotonic()
+    runtime = provenance(inputs)
+    rows = []
+    for configuration in configurations:
+        if time.monotonic() - float(budget["started_monotonic"]) >= 7200:
+            budget["exhausted"] = True
+            budget.setdefault("deferred_configurations", []).append(configuration["id"])
+            continue
+        method = str(configuration["method"])
+        score_name = str(configuration["score"])
+        score = focus_score.adaptive_detrended(tuple(configuration["radii"])) if score_name == "adaptive-detrended-std" else focus_score.score_by_name(score_name)
+        reach = configuration.get("eligibility_reach")
+        radius = int(configuration.get("score_radius", max(configuration.get("radii", (4,))))) if method == "depth-map" else 4
+        row_started = time.monotonic()
+        result = _focus_fuse(frames, coverage, method, score, reach, radius)
+        if method == "weighted-average":
+            full_reach, details_support = 20, None
+        elif method == "depth-map":
+            full_reach, details_support = depth_full_score_reach(configuration, radius), None
+        else:
+            full_reach = None
+            details_support = [{"level": level, "reach": fusion.level_reach(level, 8),
+                                "eligible_pixels": int(fusion.per_level_eligible(coverage, level, 8).any(axis=0).sum())}
+                               for level in range(5)]
+        required = (np.stack([fusion.eligible(mask, full_reach) for mask in coverage]) if full_reach is not None
+                    else fusion.per_level_eligible(coverage, 0, 8))
+        unsupported_by_frame = (result.eligible & ~required).sum(axis=(1, 2)).astype(int).tolist()
+        unsupported_support_count = int(sum(unsupported_by_frame))
+        if configuration.get("can_advance") and unsupported_support_count:
+            raise AssertionError(f"unsafe real candidate support: {configuration['id']}")
+        work = root / "stack" / str(configuration["id"])
+        work.mkdir(parents=True, exist_ok=True)
+        composite, zmap = work / "composite.tif", work / "zmap.tif"
+        gff.write_u16(composite, result.composite)
+        gff.write_u16(zmap, result.winners[..., None])
+        replay = None
+        if score_name == "current" and "eligibility_reach" not in configuration:
+            baseline = retained_by_method[method]
+            image_delta = np.abs(result.composite.astype(np.int64) - gff.read_u16(Path(str(baseline["composite"]))).astype(np.int64))
+            zmap_equal = np.array_equal(result.winners, gff.read_zmap(Path(str(baseline["zmap"]))))
+            if image_delta.max() != 0 or not zmap_equal:
+                raise AssertionError(f"current real replay mismatch: {method}")
+            replay = {"composite_max_sample_difference": 0, "zmap_equal": True,
+                      "retained_composite_sha256": baseline["composite_sha256"], "retained_zmap_sha256": baseline["zmap_sha256"]}
+        rows.append({"configuration_id": configuration["id"], "matched_control": configuration.get("matched_control"),
+                     "classification": configuration.get("classification", "control"), "can_advance": configuration.get("can_advance", False),
+                     "method": method, "score": score_name, "rect_xywh": list(rect), "coverage": coverage_proof,
+                     "eligibility_pixels": int(result.eligible.any(axis=0).sum()), "excluded_pixels": int((~result.eligible.any(axis=0)).sum()),
+                     "composite": str(composite), "zmap": str(zmap), "composite_sha256": sha256_path(composite),
+                     "zmap_sha256": sha256_path(zmap), "truth_metrics": "not computed", "replay": replay,
+                     "wall_seconds": time.monotonic() - row_started,
+                     "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, "runtime": runtime,
+                     "configuration": configuration, "score_radius": radius, "eligibility_reach": reach,
+                     "full_score_reach": full_reach, "details_support_guard": details_support,
+                     "unsupported_support_by_frame": unsupported_by_frame, "unsupported_support_count": unsupported_support_count,
+                     "image_metrics": {}})
+    montages = []
+    montage_pairs = [(method, f"{method}-current", f"{method}-detrended-std") for method in METHODS]
+    montage_pairs.extend((("depth-map-r10-e16", "depth-map-current-r4-e16", "depth-map-detrended-std-r10-e16"),
+                          ("depth-map-r10-e18", "depth-map-current-r4-e18", "depth-map-detrended-std-r10-e18")))
+    by_id = {str(row["configuration_id"]): row for row in rows}
+    for name, current_id, candidate_id in montage_pairs:
+        current, candidate = by_id.get(current_id), by_id.get(candidate_id)
+        if current is not None and candidate is not None:
+            montage = root / "stack" / f"{name}-current-vs-candidate.png"
+            gff.montage(str(montage), (0, rect[3], 0, rect[2]), [Path(str(current["composite"])), Path(str(candidate["composite"]))])
+            montages.append({"comparison": name, "path": str(montage), "sha256": sha256_path(montage)})
+    return {"source": source, "rect_xywh": list(rect), "prepared_manifest": str(prepared.resolve()),
+            "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
+            "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"], "coverage": coverage_proof,
+            "input_sha256": {path.name: sha256_path(path) for path in inputs}, "rows": rows, "montages": montages,
+            "wall_seconds": time.monotonic() - started, "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+
+
 def _control_effect(clean: float, value: float, higher_is_better: bool) -> float:
     return max(0.0, clean - value) if higher_is_better else abs(value - clean)
 
@@ -844,7 +1319,7 @@ def run_crops(root: Path, source: str, prepared: Path | None, rect_text: str | N
 
 def preparation_self_check() -> None:
     """Exercise strict preparation validation without invoking alignment."""
-    root = ROOT / ".scratch" / "stacking-controls" / "preparation-self-check"
+    root = ROOT / ".scratch" / "stacking-controls" / f"preparation-self-check-{os.getpid()}"
     saved_stack = os.environ.pop("FOCUSFORGE_REFERENCE_STACK", None)
     try:
         _real_source_paths("stack")

@@ -8,13 +8,14 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 
-from . import fusion
+from . import focus_score, fusion
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import _twin_disagreements, baseline_call_count, case_split, preparation_self_check, prepare_case, prepare_real, run_crops, run_detector_controls, run_focused_twins, run_baselines, run_equalized_context
+from .runner import _twin_disagreements, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context
 
 
 def _digest(value: np.ndarray) -> str:
@@ -119,6 +120,14 @@ def self_check(allowances: Path | None = None) -> int:
     print(f"pyramid sha256: {_digest(restored)}")
     print(f"details winners sha256: {_digest(details.winners)}")
     print(f"depth winners sha256: {_digest(depth.winners)}")
+    for name in focus_score.self_checks():
+        print(f"focus score {name}: ok")
+    for check in focus_score.radius10_support_checks() + focus_tile_checks():
+        print(f"focus score {check['name']}: ok {json.dumps(check, sort_keys=True)}")
+    for name in replay_control_checks():
+        print(f"focus score {name}: ok")
+    for name in focus_configuration_checks():
+        print(f"focus score {name}: ok")
     if allowances is None:
         print("detectors: allowances required")
     else:
@@ -157,6 +166,16 @@ def main(argv: list[str] | None = None) -> int:
     prepare_real_command.add_argument("--out", required=True)
     registration_command = sub.add_parser("registration")
     registration_command.add_argument("--out")
+    focus = sub.add_parser("focus-score")
+    focus.add_argument("--split", choices=("training",), default="training")
+    focus.add_argument("--registration", required=True)
+    focus.add_argument("--runs", required=True)
+    focus.add_argument("--allowances", required=True)
+    focus.add_argument("--out", required=True)
+    focus.add_argument("--replay-only", action="store_true")
+    focus.add_argument("--source", choices=("stack",))
+    focus.add_argument("--prepared")
+    focus.add_argument("--rect")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -165,6 +184,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.out:
             Path(args.out).write_text(document + "\n")
         print(document)
+        return 0
+    if args.command == "focus-score":
+        command_started = time.monotonic()
+        try:
+            document = focus_score.validate_command(Path(args.registration), Path(args.runs), Path(args.allowances),
+                                                    args.source, Path(args.prepared) if args.prepared else None, args.rect)
+        except ValueError as error:
+            parser.error(str(error))
+        budget = {"session_cap_seconds": 7200, "total_cap_seconds": 21600, "total_enforcement": "external aggregate",
+                  "started_monotonic": command_started, "exhausted": False}
+        records = replay_focus_baselines(Path(args.runs))
+        output = Path(args.out)
+        output.mkdir(parents=True, exist_ok=True)
+        configurations = document["matched_controls"] + document["configurations"]
+        if args.replay_only:
+            candidates, stack = [], None
+        elif args.source == "stack":
+            stack = run_focus_stack(output, args.source, Path(args.prepared), args.rect, configurations, budget)
+            candidates = stack["rows"]
+        else:
+            candidates, stack = run_focus_configurations(Path(args.runs), output, configurations, Path(args.allowances), budget), None
+        budget["measured_seconds"] = time.monotonic() - budget.pop("started_monotonic")
+        support = focus_support_records(candidates)
+        (output / "comparison.json").write_text(json.dumps({"command": sys.argv if argv is None else [sys.argv[0], *argv], "registration_sha256": document["_validated_registration_sha256"], "replay": records, "candidate_rows": candidates, "support": support,
+                                                               "support_controls": focus_score.radius10_support_checks(), "stack": stack,
+                                                               "budget": budget}, indent=2, sort_keys=True) + "\n")
+        print(f"replay records: {len(records)}")
         return 0
     if args.command == "baseline":
         root = Path(args.out)
