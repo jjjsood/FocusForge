@@ -123,7 +123,7 @@ so a repeated run, or a re-fuse in the window with only fusion settings
 changed, skips the solve. `--no-cache` forces a recompute.
 
 Large pyramid levels run on the GPU when a usable adapter is present; the
-rest of the solve is on the CPU. `--no-gpu` keeps everything on the CPU and
+rest of the solve is on the CPU. `--cpu` keeps everything on the CPU and
 `--max-vram <SIZE>` lowers the device memory budget. If the device is lost
 mid-run, the whole alignment is redone on the CPU, so every frame comes from
 one backend. Both JSON reports name the backend in `align_backend`.
@@ -141,7 +141,7 @@ would cut is still visible for inspection.
 ## Skipping it
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo laplacian --no-align
+focusforge-cli stack path/to/frames/ --algorithm laplacian --no-align
 ```
 
 `--no-align` fuses the raw frames unwarped; `--no-crop` keeps alignment on

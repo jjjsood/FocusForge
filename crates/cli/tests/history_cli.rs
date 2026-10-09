@@ -78,7 +78,7 @@ fn shared_stack() -> &'static SharedStack {
                 input.to_str().unwrap(),
                 "-o",
                 out.to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "dummy-stack",
                 "--no-align",
                 "--no-crop",

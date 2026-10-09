@@ -46,8 +46,8 @@ fn run(dir: &Path, args: &[&str]) -> CliOutput {
 }
 
 /// Shared `stack` invocation for the `--max-vram` tests below: laplacian +
-/// pyramidal-ecc, `--lax --json`, against the standard fixture -- `extra`
-/// appends whatever each test varies (`--max-vram`, `--no-gpu`, ...).
+/// pyramidal-ecc with JSON output against the standard fixture -- `extra`
+/// appends whatever each test varies (`--max-vram`, `--cpu`, ...).
 /// `output_dir` is the directory `-o` collects this run's project into, not
 /// a file path -- `stack`'s own contract.
 fn max_vram_stack_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
@@ -56,11 +56,10 @@ fn max_vram_stack_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
         mantis_512_dir().to_str().unwrap().to_string(),
         "-o".to_string(),
         output_dir.to_str().unwrap().to_string(),
-        "--algo".to_string(),
+        "--algorithm".to_string(),
         "laplacian".to_string(),
-        "--align-algo".to_string(),
+        "--align-algorithm".to_string(),
         "pyramidal-ecc".to_string(),
-        "--lax".to_string(),
         "--json".to_string(),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
@@ -136,14 +135,14 @@ fn run_with_no_adapter(dir: &Path, args: &[&str]) -> Option<CliOutput> {
 }
 
 /// A `stack` run with a usable adapter (no flag, the GPU path) must produce
-/// a composite matching an explicit `--no-gpu` run on the same input.
+/// a composite matching an explicit `--cpu` run on the same input.
 ///
 /// This drives real `pyramidal-ecc` alignment over real `mantis-512`
 /// frames, which produces near-tie composite disagreements far above 1 LSB
 /// (real alignment, not GPU error); `STACK_TOLERANCE` is that measured bound.
 #[test]
 fn stack_gpu_matches_stack_no_gpu() {
-    /// 512 LSB, measured on this fixture/algo/`--lax` combination: real
+    /// 512 LSB, measured on this fixture/algo combination: real
     /// alignment can flip a near-tied Laplacian-selection winner between GPU
     /// and CPU, and the runner-up can differ by hundreds of LSB.
     const STACK_TOLERANCE: i32 = 512;
@@ -159,16 +158,15 @@ fn stack_gpu_matches_stack_no_gpu() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             gpu_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             // Disambiguates the alignment algorithm: this test binary's
             // dev-dependency enables `focusforge-core`'s `test-algorithms`
             // feature, which registers `dummy-align` alongside the real
             // `pyramidal-ecc` -- the same reason `stack_cli.rs`/`align_cli.rs`
-            // always pass one of `--align-algo`/`--no-align` explicitly.
-            "--align-algo",
+            // always pass one of `--align-algorithm`/`--no-align` explicitly.
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
         ],
     );
@@ -191,13 +189,12 @@ fn stack_gpu_matches_stack_no_gpu() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             cpu_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
-            "--no-gpu",
+            "--cpu",
         ],
     );
     assert!(
@@ -227,7 +224,7 @@ fn stack_gpu_matches_stack_no_gpu() {
 }
 
 /// `align --write-warped` with a usable adapter must produce the same
-/// warped frames as an explicit `--no-gpu` run, to within 1 LSB at 16-bit.
+/// warped frames as an explicit `--cpu` run, to within 1 LSB at 16-bit.
 ///
 /// Unlike `stack_gpu_matches_stack_no_gpu`, this is a pure warp comparison
 /// with no fusion or Laplacian-selection winner involved, so the
@@ -246,10 +243,9 @@ fn align_write_warped_gpu_matches_no_gpu() {
             "align",
             mantis_512_dir().to_str().unwrap(),
             // Disambiguates the alignment algorithm -- see the comment on
-            // `stack_gpu_matches_stack_no_gpu`'s own `--align-algo`.
-            "--algo",
+            // `stack_gpu_matches_stack_no_gpu`'s own `--align-algorithm`.
+            "--algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--write-warped",
             gpu_dir.to_str().unwrap(),
         ],
@@ -265,12 +261,11 @@ fn align_write_warped_gpu_matches_no_gpu() {
         &[
             "align",
             mantis_512_dir().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--write-warped",
             cpu_dir.to_str().unwrap(),
-            "--no-gpu",
+            "--cpu",
         ],
     );
     assert!(
@@ -326,11 +321,10 @@ fn auto_falls_back_without_adapter() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
         ],
     ) else {
@@ -371,11 +365,10 @@ fn fallback_emits_a_message() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
         ],
     ) else {
@@ -388,7 +381,7 @@ fn fallback_emits_a_message() {
     );
 }
 
-/// `--no-gpu` forces the CPU path even when an adapter is available, and
+/// `--cpu` forces the CPU path even when an adapter is available, and
 /// never even attempts (let alone reports) adapter selection.
 #[test]
 fn no_gpu_flag_forces_cpu_even_with_adapter() {
@@ -402,13 +395,12 @@ fn no_gpu_flag_forces_cpu_even_with_adapter() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
-            "--no-gpu",
+            "--cpu",
         ],
     );
     assert!(result.success, "stderr: {}", result.stderr);
@@ -416,8 +408,8 @@ fn no_gpu_flag_forces_cpu_even_with_adapter() {
         serde_json::from_str(&result.stdout).expect("--json must parse");
     assert_eq!(report["backend"], "cpu", "report: {report}");
     assert!(
-        result.stderr.contains("--no-gpu"),
-        "stderr must name --no-gpu as the reason: {}",
+        result.stderr.contains("--cpu"),
+        "stderr must name --cpu as the reason: {}",
         result.stderr
     );
     assert!(
@@ -498,7 +490,7 @@ fn max_vram_lowers_never_raises_and_json_reports_both_fields() {
 
     // CPU path: both fields null.
     let cpu_dir = out_dir(&dir, "cpu");
-    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--no-gpu"]));
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--cpu"]));
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
@@ -567,11 +559,11 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
         "--max-vram must not move the host scheduler's own limit: {capped_report}"
     );
 
-    // `--no-gpu`: the field is null.
+    // `--cpu`: the field is null.
     let cpu_dir = out_dir(&dir, "cpu");
     let cpu = run_owned(
         &cwd,
-        &max_vram_stack_args(&cpu_dir, &four_tile_args(&["--no-gpu"])),
+        &max_vram_stack_args(&cpu_dir, &four_tile_args(&["--cpu"])),
     );
     assert!(cpu.success, "stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
@@ -586,7 +578,7 @@ fn device_peak_in_flight_is_the_device_gates_own_high_water() {
 /// One tile above the device budget runs on the host, chosen at plan time: a
 /// run capped at 1 MiB exits 0, reports the CPU backend and no device
 /// figures, names the fallback on stderr and in `gpu_fallback`, and writes
-/// the planes a `--no-gpu` run writes.
+/// the planes a `--cpu` run writes.
 #[test]
 fn a_device_budget_below_one_tile_falls_back_to_the_cpu_path() {
     let cwd = common::tmp_dir("cli_gpu_budget_fallback_cwd");
@@ -623,7 +615,7 @@ fn a_device_budget_below_one_tile_falls_back_to_the_cpu_path() {
         capped.stderr
     );
 
-    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--no-gpu"]));
+    let cpu = run_owned(&cwd, &max_vram_stack_args(&cpu_dir, &["--cpu"]));
     assert!(cpu.success, "cpu run stderr: {}", cpu.stderr);
     let cpu_report: serde_json::Value =
         serde_json::from_str(&cpu.stdout).expect("--json must parse");
@@ -638,12 +630,12 @@ fn a_device_budget_below_one_tile_falls_back_to_the_cpu_path() {
     assert_eq!(
         std::fs::read(&capped_composite).expect("read capped composite"),
         std::fs::read(&cpu_composite).expect("read cpu composite"),
-        "the fallback composite must equal a --no-gpu run's"
+        "the fallback composite must equal a --cpu run's"
     );
     assert_eq!(
         std::fs::read(&capped_zmap).expect("read capped zmap"),
         std::fs::read(&cpu_zmap).expect("read cpu zmap"),
-        "the fallback Z-Map must equal a --no-gpu run's"
+        "the fallback Z-Map must equal a --cpu run's"
     );
 }
 
@@ -692,7 +684,7 @@ fn device_peak_in_flight_is_scoped_to_its_own_group() {
             root.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",
@@ -773,7 +765,7 @@ fn device_loss_stack_args(output_dir: &Path, extra: &[&str]) -> Vec<String> {
         mantis_512_dir().to_str().unwrap().to_string(),
         "-o".to_string(),
         output_dir.to_str().unwrap().to_string(),
-        "--algo".to_string(),
+        "--algorithm".to_string(),
         "laplacian".to_string(),
         "--no-align".to_string(),
         // Four tiles, so destroying the device after the first leaves work
@@ -839,7 +831,7 @@ fn device_lost_falls_back() {
         "the log must carry the loss's reason: {log}"
     );
 
-    let cpu = run_owned(&cwd, &device_loss_stack_args(&cpu_dir, &["--no-gpu"]));
+    let cpu = run_owned(&cwd, &device_loss_stack_args(&cpu_dir, &["--cpu"]));
     assert!(cpu.success, "cpu run stderr: {}", cpu.stderr);
 
     let (gpu_composite, gpu_zmap) = export_both(&cwd, &gpu_dir.join("mantis-512.ffp"));
@@ -862,7 +854,7 @@ fn device_lost_falls_back() {
 }
 
 /// An equalized run on a real adapter applies the same gains as with
-/// `--no-gpu`. Near-tie winners move single samples by hundreds of LSB, so
+/// `--cpu`. Near-tie winners move single samples by hundreds of LSB, so
 /// parity is judged on the mean level equalization shifts each composite
 /// by; a path whose reader lacks the gain shifts by zero.
 #[test]
@@ -892,8 +884,8 @@ fn equalized_stack_gpu_matches_no_gpu() {
 
     let (gpu_off, gpu_off_report) = composite("gpu-off", &[]);
     let (gpu_on, gpu_on_report) = composite("gpu-on", &["--set", "equalize=true"]);
-    let (cpu_off, _) = composite("cpu-off", &["--no-gpu"]);
-    let (cpu_on, cpu_on_report) = composite("cpu-on", &["--no-gpu", "--set", "equalize=true"]);
+    let (cpu_off, _) = composite("cpu-off", &["--cpu"]);
+    let (cpu_on, cpu_on_report) = composite("cpu-on", &["--cpu", "--set", "equalize=true"]);
 
     assert_ne!(gpu_on_report["backend"], "cpu", "{gpu_on_report}");
     assert_ne!(gpu_off_report["backend"], "cpu", "{gpu_off_report}");
@@ -940,10 +932,9 @@ fn adapter_logged_once() {
             root.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
-            "--lax",
             "--json",
         ])
         .current_dir(&*cwd)
@@ -982,7 +973,7 @@ fn large_synthetic_stack(name: &str) -> common::TmpDir {
     dir
 }
 
-/// `align --json --lax --algo pyramidal-ecc` over `input` plus `extra`;
+/// `align --json --algorithm pyramidal-ecc` over `input` plus `extra`;
 /// `cmd` carries any env the test sets.
 fn align_json(
     mut cmd: Command,
@@ -993,9 +984,8 @@ fn align_json(
     let mut args = vec![
         "align",
         input.to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--json",
     ];
     args.extend_from_slice(extra);
@@ -1018,7 +1008,7 @@ fn align_large_synthetic_stack_uses_the_gpu() {
     let (gpu, gpu_report) = align_json(bin(), &cwd, &input, &TRANSLATION);
     assert!(gpu.success, "gpu align stderr: {}", gpu.stderr);
     let mut cpu_args = TRANSLATION.to_vec();
-    cpu_args.push("--no-gpu");
+    cpu_args.push("--cpu");
     let (cpu, cpu_report) = align_json(bin(), &cwd, &input, &cpu_args);
     assert!(cpu.success, "cpu align stderr: {}", cpu.stderr);
 
@@ -1046,7 +1036,7 @@ fn align_large_synthetic_stack_uses_the_gpu() {
 }
 
 /// A device destroyed during the first ECC iteration reruns the whole stage
-/// on the CPU: the result is the `--no-gpu` result, exactly.
+/// on the CPU: the result is the `--cpu` result, exactly.
 #[test]
 fn align_reruns_on_cpu_after_device_loss() {
     let cwd = common::tmp_dir("cli_gpu_align_loss_cwd");
@@ -1072,7 +1062,7 @@ fn align_reruns_on_cpu_after_device_loss() {
     );
 
     let mut cpu_args = TRANSLATION.to_vec();
-    cpu_args.push("--no-gpu");
+    cpu_args.push("--cpu");
     let (cpu, cpu_report) = align_json(bin(), &cwd, &input, &cpu_args);
     assert!(cpu.success, "cpu align stderr: {}", cpu.stderr);
     assert_eq!(
@@ -1081,7 +1071,7 @@ fn align_reruns_on_cpu_after_device_loss() {
     );
 }
 
-/// `--no-gpu` never brings up an adapter: the log holds no adapter record.
+/// `--cpu` never brings up an adapter: the log holds no adapter record.
 #[test]
 fn align_no_gpu_never_probes_an_adapter() {
     let cwd = common::tmp_dir("cli_gpu_align_no_gpu_cwd");
@@ -1090,10 +1080,9 @@ fn align_no_gpu_never_probes_an_adapter() {
     cmd.args([
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
-        "--no-gpu",
+        "--cpu",
         "--json",
     ]);
     let out = CliOutput::from(
@@ -1105,10 +1094,10 @@ fn align_no_gpu_never_probes_an_adapter() {
     let log = std::fs::read_to_string(log_path(&data_dir)).unwrap_or_default();
     assert!(
         !log.contains("graphics adapter selected"),
-        "--no-gpu must not probe an adapter: {log}"
+        "--cpu must not probe an adapter: {log}"
     );
     assert!(
-        out.stderr.contains("--no-gpu given: aligning on the CPU"),
+        out.stderr.contains("--cpu given: aligning on the CPU"),
         "stderr must give the reason: {}",
         out.stderr
     );
@@ -1124,9 +1113,8 @@ fn align_without_eligible_region_never_probes_an_adapter() {
     cmd.args([
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--json",
     ]);
     let out = CliOutput::from(
@@ -1157,9 +1145,8 @@ fn align_without_adapter_runs_on_cpu() {
         &[
             "align",
             input.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
             "--set",
             "mode=translation",

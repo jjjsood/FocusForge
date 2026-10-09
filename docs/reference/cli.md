@@ -238,7 +238,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | flag | meaning |
 |---|---|
 | `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
-| `--algo <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
+| `--algorithm <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
 | `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`align`, `auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
 | `--json` | emit a JSON report instead of human-readable text |
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
@@ -246,10 +246,12 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
 | `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame. Alignment is on by default, matching the project's `align` value |
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on. The crop is on by default, matching the project's `auto-crop` value; with the crop on and no interior common to the aligned frames, `stack` stops and names this flag |
-| `--align-algo <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
+| `--align-algorithm <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
+| `--strict` | refuse the run if any frame fails registration; identity fallback is the default |
 | `--align-set <KEY=VALUE>` | set one alignment parameter, repeatable; separate from `--set`, which is the stacking algorithm's own |
 | `--resume` | resume a previously cancelled run of this same stack, found by fingerprint under `.scratch/resume/` |
-| `--quiet` | print no progress at all |
+| `-q, --quiet` | log errors only; results and required warnings remain visible |
+| `--no-progress` | suppress stage progress |
 | `--tile-size <PX>` | override the scheduler's outer tile size, in pixels |
 | `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
 | `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; absent when the binary was built `--no-default-features` |
@@ -257,7 +259,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--write-preset <PATH>` | write the preset that reproduces this run |
 | `--status <PATH>` | append one NDJSON status record for this stack to this path |
 | `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
-| `--no-gpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
+| `--cpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
 | `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
 
 **Project settings.** Beside the algorithm's own parameters, `--set` and a
@@ -293,11 +295,11 @@ TIFF file. See [`reference/project-format.md`](project-format.md) for the
 container itself.
 
 Refusals happen before the input directory is read where possible: an
-unknown `--algo` id or a `--set` value that fails the algorithm's own
+unknown `--algorithm` id or a `--set` value that fails the algorithm's own
 parameter schema (unknown key, out-of-range value, an enum value that does
 not name a declared variant) is reported and the command exits 1 without
-opening a single frame. A frame that fails to register is a refusal too,
-naming every failed frame, exit 1. An empty auto-crop (the frames' footprints
+opening a single frame. A frame that fails to register uses identity fallback.
+`--strict` instead refuses, naming every failed frame and exiting 1. An empty auto-crop (the frames' footprints
 do not intersect) is refused before any output file is created, naming
 `--no-crop` as the way through.
 
@@ -314,7 +316,7 @@ Unix-only there.
 **GPU use is automatic, never an opt-in flag.** The GPU path is compiled in
 by default, and `stack` uses a usable GPU adapter automatically for the
 `laplacian` algorithm — the only one with a GPU implementation; `weighted-average` and
-`depth-map` always run on the CPU. `--no-gpu` forces the CPU path
+`depth-map` always run on the CPU. `--cpu` forces the CPU path
 regardless of algorithm. A missing or unusable adapter falls back to the
 CPU path on its own, printing why on stderr, never silently and never as a
 hard failure. Either path produces the same result — every GPU kernel is
@@ -323,8 +325,8 @@ backends changes speed, not the output; `stack --json`'s `backend` field
 names which one actually ran.
 
 ```
-$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out/ --algo laplacian --no-align --no-gpu --quiet
---no-gpu given: forcing the CPU path
+$ focusforge-cli stack fixtures/mantis-64 -o .scratch/out/ --algorithm laplacian --no-align --cpu --no-progress
+--cpu given: forcing the CPU path
 grouping fixtures/mantis-64: 1 group (directory structure (no frame carries a readable capture time))
   mantis-64  3 frames  00.tif .. 02.tif  [directory]
 fixtures/mantis-64 (3 frames)
@@ -342,17 +344,13 @@ stages: setup=0.001s align=not-entered fuse=0.109s finalize=0.015s workers=? pea
 `.scratch/out/` must already exist — `-o` names an existing directory to
 collect projects into, it never creates one. (`--no-align` keeps this
 example to the fusion stage the `backend` field is about; `mantis-64`'s own
-frames diverge under the default `pyramidal-ecc` alignment in strict mode,
-so a real run without either `--no-align` or a softened failure policy
-would refuse instead — see
-[`guide/alignment.md`](../guide/alignment.md#failure-is-strict-by-default) for
-what that policy is and why it defaults to strict. `backend` reads `"cpu"`
-because this example passes `--no-gpu`; omit it on a default build with a
+frames may diverge under the default `pyramidal-ecc` alignment and use identity
+fallback. Add `--strict` to refuse instead. `backend` reads `"cpu"`
+because this example passes `--cpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
-`--quiet` suppresses only the ticking progress line — per-frame while
-alignment runs, per-tile once fusion starts; the run summary above still
-prints. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+`--no-progress` suppresses only the ticking progress line — per-frame while
+alignment runs, per-tile once fusion starts. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
 entered the alignment stage at all — a real run reports numbers instead
 (see below).
 
@@ -513,23 +511,25 @@ Options:
 
 | flag | meaning |
 |---|---|
-| `--algo <ALGO>` | registered alignment algorithm id; optional, defaults to the sole registered one |
+| `--algorithm <ALGO>` | registered alignment algorithm id; optional, defaults to the sole registered one |
 | `--json` | emit a JSON report instead of human-readable text |
+| `--strict` | refuse the run if any frame fails registration; identity fallback is the default |
 | `--write-warped <DIR>` | write one warped TIFF per frame into `<DIR>`, at source dimensions, uncropped |
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
-| `--quiet` | print no progress at all (`align` has one stage line to suppress; it has no per-tile units to count) |
+| `-q, --quiet` | log errors only; results and required warnings remain visible |
+| `--no-progress` | suppress the one stage line |
 | `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
 | `--write-preset <PATH>` | write the preset that reproduces this run: `align-algo` plus the `[align]` values chosen |
 | `--status <PATH>` | append one NDJSON status record for this run to this path |
 | `--max-host-memory <SIZE>` | ceiling on the host-memory budget the alignment workers are sized from; it only lowers the derived budget |
 | `--max-vram <SIZE>` | ceiling on the device-memory budget for the alignment's GPU levels and the `--write-warped` fuse backend; it only lowers the probed budget. Absent when built `--no-default-features` |
-| `--no-gpu` | force the CPU path: the alignment's large levels and the `--write-warped` fuse backend stay on the CPU. Absent when built `--no-default-features` |
+| `--cpu` | force the CPU path: the alignment's large levels and the `--write-warped` fuse backend stay on the CPU. Absent when built `--no-default-features` |
 
-A frame whose registration diverges refuses the run, exit 1, naming every
-failed frame.
+A frame whose registration diverges uses identity fallback. `--strict` refuses,
+exit 1, naming every failed frame.
 
 ```
-$ focusforge-cli align path/to/frames --algo pyramidal-ecc
+$ focusforge-cli align path/to/frames --algorithm pyramidal-ecc
 path/to/frames (8 frames)
 pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=strict failures=0)
 rho = ECC correlation in [-1, 1], not a pixel distance

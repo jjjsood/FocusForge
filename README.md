@@ -96,7 +96,7 @@ cargo build --release
 Produces `target/release/focusforge-cli` and `target/release/focusforge-gui`,
 with the GPU-accelerated fusion path compiled in by default. Pass
 `--no-default-features` to exclude it; without it, `stack` always runs on the
-CPU and `--no-gpu` does not exist as a flag.
+CPU and `--cpu` does not exist as a flag.
 
 ### Inspect a stack
 
@@ -116,7 +116,7 @@ error; there is no decoder fallback.
 ### Stack a folder
 
 ```bash
-target/release/focusforge-cli stack path/to/frames/ --algo laplacian
+target/release/focusforge-cli stack path/to/frames/ --algorithm laplacian
 target/release/focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 

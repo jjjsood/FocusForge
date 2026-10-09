@@ -55,7 +55,7 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
 - `focusforge-cli`: `clap`, `serde`/`serde_json`, `toml`, `signal-hook`
   (SIGINT/SIGUSR1 handling for `stack`'s pause/resume/cancel controls), `png`
   (read back by the export tests), and the same `gpu` feature forwarded
-  to enable `--no-gpu` and the automatic GPU path on `stack`/`align`.
+  to enable `--cpu` and the automatic GPU path on `stack`/`align`.
 - `focusforge-gui`: `slint = "~1.17"` (`default-features = false`, features
   `std`, `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`,
   `unstable-wgpu-29` pinned to the same wgpu major `focusforge-gpu`
@@ -149,7 +149,7 @@ compiled or even resolved without the feature.
 
 ```
 cargo build -p focusforge-cli --features trace
-FOCUSFORGE_TRACE_FILE=trace.json target/debug/focusforge-cli stack fixtures/mantis-512 --lax
+FOCUSFORGE_TRACE_FILE=trace.json target/debug/focusforge-cli stack fixtures/mantis-512
 ```
 
 `FOCUSFORGE_TRACE_FILE` names the Chrome-trace file the run writes; unset,

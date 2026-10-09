@@ -17,11 +17,12 @@ use std::time::Duration;
 /// SIGINT tests deterministic.
 pub const POLL: Duration = Duration::from_millis(100);
 
-/// `--resume`, `--quiet`, `--tile-size` and `--no-cache`, bundled to keep
+/// `--resume`, `--no-progress`, `--tile-size` and `--no-cache`, bundled to keep
 /// `stack::run`'s argument count down.
 pub struct JobOptions {
     pub resume: bool,
     pub quiet: bool,
+    pub no_progress: bool,
     pub tile_size: Option<u32>,
     /// `true` unless `--no-cache` was given. Disables **both** the stage
     /// cache read and the write -- a user reaching for `--no-cache`

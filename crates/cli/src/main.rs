@@ -43,14 +43,15 @@ fn resolve_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
+    quiet: bool,
 ) -> stack::BackendChoice {
     #[cfg(feature = "gpu")]
     {
-        gpu::resolve_backend(algorithm_id, no_gpu, max_vram)
+        gpu::resolve_backend(algorithm_id, no_gpu, max_vram, quiet)
     }
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = (algorithm_id, no_gpu, max_vram);
+        let _ = (algorithm_id, no_gpu, max_vram, quiet);
         stack::BackendChoice::cpu()
     }
 }
@@ -63,14 +64,15 @@ fn resolve_align_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
+    quiet: bool,
 ) -> stack::AlignBackendChoice {
     #[cfg(feature = "gpu")]
     {
-        gpu::resolve_align_backend(algorithm_id, no_gpu, max_vram)
+        gpu::resolve_align_backend(algorithm_id, no_gpu, max_vram, quiet)
     }
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = (algorithm_id, no_gpu, max_vram);
+        let _ = (algorithm_id, no_gpu, max_vram, quiet);
         stack::AlignBackendChoice::cpu()
     }
 }
@@ -89,7 +91,7 @@ struct Cli {
     #[arg(short = 'v', action = clap::ArgAction::Count, global = true)]
     verbose: u8,
     /// Log errors only.
-    #[arg(short = 'q', global = true)]
+    #[arg(short = 'q', long, global = true)]
     quiet: bool,
 }
 
@@ -138,7 +140,7 @@ enum Command {
         output: Option<PathBuf>,
         /// Registered stacking algorithm id (`focusforge-cli algorithms`
         /// lists them). Required unless a `--preset` supplies `algo`.
-        #[arg(long)]
+        #[arg(long = "algorithm")]
         algo: Option<String>,
         /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
@@ -155,14 +157,14 @@ enum Command {
         /// when alignment is on.
         #[arg(long = "no-crop", action = clap::ArgAction::SetFalse)]
         crop: bool,
-        /// Soften alignment failures to an identity fallback instead of
-        /// refusing the run. Meaningless with `--no-align`.
+        /// Refuse the run when an alignment fails. Meaningless with
+        /// `--no-align`.
         #[arg(long)]
-        lax: bool,
+        strict: bool,
         /// Alignment algorithm id. Optional: defaults to the sole
         /// registered alignment algorithm, refusing (and listing the
         /// choices) when more than one is registered.
-        #[arg(long = "align-algo")]
+        #[arg(long = "align-algorithm")]
         align_algo: Option<String>,
         #[command(flatten)]
         align_set: set::AlignSetArgs,
@@ -172,9 +174,9 @@ enum Command {
         /// disagrees with this invocation's inputs.
         #[arg(long)]
         resume: bool,
-        /// Print no progress at all.
+        /// Print no stage progress.
         #[arg(long)]
-        quiet: bool,
+        no_progress: bool,
         /// Override the scheduler's outer tile size, in pixels. Omit to use
         /// the scheduler's own default.
         #[arg(long = "tile-size", value_name = "PX")]
@@ -205,7 +207,7 @@ enum Command {
         /// Read parameter values from a TOML preset: the `algo` and
         /// `align-algo` keys plus the `[stack]` and `[align]` value
         /// tables. A flag always beats the file -- `--set`/`--align-set`
-        /// override the tables, `--algo`/`--align-algo` override the keys.
+        /// override the tables, `--algorithm`/`--align-algorithm` override the keys.
         #[arg(long, value_name = "PATH")]
         preset: Option<PathBuf>,
         /// Write the preset that reproduces this run to this path: the
@@ -228,7 +230,7 @@ enum Command {
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only in builds with GPU support.
         #[cfg(feature = "gpu")]
-        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        #[arg(long = "cpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
         /// Skip the stage cache: recompute the alignment even when a valid
         /// entry exists, and store no new entry.
@@ -315,16 +317,14 @@ enum Command {
         dir: PathBuf,
         /// Registered alignment algorithm id. Optional: defaults to the
         /// sole registered alignment algorithm.
-        #[arg(long)]
+        #[arg(long = "algorithm")]
         algo: Option<String>,
         /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
-        /// Soften a failed frame to an identity fallback and exit 0,
-        /// reporting the failure count on stderr, instead of refusing the
-        /// run.
+        /// Refuse the run when an alignment fails.
         #[arg(long)]
-        lax: bool,
+        strict: bool,
         /// Write one warped TIFF per frame into this directory, at source
         /// dimensions, uncropped.
         #[arg(long = "write-warped", value_name = "DIR")]
@@ -358,7 +358,7 @@ enum Command {
         /// count: this suppresses only the one stage line `align`
         /// otherwise prints.
         #[arg(long)]
-        quiet: bool,
+        no_progress: bool,
         /// Read parameter values from a TOML preset. `align` uses only
         /// `align-algo` and the `[align]` table; a non-empty `[stack]`
         /// table or `algo` key is unused here and says so on stderr, so
@@ -377,7 +377,7 @@ enum Command {
         /// backend both stay on the CPU. Only present when the `gpu` feature
         /// is compiled in.
         #[cfg(feature = "gpu")]
-        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        #[arg(long = "cpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
     },
     /// Report one record per result found under a directory of projects, or
@@ -457,6 +457,7 @@ fn main() -> ExitCode {
     // Entered for the whole invocation, so every event a run raises names
     // the command it came from.
     let _job = tracing::debug_span!("job", command = command_name(&cli.command)).entered();
+    let quiet = cli.quiet;
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
@@ -469,11 +470,11 @@ fn main() -> ExitCode {
             group_args,
             align,
             crop,
-            lax,
+            strict,
             align_algo,
             align_set,
             resume,
-            quiet,
+            no_progress,
             tile_size,
             max_host_memory,
             #[cfg(feature = "gpu")]
@@ -501,13 +502,14 @@ fn main() -> ExitCode {
                 &align::AlignOptions {
                     align,
                     crop,
-                    lax,
+                    lax: !strict,
                     algo: align_algo.as_deref(),
                     set: &align_set.align_set,
                 },
                 &job::JobOptions {
                     resume,
                     quiet,
+                    no_progress,
                     tile_size,
                     cache,
                 },
@@ -558,13 +560,13 @@ fn main() -> ExitCode {
             dir,
             algo,
             json,
-            lax,
+            strict,
             write_warped,
             set,
             max_host_memory,
             #[cfg(feature = "gpu")]
             max_vram,
-            quiet,
+            no_progress,
             preset,
             write_preset,
             status,
@@ -581,10 +583,11 @@ fn main() -> ExitCode {
                 &dir,
                 algo.as_deref(),
                 json,
-                lax,
+                !strict,
                 write_warped.as_deref(),
                 &set,
                 max_host_memory,
+                no_progress,
                 quiet,
                 &preset::PresetOptions {
                     preset: preset.as_deref(),
@@ -1112,7 +1115,7 @@ mod tests {
     /// moment either one moves without the other.
     #[test]
     fn no_crop_flag_reads_the_project_schema() {
-        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algo", "x"])
+        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algorithm", "x"])
             .expect("a minimal `stack` invocation must parse");
         let Command::Stack { crop, .. } = cli.command else {
             panic!("expected a Command::Stack");
@@ -1123,7 +1126,7 @@ mod tests {
     /// `--no-align` and the `align` descriptor are one source of truth.
     #[test]
     fn no_align_flag_reads_the_project_schema() {
-        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algo", "x"])
+        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algorithm", "x"])
             .expect("a minimal `stack` invocation must parse");
         let Command::Stack { align, .. } = cli.command else {
             panic!("expected a Command::Stack");
