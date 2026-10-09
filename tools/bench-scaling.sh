@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/bench-scaling.sh
 #
 # Fast-ish demonstration that the adaptive CPU/GPU budgets scale -- a

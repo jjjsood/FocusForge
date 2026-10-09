@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Bounded stdout for any tool that drives a noisy subprocess. Sourced, never
 # executed -- tools/run-logged.sh is the command-line front end.
 #

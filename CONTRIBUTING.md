@@ -75,6 +75,12 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
 - Every dependency's license is checked against an allowlist in
   `deny.toml` with `cargo deny check licenses` (install with `cargo install
   cargo-deny --locked`).
+- `NOTICE` records the default CLI and GUI runtime dependency union for Linux,
+  Windows, and both macOS release targets, plus bundled fonts and icons. Run
+  `tools/check-notice.sh --write` after a locked dependency or asset-attribution
+  change; ordinary checks only compare. It needs Cargo's offline metadata and
+  package cache, and intentionally excludes dev, build, proc-macro, and
+  inactive-feature dependencies.
 - Prerequisites: **`libfontconfig1-dev`** (Debian/Ubuntu naming) — Slint's
   `renderer-femtovg-wgpu` renderer needs fontconfig. **numpy** (`python3 -m
   pip install numpy`) — needed for the synthetic-alignment gate stage
@@ -181,7 +187,7 @@ processing spans, and the closing `timing_summary` span reports both. Add
 
 ## Before you send a change
 
-`tools/check-all.sh` runs every gate (formatting, licenses, fixtures, build,
+`tools/check-all.sh` runs every gate (formatting, licenses, SPDX headers, NOTICE, fixtures, build,
 clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
 check) in one command; `--static` is the fast subset a pre-commit hook runs.
 Read `tools/README.md` for what each script does before running cargo

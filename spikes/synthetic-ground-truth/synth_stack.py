@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Renders a focus stack whose true Z-Map is known, then scores the fusion against it.
 
 With `--warp`, it renders a known misregistration instead; that path is used

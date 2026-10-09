@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/check-all.sh [--static|--quick] [--verbose] [--tail N] [--log-dir DIR]
 #
 # Every gate this repository has, in one command, with a pass/fail summary at
@@ -92,6 +93,10 @@ test_tmp_residue() {
 # --- static checks: seconds each, no side effects ---------------------------
 run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
+run_gate "source headers"   tools/check-headers.sh
+run_gate "source headers selftest" tools/check-headers-selftest.sh
+run_gate "NOTICE"           tools/with-lock.sh build -- tools/check-notice.sh
+run_gate "NOTICE selftest"  tools/check-notice-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 run_gate "lock directory selftest" tools/with-lock-selftest.sh

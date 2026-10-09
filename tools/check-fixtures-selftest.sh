@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Selftest for tools/check-fixtures.sh.
 #
 # Runs copies of tools/check-fixtures.sh against synthetic fixtures/ trees

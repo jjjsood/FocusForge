@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/synth-align.sh
 #
 # Generates a synthetic focus stack with a KNOWN per-frame misregistration

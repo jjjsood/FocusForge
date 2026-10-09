@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Spike: observe whether files and folders dropped on a Slint window arrive as usable
 //! filesystem paths, and through which route — Slint's public `DropArea` API (in-process only
 //! on this pin) or winit's `WindowEvent::{DroppedFile,HoveredFile,HoveredFileCancelled}` reached

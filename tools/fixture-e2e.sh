@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/fixture-e2e.sh
 #
 # Drive the built CLI over the checked-in fixtures. This is the gate that

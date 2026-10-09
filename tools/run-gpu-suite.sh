@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/run-gpu-suite.sh [-- <extra cargo test args>]
 #
 # Runs the full `cargo test -p focusforge-gpu --features gpu-tests` suite

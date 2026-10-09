@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Reference-free quality numbers for a fused composite, read in row bands.
 
 Usage: tools/image-metrics.py COMPOSITE.tif [--zmap ZMAP.tif] [--vs OTHER.tif] [--json]

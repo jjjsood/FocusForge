@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Cross-process mutex for target/ and the GPU, shared by every checkout
 # whose `target` points into the same cargo-target pool:
 #

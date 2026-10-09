@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Cut the checked-in fixture crops out of the reference stack, or verify that
 # the checked-in ones still match what the generator would produce.
 #

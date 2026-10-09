@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Guided-filter two-scale fusion prototype and the measurements that judge it.
 
 Subcommands (run from the repository root, workspace built):

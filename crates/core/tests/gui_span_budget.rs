@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The graphical front end's spans draw on their own admission budget, so a
 //! long processing run that exhausts the processing budget never refuses them.
 //! One test function: accounting is a process-wide switch.

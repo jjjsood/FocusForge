@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/check-fixtures.sh
 #
 # Checks fixtures/MANIFEST.sha256 both ways: every listed file still hashes

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Spike: prove a texture written by a wgpu compute shader on the *same* wgpu::Device Slint
 //! renders with can be displayed in a Slint window with no CPU round-trip on the display path.
 //! Throwaway spike — nothing here is meant to be reused.

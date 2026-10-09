@@ -7,6 +7,8 @@ from the reference stack, and the shared build/GPU lock.
 |---|---|
 | `check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]` | Every gate, one command, bounded output, pass/fail summary. `--static` is the pre-commit set. Skips cleanly until `Cargo.toml` exists. |
 | `check-licenses.sh [--advisories]` | `cargo deny` over the GPLv3 compatibility allowlist; `--advisories` checks RUSTSEC instead. Skips until `deny.toml` is committed. |
+| `check-headers.sh` | Requires the opening GPL-3.0-or-later SPDX comment on authored Rust, Slint, WGSL, shell, Python, and hook files. `check-headers-selftest.sh` proves its covered classes and exclusions. |
+| `check-notice.sh [--write]` | Compares root `NOTICE` with the locked, offline default CLI+GUI runtime graphs for four release targets. `--write` explicitly regenerates it; the check never edits files. Cargo's cached metadata and package index must be available. `check-notice-selftest.sh` covers deterministic rendering and stale component records. |
 | `check-fixtures.sh` | Verifies `fixtures/MANIFEST.sha256` both ways: every listed file still hashes correctly, and no unlisted file is hiding under `fixtures/`. |
 | `check-fixtures-selftest.sh` | Proves `check-fixtures.sh`'s refusals and passes against synthetic throwaway trees, so the gate is never trusted on the strength of only ever having been seen green. |
 | `fixture-e2e.sh` | Runs the built `focusforge-cli` over the checked-in fixtures. Cargo-free on purpose, so `check-all.sh` can run it beside the cargo gates. |

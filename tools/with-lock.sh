@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/with-lock.sh <build|gpu> -- <command> [args...]
 #
 # Command-line front end for tools/lib/lock.sh -- see there for what each
