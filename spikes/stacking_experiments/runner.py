@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import resource
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -21,7 +22,7 @@ from typing import Iterable
 import numpy as np
 import PIL
 
-from . import coefficient_shrinkage, consistency, fusion, index_field, metrics
+from . import coefficient_shrinkage, consistency, fusion, index_field, mask_pyramid, metrics
 from .protocol import FAMILIES, FRAME_COUNT, REAL_CROPS, TRAINING_SEEDS, SeedTriple, require_seed
 from .scenes import SceneData, family_members, render_family
 
@@ -1831,6 +1832,413 @@ def run_selection_stack(output: Path, source_name: str, prepared: Path, rect_tex
     return {"source": source_name, "rect_xywh": list(rect), "prepared_manifest": str(prepared.resolve()),
             "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
             "coverage": coverage, "rows": rows, "montages": montages}
+
+
+def _mask_pyramid_difference(whole: mask_pyramid.MaskPyramidResult,
+                             tiled: mask_pyramid.MaskPyramidResult) -> dict[str, int]:
+    """Report the registered whole/tile image and finest-label comparison."""
+    image = np.abs(whole.composite.astype(np.int64) - tiled.composite.astype(np.int64))
+    return {"max_abs": int(image.max()), "different_samples": int(np.count_nonzero(image)),
+            "zmap_different_pixels": int(np.count_nonzero(whole.zmap != tiled.zmap))}
+
+
+def _mask_pyramid_record(output: Path, row: dict[str, object], configuration: dict[str, object],
+                         whole: mask_pyramid.MaskPyramidResult, tiled: mask_pyramid.MaskPyramidResult,
+                         counters: dict[str, int], tile_counters: dict[str, int], plan: dict[str, object],
+                         allowances: list[dict[str, object]], repeat_kind: str) -> dict[str, object]:
+    """Write one actual whole/tile pair and its synthetic quality measurements."""
+    directory = output / str(configuration["id"]) / run_key(f"{row['family']}-{row['member']}",
+                                                                  SeedTriple.parse(str(row["seed"])), "mask-pyramid",
+                                                                  int(row["tile"]), int(row["repeat"]))
+    directory.mkdir(parents=True, exist_ok=True)
+    whole_composite, whole_zmap = directory / "whole-composite.tif", directory / "whole-zmap.tif"
+    composite, zmap = directory / "composite.tif", directory / "zmap.tif"
+    for path, image in ((whole_composite, whole.composite), (whole_zmap, whole.zmap[..., None]),
+                        (composite, tiled.composite), (zmap, tiled.zmap[..., None])):
+        gff.write_u16(path, image)
+    difference = _mask_pyramid_difference(whole, tiled)
+    if difference["max_abs"] > 1 or difference["zmap_different_pixels"] != 0:
+        raise AssertionError(f"mask-pyramid whole/tile parity failed for {configuration['id']}")
+    source = _selection_source(row)
+    family = next(item for item in FAMILIES if item.name == row["family"])
+    original = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+    data = SceneData(np.empty((0,), dtype=np.uint16), original.truth, original.depth, original.metadata)
+    metric_row = {**row, "comp": str(composite), "zmap": str(zmap), "tile_boundaries": plan, "tile_difference": difference}
+    image_metrics, metadata = _record_metrics(data, str(row["family"]), str(row["member"]), metric_row,
+                                               composite, zmap, source, plan)
+    labels = gff.read_zmap(Path(str(row["zmap"])))
+    label_agreement = {"exact_pixels": int(np.count_nonzero(tiled.zmap == labels)),
+                       "different_pixels": int(np.count_nonzero(tiled.zmap != labels)),
+                       "retained_zmap_sha256": row["zmap_sha256"]}
+    record: dict[str, object] = {
+        "configuration_id": configuration["id"], "classification": configuration["classification"],
+        "can_advance": configuration["can_advance"], "mask_rule": configuration["mask_rule"],
+        "family": row["family"], "member": row["member"], "seed": row["seed"], "tile": row["tile"],
+        "repeat": row["repeat"], "repeat_kind": repeat_kind, "method": "laplacian",
+        "whole_composite": str(whole_composite), "whole_zmap": str(whole_zmap),
+        "composite": str(composite), "zmap": str(zmap),
+        "whole_composite_sha256": sha256_path(whole_composite), "whole_zmap_sha256": sha256_path(whole_zmap),
+        "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap),
+        "input_identity": row.get("actual_source_sha256", row.get("input_sha256")),
+        "selected_input_identity": row.get("actual_source_sha256", row.get("input_sha256")),
+        "raw_input_identity": row.get("input_sha256"), "baseline_composite_sha256": row.get("composite_sha256"),
+        "baseline_zmap_sha256": row.get("zmap_sha256"), "label_agreement": label_agreement,
+        "tile_difference": difference, "tile_plan": plan, "stream_reads": counters,
+        "tile_stream_reads": tile_counters, "uncovered": list(tiled.uncovered), "fallbacks": list(tiled.fallbacks),
+        "finest_map_sha256": sha256(tiled.zmap.tobytes()).hexdigest(), "whole_level_diagnostics": whole.level_diagnostics,
+        "tile_window_diagnostics": [window["level_diagnostics"] for window in plan["windows"]],
+        "tile_window_accounting": "read halos overlap; per-window support and fallback totals are not global counts",
+        "partition_bound": tiled.partition_bound, "allowance_keys": [item for item in allowances
+            if item["family"] == row["family"] and item["member"] == row["member"]
+            and item["method"] == "laplacian" and item["tile"] == row["tile"]],
+        "image_metrics": image_metrics, "unavailable_metrics": metadata["metric_unavailable"],
+        "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+    }
+    record["label_metrics"] = {key: record["image_metrics"].pop(key) for key in ("label_exact", "label_within_one", "label_mad")}
+    unavailable = record["unavailable_metrics"]
+    unavailable.update({"geometry_error": "synthetic fusion inputs have no recovered alignment transform", "alignment_drift": "synthetic fusion inputs have no recovered alignment transform", "alignment_failures": "synthetic fusion inputs have no recovered alignment transform", "gradient_energy": "diagnostic not measured by this arm", "map_coherence": "diagnostic not measured by this arm"})
+    record["metric_schema"] = {**record["image_metrics"], **record["label_metrics"],
+                               "geometry_error": None, "alignment_drift": None, "alignment_failures": None}
+    reasons = {"seam_energy": "no interior tile boundary for this tile plan",
+               "label_exact": "no valid label-truth support", "label_within_one": "no valid label-truth support",
+               "label_mad": "no valid label-truth support", "gradient_energy": "diagnostic is not measured by this arm",
+               "map_coherence": "diagnostic is not measured by this arm"}
+    for metric, value in record["metric_schema"].items():
+        if value is None:
+            unavailable.setdefault(metric, reasons.get(metric, "metric is unavailable for this generated region"))
+        elif isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            unavailable[metric] = "metric is non-finite for this generated region"
+    record["metric_values_sha256"] = sha256(json.dumps(_json(record["metric_schema"]), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {**record, **metadata}
+
+
+def _mask_pyramid_label_audit(row: dict[str, object]) -> dict[str, object]:
+    """Classify retained CLI level-zero differences with the frozen f32 order bound."""
+    paths = row.get("actual_source_frames") or gff.frame_paths(Path(str(row["case"])))
+    frames = np.stack([gff.read_u16(path) for path in paths])
+    coverage = np.load(str(row["actual_coverage"])) if "actual_coverage" in row else None
+    view = fusion.details_level0(frames, coverage)
+    alternate = np.stack([fusion.score_plane_f32_alternate(detail, 8) for detail in view.details])
+    tolerance = float(np.max(np.abs(alternate.astype(np.float64) - view.scores.astype(np.float64))))
+    retained = gff.read_zmap(Path(str(row["zmap"])))
+    disagreements = _twin_disagreements(retained, view.winners, view.scores, view.eligible, tolerance)
+    source = _selection_source(row)
+    return {"python_exact": bool(np.array_equal(view.winners, mask_pyramid.finest_winners(source))),
+            "python_retained_different_pixels": int(np.count_nonzero(view.winners != retained)),
+            "cli_twin_disagreements": disagreements, "f32_summation_order_tolerance": tolerance,
+            "retained_zmap_sha256": row["zmap_sha256"]}
+
+
+def run_mask_pyramid_configurations(root: Path, output: Path, configurations: list[dict[str, object]],
+                                    allowances_path: Path, repeat_kind: str = "training") -> list[dict[str, object]]:
+    """Run the fixed three-arm matrix from retained Details inputs."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text())
+            if row["method"] == "laplacian" and row["repeat"] == 0]
+    if len(rows) != 60:
+        raise AssertionError(f"mask-pyramid input count is {len(rows)}, expected 60")
+    allowances = json.loads(allowances_path.read_text())
+    records = []
+    for row in rows:
+        source = _selection_source(row)
+        label_audit = _mask_pyramid_label_audit(row)
+        if not label_audit["python_exact"]:
+            raise AssertionError("Python finest winner map does not match the retained Details oracle")
+        for configuration in configurations:
+            measurement_started = time.monotonic()
+            whole, counters = mask_pyramid.fuse_streaming(source, str(configuration["mask_rule"]))
+            tiled, tile_counters, plan = mask_pyramid.fuse_tiled(source, str(configuration["mask_rule"]), int(row["tile"]), 160)
+            record = _mask_pyramid_record(output, row, configuration, whole, tiled, counters, tile_counters,
+                                          plan, allowances, repeat_kind)
+            record["old_oracle_label_audit"] = label_audit
+            record["measurement_seconds"] = time.monotonic() - measurement_started
+            records.append(record)
+    if len(records) != 180:
+        raise AssertionError("mask-pyramid output count does not match registered matrix")
+    return records
+
+
+def mask_pyramid_references(root: Path) -> dict[str, list[dict[str, object]]]:
+    """Return each retained baseline context row used beside the three arm rows."""
+    baseline = json.loads((root / "baseline.json").read_text())
+    references = {}
+    for method in ("laplacian", "weighted-average", "depth-map"):
+        rows = [row for row in baseline if row["method"] == method and row["repeat"] == 0]
+        if len(rows) != 60:
+            raise AssertionError(f"mask-pyramid {method} reference count is {len(rows)}, expected 60")
+        references[method] = rows
+    return references
+
+
+def mask_pyramid_gff_context(root: Path, output: Path) -> list[dict[str, object]]:
+    """Measure paper-scale GFF only after every retained source binding is preflighted."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text())
+            if row["method"] == "laplacian" and row["repeat"] == 0]
+    if len(rows) != 60:
+        raise AssertionError("mask-pyramid GFF context needs 60 retained Details inputs")
+    bindings = []
+    for row in rows:
+        actual = "actual_source_frames" in row
+        raw_paths = [Path(path) for path in gff.frame_paths(Path(str(row["case"])))]
+        raw_fingerprints = {path.name: sha256_path(path) for path in raw_paths}
+        paths = [Path(path) for path in row["actual_source_frames"]] if actual else raw_paths
+        fingerprints = {path.name: sha256_path(path) for path in paths}
+        expected = row.get("actual_source_sha256") if actual else row.get("input_sha256")
+        if (len(raw_paths) != 8 or raw_fingerprints != row.get("input_sha256")
+                or len(paths) != 8 or len(fingerprints) != len(paths) or fingerprints != expected
+                or row.get("equalized") is not False or "equalize=false" not in row.get("parameters", [])
+                or not isinstance(row.get("tile_boundaries"), dict)
+                or not Path(str(row.get("zmap", ""))).is_file()
+                or row.get("zmap_sha256") != sha256_path(Path(str(row["zmap"])) )):
+            raise ValueError("GFF context retained Details binding is missing or stale")
+        source = _selection_source(row)
+        if not all(isinstance(getattr(source, name, None), int) and getattr(source, name) > 0 for name in ("h", "w", "c")):
+            raise ValueError("GFF context source geometry is invalid")
+        boundaries = row["tile_boundaries"]
+        if (boundaries.get("levels") != 5 or boundaries.get("margin") != 160
+                or any(not isinstance(line, int) or not 0 < line < source.w for line in boundaries.get("vertical", []))
+                or any(not isinstance(line, int) or not 0 < line < source.h for line in boundaries.get("horizontal", []))):
+            raise ValueError("GFF context tile geometry does not match the retained Details input")
+        family = next(item for item in FAMILIES if item.name == row["family"])
+        rendered = render_family(family, SeedTriple.parse(str(row["seed"])), str(row["member"]))
+        data = SceneData(np.empty((0,), dtype=np.uint16), rendered.truth, rendered.depth, rendered.metadata)
+        if data.truth.shape != (source.h, source.w, source.c):
+            raise ValueError("GFF context truth geometry does not match the retained Details input")
+        coverage_file_sha, coverage_mask_sha, alignment = None, None, None
+        if actual:
+            coverage_path = Path(str(row.get("actual_coverage", "")))
+            if (not coverage_path.is_file() or row.get("actual_coverage_sha256") != sha256_path(coverage_path)
+                    or not isinstance(row.get("alignment"), dict) or not isinstance(row["alignment"].get("alignments"), list)
+                    or len(row["alignment"]["alignments"]) != len(paths) or not isinstance(row["alignment"].get("reference"), int)
+                    or not isinstance(row.get("actual_frame_export_commands"), list)
+                    or len(row["actual_frame_export_commands"]) != len(paths)):
+                raise ValueError("GFF context aligned source or coverage binding is missing or stale")
+            alignment_entries, reference = row["alignment"]["alignments"], row["alignment"]["reference"]
+            if not 0 <= reference < len(paths):
+                raise ValueError("GFF context aligned reference is invalid")
+            for index, (path, entry) in enumerate(zip(paths, alignment_entries)):
+                matrix = np.asarray(entry.get("transform", {}).get("m"), dtype=np.float64)
+                if (not isinstance(entry, dict) or entry.get("frame") != index or entry.get("name") != path.name
+                        or entry.get("status") != "converged" or entry.get("fallback") is not False
+                        or matrix.shape != (3, 3) or not np.isfinite(matrix).all()):
+                    raise ValueError("GFF context aligned transforms are invalid")
+            if not np.array_equal(np.asarray(alignment_entries[reference]["transform"]["m"], dtype=np.float64), np.eye(3, dtype=np.float64)):
+                raise ValueError("GFF context aligned reference transform is invalid")
+            coverage = np.load(str(coverage_path))
+            if coverage.shape != (len(paths), source.h, source.w):
+                raise ValueError("GFF context coverage geometry does not match exported inputs")
+            coverage_file_sha = row["actual_coverage_sha256"]
+            coverage_mask_sha = sha256(np.asarray(coverage, dtype=bool).any(axis=0).tobytes()).hexdigest()
+            alignment = row["alignment"]
+        else:
+            coverage_mask_sha = sha256(np.ones((source.h, source.w), dtype=bool).tobytes()).hexdigest()
+        bindings.append({"row": row, "source": source, "paths": paths, "fingerprints": fingerprints, "raw_fingerprints": raw_fingerprints,
+                         "actual": actual, "coverage_file_sha256": coverage_file_sha,
+                         "coverage_mask_sha256": coverage_mask_sha, "alignment": alignment,
+                         "data": data, "boundaries": boundaries})
+    records = []
+    for binding in bindings:
+        row, source = binding["row"], binding["source"]
+        started = time.monotonic()
+        image, covered = gff.fuse_stack(source, scale=1.0)
+        covered_sha = sha256(np.asarray(covered, dtype=bool).tobytes()).hexdigest()
+        if covered_sha != binding["coverage_mask_sha256"]:
+            raise ValueError("GFF context coverage result does not match the retained source")
+        directory = output / "gff-context" / run_key(f"{row['family']}-{row['member']}", SeedTriple.parse(str(row["seed"])), "gff", int(row["tile"]), 0)
+        directory.mkdir(parents=True, exist_ok=True)
+        composite = directory / "composite.tif"
+        gff.write_u16(composite, image)
+        metric_row = {**row, "comp": str(composite), "zmap": row["zmap"], "tile_boundaries": binding["boundaries"]}
+        metric_row.pop("tile_difference", None)
+        values, metadata = _record_metrics(binding["data"], str(row["family"]), str(row["member"]), metric_row,
+                                           composite, Path(str(row["zmap"])), source, binding["boundaries"])
+        for key in ("label_exact", "label_within_one", "label_mad"):
+            values.pop(key, None)
+        unavailable = metadata["metric_unavailable"]
+        unavailable.update({"tile_difference": "guided-filter context has no paired tiled output",
+                            "geometry_error": "guided-filter context does not recover an alignment transform",
+                            "alignment_drift": "guided-filter context does not recover an alignment transform",
+                            "alignment_failures": "guided-filter context does not recover an alignment transform",
+                            "gradient_energy": "diagnostic is not measured by this context",
+                            "map_coherence": "guided-filter context has no source-index map"})
+        for metric, value in values.items():
+            if value is None:
+                unavailable.setdefault(metric, "metric is unavailable for this retained family region")
+            elif isinstance(value, (float, np.floating)) and not np.isfinite(value):
+                unavailable[metric] = "metric is non-finite for this retained family region"
+        records.append({"family": row["family"], "member": row["member"], "seed": row["seed"], "tile": row["tile"],
+                        "context_class": "paper-parameter diagnostic", "settings": {"scale": 1.0, "equalize": False},
+                        "source_kind": "exported-aligned" if binding["actual"] else "retained-raw", "input_order": [str(path) for path in binding["paths"]],
+                        "input_identity": binding["fingerprints"], "selected_input_identity": binding["fingerprints"],
+                        "raw_input_identity": binding["raw_fingerprints"], "actual_source_sha256": row.get("actual_source_sha256"),
+                        "actual_coverage_sha256": binding["coverage_file_sha256"], "coverage_mask_sha256": covered_sha,
+                        "input_shape_hwc": [source.h, source.w, source.c], "tile_boundaries": binding["boundaries"],
+                        "alignment": binding["alignment"], "matched_details_zmap_sha256": row["zmap_sha256"],
+                        "composite": str(composite), "composite_sha256": sha256_path(composite), "image_metrics": values,
+                        "image_metric_values_sha256": sha256(json.dumps(_json(values), sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                        "unavailable_metrics": unavailable, "label_metrics": None,
+                        "label_metrics_reason": "guided-filter context has no source-index map", "measurement_seconds": time.monotonic() - started})
+    return records
+
+
+
+def mask_pyramid_resource_body(root: Path, frame_count: int) -> dict[str, object]:
+    """Measure one fresh file-backed body without creating an N-frame sample array."""
+    if frame_count not in (2, 8, 16, 32):
+        raise ValueError("resource body frame count is not registered")
+    row = next((item for item in json.loads((root / "baseline.json").read_text())
+                if item["family"] == "flat-noise" and item["member"] == "noise-250" and item["method"] == "laplacian"
+                and item["tile"] == 512 and item["repeat"] == 0), None)
+    if row is None:
+        raise ValueError("resource body needs a retained flat-noise Details input")
+    physical = [Path(path) for path in gff.frame_paths(Path(str(row["case"])))]
+    if len(physical) != 8:
+        raise ValueError("resource body needs eight physical input files")
+    paths = (physical * ((frame_count + len(physical) - 1) // len(physical)))[:frame_count]
+    source = gff.TiffSource(paths)
+    result, counters = mask_pyramid.fuse_streaming(source)
+    fingerprints = {path.name: sha256_path(path) for path in physical}
+    module_sha = sha256_path(Path(__file__).with_name("mask_pyramid.py"))
+    return {"frame_count": frame_count, "process_id": os.getpid(), "physical_input_pool_files": len(physical),
+            "distinct_referenced_files": len({str(path) for path in paths}),
+            "declared_references": [str(path) for path in paths], "sample_reads": counters["sample_reads"],
+            "mask_reads": counters["mask_reads"], "generated_default_masks": counters["mask_defaults_generated"],
+            "composite_sha256": sha256(result.composite.tobytes()).hexdigest(), "input_fingerprints": fingerprints,
+            "source_module_sha256": module_sha, "peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            "cache_limitation": "OS page cache is uncontrolled; this is not a cold/warm cache claim"}
+
+
+_MASK_PYRAMID_RESOURCE_SCRIPT = """
+import json
+import sys
+from pathlib import Path
+from spikes.stacking_experiments.runner import mask_pyramid_resource_body
+print(json.dumps(mask_pyramid_resource_body(Path(sys.argv[1]), int(sys.argv[2])), sort_keys=True))
+"""
+
+
+def mask_pyramid_resource_argv(root: Path, frame_count: int, time_path: Path) -> list[str]:
+    """Return the registered fresh-process invocation without mutable call-site text."""
+    return ["/usr/bin/time", "-v", "-o", str(time_path), sys.executable, "-c", _MASK_PYRAMID_RESOURCE_SCRIPT,
+            str(root), str(frame_count)]
+
+
+def mask_pyramid_resource_controls(root: Path, output: Path) -> dict[str, object]:
+    """Collect twelve independent file-backed bodies with retained raw evidence."""
+    records = []
+    for frame_count in (2, 8, 16, 32):
+        for repeat in range(3):
+            body = output / f"body-n{frame_count}-r{repeat}"
+            body.mkdir(parents=True, exist_ok=True)
+            stdout_path, stderr_path, time_path, exit_path = body / "stdout.txt", body / "stderr.txt", body / "time-v.txt", body / "exit.txt"
+            argv = mask_pyramid_resource_argv(root, frame_count, time_path)
+            argv_path = body / "argv.txt"
+            argv_path.write_text(json.dumps(argv) + "\n")
+            started = time.monotonic()
+            with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
+                process = subprocess.run(argv, cwd=ROOT, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, stdout=stdout, stderr=stderr, text=True)
+            elapsed = time.monotonic() - started
+            exit_path.write_text(f"{process.returncode}\n")
+            stdout_text, stderr_text, time_text = stdout_path.read_text(), stderr_path.read_text(), time_path.read_text() if time_path.is_file() else ""
+            if process.returncode:
+                raise RuntimeError(f"mask-pyramid resource body exit {process.returncode}: {stderr_text[-1000:]}")
+            try:
+                record = json.loads(stdout_text)
+            except json.JSONDecodeError as error:
+                raise RuntimeError("mask-pyramid resource body did not return JSON") from error
+            if not isinstance(record, dict):
+                raise RuntimeError("mask-pyramid resource body JSON is not an object")
+            record.update({"repeat": repeat, "argv": argv, "native_exit": process.returncode, "body_wall_seconds": elapsed,
+                           "stdout": str(stdout_path), "stderr": str(stderr_path), "time_v": str(time_path), "exit_path": str(exit_path),
+                           "argv_path": str(argv_path), "argv_sha256": sha256(argv_path.read_bytes()).hexdigest(),
+                           "stdout_sha256": sha256(stdout_text.encode()).hexdigest(), "stderr_sha256": sha256(stderr_text.encode()).hexdigest(),
+                           "time_v_sha256": sha256(time_text.encode()).hexdigest(), "exit_sha256": sha256(exit_path.read_bytes()).hexdigest()})
+            records.append(record)
+    n2 = [int(record["peak_rss_kb"]) for record in records if record["frame_count"] == 2]
+    noise = max(n2) - min(n2)
+    medians = {str(count): statistics.median([int(record["peak_rss_kb"]) for record in records if record["frame_count"] == count]) for count in (2, 8, 16, 32)}
+    n2_median = medians["2"]
+    comparisons = {count: {"median_rss_kb": median, "difference_from_n2_kb": abs(median - n2_median), "within_n2_noise": abs(median - n2_median) <= noise} for count, median in medians.items()}
+    return {"records": records, "n2_noise_kb": noise, "median_rss_kb": medians, "comparison": comparisons,
+            "resource_guard_completed": len(records) == 12, "resource_flatness_pass": all(item["within_n2_noise"] for item in comparisons.values()),
+            "cache_limitation": "OS page cache is uncontrolled; this is not a cold/warm cache claim"}
+
+
+
+def run_mask_pyramid_stack(output: Path, source_name: str, prepared: Path, rect_text: str | None,
+                           configurations: list[dict[str, object]]) -> dict[str, object]:
+    """Render three registered diagnostics after retained real references are verified."""
+    rect = _registered_rect(source_name, rect_text)
+    manifest = _validate_preparation(prepared, source_name)
+    prepared_sha = sha256_path(prepared)
+    retained_path = prepared.parents[3] / "stacking-crops" / source_name / "crops.json"
+    if not retained_path.is_file():
+        raise ValueError("retained prepared-crop references are required before mask-pyramid output")
+    retained = json.loads(retained_path.read_text())
+    if not isinstance(retained, list):
+        raise ValueError("retained prepared-crop reference record is invalid")
+    def reference(method: str) -> dict[str, object]:
+        row = next((item for item in retained if isinstance(item, dict) and item.get("method") == method
+                    and item.get("prepared_manifest_sha256") == prepared_sha
+                    and item.get("alignment_report_sha256") == manifest["alignment_report_sha256"]
+                    and item.get("rect_xywh") == list(rect)), None)
+        if row is None:
+            raise ValueError(f"retained {method} crop does not match the preparation")
+        if (row.get("raw_inputs") != manifest["raw_inputs"] or row.get("aligned_inputs") != manifest["aligned_inputs"]
+                or row.get("coverage", {}).get("rect_xywh") != list(rect)
+                or row.get("coverage", {}).get("all_sources_cover_roi") is not True
+                or row.get("equalization") is not None or row.get("method_order") != list(METHODS)):
+            raise ValueError(f"retained {method} crop settings, source order, or coverage are invalid")
+        for field in ("composite", "zmap"):
+            path = Path(str(row.get(field, "")))
+            if not path.is_file() or row.get(f"{field}_sha256") != sha256_path(path):
+                raise ValueError(f"retained {method} crop file is missing or stale")
+        return row
+    details, weighted = reference("laplacian"), reference("weighted-average")
+    directory, paths, coverage = _crop_prepared_inputs(output, source_name, prepared, rect)
+    source = gff.TiffSource(paths)
+    rows = []
+    for configuration in configurations:
+        arm_started = time.monotonic()
+        result, counters = mask_pyramid.fuse_streaming(source, str(configuration["mask_rule"]))
+        work = directory / str(configuration["id"])
+        work.mkdir(parents=True, exist_ok=True)
+        composite, zmap = work / "composite.tif", work / "zmap.tif"
+        gff.write_u16(composite, result.composite)
+        gff.write_u16(zmap, result.zmap[..., None])
+        rows.append({"configuration_id": configuration["id"], "classification": configuration["classification"], "can_advance": configuration["can_advance"], "mask_rule": configuration["mask_rule"],
+                     "rect_xywh": list(rect), "global_origin_xy": coverage["global_origin_xy"], "coverage": coverage,
+                     "prepared_manifest_sha256": prepared_sha, "alignment_report_sha256": manifest["alignment_report_sha256"],
+                     "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"],
+                     "composite": str(composite), "zmap": str(zmap), "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap),
+                     "stream_reads": counters, "uncovered": list(result.uncovered), "fallbacks": list(result.fallbacks),
+                     "finest_map_sha256": sha256(result.zmap.tobytes()).hexdigest(), "level_diagnostics": result.level_diagnostics,
+                     "reference_inputs": {"details_composite_sha256": details["composite_sha256"], "details_zmap_sha256": details["zmap_sha256"], "weighted_composite_sha256": weighted["composite_sha256"], "weighted_zmap_sha256": weighted["zmap_sha256"]},
+                     "measurement_seconds": time.monotonic() - arm_started, "truth_metrics": "not computed"})
+    if len(rows) != 3:
+        raise AssertionError("real mask-pyramid output count does not match registration")
+    candidate = next(row for row in rows if row["configuration_id"] == "soft-coarse")
+    montage = output / "stack" / "details-candidate-weighted.png"
+    montage.parent.mkdir(parents=True, exist_ok=True)
+    retained_labels = gff.read_zmap(Path(str(details["zmap"])))
+    for row in rows:
+        if not np.array_equal(gff.read_zmap(Path(str(row["zmap"]))), retained_labels):
+            raise AssertionError("real mask-pyramid finest map does not match retained Details crop")
+        row["retained_details_zmap_sha256"] = details["zmap_sha256"]
+    montage_command = [str(getattr(gff, "montage").__module__), "details,candidate,weighted"]
+    gff.montage(str(montage), (0, rect[3], 0, rect[2]), [Path(details["composite"]), Path(candidate["composite"]), Path(weighted["composite"])])
+    montage_record: dict[str, object] = {"path": str(montage), "sha256": sha256_path(montage), "command": montage_command,
+                                         "inputs": [details["composite_sha256"], candidate["composite_sha256"], weighted["composite_sha256"]]}
+    gff_started = time.monotonic()
+    gff_image, gff_covered = gff.fuse_stack(source, scale=1.0)
+    gff_composite = directory / "gff-scale-1.0.tif"
+    gff.write_u16(gff_composite, gff_image)
+    gff_context = {"scale": 1.0, "input_matches_prepared_crop": True, "composite": str(gff_composite), "composite_sha256": sha256_path(gff_composite),
+                   "covered_sha256": sha256(np.asarray(gff_covered, dtype=bool).tobytes()).hexdigest(), "settings": {"scale": 1.0, "equalize": False},
+                   "input_identity": {path.name: sha256_path(path) for path in paths}, "input_shape_hwc": [source.h, source.w, source.c],
+                   "label_metrics": None, "label_metrics_reason": "guided-filter context has no source-index map", "measurement_seconds": time.monotonic() - gff_started}
+    return {"source": source_name, "rect_xywh": list(rect), "prepared_manifest": str(prepared.resolve()), "prepared_manifest_sha256": prepared_sha,
+            "alignment_report_sha256": manifest["alignment_report_sha256"], "coverage": coverage, "rows": rows, "montage": montage_record, "gff_context": gff_context}
+
 
 
 def run_index_full_references(root: Path, output: Path, configurations: list[dict[str, object]],

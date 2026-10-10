@@ -7,16 +7,367 @@ import math
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import time
 
 import numpy as np
 
-from . import coefficient_shrinkage, consistency, focus_score, fusion, index_field
+from . import coefficient_shrinkage, consistency, focus_score, fusion, index_field, mask_pyramid
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
+from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
+
+
+def _mask_pyramid_semantics() -> dict[str, object]:
+    """Return every immutable arm setting required before an output exists."""
+    return {
+        "arm": "mask-pyramid", "method": "laplacian", "levels": 5, "score_radii": [8, 4, 2, 1, 1], "equalize": False,
+        "shared_protocol_sha256": "e6faafb9539343a1579ca71f9d2cdac00b8a7395f8c64a05ec720eaaa7f54ab6",
+        "hypothesis": "Hard finest Details selection with Gaussian coarse masks reduces edge/halo error against Details without losing thin-hair contrast or violating flat-noise, chroma, coverage or other objective floors.",
+        "configurations": [{"id": "soft-coarse", "classification": "candidate", "can_advance": True, "mask_rule": "gaussian"},
+                           {"id": "hard-every-level", "classification": "control", "can_advance": False, "mask_rule": "hard"},
+                           {"id": "uniform-weights", "classification": "control", "can_advance": False, "mask_rule": "uniform"}],
+        "training": {"holdout": "sealed", "seeds": ["101,201,301", "102,202,302", "103,203,303", "104,204,304", "105,205,305"], "tiles": [512, 1024]},
+        "mask": {"coarse": "five-tap clamp-edge Gaussian reductions including residual", "eligibility": "unchanged Details per-level erosion including residual",
+                 "epsilon": float(np.finfo(np.float32).eps), "fallback": "eligible weight sum below float32 epsilon uses plain eligible-source coefficient mean",
+                 "finest": "strict-greater current Details L0; first eligible lowest index wins ties; one map across channels",
+                 "hard_control": "unchanged non-advancing ablation: direct phase-aligned decimation of immutable finest one-hot mask",
+                 "partition_bound": "gamma_(2N+8)=(2N+8)*epsilon/(1-(2N+8)*epsilon); independently sum normalized weights; N tested 1,2,8,32",
+                 "residual": "mask-weighted; differs from Details eligible residual mean by design", "uncovered": "zero coefficients and cleared output; explicit uncovered support",
+                 "uniform_control": "equal eligible-source weights at every level"},
+        "tile": {"details_reach_pixels": 140, "margin_pixels": 160, "phase_pixels": 32, "probe": "masked odd non-square ramp/impulse; nine interior windows",
+                 "probe_shape_hw": [545, 547], "probe_tile": 512, "reach_pixels": 136, "training_metric": "actual candidate whole/tile pair only; unavailable null plus reason",
+                 "whole_tile_image_lsb": 1, "whole_tile_labels_lsb": 0},
+        "detectors": {"failure": "missing, nonfinite, stale or insensitive fixed-positive proof forces defer; no retuning",
+                      "hard-every-level": {"role": "unchanged non-advancing ablation", "family": "colour-edges", "member": "default", "keys": "reported original hard 0/10; no advancement claim", "loss": "discrimination report only"},
+                      "uniform-weights": {"family": "thin-hairs", "member": "default", "keys": "all five training seeds times tiles512/1024", "loss": "hair_retention loss exceeds exact Details keyed allowance on every designated key"}},
+        "advancement": {"benefit": "mean edge/halo benefit against Details exceeds two keyed allowances with thin-hair nonregression", "chroma_and_invalid_border": "unchanged keyed allowances and absolute invalid-source contamination rule",
+                        "flat_noise": "Details floor within unchanged keyed allowance; Weighted Average gap report-only", "hard_veto": "any objective per-seed loss above one exact keyed allowance is no-go",
+                        "missing_evidence": "defer", "negative_controls": "discrimination only; their deliberate losses do not directly veto soft-coarse"},
+        "output_matrix": {"training_input_keys": 60, "configurations_per_key": 3, "training_records": 180, "repeat_records": 180, "details_references": 60,
+                          "weighted_references": 60, "depth_map_context": 60, "gff_context_max_calls": 61, "gff_scale": 1.0, "real_records": 3, "real_montages": 1},
+        "budget": {"sessions": 2, "seconds_per_session": 7200, "total_seconds": 14400,
+                   "include": "failed checks, replays, context, resources, repeats, verification, gates and report work", "exclude": "actual recorded lock wait"},
+        "real": {"source": "stack", "raw_indices": [0, 8, 17, 26, 34, 43, 52, 60], "reference_ordinal": 3, "rect_xywh": [1878, 1056, 1024, 1024],
+                 "processing_origin_xy": [0, 0], "aligned_origin_modulo32": [22, 0], "common_covered_pixels": 1048576,
+                 "prepared_manifest_sha256": "c61d135c8ca1e25d7d53b6b3db1bc5d7c9d1cbad1bd9e5d660a65b10f88ec405", "alignment_report_sha256": "bc4ca98f0d6bb5e980ace9c4ae57fd5ee5ecc03c5c99623144fb947438aa9ce3",
+                 "unset_environment": "explicit skip without preparation or output", "truth": "none; diagnostic only; no uncropped equivalence claim"},
+    }
+
+
+def _mask_pyramid_execution_identity(document: dict[str, object], modules: dict[str, str], dependencies: dict[str, str]) -> str:
+    """Hash immutable scientific, source, and input bindings across readiness transitions."""
+    resources = document["resources"]
+    resource_procedure = {key: resources[key] for key in ("cache", "comparison", "frame_counts", "fresh_processes_per_count", "noise_procedure", "source")}
+    payload = {"semantics": _mask_pyramid_semantics(), "modules": modules, "dependencies": dependencies,
+               "baseline_sha256": document["baseline_sha256"], "allowances_sha256": document["allowances_sha256"],
+               "resource_procedure": resource_procedure, "positive_proof": document["positive_proof"],
+               "original_reference_noise": resources["original_reference_noise"]}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_mask_pyramid_command(registration_path: Path, runs: Path, allowances: Path, source: str | None,
+                                   prepared: Path | None, rect: str | None, resource_only: bool) -> dict[str, object]:
+    """Reject unbound mask-pyramid execution before it creates an output."""
+    if not registration_path.is_file() or not (runs / "baseline.json").is_file() or not allowances.is_file():
+        raise ValueError("--registration, --runs baseline.json, and --allowances are required")
+    try:
+        document = json.loads(registration_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError("registration is not valid JSON") from error
+    for key, value in _mask_pyramid_semantics().items():
+        if document.get(key) != value:
+            raise ValueError(f"registration {key} does not match the immutable mask-pyramid protocol")
+    expected = ["__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py", "coefficient_shrinkage.py", "mask_pyramid.py"]
+    package = Path(__file__).parent
+    names = [f"spikes/stacking_experiments/{name}" for name in expected]
+    if document.get("canonical_modules") != names:
+        raise ValueError("registration canonical module set is invalid")
+    current = {name: hashlib.sha256((package / Path(name).name).read_bytes()).hexdigest() for name in names}
+    if document.get("execution_module_sha256") != current:
+        raise ValueError("registration does not bind the current mask-pyramid implementation")
+    root = package.parents[1]
+    dependencies = document.get("dependency_sha256")
+    expected_dependencies = ("spikes/guided-filter-fusion/gff_fusion.py", "spikes/synthetic-ground-truth/synth_stack.py",
+                             "tools/lib/rawtiff.py", "tools/tiff-diff.py")
+    if not isinstance(dependencies, dict) or tuple(sorted(dependencies)) != tuple(sorted(expected_dependencies)):
+        raise ValueError("registration dependency bindings are invalid")
+    dependency_current: dict[str, str] = {}
+    for name in dependencies:
+        path = root / name
+        if not path.is_file():
+            raise ValueError("registration dependency is missing")
+        dependency_current[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if dependencies != dependency_current:
+        raise ValueError("registration dependencies do not match the current implementation")
+    if hashlib.sha256((runs / "baseline.json").read_bytes()).hexdigest() != document.get("baseline_sha256"):
+        raise ValueError("baseline records do not match the registration")
+    focus_score._validate_baseline_inputs(runs / "baseline.json")
+    if hashlib.sha256(allowances.read_bytes()).hexdigest() != document.get("allowances_sha256"):
+        raise ValueError("allowances do not match the registration")
+    if document.get("execution_ready") is not True:
+        raise ValueError("registration is not source-ready")
+    resources = document.get("resources")
+    if not isinstance(resources, dict):
+        raise ValueError("registration resources are invalid")
+    resource_static = {"cache": "OS page cache uncontrolled; no cold/warm cache claim", "comparison": "each repaired-source N median RSS must differ from the repaired-source N=2 median by at most the immutable original 884KiB bound; current-run N=2 noise is report-only",
+                       "frame_counts": [2, 8, 16, 32], "fresh_processes_per_count": 3,
+                       "noise_procedure": "max minus min peak RSS KiB of the three N=2 fresh process bodies",
+                       "source": "file-backed references to the same eight physical files; no N-sized pixel arrays"}
+    if any(resources.get(key) != value for key, value in resource_static.items()):
+        raise ValueError("registration resource procedure does not match the immutable mask-pyramid protocol")
+    original_noise = resources.get("original_reference_noise")
+    if (not isinstance(original_noise, dict) or set(original_noise) != {"artifact", "artifact_sha256", "n2_noise_kb"}
+            or not isinstance(original_noise["artifact"], str) or not isinstance(original_noise["artifact_sha256"], str)
+            or len(original_noise["artifact_sha256"]) != 64 or original_noise["n2_noise_kb"] != 884):
+        raise ValueError("registration does not bind the immutable original-reference noise proof")
+    original_artifact = Path(original_noise["artifact"])
+    if not original_artifact.is_file() or hashlib.sha256(original_artifact.read_bytes()).hexdigest() != original_noise["artifact_sha256"]:
+        raise ValueError("immutable original-reference noise artifact is stale")
+    try:
+        original_data = json.loads(original_artifact.read_text())
+        original_records = original_data["records"]
+        original_n2 = [int(row["peak_rss_kb"]) for row in original_records if row["frame_count"] == 2]
+        original_source = Path(str(original_data["source_registration"]))
+        original_source_sha256 = original_data["source_registration_sha256"]
+        original_source_document = json.loads(original_source.read_text())
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        raise ValueError("immutable original-reference noise artifact is malformed") from error
+    original_groups = [[row for row in original_records if isinstance(row, dict) and row.get("frame_count") == count]
+                       for count in (2, 8, 16, 32)]
+    original_pids = [row.get("process_id") for group in original_groups for row in group]
+    if (len(original_records) != 12 or any(len(group) != 3 or {row.get("repeat") for row in group} != {0, 1, 2}
+                                           for group in original_groups)
+            or any(not isinstance(pid, int) or pid <= 0 for pid in original_pids) or len(set(original_pids)) != 12
+            or not original_source.is_file() or hashlib.sha256(original_source.read_bytes()).hexdigest() != original_source_sha256
+            or original_source_document.get("execution_ready") is not True or original_source_document.get("quality_ready") is not False
+            or original_data.get("baseline_sha256") != document.get("baseline_sha256")
+            or original_data.get("allowances_sha256") != document.get("allowances_sha256")
+            or original_source_document.get("baseline_sha256") != document.get("baseline_sha256")
+            or original_source_document.get("allowances_sha256") != document.get("allowances_sha256")
+            or original_source_document.get("execution_identity") != original_data.get("execution_identity")
+            or len(original_n2) != 3 or max(original_n2) - min(original_n2) != 884 or original_data.get("n2_noise_kb") != 884):
+        raise ValueError("immutable original-reference noise proof does not reproduce 884KiB")
+    positive = document.get("positive_proof")
+    positive_required = {"artifact", "artifact_sha256", "registration", "registration_sha256", "helper_path", "helper_sha256",
+                         "input_sha256", "allowances_sha256", "support_sha256", "strengths", "maxima", "source_bindings",
+                         "dependency_bindings"}
+    hash_fields = {"artifact_sha256", "registration_sha256", "helper_sha256", "input_sha256", "allowances_sha256"}
+    valid_hash = lambda value: isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+    if (not isinstance(positive, dict) or set(positive) != positive_required
+            or any(not valid_hash(positive[key]) for key in hash_fields)
+            or any(not isinstance(positive[key], str) for key in ("artifact", "registration", "helper_path"))
+            or not isinstance(positive["support_sha256"], dict) or set(positive["support_sha256"]) != {"halo", "seam"}
+            or any(not valid_hash(value) for value in positive["support_sha256"].values())
+            or positive["strengths"] != {"halo": 617, "seam": 248}
+            or positive["maxima"] != {"edge_halo": 308.44566241918585, "seam_energy": 123.76985677083341}
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in positive["strengths"].values())
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
+                   for value in positive["maxima"].values())
+            or not isinstance(positive["source_bindings"], dict) or set(positive["source_bindings"]) != set(names)
+            or any(not valid_hash(value) for value in positive["source_bindings"].values())
+            or not isinstance(positive["dependency_bindings"], dict) or set(positive["dependency_bindings"]) != set(expected_dependencies)
+            or any(not valid_hash(value) for value in positive["dependency_bindings"].values())):
+        raise ValueError("registration does not bind the fixed positive detector proof")
+    positive_artifact = Path(positive["artifact"])
+    positive_registration = Path(positive["registration"])
+    helper = Path(positive["helper_path"])
+    if (not positive_artifact.is_file() or hashlib.sha256(positive_artifact.read_bytes()).hexdigest() != positive["artifact_sha256"]
+            or not positive_registration.is_file() or hashlib.sha256(positive_registration.read_bytes()).hexdigest() != positive["registration_sha256"]
+            or not helper.is_file() or hashlib.sha256(helper.read_bytes()).hexdigest() != positive["helper_sha256"]
+            or positive["allowances_sha256"] != document["allowances_sha256"]):
+        raise ValueError("fixed positive detector proof is stale")
+    repaired_modules = {"spikes/stacking_experiments/__main__.py", "spikes/stacking_experiments/mask_pyramid.py"}
+    if (positive["dependency_bindings"] != dependency_current
+            or any(positive["source_bindings"][name] != current[name] for name in names if name not in repaired_modules)):
+        raise ValueError("fixed positive detector proof does not bind the unchanged current sources")
+    try:
+        receipt = json.loads(positive_artifact.read_text())
+        positive_registration_document = json.loads(positive_registration.read_text())
+        native = receipt["tiffs"]
+        receipt_hashes = {key: hashlib.sha256((positive_artifact.parent / f"{key}.tif").read_bytes()).hexdigest() for key in native}
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as error:
+        raise ValueError("fixed positive detector receipt is malformed") from error
+    values = receipt.get("values", {})
+    expected_effects = {name: float(value) for name, value in positive["strengths"].items()}
+    registered_helper = Path(str(positive_registration_document.get("helper_path", "")))
+    registered_truth = Path(str(positive_registration_document.get("truth_path", "")))
+    if not registered_helper.is_absolute():
+        registered_helper = root / registered_helper
+    if not registered_truth.is_absolute():
+        registered_truth = root / registered_truth
+    registered_case = registered_truth.with_name("case.json")
+    metric_sha256 = hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if (not isinstance(receipt, dict) or not isinstance(positive_registration_document, dict)
+            or not isinstance(native, dict) or set(native) != {"clean", "halo", "seam"}
+            or any(not isinstance(item, dict) for item in native.values())
+            or not isinstance(values, dict) or any(not isinstance(values.get(name), dict) for name in native)
+            or receipt.get("native_exit") != 0 or receipt.get("registration_sha256") != positive["registration_sha256"]
+            or receipt.get("helper_sha256") != positive["helper_sha256"] or receipt.get("truth_sha256") != positive["input_sha256"]
+            or receipt.get("allowances_sha256") != positive["allowances_sha256"]
+            or receipt.get("support_sha256") != positive["support_sha256"] or receipt.get("strengths") != positive["strengths"]
+            or receipt.get("maxima") != positive["maxima"] or receipt.get("source_bindings") != positive["source_bindings"]
+            or receipt.get("dependency_bindings") != positive["dependency_bindings"]
+            or registered_helper.resolve() != helper.resolve()
+            or not registered_truth.is_file() or hashlib.sha256(registered_truth.read_bytes()).hexdigest() != positive["input_sha256"]
+            or receipt.get("case_sha256") != positive_registration_document.get("case_sha256")
+            or not registered_case.is_file() or hashlib.sha256(registered_case.read_bytes()).hexdigest() != receipt.get("case_sha256")
+            or positive_registration_document.get("helper_sha256") != positive["helper_sha256"]
+            or positive_registration_document.get("truth_sha256") != positive["input_sha256"]
+            or positive_registration_document.get("allowances_sha256") != positive["allowances_sha256"]
+            or positive_registration_document.get("support_sha256") != positive["support_sha256"]
+            or positive_registration_document.get("support_pixels") != receipt.get("support_pixels")
+            or positive_registration_document.get("strengths") != positive["strengths"]
+            or positive_registration_document.get("maxima") != positive["maxima"]
+            or positive_registration_document.get("execution_modules") != positive["source_bindings"]
+            or positive_registration_document.get("dependencies") != positive["dependency_bindings"]
+            or values.get("clean", {}).get("edge_halo") != 0.0 or values.get("clean", {}).get("seam_energy") != 0.0
+            or values.get("halo", {}).get("edge_halo") != expected_effects["halo"]
+            or values.get("seam", {}).get("seam_energy") != expected_effects["seam"]
+            or receipt.get("effects") != expected_effects
+            or receipt.get("metric_sha256") != metric_sha256
+            or receipt["effects"]["halo"] <= positive["maxima"]["edge_halo"]
+            or receipt["effects"]["seam"] <= positive["maxima"]["seam_energy"]
+            or native["clean"].get("sha256") != positive["input_sha256"]
+            or any(receipt_hashes[name] != native[name].get("sha256") for name in native)):
+        raise ValueError("fixed positive detector receipt does not authenticate its native proof")
+    document["_validated_registration_sha256"] = hashlib.sha256(registration_path.read_bytes()).hexdigest()
+    document["_execution_identity"] = _mask_pyramid_execution_identity(document, current, dependency_current)
+    if not resource_only:
+        artifact = Path(str(resources.get("noise_artifact", "")))
+        if document.get("quality_ready") is not True or resources.get("resource_guard_completed") is not True or not artifact.is_file():
+            raise ValueError("registration is not quality-ready")
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != resources.get("noise_artifact_sha256"):
+            raise ValueError("resource noise artifact is stale")
+        source_registration = Path(str(resources.get("source_registration", "")))
+        if not source_registration.is_file() or hashlib.sha256(source_registration.read_bytes()).hexdigest() != resources.get("source_registration_sha256"):
+            raise ValueError("source-ready registration provenance is missing or stale")
+        try:
+            source_document = json.loads(source_registration.read_text())
+        except json.JSONDecodeError as error:
+            raise ValueError("source-ready registration provenance is not valid JSON") from error
+        source_bindings = {"canonical_modules": document["canonical_modules"], "execution_module_sha256": document["execution_module_sha256"],
+                           "dependency_sha256": document["dependency_sha256"], "baseline_sha256": document["baseline_sha256"],
+                           "allowances_sha256": document["allowances_sha256"], "positive_proof": document["positive_proof"]}
+        if (not isinstance(source_document, dict) or source_document.get("execution_ready") is not True or source_document.get("quality_ready") is not False
+                or any(source_document.get(key) != value for key, value in source_bindings.items())
+                or any(source_document.get(key) != value for key, value in _mask_pyramid_semantics().items())
+                or not isinstance(source_document.get("resources"), dict)
+                or any(source_document["resources"].get(key) != value for key, value in resource_static.items())
+                or source_document["resources"].get("original_reference_noise") != resources["original_reference_noise"]
+                or _mask_pyramid_execution_identity(source_document, current, dependency_current) != document["_execution_identity"]):
+            raise ValueError("source-ready registration provenance does not bind this execution")
+        try:
+            measured = json.loads(artifact.read_text())
+        except json.JSONDecodeError as error:
+            raise ValueError("resource noise artifact is not valid JSON") from error
+        records = measured.get("records") if isinstance(measured, dict) else None
+        if not isinstance(records, list) or len(records) != 12 or {item.get("frame_count") for item in records if isinstance(item, dict)} != {2, 8, 16, 32}:
+            raise ValueError("resource noise artifact does not contain the measured twelve bodies")
+        bindings = {"execution_module_sha256": document["execution_module_sha256"], "dependency_sha256": document["dependency_sha256"],
+                    "baseline_sha256": document["baseline_sha256"], "allowances_sha256": document["allowances_sha256"],
+                    "execution_identity": document["_execution_identity"], "source_registration_sha256": resources["source_registration_sha256"],
+                    "source_registration": str(source_registration.resolve()), "positive_proof": document["positive_proof"],
+                    "original_reference_noise": resources["original_reference_noise"]}
+        if any(measured.get(key) != value for key, value in bindings.items()):
+            raise ValueError("resource noise artifact does not bind the registered sources and inputs")
+        current_mask_sha = current["spikes/stacking_experiments/mask_pyramid.py"]
+        baseline_rows = json.loads((runs / "baseline.json").read_text())
+        resource_row = next((item for item in baseline_rows if item.get("family") == "flat-noise" and item.get("member") == "noise-250"
+                             and item.get("method") == "laplacian" and item.get("tile") == 512 and item.get("repeat") == 0), None)
+        if not isinstance(resource_row, dict):
+            raise ValueError("resource noise artifact has no registered retained input")
+        pool = sorted((Path(str(resource_row["case"])) / "frames").glob("*.tif"))
+        fingerprints = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in pool}
+        if len(pool) != 8:
+            raise ValueError("resource noise artifact input pool is incomplete")
+        valid_counts = []
+        pids: set[int] = set()
+        for count in (2, 8, 16, 32):
+            group = [item for item in records if isinstance(item, dict) and item.get("frame_count") == count]
+            if len(group) != 3 or {item.get("repeat") for item in group} != {0, 1, 2}:
+                raise ValueError("resource noise artifact does not contain three bodies per frame count")
+            for item in group:
+                pid = item.get("process_id")
+                if not isinstance(pid, int) or pid <= 0 or pid in pids:
+                    raise ValueError("resource noise artifact bodies are not independent processes")
+                pids.add(pid)
+                expected_refs = [str(path) for path in (pool * ((count + 7) // 8))[:count]]
+                numeric = (item.get("sample_reads") == 2 * count and item.get("mask_reads", 0) + item.get("generated_default_masks", 0) == 2 * count
+                           and isinstance(item.get("peak_rss_kb"), int) and item["peak_rss_kb"] > 0
+                           and isinstance(item.get("body_wall_seconds"), (int, float)) and math.isfinite(float(item["body_wall_seconds"])) and float(item["body_wall_seconds"]) > 0)
+                if (item.get("physical_input_pool_files") != 8 or item.get("distinct_referenced_files") != min(count, 8)
+                        or item.get("declared_references") != expected_refs or item.get("input_fingerprints") != fingerprints
+                        or item.get("source_module_sha256") != current_mask_sha or not numeric):
+                    raise ValueError("resource noise artifact has incomplete or stale body evidence")
+                paths = {key: Path(str(item.get(key, ""))) for key in ("stdout", "stderr", "time_v", "argv_path", "exit_path")}
+                hashes = {"stdout": "stdout_sha256", "stderr": "stderr_sha256", "time_v": "time_v_sha256", "argv_path": "argv_sha256", "exit_path": "exit_sha256"}
+                if any(not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item.get(hashes[key]) for key, path in paths.items()):
+                    raise ValueError("resource noise artifact raw body evidence is missing or stale")
+                if paths["exit_path"].read_text() != "0\n" or item.get("native_exit") != 0:
+                    raise ValueError("resource noise artifact body native exit is invalid")
+                try:
+                    raw_argv = json.loads(paths["argv_path"].read_text())
+                    raw_body = json.loads(paths["stdout"].read_text())
+                except json.JSONDecodeError as error:
+                    raise ValueError("resource noise artifact raw command or body is not valid JSON") from error
+                if raw_argv != item.get("argv") or not isinstance(raw_body, dict):
+                    raise ValueError("resource noise artifact raw command or body disagrees with its record")
+                if raw_argv != mask_pyramid_resource_argv(runs, count, paths["time_v"]):
+                    raise ValueError("resource noise artifact probe invocation is invalid")
+                body_keys = ("frame_count", "process_id", "physical_input_pool_files", "distinct_referenced_files", "declared_references", "sample_reads", "mask_reads", "generated_default_masks", "peak_rss_kb", "composite_sha256", "input_fingerprints", "source_module_sha256", "cache_limitation")
+                if any(raw_body.get(key) != item.get(key) for key in body_keys):
+                    raise ValueError("resource noise artifact raw body does not match its record")
+                time_text = paths["time_v"].read_text()
+                rss = re.search(r"Maximum resident set size \(kbytes\): (\d+)", time_text)
+                cpu = re.findall(r"(?:User|System) time \(seconds\): ([0-9.]+)", time_text)
+                elapsed = re.search(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\): ([0-9:.]+)", time_text)
+                if "Exit status: 0" not in time_text or rss is None or len(cpu) != 2 or elapsed is None:
+                    raise ValueError("resource noise artifact GNU time evidence is incomplete")
+                try:
+                    elapsed_parts = [float(value) for value in elapsed.group(1).split(":")]
+                    if len(elapsed_parts) == 2:
+                        elapsed_seconds = elapsed_parts[0] * 60 + elapsed_parts[1]
+                    elif len(elapsed_parts) == 3:
+                        elapsed_seconds = elapsed_parts[0] * 3600 + elapsed_parts[1] * 60 + elapsed_parts[2]
+                    else:
+                        raise ValueError
+                except ValueError as error:
+                    raise ValueError("resource noise artifact GNU elapsed time is invalid") from error
+                body_seconds = float(item["body_wall_seconds"])
+                if (int(rss.group(1)) <= 0 or int(item["peak_rss_kb"]) > int(rss.group(1)) or not math.isfinite(elapsed_seconds)
+                        or elapsed_seconds <= 0 or abs(body_seconds - elapsed_seconds) > 1.0
+                        or any(not math.isfinite(float(value)) or float(value) < 0 for value in cpu)):
+                    raise ValueError("resource noise artifact GNU time does not agree with its body record")
+            valid_counts.append(group)
+        n2 = [item["peak_rss_kb"] for item in valid_counts[0]]
+        noise = max(n2) - min(n2)
+        medians = {str(count): sorted(item["peak_rss_kb"] for item in group)[1] for count, group in zip((2, 8, 16, 32), valid_counts)}
+        comparisons = {count: {"median_rss_kb": median, "difference_from_n2_kb": abs(median - medians["2"]), "within_n2_noise": abs(median - medians["2"]) <= noise} for count, median in medians.items()}
+        if measured.get("n2_noise_kb") != noise or measured.get("median_rss_kb") != medians or measured.get("comparison") != comparisons:
+            raise ValueError("resource noise artifact summaries do not match its measured bodies")
+        original_flatness = all(item["difference_from_n2_kb"] <= original_noise["n2_noise_kb"] for item in comparisons.values())
+        original_comparisons = {count: {"median_rss_kb": median, "difference_from_n2_kb": abs(median - medians["2"]),
+                                        "within_original_noise": abs(median - medians["2"]) <= original_noise["n2_noise_kb"]}
+                                for count, median in medians.items()}
+        if (measured.get("original_reference_noise") != original_noise or measured.get("original_reference_comparison") != original_comparisons
+                or measured.get("original_reference_flatness_pass") is not all(item["within_original_noise"] for item in original_comparisons.values())
+                or measured.get("resource_guard_completed") is not True or not original_flatness):
+            raise ValueError("resource guard completion or flatness summary is inconsistent")
+    if source == "mantis":
+        raise ValueError("--source mantis is not registered")
+    if source is None:
+        if prepared is not None or rect is not None:
+            raise ValueError("--prepared and --rect require --source stack")
+    elif source != "stack" or prepared is None or rect != "1878,1056,1024,1024":
+        raise ValueError("--source stack requires the registered preparation manifest and rectangle")
+    else:
+        _validate_preparation(prepared, source)
+        if hashlib.sha256(prepared.read_bytes()).hexdigest() != document["real"]["prepared_manifest_sha256"]:
+            raise ValueError("preparation manifest does not match the registered real input")
+    return document
 
 
 def _digest(value: np.ndarray) -> str:
@@ -459,6 +810,18 @@ def main(argv: list[str] | None = None) -> int:
     shrinkage.add_argument("--prepared")
     shrinkage.add_argument("--rect")
     shrinkage.add_argument("--repeat-flat", action="store_true")
+    masks = sub.add_parser("mask-pyramid")
+    masks.add_argument("--self-check", dest="mask_pyramid_self_check", action="store_true")
+    masks.add_argument("--split", choices=("training",), default="training")
+    masks.add_argument("--registration")
+    masks.add_argument("--runs")
+    masks.add_argument("--allowances")
+    masks.add_argument("--out")
+    masks.add_argument("--source", choices=("stack", "mantis"))
+    masks.add_argument("--prepared")
+    masks.add_argument("--rect")
+    masks.add_argument("--resource-only", action="store_true")
+    masks.add_argument("--repeat-only", action="store_true")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -496,6 +859,66 @@ def main(argv: list[str] | None = None) -> int:
             "registration_sha256": document["_validated_registration_sha256"], "replay": replay, "candidate_rows": rows, "weighted_references": references, "resource_controls": resources, "stack": stack,
             "budget": {"measured_seconds": time.monotonic() - started}}, indent=2, sort_keys=True) + "\n")
         print(f"candidate rows: {len(rows)}")
+        return 0
+    if args.command == "mask-pyramid":
+        if args.mask_pyramid_self_check:
+            for record in mask_pyramid.self_checks():
+                print(f"{record['name']}: ok {json.dumps(record, sort_keys=True)}")
+            return 0
+        if not all((args.registration, args.runs, args.allowances, args.out)):
+            parser.error("--registration, --runs, --allowances, and --out are required")
+        if args.resource_only and args.repeat_only:
+            parser.error("--resource-only and --repeat-only are mutually exclusive")
+        if args.resource_only and args.source is not None:
+            parser.error("--resource-only does not accept a real source")
+        if args.repeat_only and args.source is not None:
+            parser.error("--repeat-only does not accept a real source")
+        if args.source == "stack" and not os.environ.get("FOCUSFORGE_REFERENCE_STACK"):
+            print("FOCUSFORGE_REFERENCE_STACK: real work skipped")
+            return 0
+        try:
+            document = _validate_mask_pyramid_command(Path(args.registration), Path(args.runs), Path(args.allowances), args.source,
+                                                      Path(args.prepared) if args.prepared else None, args.rect, args.resource_only)
+        except ValueError as error:
+            parser.error(str(error))
+        output = Path(args.out)
+        output.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        if args.resource_only:
+            resources = mask_pyramid_resource_controls(Path(args.runs), output)
+            reference = document["resources"]["original_reference_noise"]
+            n2_median = resources["median_rss_kb"]["2"]
+            original_comparison = {count: {"median_rss_kb": median, "difference_from_n2_kb": abs(median - n2_median), "within_original_noise": abs(median - n2_median) <= reference["n2_noise_kb"]} for count, median in resources["median_rss_kb"].items()}
+            resources["original_reference_comparison"] = original_comparison
+            resources["original_reference_flatness_pass"] = all(item["within_original_noise"] for item in original_comparison.values())
+            resources.update({"execution_module_sha256": document["execution_module_sha256"],
+                              "dependency_sha256": document["dependency_sha256"], "baseline_sha256": document["baseline_sha256"],
+                              "allowances_sha256": document["allowances_sha256"],
+                              "execution_identity": document["_execution_identity"],
+                              "source_registration_sha256": document["_validated_registration_sha256"],
+                              "source_registration": str(Path(args.registration).resolve()),
+                              "positive_proof": document["positive_proof"],
+                              "original_reference_noise": reference})
+            resource_path = output / "resource-controls.json"
+            resource_path.write_text(json.dumps(resources, indent=2, sort_keys=True) + "\n")
+            payload = {"command": sys.argv if argv is None else [sys.argv[0], *argv],
+                       "registration_sha256": document["_validated_registration_sha256"], "resource_controls": resources,
+                       "resource_artifact": str(resource_path), "budget": {"measured_seconds": time.monotonic() - started}}
+        elif args.source == "stack":
+            stack = run_mask_pyramid_stack(output, args.source, Path(args.prepared), args.rect, document["configurations"])
+            payload = {"command": sys.argv if argv is None else [sys.argv[0], *argv],
+                       "registration_sha256": document["_validated_registration_sha256"], "stack": stack,
+                       "budget": {"measured_seconds": time.monotonic() - started}}
+        else:
+            rows = run_mask_pyramid_configurations(Path(args.runs), output, document["configurations"], Path(args.allowances),
+                                                    "repeat" if args.repeat_only else "training")
+            payload = {"command": sys.argv if argv is None else [sys.argv[0], *argv],
+                       "registration_sha256": document["_validated_registration_sha256"], "candidate_rows": rows,
+                       "references": mask_pyramid_references(Path(args.runs)),
+                       "gff_context": mask_pyramid_gff_context(Path(args.runs), output) if not args.repeat_only else [],
+                       "budget": {"measured_seconds": time.monotonic() - started}}
+        (output / "comparison.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"candidate rows: {len(payload.get('candidate_rows', payload.get('stack', {}).get('rows', [])))}")
         return 0
     if args.command == "focus-score":
         command_started = time.monotonic()
