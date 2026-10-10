@@ -2,7 +2,7 @@
 
 //! [`ProgressMode`] and [`ProgressRenderer`]: turns a polled
 //! [`focusforge_core::job::JobProgress`] into stderr text. Mode is chosen
-//! **once**, at construction, from `--quiet` and whether stderr is a
+//! **once**, at construction, from `--no-progress` and whether stderr is a
 //! terminal; nothing downstream re-checks. `core` never prints.
 
 use std::io::{IsTerminal, Write};
@@ -29,15 +29,15 @@ pub enum ProgressMode {
     /// stderr is redirected (a file, a pipe, `/dev/null`): one
     /// `\n`-terminated line per interval, append-only, bounded.
     Plain,
-    /// `--quiet`: every method below is a no-op.
+    /// `--no-progress`: every method below is a no-op.
     Quiet,
 }
 
 impl ProgressMode {
-    /// `quiet` wins outright; otherwise [`Interactive`](Self::Interactive)
+    /// `no_progress` wins outright; otherwise [`Interactive`](Self::Interactive)
     /// when stderr is a terminal, else [`Plain`](Self::Plain).
-    pub fn choose(quiet: bool) -> Self {
-        if quiet {
+    pub fn choose(no_progress: bool) -> Self {
+        if no_progress {
             ProgressMode::Quiet
         } else if std::io::stderr().is_terminal() {
             ProgressMode::Interactive

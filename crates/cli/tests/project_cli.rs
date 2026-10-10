@@ -94,7 +94,7 @@ fn stack_args<'a>(dir: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec![
         "stack",
         dir,
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
@@ -355,7 +355,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
             input.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",

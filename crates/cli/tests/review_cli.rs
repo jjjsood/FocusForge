@@ -92,13 +92,13 @@ fn shared_laplacian_run() -> &'static SharedRun {
             mantis_512_dir().to_str().unwrap().to_string(),
             "-o".to_string(),
             out.to_str().unwrap().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
         ];
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu".to_string());
+            args.push("--cpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_cli_in(&cwd, &args);
@@ -154,7 +154,7 @@ fn dummy_stack_args<'a>(dir: &'a str, out: &'a str) -> Vec<&'a str> {
         dir,
         "-o",
         out,
-        "--algo",
+        "--algorithm",
         "dummy-stack",
         "--no-align",
         "--no-crop",
@@ -900,7 +900,7 @@ fn review_of_a_reference_run() {
             frames.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",

@@ -46,13 +46,13 @@ fn identical_raw_frames_stack_to_the_frame() {
             input.display().to_string(),
             "-o".to_string(),
             output.display().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
         ];
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu".to_string());
+            args.push("--cpu".to_string());
         }
         let stacked = run(&cwd, &args);
         assert!(
@@ -167,7 +167,7 @@ fn non_uniform_raw_group_is_refused_by_name() {
                 input.display().to_string(),
                 "-o".to_string(),
                 output.display().to_string(),
-                "--algo".to_string(),
+                "--algorithm".to_string(),
                 "dummy-stack".to_string(),
                 "--no-align".to_string(),
                 "--no-crop".to_string(),
@@ -214,7 +214,7 @@ fn forced_mixed_group_is_refused_by_name() {
             output.display().to_string(),
             "--groups".to_string(),
             groups.display().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "dummy-stack".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
@@ -258,7 +258,7 @@ fn info_and_stack_refuse_a_directory_with_only_prior_tiff_outputs() {
             input.display().to_string(),
             "-o".to_string(),
             output.display().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "dummy-stack".to_string(),
         ],
     );
@@ -290,7 +290,7 @@ fn raw_stack_resumes_and_hits_stage_cache() {
         input.display().to_string(),
         "-o".to_string(),
         resumed_out.display().to_string(),
-        "--algo".to_string(),
+        "--algorithm".to_string(),
         "laplacian".to_string(),
         "--no-align".to_string(),
         "--no-crop".to_string(),
@@ -302,7 +302,7 @@ fn raw_stack_resumes_and_hits_stage_cache() {
         "536870912".to_string(),
     ];
     if cfg!(feature = "gpu") {
-        args.push("--no-gpu".to_string());
+        args.push("--cpu".to_string());
     }
     let reference_args = {
         let mut reference = args.clone();
@@ -388,9 +388,9 @@ fn raw_stack_resumes_and_hits_stage_cache() {
             input.display().to_string(),
             "-o".to_string(),
             output.display().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
-            "--align-algo".to_string(),
+            "--align-algorithm".to_string(),
             "dummy-align".to_string(),
             "--no-crop".to_string(),
             "--tile-size".to_string(),
@@ -402,7 +402,7 @@ fn raw_stack_resumes_and_hits_stage_cache() {
             "--json".to_string(),
         ];
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu".to_string());
+            args.push("--cpu".to_string());
         }
         args
     };
@@ -470,7 +470,7 @@ fn corpus_frame_stacks_on_default_backend() {
         input.display().to_string(),
         "-o".to_string(),
         default_out.display().to_string(),
-        "--algo".to_string(),
+        "--algorithm".to_string(),
         "laplacian".to_string(),
         "--no-align".to_string(),
         "--no-crop".to_string(),
@@ -499,7 +499,7 @@ fn corpus_frame_stacks_on_default_backend() {
     let output_index = cpu_args.iter().position(|arg| arg == "-o").expect("-o");
     cpu_args[output_index + 1] = cpu_out.display().to_string();
     if cfg!(feature = "gpu") {
-        cpu_args.push("--no-gpu".to_string());
+        cpu_args.push("--cpu".to_string());
     }
     let cpu = run(&cwd, &cpu_args);
     assert!(
@@ -559,7 +559,7 @@ fn corpus_frame_stacks_on_default_backend() {
             input.display().to_string(),
             "-o".to_string(),
             cpu_out.display().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),

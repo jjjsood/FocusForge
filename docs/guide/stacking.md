@@ -6,11 +6,11 @@ algorithm. A run prepares a project for review; it does not write an image
 file. `focusforge-cli export` does that, as a separate step.
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo laplacian
+focusforge-cli stack path/to/frames/ --algorithm laplacian
 ```
 
 `path/to/frames/` is read non-recursively, or from a `frames/` subdirectory
-of it when one exists. `--algo` picks the algorithm; see
+of it when one exists. `--algorithm` picks the algorithm; see
 [`reference/cli.md`](../reference/cli.md#algorithms) for the full list and
 [`reference/cli.md`](../reference/cli.md#stack) for every flag. The project
 is written beside the frames as `<dir>/<dir-name>.ffp`, or collected into
@@ -93,8 +93,8 @@ them before fusing, on by default for every method: each frame gets one gain,
 the same on every channel, matching the reference frame's mid-tone brightness.
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo laplacian --set equalize=false
-focusforge-cli stack path/to/frames/ --algo laplacian --set equalize-max-gain=1.5
+focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize=false
+focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize-max-gain=1.5
 ```
 
 `equalize-max-gain` (1.01 to 2.0, default 1.25) bounds the gain both ways: with
@@ -112,7 +112,7 @@ naming, per pixel, which source frame contributed. Pass `--zmap` to `export`
 to write it out:
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo depth-map
+focusforge-cli stack path/to/frames/ --algorithm depth-map
 focusforge-cli export path/to/frames/frames.ffp --zmap zmap.tif
 ```
 
@@ -121,7 +121,7 @@ focusforge-cli export path/to/frames/frames.ffp --zmap zmap.tif
 The GPU-accelerated fusion path for the `laplacian` algorithm is compiled in
 by default (`cargo build --release`) — `weighted-average` and `depth-map`
 always run on the CPU. When the path is compiled in and a usable adapter is
-present, `stack` uses it automatically; there is no opt-in flag. `--no-gpu`
+present, `stack` uses it automatically; there is no opt-in flag. `--cpu`
 forces the CPU path regardless, and `cargo build --release
 --no-default-features` excludes the GPU path from the binary entirely. A
 missing or unusable adapter falls back to the CPU path on its own, printing
@@ -138,7 +138,7 @@ Every GPU kernel produces the same result as its CPU counterpart, to within
 ## Reading the result
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo laplacian --json
+focusforge-cli stack path/to/frames/ --algorithm laplacian --json
 ```
 
 `--json` reports the frames that were read, the resolved algorithm and

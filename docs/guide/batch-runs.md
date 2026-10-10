@@ -5,7 +5,7 @@ dropped into one directory, for example. `focusforge-cli stack` detects the
 split and prints it before doing anything else:
 
 ```bash
-focusforge-cli stack path/to/many-sessions/ --algo laplacian -o projects/
+focusforge-cli stack path/to/many-sessions/ --algorithm laplacian -o projects/
 ```
 
 ```
@@ -22,7 +22,7 @@ into one directory; omit it to write each project beside its own frames.
 ## Overriding the proposal
 
 ```bash
-focusforge-cli stack path/to/many-sessions/ --algo laplacian --write-groups groups.toml --dry-run
+focusforge-cli stack path/to/many-sessions/ --algorithm laplacian --write-groups groups.toml --dry-run
 ```
 
 Writes the proposal to `groups.toml` in a plain TOML format — one
@@ -39,7 +39,7 @@ Edit it — rename a group, move a frame from one group to another, drop a
 frame from every group — and feed it back with `--groups`:
 
 ```bash
-focusforge-cli stack path/to/many-sessions/ --algo laplacian --groups groups.toml -o projects/
+focusforge-cli stack path/to/many-sessions/ --algorithm laplacian --groups groups.toml -o projects/
 ```
 
 Every frame under the directory must appear in exactly one group; a listed
@@ -53,7 +53,7 @@ name or by the identity `review --json` and `--status` report — skipping
 every other group without touching its project on disk:
 
 ```bash
-focusforge-cli stack path/to/many-sessions/ --algo laplacian --set levels=6 --only session-a -o projects/
+focusforge-cli stack path/to/many-sessions/ --algorithm laplacian --set levels=6 --only session-a -o projects/
 ```
 
 This is the cheap way to retune one stack after a batch run: change a
@@ -81,13 +81,13 @@ max-iterations = 40
 
 ```bash
 focusforge-cli stack path/to/frames/ --preset macro.toml
-focusforge-cli stack path/to/frames/ --algo laplacian --write-preset macro.toml
+focusforge-cli stack path/to/frames/ --algorithm laplacian --write-preset macro.toml
 ```
 
 `--write-preset` writes the preset that reproduces the run just made — the
 resolved algorithm ids and the values actually chosen, never a value left to
 an `auto` closure. A flag on the command line always beats the file:
-`--set`/`--align-set` override the file's tables, `--algo`/`--align-algo`
+`--set`/`--align-set` override the file's tables, `--algorithm`/`--align-algorithm`
 override its keys. The `[stack]` table also carries the project settings (`align`, `auto-crop`,
 `equalize`, `equalize-max-gain`); `align = false` in a preset fuses the frames
 as read. `focusforge-cli align` reads the same file, using only
@@ -101,7 +101,7 @@ the same stack picks the cancelled run back up from where it left off,
 instead of starting over:
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo laplacian --resume
+focusforge-cli stack path/to/frames/ --algorithm laplacian --resume
 ```
 
 `--resume` matches the earlier run by a fingerprint over the stack's inputs;
@@ -121,7 +121,7 @@ A run's alignment result is kept in a stage cache under
 produced it, so a re-run that changes only a fusion parameter (`--only`
 plus `--set`) skips a costly re-solve. `--no-cache` skips the cache
 entirely for one run, reading nothing from it and leaving nothing behind;
-`focusforge-cli cache` empties it without touching any project or a
+`focusforge-cli cache clear` empties it without touching any project or a
 `--resume` run's own recoverable state.
 
 ## Reviewing the results

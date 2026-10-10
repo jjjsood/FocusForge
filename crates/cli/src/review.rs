@@ -127,7 +127,7 @@ fn scan(dir: &Path) -> Result<ScanSource, String> {
 
     Err(format!(
         "{}: no run manifest and no *.{PROJECT_EXTENSION} project found here. Run \
-         `focusforge-cli stack {} --algo <id>` first -- add `--groups`/`--write-groups` \
+         `focusforge-cli stack {} --algorithm <id>` first -- add `--groups`/`--write-groups` \
          to control how frames are grouped into stacks. `review` reports on a run's \
          results; it never groups frames itself.",
         dir.display(),

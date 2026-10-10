@@ -140,10 +140,10 @@ pub(crate) fn alignment_entries(
 /// Runs the subcommand.
 ///
 /// `algo_id: None` resolves through [`resolve_align_algo`], never a
-/// hardcoded id. `--lax` selects [`FailurePolicy::IdentityFallback`]; its
-/// absence selects [`FailurePolicy::Strict`], the default.
+/// hardcoded id. `--strict` selects [`FailurePolicy::Strict`]; its absence
+/// selects [`FailurePolicy::IdentityFallback`], the default.
 ///
-/// `quiet` suppresses the one stage line this subcommand prints.
+/// `no_progress` suppresses the one stage line this subcommand prints.
 /// `align` installs **no** SIGINT handler at all: it has no
 /// fuse-tile units, so a handler here would have nothing to act on and would
 /// only make the process look hung for up to the alignment's own wall time
@@ -158,6 +158,7 @@ pub fn run(
     write_warped: Option<&Path>,
     set: &SetArgs,
     max_host_memory: Option<u64>,
+    no_progress: bool,
     quiet: bool,
     preset_opts: &PresetOptions<'_>,
     no_gpu: bool,
@@ -167,7 +168,7 @@ pub fn run(
     // One monotonic timer shares `start` with `wall_seconds` below.
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
-    let mut renderer = ProgressRenderer::new(ProgressMode::choose(quiet));
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(no_progress));
     let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
     // One preset file serves both subcommands: `align` reads `align-algo`
@@ -251,7 +252,7 @@ pub fn run(
     } else {
         FailurePolicy::Strict
     };
-    let align_choice = crate::resolve_align_backend(algo.id(), no_gpu, max_vram);
+    let align_choice = crate::resolve_align_backend(algo.id(), no_gpu, max_vram, quiet);
     timer.mark(Stage::Setup);
     timer.enter(Stage::Align);
     renderer.stage(&format!("align {} frames", frame_reader.len()));
@@ -288,6 +289,7 @@ pub fn run(
             focusforge_core::fuse::laplacian::Laplacian.id(),
             no_gpu,
             max_vram,
+            quiet,
         )
         .backend;
         if let Err(msg) = write_warped_frames(

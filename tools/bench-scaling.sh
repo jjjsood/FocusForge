@@ -3,8 +3,8 @@
 #
 # Fast-ish demonstration that the adaptive CPU/GPU budgets scale -- a
 # sanity check, not a rigorous benchmark; re-run it to see the same shape
-# of numbers. Sweeps `focusforge-cli stack --align-algo pyramidal-ecc
-# --lax` across a full grid: 6 budget points x 3 frame counts x {CPU, GPU}
+# of numbers. Sweeps `focusforge-cli stack --align-algorithm pyramidal-ecc
+#` across a full grid: 6 budget points x 3 frame counts x {CPU, GPU}
 # = 36 runs, real alignment. pyramidal-ecc's solve dominates wall time
 # (~20-30s at 8 frames), so the concurrency signal is a delta on that floor.
 #
@@ -60,7 +60,7 @@ run() {
   local name="$1" dir="$2"
   shift 2
   mkdir -p "$OUT/$name"
-  "$CLI" stack "$dir" --algo laplacian --align-algo pyramidal-ecc --lax --json \
+  "$CLI" stack "$dir" --algorithm laplacian --align-algorithm pyramidal-ecc --json \
     -o "$OUT/$name" "$@" >"$OUT/$name.json"
 }
 
@@ -87,7 +87,7 @@ dir_for() {
 }
 
 echo "Probing one tile's accounted host bytes ..." >&2
-run cpu-probe "$FIXTURE" --no-gpu
+run cpu-probe "$FIXTURE" --cpu
 cpu_unit=$(python3 - "$OUT/cpu-probe.json" <<'PY'
 import json
 import sys
@@ -102,7 +102,7 @@ for target in 1 2 4 8 16 32; do
   bytes=$((cpu_unit * target))
   for frames in 8 16 32; do
     dir="$(dir_for "$frames")"
-    run "cpu-${target}-f${frames}" "$dir" --no-gpu --max-host-memory "${bytes}"
+    run "cpu-${target}-f${frames}" "$dir" --cpu --max-host-memory "${bytes}"
   done
 done
 
@@ -134,7 +134,7 @@ def print_cpu_grid():
     # HOST tile scheduler's own high-water mark -- exactly what
     # --max-host-memory governs, so this grid's peak_in_flight column is a
     # direct, correct read of the swept budget's effect.
-    title = "CPU grid (--max-host-memory x frame count, --no-gpu)"
+    title = "CPU grid (--max-host-memory x frame count, --cpu)"
     print(f"\n{title}")
     header = f"{'target':>8}"
     for f in frame_counts:

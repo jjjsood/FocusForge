@@ -114,7 +114,7 @@ fn shared_laplacian_run() -> &'static SharedRun {
             mantis_512_dir().to_str().unwrap().to_string(),
             "-o".to_string(),
             out_dir.to_str().unwrap().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
             "--json".to_string(),
             "--no-align".to_string(),
@@ -124,12 +124,12 @@ fn shared_laplacian_run() -> &'static SharedRun {
         ];
         // Verifies CLI plumbing reproduces `library_oracle`'s in-process,
         // CPU-only call exactly, not GPU-vs-CPU numerics (that's the
-        // whole-pipeline `parity_pipeline::*`'s job). Without `--no-gpu`,
-        // `stack --algo laplacian` takes the GPU path on any adapter-equipped
+        // whole-pipeline `parity_pipeline::*`'s job). Without `--cpu`,
+        // `stack --algorithm laplacian` takes the GPU path on any adapter-equipped
         // machine, breaking this test's exact-byte equality via the ±1 LSB
         // GPU/CPU budget; the flag only exists when `gpu` is compiled in.
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu".to_string());
+            args.push("--cpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_cli_in(&cwd, &args);
@@ -284,7 +284,7 @@ fn unknown_algorithm_is_rejected_early() {
             missing_dir,
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "no-such-algorithm",
         ],
     );
@@ -324,7 +324,7 @@ fn unknown_parameter_key_is_rejected() {
             missing_dir,
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--set",
             "bogus=1",
@@ -350,20 +350,17 @@ fn out_of_range_parameter_is_rejected() {
     let cwd = tmp_dir("out_of_range_parameter_is_rejected");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let out = run_cli_in(
-        &cwd,
-        &[
-            "stack",
-            missing_dir,
-            "-o",
-            out_dir.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--set",
-            "levels=999",
-            "--no-gpu",
-        ],
-    );
+    let args = common::push_no_gpu(vec![
+        "stack",
+        missing_dir,
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--set",
+        "levels=999",
+    ]);
+    let out = run_cli_in(&cwd, &args);
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -385,26 +382,24 @@ fn refuses_levels_the_tile_geometry_cannot_plan() {
     let cwd = tmp_dir("refuses_levels_the_tile_geometry_cannot_plan");
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
+    let input = mantis_512_dir();
     let output = out_dir.join("refuses_levels_the_tile_geometry_cannot_plan.tif");
     let zmap = out_dir.join("refuses_levels_the_tile_geometry_cannot_plan-zmap.tif");
-    let out = run_cli_in(
-        &cwd,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            out_dir.to_str().unwrap(),
-            "--algo",
-            "laplacian",
-            "--set",
-            "levels=7",
-            "--tile-size",
-            "512",
-            "--no-align",
-            "--no-crop",
-            "--no-gpu",
-        ],
-    );
+    let args = common::push_no_gpu(vec![
+        "stack",
+        input.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--set",
+        "levels=7",
+        "--tile-size",
+        "512",
+        "--no-align",
+        "--no-crop",
+    ]);
+    let out = run_cli_in(&cwd, &args);
     assert!(
         !out.success,
         "stdout: {} stderr: {}",
@@ -455,7 +450,7 @@ fn every_run_carries_a_zmap_and_writes_no_image() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -496,7 +491,7 @@ fn refuses_empty_dir_and_unwritable_output() {
             empty_dir.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
         ],
     );
@@ -512,7 +507,7 @@ fn refuses_empty_dir_and_unwritable_output() {
             missing_dir,
             "-o",
             bad_output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
         ],
     );
@@ -540,7 +535,7 @@ fn report_contains_every_field() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -595,7 +590,7 @@ fn algo_is_required() {
         out.stderr
     );
     assert!(
-        out.stderr.contains("--algo is required"),
+        out.stderr.contains("--algorithm is required"),
         "stderr: {}",
         out.stderr
     );
@@ -616,7 +611,7 @@ fn working_space_names_the_encoding_of_a_tiff_stack() {
             mantis_64.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--json",
             "--no-align",
@@ -640,7 +635,7 @@ fn report_json_has_every_field() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--json",
             "--no-align",
@@ -713,9 +708,9 @@ fn stage_timings_are_reported_for_every_entered_stage() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--no-crop",
             "--no-cache",
@@ -750,9 +745,9 @@ fn stage_timings_are_reported_for_every_entered_stage() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             human_out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--no-crop",
             "--no-cache",
@@ -790,7 +785,7 @@ fn max_host_memory_lowers_never_raises_and_does_not_move_pixels() {
             mantis_512_dir().to_str().unwrap().to_string(),
             "-o".to_string(),
             output_dir.to_str().unwrap().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "dummy-stack".to_string(),
             "--json".to_string(),
             "--no-align".to_string(),
@@ -874,9 +869,9 @@ fn stage_timings_account_for_the_wall_clock() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--no-crop",
             "--json",
@@ -910,7 +905,7 @@ fn stage_timings_mark_a_skipped_align_as_not_entered() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -943,7 +938,7 @@ fn set_align_false_skips_the_align_stage() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--set",
             "align=false",
@@ -971,9 +966,9 @@ fn align_worker_fields_follow_align_source() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--no-crop",
             "--no-cache",
@@ -999,7 +994,7 @@ fn align_worker_fields_follow_align_source() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             skipped_out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -1034,7 +1029,7 @@ fn stage_timings_do_not_change_the_output() {
             mantis_512_dir().to_str().unwrap().to_string(),
             "-o".to_string(),
             out.to_str().unwrap().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "dummy-stack".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
@@ -1079,7 +1074,7 @@ fn failed_seal_leaves_no_output() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -1152,7 +1147,7 @@ fn refuses_a_non_uniform_frame_set() {
             frames.to_str().unwrap(),
             "-o",
             frames.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
         ],
     );
@@ -1220,7 +1215,7 @@ fn mixed_byte_order_and_rows_per_strip() {
             mixed_dir.to_str().unwrap(),
             "-o",
             mixed_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -1239,7 +1234,7 @@ fn mixed_byte_order_and_rows_per_strip() {
             baseline_dir.to_str().unwrap(),
             "-o",
             baseline_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -1267,10 +1262,10 @@ fn mixed_byte_order_and_rows_per_strip() {
 
 /// `stack` computes transforms and warps frame tiles through them before
 /// fusing: an aligned run must produce a different composite than the
-/// unaligned one. `--align-algo pyramidal-ecc --lax` is explicit because
+/// unaligned one. `--align-algorithm pyramidal-ecc` is explicit because
 /// this test binary also registers `dummy-align` (`test-algorithms`
 /// feature), so a bare default would hit the "more than one alignment
-/// algorithm" refusal -- `--lax` because frame 0 of this fixture diverges
+/// algorithm" refusal -- default fallback because frame 0 of this fixture diverges
 /// against the default middle anchor.
 #[test]
 fn stack_aligns_before_fusing() {
@@ -1289,7 +1284,7 @@ fn stack_aligns_before_fusing() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             unaligned_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",
@@ -1304,11 +1299,10 @@ fn stack_aligns_before_fusing() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             aligned_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--no-crop",
         ],
     );
@@ -1322,6 +1316,123 @@ fn stack_aligns_before_fusing() {
         unaligned_samples, aligned_samples,
         "an aligned run must differ from the unaligned one"
     );
+}
+
+#[test]
+fn registration_default_writes_a_project_and_strict_does_not() {
+    let cwd = tmp_dir("registration_default_writes_a_project");
+    let tolerant_dir = cwd.join("tolerant");
+    let strict_dir = cwd.join("strict");
+    let frames = mantis_512_dir();
+    std::fs::create_dir_all(&tolerant_dir).unwrap();
+    std::fs::create_dir_all(&strict_dir).unwrap();
+    let common = [
+        "stack",
+        frames.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--align-algorithm",
+        "pyramidal-ecc",
+        "--json",
+    ];
+
+    let mut tolerant = common.to_vec();
+    tolerant.extend(["-o", tolerant_dir.to_str().unwrap()]);
+    let out = run_cli_in(&cwd, &tolerant);
+    assert!(out.success, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("failed to register and fell back to identity")
+    );
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    assert_eq!(report["align"]["failure_policy"], "lax");
+    assert!(report["align"]["failure_count"].as_u64().unwrap() > 0);
+    assert!(
+        report["align"]["alignments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["fallback"] == true)
+    );
+    assert!(tolerant_dir.join("mantis-512.ffp").exists());
+
+    let mut strict = common.to_vec();
+    strict.extend(["-o", strict_dir.to_str().unwrap(), "--strict"]);
+    let out = run_cli_in(&cwd, &strict);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("00.tif"), "stderr: {}", out.stderr);
+    assert!(!strict_dir.join("mantis-512.ffp").exists());
+}
+
+#[test]
+fn registration_cache_keeps_fallback_facts_and_warns_once_per_run() {
+    let cwd = tmp_dir("registration_cache_keeps_fallback_facts");
+    let frames = mantis_512_dir();
+    let first_dir = cwd.join("first");
+    let cached_dir = cwd.join("cached");
+    let text_dir = cwd.join("text");
+    for dir in [&first_dir, &cached_dir, &text_dir] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let base = [
+        "stack",
+        frames.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--align-algorithm",
+        "pyramidal-ecc",
+    ];
+
+    let mut first = base.to_vec();
+    first.extend(["-o", first_dir.to_str().unwrap(), "--json"]);
+    let first = run_cli_in(&cwd, &first);
+    assert!(first.success, "stderr: {}", first.stderr);
+    let first_report: serde_json::Value = serde_json::from_str(&first.stdout).unwrap();
+    assert_eq!(first_report["align_source"], "computed", "{first_report}");
+
+    let mut cached = base.to_vec();
+    cached.extend(["-o", cached_dir.to_str().unwrap(), "--json"]);
+    let cached = run_cli_in(&cwd, &cached);
+    assert!(cached.success, "stderr: {}", cached.stderr);
+    let cached_report: serde_json::Value = serde_json::from_str(&cached.stdout).unwrap();
+    assert_eq!(cached_report["align_source"], "cached", "{cached_report}");
+    assert_eq!(
+        cached_report["align"]["failure_count"],
+        first_report["align"]["failure_count"]
+    );
+    assert_eq!(
+        cached_report["align"]["alignments"],
+        first_report["align"]["alignments"]
+    );
+    assert_eq!(
+        cached
+            .stderr
+            .matches("failed to register and fell back to identity")
+            .count(),
+        1,
+        "stderr: {}",
+        cached.stderr
+    );
+    assert!(cached_dir.join("mantis-512.ffp").exists());
+
+    let mut text = base.to_vec();
+    text.extend(["-o", text_dir.to_str().unwrap()]);
+    let text = run_cli_in(&cwd, &text);
+    assert!(text.success, "stderr: {}", text.stderr);
+    assert_eq!(
+        text.stderr
+            .matches("failed to register and fell back to identity")
+            .count(),
+        1,
+        "stderr: {}",
+        text.stderr
+    );
+    assert!(
+        text.stdout.contains("dummy-stack"),
+        "stdout: {}",
+        text.stdout
+    );
+    assert!(text_dir.join("mantis-512.ffp").exists());
 }
 
 /// The auto-crop is applied to `stack`'s output by default: composite and
@@ -1340,11 +1451,10 @@ fn stack_output_carries_the_auto_crop() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
         ],
     );
@@ -1371,9 +1481,8 @@ fn stack_output_carries_the_auto_crop() {
         &[
             "align",
             mantis_512_dir().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
         ],
     );
@@ -1400,7 +1509,7 @@ fn refuses_an_output_path_that_is_an_existing_file() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             frame.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
         ],
     );
@@ -1442,7 +1551,7 @@ fn equalization_run(label: &str, algo: &str, extra: &[&str]) -> serde_json::Valu
         input.to_str().unwrap(),
         "-o",
         out_dir.to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         algo,
         "--json",
         "--no-align",
@@ -1505,7 +1614,7 @@ fn equalize_preset_key_enables_it_and_write_preset_writes_it_back() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "weighted-average",
             "--dry-run",
             "--set",
@@ -1567,7 +1676,7 @@ fn a_written_preset_reproduces_the_focus_map_equalization_choice() {
             input.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "depth-map",
             "--dry-run",
             "--write-preset",
@@ -1613,7 +1722,7 @@ fn equalize_settings_out_of_range_or_of_the_wrong_kind_are_refused_before_any_fr
                 missing_dir,
                 "-o",
                 out_dir.to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "weighted-average",
                 "--set",
                 setting,

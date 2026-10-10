@@ -13,7 +13,7 @@ focusforge-cli align path/to/frames/
 
 ```
 path/to/frames (8 frames)
-pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=strict failures=0)
+pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=lax failures=0)
 rho = ECC correlation in [-1, 1], not a pixel distance
 00.tif    tx=+12.41 ty=-3.07 scale=1.000842 rot=+0.0131deg  converged iters=12 rho=0.9814
 ...
@@ -87,12 +87,12 @@ across at least 6 cells of a 4x4 grid, or, when clustered in as few as 2
 cells, when at least 75% of the matches support it. Otherwise the solve starts
 from the identity.
 
-## Failure is strict by default
+## Registration failures use identity fallback
 
-A frame that ends `diverged` fails the whole run: `stack` and `align` both
-exit 1 and name every frame that failed, rather than silently falling back to
-an unregistered frame. `--no-align` skips the stage when the frames are
-already registered.
+A frame that ends `diverged` keeps an identity transform and the run continues,
+with the frame marked as a fallback in the report. Pass `--strict` to make
+`stack` or `align` exit 1 and name every failed frame. `--no-align` skips the
+stage when the frames are already registered.
 
 If the aligned frames share no usable overlap, `stack` stops with an error
 that says so; `--no-crop` keeps the full frame extent instead.
@@ -110,10 +110,10 @@ Some inputs still defeat the solver:
 - Strongly periodic scenes (repeating patterns) can fail to align. Such
   frames normally end `diverged` rather than as a converged wrong fit.
 
-Only `diverged` is a failure: `stalled`, `hit-cap` and `converged` frames
-never fail a strict run. For a stack with `diverged` frames, use `--no-align`
-when the frames are already registered, or inspect the result with
-`--write-warped`.
+Only `diverged` is a registration failure: `stalled`, `hit-cap` and
+`converged` frames never fail a strict run. Use `--strict` when an
+unregistered frame must stop the run; use `--no-align` when the frames are
+already registered, or inspect the result with `--write-warped`.
 
 ## Reuse and hardware
 
@@ -123,7 +123,7 @@ so a repeated run, or a re-fuse in the window with only fusion settings
 changed, skips the solve. `--no-cache` forces a recompute.
 
 Large pyramid levels run on the GPU when a usable adapter is present; the
-rest of the solve is on the CPU. `--no-gpu` keeps everything on the CPU and
+rest of the solve is on the CPU. `--cpu` keeps everything on the CPU and
 `--max-vram <SIZE>` lowers the device memory budget. If the device is lost
 mid-run, the whole alignment is redone on the CPU, so every frame comes from
 one backend. Both JSON reports name the backend in `align_backend`.
@@ -141,7 +141,7 @@ would cut is still visible for inspection.
 ## Skipping it
 
 ```bash
-focusforge-cli stack path/to/frames/ --algo laplacian --no-align
+focusforge-cli stack path/to/frames/ --algorithm laplacian --no-align
 ```
 
 `--no-align` fuses the raw frames unwarped; `--no-crop` keeps alignment on

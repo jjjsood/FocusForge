@@ -97,7 +97,7 @@ fn grouping_is_printed_before_work_starts() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -127,10 +127,9 @@ fn grouping_is_printed_before_work_starts() {
     );
 }
 
-/// `--quiet` governs progress, not the group proposal itself: no flag
-/// suppresses it.
+/// `--quiet` suppresses the group proposal; `--no-progress` is separate.
 #[test]
-fn grouping_is_printed_under_quiet() {
+fn grouping_is_suppressed_under_quiet() {
     let dump = card_dump("groups_cli_quiet");
     let out_dir = common::tmp_dir("groups_cli_quiet_out");
     let cwd = common::tmp_dir("groups_cli_quiet_cwd");
@@ -141,7 +140,7 @@ fn grouping_is_printed_under_quiet() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -150,15 +149,50 @@ fn grouping_is_printed_under_quiet() {
     );
     assert!(result.success, "stderr: {}", result.stderr);
     assert!(
-        result.stderr.contains("grouping ") && result.stderr.contains("2 groups"),
-        "--quiet must not remove the proposal: {:?}",
+        !result.stderr.contains("grouping "),
+        "--quiet must remove the proposal: {:?}",
         result.stderr
     );
     assert!(
-        !result.stderr.contains("fuse "),
-        "--quiet must still remove progress: {:?}",
+        result.stderr.contains("fuse "),
+        "--quiet must not remove progress: {:?}",
         result.stderr
     );
+}
+
+#[test]
+fn only_skips_are_suppressed_under_quiet() {
+    let dump = card_dump("groups_cli_only_quiet");
+    let cwd = common::tmp_dir("groups_cli_only_quiet_cwd");
+    for (quiet, name) in [(false, "normal"), (true, "quiet")] {
+        let out = cwd.join(name);
+        std::fs::create_dir(&out).unwrap();
+        let mut args = vec![
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--only",
+            "IMG_9801-9802",
+        ];
+        if quiet {
+            args.push("--quiet");
+        }
+        let result = run_cli_in(&cwd, &args);
+        assert!(result.success, "stderr: {}", result.stderr);
+        assert_eq!(
+            result
+                .stderr
+                .contains("skipped (not named by --only): IMG_9910-9911"),
+            !quiet,
+            "stderr: {}",
+            result.stderr
+        );
+    }
 }
 
 // --- the superset property -------------------------------------------------
@@ -192,7 +226,7 @@ fn single_stack_directory_matches_the_plain_invocation() {
             dir.to_str().unwrap(),
             "-o",
             dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--json",
             "--no-align",
@@ -296,7 +330,7 @@ fn write_groups_then_groups_round_trips() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -319,7 +353,7 @@ fn write_groups_then_groups_round_trips() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -363,7 +397,7 @@ fn mixed_raw_tiff_groups_round_trip_with_names_order_and_count() {
             input.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -390,7 +424,7 @@ fn mixed_raw_tiff_groups_round_trip_with_names_order_and_count() {
             input.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -438,7 +472,7 @@ fn groups_file_with_a_format_key_is_refused() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -479,7 +513,7 @@ fn groups_file_overrides_the_proposal() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -519,7 +553,7 @@ fn groups_file_with_a_missing_frame_is_refused() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--groups",
@@ -556,7 +590,7 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--groups",
@@ -584,7 +618,7 @@ fn groups_file_duplicate_or_orphan_frame_is_refused() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--groups",
@@ -613,7 +647,7 @@ fn empty_directory_fails_clearly() {
             dir.to_str().unwrap(),
             "-o",
             dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
         ],
@@ -643,7 +677,7 @@ fn status_and_manifest_have_one_entry_per_group() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -706,7 +740,7 @@ fn a_failing_group_does_not_abort_the_run() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -754,7 +788,7 @@ fn a_bad_set_refuses_before_any_group_runs() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--set",
             "no-such-parameter=1",
@@ -795,7 +829,7 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -826,7 +860,7 @@ fn json_shape_is_unchanged_for_one_group_and_wrapped_for_many() {
             single.to_str().unwrap(),
             "-o",
             single.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -857,7 +891,7 @@ fn an_output_file_is_refused_by_name() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.join("out.tif").to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
         ],
@@ -895,7 +929,7 @@ fn a_one_group_run_writes_a_manifest_too() {
             common::fixtures_dir().join("mantis-512").to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
