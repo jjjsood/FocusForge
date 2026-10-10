@@ -5,12 +5,12 @@ and every batch-run control (grouping, presets, resume, review, the stage
 cache), is reachable here.
 
 ```
-focusforge-cli <COMMAND>
+focusforge-cli [OPTIONS] <COMMAND>
 ```
 
 | command | does |
 |---|---|
-| [`info`](#info) | prints TIFF or RAW metadata for a file or a directory of frames |
+| [`info`](#info) | prints project, TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
 | [`export`](#export) | renders a checkpoint to a TIFF, PNG or JPEG image, and/or writes its Z-Map or one source frame |
@@ -21,6 +21,10 @@ focusforge-cli <COMMAND>
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
 | [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
 
+Root help groups `stack`, `align`, `retouch` and `export` under Processing;
+`info`, `review` and `algorithms` under Inspection; and `history`, `cache`
+and `diagnostics` under Maintenance.
+
 ## Global options
 
 `-v` and `-q` apply to every command and control how much a run says on
@@ -29,6 +33,11 @@ stderr:
 ```
 focusforge-cli [-v]... [-q] <COMMAND>
 ```
+
+| flag | meaning |
+|---|---|
+| `-v` | increase log detail; repeat it for more detail |
+| `-q, --quiet` | log errors only |
 
 - Repeat `-v` for more detail: once for informational messages, twice for
   debug detail. Omit it for warnings and errors only.
@@ -52,8 +61,12 @@ next run prints a one-line notice before doing anything else — see
 ## `info`
 
 ```
-focusforge-cli info [--json] <PATH>
+focusforge-cli info [OPTIONS] <PATH>
 ```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
 
 Prints saved-project facts, TIFF metadata or RAW metadata for a single file, or for every matching file directly inside a
 directory (or inside a `frames/` subdirectory of it, when that exists).
@@ -243,7 +256,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | flag | meaning |
 |---|---|
 | `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
-| `--algorithm <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
+| `--algorithm <ALGO>` | registered stacking algorithm id; required unless a `--preset` supplies `algo` (see `algorithms` below for the list) |
 | `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`align`, `auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
 | `--json` | emit a JSON report instead of human-readable text |
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
@@ -641,8 +654,13 @@ inspect an alignment result visually before running `stack`.
 ## `algorithms`
 
 ```
-focusforge-cli algorithms [--json] [--set KEY=VALUE]... [ID]
+focusforge-cli algorithms [OPTIONS] [ID]
 ```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
+| `--set <KEY=VALUE>` | set a parameter; repeat it to replace a prior value for the same key |
 
 Lists every algorithm registered with `focusforge-core`, or — given `ID` —
 prints that one algorithm's full parameter schema. Every algorithm, stacking
@@ -780,7 +798,7 @@ for the `-o` image: `exif`, `icc`, `xmp`, `iptc` each a status string, plus
 ## `history`
 
 ```
-focusforge-cli history <COMMAND>
+focusforge-cli history [OPTIONS] <COMMAND>
 ```
 
 Reads and changes a project's checkpoint tree without a window. Every
@@ -802,6 +820,42 @@ cannot be found only produce a warning: the history is intact.
 | `list <PROJECT> [--json] [--accept-changed-sources]` | prints every visible checkpoint, newest first: id, parent, algorithm and creation time. `--json` emits `{"checkpoints": [{"id", "parent", "algorithm", "created_at"}]}`, `created_at` in Unix seconds |
 | `delete <PROJECT> --checkpoint <ID> [--json] [--accept-changed-sources]` | hides a checkpoint and removes it from the file once no visible checkpoint is built on it. Refuses the last visible checkpoint |
 | `compact <PROJECT> [--json]` | rewrites the project to its live checkpoints only and reports the bytes reclaimed |
+
+| flag | meaning |
+|---|---|
+
+### `history list`
+
+```
+focusforge-cli history list [OPTIONS] <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
+| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |
+
+### `history delete`
+
+```
+focusforge-cli history delete [OPTIONS] --checkpoint <CHECKPOINT> <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--checkpoint <CHECKPOINT>` | checkpoint id or unique id prefix to delete |
+| `--json` | emit the JSON document instead of human-readable text |
+| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |
+
+### `history compact`
+
+```
+focusforge-cli history compact [OPTIONS] <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
 
 ```
 focusforge-cli history list mantis-64.ffp
@@ -854,8 +908,12 @@ the op's 0-based position in the list.
 ## `review`
 
 ```
-focusforge-cli review [--json] <DIR>
+focusforge-cli review [OPTIONS] <DIR>
 ```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit one wrapped JSON document instead of a human-readable table |
 
 Reports one record per stack found under `<DIR>` — a `stack` run's `-o`
 output directory, or a plain directory of `.ffp` files — without
@@ -890,8 +948,26 @@ resolved).
 ## `cache`
 
 ```
-focusforge-cli cache clear [--json]
+focusforge-cli cache [OPTIONS] <COMMAND>
 ```
+
+| subcommand | does |
+|---|---|
+| `clear` | removes every entry from the stage cache |
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
+
+### `cache clear`
+
+```
+focusforge-cli cache clear [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
 
 Removes every entry from the stage cache under `.scratch/stage-cache/`, the
 store `stack` reads and writes to skip a repeated alignment solve — see
@@ -909,8 +985,14 @@ removed 1 stage cache entry
 ## `diagnostics`
 
 ```
-focusforge-cli diagnostics [-o FILE] [--include-minidumps] [--force]
+focusforge-cli diagnostics [OPTIONS]
 ```
+
+| flag | meaning |
+|---|---|
+| `-o, --output <FILE>` | where to write the ZIP; omit it for a dated name in the current directory |
+| `--include-minidumps` | include the minidump binaries alongside their JSON metadata |
+| `--force` | overwrite an existing output path |
 
 Packages this installation's log files, any crash reports, a system
 summary, the graphics adapter record, the configuration a new run would
