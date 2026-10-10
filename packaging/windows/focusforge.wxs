@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="FocusForge" Manufacturer="FocusForge" Version="$(var.Version)" UpgradeCode="E0A1B063-1D44-4A53-8F91-32D4293A1659" Language="1033">
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles6432Folder"><Directory Id="INSTALLFOLDER" Name="FocusForge" /></StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder"><Directory Id="FocusForgeMenu" Name="FocusForge" /></StandardDirectory>
+    <Feature Id="ProductFeature" Title="FocusForge" Level="1">
+      <Component Id="CliComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="CliFile" Source="$(var.Cli)" Name="focusforge-cli.exe" KeyPath="yes" /></Component>
+      <Component Id="GuiComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="GuiFile" Source="$(var.Gui)" Name="focusforge-gui.exe" KeyPath="yes" /></Component>
+      <Component Id="LicenseComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="LicenseFile" Source="$(var.License)" Name="LICENSE" KeyPath="yes" /></Component>
+      <Component Id="NoticeComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="NoticeFile" Source="$(var.Notice)" Name="NOTICE" KeyPath="yes" /></Component>
+      <Component Id="IconComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="IconFile" Source="$(var.Icon)" Name="focusforge.ico" KeyPath="yes" /></Component>
+      <Component Directory="FocusForgeMenu" Bitness="always64"><Shortcut Id="FocusForgeShortcut" Name="FocusForge" Target="[INSTALLFOLDER]focusforge-gui.exe" Icon="FocusForgeIcon" /><RemoveFolder Id="RemoveFocusForgeMenu" On="uninstall" /><RegistryValue Root="HKCU" Key="Software\\FocusForge" Name="installed" Type="integer" Value="1" KeyPath="yes" /></Component>
+    </Feature>
+    <Icon Id="FocusForgeIcon" SourceFile="$(var.Icon)" />
+  </Package>
+</Wix>

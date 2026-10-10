@@ -8,21 +8,30 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 import tomllib
 import urllib.error
+import xml.etree.ElementTree as ET
+import plistlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "tools/package-linux.sh"
 CHECKER = ROOT / "tools/check-package-linux.sh"
+NATIVE_COLLECTOR = ROOT / "tools/collect-native-artifacts.py"
+NATIVE_WORKFLOW = ROOT / ".github/workflows/package-native.yml"
 spec = importlib.util.spec_from_file_location("release_gate", ROOT / "tools/check-release-gate.py")
 gate = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
 spec.loader.exec_module(gate)
+collector_spec = importlib.util.spec_from_file_location("native_collector", NATIVE_COLLECTOR)
+collector = importlib.util.module_from_spec(collector_spec)
+assert collector_spec and collector_spec.loader
+collector_spec.loader.exec_module(collector)
 
 
 def call(args: list[str], success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -207,7 +216,7 @@ def gate_checks() -> None:
         gate.remote = original_remote
 
 
-def valid_graph(config: str, setup: str, release: str) -> bool:
+def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
     try:
         dist = tomllib.loads(config)
         targets = dist["dist"]["targets"]
@@ -217,47 +226,83 @@ def valid_graph(config: str, setup: str, release: str) -> bool:
         return False
     if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
         return False
-    if not extras or any(item.get("build") != ["tools/package-linux.sh"] or not item.get("artifacts") for item in extras): return False
+    if dist["dist"].get("local-artifacts-jobs") != ["./package-native"] or dist["dist"].get("pr-run-mode") != "upload": return False
+    linux = next((item for item in extras if item.get("build") == ["tools/package-linux.sh"]), None)
+    native_extra = next((item for item in extras if item.get("build") == ["python3", "tools/collect-native-artifacts.py"]), None)
+    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 4: return False
     checker = "python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
     step = setup[setup.find("- name: Require exact check run"):setup.find("- name: Require locked release Cargo profile")]
-    if checker not in step or "if:" in step or "continue-on-error" in step or "|| true" in step: return False
+    if checker not in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
     if "plan-gate" in release: return False
     local, global_build, host = release.find("build-local-artifacts:"), release.find("build-global-artifacts:"), release.find("\n  host:")
-    local_part = release[local:global_build]; host_part = release[host:release.find("\n  announce:", host)]
+    local_part = release[local:global_build]; global_part = release[global_build:host]; host_part = release[host:release.find("\n  announce:", host)]
     matrix = "matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}"
-    pinned_actions = re.findall(r"uses:\s*['\"]?([^\s'\"]+)", release)
+    pinned_actions = [action for action in re.findall(r"uses:\s*['\"]?([^\s'\"]+)", release) if "@" in action]
     condition = "if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null &&"
     generated_step = local_part[local_part.find("Require exact check run"):local_part.find("Require locked release Cargo profile")]
     run_line = next((line.strip().split(": ", 1)[1] for line in generated_step.splitlines() if line.strip().startswith("run: ")), "")
     try: generated_command = json.loads(run_line)
     except json.JSONDecodeError: return False
-    return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == "GH_TOKEN= GITHUB_TOKEN= " + checker and "if:" not in generated_step and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- build-local-artifacts" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions)
+    native_actions = re.findall(r"uses:\s*['\"]?([^\s'\"]+)", native)
+    def native_job(name: str) -> str | None:
+        match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", native, re.MULTILINE | re.DOTALL)
+        return match.group(1) if match else None
+    native_jobs = {name: native_job(name) for name in ("macos", "windows")}
+    producer = {"macos": r"tools/package-macos\.sh(?:\s+--output\s+target/distrib/native/macos)?", "windows": r"tools/package-windows\.ps1(?:\s+-OutputDirectory\s+target/distrib/native/windows)?"}
+    def guarded_job(job: str, command: str) -> bool:
+        guard = re.search(r"- name: Require exact check run\n\s+if: github\.event_name != 'pull_request'\n\s+shell: \w+\n\s+run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate\.py --anonymous --sha \"\$GITHUB_SHA\" --repository \"\$GITHUB_REPOSITORY\"", job)
+        header = job[:job.find("    steps:")]
+        runs = list(re.finditer(rf"^\s+run:\s*{command}\s*$", job, re.MULTILINE))
+        if "if:" in header or "needs:" in header or guard is None or len(runs) != 1 or guard.start() > runs[0].start(): return False
+        step_start = job.rfind("      - name:", 0, runs[0].start())
+        next_step = job.find("      - name:", runs[0].end())
+        producer_step = job[step_start:None if next_step < 0 else next_step]
+        return "if:" not in producer_step and "continue-on-error" not in producer_step and "|| true" not in producer_step
+    guarded = all(native_jobs[name] is not None and guarded_job(native_jobs[name] or "", producer[name]) for name in producer)
+    return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == "GH_TOKEN= GITHUB_TOKEN= " + checker and re.search(r"if: ['\"]github\.event_name != 'pull_request'['\"]", generated_step) is not None and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- custom-package-native" in global_part and "- build-local-artifacts" in host_part and "- custom-package-native" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and "needs.custom-package-native.result == 'success'" in host_part and "needs.custom-package-native.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and "uses: ./.github/workflows/package-native.yml" in release and len(native_jobs) == 2 and guarded and native.count("if: github.event_name != 'pull_request'") == 2 and native.count("GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\"") == 2 and "continue-on-error" not in native and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions + native_actions)
 
 
 def graph() -> None:
     config = (ROOT / "dist-workspace.toml").read_text(); setup = (ROOT / ".github/build-setup.yml").read_text()
-    release = (ROOT / ".github/workflows/release.yml").read_text(); assert valid_graph(config, setup, release)
-    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]', "targets = []"), setup, release)
-    assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release)
-    assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  if: false'), release)
-    assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release)
-    assert not valid_graph(config, setup.replace(checker := 'python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"', checker + ' || true'), release)
-    assert not valid_graph(config, setup, release.replace('Require exact check run', 'masked check run', 1))
-    assert not valid_graph(config, setup, release.replace('- name: "Require exact check run"', '- name: "Require exact check run"\n        if: false', 1))
-    assert not valid_graph(config, setup, release.replace('- name: "Require exact check run"', '- name: "Require exact check run"\n        continue-on-error: true', 1))
+    release = (ROOT / ".github/workflows/release.yml").read_text(); native = NATIVE_WORKFLOW.read_text(); assert valid_graph(config, setup, release, native)
+    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
+    assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release, native)
+    assert not valid_graph(config, setup.replace("if: github.event_name != 'pull_request'", "if: false", 1), release, native)
+    assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release, native)
+    assert not valid_graph(config, setup.replace(checker := 'python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"', checker + ' || true'), release, native)
+    assert not valid_graph(config, setup, release.replace('Require exact check run', 'masked check run', 1), native)
+    assert not valid_graph(config, setup, release.replace('- name: "Require exact check run"', '- name: "Require exact check run"\n        continue-on-error: true', 1), native)
     generated_run = next(line for line in release.splitlines() if 'tools/check-release-gate.py' in line)
-    assert not valid_graph(config, setup, release.replace(generated_run, generated_run[:-1] + ' || true"', 1))
-    assert not valid_graph(config, setup, release.replace("needs.build-local-artifacts.result == 'success'", "needs.build-local-artifacts.result == 'failure'", 1))
-    assert not valid_graph(config, setup, release.replace("needs.build-local-artifacts.result == 'success'", "needs.build-local-artifacts.result == 'skipped'", 1))
-    assert not valid_graph(config, setup, release.replace("build-local-artifacts:", "plan-gate:\n  build-local-artifacts:", 1))
-    assert not valid_graph(config, setup, release.replace("if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null", "if: ${{ false && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null", 1))
-    assert not valid_graph(config, setup, release.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1))
+    assert not valid_graph(config, setup, release.replace(generated_run, generated_run[:-1] + ' || true"', 1), native)
+    assert not valid_graph(config, setup, release.replace("needs.build-local-artifacts.result == 'success'", "needs.build-local-artifacts.result == 'failure'", 1), native)
+    assert not valid_graph(config, setup, release.replace("needs.custom-package-native.result == 'success'", "needs.custom-package-native.result == 'failure'", 1), native)
+    assert not valid_graph(config, setup, release.replace("build-local-artifacts:", "plan-gate:\n  build-local-artifacts:", 1), native)
+    assert not valid_graph(config, setup, release.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1), native)
+    assert not valid_graph(config, setup, release, native.replace("if: github.event_name != 'pull_request'", "if: false", 1))
+    assert not valid_graph(config, setup, release, native.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1))
+    assert not valid_graph(config, setup, release.replace("      - custom-package-native\n", "", 1), native)
+    for job, command in (("macos", "tools/package-macos.sh --output target/distrib/native/macos"), ("macos", "tools/package-macos.sh"), ("windows", "tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows"), ("windows", "tools/package-windows.ps1")):
+        start = native.index(f"  {job}:\n")
+        insertion = native.index("      - name: Check native plan", start)
+        injected = native[:insertion] + f"      - name: any name\n        shell: bash\n        run: {command}\n" + native[insertion:]
+        assert not valid_graph(config, setup, release, injected)
+    assert not valid_graph(config, setup, release, native.replace("      - name: Build native package", "      - name: Build native package\n        if: true", 1))
+    assert not valid_graph(config, setup, release, native.replace("    runs-on: macos-14", "    if: false\n    runs-on: macos-14").replace("    runs-on: windows-2022", "    if: false\n    runs-on: windows-2022"))
     matrix = "matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}"
-    assert not valid_graph(config, setup, release.replace(matrix, "matrix: { include: [] }", 1))
-    local = release[release.find("build-local-artifacts:"):release.find("build-global-artifacts:")]
-    host = release[release.find("\n  host:"):release.find("\n  announce:")]
+    assert not valid_graph(config, setup, release.replace(matrix, "matrix: { include: [] }", 1), native)
+    def workflow_job(name: str) -> str:
+        match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", release, re.MULTILINE | re.DOTALL)
+        assert match
+        return match.group(1)
+    def needs(job: str) -> list[str]:
+        match = re.search(r"^    needs:\n((?:      - [A-Za-z0-9_-]+\n)+)", job, re.MULTILINE)
+        return re.findall(r"- ([A-Za-z0-9_-]+)", match.group(1)) if match else []
+    local, custom, global_job, host, announce = (workflow_job(name) for name in ("build-local-artifacts", "custom-package-native", "build-global-artifacts", "host", "announce"))
+    assert needs(local) == ["plan"] and needs(custom) == ["plan"] and needs(global_job) == ["plan", "build-local-artifacts", "custom-package-native"] and needs(host) == ["plan", "build-local-artifacts", "custom-package-native", "build-global-artifacts"] and needs(announce) == ["plan", "host"]
     local_condition = next(line.strip()[4:] for line in local.splitlines() if line.strip().startswith("if: "))
+    custom_condition = next(line.strip()[4:] for line in custom.splitlines() if line.strip().startswith("if: "))
     host_condition = next(line.strip()[4:] for line in host.splitlines() if line.strip().startswith("if: "))
+    announce_condition = next(line.strip()[4:] for line in announce.splitlines() if line.strip().startswith("if: "))
 
     def condition(expression: str, values: dict[str, object]) -> bool:
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
@@ -275,6 +320,7 @@ def graph() -> None:
         "needs.plan.outputs.publishing": "true",
         "needs.plan.result": "success",
         "needs.build-local-artifacts.result": "success",
+        "needs.custom-package-native.result": "success",
         "needs.build-global-artifacts.result": "success",
     }
     assert condition(local_condition, values) and condition(host_condition, values)
@@ -285,7 +331,246 @@ def graph() -> None:
     assert condition(host_condition, values | {"needs.build-local-artifacts.result": "skipped"})
     assert not condition(local_condition, values | {"fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": False})
     assert not condition(host_condition, values | {"needs.plan.outputs.publishing": "false"})
+    assert "- host" in announce and "if: ${{ always() && needs.host.result == 'success' }}" in announce
+    assert "if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}" in custom
+    def states(publishing: bool, pr_mode: str, native_result: str = "success", collector_result: str = "success") -> tuple[str, str, str, str]:
+        values = {"always()": True, "fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": True, "fromJson(needs.plan.outputs.val).ci.github.pr_run_mode": pr_mode, "needs.plan.outputs.publishing": "true" if publishing else "false", "needs.plan.result": "success"}
+        local_result = "success" if condition(local_condition, values) else "skipped"
+        custom_result = native_result if condition(custom_condition, values) else "skipped"
+        results = {"plan": "success", "build-local-artifacts": local_result, "custom-package-native": custom_result}
+        global_result = collector_result if all(results[name] == "success" for name in needs(global_job)) else "skipped"
+        results["build-global-artifacts"] = global_result
+        values |= {f"needs.{name}.result": result for name, result in results.items()}
+        host_result = "success" if condition(host_condition, values) else "skipped"
+        values["needs.host.result"] = host_result
+        return custom_result, global_result, host_result, "success" if condition(announce_condition, values) else "skipped"
+    assert states(False, "upload") == ("success", "success", "skipped", "skipped")
+    assert states(True, "skip") == ("success", "success", "success", "success")
+    assert states(True, "skip", "failure") == ("failure", "skipped", "skipped", "skipped")
+    assert states(True, "skip", "cancelled") == ("cancelled", "skipped", "skipped", "skipped")
+    assert states(True, "skip", "success", "failure") == ("success", "failure", "skipped", "skipped")
+
+
+def native_boundaries() -> None:
+    plist = plistlib.loads((ROOT / "packaging/macos/Info.plist").read_bytes())
+    assert {key: plist[key] for key in ("CFBundleExecutable", "CFBundleIconFile", "CFBundleShortVersionString", "CFBundleVersion")} == {"CFBundleExecutable": "focusforge-gui", "CFBundleIconFile": "focusforge", "CFBundleShortVersionString": "__VERSION__", "CFBundleVersion": "__VERSION__"}
+    wix = ET.parse(ROOT / "packaging/windows/focusforge.wxs").getroot()
+    package = next(item for item in wix if item.tag.endswith("Package"))
+    files = [item for item in wix.iter() if item.tag.endswith("File")]
+    assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and {(item.attrib["Name"], item.attrib["Source"], item.attrib.get("KeyPath")) for item in files} == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
+    shortcut = next(item for item in wix.iter() if item.tag.endswith("Shortcut")); icon = next(item for item in wix.iter() if item.tag.endswith("Icon"))
+    assert shortcut.attrib["Target"] == "[INSTALLFOLDER]focusforge-gui.exe" and shortcut.attrib["Icon"] == "FocusForgeIcon" and icon.attrib == {"Id": "FocusForgeIcon", "SourceFile": "$(var.Icon)"}
+    call(["bash", "-n", str(ROOT / "tools/package-macos.sh"), str(ROOT / "tools/check-package-macos.sh")])
+    call(["bash", str(ROOT / "tools/package-macos.sh"), "--output", "/tmp/outside-native-packages"], False)
+    call(["python3", "-m", "py_compile", str(NATIVE_COLLECTOR)])
+    old_plan = os.environ.get("DIST_PLAN")
+    required = [f"FocusForge-{collector.version()}-universal.dmg", f"FocusForge-{collector.version()}-x86_64.msi", "native-artifacts.sha256", "native-artifacts.json"]
+    plan = {"releases": [{"app_name": name, "app_version": collector.version(), "artifacts": [*(f"{name}-{target}.zip" for target in collector.TARGETS), *required]} for name in sorted(collector.PACKAGES)]}
+    os.environ["DIST_PLAN"] = json.dumps(plan)
+    try:
+        collector.check_plan()
+        plan["releases"][0]["artifacts"].append(f"{plan['releases'][0]['app_name']}-aarch64-pc-windows-msvc.zip")
+        os.environ["DIST_PLAN"] = json.dumps(plan)
+        try: collector.check_plan()
+        except ValueError: pass
+        else: raise AssertionError("additional target accepted")
+    finally:
+        if old_plan is None: os.environ.pop("DIST_PLAN", None)
+        else: os.environ["DIST_PLAN"] = old_plan
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        native, output = directory / "native", directory / "output"
+        old_native, old_output = collector.NATIVE, collector.OUTPUT
+        collector.NATIVE, collector.OUTPUT = native, output
+        try:
+            revision = collector.revision()
+            def restore() -> None:
+                shutil.rmtree(native, ignore_errors=True)
+                for platform, kind, suffix in (("macos", "dmg", "universal.dmg"), ("windows", "msi", "x86_64.msi")):
+                    target = native / platform; target.mkdir(parents=True)
+                    artifact = target / f"FocusForge-{collector.version()}-{suffix}"; artifact.write_bytes(platform.encode())
+                    receipt = {"kind": kind, "version": collector.version(), "revision": revision, "artifact": artifact.name, "sha256": collector.sha256(artifact)}
+                    (target / "native-receipt.json").write_text(json.dumps(receipt))
+            restore(); collector.collect()
+            baseline = {path.name: path.read_bytes() for path in output.iterdir()}
+            def reject(mutate: object) -> None:
+                restore(); mutate()
+                try: collector.collect()
+                except (TypeError, ValueError): pass
+                else: raise AssertionError("collector accepted malformed native input")
+                assert baseline == {path.name: path.read_bytes() for path in output.iterdir()}
+            receipt = native / "macos/native-receipt.json"
+            def receipt_field(field: str, value: object) -> object:
+                def mutate() -> None:
+                    body = json.loads(receipt.read_text()); body[field] = value; receipt.write_text(json.dumps(body))
+                return mutate
+            for field, value in (("revision", "0" * 40), ("version", "9.9.9"), ("artifact", "wrong.dmg"), ("kind", "msi"), ("sha256", "0" * 64)):
+                reject(receipt_field(field, value))
+            reject(lambda: receipt.write_text("{"))
+            reject(lambda: (native / "macos/FocusForge-0.1.0-universal.dmg").unlink())
+            def duplicate() -> None:
+                nested = native / "native/macos"; nested.mkdir(parents=True)
+                shutil.copytree(native / "macos", nested, dirs_exist_ok=True)
+            reject(duplicate)
+            reject(lambda: receipt.unlink())
+        finally:
+            collector.NATIVE, collector.OUTPUT = old_native, old_output
+
+
+def wix_version_cases() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "PowerShell 7+ is required for WiX version cases"
+    source = (ROOT / "tools/package-windows.ps1").read_text()
+    match = re.search(r"(\$wixVersion = @\(& dotnet \$wix --version\)\nif \(\$LASTEXITCODE.*?\{ throw 'WiX 4\.0\.5 cannot run on this runner' \})", source)
+    assert match, "current WiX version check not found"
+    with tempfile.TemporaryDirectory() as temp:
+        runner = Path(temp) / "wix-version.ps1"
+        runner.write_text("param([string]$Case)\n$ErrorActionPreference='Stop'\nfunction dotnet { switch ($Case) { 'good' { '4.0.5+b9b2f1b4' }; 'wrong' { '4.0.6' }; 'empty' { }; 'multiple' { '4.0.5+b9b2f1b4'; 'unexpected' }; 'badexit' { '4.0.5+b9b2f1b4' } }; $global:LASTEXITCODE=if ($Case -eq 'badexit') {1} else {0} }\n$wix='mock.dll'\n" + match.group(1))
+        for case, success in (("good", True), ("wrong", False), ("empty", False), ("multiple", False), ("badexit", False)):
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(runner), case], text=True, capture_output=True)
+            assert (result.returncode == 0) == success, (case, result.stderr)
+
+
+def macos_checker_mock() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp); mount = directory / "mount"; app = mount / "FocusForge.app/Contents"; binary = app / "MacOS"; resources = app / "Resources"; mock = directory / "mock"; log = directory / "hdiutil.log"
+        binary.mkdir(parents=True); resources.mkdir(); mock.mkdir()
+        shutil.copy(ROOT / "Cargo.toml", directory / "Cargo.toml")
+        shutil.copy(ROOT / "LICENSE", directory / "LICENSE"); shutil.copy(ROOT / "NOTICE", directory / "NOTICE")
+        shutil.copytree(ROOT / "assets/build", directory / "assets/build")
+        shutil.copytree(ROOT / "fixtures/mantis-64", directory / "fixtures/mantis-64")
+        for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, resources / name)
+        shutil.copy(ROOT / "assets/build/focusforge.icns", resources / "focusforge.icns")
+        version_file, info_file = directory / "version", directory / "info.json"
+        version_file.write_text("0.1.0\n")
+        for name in ("focusforge-cli", "focusforge-gui"):
+            path = binary / name; path.write_text(f"#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"focusforge-cli $(cat {version_file})\"; elif [ \"$1\" = info ]; then cat {info_file}; fi\n"); path.chmod(0o755)
+        (app / "Info.plist").write_text("stub")
+        template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
+        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-x86_64 arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O universal binary with 2 architectures: [x86_64] [arm64]'\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; esac\n"}
+        for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
+        info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
+        info_file.write_text(info)
+        (directory / "tools").mkdir()
+        checker_copy = directory / "tools/check-package-macos.sh"
+        original = (ROOT / "tools/check-package-macos.sh").read_text()
+        assert original.count("/usr/libexec/PlistBuddy") == 4
+        checker_copy.write_text(original.replace("/usr/libexec/PlistBuddy", str(mock / "PlistBuddy")))
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}"}
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg"], text=True, capture_output=True, env=env)
+        assert result.returncode == 0, result.stderr
+        env["MOCK_ARCHES"] = "x86_64"
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg"], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        env.pop("MOCK_ARCHES")
+        version_file.write_text("0.1.1\n")
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg"], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        version_file.write_text("0.1.0\n")
+        template_resources = template / "FocusForge.app/Contents/Resources"
+        (template_resources / "focusforge.icns").unlink()
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg"], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        shutil.copy(ROOT / "assets/build/focusforge.icns", template_resources / "focusforge.icns")
+        (template_resources / "LICENSE").unlink()
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg"], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        shutil.copy(ROOT / "LICENSE", template_resources / "LICENSE")
+        info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg"], text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and log.read_text().count("detach") == 6
+
+
+def macos_producer_mock() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp); tools, mock = root / "tools", root / "mock"; tools.mkdir(); mock.mkdir()
+        shutil.copy(ROOT / "Cargo.toml", root / "Cargo.toml")
+        for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)
+        shutil.copytree(ROOT / "assets/build", root / "assets/build")
+        shutil.copytree(ROOT / "packaging/macos", root / "packaging/macos")
+        producer_copy = tools / "package-macos.sh"; producer_copy.write_text((ROOT / "tools/package-macos.sh").read_text())
+        commands = {
+            "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; touch \"target/$target/release/focusforge-cli\" \"target/$target/release/focusforge-gui\"\n",
+            "lipo": "#!/usr/bin/env bash\nif [[ $1 == -archs ]]; then echo \"${MOCK_ARCHES:-x86_64 arm64}\"; else while (($#)); do if [[ $1 == -output ]]; then touch \"$2\"; exit 0; fi; shift; done; fi\n",
+            "hdiutil": "#!/usr/bin/env bash\n[[ -z ${MOCK_HDIUTIL_FAIL:-} ]] || exit 77; touch \"${!#}\"\n",
+            "plutil": "#!/usr/bin/env bash\nexit 0\n",
+            "shasum": "#!/usr/bin/env bash\nprintf '%064d  %s\\n' 0 \"${!#}\"\n",
+            "git": "#!/usr/bin/env bash\necho 0123456789abcdef0123456789abcdef01234567\n",
+            "mv": "#!/usr/bin/env bash\nif [[ ${MOCK_MV_PROMOTION_FAIL:-} && $1 == *.next && $2 == */macos ]]; then exit 77; fi; exec /bin/mv \"$@\"\n",
+        }
+        for name, body in commands.items():
+            path = mock / name; path.write_text(body); path.chmod(0o755)
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}"}
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 0, result.stderr
+        output = root / "target/distrib/native/macos"
+        artifact = output / "FocusForge-0.1.0-universal.dmg"; receipt = output / "native-receipt.json"
+        assert artifact.exists() and receipt.exists()
+        original = artifact.read_bytes(), receipt.read_bytes()
+        env["MOCK_ARCHES"] = "x86_64"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_ARCHES")
+        env["MOCK_HDIUTIL_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_HDIUTIL_FAIL")
+        env["MOCK_MV_PROMOTION_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+
+
+def windows_checker_mock() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "PowerShell is required for the Windows checker mock"
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp); tools = root / "tools"; tools.mkdir()
+        checker_copy = tools / "check-package-windows.ps1"; checker_copy.write_text((ROOT / "tools/check-package-windows.ps1").read_text())
+        for name in ("Cargo.toml", "LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)
+        shutil.copytree(ROOT / "assets/build", root / "assets/build")
+        shutil.copytree(ROOT / "fixtures/mantis-64", root / "fixtures/mantis-64")
+        runner = root / "runner.ps1"
+        runner.write_text(r'''param([string]$Script, [string]$Msi)
+$ErrorActionPreference = 'Stop'
+function global:msiexec.exe {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+  $product = Join-Path $env:ProgramFiles 'FocusForge'
+  $shortcut = Join-Path $env:ProgramData 'Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk'
+  if ($Arguments[0] -eq '/i') {
+    New-Item -ItemType Directory -Force -Path $product, (Split-Path $shortcut) | Out-Null
+    @('#!/usr/bin/env bash', 'if [[ $1 == --version ]]; then echo focusforge-cli 0.1.0; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
+    & chmod +x (Join-Path $product 'focusforge-cli.exe')
+    Set-Content (Join-Path $product 'focusforge-gui.exe') gui
+    Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $product
+    Copy-Item (Join-Path $PSScriptRoot 'NOTICE') $product
+    Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') $product
+    Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') (Join-Path $env:ProgramData 'cache.ico')
+    Set-Content $shortcut shortcut
+  } elseif ($Arguments[0] -eq '/x') { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $product, $shortcut }
+  $global:LASTEXITCODE = 0
+}
+function global:New-Object {
+  param([string]$ComObject)
+  if ($ComObject -ne 'WScript.Shell') { throw "unexpected COM object: $ComObject" }
+  $shell = [pscustomobject]@{}
+  $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
+    param($Path)
+    $index = if ($env:MOCK_ICON_INDEX) { $env:MOCK_ICON_INDEX } else { '0' }
+    [pscustomobject]@{ TargetPath = (Join-Path $env:ProgramFiles 'FocusForge/focusforge-gui.exe'); IconLocation = ((Join-Path $env:ProgramData 'cache.ico') + ',' + $index) }
+  }
+  $shell
+}
+& $Script -Msi $Msi
+''')
+        info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
+        env = {**os.environ, "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info}
+        for mutation, success in (({}, True), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False)):
+            case_env = env | mutation
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(runner), str(checker_copy), "mock.msi"], text=True, capture_output=True, env=case_env)
+            assert (result.returncode == 0) == success, result.stderr
+            assert not (root / "program-files/FocusForge").exists()
+            assert not (root / "program-data/Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk").exists()
 
 
 if __name__ == "__main__":
-    producer(); checker(); gate_checks(); graph(); print("packaging selftest: PASS")
+    producer(); checker(); gate_checks(); graph(); native_boundaries(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); print("packaging selftest: PASS")

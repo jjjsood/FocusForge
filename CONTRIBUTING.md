@@ -203,3 +203,8 @@ A human starts a release by pushing a version tag such as `v0.1.0`; the
 generated release workflow builds the supported matrix and creates the release
 only after its same-commit checks pass. Before creating or pushing a tag, run
 the documented Linux package recipe and inspect its two artifacts locally.
+
+Pull requests run the same native package jobs without creating a release.
+macOS produces a universal DMG and Windows produces one combined MSI; their
+target runners validate the installed package before uploading it for the
+release checksum job.
