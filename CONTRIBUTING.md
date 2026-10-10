@@ -196,3 +196,10 @@ commands by hand.
 `crates/core` never links a UI crate, and no reader or writer API returns a
 whole frame — the reference stack this project targets does not fit in
 memory, so tiling is the default path everywhere, not a fallback.
+
+## Releases
+
+A human starts a release by pushing a version tag such as `v0.1.0`; the
+generated release workflow builds the supported matrix and creates the release
+only after its same-commit checks pass. Before creating or pushing a tag, run
+the documented Linux package recipe and inspect its two artifacts locally.
