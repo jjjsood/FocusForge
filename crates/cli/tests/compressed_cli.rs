@@ -109,7 +109,7 @@ fn run_stack(cwd: &Path, input: &Path, output: &Path) -> PathBuf {
         input.to_str().unwrap(),
         "-o",
         output.to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
@@ -255,7 +255,7 @@ fn changed_tile_size_keeps_compressed_output_equal() {
             input.to_str().unwrap(),
             "-o",
             output.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",
@@ -356,7 +356,7 @@ fn dry_run_plan(cwd: &Path, input: &Path) -> serde_json::Value {
         input.to_str().unwrap(),
         "-o",
         output.to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
@@ -370,7 +370,7 @@ fn dry_run_plan(cwd: &Path, input: &Path) -> serde_json::Value {
         "--json",
     ]);
     if cfg!(feature = "gpu") {
-        command.arg("--no-gpu");
+        command.arg("--cpu");
     }
     let output = command.output().unwrap();
     assert!(
@@ -402,9 +402,8 @@ fn align_report(cwd: &Path, input: &Path) -> serde_json::Value {
         .args([
             "align",
             input.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
         ])
         .output()
@@ -500,13 +499,13 @@ fn refused_codec_fails_only_its_group() {
         output.to_str().unwrap(),
         "--groups",
         groups.to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
     ]);
     if cfg!(feature = "gpu") {
-        command.arg("--no-gpu");
+        command.arg("--cpu");
     }
     let result = command.output().unwrap();
     assert!(!result.status.success());

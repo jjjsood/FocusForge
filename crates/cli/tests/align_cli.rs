@@ -2,13 +2,10 @@
 
 //! Process-level coverage of `focusforge-cli align`: the human report, the
 //! `--json` report, both solver modes, `--write-warped`, and the
-//! strict-versus-`--lax` exit policy.
+//! default-tolerant and strict exit policy.
 //!
-//! Every recipe here that reaches a real solve passes `--lax`: frame 0 of
-//! `fixtures/mantis-512` genuinely diverges against the default middle
-//! anchor, so the strict default would refuse the fixture.
-//! `strict_path_exits_one_on_the_fixture` is the one test that keeps the
-//! strict default itself exercised on real data.
+//! Frame 0 of `fixtures/mantis-512` genuinely diverges against the default
+//! middle anchor. `strict_path_exits_one_on_the_fixture` exercises refusal.
 
 mod common;
 
@@ -29,17 +26,16 @@ fn run_cli(args: &[&str]) -> CliOutput {
 }
 
 #[test]
-fn align_quiet_prints_no_progress() {
+fn align_no_progress_suppresses_progress() {
     let quiet = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
-        "--quiet",
+        "--no-progress",
     ]);
     assert!(quiet.success, "stderr: {}", quiet.stderr);
-    // `--quiet` suppresses the stage line, never the `--lax` failure-count
+    // `--no-progress` suppresses the stage line, never the fallback-count
     // warning: that is a diagnostic about the result, not progress.
     assert!(
         !quiet.stderr.contains("align 8 frames"),
@@ -50,9 +46,8 @@ fn align_quiet_prints_no_progress() {
     let loud = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
     ]);
     assert!(loud.success, "stderr: {}", loud.stderr);
     assert!(
@@ -60,7 +55,7 @@ fn align_quiet_prints_no_progress() {
         "stderr: {}",
         loud.stderr
     );
-    // `--quiet` must not change stdout, other than the trailing `stages:`
+    // `--no-progress` must not change stdout, other than the trailing `stages:`
     // line: it carries real per-run wall-clock figures, so two separately
     // timed runs of the same alignment never render it identically even
     // though every other line is deterministic.
@@ -72,7 +67,7 @@ fn align_quiet_prints_no_progress() {
     assert_eq!(
         strip_stages(&quiet.stdout),
         strip_stages(&loud.stdout),
-        "--quiet must not change stdout (aside from the timing-dependent stages: line)"
+        "--no-progress must not change stdout (aside from the timing-dependent stages: line)"
     );
 }
 
@@ -81,9 +76,8 @@ fn align_prints_a_stage_line_on_stderr() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
     assert!(
@@ -98,9 +92,8 @@ fn align_reports_one_row_per_frame() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
 
@@ -140,9 +133,8 @@ fn align_json_schema_is_stable() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--json",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
@@ -232,9 +224,8 @@ fn worker_limit_in_report() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--json",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
@@ -277,9 +268,8 @@ fn max_host_memory_bounds_the_alignment_workers() {
         let out = run_cli(&[
             "align",
             mantis_512_dir().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "pyramidal-ecc",
-            "--lax",
             "--json",
             "--set",
             "max-iterations=20",
@@ -309,11 +299,10 @@ fn align_modes_differ() {
     let translation = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
         "--set",
         "mode=translation",
-        "--lax",
         "--json",
     ]);
     assert!(translation.success, "stderr: {}", translation.stderr);
@@ -334,11 +323,10 @@ fn align_modes_differ() {
     let rotation_scale = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
         "--set",
         "mode=rotation-scale",
-        "--lax",
         "--json",
     ]);
     assert!(rotation_scale.success, "stderr: {}", rotation_scale.stderr);
@@ -360,9 +348,8 @@ fn align_write_warped_writes_one_tiff_per_frame() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--write-warped",
         dir.to_str().unwrap(),
     ]);
@@ -389,9 +376,8 @@ fn stage_timings_report_fuse_as_not_entered() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--json",
     ]);
     assert!(out.success, "stderr: {}", out.stderr);
@@ -420,9 +406,8 @@ fn stage_timings_report_warp_write_only_under_the_flag() {
     let without = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--json",
     ]);
     assert!(without.success, "stderr: {}", without.stderr);
@@ -437,9 +422,8 @@ fn stage_timings_report_warp_write_only_under_the_flag() {
     let with = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
         "--write-warped",
         dir.to_str().unwrap(),
         "--json",
@@ -452,15 +436,16 @@ fn stage_timings_report_warp_write_only_under_the_flag() {
     );
 }
 
-/// Strict is the default: a frame that fails to register exits 1 and names
-/// every failed frame. Frame 0 of this fixture is the free, honest case.
+/// Strict opt-in refuses every failed frame and names it. Frame 0 of this
+/// fixture is the free, honest case.
 #[test]
 fn align_reports_a_failed_frame() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
+        "--strict",
     ]);
     assert!(
         !out.success,
@@ -483,30 +468,26 @@ fn align_reports_a_failed_frame() {
     assert!(out.stdout.contains("00.tif"), "stdout: {}", out.stdout);
 }
 
-/// The strict default, exercised on real data: the fixture exits 1.
+/// The strict opt-in, exercised on real data: the fixture exits 1.
 #[test]
-fn strict_path_exits_one_on_the_fixture() {
+fn registration_strict_path_exits_one_on_the_fixture() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
+        "--strict",
     ]);
-    assert_eq!(
-        out.code,
-        Some(1),
-        "strict (the default) must exit 1 on this fixture"
-    );
+    assert_eq!(out.code, Some(1), "strict must exit 1 on this fixture");
 }
 
 #[test]
-fn lax_reports_the_failure_and_exits_zero() {
+fn registration_default_reports_the_failure_and_exits_zero() {
     let out = run_cli(&[
         "align",
         mantis_512_dir().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "pyramidal-ecc",
-        "--lax",
     ]);
     assert!(out.success, "stdout: {} stderr: {}", out.stdout, out.stderr);
     assert_eq!(out.code, Some(0));

@@ -10,11 +10,13 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use focusforge_core::io::{
     ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
     all_frame_paths, classify_header, has_extension, is_frame_path,
 };
+use focusforge_core::params::ParamValues;
+use focusforge_core::project::Project;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -43,14 +45,15 @@ fn resolve_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
+    quiet: bool,
 ) -> stack::BackendChoice {
     #[cfg(feature = "gpu")]
     {
-        gpu::resolve_backend(algorithm_id, no_gpu, max_vram)
+        gpu::resolve_backend(algorithm_id, no_gpu, max_vram, quiet)
     }
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = (algorithm_id, no_gpu, max_vram);
+        let _ = (algorithm_id, no_gpu, max_vram, quiet);
         stack::BackendChoice::cpu()
     }
 }
@@ -63,14 +66,15 @@ fn resolve_align_backend(
     algorithm_id: &str,
     no_gpu: bool,
     max_vram: Option<u64>,
+    quiet: bool,
 ) -> stack::AlignBackendChoice {
     #[cfg(feature = "gpu")]
     {
-        gpu::resolve_align_backend(algorithm_id, no_gpu, max_vram)
+        gpu::resolve_align_backend(algorithm_id, no_gpu, max_vram, quiet)
     }
     #[cfg(not(feature = "gpu"))]
     {
-        let _ = (algorithm_id, no_gpu, max_vram);
+        let _ = (algorithm_id, no_gpu, max_vram, quiet);
         stack::AlignBackendChoice::cpu()
     }
 }
@@ -89,7 +93,7 @@ struct Cli {
     #[arg(short = 'v', action = clap::ArgAction::Count, global = true)]
     verbose: u8,
     /// Log errors only.
-    #[arg(short = 'q', global = true)]
+    #[arg(short = 'q', long, global = true)]
     quiet: bool,
 }
 
@@ -105,7 +109,7 @@ fn verbosity(cli: &Cli) -> i8 {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print TIFF or RAW metadata for a file, or for every frame in a directory.
+    /// Print project, TIFF or RAW metadata for a file, or for every frame in a directory.
     Info {
         /// Path to a file or directory.
         path: PathBuf,
@@ -138,7 +142,7 @@ enum Command {
         output: Option<PathBuf>,
         /// Registered stacking algorithm id (`focusforge-cli algorithms`
         /// lists them). Required unless a `--preset` supplies `algo`.
-        #[arg(long)]
+        #[arg(long = "algorithm")]
         algo: Option<String>,
         /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
@@ -155,14 +159,14 @@ enum Command {
         /// when alignment is on.
         #[arg(long = "no-crop", action = clap::ArgAction::SetFalse)]
         crop: bool,
-        /// Soften alignment failures to an identity fallback instead of
-        /// refusing the run. Meaningless with `--no-align`.
+        /// Refuse the run when an alignment fails. Meaningless with
+        /// `--no-align`.
         #[arg(long)]
-        lax: bool,
+        strict: bool,
         /// Alignment algorithm id. Optional: defaults to the sole
         /// registered alignment algorithm, refusing (and listing the
         /// choices) when more than one is registered.
-        #[arg(long = "align-algo")]
+        #[arg(long = "align-algorithm")]
         align_algo: Option<String>,
         #[command(flatten)]
         align_set: set::AlignSetArgs,
@@ -172,9 +176,9 @@ enum Command {
         /// disagrees with this invocation's inputs.
         #[arg(long)]
         resume: bool,
-        /// Print no progress at all.
+        /// Print no stage progress.
         #[arg(long)]
-        quiet: bool,
+        no_progress: bool,
         /// Override the scheduler's outer tile size, in pixels. Omit to use
         /// the scheduler's own default.
         #[arg(long = "tile-size", value_name = "PX")]
@@ -205,7 +209,7 @@ enum Command {
         /// Read parameter values from a TOML preset: the `algo` and
         /// `align-algo` keys plus the `[stack]` and `[align]` value
         /// tables. A flag always beats the file -- `--set`/`--align-set`
-        /// override the tables, `--algo`/`--align-algo` override the keys.
+        /// override the tables, `--algorithm`/`--align-algorithm` override the keys.
         #[arg(long, value_name = "PATH")]
         preset: Option<PathBuf>,
         /// Write the preset that reproduces this run to this path: the
@@ -228,7 +232,7 @@ enum Command {
         /// Force the CPU path even when a usable GPU adapter is available.
         /// Only in builds with GPU support.
         #[cfg(feature = "gpu")]
-        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        #[arg(long = "cpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
         /// Skip the stage cache: recompute the alignment even when a valid
         /// entry exists, and store no new entry.
@@ -299,10 +303,6 @@ enum Command {
     /// List, delete or compact a project's checkpoints. Every history
     /// operation is reachable through this command, headless.
     History {
-        /// Accept a project whose recorded source frames' content changed
-        /// since it was written, printing a warning instead of refusing.
-        #[arg(long = "accept-changed-sources", global = true)]
-        accept_changed_sources: bool,
         #[command(subcommand)]
         command: history::HistoryCommand,
     },
@@ -315,16 +315,14 @@ enum Command {
         dir: PathBuf,
         /// Registered alignment algorithm id. Optional: defaults to the
         /// sole registered alignment algorithm.
-        #[arg(long)]
+        #[arg(long = "algorithm")]
         algo: Option<String>,
         /// Emit the JSON report instead of human-readable text.
         #[arg(long)]
         json: bool,
-        /// Soften a failed frame to an identity fallback and exit 0,
-        /// reporting the failure count on stderr, instead of refusing the
-        /// run.
+        /// Refuse the run when an alignment fails.
         #[arg(long)]
-        lax: bool,
+        strict: bool,
         /// Write one warped TIFF per frame into this directory, at source
         /// dimensions, uncropped.
         #[arg(long = "write-warped", value_name = "DIR")]
@@ -358,7 +356,7 @@ enum Command {
         /// count: this suppresses only the one stage line `align`
         /// otherwise prints.
         #[arg(long)]
-        quiet: bool,
+        no_progress: bool,
         /// Read parameter values from a TOML preset. `align` uses only
         /// `align-algo` and the `[align]` table; a non-empty `[stack]`
         /// table or `algo` key is unused here and says so on stderr, so
@@ -377,7 +375,7 @@ enum Command {
         /// backend both stay on the CPU. Only present when the `gpu` feature
         /// is compiled in.
         #[cfg(feature = "gpu")]
-        #[arg(long = "no-gpu", action = clap::ArgAction::SetFalse)]
+        #[arg(long = "cpu", action = clap::ArgAction::SetFalse)]
         gpu: bool,
     },
     /// Report one record per result found under a directory of projects, or
@@ -397,10 +395,13 @@ enum Command {
     /// Remove every entry from the stage cache under
     /// `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any
     /// project.
+    #[command(subcommand_required = true)]
     Cache {
         /// Emit the JSON report instead of human-readable text.
-        #[arg(long)]
+        #[arg(long, global = true)]
         json: bool,
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     /// Package this installation's logs, crash reports, system summary,
     /// graphics adapter record, effective configuration and version into
@@ -421,6 +422,12 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Remove every entry from the stage cache.
+    Clear,
+}
+
 /// The subcommand's own name, as the job span carries it in the log.
 fn command_name(command: &Command) -> &'static str {
     match command {
@@ -437,13 +444,72 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
+const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
+    ("Processing", &["stack", "align", "retouch", "export"]),
+    ("Inspection", &["info", "review", "algorithms"]),
+    ("Maintenance", &["history", "cache", "diagnostics"]),
+];
+
+fn categorized_root_help_template(
+    command: &clap::Command,
+    categories: &[(&str, &[&str])],
+) -> Result<String, String> {
+    let visible: Vec<_> = command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+        .collect();
+    let mut grouped = String::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (heading, names) in categories {
+        grouped.push_str(heading);
+        grouped.push_str(":\n");
+        for &name in *names {
+            let subcommand = visible
+                .iter()
+                .find(|subcommand| subcommand.get_name() == name)
+                .ok_or_else(|| format!("root help category names missing command `{name}`"))?;
+            if !seen.insert(name) {
+                return Err(format!("root help category names `{name}` more than once"));
+            }
+            let about = subcommand
+                .get_about()
+                .ok_or_else(|| format!("root command `{name}` needs an about"))?;
+            grouped.push_str(&format!("  {name:12} {about}\n"));
+        }
+        grouped.push('\n');
+    }
+    for subcommand in visible {
+        if !seen.contains(subcommand.get_name()) {
+            return Err(format!(
+                "root help category has no entry for visible command `{}`",
+                subcommand.get_name()
+            ));
+        }
+    }
+    Ok(format!(
+        "{{before-help}}{{name}} {{version}}\n{{about}}\n\n{{usage-heading}} {{usage}}\n\n{grouped}Examples:\n  focusforge-cli stack frames/ --algorithm laplacian\n  focusforge-cli history list project.ffp\n\n{{options}}{{after-help}}"
+    ))
+}
+
+fn root_help_template(command: &clap::Command) -> Result<String, String> {
+    categorized_root_help_template(command, &ROOT_CATEGORIES)
+}
+
+fn parse_cli() -> Cli {
+    let command = Cli::command();
+    let template =
+        root_help_template(&command).expect("every visible root command must be categorized");
+    let matches = command.help_template(template).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never reaches the application's own work.
     if let Some(code) = focusforge_diagnostics::run_monitor() {
         return ExitCode::from(code as u8);
     }
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let data_dir = focusforge_diagnostics::data_dir_from_env();
     let _diagnostics = focusforge_diagnostics::init(&focusforge_diagnostics::Options {
         data_dir: data_dir.clone(),
@@ -457,6 +523,7 @@ fn main() -> ExitCode {
     // Entered for the whole invocation, so every event a run raises names
     // the command it came from.
     let _job = tracing::debug_span!("job", command = command_name(&cli.command)).entered();
+    let quiet = cli.quiet;
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
@@ -469,11 +536,11 @@ fn main() -> ExitCode {
             group_args,
             align,
             crop,
-            lax,
+            strict,
             align_algo,
             align_set,
             resume,
-            quiet,
+            no_progress,
             tile_size,
             max_host_memory,
             #[cfg(feature = "gpu")]
@@ -501,13 +568,14 @@ fn main() -> ExitCode {
                 &align::AlignOptions {
                     align,
                     crop,
-                    lax,
+                    lax: !strict,
                     algo: align_algo.as_deref(),
                     set: &align_set.align_set,
                 },
                 &job::JobOptions {
                     resume,
                     quiet,
+                    no_progress,
                     tile_size,
                     cache,
                 },
@@ -550,21 +618,18 @@ fn main() -> ExitCode {
             name,
             json,
         } => retouch::run(&project, &ops, from.as_deref(), name.as_deref(), json),
-        Command::History {
-            command,
-            accept_changed_sources,
-        } => history::run(command, accept_changed_sources),
+        Command::History { command } => history::run(command),
         Command::Align {
             dir,
             algo,
             json,
-            lax,
+            strict,
             write_warped,
             set,
             max_host_memory,
             #[cfg(feature = "gpu")]
             max_vram,
-            quiet,
+            no_progress,
             preset,
             write_preset,
             status,
@@ -581,10 +646,11 @@ fn main() -> ExitCode {
                 &dir,
                 algo.as_deref(),
                 json,
-                lax,
+                !strict,
                 write_warped.as_deref(),
                 &set,
                 max_host_memory,
+                no_progress,
                 quiet,
                 &preset::PresetOptions {
                     preset: preset.as_deref(),
@@ -597,7 +663,10 @@ fn main() -> ExitCode {
             )
         }
         Command::Review { dir, json } => review::run(&dir, json),
-        Command::Cache { json } => cache_clear(json),
+        Command::Cache {
+            json,
+            command: CacheCommand::Clear,
+        } => cache_clear(json),
         Command::Diagnostics {
             output,
             include_minidumps,
@@ -727,6 +796,24 @@ struct InfoReport {
     files: Vec<FileReport>,
 }
 
+/// The `info --json` document for a saved project.
+#[derive(Serialize)]
+struct ProjectInfoReport {
+    path: String,
+    bytes: u64,
+    producer: String,
+    created_at: i64,
+    checkpoint_id: String,
+    checkpoint_label: Option<String>,
+    algorithm: String,
+    params: ParamValues,
+    width: u32,
+    height: u32,
+    channels: u32,
+    source_count: usize,
+    visible_checkpoint_count: usize,
+}
+
 fn byte_order_str(order: ByteOrder) -> &'static str {
     match order {
         ByteOrder::Little => "II",
@@ -744,6 +831,10 @@ fn info(path: &Path, json: bool) -> ExitCode {
         Ok(metadata) => metadata,
         Err(err) => return fail(format!("cannot read {}: {err}", path.display())),
     };
+
+    if metadata.is_file() && has_extension(path, &["ffp"]) {
+        return info_project(path, metadata.len(), json);
+    }
 
     let is_directory = metadata.is_dir();
     let paths: Vec<PathBuf> = if is_directory {
@@ -774,6 +865,76 @@ fn info(path: &Path, json: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn info_project(path: &Path, bytes: u64, json: bool) -> ExitCode {
+    let project = match Project::open(path) {
+        Ok(project) => project,
+        Err(err) => {
+            return fail_with_code(
+                format!("cannot inspect {}: {err}", path.display()),
+                history::exit_code_for(&err),
+            );
+        }
+    };
+    let checkpoint = project.checkpoint();
+    let fused = match project.fuse_state(&checkpoint.id) {
+        Ok(fused) => fused,
+        Err(err) => {
+            return fail_with_code(
+                format!("cannot inspect {}: {err}", path.display()),
+                history::exit_code_for(&err),
+            );
+        }
+    };
+    let report = ProjectInfoReport {
+        path: path.display().to_string(),
+        bytes,
+        producer: project.manifest().producer.clone(),
+        created_at: project.manifest().created_at,
+        checkpoint_id: checkpoint.id.clone(),
+        checkpoint_label: checkpoint.label.clone(),
+        algorithm: checkpoint.algorithm.clone(),
+        params: checkpoint.params.clone(),
+        width: fused.composite.width,
+        height: fused.composite.height,
+        channels: fused.composite.samples_per_pixel,
+        source_count: project.manifest().sources.len(),
+        visible_checkpoint_count: project.history().visible().len(),
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    } else {
+        let params = match serde_json::to_string(&report.params) {
+            Ok(params) => params,
+            Err(err) => return fail(format!("failed to serialize parameters: {err}")),
+        };
+        print_project_human(&report, &params);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_project_human(report: &ProjectInfoReport, params: &str) {
+    println!("{}", report.path);
+    println!("  bytes: {}", report.bytes);
+    println!("  producer: {}", report.producer);
+    println!("  created_at: {}", report.created_at);
+    println!("  checkpoint: {}", report.checkpoint_id);
+    println!(
+        "  checkpoint label: {}",
+        report.checkpoint_label.as_deref().unwrap_or("none")
+    );
+    println!("  algorithm: {}", report.algorithm);
+    println!("  params: {params}");
+    println!("  width: {}", report.width);
+    println!("  height: {}", report.height);
+    println!("  channels: {}", report.channels);
+    println!("  sources: {}", report.source_count);
+    println!("  visible checkpoints: {}", report.visible_checkpoint_count);
 }
 
 fn is_raw_path(path: &Path) -> bool {
@@ -1112,7 +1273,7 @@ mod tests {
     /// moment either one moves without the other.
     #[test]
     fn no_crop_flag_reads_the_project_schema() {
-        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algo", "x"])
+        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algorithm", "x"])
             .expect("a minimal `stack` invocation must parse");
         let Command::Stack { crop, .. } = cli.command else {
             panic!("expected a Command::Stack");
@@ -1123,7 +1284,7 @@ mod tests {
     /// `--no-align` and the `align` descriptor are one source of truth.
     #[test]
     fn no_align_flag_reads_the_project_schema() {
-        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algo", "x"])
+        let cli = Cli::try_parse_from(["focusforge-cli", "stack", "dir", "--algorithm", "x"])
             .expect("a minimal `stack` invocation must parse");
         let Command::Stack { align, .. } = cli.command else {
             panic!("expected a Command::Stack");
@@ -1137,6 +1298,68 @@ mod tests {
     fn parser_is_consistent() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn root_help_categories_cover_unique_metadata_commands() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let help = root_help_template(&command).expect("root categories cover every command");
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
+            let about = subcommand.get_about().expect("visible command needs about");
+            assert!(
+                help.contains(&format!("  {:12} {about}", subcommand.get_name())),
+                "{} must use its clap about",
+                subcommand.get_name()
+            );
+        }
+
+        let duplicate = [("Duplicate", &["stack", "stack"][..])];
+        assert!(
+            categorized_root_help_template(&command, &duplicate)
+                .expect_err("duplicate category entries must fail")
+                .contains("more than once")
+        );
+
+        let missing = [("Missing", &["stack"][..])];
+        assert!(
+            categorized_root_help_template(&command, &missing)
+                .expect_err("incomplete categories must fail")
+                .contains("no entry")
+        );
+
+        let unmapped = command
+            .clone()
+            .subcommand(clap::Command::new("unmapped").about("Unmapped test"));
+        assert!(
+            root_help_template(&unmapped)
+                .expect_err("new visible command must fail category coverage")
+                .contains("unmapped")
+        );
+
+        let with_hidden = command.clone().subcommand(
+            clap::Command::new("hidden-test")
+                .about("Hidden test command")
+                .hide(true),
+        );
+        let hidden_help = root_help_template(&with_hidden)
+            .expect("hidden command must not require a product category");
+        assert!(!hidden_help.contains("hidden-test"));
+        assert!(!hidden_help.contains("Hidden test command"));
+        assert!(
+            !command
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_name() == "help"),
+            "generated help must not be a product category entry"
+        );
+        let generated_help = Cli::command()
+            .try_get_matches_from(["focusforge-cli", "help", "history", "list"])
+            .expect_err("generated help must remain parseable");
+        assert_eq!(generated_help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     /// Every export `ParamDesc` id is a `--<id>` flag on `export` whose help

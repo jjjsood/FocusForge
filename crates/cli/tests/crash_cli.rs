@@ -198,7 +198,7 @@ fn panicking_stack_fails_alone() {
             dump.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",

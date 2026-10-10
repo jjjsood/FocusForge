@@ -91,7 +91,7 @@ fn real_history_round_trips() {
         arg(&input),
         "-o",
         arg(&out),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",

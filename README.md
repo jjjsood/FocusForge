@@ -96,19 +96,21 @@ cargo build --release
 Produces `target/release/focusforge-cli` and `target/release/focusforge-gui`,
 with the GPU-accelerated fusion path compiled in by default. Pass
 `--no-default-features` to exclude it; without it, `stack` always runs on the
-CPU and `--no-gpu` does not exist as a flag.
+CPU and `--cpu` does not exist as a flag.
 
 ### Inspect a stack
 
 ```bash
 target/release/focusforge-cli info path/to/frames/
+target/release/focusforge-cli info path/to/project.ffp
 ```
 
-Prints one block per frame in the directory. TIFF entries show size, depth,
-byte order, compression and strip layout;
-RAW entries show decoder metadata without developing pixels. The report ends
-with a frame count, total size and a uniform-layout verdict. Add `--json` for
-the same report as machine-readable JSON.
+For a project file, prints stored project facts after structural and head
+Z-Map validation without reading source frames. For a directory, prints one
+block per frame. TIFF entries show size, depth, byte order, compression and
+strip layout; RAW entries show decoder metadata without developing pixels. The
+report ends with a frame count, total size and a uniform-layout verdict. Add
+`--json` for the same report as machine-readable JSON.
 
 RAW frames use `rawler` as the only decoder. Files it cannot read return an
 error; there is no decoder fallback.
@@ -116,7 +118,7 @@ error; there is no decoder fallback.
 ### Stack a folder
 
 ```bash
-target/release/focusforge-cli stack path/to/frames/ --algo laplacian
+target/release/focusforge-cli stack path/to/frames/ --algorithm laplacian
 target/release/focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 

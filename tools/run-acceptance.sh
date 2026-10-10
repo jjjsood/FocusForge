@@ -6,7 +6,7 @@
 #        tools/run-acceptance.sh --inside-scope 8G -- internal re-entry only,
 #                                                 never invoked by hand
 #        tools/run-acceptance.sh --algo depth-map -- either mode above, but
-#                                                 stacking with --algo depth-map
+#                                                 stacking with --algorithm depth-map
 #   --algo ID  stacking algorithm (default laplacian); --set levels=5 only
 #              accompanies laplacian
 #
@@ -24,7 +24,7 @@
 #      the assertion; memory.peak, memory.swap.peak and the anon/file split
 #      are recorded, never thresholded.
 #
-# `run_stack` passes `--no-gpu`: `gpu` is a default feature, and without it
+# `run_stack` passes `--cpu`: `gpu` is a default feature, and without it
 # this run would measure the GPU path's VRAM probe instead of the CPU tile
 # scheduler's host-memory behaviour it exists to measure.
 #
@@ -60,7 +60,7 @@
 #                              repeats sources, `r<replica>-`-prefixed to
 #                              match replay order.
 #   ACCEPTANCE_ALIGN          `1` (default): `run_stack` aligns in-process
-#                              with `--align-algo pyramidal-ecc --lax`, and
+#                              with `--align-algorithm pyramidal-ecc`, and
 #                              the unlimited branch also runs two standalone
 #                              `align` legs. `0`: `run_stack` uses
 #                              `--no-align` instead and the standalone
@@ -279,13 +279,14 @@ build_farm() {
 
 # --- the run itself: identical command, different OUT ----------------------
 # `--no-crop` keeps the full extent `crates/cli/tests/acceptance.rs` compares.
-# `--lax` because a 61-frame sweep has divergent frames.
+# Tolerant registration is the default because a 61-frame sweep has divergent
+# frames.
 # `ACCEPTANCE_ALIGN=0` measures the scheduler without alignment.
 #
 # Both locks: this reads target/release directly and drives the GPU.
 run_stack() {
   local out="$1"
-  local align_flags=(--align-algo pyramidal-ecc --lax)
+  local align_flags=(--align-algorithm pyramidal-ecc)
   if [ "$ALIGN" != "1" ]; then
     align_flags=(--no-align)
   fi
@@ -299,8 +300,8 @@ run_stack() {
   tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
     /usr/bin/time -v "$CLI" stack "$OUT_DIR/frames" \
       -o "$out" \
-      --algo "$ALGO" "${algo_settings[@]}" --json \
-      --no-crop "${align_flags[@]}" --no-gpu --no-cache \
+      --algorithm "$ALGO" "${algo_settings[@]}" --json \
+      --no-crop "${align_flags[@]}" --cpu --no-cache \
       > "$out/stack.json" 2> "$out/time-v.txt"
 
   # A stacking run writes a project, not an image. The two TIFFs
@@ -322,13 +323,12 @@ run_stack() {
 # branch stays a single `run_stack`, whose own in-process alignment is
 # exactly what the memory ceiling is being measured with, and a second
 # standalone align inside the scope would spend minutes measuring nothing
-# new. `--lax` for the same reason `run_stack` above carries it.
 run_align() {
   local out="$1"
   local mode="$2"
   tools/with-lock.sh build -- tools/with-lock.sh gpu -- \
     /usr/bin/time -v "$CLI" align "$OUT_DIR/frames" \
-      --algo pyramidal-ecc --set "mode=$mode" --lax --json \
+      --algorithm pyramidal-ecc --set "mode=$mode" --json \
       > "$out/align-$mode.json" 2> "$out/align-$mode-time-v.txt"
 }
 
@@ -380,7 +380,7 @@ case "$MODE" in
     build_farm
     if [ "$ALIGN" = "1" ]; then
       for mode in translation rotation-scale; do
-        echo "+ $CLI align $OUT_DIR/frames --algo pyramidal-ecc --set mode=$mode --lax --json ..."
+        echo "+ $CLI align $OUT_DIR/frames --algorithm pyramidal-ecc --set mode=$mode --json ..."
         run_align "$OUT_DIR/unlimited" "$mode"
       done
       echo "OK: align stage complete (both modes)"

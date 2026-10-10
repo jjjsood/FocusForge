@@ -488,7 +488,7 @@ pub fn backend_for(
         return (None, String::new());
     }
     if no_gpu {
-        return (None, "--no-gpu given: forcing the CPU path".to_string());
+        return (None, "--cpu given: forcing the CPU path".to_string());
     }
     match gpu_backend_capped(max_vram) {
         Ok(backend) => (
@@ -580,7 +580,7 @@ pub fn align_backend_for(
         return (None, String::new());
     }
     if no_gpu {
-        return (None, "--no-gpu given: aligning on the CPU".to_string());
+        return (None, "--cpu given: aligning on the CPU".to_string());
     }
     let lazy = LAZY_ALIGN_BACKEND.get_or_init(|| LazyAlignBackend {
         max_vram,
@@ -633,7 +633,7 @@ mod tests {
         for max_vram in [None, Some(0)] {
             let (backend, message) = backend_for(Laplacian.id(), true, max_vram);
             assert!(backend.is_none());
-            assert_eq!(message, "--no-gpu given: forcing the CPU path");
+            assert_eq!(message, "--cpu given: forcing the CPU path");
 
             for no_gpu in [false, true] {
                 let (backend, message) = backend_for("unsupported", no_gpu, max_vram);
@@ -661,7 +661,7 @@ mod tests {
         for max_vram in [None, Some(0)] {
             let (backend, message) = align_backend_for(PyramidalEcc.id(), true, max_vram, |_| {});
             assert!(backend.is_none());
-            assert_eq!(message, "--no-gpu given: aligning on the CPU");
+            assert_eq!(message, "--cpu given: aligning on the CPU");
             assert!(!message.contains("adapter selected: "));
 
             for no_gpu in [false, true] {

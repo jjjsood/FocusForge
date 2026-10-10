@@ -30,7 +30,7 @@
 //!
 //! One rule, in both directions: **a flag beats the file.** An inline
 //! `--set key=value` overrides the `[stack]` table for the same key,
-//! `--align-set` overrides `[align]`, and `--algo`/`--align-algo` override
+//! `--align-set` overrides `[align]`, and `--algorithm`/`--align-algorithm` override
 //! the file's `algo`/`align-algo`. A key the file sets and no flag mentions
 //! resolves with [`focusforge_core::params::Provenance::Explicit`]: a preset
 //! is the user setting the value, in a file instead of on the command line.

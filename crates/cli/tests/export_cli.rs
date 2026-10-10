@@ -76,18 +76,15 @@ fn shared_project() -> &'static SharedProject {
             input.to_str().unwrap().to_string(),
             "-o".to_string(),
             out.to_str().unwrap().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
             "--no-align".to_string(),
             "--no-crop".to_string(),
             "--set".to_string(),
             "equalize=false".to_string(),
         ];
-        // The GPU path's ±1 LSB budget would break the exact-byte equality
-        // this file asserts against a CPU library oracle -- the same reason
-        // `stack_cli.rs`'s shared run pins `--no-gpu`.
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu".to_string());
+            args.push("--cpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_cli_in(&cwd, &args);
@@ -677,15 +674,15 @@ fn aligned_project() -> &'static AlignedProject {
             input.to_str().unwrap().to_string(),
             "-o".to_string(),
             out.to_str().unwrap().to_string(),
-            "--algo".to_string(),
+            "--algorithm".to_string(),
             "laplacian".to_string(),
-            "--align-algo".to_string(),
+            "--align-algorithm".to_string(),
             "dummy-align".to_string(),
             "--set".to_string(),
             "equalize=false".to_string(),
         ];
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu".to_string());
+            args.push("--cpu".to_string());
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_cli_in(&cwd, &args);
@@ -1322,7 +1319,7 @@ fn export_frame_applies_the_recorded_equalization() {
             input.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "weighted-average",
             "--no-align",
             "--no-crop",
@@ -1403,7 +1400,7 @@ fn equalized_export_is_the_stored_composite() {
             input.to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "weighted-average",
             "--no-align",
             "--no-crop",

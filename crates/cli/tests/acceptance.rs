@@ -132,7 +132,7 @@ fn read_align_json(mode: &str) -> Option<serde_json::Value> {
 /// All 61 real frames produce an outcome; the per-frame `status` histogram
 /// and `failure_count` are part of what is recorded -- a sweep this long is
 /// where divergence far from the anchor is expected, not an anomaly. The
-/// alignment itself is done by the script, once, under `--lax`; this test
+/// alignment itself is done by the script, once, with fallback enabled; this test
 /// only parses what it already wrote.
 #[test]
 #[ignore = "reads the 16 GB reference stack"]
@@ -227,11 +227,11 @@ fn the_two_modes_disagree_as_focus_breathing_predicts() {
 /// The full-scale measurement of whether re-running a subset is cheap by
 /// construction, not merely true on a fixture. A first `stack` run over the
 /// real 61-frame reference stack computes and caches the alignment
-/// (`--align-algo pyramidal-ecc --lax`); a second run, differing only in a
+/// (`--align-algorithm pyramidal-ecc`); a second run, differing only in a
 /// fusion parameter (`--set levels=`), must reuse it (`align_cached: true`)
 /// and finish in a fraction of the first run's wall clock -- alignment
 /// dominates a real run (~240 s for a bare `align` against 253.97 s for a
-/// whole `stack --algo depth-map`), so a cache hit that skips it entirely
+/// whole `stack --algorithm depth-map`), so a cache hit that skips it entirely
 /// is the measurement that says the triage loop actually pays off at
 /// scale.
 #[test]
@@ -270,13 +270,12 @@ fn fusion_change_reuses_reference_alignment() {
                 frames.to_str().unwrap(),
                 "-o",
                 out_dir.to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "laplacian",
                 "--set",
                 &format!("levels={levels}"),
-                "--align-algo",
+                "--align-algorithm",
                 "pyramidal-ecc",
-                "--lax",
                 "--no-crop",
                 "--json",
             ])

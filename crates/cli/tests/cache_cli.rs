@@ -9,10 +9,10 @@
 //! concurrent test runs sharing one `target/` must never share a cache
 //! directory either.
 //!
-//! `--algo laplacian --align-algo dummy-align` is the one recipe here that
+//! `--algorithm laplacian --align-algorithm dummy-align` is the one recipe here that
 //! pays for a real fusion (a few seconds over `fixtures/mantis-512`);
 //! `dummy-align` reaches [`AlignStatus::Converged`] by construction, so no
-//! `--lax` is needed to keep the run from refusing. Every other test drives
+//! Default fallback keeps the run from refusing. Every other test drives
 //! `dummy-stack --no-align`, milliseconds only.
 
 mod common;
@@ -183,9 +183,9 @@ fn fusion_parameter_change_reuses_alignment() {
             input.to_str().unwrap(),
             "-o",
             out_a.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--set",
             "levels=3",
@@ -211,9 +211,9 @@ fn fusion_parameter_change_reuses_alignment() {
             input.to_str().unwrap(),
             "-o",
             out_b.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--set",
             "levels=5",
@@ -246,9 +246,9 @@ fn fusion_parameter_change_reuses_alignment() {
             input.to_str().unwrap(),
             "-o",
             out_c.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--set",
             "levels=5",
@@ -296,9 +296,9 @@ fn an_alignment_input_change_misses_the_cache() {
             input.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--json",
         ];
@@ -318,7 +318,7 @@ fn an_alignment_input_change_misses_the_cache() {
         "an alignment parameter change misses"
     );
     assert!(
-        !cached("lax", &frames, &["--lax"]),
+        !cached("strict", &frames, &["--strict"]),
         "a failure policy change misses"
     );
     std::fs::remove_file(frames.join(sources.last().unwrap().file_name().unwrap())).unwrap();
@@ -347,9 +347,9 @@ fn stage_timings_survive_a_cache_hit() {
             input.to_str().unwrap(),
             "-o",
             out_a.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--set",
             "levels=3",
@@ -365,9 +365,9 @@ fn stage_timings_survive_a_cache_hit() {
             input.to_str().unwrap(),
             "-o",
             out_b.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--set",
             "levels=5",
@@ -402,9 +402,9 @@ fn no_cache_flag_forces_a_recompute() {
     std::fs::create_dir_all(&out_b).unwrap();
 
     let common_args = [
-        "--algo",
+        "--algorithm",
         "dummy-stack",
-        "--align-algo",
+        "--align-algorithm",
         "dummy-align",
         "--json",
     ];
@@ -462,7 +462,31 @@ fn no_cache_flag_forces_a_recompute() {
 
 // --- cache clear --------------------------------------------------------
 
-/// `cache` empties the stage cache and touches nothing else: a
+#[test]
+fn cache_without_action_deletes_nothing() {
+    let cwd = tmp_dir("cache_cli_without_action");
+    let entry = cwd
+        .join(".scratch")
+        .join("stage-cache")
+        .join("align")
+        .join("sentinel.json");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, b"stage cache").unwrap();
+    let resume = cwd.join(".scratch").join("resume").join("sentinel");
+    std::fs::create_dir_all(resume.parent().unwrap()).unwrap();
+    std::fs::write(&resume, b"resume").unwrap();
+
+    for args in [["cache"].as_slice(), ["cache", "--json"].as_slice()] {
+        let output = run_cli_in(&cwd, args);
+        assert_eq!(output.code, Some(2), "stderr: {}", output.stderr);
+        assert!(output.stderr.contains("clear"), "stderr: {}", output.stderr);
+        assert!(output.stdout.is_empty(), "stdout: {}", output.stdout);
+        assert_eq!(std::fs::read(&entry).unwrap(), b"stage cache");
+        assert_eq!(std::fs::read(&resume).unwrap(), b"resume");
+    }
+}
+
+/// `cache clear` empties the stage cache and touches nothing else: a
 /// cancelled run's resume ledger, the sealed project, the run manifest and
 /// the tile scheduler's staging directory under `.scratch/projects/` all
 /// survive byte for byte (or, for a directory, simply survive).
@@ -480,9 +504,9 @@ fn cache_clear_removes_entries_and_nothing_else() {
             input.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--json",
         ],
@@ -514,7 +538,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
         "the leftover staging directory must be visible before the clear"
     );
 
-    let clear = run_cli_in(&cwd, &["cache", "--json"]);
+    let clear = run_cli_in(&cwd, &["cache", "clear", "--json"]);
     assert!(clear.success, "stderr: {}", clear.stderr);
     let clear_report: serde_json::Value = serde_json::from_str(&clear.stdout).expect("--json");
     assert_eq!(clear_report["removed"], 1);
@@ -524,6 +548,25 @@ fn cache_clear_removes_entries_and_nothing_else() {
         0,
         "cache clear must empty the stage cache"
     );
+
+    let empty = run_cli_in(&cwd, &["cache", "clear"]);
+    assert!(empty.success, "stderr: {}", empty.stderr);
+    assert!(
+        empty.stdout.contains("removed 0"),
+        "stdout: {}",
+        empty.stdout
+    );
+
+    let align_cache = cwd.join(".scratch").join("stage-cache").join("align");
+    std::fs::create_dir_all(&align_cache).unwrap();
+    std::fs::write(align_cache.join("first.json"), b"first").unwrap();
+    std::fs::write(align_cache.join("second.json"), b"second").unwrap();
+    let multiple = run_cli_in(&cwd, &["cache", "clear", "--json"]);
+    assert!(multiple.success, "stderr: {}", multiple.stderr);
+    let multiple_report: serde_json::Value =
+        serde_json::from_str(&multiple.stdout).expect("--json");
+    assert_eq!(multiple_report["removed"], 2);
+    assert_eq!(cache_entry_count(&cwd), 0);
 
     assert_eq!(
         std::fs::read(ledger_dir.join("job.json")).unwrap(),
@@ -566,7 +609,7 @@ fn only_runs_the_named_results() {
             dump.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -598,7 +641,7 @@ fn only_runs_the_named_results() {
             dump.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -656,7 +699,7 @@ fn only_accepts_the_identity_review_prints() {
             dump.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -684,7 +727,7 @@ fn only_accepts_the_identity_review_prints() {
             dump.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -716,7 +759,7 @@ fn unknown_only_value_fails_clearly() {
             dump.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -769,9 +812,9 @@ fn the_cache_stays_in_the_scratch_directory() {
             input.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
-            "--align-algo",
+            "--align-algorithm",
             "dummy-align",
             "--json",
         ],

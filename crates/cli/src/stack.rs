@@ -281,7 +281,7 @@ pub struct DryRunAlignPlan {
 
 /// Runs the subcommand.
 ///
-/// `algo_id: None` is refused here, by name, rather than by clap: `--algo`
+/// `algo_id: None` is refused here, by name, rather than by clap: `--algorithm`
 /// is declared `Option<String>` in `crate::Command::Stack` specifically so
 /// its absence reaches this function as `None` instead of aborting the
 /// process on clap's own usage error (exit 2, no knowledge of the registry).
@@ -331,7 +331,7 @@ pub fn run(
 
     // Resolve the algorithm first, before anything else -- an
     // unknown or missing id is refused before the input directory (which
-    // may not even exist) is ever touched. `--algo` beats the preset's own
+    // may not even exist) is ever touched. `--algorithm` beats the preset's own
     // `algo` key: one rule, flag beats file.
     let algo = match algo_id.or(file.algo.as_deref()) {
         None => {
@@ -343,7 +343,7 @@ pub fn run(
                 .map(|a| a.id())
                 .collect();
             return refuse(format!(
-                "--algo is required (or an `algo` key in the preset); known algorithms: {}",
+                "--algorithm is required (or an `algo` key in the preset); known algorithms: {}",
                 ids.join(", ")
             ));
         }
@@ -356,7 +356,7 @@ pub fn run(
     // This crate's GPU backend is a WGSL port of exactly one algorithm, so
     // every other id stays on the CPU path -- `crate::resolve_backend`
     // (`focusforge_gpu::harness::backend_for`) holds that gate itself.
-    let choice = crate::resolve_backend(algo.id(), no_gpu, max_vram);
+    let choice = crate::resolve_backend(algo.id(), no_gpu, max_vram, job_opts.quiet);
     let backend = choice.backend;
     let device_budget_report = choice.device_budget;
     let device_peak = choice.device_peak;
@@ -408,7 +408,9 @@ pub fn run(
     // message; here it only means no accelerator.
     let align_choice = if align_opts.align {
         match resolve_align_algo(align_opts.algo.or(file.align_algo.as_deref())) {
-            Ok(align_algo) => crate::resolve_align_backend(align_algo.id(), no_gpu, max_vram),
+            Ok(align_algo) => {
+                crate::resolve_align_backend(align_algo.id(), no_gpu, max_vram, job_opts.quiet)
+            }
             Err(_) => AlignBackendChoice::cpu(),
         }
     } else {
@@ -436,14 +438,12 @@ pub fn run(
         },
     };
 
-    // Printed **even under `--quiet`**: `--quiet` governs progress, not
-    // decisions, and no flag suppresses the proposal. Hence a direct
-    // `eprintln!` rather than `ProgressRenderer`,
-    // whose `Quiet` mode is a no-op by construction.
-    eprintln!(
-        "{}",
-        groups::render_proposal(&proposal, group_args.groups.as_deref())
-    );
+    if !job_opts.quiet {
+        eprintln!(
+            "{}",
+            groups::render_proposal(&proposal, group_args.groups.as_deref())
+        );
+    }
     if let Some(path) = group_args.write_groups.as_deref()
         && let Err(msg) = groups::write(&proposal, path)
     {
@@ -490,7 +490,7 @@ pub fn run(
             .collect()
     };
     for (i, sel) in selected.iter().enumerate() {
-        if !sel {
+        if !sel && !job_opts.quiet {
             eprintln!("skipped (not named by --only): {}", identities[i]);
         }
     }
@@ -572,6 +572,23 @@ pub fn run(
     if let Err(msg) = write_manifest(output, dir, manifest) {
         eprintln!("warning: {msg}");
         tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "warning: {msg}");
+    }
+
+    for result in &results {
+        let GroupResult::Completed(report) = result else {
+            continue;
+        };
+        let Some(align) = &report.align else {
+            continue;
+        };
+        if align.failure_count > 0 {
+            let warning = format!(
+                "warning: {} frame(s) failed to register and fell back to identity",
+                align.failure_count
+            );
+            eprintln!("{warning}");
+            tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "{warning}");
+        }
     }
 
     report_results(&results, json);
@@ -949,7 +966,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let _stack = tracing::debug_span!("stack", identity = %identity).entered();
     // Inside the span, so a forced crash carries this run's own context.
     focusforge_diagnostics::force_crash("stack");
-    let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.quiet));
+    let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.no_progress));
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
 

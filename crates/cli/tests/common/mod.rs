@@ -80,7 +80,7 @@ pub fn tmp_dir(name: &str) -> TmpDir {
     TmpDir { path }
 }
 
-/// Appends `--no-gpu` to `args` when this crate's own `gpu` feature is
+/// Appends `--cpu` to `args` when this crate's own `gpu` feature is
 /// compiled in -- a no-op build has no such flag at all, not even as a
 /// no-op (`crates/cli/src/main.rs`'s own `#[cfg(feature = "gpu")]` on the
 /// arg). `gpu` is a default build feature, so any test that names a
@@ -94,7 +94,7 @@ pub fn tmp_dir(name: &str) -> TmpDir {
 #[allow(dead_code)]
 pub fn push_no_gpu(mut args: Vec<&str>) -> Vec<&str> {
     if cfg!(feature = "gpu") {
-        args.push("--no-gpu");
+        args.push("--cpu");
     }
     args
 }
