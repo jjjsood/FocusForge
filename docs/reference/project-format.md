@@ -59,8 +59,8 @@ Nothing outside the three paths above is ever written.
 Z-Map; `focusforge-cli history` lists, extends and prunes
 checkpoints; `focusforge-cli review` reports the outcome and parameters the
 manifest recorded, streaming the Z-Map blob only to compute its coherence
-metric. `focusforge-cli cache` never touches a project — its `clear`
-subcommand only empties the stage cache under `.scratch/stage-cache/`.
+metric. `focusforge-cli cache clear` never touches a project; it only empties
+the stage cache under `.scratch/stage-cache/`.
 
 ## Source frames
 
@@ -73,8 +73,9 @@ the content hash recorded when the project was written:
   the `history` subcommands need no frames.
 - A frame whose content changed makes a retouched `export -o` refuse, naming
   it. The strokes would blend frames the project was not stacked from.
-  `history` subcommands refuse the same way with exit code 9 unless
-  `--accept-changed-sources` is passed, which prints a warning and proceeds.
+  `history list` and `history delete` refuse the same way with exit code 9
+  unless their `--accept-changed-sources` flag is passed, which prints a
+  warning and proceeds.
 - In the window, a project with changed frames asks before opening and
   offers **Locate frames…** to point at the originals, or **Open anyway**.
   A project whose frames are not where it recorded them opens with a notice

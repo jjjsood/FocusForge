@@ -130,7 +130,7 @@ fn unwritable_data_directory_falls_back_to_stderr_alone() {
 }
 
 /// A `stack` invocation that warns (its `--status` path cannot be written)
-/// and then refuses (no `--algo`), so one spawn carries both a mirrored
+/// and then refuses (no `--algorithm`), so one spawn carries both a mirrored
 /// warning and a mirrored refusal. `None` when this filesystem does not
 /// enforce the read-only directory the warning depends on.
 #[cfg(unix)]
@@ -176,7 +176,7 @@ fn mirrored_output_prints_once() {
             "the --status warning must appear exactly once, got: {stderr}"
         );
         assert_eq!(
-            count_lines(&stderr, "error: --algo is required"),
+            count_lines(&stderr, "error: --algorithm is required"),
             1,
             "the refusal must appear exactly once, got: {stderr}"
         );
@@ -247,7 +247,7 @@ fn spans_nest() {
         fixture.to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-cache",

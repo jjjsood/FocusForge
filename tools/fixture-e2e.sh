@@ -66,13 +66,13 @@ printf '%s' "$SINGLE_OUT" | grep -q 'mmap fast path: yes' \
   || { echo "FAIL: fixture e2e -- missing fact: mmap fast path: yes" >&2; exit 1; }
 echo "OK: fact present -- mmap fast path: yes"
 
-# `align`, cheap: `--algo pyramidal-ecc` is explicit because the all-targets
+# `align`, cheap: `--algorithm pyramidal-ecc` is explicit because the all-targets
 # debug build also registers a test algorithm, which makes the bare default
-# ambiguous. `--lax` because frames 0, 1, 6 and 7 of this fixture diverge
-# against the middle anchor. Never a `stack` invocation here: that is
+# ambiguous. The default fallback records divergent frames against the
+# middle anchor. Never a `stack` invocation here: that is
 # minutes of debug-profile fusion this cheap gate must not pay for.
-echo "+ $CLI align fixtures/mantis-512 --algo pyramidal-ecc --lax --json"
-ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algo pyramidal-ecc --lax --json)"
+echo "+ $CLI align fixtures/mantis-512 --algorithm pyramidal-ecc --json"
+ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --json)"
 
 printf '%s' "$ALIGN_OUT" | grep -q '"frame_count": 8' \
   || { echo "FAIL: fixture e2e -- align missing fact: frame_count 8" >&2; exit 1; }
@@ -88,14 +88,13 @@ printf '%s' "$ALIGN_OUT" | grep -q '"failure_count": 4' \
   || { echo "FAIL: fixture e2e -- align missing fact: failure_count 4" >&2; exit 1; }
 echo "OK: fact present -- align failure_count: 4 (per-frame divergence, recorded)"
 
-# --lax must not appear in README.md or docs/: it is a recipe flag, not the
-# recommended invocation.
-echo "+ grepping the docs tree for --lax outside the recipe files"
-LAX_HITS="$(grep -rln -- '--lax' README.md docs/ 2>/dev/null || true)"
-if [ -n "$LAX_HITS" ]; then
-  echo "FAIL: --lax must not appear in the docs tree, found in: $LAX_HITS" >&2
+# Removed processing flags must not appear in README.md or docs/.
+echo "+ grepping the docs tree for removed processing flags"
+REMOVED_HITS="$(grep -rlnE -- '--(algo|align-algo|no-gpu|lax)\b' README.md docs/ 2>/dev/null || true)"
+if [ -n "$REMOVED_HITS" ]; then
+  echo "FAIL: removed processing flags found in: $REMOVED_HITS" >&2
   exit 1
 fi
-echo "OK: --lax does not appear in README.md or docs/"
+echo "OK: removed processing flags absent from README.md and docs/"
 
 echo "OK: fixture e2e"

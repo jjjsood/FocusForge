@@ -53,7 +53,7 @@ fn shared_stack() -> &'static SharedStack {
                 arg(&input),
                 "-o",
                 arg(&out),
-                "--algo",
+                "--algorithm",
                 "dummy-stack",
                 "--no-align",
                 "--no-crop",

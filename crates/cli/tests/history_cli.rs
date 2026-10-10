@@ -78,7 +78,7 @@ fn shared_stack() -> &'static SharedStack {
                 input.to_str().unwrap(),
                 "-o",
                 out.to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "dummy-stack",
                 "--no-align",
                 "--no-crop",
@@ -1358,9 +1358,9 @@ fn validation_states_are_reported() {
         &dir,
         &[
             "history",
-            "--accept-changed-sources",
             "list",
             project_path.to_str().unwrap(),
+            "--accept-changed-sources",
         ],
     );
     assert!(output.success);
@@ -1379,4 +1379,136 @@ fn validation_states_are_reported() {
     assert!(!output.stdout.is_empty());
     assert!(output.stderr.contains("warning:"));
     assert!(output.stderr.contains("unresolved"));
+}
+
+#[test]
+fn accept_changed_sources_list_and_delete_changed_project() {
+    let dir = common::tmp_dir("accept_changed_sources_list_and_delete");
+    let project = seal_synthetic_project(&dir, 8);
+    let child = retouch(
+        &dir,
+        &project,
+        &[Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 5, y: 5 }, Point { x: 7, y: 7 }],
+            radius: 1.0,
+            softness: 0.0,
+        }],
+        None,
+    )
+    .remove(0);
+    assert_eq!(
+        listed(&dir, &project).len(),
+        2,
+        "fixture needs two visible states"
+    );
+
+    let manifest = Project::open(&project).unwrap().manifest().clone();
+    let source = dir.join(&manifest.sources[0].path);
+    let mut changed = std::fs::read(&source).unwrap();
+    changed[0] ^= 0xFF;
+    std::fs::write(source, changed).unwrap();
+
+    let refused = run(&dir, &["history", "list", project.to_str().unwrap()]);
+    assert_eq!(refused.exit_code, Some(9));
+    assert!(refused.stdout.is_empty());
+    assert!(refused.stderr.contains("--accept-changed-sources"));
+
+    let before_refused_delete = std::fs::read(&project).unwrap();
+    let refused_delete = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &child,
+        ],
+    );
+    assert_eq!(refused_delete.exit_code, Some(9));
+    assert!(refused_delete.stdout.is_empty());
+    assert!(
+        refused_delete.stderr.contains("--accept-changed-sources"),
+        "{}",
+        refused_delete.stderr
+    );
+    assert_eq!(std::fs::read(&project).unwrap(), before_refused_delete);
+
+    let listed_changed = run(
+        &dir,
+        &[
+            "history",
+            "list",
+            project.to_str().unwrap(),
+            "--accept-changed-sources",
+            "--json",
+        ],
+    );
+    assert!(listed_changed.success, "stderr: {}", listed_changed.stderr);
+    assert!(listed_changed.stderr.contains("warning:"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed_changed.stdout).unwrap()["checkpoints"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let accepted = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            project.to_str().unwrap(),
+            "--checkpoint",
+            &child,
+            "--accept-changed-sources",
+            "--json",
+        ],
+    );
+    assert!(accepted.success, "stderr: {}", accepted.stderr);
+    assert!(accepted.stderr.contains("warning:"), "{}", accepted.stderr);
+    assert_eq!(
+        serde_json::from_str::<Value>(&accepted.stdout).unwrap()["hidden"],
+        child
+    );
+
+    let after_delete = run(
+        &dir,
+        &[
+            "history",
+            "list",
+            project.to_str().unwrap(),
+            "--accept-changed-sources",
+            "--json",
+        ],
+    );
+    assert!(after_delete.success, "stderr: {}", after_delete.stderr);
+    assert!(after_delete.stderr.contains("warning:"));
+    let remaining = serde_json::from_str::<Value>(&after_delete.stdout).unwrap()["checkpoints"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining.iter().all(|checkpoint| checkpoint["id"] != child));
+
+    let before_rejection = std::fs::read(&project).unwrap();
+    for args in [
+        vec![
+            "history",
+            "--accept-changed-sources",
+            "list",
+            project.to_str().unwrap(),
+        ],
+        vec![
+            "history",
+            "compact",
+            project.to_str().unwrap(),
+            "--accept-changed-sources",
+        ],
+    ] {
+        let output = run(&dir, &args);
+        assert_eq!(output.exit_code, Some(2), "stderr: {}", output.stderr);
+        assert_eq!(std::fs::read(&project).unwrap(), before_rejection);
+    }
 }

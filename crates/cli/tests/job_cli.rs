@@ -144,7 +144,7 @@ fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
     exported
 }
 
-/// `stack <dir> -o <out_dir> --algo laplacian --no-align --no-crop
+/// `stack <dir> -o <out_dir> --algorithm laplacian --no-align --no-crop
 /// --tile-size 160 --set levels=3 --max-host-memory 1` -- the
 /// single-worker recipe this module's own doc comment explains (25 units
 /// against `fixtures/mantis-512`'s 4-tile default plan), assembled once so
@@ -158,7 +158,7 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
         dir,
         "-o",
         output,
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
@@ -171,13 +171,13 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
         "--max-host-memory",
         "1",
     ];
-    // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
+    // Without `--cpu`, `--algorithm laplacian` takes the GPU path automatically
     // because `gpu` is a default build feature, and every SIGINT/pause test
     // in this file depends on the CPU tile scheduler's own admission gate
-    // and worker count -- a GPU run bypasses both. `--no-gpu` only exists
+    // and worker count -- a GPU run bypasses both. `--cpu` only exists
     // when this crate's own `gpu` feature is compiled in.
     if cfg!(feature = "gpu") {
-        args.push("--no-gpu");
+        args.push("--cpu");
     }
     args
 }
@@ -198,19 +198,19 @@ fn stack_output_is_unchanged_under_the_job_engine() {
         source.to_str().unwrap(),
         "-o",
         output.parent().unwrap().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
         "--set",
         "equalize=false",
     ];
-    // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
+    // Without `--cpu`, `--algorithm laplacian` takes the GPU path automatically
     // because `gpu` is a default build feature, and the in-process oracle
     // below is CPU-only -- GPU/CPU parity is <=1 LSB by contract, not
     // byte-identical, so this comparison needs both sides on the CPU path.
     if cfg!(feature = "gpu") {
-        args.push("--no-gpu");
+        args.push("--cpu");
     }
     let out = run_cli_in(&dir, &args);
     assert!(out.success, "stderr: {}", out.stderr);
@@ -417,23 +417,23 @@ fn quiet_prints_no_progress() {
         source.to_str().unwrap(),
         "-o",
         output.parent().unwrap().to_str().unwrap(),
-        "--algo",
+        "--algorithm",
         "laplacian",
         "--no-align",
         "--no-crop",
         "--quiet",
+        "--no-progress",
     ];
-    // Without `--no-gpu`, `--algo laplacian` takes the GPU path automatically
+    // Without `--cpu`, `--algorithm laplacian` takes the GPU path automatically
     // because `gpu` is a default build feature, and a GPU-unavailable
     // fallback prints a warning to stderr regardless of `--quiet`, which this
     // test asserts is otherwise empty.
     if cfg!(feature = "gpu") {
-        args.push("--no-gpu");
+        args.push("--cpu");
     }
     let out = run_cli_in(&dir, &args);
     assert!(out.success, "stderr: {}", out.stderr);
-    // `--quiet` removes progress, not decisions: the grouping proposal prints
-    // regardless, so what must be empty is everything else.
+    // Both controls leave no routine stderr for this CPU-only run.
     assert!(
         strip_grouping(&out.stderr).trim().is_empty(),
         "stderr: {}",
@@ -542,7 +542,7 @@ mod unix_signals {
             mantis_dir_ref.to_str().unwrap(),
             "-o",
             ref_output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",
@@ -556,7 +556,7 @@ mod unix_signals {
             "1",
         ];
         if cfg!(feature = "gpu") {
-            ref_args.push("--no-gpu");
+            ref_args.push("--cpu");
         }
         let ref_run = run_cli_in(&ref_dir, &ref_args);
         assert!(ref_run.success, "stderr: {}", ref_run.stderr);
@@ -768,7 +768,7 @@ mod unix_signals {
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
                 output.parent().unwrap().to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "laplacian",
                 "--no-align",
                 "--no-crop",
@@ -886,7 +886,7 @@ mod unix_signals {
             mantis_dir.to_str().unwrap(),
             "-o",
             output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",
@@ -896,7 +896,7 @@ mod unix_signals {
             "1",
         ];
         if cfg!(feature = "gpu") {
-            base_args.push("--no-gpu");
+            base_args.push("--cpu");
         }
         let mut first_args = base_args.to_vec();
         first_args.push("--tile-size");
@@ -934,7 +934,7 @@ mod unix_signals {
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
                 ok_output.parent().unwrap().to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "laplacian",
                 "--no-align",
                 "--no-crop",
@@ -952,7 +952,7 @@ mod unix_signals {
                 mantis_512_dir().to_str().unwrap(),
                 "-o",
                 fail_output.parent().unwrap().to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "does-not-exist",
             ],
         );
@@ -1056,7 +1056,7 @@ mod unix_signals {
                 &frames_arg,
                 "-o",
                 reference_output.parent().unwrap().to_str().unwrap(),
-                "--algo",
+                "--algorithm",
                 "laplacian",
                 "--no-align",
                 "--no-crop",
@@ -1073,7 +1073,7 @@ mod unix_signals {
             &frames_arg,
             "-o",
             output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",
@@ -1157,11 +1157,10 @@ mod unix_signals {
             mantis_dir.to_str().unwrap(),
             "-o",
             output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-crop",
-            "--lax",
-            "--align-algo",
+            "--align-algorithm",
             "pyramidal-ecc",
             "--tile-size",
             "160",
@@ -1171,7 +1170,7 @@ mod unix_signals {
             "1",
         ];
         if cfg!(feature = "gpu") {
-            args.push("--no-gpu");
+            args.push("--cpu");
         }
         let mut child = spawn_piped(&dir, &args);
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
@@ -1281,7 +1280,7 @@ fn tuning_flags_reach_the_scheduler() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             default_output.parent().unwrap().to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "laplacian",
             "--no-align",
             "--no-crop",

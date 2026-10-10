@@ -249,7 +249,7 @@ fn hit_cap_frames_report_their_distance_from_epsilon() {
             let mut levels = Vec::new();
             let outcome = PyramidalEcc
                 .align_frame_traced(&ctx, frame, &cfg, &mut levels)
-                .expect("fixture frames register (`--lax` is a driver policy, not a solver one)");
+                .expect("fixture frames register (fallback is a driver policy, not a solver one)");
             println!(
                 "hit_cap_frames_report_their_distance_from_epsilon: mode={mode} frame={frame} \
                  outcome.status={:?} outcome.iterations={}",

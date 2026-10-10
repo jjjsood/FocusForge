@@ -419,7 +419,7 @@ fn info_exits_1_for_empty_directory() {
 }
 
 /// With the `gpu` feature off, `stack` runs CPU-only:
-/// no GPU probing, no `--no-gpu` flag, and the `backend` field is
+/// no GPU probing, no `--cpu` flag, and the `backend` field is
 /// always `"cpu"` -- run against `dummy-stack` (cheap: no pyramid, no
 /// alignment, no crop) to keep the run inexpensive.
 #[test]
@@ -435,7 +435,7 @@ fn stack_defaults_to_cpu() {
             mantis_512_dir().to_str().unwrap(),
             "-o",
             out_dir.to_str().unwrap(),
-            "--algo",
+            "--algorithm",
             "dummy-stack",
             "--no-align",
             "--no-crop",
@@ -452,7 +452,7 @@ fn stack_defaults_to_cpu() {
     assert_eq!(report["backend"], "cpu", "report: {report}");
 }
 
-/// With the `gpu` feature off, `--no-gpu` does not exist on `stack` or
+/// With the `gpu` feature off, `--cpu` does not exist on `stack` or
 /// `align` -- it is refused, not silently accepted.
 #[test]
 #[cfg(not(feature = "gpu"))]
@@ -463,8 +463,8 @@ fn no_gpu_flag_absent_without_the_feature() {
         assert!(output.status.success(), "exit status: {:?}", output.status);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            !stdout.contains("--no-gpu"),
-            "{sub} --help must not mention --no-gpu without the gpu feature: {stdout}"
+            !stdout.contains("--cpu"),
+            "{sub} --help must not mention --cpu without the gpu feature: {stdout}"
         );
     }
 }

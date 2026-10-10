@@ -290,7 +290,7 @@ def run_cli(name, levels):
     out, zm = f"{OUT}/{name}-l{levels}.tif", f"{OUT}/{name}-l{levels}-zmap.tif"
     r = subprocess.run(
         [CLI, "stack", f"{OUT}/{name}", "-o", out, "--zmap", zm,
-         "--algo", "laplacian", "--set", f"levels={levels}"],
+         "--algorithm", "laplacian", "--set", f"levels={levels}"],
         capture_output=True,
         text=True,
     )
@@ -532,9 +532,9 @@ def direction_check_impulse(verbose=True):
 
 
 def run_align(out_dir, algo, mode, lax):
-    cmd = [CLI, "align", out_dir, "--json", "--algo", algo, "--set", f"mode={mode}"]
-    if lax:
-        cmd.append("--lax")
+    cmd = [CLI, "align", out_dir, "--json", "--algorithm", algo, "--set", f"mode={mode}"]
+    if not lax:
+        cmd.append("--strict")
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"{' '.join(cmd)} failed (exit {r.returncode}): {r.stderr.strip()[:600]}")
@@ -744,7 +744,7 @@ def main():
                    help="depth relief profile")
     p.add_argument("--out", default=OUT, help="output directory")
     p.add_argument("--algo", default="pyramidal-ecc",
-                   help="alignment algorithm id passed to `align --algo` (--warp path only)")
+                   help="alignment algorithm id passed to `align --algorithm` (--warp path only)")
     p.add_argument("--frames-only", action="store_true",
                    help="render frames and truth files without invoking the CLI")
     p.add_argument("--self-check", action="store_true",

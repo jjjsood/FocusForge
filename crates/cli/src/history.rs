@@ -34,6 +34,9 @@ pub struct ListArgs {
     /// Emit the JSON document instead of human-readable text.
     #[arg(long)]
     json: bool,
+    /// Accept changed source frames, printing their warning instead of refusing.
+    #[arg(long = "accept-changed-sources")]
+    accept_changed_sources: bool,
 }
 
 #[derive(Args)]
@@ -46,6 +49,9 @@ pub struct DeleteArgs {
     /// Emit the JSON report instead of human-readable text.
     #[arg(long)]
     json: bool,
+    /// Accept changed source frames, printing their warning instead of refusing.
+    #[arg(long = "accept-changed-sources")]
+    accept_changed_sources: bool,
 }
 
 #[derive(Args)]
@@ -57,14 +63,14 @@ pub struct CompactArgs {
     json: bool,
 }
 
-pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
+pub fn run(command: HistoryCommand) -> ExitCode {
     match command {
-        HistoryCommand::List(args) => list(&args.project, args.json, accept_changed_sources),
+        HistoryCommand::List(args) => list(&args.project, args.json, args.accept_changed_sources),
         HistoryCommand::Delete(args) => delete(
             &args.project,
             &args.checkpoint,
             args.json,
-            accept_changed_sources,
+            args.accept_changed_sources,
         ),
         HistoryCommand::Compact(args) => compact(&args.project, args.json),
     }
@@ -74,7 +80,7 @@ pub fn run(command: HistoryCommand, accept_changed_sources: bool) -> ExitCode {
 /// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a
 /// dangling parent, a parent cycle, a fingerprint disagreement, ops with no
 /// parent to record them against). Anything else stays the generic 1.
-fn exit_code_for(err: &ProjectError) -> u8 {
+pub(crate) fn exit_code_for(err: &ProjectError) -> u8 {
     match err {
         ProjectError::NotAProject { .. } => 3,
         ProjectError::Truncated { .. } => 4,
