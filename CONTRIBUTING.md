@@ -193,6 +193,14 @@ check) in one command; `--static` is the fast subset a pre-commit hook runs.
 Read `tools/README.md` for what each script does before running cargo
 commands by hand.
 
+For user-visible changes, add an entry under `Unreleased` in
+[CHANGELOG.md](CHANGELOG.md). New Rust, Slint, WGSL, shell, and Python source
+files need the SPDX header checked by `tools/check-headers.sh`.
+
+Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SECURITY.md](SECURITY.md), and
+[CHANGELOG.md](CHANGELOG.md) before contributing or reporting a problem.
+The maintainer website is [somestrangedays.dev](https://www.somestrangedays.dev/).
+
 `crates/core` never links a UI crate, and no reader or writer API returns a
 whole frame — the reference stack this project targets does not fit in
 memory, so tiling is the default path everywhere, not a fallback.
@@ -208,3 +216,8 @@ Pull requests run the same native package jobs without creating a release.
 macOS produces a universal DMG and Windows produces one combined MSI; their
 target runners validate the installed package before uploading it for the
 release checksum job.
+
+Before tagging, move the `Unreleased` entries into a heading such as
+`## [0.1.0] - YYYY-MM-DD`, add a fresh `Unreleased` heading, and commit the
+result. The release workflow uses that version heading for release notes; tag
+only after that commit is ready.
