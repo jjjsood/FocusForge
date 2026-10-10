@@ -8,16 +8,466 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 import sys
 import time
 
 import numpy as np
+import PIL
 
-from . import coefficient_shrinkage, consistency, focus_score, fusion, index_field, mask_pyramid
+from . import coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
+from .runner import gff, _wavelet_verify_file, _wavelet_input_identity, complex_wavelet_case_controls, _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, complex_wavelet_paired_effects, complex_wavelet_repeat_equality, complex_wavelet_repeat_preflight, run_complex_wavelet_configurations, run_complex_wavelet_resource_body, run_complex_wavelet_stack, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
+
+
+def _complex_wavelet_semantics() -> dict[str, object]:
+    """Return fixed transform and comparison settings for this arm."""
+    return {"arm": "complex-wavelet", "transform": "Lina-Mayrand symmetric six-tap complex Daubechies", "levels": 5,
+            "orientations": 3, "representation": "critically sampled complex coefficients", "analysis_phase": "2k+j-3 periodic",
+            "synthesis": "conjugate adjoint", "padding": "bottom-right reflect; padded samples ineligible",
+            "score": "unwindowed summed channel magnitude squared", "grey": "arithmetic RGB mean", "lowpass": "eligible-source mean",
+            "configurations": list(complex_wavelet.CONFIGURATIONS), "selection": {"ties": "first eligible strict-greater", "detail_tuple": "one RGB source tuple per band", "lowpass": "eligible-source mean", "vote": "two-of-three orientations with second streaming gather", "grey": "nearest eligible grey source colour reassignment"},
+            "maps": {"orientation": "three global two-pixel-anchor winner/support maps", "pixel_reassignment": "separate from coefficient winners", "uncovered": "NO_SOURCE distinct from unsupported"},
+            "tile": {"outer_domain": "global padded periodic", "phase_pixels": 32, "margin": "four-config empirical impulse proof before body", "insufficient_interior": "refuse"},
+            "real": {"manifest_sha256": "c61d135c8ca1e25d7d53b6b3db1bc5d7c9d1cbad1bd9e5d660a65b10f88ec405", "report_sha256": "bc4ca98f0d6bb5e980ace9c4ae57fd5ee5ecc03c5c99623144fb947438aa9ce3", "raw_indices": [0, 8, 17, 26, 34, 43, 52, 60], "reference": 3, "rect_xywh": [1878, 1056, 1024, 1024], "common_covered_pixels": 1048576, "processing_origin": "aligned registered crop only", "truth": "unavailable", "montages": 4, "null_reasons": 17},
+            "metrics": {"count": 17, "definitions": registration()["metrics"], "shared_protocol_sha256": "e6faafb9539343a1579ca71f9d2cdac00b8a7395f8c64a05ec720eaaa7f54ab6", "floors": "unchanged keyed Details allowances"},
+            "resource_procedure": {"bodies": 6, "counts": [8, 32], "repeats": 3, "fresh_process": True, "source": "registered physical TIFF", "no_pixel_or_coefficient_n_cache": True},
+            "limits": {"total_seconds": 21600, "sessions": [7200, 7200, 7200], "source_controls_seconds": 1800, "training_calls": 240, "repeat_calls": 240, "resource_seconds": 600, "training_seconds": 6000, "repeat_seconds": 6000, "real_seconds": 1800, "gates_seconds": 3000, "admin_reserve_seconds": 600, "post_reserve_seconds": 60, "prior_verified_runtime_seconds": 726.10, "unassigned_reserve_seconds": 1013.90},
+            "runtime": {"python": "3.14.4", "numpy": "2.3.5", "pillow": "12.1.1"},
+            "training": {"holdout": "sealed", "tiles": [512, 1024], "seeds": [item.text() for item in TRAINING_SEEDS]}}
+
+
+def _complex_wavelet_identity(document: dict[str, object], modules: dict[str, str], dependencies: dict[str, str]) -> str:
+    """Hash immutable source and scientific bindings across readiness files."""
+    policy = {key: document.get(key) for key in ("hypothesis", "benefit_conjunction", "benefit_key_coverage", "benefit_rule", "hard_veto")}
+    payload = {"semantics": _complex_wavelet_semantics(), "modules": modules, "dependencies": dependencies,
+               "baseline_sha256": document.get("baseline_sha256"), "allowances_sha256": document.get("allowances_sha256"), "policy": policy, "baseline_keys": document.get("baseline_keys"),
+               "shared_protocol": document.get("shared_protocol"), "metric_assessor": document.get("metric_assessor"), "resource_input_pool": document.get("resource_input_pool"),
+               "training_comparison": document.get("training_comparison"), "training_coverage": document.get("training_coverage")}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_complex_wavelet_resources(artifact: object, identity: str, source_sha: str, verified: set[tuple[str, str]], expected_pool: list[dict[str, str]] | None = None) -> None:
+    """Require six native timed bodies over the same physical input pool."""
+    if not isinstance(artifact, dict) or artifact.get("body_count") != 6 or artifact.get("execution_identity") != identity or artifact.get("registration_sha256") != source_sha:
+        raise ValueError("complex-wavelet resource artifact lacks six bound native bodies")
+    rows = artifact.get("records")
+    if not isinstance(rows, list) or len(rows) != 6 or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("complex-wavelet resource records are invalid")
+    if any(any(not isinstance(row.get(name), int) or isinstance(row.get(name), bool) for name in ("frame_count", "repeat")) for row in rows):
+        raise ValueError("complex-wavelet resource keys have invalid scalar types")
+    if {(row.get("frame_count"), row.get("repeat")) for row in rows} != {(n, r) for n in (8, 32) for r in range(3)}:
+        raise ValueError("complex-wavelet resource keys are missing or duplicated")
+    pids, pools, phase_totals = [], [], []
+    for row in rows:
+        if row.get("native_exit") != 0:
+            raise ValueError("complex-wavelet resource body failed")
+        for name, path_key, hash_key in (("argv", "argv_path", "argv_sha256"), ("body", "body_receipt", "body_receipt_sha256"),
+                                      ("stdout", "stdout", "stdout_sha256"), ("stderr", "stderr", "stderr_sha256"),
+                                      ("time", "time_v", "time_v_sha256"), ("exit", "exit_path", "exit_sha256")):
+            _wavelet_verify_file(row.get(path_key), row.get(hash_key), verified)
+        if Path(row["exit_path"]).read_text().strip() != "0":
+            raise ValueError("complex-wavelet resource native exit receipt failed")
+        timing = Path(row["time_v"]).read_text()
+        rss = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", timing)
+        if not re.search(r"Exit status:\s*0\s*(?:$|\n)", timing) or rss is None or int(rss[1]) <= 0:
+            raise ValueError("complex-wavelet resource GNU time/RSS receipt is incomplete")
+        argv = json.loads(Path(row["argv_path"]).read_text())
+        if argv != row.get("argv") or not isinstance(argv, list) or "--resource-body" not in argv or argv.index("--resource-body") + 1 >= len(argv) or str(row["frame_count"]) != argv[argv.index("--resource-body") + 1]:
+            raise ValueError("complex-wavelet resource command identity differs")
+        receipt = json.loads(Path(row["body_receipt"]).read_text())
+        if not isinstance(receipt, dict) or receipt.get("registration_sha256") != source_sha or receipt.get("execution_identity") != identity:
+            raise ValueError("complex-wavelet resource body source identity differs")
+        pid = receipt.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError("complex-wavelet resource body has no native PID")
+        pids.append(pid)
+        body = receipt.get("body")
+        if not isinstance(body, dict) or body.get("frame_count") != row["frame_count"] or body.get("input_shape_hwc") != [512, 512, 3]:
+            raise ValueError("complex-wavelet resource physical geometry differs")
+        pool = body.get("physical_input_pool")
+        if not isinstance(pool, list) or len(pool) != 8 or any(not isinstance(bound, dict) for bound in pool):
+            raise ValueError("complex-wavelet resource physical input pool is incomplete")
+        if expected_pool is not None and pool != expected_pool:
+            raise ValueError("complex-wavelet resource pool differs from registered baseline files")
+        for bound in pool:
+            _wavelet_verify_file(bound.get("path"), bound.get("sha256"), verified)
+            header = gff.rawtiff.read_info(Path(bound["path"]))
+            if (header.height, header.width, header.samples_per_pixel) != (512, 512, 3) or header.bits_per_sample != (16, 16, 16):
+                raise ValueError("complex-wavelet resource input header is not physical 512px RGB16")
+        pools.append(pool)
+        references = body.get("declared_references")
+        if references != [bound["path"] for bound in pool] * (row["frame_count"] // 8):
+            raise ValueError("complex-wavelet resource declared reference order differs")
+        reads = body.get("read_counts")
+        if not isinstance(reads, list) or len(reads) != row["frame_count"] or any(not isinstance(value, int) or value < 2 for value in reads):
+            raise ValueError("complex-wavelet resource streaming read proof is incomplete")
+        _wavelet_verify_file(body.get("composite"), body.get("composite_sha256"), verified)
+        state = body.get("state_bound", {})
+        if not isinstance(state, dict):
+            raise ValueError("complex-wavelet resource source lifetime state is invalid")
+        phases = state.get("phase_total_bytes")
+        if not isinstance(phases, dict) or not phases or any(not isinstance(value, int) or value <= 0 for value in phases.values()):
+            raise ValueError("complex-wavelet resource source lifetime bound is missing")
+        phase_totals.append(phases)
+    if len(set(pids)) != 6 or any(pool != pools[0] for pool in pools) or any(phases != phase_totals[0] for phases in phase_totals):
+        raise ValueError("complex-wavelet resource fresh processes, physical pool or bounded array state differ")
+
+
+def _validate_complex_wavelet_command(registration_path: Path, runs: Path, allowances: Path, resource_only: bool) -> dict[str, object]:
+    """Reject incomplete source or quality registrations before writing output."""
+    if not registration_path.is_file() or not (runs / "baseline.json").is_file() or not allowances.is_file():
+        raise ValueError("--registration, --runs baseline.json, and --allowances are required")
+    try:
+        document = json.loads(registration_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError("complex-wavelet registration is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise ValueError("complex-wavelet registration must be a JSON object")
+    if any(document.get(key) != value for key, value in _complex_wavelet_semantics().items()):
+        raise ValueError("complex-wavelet registration does not match immutable semantics")
+    runtime = _complex_wavelet_semantics()["runtime"]
+    if {"python": sys.version.split()[0], "numpy": np.__version__, "pillow": PIL.__version__} != runtime:
+        raise ValueError("complex-wavelet runtime does not match the registered executable environment")
+    policy = {"hypothesis": "Magnitude-squared maximum selection over Lina-Mayrand complex coefficients improves registered thin-hair and halo quality against retained Details, subject to all unchanged keyed objective floors. Consistency and colour reassignment are paired factors.",
+              "benefit_key_coverage": "every applicable registered training key; no aggregate mean substitution",
+              "benefit_rule": "each claimed metric must exceed two unchanged keyed Details allowances on every applicable training key",
+              "hard_veto": "any applicable objective loss greater than one unchanged keyed Details allowance on any training seed; each orientation label result checked separately"}
+    if (any(document.get(key) != value for key, value in policy.items())
+            or document.get("benefit_conjunction") != "AND"
+            or not isinstance(document.get("readiness_proofs"), dict)):
+        raise ValueError("complex-wavelet registration has no settled immutable benefit and hard-veto policy")
+    verified: set[tuple[str, str]] = set()
+    for name in ("shared_protocol", "metric_assessor"):
+        bound = document.get(name)
+        if not isinstance(bound, dict):
+            raise ValueError(f"complex-wavelet registration lacks {name} file binding")
+        _wavelet_verify_file(bound.get("path"), bound.get("sha256"), verified)
+    shared = json.loads(Path(document["shared_protocol"]["path"]).read_text())
+    if document["shared_protocol"]["sha256"] != document["metrics"]["shared_protocol_sha256"] or shared.get("metrics") != registration()["metrics"]:
+        raise ValueError("complex-wavelet shared metric definitions are stale")
+    package = Path(__file__).parent
+    names = [f"spikes/stacking_experiments/{name}" for name in ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py", "coefficient_shrinkage.py", "mask_pyramid.py", "complex_wavelet.py")]
+    current = {name: hashlib.sha256((package / Path(name).name).read_bytes()).hexdigest() for name in names}
+    dependencies = {name: hashlib.sha256((package.parents[1] / name).read_bytes()).hexdigest() for name in
+                    ("spikes/guided-filter-fusion/gff_fusion.py", "spikes/synthetic-ground-truth/synth_stack.py", "tools/lib/rawtiff.py", "tools/tiff-diff.py")}
+    if document.get("canonical_modules") != names or document.get("execution_module_sha256") != current or document.get("dependency_sha256") != dependencies:
+        raise ValueError("complex-wavelet registration source bindings are stale")
+    if (document.get("baseline_sha256") != "9f9d1e1f3195b4841180648617305aea4e2be3c98a49a815b4f6184f0bfc084c"
+            or document.get("allowances_sha256") != "eb2086eb35d94b7254016ecbe10628a6a52ea5cc9b2d9544b02b4f93c418a5dc"):
+        raise ValueError("complex-wavelet registration changed immutable baseline or allowances")
+    if hashlib.sha256((runs / "baseline.json").read_bytes()).hexdigest() != document.get("baseline_sha256"):
+        raise ValueError("complex-wavelet baseline records do not match registration")
+    focus_score._validate_baseline_inputs(runs / "baseline.json")
+    baseline_rows = json.loads((runs / "baseline.json").read_text())
+    keys = [{"family": row["family"], "member": row["member"], "seed": row["seed"], "tile": row["tile"]}
+            for row in baseline_rows if row.get("method") == "laplacian" and row.get("repeat") == 0]
+    keys.sort(key=lambda item: (item["family"], item["member"], item["seed"], item["tile"]))
+    expected_keys = {(family.name, member, seed.text(), tile) for family in FAMILIES if family.fusion_baseline
+                     for member in family_members(family) for seed in TRAINING_SEEDS for tile in (512, 1024)}
+    if (len(keys) != 60 or {(item["family"], item["member"], item["seed"], item["tile"]) for item in keys} != expected_keys
+            or {item["tile"] for item in keys} != {512, 1024}
+            or {item["seed"] for item in keys} != {seed.text() for seed in TRAINING_SEEDS}
+            or document.get("baseline_keys") != keys):
+        raise ValueError("complex-wavelet registration does not bind the exact 60 retained Details keys")
+    coverage = [{**{name: row[name] for name in ("family", "member", "seed", "tile")}, **_wavelet_input_identity(row)}
+                for row in baseline_rows if row.get("method") == "laplacian" and row.get("repeat") == 0]
+    coverage.sort(key=lambda row: tuple(row[name] for name in ("family", "member", "seed", "tile")))
+    if document.get("training_coverage") != coverage:
+        raise ValueError("complex-wavelet registration training coverage is missing or stale")
+    resource_row = next(row for row in baseline_rows if row.get("method") == "laplacian" and row.get("repeat") == 0 and row.get("family") == "thin-hairs" and row.get("seed") == "101,201,301" and row.get("tile") == 512)
+    expected_pool = [{"path": str(Path(resource_row["case"]) / "frames" / name), "sha256": digest} for name, digest in sorted(resource_row["input_sha256"].items())]
+    if document.get("resource_input_pool") != expected_pool:
+        raise ValueError("complex-wavelet resource pool differs from the registered retained inputs")
+    if not isinstance(document.get("training_comparison"), str) or not document["training_comparison"]:
+        raise ValueError("complex-wavelet registration needs the prospective training comparison locator")
+    if hashlib.sha256(allowances.read_bytes()).hexdigest() != document.get("allowances_sha256"):
+        raise ValueError("complex-wavelet allowances do not match registration")
+    identity = _complex_wavelet_identity(document, current, dependencies)
+    if document.get("execution_identity") != identity:
+        raise ValueError("complex-wavelet registration execution identity is stale")
+    proof = document["readiness_proofs"]
+    expected_proof = {"receipt", "receipt_sha256", "source_identity", "native_exit", "argv_path", "argv_sha256", "stdout_path", "stdout_sha256", "stderr_path", "stderr_sha256", "time_v_path", "time_v_sha256"}
+    proof_path = Path(str(proof.get("receipt", "")))
+    if (set(proof) != expected_proof or not proof_path.is_file()
+            or hashlib.sha256(proof_path.read_bytes()).hexdigest() != proof.get("receipt_sha256")
+            or proof.get("source_identity") != identity or proof.get("native_exit") != 0):
+        raise ValueError("complex-wavelet registration lacks a valid source correctness receipt")
+    raw_paths = {"argv": Path(str(proof["argv_path"])), "stdout": Path(str(proof["stdout_path"])),
+                 "stderr": Path(str(proof["stderr_path"])), "time_v": Path(str(proof["time_v_path"]))}
+    for name, path in raw_paths.items():
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != proof[f"{name}_sha256"]:
+            raise ValueError(f"complex-wavelet source receipt {name} file is missing or stale")
+    try:
+        proof_document = json.loads(proof_path.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError("complex-wavelet source correctness receipt is invalid JSON") from error
+    if not isinstance(proof_document, dict):
+        raise ValueError("complex-wavelet source correctness receipt must be a JSON object")
+    if (proof_document.get("execution_identity") != identity or proof_document.get("native_exit") != 0
+            or any(proof_document.get(f"{name}_sha256") != proof[f"{name}_sha256"] for name in raw_paths)
+            or any(Path(str(proof_document.get(f"{name}_path", ""))).resolve() != path.resolve() for name, path in raw_paths.items())):
+        raise ValueError("complex-wavelet source correctness receipt does not bind this execution")
+    if not re.search(r"Exit status:\s*0\s*(?:$|\n)", raw_paths["time_v"].read_text()):
+        raise ValueError("complex-wavelet source GNU receipt does not show successful native exit")
+    if not raw_paths["argv"].read_text().strip() or not raw_paths["stdout"].read_text().strip():
+        raise ValueError("complex-wavelet source command or positive control output is empty")
+    if document.get("execution_ready") is not True:
+        raise ValueError("complex-wavelet registration is not source-ready")
+    if resource_only:
+        if document.get("quality_ready") is not False:
+            raise ValueError("complex-wavelet resource mode requires immutable SOURCE_READY registration")
+    else:
+        resources = document.get("resources")
+        if document.get("quality_ready") is not True or not isinstance(resources, dict):
+            raise ValueError("complex-wavelet quality mode requires immutable QUALITY_READY registration")
+        source = Path(str(resources.get("source_registration", "")))
+        if source.resolve() == registration_path.resolve():
+            raise ValueError("complex-wavelet quality proof must name a separate immutable source registration")
+        artifact = Path(str(resources.get("resource_artifact", "")))
+        audit = Path(str(resources.get("audit_receipt", "")))
+        if (not source.is_file() or not artifact.is_file() or not audit.is_file()
+                or hashlib.sha256(source.read_bytes()).hexdigest() != resources.get("source_registration_sha256")
+                or hashlib.sha256(artifact.read_bytes()).hexdigest() != resources.get("resource_artifact_sha256")
+                or hashlib.sha256(audit.read_bytes()).hexdigest() != resources.get("audit_receipt_sha256")):
+            raise ValueError("complex-wavelet resource proof or audit is missing or stale")
+        try:
+            source_document, audit_document = json.loads(source.read_text()), json.loads(audit.read_text())
+            source_checked = _validate_complex_wavelet_command(source, runs, allowances, True)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise ValueError("complex-wavelet immutable SOURCE_READY registration is invalid") from error
+        if not isinstance(source_document, dict) or not isinstance(audit_document, dict):
+            raise ValueError("complex-wavelet readiness source registration or audit is invalid")
+        if (source_document.get("quality_ready") is not False or source_document.get("execution_ready") is not True
+                or source_checked.get("_execution_identity") != identity
+                or _complex_wavelet_identity(source_document, current, dependencies) != identity
+                or audit_document.get("passed") is not True or resources.get("execution_identity") != identity
+                or audit_document.get("execution_identity") != identity
+                or audit_document.get("source_registration") != str(source.resolve())
+                or audit_document.get("source_registration_sha256") != resources.get("source_registration_sha256")
+                or audit_document.get("resource_artifact") != str(artifact.resolve())
+                or audit_document.get("resource_artifact_sha256") != resources.get("resource_artifact_sha256")):
+            raise ValueError("complex-wavelet readiness evidence does not bind this execution")
+        artifact_document = json.loads(artifact.read_text())
+        _validate_complex_wavelet_resources(artifact_document, identity, resources["source_registration_sha256"], verified, expected_pool)
+        if audit_document.get("resource_body_count") != 6 or audit_document.get("source_lifetime_pass") is not True or audit_document.get("native_receipts_pass") is not True:
+            raise ValueError("complex-wavelet resource audit has not verified six bodies and source lifetime")
+    document["_validated_registration_sha256"] = hashlib.sha256(registration_path.read_bytes()).hexdigest()
+    document["_execution_identity"] = identity
+    return document
+
+
+def _complex_wavelet_guard_checks(template_path: Path, runs: Path, allowances: Path, output: Path) -> list[dict[str, object]]:
+    """Check constructed native schemas and refusals without measured wavelet bodies."""
+    import copy
+    import contextlib
+    import io
+    from . import runner
+    cli = sys.modules[__name__]
+    OUT = output / "guard-controls"
+    OUT.mkdir(exist_ok=False)
+    records_out = []
+    sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+    def write(path,value):
+        path.write_text(json.dumps(value,indent=2)+'\n');return path
+
+    def native(directory,payload):
+        directory.mkdir()
+        write(directory/'payload.json',payload)
+        script=directory/'child.py'
+        script.write_text("import json,os,sys\nfrom pathlib import Path\np=Path(__file__).parent\nd=json.loads((p/'payload.json').read_text());d['pid']=os.getpid();(p/'body.json').write_text(json.dumps(d));print('constructed guard fixture; no wavelet workload')\n")
+        argv=['/usr/bin/time','-v','-o',str(directory/'time.txt'),sys.executable,str(script),'--resource-body',str(payload.get('body',{}).get('frame_count',8))]
+        write(directory/'argv.json',argv)
+        with (directory/'stdout.txt').open('w') as out,(directory/'stderr.txt').open('w') as err:
+            result=subprocess.run(argv,stdout=out,stderr=err)
+        (directory/'exit.txt').write_text(str(result.returncode)+'\n');assert result.returncode==0
+        return argv
+
+    baseline=json.loads((runs/'baseline.json').read_text())
+    details=[r for r in baseline if r['method']=='laplacian' and r['repeat']==0]
+    keys=[{k:r[k] for k in ('family','member','seed','tile')} for r in details]
+    keys.sort(key=lambda r:tuple(r[k] for k in ('family','member','seed','tile')))
+    doc=json.loads(template_path.read_text())
+    if not isinstance(doc, dict):
+        raise ValueError("complex-wavelet control template must be a JSON object")
+    doc.update(test_fixture=True,execution_ready=True,quality_ready=False)
+    identity=doc['execution_identity']
+    control=OUT/'control';native(control,{'execution_identity':identity})
+    proof={'source_identity':identity,'native_exit':0}
+    receipt={'execution_identity':identity,'native_exit':0,'test_fixture':True}
+    for name,file in [('argv','argv.json'),('stdout','stdout.txt'),('stderr','stderr.txt'),('time_v','time.txt')]:
+        path=control/file;proof[name+'_path']=str(path);proof[name+'_sha256']=sha(path);receipt[name+'_path']=str(path);receipt[name+'_sha256']=sha(path)
+    receipt_path=write(control/'receipt.json',receipt);proof.update(receipt=str(receipt_path),receipt_sha256=sha(receipt_path));doc['readiness_proofs']=proof
+    source=write(OUT/'source.json',doc)
+    checked=cli._validate_complex_wavelet_command(source,runs,allowances,True)
+    assert checked['_execution_identity']==identity
+    records_out.append({"name":"constructed-source-schema", "test_fixture":True, "passed":True})
+
+    # Reused physical arrays are explicitly constructed guard fixtures, not candidate rows.
+    image=OUT/'image.tif';runner.gff.write_u16(image,np.zeros((512,512,3),np.uint16))
+    label=OUT/'label.tif';runner.gff.write_u16(label,np.zeros((512,512,1),np.uint16))
+    support=OUT/'support.npy';np.save(support,np.ones((512,512),bool))
+    plane={'path':str(label),'sha256':sha(label)};live={'path':str(support),'sha256':sha(support),'pixels':512*512}
+    map_tree=[[dict(plane) for _ in range(3)] for _ in range(5)]
+    records=[]
+    for config in complex_wavelet.CONFIGURATIONS:
+     for key in keys:
+        records.append({**key,'configuration_id':config['id'],'repeat':0,'input_identity':{'fixture':'a'*64},'coverage_identity':{'coverage':None},'aligned_identity':None,'whole':str(image),'whole_sha256':sha(image),'tiled':str(image),'tiled_sha256':sha(image),
+          **{name:copy.deepcopy(map_tree) for name in ('coefficient_source_maps','tiled_coefficient_source_maps','raw_coefficient_source_maps','tiled_raw_coefficient_source_maps')},
+          'support_maps':[[dict(live) for _ in range(3)] for _ in range(5)],'tiled_support_maps':[[dict(live) for _ in range(3)] for _ in range(5)],
+          'pixel_source_map':dict(plane) if config['colour']=='reassign' else None,'tiled_pixel_source_map':dict(plane) if config['colour']=='reassign' else None,
+          'orientation_label_maps':[dict(plane,orientation=b,support_path=str(support),support_sha256=sha(support)) for b in range(3)],
+          'native_whole_tile':dict(different_samples=0,pixel_source_differences=0,orientation_map_differences=[0]*15,raw_map_differences=[0]*15,support_differences=[0]*15)})
+    runner.complex_wavelet_repeat_preflight(records)
+    records_out.append({"name":"constructed-repeat-native-files", "test_fixture":True, "passed":True})
+    for mutation in ('unknown-key','missing-map','wrong-hash','missing-file','typed-key'):
+        bad=copy.deepcopy(records)
+        if mutation=='unknown-key':bad[0]['seed']='111,211,311'
+        if mutation=='typed-key':bad[0]['tile']=[]
+        if mutation=='missing-map':bad[0].pop('raw_coefficient_source_maps')
+        if mutation=='wrong-hash':bad[0]['whole_sha256']='b'*64
+        if mutation=='missing-file':bad[0]['whole']=str(OUT/'absent.tif')
+        try:runner.complex_wavelet_repeat_preflight(bad)
+        except ValueError:records_out.append({"name":"repeat-"+mutation,"test_fixture":True,"refused":True})
+        else:raise AssertionError(mutation)
+
+    base=next(r for r in details if r['family']=='thin-hairs' and r['seed']=='101,201,301' and r['tile']==512)
+    pool=[{'path':str(p),'sha256':sha(p)} for p in runner._selection_source(base).paths]
+    resource_rows=[]
+    for count in (8,32):
+     for repeat in range(3):
+        directory=OUT/f'body-n{count}-r{repeat}'
+        payload={'test_fixture':True,'registration_sha256':sha(source),'execution_identity':identity,'body':{'frame_count':count,'configuration_id':'shared-raw','input_shape_hwc':[512,512,3],'physical_input_pool':pool,'declared_references':[p['path'] for p in pool]*(count//8),'read_counts':[2]*count,'composite':str(image),'composite_sha256':sha(image),'state_bound':{'phase_total_bytes':{'constructed_fixture':100}}}}
+        argv=native(directory,payload)
+        row={'frame_count':count,'repeat':repeat,'native_exit':0,'argv':argv}
+        for path_key,hash_key,file in [('argv_path','argv_sha256','argv.json'),('body_receipt','body_receipt_sha256','body.json'),('stdout','stdout_sha256','stdout.txt'),('stderr','stderr_sha256','stderr.txt'),('time_v','time_v_sha256','time.txt'),('exit_path','exit_sha256','exit.txt')]:
+            row[path_key]=str(directory/file);row[hash_key]=sha(directory/file)
+        resource_rows.append(row)
+    artifact_doc={'test_fixture':True,'body_count':6,'registration_sha256':sha(source),'execution_identity':identity,'records':resource_rows}
+    artifact=write(OUT/'resources.json',artifact_doc)
+    audit=write(OUT/'audit.json',dict(test_fixture=True,passed=True,resource_body_count=6,source_lifetime_pass=True,native_receipts_pass=True,execution_identity=identity,source_registration=str(source.resolve()),source_registration_sha256=sha(source),resource_artifact=str(artifact.resolve()),resource_artifact_sha256=sha(artifact)))
+    quality_doc=copy.deepcopy(doc);quality_doc.update(quality_ready=True,resources=dict(source_registration=str(source),source_registration_sha256=sha(source),resource_artifact=str(artifact),resource_artifact_sha256=sha(artifact),audit_receipt=str(audit),audit_receipt_sha256=sha(audit),execution_identity=identity))
+    quality=write(OUT/'quality.json',quality_doc)
+    cli._validate_complex_wavelet_command(quality,runs,allowances,False)
+    records_out.append({"name":"constructed-quality-schema", "test_fixture":True, "passed":True})
+    for mutation in ('empty','duplicate-key','missing-argv','duplicate-pid'):
+        bad=copy.deepcopy(artifact_doc)
+        if mutation=='empty':bad={}
+        if mutation=='duplicate-key':bad['records'][-1]=bad['records'][0]
+        if mutation=='missing-argv':bad['records'][0]['argv_path']=str(OUT/'absent.json')
+        if mutation=='duplicate-pid':
+            receipt2=json.loads(Path(bad['records'][1]['body_receipt']).read_text());receipt2['pid']=json.loads(Path(bad['records'][0]['body_receipt']).read_text())['pid'];p=write(OUT/'duplicate-pid.json',receipt2);bad['records'][1].update(body_receipt=str(p),body_receipt_sha256=sha(p))
+        try:cli._validate_complex_wavelet_resources(bad,identity,sha(source),set())
+        except ValueError:records_out.append({"name":"resource-"+mutation,"test_fixture":True,"refused":True})
+        else:raise AssertionError(mutation)
+    for mutation in ('OR','runtime','baseline','missing-assessor','missing-proof-file','stale-identity','training-coverage','fixture-workload'):
+        bad=copy.deepcopy(doc)
+        if mutation=='OR':bad['benefit_conjunction']='OR'
+        if mutation=='runtime':bad['runtime']['python']='0.0'
+        if mutation=='baseline':bad['baseline_sha256']='a'*64
+        if mutation=='missing-assessor':bad['metric_assessor']['path']=str(OUT/'absent.py')
+        if mutation=='missing-proof-file':bad['readiness_proofs']['stdout_path']=str(OUT/'absent.txt')
+        if mutation=='stale-identity':bad['execution_identity']='a'*64
+        if mutation=='training-coverage':bad['training_coverage']=[]
+        path=write(OUT/(mutation+'.json'),bad)
+        output=OUT/('refused-'+mutation)
+        expected={'OR':'settled immutable benefit', 'runtime':'immutable semantics', 'baseline':'changed immutable baseline', 'missing-assessor':'file', 'missing-proof-file':'stdout file', 'stale-identity':'execution identity is stale', 'training-coverage':'training coverage is missing or stale', 'fixture-workload':'constructed validation fixtures cannot authorize measured workloads'}[mutation]
+        diagnostic=io.StringIO()
+        with contextlib.redirect_stderr(diagnostic):
+            try:cli.main(['complex-wavelet','--resource-only','--registration',str(path),'--runs',str(runs),'--allowances',str(allowances),'--out',str(output)])
+            except SystemExit as error:assert error.code!=0
+            else:raise AssertionError(mutation)
+        message=diagnostic.getvalue();print(message, file=sys.stderr, end='')
+        assert expected in message, (mutation,expected,message)
+        assert not output.exists()
+        records_out.append({"name":"public-"+mutation,"expected_error":expected,"test_fixture":True,"refused":True})
+    def refuse(name, expected, action, absent=None):
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            try:
+                returned = action()
+            except (ValueError, SystemExit) as error:
+                if isinstance(error, SystemExit):
+                    assert error.code != 0, name
+                message = str(error) + captured.getvalue()
+            else:
+                assert returned == 1, f"{name}: refusal escaped"
+                message = captured.getvalue()
+        assert expected in message, (name, expected, message)
+        assert absent is None or not absent.exists(), name
+        records_out.append({"name": name, "expected_error": expected, "diagnostic": message, "test_fixture": True, "refused": True})
+
+    for name, expected in (("stale-source", "source bindings are stale"), ("stale-dependency", "source bindings are stale"),
+                           ("missing-readiness", "not source-ready"), ("missing-proof", "valid source correctness receipt")):
+        bad = copy.deepcopy(doc)
+        if name == "stale-source":
+            bad['execution_module_sha256'][bad['canonical_modules'][0]] = '0' * 64
+        elif name == "stale-dependency":
+            bad['dependency_sha256'][next(iter(bad['dependency_sha256']))] = '0' * 64
+        elif name == "missing-readiness":
+            bad['execution_ready'] = False
+        else:
+            bad['readiness_proofs'] = {}
+        path = write(OUT / (name + '.json'), bad)
+        refuse(name, expected, lambda path=path: _validate_complex_wavelet_command(path, runs, allowances, True))
+    refuse("source-only-quality", "immutable QUALITY_READY", lambda: _validate_complex_wavelet_command(source, runs, allowances, False))
+    foreign_runs = OUT / "changed-baseline"
+    foreign_runs.mkdir()
+    write(foreign_runs / "baseline.json", [])
+    refuse("changed-baseline-bytes", "baseline records do not match", lambda: _validate_complex_wavelet_command(source, foreign_runs, allowances, True))
+    changed_allowance = write(OUT / "changed-allowance.json", [])
+    refuse("changed-allowance-bytes", "allowances do not match", lambda: _validate_complex_wavelet_command(source, runs, changed_allowance, True))
+    for name in ("missing-resource", "changed-resource", "missing-audit", "malformed-audit", "malformed-state"):
+        bad = copy.deepcopy(quality_doc)
+        if name == "missing-resource":
+            bad['resources']['resource_artifact'] = str(OUT / 'absent-resource.json')
+        elif name == "changed-resource":
+            bad['resources']['resource_artifact_sha256'] = '0' * 64
+        elif name == "missing-audit":
+            bad['resources']['audit_receipt'] = str(OUT / 'absent-audit.json')
+        elif name == "malformed-audit":
+            path = write(OUT / 'malformed-audit-body.json', [])
+            bad['resources'].update(audit_receipt=str(path), audit_receipt_sha256=sha(path))
+        else:
+            changed = copy.deepcopy(artifact_doc)
+            body_path = Path(changed['records'][0]['body_receipt'])
+            body = json.loads(body_path.read_text())
+            body['body']['state_bound'] = []
+            path = write(OUT / 'malformed-state-body.json', body)
+            changed['records'][0].update(body_receipt=str(path), body_receipt_sha256=sha(path))
+            artifact_path = write(OUT / 'malformed-state-artifact.json', changed)
+            audit_body = json.loads(audit.read_text())
+            audit_body.update(resource_artifact=str(artifact_path.resolve()), resource_artifact_sha256=sha(artifact_path))
+            audit_path = write(OUT / 'malformed-state-audit.json', audit_body)
+            bad['resources'].update(resource_artifact=str(artifact_path), resource_artifact_sha256=sha(artifact_path), audit_receipt=str(audit_path), audit_receipt_sha256=sha(audit_path))
+        path = write(OUT / (name + '.json'), bad)
+        expected = 'source lifetime state is invalid' if name == 'malformed-state' else 'source registration or audit is invalid' if name == 'malformed-audit' else 'resource proof or audit is missing or stale'
+        refuse(name, expected, lambda path=path: _validate_complex_wavelet_command(path, runs, allowances, False))
+    unknown = copy.deepcopy(records)
+    unknown[0]['seed'] = '111,211,311'
+    refuse('sealed-seed', 'exact unique 240 training keys', lambda: runner.complex_wavelet_repeat_preflight(unknown))
+    real_output = OUT / 'refused-unset-environment'
+    old_environment = os.environ.pop('FOCUSFORGE_REFERENCE_STACK', None)
+    try:
+        refuse('unset-real-environment', 'FOCUSFORGE_REFERENCE_STACK', lambda: main(['complex-wavelet', '--source', 'stack', '--registration', str(quality), '--runs', str(runs), '--allowances', str(allowances), '--out', str(real_output)]), real_output)
+    finally:
+        if old_environment is not None:
+            os.environ['FOCUSFORGE_REFERENCE_STACK'] = old_environment
+    # Small immutable physical inputs exercise preparation failures before any crop.
+    pool_paths = [Path(bound['path']) for bound in pool]
+    raw = [{'source_path': str(path.resolve()), 'sha256': sha(path), **runner._header(path)} for path in pool_paths]
+    preparation = {'source': 'stack', 'raw_inputs': raw, 'alignment_exit': 1, 'strict': False, 'settings': runner.ALIGN_SETTINGS, 'reference_frame': 3}
+    bypass = write(OUT / 'bypassed-preparation.json', preparation)
+    refuse('missing-preparation', 'manifest is required', lambda: runner._validate_preparation(OUT / 'absent-preparation.json', 'stack', pool_paths))
+    refuse('bypassed-preparation', 'strict alignment exit 0', lambda: runner._validate_preparation(bypass, 'stack', pool_paths))
+    preparation.update(alignment_exit=0, strict=True, alignment_report=str(OUT / 'absent-report.json'))
+    stale = write(OUT / 'stale-preparation.json', preparation)
+    refuse('stale-preparation-report', 'alignment report is missing or stale', lambda: runner._validate_preparation(stale, 'stack', pool_paths))
+    refuse('changed-preparation-bytes', 'native file is missing or stale', lambda: _wavelet_verify_file(str(stale), doc['real']['manifest_sha256'], set()))
+    write(OUT / 'summary.json', {'test_fixture': True, 'scientific_executions': 0, 'execution_ready_for_science': False, 'records': records_out})
+    return records_out
 
 
 def _mask_pyramid_semantics() -> dict[str, object]:
@@ -822,6 +1272,22 @@ def main(argv: list[str] | None = None) -> int:
     masks.add_argument("--rect")
     masks.add_argument("--resource-only", action="store_true")
     masks.add_argument("--repeat-only", action="store_true")
+    wavelet = sub.add_parser("complex-wavelet")
+    wavelet.add_argument("--self-check", dest="wavelet_self_check", action="store_true")
+    wavelet.add_argument("--reach-only", action="store_true")
+    wavelet.add_argument("--break", dest="wavelet_break", choices=("missing-conjugate", "ignore-mask", "per-channel-selection", "real-only-magnitude", "inconsistent-vote-gather"))
+    wavelet.add_argument("--registration")
+    wavelet.add_argument("--runs")
+    wavelet.add_argument("--allowances")
+    wavelet.add_argument("--out")
+    wavelet.add_argument("--split", choices=("training",))
+    wavelet.add_argument("--source", choices=("stack",))
+    wavelet.add_argument("--prepared")
+    wavelet.add_argument("--rect")
+    wavelet.add_argument("--resource-only", action="store_true")
+    wavelet.add_argument("--training-sha256", help="immutable first comparison SHA256 required for repeat")
+    wavelet.add_argument("--resource-body", type=int, choices=(8, 32), help=argparse.SUPPRESS)
+    wavelet.add_argument("--repeat-only", action="store_true")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -830,6 +1296,139 @@ def main(argv: list[str] | None = None) -> int:
         if args.out:
             Path(args.out).write_text(document + "\n")
         print(document)
+        return 0
+    if args.command == "complex-wavelet":
+        if args.training_sha256 is not None and not args.repeat_only:
+            parser.error("--training-sha256 requires --repeat-only")
+        if args.wavelet_break is not None and not (args.wavelet_self_check or args.reach_only):
+            parser.error("--break requires a complex-wavelet control mode")
+        if args.resource_body is not None and not args.resource_only:
+            parser.error("--resource-body requires --resource-only")
+        if (args.prepared is not None or args.rect is not None) and args.source != "stack":
+            parser.error("--prepared and --rect require --source stack")
+        if args.wavelet_self_check and args.reach_only:
+            parser.error("--self-check and --reach-only are mutually exclusive")
+        if args.wavelet_self_check or args.reach_only:
+            context = (args.registration, args.runs, args.allowances)
+            if args.split is not None:
+                parser.error("complex-wavelet controls do not consume training splits")
+            if any(context) and (not all(context) or args.reach_only):
+                parser.error("complete --self-check context requires --registration, --runs, and --allowances together")
+            if args.resource_only or args.repeat_only or args.source is not None:
+                parser.error("complex-wavelet controls do not accept quality, repeat, resource, or real-source modes")
+            out = Path(args.out or (".scratch/complex-wavelet/reach" if args.reach_only else ".scratch/complex-wavelet/controls"))
+            try:
+                records = complex_wavelet.self_checks(out, args.wavelet_break)
+                if all(context) and args.wavelet_break is None:
+                    records += complex_wavelet_case_controls(out)
+                    records += _complex_wavelet_guard_checks(Path(args.registration), Path(args.runs), Path(args.allowances), out)
+            except (AssertionError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            if args.wavelet_break is not None:
+                print(f"broken variant escaped detection: {args.wavelet_break}", file=sys.stderr)
+                return 1
+            for record in records:
+                print(f"{record['name']}: ok {json.dumps(record, sort_keys=True)}")
+            return 0
+        if args.resource_only and args.repeat_only:
+            parser.error("--resource-only and --repeat-only are mutually exclusive")
+        if args.resource_only and args.source is not None:
+            parser.error("--resource-only does not accept a real source")
+        if args.repeat_only and args.source is not None:
+            parser.error("--repeat-only does not accept a real source")
+        if args.split is not None and (args.resource_only or args.repeat_only or args.source is not None):
+            parser.error("--split is only valid for synthetic training mode")
+        if not args.resource_only and not args.repeat_only and args.source is None and args.split != "training":
+            parser.error("complex-wavelet synthetic quality mode requires --split training")
+        if not all((args.registration, args.runs, args.allowances, args.out)):
+            parser.error("--registration, --runs, --allowances, and --out are required")
+        if args.source == "stack" and not os.environ.get("FOCUSFORGE_REFERENCE_STACK"):
+            print("FOCUSFORGE_REFERENCE_STACK is required for complex-wavelet real mode", file=sys.stderr)
+            return 1
+        try:
+            document = _validate_complex_wavelet_command(Path(args.registration), Path(args.runs), Path(args.allowances), args.resource_only)
+        except ValueError as error:
+            parser.error(str(error))
+        if document.get("test_fixture") is True:
+            parser.error("constructed validation fixtures cannot authorize measured workloads")
+        if args.source == "stack":
+            if args.prepared is None or args.rect != ",".join(str(v) for v in document["real"]["rect_xywh"]):
+                parser.error("complex-wavelet real mode requires its registered preparation and exact crop")
+            prepared = Path(args.prepared)
+            try:
+                _wavelet_verify_file(str(prepared), document["real"]["manifest_sha256"], set())
+                manifest = _validate_preparation(prepared, "stack")
+                if manifest.get("alignment_report_sha256") != document["real"]["report_sha256"]:
+                    raise ValueError("complex-wavelet real alignment report differs from registration")
+            except ValueError as error:
+                parser.error(str(error))
+        output = Path(args.out)
+        repeat_reference = None
+        if args.repeat_only:
+            reference = Path(str(document.get("training_comparison", "")))
+            if not reference.is_file():
+                parser.error("complex-wavelet repeat requires immutable training_comparison record")
+            try:
+                if not isinstance(args.training_sha256, str) or hashlib.sha256(reference.read_bytes()).hexdigest() != args.training_sha256:
+                    raise ValueError("immutable training comparison SHA256 is missing or changed")
+                comparison = json.loads(reference.read_text())
+                if not isinstance(comparison, dict):
+                    raise ValueError("immutable training comparison must be a JSON object")
+                if comparison.get("execution_identity") != document["_execution_identity"] or comparison.get("registration_sha256") != document["_validated_registration_sha256"] or comparison.get("repeat_only") is not False:
+                    raise ValueError("immutable training comparison execution or registration identity differs")
+                repeat_reference = comparison["candidate_rows"]
+                complex_wavelet_repeat_preflight(repeat_reference, json.loads((Path(args.runs) / "baseline.json").read_text()))
+            except (KeyError, ValueError, json.JSONDecodeError) as error:
+                parser.error(f"complex-wavelet repeat validation failed: {error}")
+        if args.resource_only:
+            output.mkdir(parents=True, exist_ok=True)
+            if args.resource_body is not None:
+                body = run_complex_wavelet_resource_body(Path(args.runs), output, args.resource_body)
+                (output / "resource-body.json").write_text(json.dumps({"command": sys.argv if argv is None else [sys.argv[0], *argv],
+                    "registration_sha256": document["_validated_registration_sha256"], "execution_identity": document["_execution_identity"],
+                    "pid": os.getpid(), "body": body}, indent=2, sort_keys=True) + "\n")
+                print(f"resource body N={args.resource_body}")
+                return 0
+            records = []
+            for count in (8, 32):
+                for repeat in range(3):
+                    body_dir = output / f"body-n{count}-r{repeat}"
+                    body_dir.mkdir(parents=True, exist_ok=True)
+                    stdout, stderr, time_v, exit_path, argv_path = (body_dir / "stdout.txt", body_dir / "stderr.txt", body_dir / "time-v.txt", body_dir / "exit.txt", body_dir / "argv.json")
+                    child = [sys.executable, "-m", "spikes.stacking_experiments", "complex-wavelet", "--resource-only", "--registration", str(args.registration), "--runs", str(args.runs), "--allowances", str(args.allowances), "--out", str(body_dir), "--resource-body", str(count)]
+                    timed = ["/usr/bin/time", "-v", "-o", str(time_v), *child]
+                    argv_path.write_text(json.dumps(timed) + "\n")
+                    with stdout.open("w") as out_handle, stderr.open("w") as err_handle:
+                        process = subprocess.run(timed, cwd=Path(__file__).resolve().parents[2], env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, stdout=out_handle, stderr=err_handle, text=True)
+                    exit_path.write_text(f"{process.returncode}\n")
+                    if process.returncode:
+                        raise RuntimeError(f"complex-wavelet resource body N={count} repeat={repeat} exited {process.returncode}")
+                    body_json = body_dir / "resource-body.json"
+                    if not body_json.is_file():
+                        raise RuntimeError("complex-wavelet resource body wrote no receipt")
+                    records.append({"frame_count": count, "repeat": repeat, "argv": timed, "argv_path": str(argv_path), "argv_sha256": hashlib.sha256(argv_path.read_bytes()).hexdigest(), "native_exit": process.returncode,
+                                    "body_receipt": str(body_json), "body_receipt_sha256": hashlib.sha256(body_json.read_bytes()).hexdigest(),
+                                    "stdout": str(stdout), "stdout_sha256": hashlib.sha256(stdout.read_bytes()).hexdigest(), "stderr": str(stderr), "stderr_sha256": hashlib.sha256(stderr.read_bytes()).hexdigest(),
+                                    "time_v": str(time_v), "time_v_sha256": hashlib.sha256(time_v.read_bytes()).hexdigest(), "exit_path": str(exit_path), "exit_sha256": hashlib.sha256(exit_path.read_bytes()).hexdigest()})
+            (output / "resource-bodies.json").write_text(json.dumps({"registration_sha256": document["_validated_registration_sha256"], "execution_identity": document["_execution_identity"], "records": records, "body_count": len(records)}, indent=2, sort_keys=True) + "\n")
+            print("resource bodies: 6")
+            return 0
+        rows = (run_complex_wavelet_stack(output, args.source, Path(args.prepared) if args.prepared else None, args.rect, document["configurations"])["rows"]
+                if args.source == "stack" else run_complex_wavelet_configurations(Path(args.runs), output, document["configurations"], repeat=1 if args.repeat_only else 0))
+        paired, equality = [], []
+        if args.source is None:
+            paired = complex_wavelet_paired_effects(Path(args.runs), rows)
+            if args.repeat_only:
+                try:
+                    assert repeat_reference is not None
+                    equality = complex_wavelet_repeat_equality(rows, repeat_reference)
+                except (ValueError, AssertionError) as error:
+                    parser.error(f"complex-wavelet repeat equality failed: {error}")
+        (output / "comparison.json").write_text(json.dumps({"command": sys.argv if argv is None else [sys.argv[0], *argv],
+            "registration_sha256": document["_validated_registration_sha256"], "execution_identity": document["_execution_identity"],
+            "candidate_rows": rows, "paired_signed_effects": paired, "repeat_native_equality": equality, "repeat_only": args.repeat_only}, indent=2, sort_keys=True) + "\n")
+        print(f"candidate rows: {len(rows)}")
         return 0
     if args.command == "noise-shrinkage":
         if args.shrinkage_self_check:

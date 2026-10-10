@@ -21,8 +21,9 @@ from typing import Iterable
 
 import numpy as np
 import PIL
+from PIL import Image, ImageDraw
 
-from . import coefficient_shrinkage, consistency, fusion, index_field, mask_pyramid, metrics
+from . import coefficient_shrinkage, complex_wavelet, consistency, fusion, index_field, mask_pyramid, metrics
 from .protocol import FAMILIES, FRAME_COUNT, REAL_CROPS, TRAINING_SEEDS, SeedTriple, require_seed
 from .scenes import SceneData, family_members, render_family
 
@@ -2645,6 +2646,519 @@ def _registered_rect(source: str, rect_text: str | None) -> tuple[int, int, int,
     if rect_text is not None and tuple(int(part) for part in rect_text.split(",")) != expected:
         raise ValueError(f"--rect must equal the registered {source} rectangle {','.join(str(part) for part in expected)}")
     return expected
+
+
+def _wavelet_crop_prepared_inputs(root: Path, source: str, manifest_path: Path, rect: tuple[int, int, int, int]) -> tuple[Path, list[Path], dict[str, object]]:
+    """Copy the validated registered crop with wavelet-local retained common masks."""
+    manifest = _validate_preparation(manifest_path, source)
+    report = json.loads(Path(manifest["alignment_report"]).read_text())
+    header = manifest["aligned_inputs"][0]
+    coverage = _roi_coverage(report, rect, int(header["width"]), int(header["height"]))
+    directory = root / "complex-wavelet-crops" / "stack-mantis-registered" / "inputs"
+    (directory / "frames").mkdir(parents=True, exist_ok=True)
+    x, y, width, height = rect
+    outputs = []
+    for index, bound in enumerate(manifest["aligned_inputs"]):
+        aligned = Path(bound["path"])
+        info = gff.rawtiff.read_info(aligned)
+        pixels = gff.rawtiff.read_rect(aligned, x, y, width, height, info)
+        output = directory / "frames" / f"{index:02d}.tif"
+        gff.rawtiff.write_tiff(output, width, height, pixels, bits=16, spp=info.samples_per_pixel)
+        outputs.append(output)
+    mask_path = directory / "coverage-masks.npy"
+    np.save(mask_path, np.ones((len(outputs), height, width), dtype=bool))
+    return directory, outputs, {**coverage, "mask_path": str(mask_path), "mask_sha256": sha256_path(mask_path),
+                                "mask_shape": [len(outputs), height, width], "mask_semantics": "validated common aligned crop coverage"}
+
+
+def _wavelet_maps(root: Path, result: complex_wavelet.FusionResult) -> dict[str, object]:
+    """Write separate coefficient and pixel source maps for one wavelet result."""
+    root.mkdir(parents=True, exist_ok=True)
+    orientation = []
+    raw = []
+    support = []
+    for level, bands in enumerate(result.orientation_winners):
+        level_paths, level_raw, level_support = [], [], []
+        for band, values in enumerate(bands):
+            path = root / f"orientation-l{level}-b{band}.tif"
+            gff.write_u16(path, values[..., None])
+            level_paths.append({"path": str(path), "sha256": sha256_path(path)})
+            raw_path = root / f"raw-orientation-l{level}-b{band}.tif"
+            gff.write_u16(raw_path, result.raw_winners[level][band][..., None])
+            level_raw.append({"path": str(raw_path), "sha256": sha256_path(raw_path)})
+            live = result.support[level][band]
+            support_path = root / f"support-l{level}-b{band}.npy"
+            np.save(support_path, live)
+            level_support.append({"path": str(support_path), "sha256": sha256_path(support_path), "pixels": int(live.sum())})
+        orientation.append(level_paths)
+        raw.append(level_raw)
+        support.append(level_support)
+    pixel = None
+    if result.pixel_sources is not None:
+        path = root / "pixel-sources.tif"
+        gff.write_u16(path, result.pixel_sources[..., None])
+        pixel = {"path": str(path), "sha256": sha256_path(path)}
+    return {"orientation_maps": orientation, "raw_orientation_maps": raw, "support_maps": support, "pixel_source_map": pixel}
+
+
+def _wavelet_aligned_identity(row: dict[str, object]) -> dict[str, object] | None:
+    """Bind retained aligned source and coverage files separately from frozen input identity."""
+    paths = row.get("actual_source_frames")
+    coverage = row.get("actual_coverage")
+    if not paths or not coverage:
+        return None
+    mask = Path(str(coverage))
+    source_paths = [Path(str(path)) for path in paths]
+    if not mask.is_file() or any(not path.is_file() for path in source_paths):
+        raise ValueError("retained aligned source or coverage file is missing")
+    return {"paths": [str(path) for path in source_paths], "path_sha256": [sha256_path(path) for path in source_paths],
+            "coverage_path": str(mask), "coverage_sha256": sha256_path(mask), "reference": row.get("alignment", {}).get("reference"),
+            "transforms": row.get("alignment", {}).get("alignments")}
+
+
+def _wavelet_selection_source(row: dict[str, object]) -> object:
+    """Open retained frames and case coverage used for baseline scoring."""
+    if row.get("actual_source_frames"):
+        coverage = row.get("actual_coverage")
+        if not isinstance(coverage, str) or not Path(coverage).is_file():
+            raise ValueError("complex-wavelet aligned input lacks retained coverage mask")
+        source = gff.TiffSource(row["actual_source_frames"], coverage)
+    else:
+        case = Path(str(row.get("case", "")))
+        mask = case / "masks.npy"
+        if row.get("family") == "invalid-borders" and row.get("member") == "zero-strip" and not mask.is_file():
+            raise ValueError("complex-wavelet zero-strip input lacks required retained masks.npy")
+        source = _source(case)
+    if source.has_masks and (source.masks.dtype != bool or source.masks.shape != (source.n, source.h, source.w)):
+        raise ValueError("complex-wavelet retained coverage has invalid type or dimensions")
+    return source
+
+
+def _wavelet_input_identity(row: dict[str, object]) -> dict[str, object]:
+    """Bind the exact applicable coverage file independently of frame hashes."""
+    source = _wavelet_selection_source(row)
+    if not source.has_masks:
+        return {"coverage": None}
+    path = Path(str(row["actual_coverage"])) if row.get("actual_source_frames") else Path(str(row["case"])) / "masks.npy"
+    return {"coverage": {"path": str(path), "sha256": sha256_path(path), "dtype": str(source.masks.dtype), "shape": list(source.masks.shape)}}
+
+
+def complex_wavelet_case_controls(output: Path) -> list[dict[str, object]]:
+    """Exercise physical case coverage and missing/malformed mask refusals."""
+    case = output / "case-coverage"
+    (case / "frames").mkdir(parents=True)
+    for index in range(2):
+        gff.write_u16(case / "frames" / f"{index:02}.tif", np.full((64, 96, 3), 6000 + index * 1000, dtype=np.uint16))
+    masks = np.ones((2, 64, 96), dtype=bool)
+    masks[0, :, :5] = False
+    masks[1, :, :7] = False
+    mask_path = case / "masks.npy"
+    np.save(mask_path, masks)
+    row = {"case": str(case), "family": "invalid-borders", "member": "zero-strip"}
+    source = _wavelet_selection_source(row)
+    assert source.has_masks and all(np.array_equal(source.read(index)[1], masks[index]) for index in range(2)), "retained case coverage omitted"
+    bound = _wavelet_input_identity(row)["coverage"]
+    assert bound["sha256"] == sha256_path(mask_path) and bound["shape"] == [2, 64, 96] and bound["dtype"] == "bool", "retained coverage identity differs"
+    contamination = gff.border_pull(np.full((64, 96, 3), 5000, dtype=np.uint16), source)
+    assert contamination == 1000.0, "mixed-validity border metric differs"
+    refusals = []
+    for name, value in (("mask-width", np.ones((2, 64, 95), dtype=bool)), ("mask-type", masks.astype(np.uint8)), ("mask-missing", None)):
+        if value is None:
+            mask_path.unlink()
+        else:
+            np.save(mask_path, value)
+        try:
+            _wavelet_selection_source(row)
+        except ValueError as error:
+            assert "coverage" in str(error) or "masks.npy" in str(error), str(error)
+            refusals.append(name)
+        else:
+            raise AssertionError(f"{name}: invalid retained mask accepted")
+    np.save(mask_path, masks)
+    return [{"name": "physical-case-coverage", "shape_hwc": [64, 96, 3], "coverage_sha256": bound["sha256"], "mixed_pixels": 128, "border_contamination": contamination, "refusals": refusals}]
+
+
+def _wavelet_label_maps(root: Path, result: complex_wavelet.FusionResult, shape: tuple[int, int]) -> list[dict[str, object]]:
+    """Expand each finest coefficient plane at its global two-pixel anchors."""
+    labels = []
+    height, width = shape
+    for band, winners in enumerate(result.orientation_winners[0]):
+        expanded = np.repeat(np.repeat(winners, 2, axis=0), 2, axis=1)[:height, :width]
+        support = np.repeat(np.repeat(result.support[0][band], 2, axis=0), 2, axis=1)[:height, :width]
+        path, support_path = root / f"finest-orientation-{band}-labels.tif", root / f"finest-orientation-{band}-support.npy"
+        gff.write_u16(path, expanded[..., None])
+        np.save(support_path, support)
+        labels.append({"orientation": band, "path": str(path), "sha256": sha256_path(path), "support_path": str(support_path),
+                       "support_sha256": sha256_path(support_path), "valid_support_pixels": int(support.sum())})
+    return labels
+
+
+def _wavelet_record_metrics(data: SceneData, row: dict[str, object], composite: Path, labels: list[dict[str, object]],
+                            source: object, tiled_difference: int) -> tuple[dict[str, float | None], dict[str, object], list[dict[str, object]]]:
+    """Reuse frozen image metrics; score each orientation label plane independently."""
+    margin = ((complex_wavelet.theoretical_reach() + 31) // 32) * 32
+    boundaries = tile_boundaries(data.truth.shape[1], data.truth.shape[0], int(row["tile"]), margin, complex_wavelet.LEVELS)
+    metrics_row = {**row, "tile_difference": {"max_abs": tiled_difference}}
+    values, metadata = _record_metrics(data, str(row["family"]), str(row["member"]), metrics_row, composite, Path(str(labels[0]["path"])), source, boundaries)
+    unavailable = dict(metadata["metric_unavailable"])
+    for name in ("label_exact", "label_within_one", "label_mad"):
+        values[name] = None
+        unavailable[name] = "three orientation source-label metrics are recorded separately"
+    for name in ("geometry_error", "alignment_drift", "alignment_failures"):
+        values[name] = None
+        unavailable[name] = "complex-wavelet synthetic comparison does not estimate alignment"
+    label_truth, label_depth, label_support = data.truth, data.depth, np.ones(data.depth.shape, dtype=bool)
+    if row["family"] == "invalid-borders" and row["member"] == "aligned-coverage":
+        label_truth, label_depth, label_support = _rebase_truth(data, int(row["alignment"]["reference"]))
+    truth = np.rint(label_depth).clip(0, 65535).astype(np.uint16)
+    for name in ("gradient_energy", "map_coherence"):
+        if values.get(name) is None:
+            unavailable.setdefault(name, "complex-wavelet does not define this frozen diagnostic")
+    for name, value in values.items():
+        if value is None:
+            unavailable.setdefault(name, "registered metric is nonfinite or its applicable truth region is empty")
+    orientation_scores = []
+    for item in labels:
+        label = gff.read_zmap(Path(str(item["path"])))
+        valid = label_support & np.load(Path(str(item["support_path"]))) & (label != fusion.NO_SOURCE)
+        label_values = metrics.label_metrics(label, truth, valid)
+        orientation_scores.append({"orientation": item["orientation"], "valid_support_pixels": int(valid.sum()),
+                                   "metrics": label_values,
+                                   "metric_unavailable": {name: "orientation has no eligible rebased truth support" for name, value in label_values.items() if value is None}})
+    return values, {**metadata, "metric_unavailable": unavailable, "registered_metric_count": len(values)}, orientation_scores
+
+
+def _wavelet_maps_equal(whole: complex_wavelet.FusionResult, tiled: complex_wavelet.FusionResult) -> dict[str, object]:
+    final, raw, support = [], [], []
+    for level in range(complex_wavelet.LEVELS):
+        for band in range(3):
+            final.append(int(np.count_nonzero(whole.orientation_winners[level][band] != tiled.orientation_winners[level][band])))
+            raw.append(int(np.count_nonzero(whole.raw_winners[level][band] != tiled.raw_winners[level][band])))
+            support.append(int(np.count_nonzero(whole.support[level][band] != tiled.support[level][band])))
+    image = int(np.count_nonzero(whole.composite != tiled.composite))
+    if (whole.pixel_sources is None) != (tiled.pixel_sources is None):
+        raise AssertionError("complex-wavelet whole/tile reassignment presence mismatch")
+    pixels = 0 if whole.pixel_sources is None else int(np.count_nonzero(whole.pixel_sources != tiled.pixel_sources))
+    if image or pixels or any(final) or any(raw) or any(support):
+        raise AssertionError(f"complex-wavelet whole/tile mismatch image={image} final={final} raw={raw} support={support}")
+    return {"different_samples": image, "pixel_source_differences": pixels, "orientation_map_differences": final, "raw_map_differences": raw, "support_differences": support}
+
+
+def run_complex_wavelet_configurations(root: Path, output: Path, configurations: list[dict[str, object]],
+                                       family_filter: str | None = None, repeat: int = 0) -> list[dict[str, object]]:
+    """Run exact four-mode whole/tile records over frozen repeat-zero Details inputs."""
+    rows = [row for row in json.loads((root / "baseline.json").read_text())
+            if row["repeat"] == 0 and row["method"] == "laplacian" and (family_filter is None or row["family"] == family_filter)]
+    expected = {item["id"] for item in complex_wavelet.CONFIGURATIONS}
+    if {str(item.get("id")) for item in configurations} != expected or len(configurations) != 4:
+        raise ValueError("complex-wavelet requires exactly four registered configurations")
+    records = []
+    for configuration in configurations:
+        for row in rows:
+            source = _wavelet_selection_source(row)
+            whole = complex_wavelet.fuse(source, configuration)
+            tiled, plan = complex_wavelet.fuse_tiled(source, configuration, tile=int(row["tile"]))
+            equality = _wavelet_maps_equal(whole, tiled)
+            seed = SeedTriple.parse(str(row["seed"]))
+            directory = output / str(configuration["id"]) / run_key(f"{row['family']}-{row['member']}", seed, "complex-wavelet", int(row["tile"]), repeat)
+            directory.mkdir(parents=True, exist_ok=True)
+            whole_path, tiled_path = directory / "whole.tif", directory / "tiled.tif"
+            gff.write_u16(whole_path, whole.composite)
+            gff.write_u16(tiled_path, tiled.composite)
+            maps, tiled_maps = _wavelet_maps(directory / "whole-maps", whole), _wavelet_maps(directory / "tiled-maps", tiled)
+            labels = _wavelet_label_maps(directory, whole, (source.h, source.w))
+            family = next(item for item in FAMILIES if item.name == row["family"])
+            data = render_family(family, seed, str(row["member"]))
+            values, metric_metadata, orientation_scores = _wavelet_record_metrics(data, row, whole_path, labels, source, equality["different_samples"])
+            pixel_scores, pixel_metadata = None, None
+            if whole.pixel_sources is not None:
+                label_depth, label_support = data.depth, np.ones(data.depth.shape, dtype=bool)
+                if row["family"] == "invalid-borders" and row["member"] == "aligned-coverage":
+                    _truth, label_depth, label_support = _rebase_truth(data, int(row["alignment"]["reference"]))
+                valid = label_support & (whole.pixel_sources != fusion.NO_SOURCE)
+                pixel_scores = metrics.label_metrics(whole.pixel_sources, np.rint(label_depth).clip(0, 65535).astype(np.uint16), valid)
+                pixel_metadata = {"valid_support_pixels": int(valid.sum()), "source": "nearest-grey reassignment pixel map", "metric_unavailable": {name: "pixel reassignment has no eligible rebased truth support" for name, value in pixel_scores.items() if value is None}}
+            records.append({"configuration_id": configuration["id"], "family": row["family"], "member": row["member"], "seed": row["seed"],
+                            "tile": row["tile"], "repeat": repeat, "whole": str(whole_path), "whole_sha256": sha256_path(whole_path),
+                            "tiled": str(tiled_path), "tiled_sha256": sha256_path(tiled_path), "native_whole_tile": equality,
+                            "input_identity": row.get("input_sha256"), "coverage_identity": _wavelet_input_identity(row), "aligned_identity": _wavelet_aligned_identity(row), "vote_counts": whole.counts, "tile_plan": plan,
+                            "coefficient_source_maps": maps["orientation_maps"], "tiled_coefficient_source_maps": tiled_maps["orientation_maps"],
+                            "raw_coefficient_source_maps": maps["raw_orientation_maps"], "tiled_raw_coefficient_source_maps": tiled_maps["raw_orientation_maps"],
+                            "support_maps": maps["support_maps"], "tiled_support_maps": tiled_maps["support_maps"], "pixel_source_map": maps["pixel_source_map"], "tiled_pixel_source_map": tiled_maps["pixel_source_map"],
+                            "orientation_label_maps": labels, "orientation_label_metrics": orientation_scores,
+                            "pixel_label_metrics": pixel_scores, "pixel_label_metadata": pixel_metadata,
+                            "image_metrics": values, "metric_metadata": metric_metadata, "metric_count": len(values)})
+    if family_filter is None and len(records) != 240:
+        raise AssertionError("complex-wavelet training matrix must contain 240 rows")
+    return records
+
+def complex_wavelet_paired_effects(root: Path, records: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Compute signed candidate-minus-retained-baseline metrics without another fusion run."""
+    baseline = json.loads((root / "baseline.json").read_text())
+    indexed = {(row["family"], row["member"], row["seed"], row["tile"], row["method"]): row for row in baseline if row.get("repeat") == 0}
+    effects = []
+    for row in records:
+        key = (row["family"], row["member"], row["seed"], row["tile"])
+        for method in METHODS:
+            reference = indexed.get((*key, method))
+            if reference is None:
+                raise ValueError(f"complex-wavelet missing retained {method} baseline for {key}")
+            values = reference.get("metrics", {})
+            signed = {name: (None if row["image_metrics"].get(name) is None or values.get(name) is None else float(row["image_metrics"][name]) - float(values[name]))
+                      for name in row["image_metrics"]}
+            labels = [{"orientation": item["orientation"], "signed": {name: (None if item["metrics"].get(name) is None or values.get(name) is None else float(item["metrics"][name]) - float(values[name])) for name in item["metrics"]}}
+                      for item in row["orientation_label_metrics"]]
+            pixel = None if row.get("pixel_label_metrics") is None else {name: (None if row["pixel_label_metrics"].get(name) is None or values.get(name) is None else float(row["pixel_label_metrics"][name]) - float(values[name])) for name in row["pixel_label_metrics"]}
+            effects.append({"configuration_id": row["configuration_id"], "family": row["family"], "member": row["member"], "seed": row["seed"],
+                            "tile": row["tile"], "baseline_method": method, "signed_effects": signed,
+                            "orientation_label_effects": labels, "pixel_label_effect": pixel,
+                            "pixel_label_unavailable": None if pixel is not None else "shared configuration has no pixel reassignment map"})
+    indexed_candidates = {(row["configuration_id"], row["family"], row["member"], row["seed"], row["tile"]): row for row in records}
+    for left_id, right_id, factor in (("shared-raw", "shared-voted", "consistency"), ("grey-reassign-raw", "grey-reassign-voted", "consistency"),
+                                      ("shared-raw", "grey-reassign-raw", "colour-reassignment"), ("shared-voted", "grey-reassign-voted", "colour-reassignment")):
+        for key in {(row["family"], row["member"], row["seed"], row["tile"]) for row in records}:
+            left, right = indexed_candidates[(left_id, *key)], indexed_candidates[(right_id, *key)]
+            signed = {name: (None if left["image_metrics"].get(name) is None or right["image_metrics"].get(name) is None else float(right["image_metrics"][name]) - float(left["image_metrics"][name])) for name in left["image_metrics"]}
+            labels = [{"orientation": index, "signed": {name: (None if a["metrics"].get(name) is None or b["metrics"].get(name) is None else float(b["metrics"][name]) - float(a["metrics"][name])) for name in a["metrics"]}}
+                      for index, (a, b) in enumerate(zip(left["orientation_label_metrics"], right["orientation_label_metrics"]))]
+            pixel = None
+            pixel_reason = "shared configuration has no pixel reassignment map"
+            if left.get("pixel_label_metrics") is not None and right.get("pixel_label_metrics") is not None:
+                pixel = {name: (None if left["pixel_label_metrics"].get(name) is None or right["pixel_label_metrics"].get(name) is None else float(right["pixel_label_metrics"][name]) - float(left["pixel_label_metrics"][name])) for name in left["pixel_label_metrics"]}
+                pixel_reason = None
+            effects.append({"factor": factor, "left_configuration": left_id, "right_configuration": right_id, "family": key[0], "member": key[1], "seed": key[2], "tile": key[3],
+                            "signed_effects": signed, "orientation_label_effects": labels, "pixel_label_effect": pixel, "pixel_label_unavailable": pixel_reason})
+    groups: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
+    for row in effects:
+        comparison = ('baseline', row['configuration_id'], row['baseline_method']) if 'baseline_method' in row else ('factor', row['left_configuration'], row['right_configuration'])
+        groups[(*comparison, row['family'], row['member'], row['tile'])].append(row)
+
+    def seed_statistics(planes):
+        names = next((plane for plane in planes if plane is not None), {})
+        samples = {name: [float(plane[name]) for plane in planes if plane is not None and plane.get(name) is not None and math.isfinite(float(plane[name]))] for name in names}
+        return {name: None if not values else float(np.std(values, ddof=0)) for name, values in samples.items()}, {name: len(values) for name, values in samples.items()}
+
+    for group in groups.values():
+        image_spread, image_count = seed_statistics([row['signed_effects'] for row in group])
+        labels = [seed_statistics([row['orientation_label_effects'][orientation]['signed'] for row in group]) for orientation in range(3)]
+        pixel_spread, pixel_count = seed_statistics([row['pixel_label_effect'] for row in group])
+        for row in group:
+            row['paired_seed_spread'] = image_spread
+            row['orientation_paired_seed_spread'] = [item[0] for item in labels]
+            row['pixel_paired_seed_spread'] = pixel_spread if row['pixel_label_effect'] is not None else None
+            row['uncertainty'] = {'kind': 'population standard deviation across same-family keyed training seeds',
+                                  'metric_spread': image_spread, 'orientation_spread': row['orientation_paired_seed_spread'], 'pixel_spread': row['pixel_paired_seed_spread'],
+                                  'valid_seed_counts': {'image': image_count, 'orientation': [item[1] for item in labels], 'pixel': pixel_count if row['pixel_label_effect'] is not None else None}}
+    return effects
+
+
+def _wavelet_artifact_content(value: object) -> object:
+    """Keep native content bindings while intentionally discarding output locations."""
+    if isinstance(value, dict):
+        return {key: _wavelet_artifact_content(item) for key, item in value.items() if key not in {"path", "support_path"}}
+    if isinstance(value, list):
+        return [_wavelet_artifact_content(item) for item in value]
+    return value
+
+
+def _wavelet_verify_file(path_value: object, digest: object, verified: set[tuple[str, str]]) -> None:
+    """Verify each retained native file once before repeat output."""
+    if not isinstance(path_value, str) or not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("complex-wavelet native file lacks a path and SHA256")
+    path = Path(path_value)
+    binding = (str(path.resolve()), digest)
+    if binding not in verified:
+        if not path.is_file() or sha256_path(path) != digest:
+            raise ValueError(f"complex-wavelet native file is missing or stale: {path}")
+        verified.add(binding)
+
+
+def complex_wavelet_repeat_preflight(prior: list[dict[str, object]], baseline: list[dict[str, object]] | None = None) -> None:
+    """Validate registered keys and every retained native artifact before a repeat."""
+    members = (("thin-hairs", "default"), ("flat-noise", "noise-250"), ("flat-noise", "noise-1000"),
+               ("colour-edges", "default"), ("invalid-borders", "zero-strip"), ("invalid-borders", "aligned-coverage"))
+    expected = {(config["id"], family, member, seed.text(), tile) for config in complex_wavelet.CONFIGURATIONS
+                for family, member in members for seed in TRAINING_SEEDS for tile in (512, 1024)}
+    if not isinstance(prior, list) or any(not isinstance(row, dict) for row in prior):
+        raise ValueError("complex-wavelet training rows must be a list of objects")
+    if any(any(not isinstance(row.get(name), str) for name in ("configuration_id", "family", "member", "seed")) or not isinstance(row.get("tile"), int) or isinstance(row.get("tile"), bool) for row in prior):
+        raise ValueError("complex-wavelet training keys have invalid scalar types")
+    keys = {(row.get("configuration_id"), row.get("family"), row.get("member"), row.get("seed"), row.get("tile")) for row in prior}
+    if len(prior) != 240 or keys != expected:
+        raise ValueError("complex-wavelet repeat requires the exact unique 240 training keys")
+    references = {(row["family"], row["member"], row["seed"], row["tile"]): row for row in baseline or []
+                  if row.get("method") == "laplacian" and row.get("repeat") == 0}
+    verified: set[tuple[str, str]] = set()
+    for row in prior:
+        if row.get("repeat") != 0 or not isinstance(row.get("input_identity"), dict) or not row["input_identity"]:
+            raise ValueError("complex-wavelet repeat requires repeat-zero input identity")
+        if not isinstance(row.get("coverage_identity"), dict) or "coverage" not in row["coverage_identity"]:
+            raise ValueError("complex-wavelet repeat requires retained coverage identity")
+        if baseline is not None:
+            reference = references.get(tuple(row[name] for name in ("family", "member", "seed", "tile")))
+            if (reference is None or row["input_identity"] != reference.get("input_sha256")
+                    or row.get("coverage_identity") != _wavelet_input_identity(reference)
+                    or row.get("aligned_identity") != _wavelet_aligned_identity(reference)):
+                raise ValueError("complex-wavelet training input or aligned coverage identity is stale")
+        for name in ("whole", "tiled"):
+            _wavelet_verify_file(row.get(name), row.get(name + "_sha256"), verified)
+        for name in ("coefficient_source_maps", "tiled_coefficient_source_maps", "raw_coefficient_source_maps", "tiled_raw_coefficient_source_maps", "support_maps", "tiled_support_maps"):
+            planes = row.get(name)
+            if not isinstance(planes, list) or len(planes) != 5 or any(not isinstance(bands, list) or len(bands) != 3 for bands in planes):
+                raise ValueError(f"complex-wavelet repeat requires all five levels and three bands: {name}")
+            for bands in planes:
+                for plane in bands:
+                    if not isinstance(plane, dict):
+                        raise ValueError(f"complex-wavelet repeat native plane is invalid: {name}")
+                    _wavelet_verify_file(plane.get("path"), plane.get("sha256"), verified)
+        reassign = str(row["configuration_id"]).startswith("grey-reassign-")
+        for name in ("pixel_source_map", "tiled_pixel_source_map"):
+            plane = row.get(name)
+            if reassign:
+                if not isinstance(plane, dict):
+                    raise ValueError("complex-wavelet repeat requires the reassignment pixel plane")
+                _wavelet_verify_file(plane.get("path"), plane.get("sha256"), verified)
+            elif name not in row or plane is not None:
+                raise ValueError("complex-wavelet shared mode must explicitly have no reassignment plane")
+        labels = row.get("orientation_label_maps")
+        if not isinstance(labels, list) or len(labels) != 3 or {v.get("orientation") for v in labels if isinstance(v, dict)} != {0, 1, 2}:
+            raise ValueError("complex-wavelet repeat requires three finest orientation label/support planes")
+        for plane in labels:
+            _wavelet_verify_file(plane.get("path"), plane.get("sha256"), verified)
+            _wavelet_verify_file(plane.get("support_path"), plane.get("support_sha256"), verified)
+        native = row.get("native_whole_tile")
+        if not isinstance(native, dict) or native.get("different_samples") != 0 or native.get("pixel_source_differences") != 0 or any(native.get(name) != [0] * 15 for name in ("orientation_map_differences", "raw_map_differences", "support_differences")):
+            raise ValueError("complex-wavelet training native whole/tile proof is incomplete")
+
+
+def complex_wavelet_repeat_equality(records: list[dict[str, object]], prior: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Require native content and input identity match without comparing output paths."""
+    complex_wavelet_repeat_preflight(prior)
+    def key(row: dict[str, object]) -> tuple[object, ...]:
+        return tuple(row[name] for name in ("configuration_id", "family", "member", "seed", "tile"))
+    previous = {key(row): row for row in prior}
+    if len(records) != 240 or set(previous) != {key(row) for row in records}:
+        raise ValueError("complex-wavelet repeat lacks the exact 240-key training record")
+    comparisons = []
+    for row in records:
+        first = previous[key(row)]
+        fields = ("input_identity", "coverage_identity", "aligned_identity", "whole_sha256", "tiled_sha256", "coefficient_source_maps", "tiled_coefficient_source_maps", "raw_coefficient_source_maps", "tiled_raw_coefficient_source_maps", "support_maps", "tiled_support_maps", "pixel_source_map", "tiled_pixel_source_map", "orientation_label_maps")
+        equal = all(_wavelet_artifact_content(row.get(field)) == _wavelet_artifact_content(first.get(field)) for field in fields)
+        if not equal:
+            raise AssertionError(f"complex-wavelet repeat native equality failed for {key(row)}")
+        comparisons.append({"key": list(key(row)), "native_equal": True})
+    return comparisons
+
+def _wavelet_state_bound(source: object) -> dict[str, object]:
+    """Quantify Python-array phase bounds; observed RSS remains a separate body receipt."""
+    padded_h, padded_w = ((source.h + 31) // 32) * 32, ((source.w + 31) // 32) * 32
+    details = [(padded_h // (2 ** (level + 1)), padded_w // (2 ** (level + 1)), source.c) for level in range(complex_wavelet.LEVELS)]
+    coeff = sum(3 * int(np.prod(shape)) * np.dtype(np.complex128).itemsize for shape in details)
+    scalar = sum(3 * shape[0] * shape[1] for shape in details)
+    low_shape = (padded_h // 32, padded_w // 32, source.c)
+    low_coeff = int(np.prod(low_shape)) * np.dtype(np.complex128).itemsize
+    input_bytes = source.h * source.w * source.c * np.dtype(np.float64).itemsize
+    padded_bytes = padded_h * padded_w * source.c * np.dtype(np.complex128).itemsize
+    phases = {"analysis_current_and_six_tap_samples": {"current_padded_complex128": padded_bytes, "advanced_index_six_tap_transient_upper_bound": 6 * padded_bytes},
+              "selection_persistent": {"best_float64": scalar * np.dtype(np.float64).itemsize, "raw_and_final_u16": 2 * scalar * np.dtype(np.uint16).itemsize,
+                                       "seen_and_support_bool": 2 * scalar * np.dtype(bool).itemsize, "low_sum_complex128": low_coeff,
+                                       "low_count_u16": low_shape[0] * low_shape[1] * np.dtype(np.uint16).itemsize},
+              "gather": {"current_tree_complex128": coeff + low_coeff, "selected_tree_complex128": coeff + low_coeff, "transient_gathered_tree_complex128": coeff + low_coeff},
+              "synthesis": {"selected_tree_complex128": coeff + low_coeff, "synthesis_padded_complex128": padded_bytes},
+              "reassign": {"input_rgb_float64": input_bytes, "distance_float64": source.h * source.w * np.dtype(np.float64).itemsize,
+                           "pixel_source_u16": source.h * source.w * np.dtype(np.uint16).itemsize, "output_rgb_float64": input_bytes}}
+    # Prior/current trees and reader-normalization buffers can overlap across loop phases.
+    resident = {"resident_input_float64": input_bytes, "reader_raw_u16": input_bytes // 4,
+                "reader_normalized_float32": input_bytes // 2, "reflected_samples_float64": padded_bytes // 2,
+                "input_validation_bool": source.h * source.w * source.c,
+                "padded_eligibility_bool": padded_h * padded_w,
+                "persistent_selection_state": sum(phases["selection_persistent"].values()),
+                "prior_frame_tree_held": coeff + low_coeff, "current_frame_tree_upper_bound": coeff + low_coeff,
+                "resident_output_u16": input_bytes // 4, "resident_gray_float64": source.h * source.w * 8}
+    for values in phases.values():
+        values.update(resident)
+    totals = {name: int(sum(values.values())) for name, values in phases.items()}
+    return {"kind": "structural_python_ndarray_upper_bound_not_observed_rss", "shape_hwc": [source.h, source.w, source.c], "padded_shape_hwc": [padded_h, padded_w, source.c],
+            "phase_bytes": phases, "phase_total_bytes": totals, "maximum_phase_bytes": max(totals.values()),
+            "n_dependent_metadata": {"declared_path_references": "O(N)", "tiff_infos": "O(N)", "reader_pass_counters": "O(N)"},
+            "metadata_object_counts": {"paths": len(getattr(source, "paths", ())), "tiff_infos": len(getattr(source, "infos", ())), "read_counters": len(getattr(source, "reads", ()))},
+            "bound_overcount": "reader buffers and prior/current trees are conservatively included in every phase; bounds are not observed allocations",
+            "cache_limitation": "OS page cache and NumPy C temporaries are not controlled or claimed as RSS", "prohibited": ["N-sized pixel cache", "N-sized coefficient cache"]}
+
+
+def run_complex_wavelet_stack(output: Path, source_name: str, prepared: Path | None, rect_text: str | None,
+                              configurations: list[dict[str, object]]) -> dict[str, object]:
+    """Fuse only the registered aligned real crop after validating its preparation."""
+    if prepared is None:
+        raise ValueError("--prepared preparation-manifest.json is required before complex-wavelet real output")
+    if {item.get("id") for item in configurations} != {item["id"] for item in complex_wavelet.CONFIGURATIONS} or len(configurations) != 4:
+        raise ValueError("complex-wavelet real mode requires exactly four registered configurations")
+    rect = _registered_rect(source_name, rect_text)
+    manifest = _validate_preparation(prepared, source_name)
+    prepared_sha = sha256_path(prepared)
+    retained_path = prepared.parents[3] / "stacking-crops" / source_name / "crops.json"
+    if not retained_path.is_file():
+        raise ValueError("retained Details crop reference is required before complex-wavelet output")
+    retained = json.loads(retained_path.read_text())
+    details = next((row for row in retained if isinstance(row, dict) and row.get("method") == "laplacian"
+                    and row.get("prepared_manifest_sha256") == prepared_sha and row.get("alignment_report_sha256") == manifest["alignment_report_sha256"]
+                    and row.get("rect_xywh") == list(rect)), None)
+    if (details is None or details.get("raw_inputs") != manifest["raw_inputs"] or details.get("aligned_inputs") != manifest["aligned_inputs"]
+            or details.get("coverage", {}).get("all_sources_cover_roi") is not True):
+        raise ValueError("retained Details crop reference does not match preparation geometry")
+    details_composite = Path(str(details.get("composite", "")))
+    if not details_composite.is_file() or details.get("composite_sha256") != sha256_path(details_composite):
+        raise ValueError("retained Details crop composite is missing or stale")
+    directory, paths, coverage = _wavelet_crop_prepared_inputs(output, source_name, prepared, rect)
+    source = gff.TiffSource(paths, Path(str(coverage["mask_path"])))
+    null_fields = ("psnr", "ssim", "edge_halo", "hair_retention", "flat_noise", "chroma_drift", "border_contamination", "seam_energy", "gradient_energy", "map_coherence", "label_exact", "label_within_one", "label_mad", "tile_difference", "geometry_error", "alignment_drift", "alignment_failures")
+    null_reasons = {name: "registered real crop has no synthetic truth or source-index truth" for name in null_fields}
+    rows = []
+    for configuration in configurations:
+        result = complex_wavelet.fuse(source, configuration)
+        work = output / "real" / str(configuration["id"])
+        work.mkdir(parents=True, exist_ok=True)
+        composite = work / "composite.tif"
+        gff.write_u16(composite, result.composite)
+        montage = work / "montage.png"
+        gff.montage(str(montage), (0, source.h, 0, source.w), [details_composite, composite])
+        rendered = Image.open(montage).convert("RGB")
+        canvas = Image.new("RGB", (rendered.width, rendered.height + 24), "black")
+        canvas.paste(rendered, (0, 24))
+        ImageDraw.Draw(canvas).text((4, 4), f"retained Details | {configuration['id']} | crop-only, no truth", fill="white")
+        canvas.save(montage)
+        rows.append({"configuration_id": configuration["id"], "composite": str(composite), "composite_sha256": sha256_path(composite),
+                     "montage": str(montage), "montage_sha256": sha256_path(montage), "montage_labels": ["retained Details", str(configuration["id"])],
+                     "retained_details_composite": str(details_composite), "retained_details_composite_sha256": sha256_path(details_composite),
+                     "maps": _wavelet_maps(work, result), "rect_xywh": list(rect), "coverage": coverage,
+                     "prepared_manifest_sha256": sha256_path(prepared), "alignment_report_sha256": manifest["alignment_report_sha256"],
+                     "raw_inputs": manifest["raw_inputs"], "aligned_inputs": manifest["aligned_inputs"],
+                     "image_metrics": {name: None for name in null_fields}, "metric_unavailable": null_reasons,
+                     "metric_count": len(null_fields), "truth_metrics": "not computed"})
+    return {"source": source_name, "rect_xywh": list(rect), "prepared_manifest": str(prepared.resolve()), "rows": rows}
+
+def run_complex_wavelet_resource_body(runs: Path, output: Path, frame_count: int) -> dict[str, object]:
+    """Measure one fresh-process bounded-memory body from registered physical TIFFs."""
+    if frame_count not in {8, 32}:
+        raise ValueError("complex-wavelet resource frame count must be 8 or 32")
+    rows = [row for row in json.loads((runs / "baseline.json").read_text())
+            if row["repeat"] == 0 and row["method"] == "laplacian" and row["tile"] == 512 and row["family"] == "thin-hairs"]
+    if not rows:
+        raise ValueError("registered physical 512px resource source is missing")
+    base = _selection_source(rows[0])
+    paths = [Path(path) for path in getattr(base, "paths", ())]
+    if not paths:
+        raise ValueError("complex-wavelet resource source must be TIFF-backed")
+    declared = (paths * ((frame_count + len(paths) - 1) // len(paths)))[:frame_count]
+    source = gff.TiffSource(declared)
+    result = complex_wavelet.fuse(source, complex_wavelet.CONFIGURATIONS[0])
+    composite = output / "composite.tif"
+    output.mkdir(parents=True, exist_ok=True)
+    gff.write_u16(composite, result.composite)
+    return {"frame_count": frame_count, "configuration_id": complex_wavelet.CONFIGURATIONS[0]["id"], "physical_input_pool_paths": [str(path) for path in paths], "physical_input_pool_count": len(paths), "physical_input_pool": [{"path": str(path), "sha256": sha256_path(path)} for path in paths], "input_shape_hwc": [source.h, source.w, source.c],
+            "declared_references": [str(path) for path in declared], "declared_reference_count": len(declared),
+            "read_counts": source.reads, "composite": str(composite), "composite_sha256": sha256_path(composite),
+            "state_bound": _wavelet_state_bound(source), "o_n_state": "TIFF header metadata, source paths and read counters only", "vote_counts": result.counts}
 
 
 def run_crops(root: Path, source: str, prepared: Path | None, rect_text: str | None = None) -> list[dict[str, object]]:

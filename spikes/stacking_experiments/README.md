@@ -37,6 +37,24 @@ The registration command records six scene families, three independent seed axes
 
 `mask-pyramid` uses the current Details finest winner map with Gaussian coarse masks. The hard-mask arm is an unchanged non-advancing ablation. Its source-ready registration must bind the fixed positive detector proof and immutable original-reference 884KiB noise proof; current-run N=2 noise remains report-only.
 
+`complex-wavelet` implements the Lina--Mayrand symmetric six-tap complex Daubechies transform from [Lina and Mayrand (1995)](https://doi.org/10.1006/acha.1995.1015), using the [focus-stack filter transcription](https://github.com/PetteriAimonen/focus-stack/blob/0cd289e224fe24aead5b146faeaa46950775f346/src/task_wavelet_templates.hh) under its [MIT licence](https://github.com/PetteriAimonen/focus-stack/blob/0cd289e224fe24aead5b146faeaa46950775f346/LICENSE.md) as a numerical cross-check. Its low-pass taps are `sqrt(2)/64 * [-3, 5, 30, 30, 5, -3] + i*sqrt(30)/64 * [-1, -1, 2, 2, -1, -1]`; high-pass taps alternate conjugate signs. Analysis uses periodic `2k+j-3` samples and synthesis uses conjugate-adjoint taps. Inputs reflect-pad at the bottom/right to a 32-pixel multiple, while padded samples stay ineligible.
+
+Use unwindowed summed channel `|c|²` scores with first-eligible strict ties. The grey control uses the arithmetic RGB mean and assigns output colour from the nearest eligible source grey value. Three orientation winner maps remain separate from this pixel reassignment map. Tile windows preserve the global padded periodic domain; the reach control records the required 32-phase margin.
+
+The public resource command starts six fresh GNU-time child bodies: three each for eight and 32 references from one physical 512px RGB16 TIFF pool. It stores child argv, PID, stdout, stderr, exit, GNU time, physical read counters, composite, vote counts, structural-state evidence and receipt hashes. Training and repeat records additionally retain raw/final/support/reassignment maps. The internal child selector is not a public recipe. Resource records state a conservative structural ndarray upper bound separately from observed GNU RSS; OS page cache and NumPy C temporaries remain outside that bound. Their only N-dependent Python state is path references, TIFF metadata and reader counters.
+
+The full self-check takes all three registration, runs and allowances inputs and uses the prospective registration as an immutable template for constructed native schemas and named preparation/registration refusals. These test fixtures cannot authorize measured workloads. Omitting all three inputs runs transform controls only; a partial context is rejected before output.
+
+Training writes one whole TIFF and one global-periodic tiled TIFF per retained key, source/support hashes, all 17 frozen metric fields and three separate finest-orientation label metrics. Repeat requires the immutable training comparison record and rejects any native image, coefficient-map, support-map or reassignment-map mismatch.
+
+```text
+python3 -m spikes.stacking_experiments complex-wavelet --self-check --registration /path/to/non-ready-prospective.json --runs /path/to/stacking-controls --allowances /path/to/allowances.json --out /path/to/controls
+python3 -m spikes.stacking_experiments complex-wavelet --reach-only --out .scratch/complex-wavelet/reach
+python3 -m spikes.stacking_experiments complex-wavelet --resource-only --registration /path/to/source-ready.json --runs /path/to/stacking-controls --allowances /path/to/allowances.json --out /path/to/resources
+python3 -m spikes.stacking_experiments complex-wavelet --split training --registration /path/to/quality-ready.json --runs /path/to/stacking-controls --allowances /path/to/allowances.json --out /path/to/training
+python3 -m spikes.stacking_experiments complex-wavelet --repeat-only --registration /path/to/quality-ready.json --runs /path/to/stacking-controls --allowances /path/to/allowances.json --training-sha256 <archived-first-comparison-sha256> --out /path/to/repeat
+```
+
 Run `mask-pyramid --self-check` before registration. After the source registration is bound, run `mask-pyramid --resource-only` once; its measured artifact must be bound into the quality registration before `mask-pyramid` training or `--repeat-only` runs. Use `--source stack --prepared <manifest> --rect 1878,1056,1024,1024` only with the registered aligned preparation for the three real outputs.
 
 Mask-pyramid sequence:
