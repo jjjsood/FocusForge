@@ -144,4 +144,4 @@ focusforge-cli stack path/to/frames/ --algorithm laplacian --json
 `--json` reports the frames that were read, the resolved algorithm and
 parameters (with where each value came from), the tile geometry the run
 planned, and the project path written — see
-[`reference/cli.md`](../reference/cli.md#--json-1) for the full schema.
+[`reference/cli.md`](../reference/cli.md#stack) for the full schema.

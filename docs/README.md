@@ -9,6 +9,9 @@ not here.
 Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
+- [`getting-started.md`](getting-started.md) — release artifacts when a
+  matching release provides them, or the source-build fallback when they do not
+
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
   window, the dock's `Images` panel and the four-section `Settings` panel, the five-tab settings window, running and controlling
   a fuse, saving the held result, exporting an image, switching between open

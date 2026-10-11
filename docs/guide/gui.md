@@ -210,7 +210,10 @@ five tabs:
 - **About** shows the version, the licence (GPL-3.0), the copyright and
   warranty notice, and the source repository.
 
-`focusforge-gui --settings-section performance|storage|input-map|diagnostics|about`
+`focusforge-gui --settings-section performance`
+
+The other accepted sections are `storage`, `input-map`, `diagnostics` and
+`about`.
 opens the window on that tab at startup.
 
 ## Keyboard and mouse bindings

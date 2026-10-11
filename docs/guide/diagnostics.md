@@ -32,14 +32,8 @@ directory until you package it yourself.
 ## The crash notice
 
 The next time you start `focusforge-cli` after a crash, it prints a one-line
-hint before doing anything else:
-
-```
-$ focusforge-cli info some/folder
-2026-09-18T17:07:09Z ERROR focusforge_cli: 1 earlier run crashed -- run focusforge-cli diagnostics to package the evidence
-```
-
-The hint clears itself once you run `focusforge-cli diagnostics` — see
+hint before doing anything else. The hint clears itself once you run
+`focusforge-cli diagnostics` — see
 below — which marks every crash it packages as reported.
 
 The GUI shows the same thing as a dismissible notice the next time you start
@@ -56,19 +50,7 @@ focusforge-cli diagnostics [-o out.zip] [--include-minidumps] [--force]
 Collects the log files, any crash reports, a system summary, the graphics
 adapter record, the configuration a new run would resolve right now (with
 where each value came from), and the version and commit into one ZIP. It
-prints what it's about to write before writing it:
-
-```
-$ focusforge-cli diagnostics
-diagnostics bundle contents:
-  adapter.json (generated, redacted)
-  configuration.json (generated, redacted)
-  system.json (generated, redacted)
-  version.json (generated, redacted)
-  logs/focusforge.jsonl (log, redacted)
-no crash reports were found
-wrote focusforge-diagnostics-20260918.zip
-```
+prints its planned contents before writing it.
 
 Every text entry has your home directory path and user name stripped out;
 no image data is ever included. Minidumps are left out by default — pass
@@ -116,8 +98,9 @@ a `timing_summary` span records each budget, how many spans it admitted and
 how many it refused.
 
 To see Slint's own frame timing as well, set
-`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment; it
-prints refresh statistics on the console.
+`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment. Slint
+collects and prints refresh statistics when a frame is rendered; `refresh_lazy`
+does not force frames while the window is idle.
 
 `focusforge-cli` takes the same feature and variable; see the repository's
 `CONTRIBUTING.md` for the command.

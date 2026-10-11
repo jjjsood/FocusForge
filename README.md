@@ -2,17 +2,22 @@
   <img src="assets/wordmark-horizontal.svg" alt="FocusForge" width="420">
 </p>
 
+<h1 align="center">FocusForge</h1>
+
+<p align="center">A cross-platform focus stacking application with a full retouching editor.</p>
+
 <p align="center">
   <a href="LICENSE"><img alt="License: GPL v3" src="https://img.shields.io/badge/license-GPLv3-blue.svg"></a>
   <img alt="Rust edition 2024" src="https://img.shields.io/badge/rust-edition%202024-orange.svg">
+  <a href="https://github.com/jjjsood/FocusForge/actions/workflows/check.yml"><img alt="CI" src="https://github.com/jjjsood/FocusForge/actions/workflows/check.yml/badge.svg"></a>
+  <a href="https://github.com/jjjsood/FocusForge/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/jjjsood/FocusForge"></a>
 </p>
 
 <p align="center">
-A cross-platform focus stacking application for Linux, macOS and Windows, with
-a full retouching editor rather than a batch processor. Built in Rust on Slint
-for the interface and wgpu for compute and canvas. Free software under the
-GNU General Public License v3.
+  <img src="docs/assets/readme-hero.png" alt="FocusForge showing a real Mantis source frame and its stacked composite" width="100%">
 </p>
+
+![Source frame 30 beside the FocusForge composite](docs/assets/stack-before-after.jpg)
 
 ## Features
 
@@ -72,9 +77,15 @@ GNU General Public License v3.
   and switch into editor mode to retouch the result, browse its
   checkpoints and export an image in the format you choose
 
+## Install
+
+Linux: install the matching `.deb` or run its AppImage from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source.
+macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
+Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source. See [getting started](docs/getting-started.md) for paths.
+
 ## Quick start
 
-### Prerequisites
+### Build
 
 Rust, toolchain pinned to `1.95.0` (`rust-toolchain.toml`, picked up
 automatically by `rustup`). `crates/gui` links Slint with
@@ -87,8 +98,6 @@ sudo apt install libfontconfig1-dev
 
 There is no code-side workaround for a missing fontconfig on this renderer.
 
-### Build
-
 ```bash
 cargo build --release
 ```
@@ -97,6 +106,8 @@ Produces `target/release/focusforge-cli` and `target/release/focusforge-gui`,
 with the GPU-accelerated fusion path compiled in by default. Pass
 `--no-default-features` to exclude it; without it, `stack` always runs on the
 CPU and `--cpu` does not exist as a flag.
+
+### CLI
 
 ### Inspect a stack
 
@@ -133,7 +144,10 @@ transforms on their own, before any fusion runs. See
 and their parameters, and [`docs/guide/batch-runs.md`](docs/guide/batch-runs.md)
 for stacking a folder that holds more than one stack.
 
-### Open it in the window
+The Mantis photographs and derived comparison image are used only within this
+project; see [their image rights notice](docs/assets/README.md).
+
+### GUI
 
 ```bash
 target/release/focusforge-gui --open path/to/frames/
@@ -144,15 +158,16 @@ per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 
 ## Documentation
 
-See [`docs/`](docs/README.md) for the guides (the window, stacking,
+See [`docs/`](docs/README.md) for [getting started](docs/getting-started.md)
+and the guides (the window, stacking,
 alignment, retouching, checkpoint history, batch runs, diagnostics) and the
 reference for every `focusforge-cli` subcommand, the project format and the
 TIFF layouts it reads and writes.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the repository layout, tech
-stack, tests and the gate to run before sending a change.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
+[Code of Conduct](CODE_OF_CONDUCT.md), [Security policy](SECURITY.md) and [changelog](CHANGELOG.md) set community standards.
 
 ## License
 

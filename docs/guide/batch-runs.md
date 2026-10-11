@@ -8,12 +8,6 @@ split and prints it before doing anything else:
 focusforge-cli stack path/to/many-sessions/ --algorithm laplacian -o projects/
 ```
 
-```
-grouping path/to/many-sessions: 2 groups (directory structure (no frame carries a readable capture time))
-  session-a  32 frames  IMG_9801.tif .. IMG_9832.tif  [directory]
-  session-b  29 frames  IMG_9910.tif .. IMG_9938.tif  [directory]
-```
-
 Grouping falls back through capture time (each frame's TIFF `DateTime` tag)
 and directory structure — never silent, the reason it picked is always named
 on the same line. `-o`/`--output` collects every project this run produces
@@ -85,8 +79,9 @@ focusforge-cli stack path/to/frames/ --algorithm laplacian --write-preset macro.
 ```
 
 `--write-preset` writes the preset that reproduces the run just made — the
-resolved algorithm ids and the values actually chosen, never a value left to
-an `auto` closure. A flag on the command line always beats the file:
+resolved algorithm ids and explicit values actually chosen. Values still left
+to an `auto` closure remain live rather than being frozen. A flag on the
+command line always beats the file:
 `--set`/`--align-set` override the file's tables, `--algorithm`/`--align-algorithm`
 override its keys. The `[stack]` table also carries the project settings (`align`, `auto-crop`,
 `equalize`, `equalize-max-gain`); `align = false` in a preset fuses the frames
@@ -128,12 +123,6 @@ entirely for one run, reading nothing from it and leaving nothing behind;
 
 ```bash
 focusforge-cli review projects/
-```
-
-```
-review projects/manifest.json: 2 results
-  session-a                completed sharpness=0.9823   sources=32  coherence=0.7464   wall=41.203s
-  session-b                failed    sharpness=--       sources=--  coherence=--        wall=0.031s  -- alignment failed for 2 frame(s): IMG_9921.tif, IMG_9930.tif
 ```
 
 `review` reads a run's manifest (or, given a plain directory of projects, no
