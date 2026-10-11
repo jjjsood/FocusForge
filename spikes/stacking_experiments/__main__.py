@@ -16,10 +16,10 @@ import time
 import numpy as np
 import PIL
 
-from . import coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid
+from . import coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid, photometric
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
-from .runner import gff, _wavelet_verify_file, _wavelet_input_identity, complex_wavelet_case_controls, _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, complex_wavelet_paired_effects, complex_wavelet_repeat_equality, complex_wavelet_repeat_preflight, run_complex_wavelet_configurations, run_complex_wavelet_resource_body, run_complex_wavelet_stack, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
+from .runner import gff, _wavelet_verify_file, _wavelet_input_identity, complex_wavelet_case_controls, _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, photometric_full_frame_manifest, photometric_physical_controls, photometric_real_roi_coverage, photometric_repeat_equality, photometric_repeat_preflight, photometric_stack_command, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, complex_wavelet_paired_effects, complex_wavelet_repeat_equality, complex_wavelet_repeat_preflight, run_complex_wavelet_configurations, run_complex_wavelet_resource_body, run_complex_wavelet_stack, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_photometric_source_controls, run_photometric_stage, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
 
 
 def _complex_wavelet_semantics() -> dict[str, object]:
@@ -1187,6 +1187,70 @@ def self_check(allowances: Path | None = None) -> int:
     return 0
 
 
+def _photometric_calibration_documents(readiness: dict[str, object], registration_sha256: str) -> tuple[dict[str, object], dict[str, object], dict[str, dict[str, str]]]:
+    """Load the two calibration records only from immutable readiness bindings."""
+    hashes = readiness.get("input_hashes")
+    if not isinstance(hashes, dict):
+        raise ValueError("photometric readiness has no calibration bindings")
+    documents: dict[str, dict[str, object]] = {}
+    bindings: dict[str, dict[str, str]] = {}
+    for raw_path, digest in hashes.items():
+        if not isinstance(raw_path, str) or not isinstance(digest, str):
+            continue
+        path = Path(raw_path)
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError("photometric calibration binding is stale")
+        if path.suffix != ".json":
+            continue
+        try:
+            document = json.loads(path.read_text(), object_pairs_hook=photometric._unique_object)
+        except json.JSONDecodeError as error:
+            raise ValueError("photometric calibration binding is not JSON") from error
+        if isinstance(document, dict) and document.get("registration_sha256") == registration_sha256 and document.get("control") in ("off", "global-gain"):
+            control = str(document["control"])
+            if control in documents:
+                raise ValueError("photometric readiness has duplicate calibration records")
+            documents[control] = document
+            bindings[control] = {"path": str(path.resolve()), "sha256": digest}
+    if set(documents) != {"off", "global-gain"}:
+        raise ValueError("photometric readiness lacks both calibration records")
+    photometric._quality_calibration(documents["off"], "off", registration_sha256)
+    photometric._quality_calibration(documents["global-gain"], "global-gain", registration_sha256)
+    photometric._quality_identity(documents["global-gain"])
+    return documents["off"], documents["global-gain"], bindings
+
+
+def _photometric_readiness(runs: Path, registration_sha256: str, stage: str) -> dict[str, object]:
+    """Load the immutable per-command readiness admission from the runs directory."""
+    return photometric.readiness_document(runs, registration_sha256, stage)
+
+
+def _photometric_allowance_calibrations(envelope: dict[str, object], registration_sha256: str) -> dict[str, dict[str, str]] | None:
+    if envelope.get("state") != "allowance-ready":
+        return None
+    readiness_path, _ = photometric._binding(envelope.get("readiness"), "photometric allowance readiness binding is invalid")
+    readiness = photometric._json_document(readiness_path, "photometric allowance readiness is invalid")
+    pairs = (("off", "calibration_off"), ("global-gain", "calibration_global"))
+    bindings = {}
+    for control, field in pairs:
+        path, digest = photometric._binding(readiness.get(field), "photometric allowance calibration binding is invalid")
+        document = photometric._json_document(path, "photometric allowance calibration is invalid")
+        photometric._quality_calibration(document, control, registration_sha256)
+        if control == "global-gain":
+            photometric._quality_identity(document)
+        bindings[control] = {"path": str(path.resolve()), "sha256": digest}
+    return bindings
+
+
+def _photometric_write_comparison(output: Path, name: str, value: object) -> None:
+    path = output / "comparison.json"
+    document = json.loads(path.read_text(), object_pairs_hook=photometric._unique_object)
+    if not isinstance(document, dict):
+        raise ValueError("photometric comparison is not an object")
+    document[name] = value
+    path.write_text(json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-check", action="store_true")
@@ -1288,6 +1352,22 @@ def main(argv: list[str] | None = None) -> int:
     wavelet.add_argument("--training-sha256", help="immutable first comparison SHA256 required for repeat")
     wavelet.add_argument("--resource-body", type=int, choices=(8, 32), help=argparse.SUPPRESS)
     wavelet.add_argument("--repeat-only", action="store_true")
+    photo = sub.add_parser("photometric")
+    photo.add_argument("--self-check", dest="photometric_self_check", action="store_true")
+    photo.add_argument("--source-controls", action="store_true")
+    photo.add_argument("--parity-only", action="store_true")
+    photo.add_argument("--calibration-only", action="store_true")
+    photo.add_argument("--control", choices=("off", "global-gain"))
+    photo.add_argument("--split", choices=("training",))
+    photo.add_argument("--repeat-only", action="store_true")
+    photo.add_argument("--training")
+    photo.add_argument("--training-sha256")
+    photo.add_argument("--registration")
+    photo.add_argument("--runs")
+    photo.add_argument("--out")
+    photo.add_argument("--prepared")
+    photo.add_argument("--source", choices=("stack",))
+    photo.add_argument("--rect")
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
@@ -1296,6 +1376,113 @@ def main(argv: list[str] | None = None) -> int:
         if args.out:
             Path(args.out).write_text(document + "\n")
         print(document)
+        return 0
+    if args.command == "photometric":
+        if args.photometric_self_check:
+            if any((args.source_controls, args.parity_only, args.calibration_only, args.repeat_only, args.split, args.source, args.prepared, args.training, args.training_sha256, args.rect)):
+                parser.error("photometric self-check does not accept measured inputs")
+            if (args.registration is None) != (args.runs is None):
+                parser.error("photometric self-check requires --registration and --runs together")
+            output = Path(args.out or ".scratch/photometric/controls")
+            try:
+                if args.registration is not None:
+                    photometric.registration_document(Path(args.registration))
+                for record in [*photometric.control_records(output), *photometric_physical_controls(output / "physical")]:
+                    print(f"{record['name']}: ok {json.dumps(record, sort_keys=True)}")
+            except (AssertionError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            return 0
+        if args.source_controls:
+            if any((args.parity_only, args.calibration_only, args.repeat_only, args.split, args.source, args.prepared, args.registration, args.runs, args.training, args.training_sha256, args.rect)):
+                parser.error("photometric source controls do not accept real input")
+            if args.out is None:
+                parser.error("photometric source controls require --out")
+            try:
+                records = run_photometric_source_controls(Path(args.out))
+            except (RuntimeError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            print(f"photometric source controls: {len(records)}")
+            return 0
+        selected = sum(bool(value) for value in (args.parity_only, args.calibration_only, args.repeat_only, args.split, args.source))
+        if selected != 1:
+            parser.error("photometric requires exactly one registered measured mode")
+        if not all((args.registration, args.runs, args.out)):
+            parser.error("photometric measured modes require --registration, --runs, and --out")
+        if args.parity_only:
+            stage = "parity"
+            if any((args.control, args.training, args.training_sha256, args.prepared, args.rect)):
+                parser.error("photometric parity does not accept calibration, repeat, or real inputs")
+        elif args.calibration_only:
+            if args.control is None:
+                parser.error("photometric calibration requires --control")
+            stage = "calibration-off" if args.control == "off" else "calibration-global"
+            if any((args.training, args.training_sha256, args.prepared, args.rect)):
+                parser.error("photometric calibration does not accept training or real inputs")
+        elif args.repeat_only:
+            stage = "repeat"
+            if not all((args.training, args.training_sha256)) or any((args.control, args.prepared, args.rect)):
+                parser.error("photometric repeat requires --training and --training-sha256 only")
+        elif args.source:
+            stage = "real"
+            if args.source != "stack" or args.prepared is None or args.rect is None or any((args.control, args.training, args.training_sha256)):
+                parser.error("photometric real requires --source stack --prepared and --rect")
+        else:
+            stage = "quality"
+            if args.split != "training" or any((args.control, args.training, args.training_sha256, args.prepared, args.rect)):
+                parser.error("photometric quality requires --split training")
+        try:
+            if stage == "parity" or stage.startswith("calibration") or stage in ("quality", "repeat", "real"):
+                document, digest, envelope = photometric.stage_envelope(Path(args.registration), stage)
+                readiness = _photometric_readiness(Path(args.runs), digest, stage)
+            else:
+                document, digest = photometric.registration_document(Path(args.registration))
+                envelope = None
+                readiness = photometric.readiness_document(Path(args.runs), digest, stage)
+            output = Path(args.out)
+            if output.exists():
+                raise ValueError("photometric output must not exist before readiness admission")
+            if stage == "repeat":
+                training = photometric_repeat_preflight(Path(args.training), str(args.training_sha256), digest)
+                if readiness.get("training_sha256") != args.training_sha256:
+                    raise ValueError("photometric repeat training comparison is missing or stale")
+            else:
+                training = None
+            expected_calibrations = _photometric_allowance_calibrations(envelope, digest) if envelope is not None else None
+            calibrations = None
+            if stage in ("quality", "repeat", "real"):
+                calibrations = _photometric_calibration_documents(readiness, digest)
+                if expected_calibrations is None or calibrations[2] != expected_calibrations:
+                    raise ValueError("photometric readiness calibration bindings differ from allowance evidence")
+            prepared, rect = None, None
+            if stage == "real":
+                rect = tuple(int(value) for value in args.rect.split(","))
+                if rect != (1878, 1056, 1024, 1024):
+                    raise ValueError("photometric real rectangle differs from registration")
+                prepared = Path(args.prepared)
+                full = photometric_full_frame_manifest(prepared, "stack")
+                if document.get("original_inputs", {}).get("preparation", {}).get("sha256") != hashlib.sha256(prepared.read_bytes()).hexdigest() or not full["photometric_full_frame"]["coverage"]["common_valid_pixels"]:
+                    raise ValueError("photometric real preparation is stale or has no full-frame coverage")
+                photometric_real_roi_coverage(full["photometric_full_frame"], rect)
+            records = run_photometric_stage(stage, output, Path(args.runs), readiness, prepared, args.source, rect)
+            if stage == "quality":
+                assert calibrations is not None
+                off, global_gain, bindings = calibrations
+                verdict = photometric.quality_verdict(records, off, global_gain, digest)
+                if not isinstance(verdict, dict):
+                    raise ValueError("photometric quality verdict is invalid")
+                _photometric_write_comparison(output, "quality_verdict", verdict)
+                _photometric_write_comparison(output, "calibration_bindings", bindings)
+            elif stage == "repeat":
+                assert training is not None and calibrations is not None
+                repeated = json.loads((output / "comparison.json").read_text(), object_pairs_hook=photometric._unique_object)
+                audit = photometric_repeat_equality(training, repeated, digest)
+                _photometric_write_comparison(output, "repeat_audit", {**audit, "training_sha256": args.training_sha256, "reference_sha256": args.training_sha256,
+                                                                         "calibration_bindings": calibrations[2]})
+        except (AttributeError, OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+            parser.error(str(error))
+        print(f"photometric {stage}: {len(records)} rows")
         return 0
     if args.command == "complex-wavelet":
         if args.training_sha256 is not None and not args.repeat_only:

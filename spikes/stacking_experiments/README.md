@@ -9,6 +9,8 @@ python3 -m spikes.stacking_experiments focus-score --split training --registrati
 python3 -m spikes.stacking_experiments index-field --split training --registration /path/to/index-field-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/index-field/replay
 python3 -m spikes.stacking_experiments selection-consistency --split training --registration /path/to/selection-consistency-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/selection-consistency/replay
 python3 -m spikes.stacking_experiments noise-shrinkage --self-check
+python3 -m spikes.stacking_experiments photometric --self-check --out .scratch/photometric/controls
+python3 -m spikes.stacking_experiments photometric --source-controls --out .scratch/photometric/source-controls
 python3 -m spikes.stacking_experiments noise-shrinkage --split training --registration /path/to/noise-shrinkage-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --out .scratch/noise-shrinkage/training
 python3 -m spikes.stacking_experiments mask-pyramid --self-check
 python3 -m spikes.stacking_experiments baseline --split training --out .scratch/stacking-controls
@@ -22,6 +24,16 @@ FOCUSFORGE_REFERENCE_STACK=/path/to/frames python3 -m spikes.stacking_experiment
 ```
 
 The hold-out command without `--allow-holdout` intentionally exits nonzero before rendering. The explicit flag is reserved for final synthesis. `FOCUSFORGE_REFERENCE_STACK` names the directory containing the 61 reduced mantis frames.
+
+`photometric --self-check` proves fixed encoded-domain fitting and full-frame tile application controls. `--source-controls` runs the four current-product gain controls once and retains each command, report, native exit and GNU-time record. Measured modes require a registration, run directory, empty output directory and matching immutable readiness record: `--parity-only`, `--calibration-only --control off|global-gain`, `--split training`, `--repeat-only --training ... --training-sha256 ...`, or `--source stack --prepared ... --rect 1878,1056,1024,1024`. The command validates all hashes, the fixed row matrix and remaining budget before creating output. Real input is fit and corrected over full aligned TIFFs before the registered ROI is read.
+
+The run directory supplies immutable `<stage>-admission.json` records under `photometric/`; calibration also requires `parity-ready.json`. A real invocation has the form:
+
+```text
+FOCUSFORGE_REFERENCE_STACK=/path/to/frames python3 -m spikes.stacking_experiments photometric --source stack --prepared /path/to/preparation-manifest.json --rect 1878,1056,1024,1024 --registration /path/to/allowance-ready.json --runs /path/to/runs --out /path/to/real
+```
+
+The admission record bounds one complete command invocation. The caller may enforce its wall-time limit around that command with a ten-second termination grace; the command does not create nested deadlines. Real output records full-frame fits, crop coverage, native receipts and labelled off/candidate diagnostic panels. All truth-dependent metrics remain unavailable because real inputs have no oracle image.
 
 `prepare-real` aligns the registered full-resolution files with CPU pyramidal ECC, rotation-scale mode, an anchor reference and the middle frame. It writes a strict preparation manifest binding source headers and hashes, report, transforms, statuses, warped TIFFs, command exit, wall time and RSS. `crops` requires that manifest, verifies it again, proves all sources cover the registered aligned-reference rectangle, then reads only that rectangle from the aligned TIFFs. Synthetic co-registered cases use their registered no-alignment geometry.
 

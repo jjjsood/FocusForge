@@ -23,7 +23,7 @@ import numpy as np
 import PIL
 from PIL import Image, ImageDraw
 
-from . import coefficient_shrinkage, complex_wavelet, consistency, fusion, index_field, mask_pyramid, metrics
+from . import coefficient_shrinkage, complex_wavelet, consistency, fusion, index_field, mask_pyramid, metrics, photometric
 from .protocol import FAMILIES, FRAME_COUNT, REAL_CROPS, TRAINING_SEEDS, SeedTriple, require_seed
 from .scenes import SceneData, family_members, render_family
 
@@ -177,6 +177,738 @@ def _sets(method: str, equalized: bool) -> tuple[str, ...]:
     if method == "laplacian":
         sets.append("levels=5")
     return tuple(sets)
+
+
+def photometric_stack_command(case: Path, method: str, tile: int, output: Path, equalized: bool = False) -> list[str]:
+    """Build the current CPU stack command with photometric correction disabled."""
+    if method not in METHODS or tile != 512:
+        raise ValueError("photometric runs require a registered method and 512px tile")
+    command = [str(ROOT / "target" / "debug" / "focusforge-cli"), "stack", str(case.resolve()), "--algorithm", method,
+               "--no-align", "--no-crop", "--cpu", "--json", "--tile-size", str(tile), "--set", f"equalize={'true' if equalized else 'false'}",
+               "--output", str(output.resolve())]
+    if method == "laplacian":
+        command.extend(("--set", "levels=5"))
+    return command
+
+
+def _photometric_native(case: Path, method: str, output: Path, equalized: bool) -> dict[str, object]:
+    """Run stack then current export, retaining each native artifact binding."""
+    argv = photometric_stack_command(case, method, 512, output, equalized)
+    cli = ROOT / "target" / "debug" / "focusforge-cli"
+    time_v, stdout, stderr, native_exit = output / "time-v.txt", output / "stdout.txt", output / "stderr.txt", output / "nativeexit.txt"
+    _write_json(output / "argv.json", argv)
+    with stdout.open("w") as out, stderr.open("w") as err:
+        process = subprocess.run(["/usr/bin/time", "-v", "-o", str(time_v), *argv], cwd=ROOT, stdout=out, stderr=err, text=True)
+    native_exit.write_text(f"{process.returncode}\n")
+    if process.returncode:
+        raise RuntimeError(f"photometric native {method} failed")
+    report = json.loads(stdout.read_text())
+    project = Path(str(report["outputs"][0]))
+    composite, zmap = output / "composite.tif", output / "zmap.tif"
+    export = [str(ROOT / "target" / "debug" / "focusforge-cli"), "export", str(project), "-o", str(composite), "--zmap", str(zmap), "--json"]
+    export_time, export_stdout, export_stderr, export_exit = output / "export-time-v.txt", output / "export-stdout.txt", output / "export-stderr.txt", output / "exportexit.txt"
+    _write_json(output / "export-argv.json", export)
+    with export_stdout.open("w") as out, export_stderr.open("w") as err:
+        exported = subprocess.run(["/usr/bin/time", "-v", "-o", str(export_time), *export], cwd=ROOT, stdout=out, stderr=err, text=True)
+    export_exit.write_text(f"{exported.returncode}\n")
+    if exported.returncode:
+        raise RuntimeError(f"photometric export {method} failed")
+    return {"argv": str((output / "argv.json").resolve()), "argv_sha256": sha256_path(output / "argv.json"),
+            "time_v": str(time_v.resolve()), "time_v_sha256": sha256_path(time_v), "stdout": str(stdout.resolve()), "stdout_sha256": sha256_path(stdout),
+            "stderr": str(stderr.resolve()), "stderr_sha256": sha256_path(stderr), "native_exit": process.returncode,
+            "native_exit_path": str(native_exit.resolve()), "native_exit_sha256": sha256_path(native_exit),
+            "export_argv": str((output / "export-argv.json").resolve()), "export_argv_sha256": sha256_path(output / "export-argv.json"),
+            "export_time_v": str(export_time.resolve()), "export_time_v_sha256": sha256_path(export_time),
+            "export_stdout": str(export_stdout.resolve()), "export_stdout_sha256": sha256_path(export_stdout),
+            "export_stderr": str(export_stderr.resolve()), "export_stderr_sha256": sha256_path(export_stderr), "export_exit": exported.returncode,
+            "export_exit_path": str(export_exit.resolve()), "export_exit_sha256": sha256_path(export_exit),
+            "cli": str(cli.resolve()), "cli_sha256": sha256_path(cli), "runner_sha256": sha256_path(Path(__file__)),
+            "project": str(project.resolve()), "project_sha256": sha256_path(project),
+            "composite": str(composite.resolve()), "composite_sha256": sha256_path(composite),
+            "zmap": str(zmap.resolve()), "zmap_sha256": sha256_path(zmap), "equalization": report.get("equalization")}
+
+
+def _photometric_case_metrics(case: Path, corrected: Path, native: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+    """Measure stored synthetic output against the sealed reference-lighting truth."""
+    manifest = json.loads((case / "case.json").read_text())
+    metadata = json.loads(Path(str(manifest["metric_metadata"])).read_text())
+    truth = gff.read_u16(Path(str(manifest["truth_reference_lighting"])))
+    coverage = np.load(manifest["coverage"], allow_pickle=False)
+    composite = gff.read_u16(Path(str(native["composite"])))
+    zinfo = gff.rawtiff.read_info(Path(str(native["zmap"])))
+    zmap = np.frombuffer(gff.rawtiff.read_rect(Path(str(native["zmap"])), 0, 0, zinfo.width, zinfo.height, zinfo), dtype="<u2").reshape(zinfo.height, zinfo.width)
+    labels = metrics.label_metrics(zmap, np.clip(np.rint(np.load(manifest["depth"], allow_pickle=False)), 0, 65535).astype(np.uint16), coverage[photometric.REFERENCE])
+    values = metrics.measure(composite, truth, metadata)
+    measured = {**{name: values[name] for name in ("psnr", "ssim", "edge_halo", "hair_retention", "chroma_drift")}, **labels}
+    if any(value is None or not np.isfinite(value) for value in measured.values()):
+        raise ValueError("photometric synthetic output omitted a required fused metric")
+    fused = photometric.fused_fields({name: float(measured[name]) for name in photometric.REQUIRED_FUSED},
+                                     {name: "not applicable to this photometric comparison" for name in photometric.NULL_FUSED})
+    frames = np.stack([gff.read_u16(corrected / "frames" / f"{index:02d}.tif") for index in range(FRAME_COUNT)])
+    targets = [gff.read_u16(Path(str(row["path"]))) for row in manifest["reference_lighting_frames"]]
+    errors = [photometric.frame_error(frame, target, coverage[index] & coverage[photometric.REFERENCE]) for index, (frame, target) in enumerate(zip(frames, targets))]
+    return fused, {"frame_errors": errors, "noise": manifest["noise"], "noise_array_sha256": manifest["noise_array_sha256"]}
+
+
+def _photometric_document(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(), object_pairs_hook=photometric._unique_object)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("photometric comparison JSON is unreadable") from error
+    if not isinstance(value, dict):
+        raise ValueError("photometric comparison JSON must be an object")
+    return value
+
+
+def _photometric_finite(value: object) -> bool:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return True
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_photometric_finite(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _photometric_finite(item) for key, item in value.items())
+    return False
+
+
+def _photometric_bound_file(path_value: object, hash_value: object) -> Path:
+    path = Path(str(path_value))
+    if not isinstance(hash_value, str) or not path.is_file() or sha256_path(path) != hash_value:
+        raise ValueError("photometric retained artifact is missing or stale")
+    return path
+
+
+def _photometric_key(row: dict[str, object]) -> tuple[object, ...]:
+    return (row.get("variant"), tuple(row.get("seed", ())), row.get("method"), row.get("tile"), row.get("arm"))
+
+
+def _photometric_row(row: object, expected: dict[str, object], registration_sha256: str) -> dict[str, object]:
+    if not isinstance(row, dict) or any(row.get(name) != value for name, value in expected.items()):
+        raise ValueError("photometric comparison row key differs from the fixed matrix")
+    if row.get("registration_sha256") != registration_sha256 or not _photometric_finite(row):
+        raise ValueError("photometric comparison row has stale provenance or nonfinite data")
+    source = Path(str(row.get("source_case", "")))
+    _photometric_bound_file(source / "case.json", row.get("source_case_sha256"))
+    manifest = _photometric_document(source / "case.json")
+    if manifest.get("variant") != expected["variant"] or manifest.get("seed") != expected["seed"]:
+        raise ValueError("photometric source case differs from its row")
+    frames, frame_hashes = manifest.get("frames"), manifest.get("frame_sha256")
+    if (not isinstance(frames, list) or not isinstance(frame_hashes, list) or len(frames) != FRAME_COUNT
+            or len(frame_hashes) != FRAME_COUNT or any(sha256_path(Path(str(path))) != digest for path, digest in zip(frames, frame_hashes))):
+        raise ValueError("photometric source frames are incomplete or stale")
+    if row.get("noise_array_sha256") != manifest.get("noise_array_sha256"):
+        raise ValueError("photometric row noise binding differs from its source case")
+    _photometric_bound_file(manifest.get("noise"), manifest.get("noise_array_sha256"))
+    corrected = Path(str(row.get("input_case", "")))
+    correction = _photometric_bound_file(corrected / "correction.json", row.get("correction_sha256"))
+    correction_document = _photometric_document(correction)
+    corrected_hashes = correction_document.get("corrected_sha256")
+    if (correction_document.get("arm") != expected["arm"] or correction_document.get("variant") != expected["variant"]
+            or correction_document.get("source_frame_sha256") != frame_hashes or not isinstance(corrected_hashes, list)
+            or len(corrected_hashes) != FRAME_COUNT
+            or any(sha256_path(corrected / "frames" / f"{index:02d}.tif") != digest for index, digest in enumerate(corrected_hashes))):
+        raise ValueError("photometric correction inputs are incomplete or stale")
+    fits = row.get("fits")
+    if expected["arm"] in ("channel-gain-offset", "spatial-multiplier"):
+        width = 6 if expected["arm"] == "channel-gain-offset" else 5
+        if (fits != correction_document.get("fits") or not isinstance(fits, list) or len(fits) != FRAME_COUNT
+                or any(not isinstance(fit, dict) or not isinstance(fit.get("clamped"), bool)
+                       or not isinstance(fit.get("applied"), list) or len(fit["applied"]) != width
+                       or any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) for value in fit["applied"])
+                       for fit in fits)):
+            raise ValueError("photometric fitted parameters are incomplete or stale")
+    native = row.get("native")
+    if not isinstance(native, dict) or native.get("native_exit") != 0 or native.get("export_exit") != 0:
+        raise ValueError("photometric native record has failed")
+    for path_name, hash_name in (("project", "project_sha256"), ("composite", "composite_sha256"), ("zmap", "zmap_sha256"),
+                                 ("argv", "argv_sha256"), ("time_v", "time_v_sha256"), ("stdout", "stdout_sha256"),
+                                 ("stderr", "stderr_sha256"), ("native_exit_path", "native_exit_sha256"),
+                                 ("export_argv", "export_argv_sha256"), ("export_time_v", "export_time_v_sha256"),
+                                 ("export_stdout", "export_stdout_sha256"), ("export_stderr", "export_stderr_sha256"),
+                                 ("export_exit_path", "export_exit_sha256"), ("cli", "cli_sha256")):
+        _photometric_bound_file(native.get(path_name), native.get(hash_name))
+    if native.get("runner_sha256") != sha256_path(Path(__file__)):
+        raise ValueError("photometric native record has a stale runner binding")
+    fused = row.get("fused")
+    if not isinstance(fused, dict):
+        raise ValueError("photometric fused metrics are missing")
+    null_metrics = fused.get("null_metrics")
+    if (not isinstance(fused.get("metrics"), dict) or not isinstance(null_metrics, dict)
+            or set(null_metrics) != set(photometric.NULL_FUSED)
+            or any(not isinstance(value, dict) or "value" not in value or value["value"] is not None
+                   or not isinstance(value.get("reason"), str) or not value["reason"]
+                   for value in null_metrics.values())):
+        raise ValueError("photometric unavailable fused metrics are invalid")
+    photometric.fused_fields(fused["metrics"], {name: null_metrics[name]["reason"] for name in photometric.NULL_FUSED})
+    errors = row.get("frame_errors")
+    if (not isinstance(errors, list) or len(errors) != FRAME_COUNT
+            or any(not isinstance(value, dict) or any(not isinstance(value.get(name), (int, float)) or isinstance(value[name], bool) or not math.isfinite(value[name])
+                                                      for name in ("frame_rgb_mae", "frame_luma_rmse")) for value in errors)):
+        raise ValueError("photometric frame errors are missing or nonfinite")
+    return row
+
+
+def _photometric_comparison(document: object, stage: str, registration_sha256: str) -> dict[tuple[object, ...], dict[str, object]]:
+    if not isinstance(document, dict) or document.get("stage") != stage or document.get("registration_sha256") != registration_sha256:
+        raise ValueError("photometric comparison stage or registration differs")
+    rows = document.get("rows")
+    expected = photometric.stage_rows(stage)
+    if not isinstance(rows, list) or len(rows) != len(expected):
+        raise ValueError("photometric comparison row count is incomplete")
+    expected_rows = {_photometric_key(row): row for row in expected}
+    if len(expected_rows) != len(expected):
+        raise ValueError("photometric fixed matrix has duplicate keys")
+    matched: dict[tuple[object, ...], dict[str, object]] = {}
+    for actual in rows:
+        key = _photometric_key(actual) if isinstance(actual, dict) else ()
+        required = expected_rows.get(key)
+        if required is None:
+            raise ValueError("photometric comparison row key differs from the fixed matrix")
+        checked = _photometric_row(actual, required, registration_sha256)
+        if key in matched:
+            raise ValueError("photometric comparison has duplicate fixed keys")
+        matched[key] = checked
+    expected_keys = set(expected_rows)
+    if set(matched) != expected_keys:
+        raise ValueError("photometric comparison fixed keys are incomplete")
+    return matched
+
+
+def photometric_repeat_preflight(training: Path, training_sha256: str, registration_sha256: str) -> dict[str, object]:
+    """Verify the immutable quality artifact before repeat output can exist."""
+    if not isinstance(training_sha256, str) or not training.is_file() or sha256_path(training) != training_sha256:
+        raise ValueError("photometric repeat training comparison is missing or stale")
+    document = _photometric_document(training)
+    _photometric_comparison(document, "quality", registration_sha256)
+    return document
+
+
+def _photometric_semantics(row: dict[str, object]) -> dict[str, object]:
+    native = dict(row["native"])
+    correction = _photometric_document(Path(str(row["input_case"])) / "correction.json")
+    return {"source_case_sha256": row["source_case_sha256"], "noise_array_sha256": row["noise_array_sha256"],
+            "correction": {"source_frame_sha256": correction.get("source_frame_sha256"), "coverage_sha256": correction.get("coverage_sha256"),
+                           "fits": correction.get("fits"), "corrected_pixels": [_photometric_tiff_pixels(Path(str(row["input_case"])) / "frames" / f"{index:02d}.tif") for index in range(FRAME_COUNT)]},
+            "native": {"composite": _photometric_tiff_pixels(Path(str(native["composite"]))), "zmap": _photometric_tiff_pixels(Path(str(native["zmap"]))),
+                       "cli_sha256": native["cli_sha256"], "runner_sha256": native["runner_sha256"], "equalization": native["equalization"]},
+            "fused": row["fused"], "frame_errors": row["frame_errors"]}
+
+
+def _photometric_tiff_pixels(path: Path) -> dict[str, object]:
+    try:
+        info = gff.rawtiff.read_info(path)
+        pixels = gff.rawtiff.read_rect(path, 0, 0, info.width, info.height, info)
+    except (OSError, ValueError) as error:
+        raise ValueError("photometric native TIFF is unreadable") from error
+    return {"width": info.width, "height": info.height, "samples_per_pixel": info.samples_per_pixel,
+            "bits_per_sample": list(info.bits_per_sample), "pixels_sha256": sha256(pixels).hexdigest()}
+
+
+def photometric_repeat_equality(training: dict[str, object], repeated: dict[str, object], registration_sha256: str) -> dict[str, object]:
+    """Compare repeat artifacts by fixed keys and retained content, never paths."""
+    first = _photometric_comparison(training, "quality", registration_sha256)
+    try:
+        second = _photometric_comparison(repeated, "repeat", registration_sha256)
+    except ValueError as error:
+        return {"status": "DEFER", "full_matched_keys": False, "training_count": len(first), "repeat_count": 0,
+                "counts": {"quality": len(first), "repeat": 0},
+                "registration_sha256": registration_sha256, "semantic_differences": [{"reason": str(error)}]}
+    first_semantics = {key: _photometric_semantics(row) for key, row in first.items()}
+    second_semantics = {key: _photometric_semantics(row) for key, row in second.items()}
+    differences = [{"key": list(key), "fields": [name for name in first_semantics[key] if first_semantics[key][name] != second_semantics[key][name]]}
+                   for key in sorted(first) if first_semantics[key] != second_semantics[key]]
+    metadata_differences = [{"key": list(key), "artifacts": [name for name in ("project_sha256", "composite_sha256", "zmap_sha256")
+                                                               if first[key]["native"][name] != second[key]["native"][name]]}
+                            for key in sorted(first) if any(first[key]["native"][name] != second[key]["native"][name] for name in ("project_sha256", "composite_sha256", "zmap_sha256"))]
+    return {"status": "NO_GO" if differences else "GO", "full_matched_keys": set(first) == set(second),
+            "training_count": len(first), "repeat_count": len(second), "counts": {"quality": len(first), "repeat": len(second)}, "registration_sha256": registration_sha256,
+            "semantic_differences": differences, "metadata_differences": metadata_differences}
+
+
+def _photometric_calibration_records(stage: str, rows: list[dict[str, object]]) -> dict[str, object]:
+    """Seal one calibration partition without counting method-duplicate frame observations."""
+    control = "off" if stage == "calibration-off" else "global-gain"
+    fused, errors, frame_allowance_rows, groups, scalars = [], [], [], [], []
+    cases: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in rows:
+        seed = row["seed"]
+        for metric, value in row["fused"]["metrics"].items():
+            fused.append({"variant": row["variant"], "method": row["method"], "tile": row["tile"], "control": control,
+                          "metric": metric, "seed": seed, "repeat": row["repeat"], "value": value})
+        cases.setdefault((row["variant"], tuple(seed), row["repeat"]), row)
+    for (variant, seed, repeat), row in cases.items():
+        for frame, values in enumerate(row["frame_errors"]):
+            for metric in ("frame_rgb_mae", "frame_luma_rmse"):
+                if values[metric] is None:
+                    raise ValueError("photometric calibration frame error is unavailable")
+                frame_allowance_rows.append({"variant": variant, "frame": frame, "control": control, "metric": metric,
+                                             "seed": list(seed), "repeat": repeat, "value": values[metric], "units": "encoded code counts", "direction": "lower"})
+            errors.append({"variant": variant, "frame": frame, "control": control, "seed": list(seed), "repeat": repeat,
+                           "frame_rgb_mae": values["frame_rgb_mae"], "frame_luma_rmse": values["frame_luma_rmse"],
+                           "units": "encoded code counts", "direction": "lower"})
+    if control == "global-gain":
+        for (variant, seed, repeat), row in cases.items():
+            if variant != "unchanged-focus":
+                continue
+            source = Path(str(row["source_case"]))
+            manifest = json.loads((source / "case.json").read_text())
+            frames = np.stack([gff.read_u16(Path(path)) for path in manifest["frames"]])
+            coverage = np.load(manifest["coverage"], allow_pickle=False)
+            fits = {arm: [photometric.estimate(arm, frames, coverage, frame) for frame in range(FRAME_COUNT)] for arm in photometric.FITTED_ARMS}
+            groups.extend(photometric.identity_observations(type("Seed", (), {"layout": seed[0], "texture": seed[1], "noise": seed[2]})(), fits, repeat))
+            for group in groups[-len(photometric.FITTED_ARMS) * FRAME_COUNT:]:
+                for scalar in group["scalars"]:
+                    scalars.append({**{name: group[name] for name in ("seed", "repeat", "arm", "frame")}, **scalar, "direction": "lower"})
+    if len(fused) != 210 * len(photometric.REQUIRED_FUSED) or len(errors) != 560:
+        raise ValueError("photometric calibration record count is invalid")
+    if control == "global-gain" and (len(groups) != 240 or len(scalars) != 640):
+        raise ValueError("photometric identity calibration record count is invalid")
+    return {"control": control, "fused": fused, "frame_errors": errors, "identity_groups": groups, "identity_scalars": scalars,
+            "fused_allowances": photometric.reduce_allowances(fused, ("variant", "method", "tile", "control", "metric")),
+            "frame_allowances": photometric.reduce_allowances(frame_allowance_rows, ("variant", "frame", "control", "metric", "units", "direction")),
+            "identity_allowances": photometric.reduce_allowances(scalars, ("arm", "frame", "parameter", "units", "direction")) if scalars else []}
+
+
+def photometric_full_frame_manifest(manifest_path: Path, source: str = "stack") -> dict[str, object]:
+    """Bind full-frame aligned TIFFs and transform-derived coverage before any ROI."""
+    manifest = _validate_preparation(manifest_path, source)
+    inputs = manifest.get("aligned_inputs")
+    if not isinstance(inputs, list) or len(inputs) != FRAME_COUNT:
+        raise ValueError("photometric real input has no aligned full-frame TIFFs")
+    report = json.loads(Path(str(manifest["alignment_report"])).read_text())
+    headers = []
+    for bound in inputs:
+        path = Path(str(bound.get("path", "")))
+        info = gff.rawtiff.read_info(path)
+        if not path.is_file() or info.width != bound.get("width") or info.height != bound.get("height") or info.samples_per_pixel != 3:
+            raise ValueError("photometric aligned TIFF header is stale")
+        headers.append({"path": str(path.resolve()), "sha256": sha256_path(path), "width": info.width, "height": info.height})
+    if len({(row["width"], row["height"]) for row in headers}) != 1:
+        raise ValueError("photometric full-frame inputs differ in dimensions")
+    width, height = headers[0]["width"], headers[0]["height"]
+    if not isinstance(report.get("alignments"), list) or len(report["alignments"]) != FRAME_COUNT:
+        raise ValueError("photometric preparation transforms are incomplete")
+    manifest = {**manifest, "photometric_full_frame": {"width": width, "height": height, "frames": headers,
+                                                           "coverage": photometric_full_frame_coverage(report, width, height)}}
+    return manifest
+
+
+def photometric_full_frame_coverage(report: dict[str, object], width: int, height: int, tile: int = 512) -> dict[str, object]:
+    """Count transform-valid full-frame pixels tilewise; never assume crop coverage."""
+    if width <= 0 or height <= 0 or tile <= 0:
+        raise ValueError("photometric full-frame geometry is invalid")
+    entries = report.get("alignments")
+    if not isinstance(entries, list) or len(entries) != FRAME_COUNT:
+        raise ValueError("photometric transforms are incomplete")
+    totals = [0] * FRAME_COUNT
+    common_total = 0
+    for y0 in range(0, height, tile):
+        for x0 in range(0, width, tile):
+            yy, xx = np.mgrid[y0:min(y0 + tile, height), x0:min(x0 + tile, width)].astype(np.float64)
+            common = np.ones(xx.shape, dtype=bool)
+            for index, entry in enumerate(entries):
+                matrix = np.asarray(entry["transform"]["m"], dtype=np.float64)
+                denominator = matrix[2, 0] * xx + matrix[2, 1] * yy + matrix[2, 2]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ux = (matrix[0, 0] * xx + matrix[0, 1] * yy + matrix[0, 2]) / denominator
+                    uy = (matrix[1, 0] * xx + matrix[1, 1] * yy + matrix[1, 2]) / denominator
+                valid = np.isfinite(ux) & np.isfinite(uy) & (denominator > 1e-6) & (ux >= 0) & (ux <= width - 1) & (uy >= 0) & (uy <= height - 1)
+                totals[index] += int(valid.sum())
+                common &= valid
+            common_total += int(common.sum())
+    return {"coordinate_system": "aligned-reference", "tile": tile, "per_frame_valid_pixels": totals,
+            "common_valid_pixels": common_total, "total_pixels": width * height,
+            "transforms": report["alignments"]}
+
+
+def photometric_real_roi_coverage(full: dict[str, object], rect: tuple[int, int, int, int]) -> dict[str, object]:
+    """Require the registered ROI to be wholly covered before real processing."""
+    coverage = full.get("coverage")
+    if not isinstance(coverage, dict) or not isinstance(coverage.get("transforms"), list):
+        raise ValueError("photometric full-frame coverage is incomplete")
+    return _roi_coverage({"alignments": coverage["transforms"]}, rect, int(full["width"]), int(full["height"]))
+
+
+def photometric_stream_apply_full_frame(manifest_path: Path, source: str, arm: str, output: Path) -> dict[str, object]:
+    """Fit/apply an arm over aligned TIFF rectangles before extracting the registered ROI."""
+    manifest = photometric_full_frame_manifest(manifest_path, source)
+    full = manifest["photometric_full_frame"]
+    width, height = int(full["width"]), int(full["height"])
+    paths = [Path(str(row["path"])) for row in full["frames"]]
+    infos = [gff.rawtiff.read_info(path) for path in paths]
+    step = max(1, int(math.ceil(math.sqrt(width * height / 262144))))
+    samples = [[] for _ in range(FRAME_COUNT)]
+    transforms = full["coverage"]["transforms"]
+    for y0 in range(0, height, 512):
+        for x0 in range(0, width, 512):
+            h, w = min(512, height - y0), min(512, width - x0)
+            blocks = [np.frombuffer(gff.rawtiff.read_rect(path, x0, y0, w, h, info), dtype="<u2").reshape(h, w, 3) for path, info in zip(paths, infos)]
+            yy, xx = np.mgrid[y0:y0+h, x0:x0+w]
+            grid = (yy % step == 0) & (xx % step == 0)
+            valid = []
+            for entry in transforms:
+                matrix = np.asarray(entry["transform"]["m"], dtype=np.float64); den = matrix[2,0]*xx + matrix[2,1]*yy + matrix[2,2]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ux=(matrix[0,0]*xx+matrix[0,1]*yy+matrix[0,2])/den; uy=(matrix[1,0]*xx+matrix[1,1]*yy+matrix[1,2])/den
+                valid.append(np.isfinite(ux)&np.isfinite(uy)&(den>1e-6)&(ux>=0)&(ux<=width-1)&(uy>=0)&(uy<=height-1))
+            reference_luma = blocks[photometric.REFERENCE].mean(axis=2)
+            for index, block in enumerate(blocks):
+                chosen = grid & valid[index] & valid[photometric.REFERENCE] & (reference_luma >= .05*65535) & (reference_luma <= .95*65535) & (block.mean(axis=2)>0)
+                samples[index].append((xx[chosen], yy[chosen], block[chosen], blocks[photometric.REFERENCE][chosen]))
+    fits = []
+    for index, parts in enumerate(samples):
+        xs=np.concatenate([part[0] for part in parts]); ys=np.concatenate([part[1] for part in parts])
+        values=np.concatenate([part[2] for part in parts]); targets=np.concatenate([part[3] for part in parts])
+        fits.append(photometric.estimate_samples(arm, values, targets, xs, ys, width, height, index))
+    output.mkdir(parents=True, exist_ok=True)
+    corrected = []
+    for index, (path, info, fit) in enumerate(zip(paths, infos, fits)):
+        raw = bytearray(width * height * 3 * 2)
+        for y0 in range(0, height, 512):
+            for x0 in range(0, width, 512):
+                h, w = min(512, height-y0), min(512, width-x0)
+                block = np.frombuffer(gff.rawtiff.read_rect(path, x0, y0, w, h, info), dtype="<u2").reshape(h, w, 3)
+                value = photometric.apply(block, fit, (x0, y0), (height, width)).astype("<u2", copy=False).tobytes()
+                for row in range(h):
+                    offset = ((y0 + row) * width + x0) * 6
+                    raw[offset:offset + w * 6] = value[row*w*6:(row+1)*w*6]
+        target = output / f"{index:02d}.tif"
+        gff.rawtiff.write_tiff(target, width, height, bytes(raw), bits=16, spp=3)
+        output_values = np.frombuffer(raw, dtype="<u2")
+        input_pixels = _photometric_tiff_pixels(path)
+        output_pixels = _photometric_tiff_pixels(target)
+        identity = bool(fit.identity and index == photometric.REFERENCE)
+        if identity and input_pixels["pixels_sha256"] != output_pixels["pixels_sha256"]:
+            raise ValueError("photometric reference correction is not pixel-identical")
+        corrected.append({"path": str(target.resolve()), "sha256": sha256_path(target), "fit": fit.record(),
+                          "input_pixels_sha256": input_pixels["pixels_sha256"], "output_pixels_sha256": output_pixels["pixels_sha256"],
+                          "reference_identity_proof": identity,
+                          "output_saturated_samples": int(((output_values == 0) | (output_values == 65535)).sum()),
+                          "output_samples": int(output_values.size)})
+    return {"manifest_sha256": sha256_path(manifest_path), "coverage": full["coverage"], "fits": corrected}
+
+
+def _photometric_crop_after_full_frame(root: Path, frames: list[dict[str, object]], rect: tuple[int, int, int, int]) -> Path:
+    """Extract a registered ROI only after a full-frame correction has been written."""
+    x, y, width, height = rect
+    directory = root / "frames"
+    directory.mkdir(parents=True, exist_ok=True)
+    for index, binding in enumerate(frames):
+        source = Path(str(binding["path"])); info = gff.rawtiff.read_info(source)
+        pixels = gff.rawtiff.read_rect(source, x, y, width, height, info)
+        gff.rawtiff.write_tiff(directory / f"{index:02d}.tif", width, height, pixels, bits=16, spp=3)
+    return root
+
+
+def _photometric_roi_bindings(case: Path) -> list[dict[str, str]]:
+    """Bind the exact corrected ROI TIFFs supplied to one native stack command."""
+    bindings = []
+    for index in range(FRAME_COUNT):
+        path = case / "frames" / f"{index:02d}.tif"
+        bindings.append({"path": str(path.resolve()), "sha256": sha256_path(path), "pixels_sha256": _photometric_tiff_pixels(path)["pixels_sha256"]})
+    return bindings
+
+
+def _photometric_real_montages(output: Path, records: list[dict[str, object]], rect: tuple[int, int, int, int], coverage: dict[str, object]) -> list[dict[str, object]]:
+    """Render one fixed arm-order diagnostic panel per fusion method."""
+    montages = []
+    arms = ("off", "global-gain", "channel-gain-offset", "spatial-multiplier")
+    for method in METHODS:
+        rows = {str(row["arm"]): row for row in records if row["method"] == method}
+        if set(rows) != set(arms):
+            raise ValueError("photometric real montage needs four arms per method")
+        path = output / "montages" / f"{method}-off-vs-candidates.png"
+        path.parent.mkdir(exist_ok=True)
+        gff.montage(str(path), (0, rect[3], 0, rect[2]), [Path(str(rows[arm]["native"]["composite"])) for arm in arms])
+        rendered = Image.open(path).convert("RGB")
+        canvas = Image.new("RGB", (rendered.width, rendered.height + 24), "black")
+        canvas.paste(rendered, (0, 24))
+        ImageDraw.Draw(canvas).text((4, 4), f"{method}: off | global-gain | channel-gain-offset | spatial-multiplier", fill="white")
+        canvas.save(path)
+        montages.append({"method": method, "path": str(path.resolve()), "sha256": sha256_path(path), "panels": list(arms),
+                         "rect_xywh": list(rect), "coverage": coverage, "truth": "unavailable"})
+    return montages
+
+
+def photometric_physical_controls(root: Path) -> list[dict[str, object]]:
+    """Exercise raw RGB16 TIFF application and deliberate physical mutation refusals."""
+    root.mkdir(parents=True, exist_ok=True)
+    frame = np.broadcast_to(np.arange(1088, dtype=np.uint16)[None, :, None] * 31 + np.arange(736, dtype=np.uint16)[:, None, None] * 7,
+                            (736, 1088, 3)).copy()
+    fits = {"off": photometric._identity("off"),
+            "global-gain": photometric.Fit("global-gain", np.array((1.25,)), False, False, 1, False),
+            "channel-gain-offset": photometric.Fit("channel-gain-offset", np.array((1.1, 37., .9, -19., 1.02, 9.)), False, False, 2, False),
+            "spatial-multiplier": photometric.Fit("spatial-multiplier", np.array((1., .12, .03, -.04, .02)), False, False, 5, False)}
+    records: list[dict[str, object]] = []
+    for arm, fit in fits.items():
+        source = root / f"{arm}-source.tif"; gff.write_u16(source, frame)
+        whole = root / f"{arm}-whole.tif"; gff.write_u16(whole, photometric.apply(gff.read_u16(source), fit))
+        equal = {}
+        for tile in (512, 1024):
+            stitched = np.empty_like(frame)
+            for y0 in range(0, 736, tile):
+                for x0 in range(0, 1088, tile):
+                    stitched[y0:min(y0+tile,736), x0:min(x0+tile,1088)] = photometric.apply(frame[y0:min(y0+tile,736), x0:min(x0+tile,1088)], fit, (x0,y0), (736,1088))
+            path = root / f"{arm}-tile{tile}.tif"; gff.write_u16(path, stitched)
+            equal[str(tile)] = np.array_equal(gff.read_u16(whole), gff.read_u16(path))
+        records.append({"name": f"physical-{arm}", "ok": all(equal.values()), "whole_sha256": sha256_path(whole), "tiles": equal})
+    wrong_origin = np.empty_like(frame)
+    spatial = fits["spatial-multiplier"]
+    for y0 in range(0, 736, 512):
+        for x0 in range(0, 1088, 512): wrong_origin[y0:min(y0+512,736),x0:min(x0+512,1088)] = photometric.apply(frame[y0:min(y0+512,736),x0:min(x0+512,1088)], spatial)
+    samples = np.full((FRAME_COUNT, 50, 50, 3), 10000, dtype=np.uint16); samples[0] = 5000; samples[photometric.REFERENCE] = 6000
+    coverage = np.ones((FRAME_COUNT,50,50),bool); coverage[0,:,25:] = False
+    covered = photometric.estimate("global-gain", samples, coverage, 0)
+    bound_samples = np.full((FRAME_COUNT, 50, 50, 3), 5000, dtype=np.uint16)
+    bound_samples[photometric.REFERENCE] = 20000
+    bounded = photometric.estimate("global-gain", bound_samples, None, 0)
+    wrong_reference = photometric.estimate("global-gain", samples, coverage, 0, reference=2)
+    black = samples.copy(); black[0,0,0] = 0; invalid = coverage.copy(); invalid[0,0,0] = False
+    black_fit = photometric.estimate("global-gain", black, invalid, 0)
+    saturated = photometric.apply(np.array([[[65535, 65535, 65535]]],dtype=np.uint16), fits["global-gain"])
+    records.extend([
+        {"name":"bad-tile-origin","ok":not np.array_equal(gff.read_u16(root / "spatial-multiplier-whole.tif"), wrong_origin)},
+        {"name":"bad-reference-binding","ok":bool(wrong_reference.reference == 2 and wrong_reference.values[0] != covered.values[0])},
+        {"name":"coverage-intersection","ok":bool(covered.sample_count == 1250 and black_fit.sample_count == 1249)},
+        {"name":"bounds-and-saturation","ok":bool(bounded.values[0] == photometric.HIGH and bounded.clamped and int(saturated[0,0,0]) == 65535)},
+        {"name":"q16-tie","ok":int(photometric.apply(np.array([[[2,2,2]]],dtype=np.uint16), fits["global-gain"])[0,0,0]) == 3},
+    ])
+    _write_json(root / "physical-controls.json", {"records": records})
+    if not all(record["ok"] for record in records): raise AssertionError("photometric physical TIFF control failed")
+    return records
+
+
+def _photometric_case_inputs(root: Path) -> dict[str, Path]:
+    """Create each fixed synthetic input once, then bind its ordered physical TIFF hashes."""
+    root.mkdir(parents=True, exist_ok=True)
+    cases: dict[str, Path] = {}
+    for variant in photometric.VARIANTS:
+        for seed in TRAINING_SEEDS:
+            key = f"{variant}-{seed.layout}-{seed.texture}-{seed.noise}"
+            case = root / key
+            manifest_path = case / "case.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text())
+                paths = [Path(str(path)) for path in manifest.get("frames", [])]
+                if (manifest.get("variant") != variant or manifest.get("seed") != [seed.layout, seed.texture, seed.noise]
+                        or len(paths) != FRAME_COUNT or any(not path.is_file() for path in paths)
+                        or manifest.get("frame_sha256") != [sha256_path(path) for path in paths]
+                        or any(not isinstance(manifest.get(name), str) or not Path(manifest[name]).is_file()
+                               or manifest.get(digest) != sha256_path(Path(manifest[name]))
+                               for name, digest in (("coverage", "coverage_sha256"), ("noise", "noise_array_sha256"),
+                                                    ("truth_reference_lighting", "truth_reference_lighting_sha256"),
+                                                    ("depth", "depth_sha256"), ("metric_metadata", "metric_metadata_sha256")))
+                        or not isinstance(manifest.get("reference_lighting_frames"), list)
+                        or len(manifest["reference_lighting_frames"]) != FRAME_COUNT
+                        or any(not Path(str(row.get("path", ""))).is_file() or row.get("sha256") != sha256_path(Path(str(row["path"]))) for row in manifest["reference_lighting_frames"])):
+                    raise ValueError("photometric sealed case is stale or incomplete")
+                cases[key] = case
+                continue
+            if case.exists():
+                raise ValueError("photometric case directory exists without a sealed manifest")
+            data = photometric.build_case(seed, variant)
+            frames = case / "frames"
+            frames.mkdir(parents=True)
+            paths = []
+            for index, image in enumerate(data.frames):
+                path = frames / f"{index:02d}.tif"
+                gff.write_u16(path, image)
+                paths.append(path.resolve())
+            coverage_path = case / "coverage.npy"
+            np.save(coverage_path, np.asarray(data.metadata["coverage"], dtype=bool))
+            noise_path = case / "noise.npy"
+            np.save(noise_path, np.asarray(data.metadata["noise"], dtype=np.float64))
+            targets = []
+            target_dir = case / "reference-lighting"
+            target_dir.mkdir()
+            for index, image in enumerate(np.asarray(data.metadata["reference_lighting_frames"], dtype=np.uint16)):
+                target = target_dir / f"{index:02d}.tif"; gff.write_u16(target, image)
+                targets.append({"path": str(target.resolve()), "sha256": sha256_path(target)})
+            truth_path = case / "truth-reference.tif"; gff.write_u16(truth_path, data.truth)
+            depth_path = case / "depth.npy"; np.save(depth_path, data.depth.astype(np.float64))
+            metadata_path = case / "metric-metadata.json"
+            _write_json(metadata_path, {name: value for name, value in data.metadata.items()
+                                        if name not in {"coverage", "noise", "reference_lighting_frames", "truth_reference_lighting"}})
+            manifest = {"variant": variant, "seed": [seed.layout, seed.texture, seed.noise], "reference": photometric.REFERENCE,
+                        "frames": [str(path) for path in paths], "frame_sha256": [sha256_path(path) for path in paths],
+                        "coverage": str(coverage_path.resolve()), "coverage_sha256": sha256_path(coverage_path),
+                        "noise": str(noise_path.resolve()), "noise_array_sha256": sha256_path(noise_path), "noise_sha256": data.metadata["noise_sha256"], "clip_fraction": data.metadata["clip_fraction"], "reference_lighting_frames": targets,
+                        "truth_reference_lighting": str(truth_path.resolve()),
+                        "depth": str(depth_path.resolve()), "depth_sha256": sha256_path(depth_path),
+                        "metric_metadata": str(metadata_path.resolve()), "metric_metadata_sha256": sha256_path(metadata_path),
+                        "lighting_order": data.metadata["lighting_order"]}
+            manifest["truth_reference_lighting_sha256"] = sha256_path(truth_path)
+            _write_json(manifest_path, manifest)
+            cases[key] = case
+    return cases
+
+
+def _photometric_corrected_case(root: Path, case: Path, arm: str, variant: str) -> Path:
+    """Apply a synthetic arm to physical TIFF inputs before a native fusion command."""
+    manifest = json.loads((case / "case.json").read_text())
+    frames = np.stack([gff.read_u16(Path(path)).astype(np.uint16) for path in manifest["frames"]])
+    coverage = np.load(manifest["coverage"], allow_pickle=False)
+    destination = root / f"{case.name}-{arm}" / "frames"
+    if destination.parent.exists():
+        expected = [destination / f"{index:02d}.tif" for index in range(FRAME_COUNT)]
+        binding = destination.parent / "correction.json"
+        if binding.is_file() and all(path.is_file() for path in expected):
+            saved = json.loads(binding.read_text())
+            if (saved.get("arm") == arm and saved.get("variant") == variant and saved.get("source_frame_sha256") == manifest["frame_sha256"]
+                    and saved.get("coverage_sha256") == manifest["coverage_sha256"] and saved.get("corrected_sha256") == [sha256_path(path) for path in expected]):
+                return destination.parent
+        raise ValueError("photometric corrected case output is incomplete")
+    destination.mkdir(parents=True)
+    fits = []
+    for index, frame in enumerate(frames):
+        if arm == "off": value = frame
+        elif arm == "oracle": value = photometric.oracle(frame, variant, index)
+        else:
+            fit = photometric.estimate(arm, frames, coverage, index)
+            fits.append(fit.record())
+            value = photometric.apply(frame, fit)
+        gff.write_u16(destination / f"{index:02d}.tif", value)
+    _write_json(destination.parent / "correction.json", {"arm": arm, "variant": variant, "source_frame_sha256": manifest["frame_sha256"],
+                                                          "coverage_sha256": manifest["coverage_sha256"], "fits": fits,
+                                                          "corrected_sha256": [sha256_path(destination / f"{index:02d}.tif") for index in range(FRAME_COUNT)]})
+    return destination.parent
+
+
+def run_photometric_stage(stage: str, output: Path, runs: Path, readiness: dict[str, object],
+                          prepared: Path | None = None, source: str | None = None,
+                          rect: tuple[int, int, int, int] | None = None) -> list[dict[str, object]]:
+    """Execute one admitted fixed matrix; this function never admits itself or refusions old baselines."""
+    rows = photometric.stage_rows(stage)
+    real_full: dict[str, object] | None = None
+    real_roi: dict[str, object] | None = None
+    real_preparation: dict[str, object] | None = None
+    if stage == "real":
+        if source != "stack" or prepared is None or rect is None:
+            raise ValueError("photometric real stage needs registered full-frame input")
+        real_manifest = photometric_full_frame_manifest(prepared, source)
+        real_full = dict(real_manifest["photometric_full_frame"])
+        real_roi = photometric_real_roi_coverage(real_full, rect)
+        real_preparation = {"manifest": str(prepared.resolve()), "manifest_sha256": sha256_path(prepared),
+                            "alignment_report": real_manifest["alignment_report"], "alignment_report_sha256": real_manifest["alignment_report_sha256"],
+                            "raw_inputs": real_manifest["raw_inputs"], "aligned_inputs": real_manifest["aligned_inputs"], "reference_frame": real_manifest["reference_frame"]}
+    output.mkdir(parents=True, exist_ok=False)
+    records: list[dict[str, object]] = []
+    if stage == "real":
+        assert prepared is not None and source is not None and rect is not None and real_full is not None and real_roi is not None and real_preparation is not None
+        full_cache: dict[str, dict[str, object]] = {}
+        crop_cache: dict[str, Path] = {}
+        for row in rows:
+            arm, method = str(row["arm"]), str(row["method"])
+            if arm not in full_cache:
+                full_cache[arm] = photometric_stream_apply_full_frame(prepared, source, arm, output / "full" / arm)
+                crop_cache[arm] = _photometric_crop_after_full_frame(output / "roi" / arm, full_cache[arm]["fits"], rect)
+            full, case = full_cache[arm], crop_cache[arm]
+            work = output / f"{arm}-{method}"
+            work.mkdir(parents=True)
+            native = _photometric_native(case, method, work, False)
+            null_reasons = {name: "registered real input has no ground-truth or oracle reference" for name in (*photometric.REQUIRED_FUSED, *photometric.NULL_FUSED)}
+            null_reasons.update({name: "diagnostic is not registered for this real comparison" for name in ("gradient_energy", "map_coherence")})
+            records.append({**row, "registration_sha256": readiness["registration_sha256"], "preparation": real_preparation, "full_frame": full, "roi": real_roi,
+                            "input_case": str(case.resolve()), "roi_inputs": _photometric_roi_bindings(case),
+                            "native": native, "image_metrics": {name: None for name in null_reasons}, "metric_unavailable": null_reasons,
+                            "metric_count": len(null_reasons), "truth_metrics": "not computed"})
+        montages = _photometric_real_montages(output, records, rect, real_roi)
+        _write_json(output / "real-summary.json", {"source": source, "preparation": real_preparation, "full_frame": real_full,
+                                                     "roi": real_roi, "rows": records, "montages": montages,
+                                                     "truth": "unavailable", "oracle": "unavailable"})
+    else:
+        cases = _photometric_case_inputs(runs / "cases")
+        for row in rows:
+            seed = row["seed"]; key = f"{row['variant']}-{seed[0]}-{seed[1]}-{seed[2]}"; source_case = cases[key]
+            source_manifest = _photometric_document(source_case / "case.json")
+            arm = "off" if stage == "parity" else ("off" if row.get("control") == "off" else "global-gain" if row.get("control") == "global-gain" else str(row.get("arm", "off")))
+            case = source_case if arm == "off" and stage == "parity" else _photometric_corrected_case(output / "inputs", source_case, arm, str(row["variant"]))
+            work = output / "native" / f"{key}-{row['method']}-{row.get('repeat', 0)}-{arm}"
+            work.mkdir(parents=True)
+            native = _photometric_native(case, str(row["method"]), work, stage == "parity")
+            correction = case / "correction.json"
+            correction_document = _photometric_document(correction) if correction.is_file() else {}
+            record = {**row, "registration_sha256": readiness["registration_sha256"], "source_case": str(source_case.resolve()),
+                      "source_case_sha256": sha256_path(source_case / "case.json"), "source_frame_sha256": source_manifest["frame_sha256"],
+                      "noise_array_sha256": source_manifest["noise_array_sha256"], "input_case": str(case.resolve()),
+                      "correction_sha256": sha256_path(correction) if correction.is_file() else None, "fits": correction_document.get("fits"), "native": native}
+            if stage == "parity":
+                frames = np.stack([gff.read_u16(Path(path)) for path in json.loads((source_case / "case.json").read_text())["frames"]])
+                coverage = np.load(json.loads((source_case / "case.json").read_text())["coverage"], allow_pickle=False)
+                record["parity"] = photometric.parity_global(frames, coverage, native["equalization"])
+            else:
+                fused, frame = _photometric_case_metrics(source_case, case, native)
+                record.update({"fused": fused, **frame})
+            records.append(record)
+    payload = {"stage": stage, "registration_sha256": readiness["registration_sha256"], "readiness": readiness, "rows": records}
+    _write_json(output / "comparison.json", payload)
+    if stage == "parity":
+        keys = {(row["variant"], tuple(row["seed"]), row["method"], row["tile"]) for row in records}
+        if len(records) != 35 or len(keys) != 35:
+            raise ValueError("photometric parity lacks exact unique native comparisons")
+        _write_json(output / "parity.json", payload)
+    if stage.startswith("calibration"):
+        calibration = _photometric_calibration_records(stage, records)
+        _write_json(output / "calibration.json", {"registration_sha256": readiness["registration_sha256"], **calibration})
+    return records
+
+
+def run_photometric_source_controls(root: Path) -> list[dict[str, object]]:
+    """Run the four registered current-product equalization controls once."""
+    if root.exists():
+        raise ValueError("photometric source-control output must not already exist")
+    root.mkdir(parents=True)
+    cases = (("thin999", 999, 20000, 20000), ("usable1000", 1000, 20000, 20000),
+             ("clamped", 512 * 512, 5000, 20000), ("positive-half-q16", 512 * 512, 16000, 20000))
+    records = []
+    for name, usable, source_value, reference_value in cases:
+        case, output = root / name / "input", root / name / "output"
+        frames = case / "frames"
+        frames.mkdir(parents=True, exist_ok=True)
+        reference = np.zeros((512, 512, 3), dtype=np.uint16)
+        reference.reshape(-1, 3)[:usable] = reference_value
+        source = np.full_like(reference, source_value)
+        if name == "positive-half-q16":
+            reference[0, 0] = 3
+            source[0, 0] = 2
+        paths = []
+        for index in range(FRAME_COUNT):
+            path = frames / f"{index:02d}.tif"
+            gff.write_u16(path, reference if index == (FRAME_COUNT - 1) // 2 else source)
+            paths.append(path)
+        output.mkdir(parents=True, exist_ok=True)
+        argv = photometric_stack_command(case, "laplacian", 512, output, equalized=True)
+        argv_path, stdout, stderr, time_v, exit_path = (root / name / "argv.json", root / name / "stdout.txt", root / name / "stderr.txt", root / name / "time-v.txt", root / name / "exit.txt")
+        timed = ["/usr/bin/time", "-v", "-o", str(time_v), *argv]
+        argv_path.write_text(json.dumps(timed) + "\n")
+        with stdout.open("w") as out_handle, stderr.open("w") as err_handle:
+            process = subprocess.run(timed, cwd=ROOT, stdout=out_handle, stderr=err_handle, text=True)
+        exit_path.write_text(f"{process.returncode}\n")
+        report = json.loads(stdout.read_text()) if process.returncode == 0 else {}
+        if not isinstance(report.get("equalization"), dict):
+            raise RuntimeError(f"photometric source control {name} omitted equalization")
+        equalization = report["equalization"]
+        frames_report = equalization.get("frames")
+        if equalization.get("reference") != (FRAME_COUNT - 1) // 2 or not isinstance(frames_report, list) or len(frames_report) != FRAME_COUNT:
+            raise RuntimeError(f"photometric source control {name} reported an invalid reference")
+        others = [entry for index, entry in enumerate(frames_report) if index != (FRAME_COUNT - 1) // 2]
+        if name == "thin999":
+            valid = all(entry.get("thin") is True and entry.get("samples") == 999 and entry.get("applied") == 1.0 for entry in others)
+        elif name == "usable1000":
+            valid = all(entry.get("thin") is False and entry.get("samples") == 1000 and entry.get("applied") == 1.0 for entry in others)
+        elif name == "clamped":
+            valid = all(entry.get("thin") is False and entry.get("samples") == 512 * 512 and entry.get("estimated") == 4.0 and entry.get("applied") == 1.25 and entry.get("clamped") is True for entry in others)
+        else:
+            valid = all(entry.get("thin") is False and entry.get("samples") == 512 * 512 - 1 and entry.get("estimated") == 1.25 and entry.get("applied") == 1.25 and entry.get("clamped") is False for entry in others)
+        if not valid:
+            raise RuntimeError(f"photometric source control {name} did not meet its registered outcome")
+        records.append({"name": name, "native_exit": process.returncode, "argv_path": str(argv_path), "stdout": str(stdout), "stderr": str(stderr), "time_v": str(time_v), "exit_path": str(exit_path),
+                        "frame_sha256": [sha256_path(path) for path in paths]})
+        if process.returncode:
+            raise RuntimeError(f"photometric source control {name} exited {process.returncode}")
+    _write_json(root / "source-controls.json", {"records": records})
+    return records
 
 
 def _run_current_baseline(case: Path, method: str, tile: int, work: Path, sets: tuple[str, ...], align: bool = False) -> dict[str, object]:
