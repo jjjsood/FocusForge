@@ -16,7 +16,7 @@ import time
 import numpy as np
 import PIL
 
-from . import coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid, photometric
+from . import alignment_reference, coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid, photometric
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
 from .runner import gff, _wavelet_verify_file, _wavelet_input_identity, complex_wavelet_case_controls, _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, photometric_full_frame_manifest, photometric_physical_controls, photometric_real_roi_coverage, photometric_repeat_equality, photometric_repeat_preflight, photometric_stack_command, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, complex_wavelet_paired_effects, complex_wavelet_repeat_equality, complex_wavelet_repeat_preflight, run_complex_wavelet_configurations, run_complex_wavelet_resource_body, run_complex_wavelet_stack, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_photometric_source_controls, run_photometric_stage, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
@@ -1251,7 +1251,60 @@ def _photometric_write_comparison(output: Path, name: str, value: object) -> Non
     path.write_text(json.dumps(document, indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
-def main(argv: list[str] | None = None) -> int:
+def alignment_reference_dispatch_self_check() -> str:
+    """Exercise the public alignment-reference argument path without fitting."""
+    import contextlib
+    import io
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        captured: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def executor(*values: object, **named: object) -> dict[str, str]:
+            captured.append((values, named))
+            return {"stage": str(values[0])}
+
+        digest = "0" * 64
+        result = main(["alignment-reference", "--stage", "quality", "--registration", str(root / "registration.json"),
+                       "--source-proof", str(root / "source.json"), "--source-proof-sha256", digest,
+                       "--parity-proof", str(root / "parity.json"), "--parity-proof-sha256", digest,
+                       "--allowance-proof", str(root / "allowance.json"), "--allowance-proof-sha256", digest,
+                       "--root", str(root), "--spike", str(root / "spike"), "--cli", str(root / "cli"),
+                       "--quality-digest", digest, "--quality-records", str(root / "quality.json"),
+                       "--calibration-records", str(root / "calibration.json"), "--calibration-records-sha256", digest,
+                       "--real-manifest", str(root / "real.json"), "--out", str(root / "out")], alignment_executor=executor)
+        if result != 0 or len(captured) != 1:
+            raise AssertionError("alignment-reference CLI did not dispatch once")
+        values, named = captured[0]
+        if (values != ("quality", root / "registration.json", root / "source.json", root / "allowance.json", root / "parity.json",
+                      root, root / "spike", root / "cli", root / "out")
+                or named.get("source_proof_sha256") != digest or named.get("parity_proof_sha256") != digest
+                or named.get("allowance_proof_sha256") != digest or named.get("quality_digest") != digest
+                or named.get("quality_records") != root / "quality.json"
+                or named.get("calibration_records") != root / "calibration.json"
+                or named.get("calibration_records_sha256") != digest
+                or named.get("real_manifest") != root / "real.json"):
+            raise AssertionError("alignment-reference CLI lost immutable inputs")
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["alignment-reference", "--records", "ignored"], alignment_executor=executor)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("obsolete alignment-reference records input accepted")
+            try:
+                main(["alignment-reference", "--stage", "quality"], alignment_executor=executor)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("incomplete alignment-reference inputs accepted")
+        if len(captured) != 1:
+            raise AssertionError("invalid alignment-reference input reached executor")
+    return "cli-dispatch"
+
+
+def main(argv: list[str] | None = None, *, alignment_executor: object | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--allowances")
@@ -1277,6 +1330,28 @@ def main(argv: list[str] | None = None) -> int:
     prepare_real_command = sub.add_parser("prepare-real")
     prepare_real_command.add_argument("--source", choices=("stack",), required=True)
     prepare_real_command.add_argument("--out", required=True)
+    alignment_reference_command = sub.add_parser("alignment-reference")
+    alignment_reference_command.add_argument("--self-check", dest="alignment_reference_self_check", action="store_true")
+    alignment_reference_command.add_argument("--stage", choices=alignment_reference.STAGES)
+    alignment_reference_command.add_argument("--registration")
+    alignment_reference_command.add_argument("--source-proof")
+    alignment_reference_command.add_argument("--source-proof-sha256")
+    alignment_reference_command.add_argument("--parity-proof")
+    alignment_reference_command.add_argument("--parity-proof-sha256")
+    alignment_reference_command.add_argument("--allowance-proof")
+    alignment_reference_command.add_argument("--allowance-proof-sha256")
+    alignment_reference_command.add_argument("--calibration-records")
+    alignment_reference_command.add_argument("--calibration-records-sha256")
+    alignment_reference_command.add_argument("--parity-records")
+    alignment_reference_command.add_argument("--parity-records-sha256")
+    alignment_reference_command.add_argument("--verify-parity", action="store_true")
+    alignment_reference_command.add_argument("--quality-records")
+    alignment_reference_command.add_argument("--root")
+    alignment_reference_command.add_argument("--spike")
+    alignment_reference_command.add_argument("--cli")
+    alignment_reference_command.add_argument("--quality-digest")
+    alignment_reference_command.add_argument("--real-manifest")
+    alignment_reference_command.add_argument("--out")
     registration_command = sub.add_parser("registration")
     registration_command.add_argument("--out")
     focus = sub.add_parser("focus-score")
@@ -1371,6 +1446,56 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
+    if args.command == "alignment-reference":
+        executor = alignment_reference.execute_registered_stage if alignment_executor is None else alignment_executor
+        if not callable(executor):
+            raise TypeError("alignment executor must be callable")
+        if args.verify_parity:
+            if any(value is None for value in (args.parity_records, args.parity_records_sha256, args.calibration_records, args.calibration_records_sha256)):
+                parser.error("parity verification requires pinned --parity-records and --calibration-records")
+            if any(value is not None for value in (args.stage, args.registration, args.source_proof, args.parity_proof, args.allowance_proof, args.root, args.spike, args.cli, args.quality_records, args.real_manifest, args.out)):
+                parser.error("parity verification accepts only parity and calibration records")
+            try:
+                parity = alignment_reference.verify_parity_records(Path(args.parity_records), args.parity_records_sha256, Path(args.calibration_records), args.calibration_records_sha256)
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+                parser.error(str(error))
+            for row in parity["comparisons"]:
+                print(f"alignment-reference parity {row['strategy']} repeat={row['repeat']} frame={row['frame']} corner={json.dumps(row['corner_difference'], sort_keys=True)} tolerance={json.dumps(row['tau'])}")
+            print("alignment-reference parity: ok")
+            return 0
+        if args.alignment_reference_self_check:
+            if any((args.stage, args.registration, args.source_proof, args.source_proof_sha256, args.parity_proof, args.parity_proof_sha256, args.allowance_proof, args.allowance_proof_sha256, args.calibration_records, args.calibration_records_sha256, args.parity_records, args.parity_records_sha256, args.quality_records, args.root, args.spike, args.cli, args.quality_digest, args.real_manifest, args.out)):
+                parser.error("alignment-reference self-check does not accept stage inputs")
+            try:
+                for name in [*alignment_reference.self_checks(), alignment_reference_dispatch_self_check()]:
+                    print(f"{name}: ok")
+            except (AssertionError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            return 0
+        if any(value is None for value in (args.stage, args.registration, args.root, args.spike, args.cli, args.out)):
+            parser.error("alignment-reference requires --stage, --registration, --root, --spike, --cli, and --out")
+        try:
+            record = executor(
+                args.stage,
+                Path(args.registration),
+                Path(args.source_proof) if args.source_proof else None,
+                Path(args.allowance_proof) if args.allowance_proof else None,
+                Path(args.parity_proof) if args.parity_proof else None,
+                Path(args.root), Path(args.spike), Path(args.cli), Path(args.out),
+                source_proof_sha256=args.source_proof_sha256,
+                parity_proof_sha256=args.parity_proof_sha256,
+                allowance_proof_sha256=args.allowance_proof_sha256,
+                quality_digest=args.quality_digest,
+                real_manifest=Path(args.real_manifest) if args.real_manifest else None,
+                calibration_records=Path(args.calibration_records) if args.calibration_records else None,
+                calibration_records_sha256=args.calibration_records_sha256,
+                quality_records=Path(args.quality_records) if args.quality_records else None,
+            )
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+            parser.error(str(error))
+        print(f"alignment-reference stage: {record['stage']}")
+        return 0
     if args.command == "registration":
         document = json.dumps(registration(), indent=2, sort_keys=True)
         if args.out:

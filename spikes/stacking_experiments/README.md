@@ -80,3 +80,7 @@ FOCUSFORGE_REFERENCE_STACK=/path/to/frames python3 -m spikes.stacking_experiment
 ```
 
 Archive source-ready registration unchanged before quality transition. Resource output binds this archive, its fixed source and input identities, and all twelve raw body records. A quality-ready registration names the measured artifact before training, repeat, or real output.
+
+## Alignment reference
+
+`python3 -m spikes.stacking_experiments alignment-reference --self-check` validates fixed identifiers, arithmetic, and refusal paths without fitting frames. A stage records physical child arguments, inputs, streams, parsed output, and immutable artifacts. Source writes candidate snapshots and controls only; later independent evidence supplies ready envelopes. The parity collector records four current CLI runs before calibration; `--verify-parity` compares pinned CLI and calibration records without starting another fit. Controls require parity; quality, repeat, and real require allowance evidence. Repeat uses a pinned quality record and reuses its raw input bindings.
