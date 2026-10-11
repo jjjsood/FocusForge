@@ -20,27 +20,37 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 CLI=target/debug/focusforge-cli
+[ -f "$CLI.exe" ] && CLI="$CLI.exe"
 OUT=.scratch/synth-align
 GENERATOR=spikes/synthetic-ground-truth/synth_stack.py
+
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  echo "FAIL: tools/synth-align.sh needs Python 3" >&2
+  exit 1
+fi
 
 if [ ! -x "$CLI" ]; then
   echo "SKIP: no CLI binary yet ($CLI)"
   exit 0
 fi
 
-if ! python3 -c 'import numpy' >/dev/null 2>&1; then
+if ! "$PYTHON" -c 'import numpy' >/dev/null 2>&1; then
   echo "FAIL: tools/synth-align.sh needs numpy -- install it with 'python3 -m pip install numpy' (see CONTRIBUTING.md, Tech stack)" >&2
   exit 1
 fi
 
-echo "+ python3 $GENERATOR --warp 2.0 --scene hard --seed 11 --out $OUT --algo pyramidal-ecc"
-python3 "$GENERATOR" --warp 2.0 --scene hard --seed 11 --out "$OUT" --algo pyramidal-ecc
+echo "+ $PYTHON $GENERATOR --warp 2.0 --scene hard --seed 11 --out $OUT --algo pyramidal-ecc"
+"$PYTHON" "$GENERATOR" --warp 2.0 --scene hard --seed 11 --out "$OUT" --algo pyramidal-ecc
 
 if [ ! -f "$OUT/measurement.json" ]; then
   echo "FAIL: $OUT/measurement.json was not written" >&2
   exit 1
 fi
-python3 -c "import json, sys; json.load(open(sys.argv[1]))" "$OUT/measurement.json" \
+"$PYTHON" -c "import json, sys; json.load(open(sys.argv[1]))" "$OUT/measurement.json" \
   || { echo "FAIL: $OUT/measurement.json is not valid JSON" >&2; exit 1; }
 
 echo "OK: synthetic alignment truth artefact written to $OUT/measurement.json"

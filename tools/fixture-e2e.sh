@@ -27,6 +27,7 @@ cd "$REPO"
 export FOCUSFORGE_DATA_DIR="$REPO/.scratch/fixture-e2e-data"
 
 CLI=target/debug/focusforge-cli
+[ -f "$CLI.exe" ] && CLI="$CLI.exe"
 
 if [ ! -x "$CLI" ]; then
   echo "SKIP: no CLI binary yet ($CLI)"

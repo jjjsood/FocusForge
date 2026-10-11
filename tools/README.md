@@ -3,6 +3,13 @@
 Scripts that check and drive **this** repository: gates, fixture generation
 from the reference stack, and the shared build/GPU lock.
 
+`tools/check-all.sh` is the one canonical build gate. Run it locally before
+acceptance or merge; GitHub Actions runs the same command on Linux, macOS and
+Windows for additional native-platform evidence. CI does not replace the local
+gate. It needs Rust 1.95.0 with rustfmt and clippy, cargo-deny 0.20.2,
+cargo-nextest 0.9.144, Python 3.12.15 with NumPy 2.2.6, and Linux GUI link
+prerequisites when run on Linux.
+
 | script | what it does |
 |---|---|
 | `check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]` | Every gate, one command, bounded output, pass/fail summary. `--static` is the pre-commit set. Skips cleanly until `Cargo.toml` exists. |
@@ -11,6 +18,7 @@ from the reference stack, and the shared build/GPU lock.
 | `check-notice.sh [--write]` | Compares root `NOTICE` with the locked, offline default CLI+GUI runtime graphs for four release targets. `--write` explicitly regenerates it; the check never edits files. Cargo's cached metadata and package index must be available. `check-notice-selftest.sh` covers deterministic rendering and stale component records. |
 | `check-fixtures.sh` | Verifies `fixtures/MANIFEST.sha256` both ways: every listed file still hashes correctly, and no unlisted file is hiding under `fixtures/`. |
 | `check-fixtures-selftest.sh` | Proves `check-fixtures.sh`'s refusals and passes against synthetic throwaway trees, so the gate is never trusted on the strength of only ever having been seen green. |
+| `check-workflow-selftest.py` | Guards the checked-in Actions workflow's native matrix, immutable action pins, one canonical gate call, and narrow hidden-log artifact upload. |
 | `package-linux.sh` | Builds the GUI+CLI AppImage and `.deb` in the pinned Ubuntu 22.04 container. Run `tools/with-lock.sh build -- tools/package-linux.sh`; outputs, SHA-256 file and provenance inventory go under `.scratch/package-linux/`. |
 | `check-package-linux.sh [.scratch/package-linux]` | Uses only generated artifacts and copied fixture/legal expectations in fresh Ubuntu 22.04 containers. It checks inventories, hashes, loader/GLIBC requirements, Debian dependencies, CLI metadata and GUI help. Run it under the build lock after `package-linux.sh`. |
 | `package-macos.sh [--output DIR]` | On macOS, builds universal GUI and CLI binaries, assembles `FocusForge.app`, and creates a DMG below `target/distrib/native/`. |

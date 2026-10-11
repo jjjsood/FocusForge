@@ -63,12 +63,6 @@ RUNLOG_VERBOSE="${RUNLOG_VERBOSE:-${FF_TOOL_VERBOSE:-0}}"
 RUNLOG_TAIL="${RUNLOG_TAIL:-${FF_TOOL_TAIL:-40}}"
 RUNLOG_KEEP="${RUNLOG_KEEP:-${FF_TOOL_KEEP:-10}}"
 
-# Internal, not a FF_TOOL_* knob (assigned unconditionally, not with
-# ${...:-}, so a caller that exports the name cannot turn it into one). A
-# directory this old is prunable regardless of what its .owner file says, so
-# a wedged or orphaned owner cannot pin the root forever.
-RUNLOG_STALE_AFTER_SECS=86400
-
 RUNLOG_NAMES=()
 RUNLOG_STATUSES=()
 RUNLOG_LOGS=()
@@ -110,32 +104,38 @@ runlog_proc_starttime() {
 # protected by the explicit self-skip in the prune loop below. A dot-file in
 # a run directory is already precedent (.status-NN); nothing globs `.*`.
 runlog_write_owner() {
-  printf '%s %s\n' "$$" "$(runlog_proc_starttime "$$")" >"$RUNLOG_DIR/.owner"
+  local starttime
+  starttime="$(runlog_proc_starttime "$$")"
+  printf '%s %s\n' "$$" "${starttime:-unknown}" >"$RUNLOG_DIR/.owner"
 }
 
-# A candidate directory counts as live iff it names a real, well-formed
-# .owner file, is not older than the staleness fallback (checked before the
-# /proc probe, so a wedged process cannot pin the root forever), and its
-# recorded pid is still running with a matching start time (a recycled pid
-# fails this and is treated as finished). No .owner file reads as finished.
+runlog_dir_mtime() {  # runlog_dir_mtime <directory>
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# A candidate directory is finished only when its absent owner file or a
+# readable Linux process identity proves that. Missing metadata, an unreadable
+# owner, or a host without /proc stays live: pruning an unknown active run is
+# worse than retaining an old directory.
 runlog_dir_is_live() {
-  local dir="$1" pid starttime now mtime current
+  local dir="$1" pid starttime mtime current
   [ -f "$dir/.owner" ] || return 1
-  read -r pid starttime <"$dir/.owner" 2>/dev/null || return 1
-  [ -n "$pid" ] && [ -n "$starttime" ] || return 1
+  read -r pid starttime <"$dir/.owner" 2>/dev/null || return 0
+  [ -n "$pid" ] && [ -n "$starttime" ] || return 0
 
-  now="$(date +%s)"
-  mtime="$(stat -c %Y "$dir" 2>/dev/null)" || return 1
-  [ "$((now - mtime))" -le "$RUNLOG_STALE_AFTER_SECS" ] || return 1
+  # GNU and BSD stat spell this differently. If neither works, retain the
+  # candidate: pruning an unknown live run is worse than leaving one behind.
+  mtime="$(runlog_dir_mtime "$dir")" || return 0
 
-  # /proc unreadable at all (a hypothetical non-Linux host) means there is no
-  # way to prove the run is finished -- fail closed and call it live, rather
-  # than fail open and delete a run with no evidence it has ended.
+  # /proc unreadable at all means there is no way to prove the run finished.
   [ -d /proc ] || return 0
+  [ "$starttime" = unknown ] && return 0
 
   [ -d "/proc/$pid" ] || return 1
   current="$(runlog_proc_starttime "$pid")"
-  [ -n "$current" ] && [ "$current" = "$starttime" ]
+  [ -n "$current" ] || return 0
+  [ "$current" = "$starttime" ] && return 0
+  return 1
 }
 
 # One append-only line per gate transition, for anything watching a run from
@@ -160,7 +160,7 @@ runlog_progress() {  # runlog_progress <record...>
   [ -n "${RUNLOG_DIR:-}" ] || return 0
   local line
   printf -v line '%s\t' "$@"
-  printf '%s\n' "${line%$'\t'}" >>"$RUNLOG_DIR/.progress" 2>/dev/null || true
+  printf '%s\n' "${line%$'\t'}" >>"$RUNLOG_DIR/.progress" 2>/dev/null
 }
 
 runlog_init() {
@@ -176,15 +176,16 @@ runlog_init() {
     echo "run-logged: cannot create log dir: $RUNLOG_DIR" >&2
     return 2
   }
-  RUNLOG_DIR_READY=1
-
   # Keep the last few FINISHED runs only. Bounded by construction: the glob is
   # this library's own root directory, never an argument. A directory that is
   # still being written to -- this process's own, or another one's sharing
   # the root -- is never a deletion candidate and never counts against
   # RUNLOG_KEEP; only a directory that has actually finished does.
   if [ "$prune" -eq 1 ]; then
-    runlog_write_owner
+    if ! runlog_write_owner; then
+      echo "run-logged: cannot write log owner: $RUNLOG_DIR/.owner" >&2
+      return 2
+    fi
     local old kept=0
     while read -r old; do
       [ -d "$old" ] || continue
@@ -202,6 +203,7 @@ runlog_init() {
       esac
     done < <(ls -1dt "$RUNLOG_ROOT"/*-* 2>/dev/null)
   fi
+  RUNLOG_DIR_READY=1
 }
 
 # Append one finished command to the table and print its status line. Shared by
@@ -258,7 +260,11 @@ run_logged() {
   set -o pipefail
 
   local t0=$SECONDS status=0
-  runlog_progress start "$order" "$(date +%s)" fg "$name"
+  if ! runlog_progress start "$order" "$(date +%s)" fg "$name"; then
+    echo "run-logged: cannot write progress for $name" >&2
+    RUNLOG_FAILED=1
+    return 2
+  fi
   # The log path goes out BEFORE the command runs as well as after it: a long
   # quiet run is followable with `tail -f` only if its path is already on screen.
   if [ "$RUNLOG_VERBOSE" -eq 1 ]; then
@@ -267,13 +273,36 @@ run_logged() {
     echo ">>> $name (log: ${log#"$RUNLOG_REPO"/})"
   fi
   if [ "$RUNLOG_VERBOSE" -eq 1 ]; then
-    if "$@" 2>&1 | tee "$log"; then status=0; else status="${PIPESTATUS[0]}"; fi
+    local command_status tee_status
+    if "$@" 2>&1 | tee "$log"; then
+      command_status="${PIPESTATUS[0]}" tee_status="${PIPESTATUS[1]}"
+    else
+      command_status="${PIPESTATUS[0]}" tee_status="${PIPESTATUS[1]}"
+    fi
+    if [ "$command_status" -ne 0 ]; then
+      status="$command_status"
+    else
+      status="$tee_status"
+    fi
   else
-    if "$@" >"$log" 2>&1; then status=0; else status=$?; fi
+    local command_status tee_status
+    if "$@" 2>&1 | tee "$log" >/dev/null; then
+      command_status="${PIPESTATUS[0]}" tee_status="${PIPESTATUS[1]}"
+    else
+      command_status="${PIPESTATUS[0]}" tee_status="${PIPESTATUS[1]}"
+    fi
+    if [ "$command_status" -ne 0 ]; then
+      status="$command_status"
+    else
+      status="$tee_status"
+    fi
   fi
   [ "$had_pipefail" -eq 1 ] || set +o pipefail
 
-  runlog_progress end "$order" "$(date +%s)" "$status"
+  if ! runlog_progress end "$order" "$(date +%s)" "$status"; then
+    echo "run-logged: cannot write completion progress for $name" >&2
+    [ "$status" -ne 0 ] || status=2
+  fi
   runlog_record "$order" "$name" "$log" "$((SECONDS - t0))" "$status" "$tail_fail" "$tail_ok"
   return "$status"
 }
@@ -304,15 +333,25 @@ run_logged_bg() {
   status_file="$(printf '%s/.status-%02d' "$RUNLOG_DIR" "$RUNLOG_COUNT")"
   rm -f "$status_file"
 
-  runlog_progress start "$order" "$(date +%s)" bg "$name"
+  if ! runlog_progress start "$order" "$(date +%s)" bg "$name"; then
+    echo "run-logged: cannot write progress for $name" >&2
+    RUNLOG_FAILED=1
+    return 2
+  fi
   echo ">>> $name (background, log: ${log#"$RUNLOG_REPO"/})"
   # Always to the file, never tee'd: two streams at once is unreadable,
   # and the summary is the thing FF_TOOL_VERBOSE must not cost the caller.
   (
     t0=$SECONDS
-    if "$@" >"$log" 2>&1; then status=0; else status=$?; fi
-    printf '%s %s\n' "$status" "$((SECONDS - t0))" >"$status_file"
-    runlog_progress end "$order" "$(date +%s)" "$status"
+    if "$@" 2>&1 | tee "$log" >/dev/null; then
+      command_status="${PIPESTATUS[0]}" tee_status="${PIPESTATUS[1]}"
+    else
+      command_status="${PIPESTATUS[0]}" tee_status="${PIPESTATUS[1]}"
+    fi
+    if [ "$command_status" -ne 0 ]; then status="$command_status"; else status="$tee_status"; fi
+    printf '%s %s\n' "$status" "$((SECONDS - t0))" >"$status_file" || exit 2
+    runlog_progress end "$order" "$(date +%s)" "$status" || exit 2
+    exit "$status"
   ) &
 
   RUNLOG_BG_ORDER+=("$order")
@@ -324,18 +363,23 @@ run_logged_bg() {
 }
 
 runlog_join() {
-  local i status elapsed
+  local i status elapsed wait_status
   for i in "${!RUNLOG_BG_PIDS[@]}"; do
-    wait "${RUNLOG_BG_PIDS[$i]}" 2>/dev/null || true
+    if wait "${RUNLOG_BG_PIDS[$i]}" 2>/dev/null; then wait_status=0; else wait_status=$?; fi
     # The status file, not `wait`'s code: the subshell's own exit status is the
     # printf's. A missing file means the subshell died before writing one (a
     # kill, an out-of-space), which must read as a failure, not as a pass.
-    if [ -r "${RUNLOG_BG_STATUS[$i]}" ]; then
-      read -r status elapsed <"${RUNLOG_BG_STATUS[$i]}"
+    if [ -r "${RUNLOG_BG_STATUS[$i]}" ] &&
+       read -r status elapsed <"${RUNLOG_BG_STATUS[$i]}" &&
+       [[ "$status" =~ ^[0-9]+$ ]] && [[ "$elapsed" =~ ^[0-9]+$ ]]; then
+      if [ "$wait_status" -ne 0 ] && [ "$status" -eq 0 ]; then
+        echo "run-logged: ${RUNLOG_BG_NAMES[$i]} ended with inconsistent status -- treating as failed" >&2
+        status="$wait_status"
+      fi
     else
       status=127
       elapsed=0
-      echo "run-logged: ${RUNLOG_BG_NAMES[$i]} left no status file -- treating as failed" >&2
+      echo "run-logged: ${RUNLOG_BG_NAMES[$i]} left an invalid status file -- treating as failed" >&2
     fi
     runlog_record "${RUNLOG_BG_ORDER[$i]}" "${RUNLOG_BG_NAMES[$i]}" "${RUNLOG_BG_LOGS[$i]}" \
       "$elapsed" "$status" "${RUNLOG_BG_TAILS[$i]}"
@@ -354,25 +398,38 @@ runlog_summary() {
   # A caller that forgot to join must not lose a gate. A no-op once joined, and
   # NOT redirected: a background failure's tail is the actionable part.
   runlog_join || true
-  echo
-  echo "=== summary ==="
+  if [ "$RUNLOG_COUNT" -eq 0 ]; then
+    echo "run-logged: no ${noun}s were recorded" >&2
+    RUNLOG_FAILED=1
+  fi
+  local output indexes verdict
+  if ! indexes="$(for i in "${!RUNLOG_NAMES[@]}"; do printf '%s %s\n' "${RUNLOG_ORDER[$i]}" "$i"; done | sort -n -k1,1 | cut -d' ' -f2)"; then
+    echo "run-logged: cannot order summary" >&2
+    RUNLOG_FAILED=1
+    indexes=""
+  fi
+  output=$'\n=== summary ===\n'
   # By start order, not by array order: a background gate finishes after the
   # foreground ones that were started later, and a table that reordered itself
   # run to run cannot be diffed against a previous run's.
-  local i
+  local i line
   while read -r i; do
-    printf '%-4s %-22s %4ss  %s\n' \
+    [ -n "$i" ] || continue
+    printf -v line '%-4s %-22s %4ss  %s\n' \
       "${RUNLOG_STATUSES[$i]}" "${RUNLOG_NAMES[$i]}" "${RUNLOG_SECS[$i]}" \
       "${RUNLOG_LOGS[$i]#"$RUNLOG_REPO"/}"
-  done < <(
-    for i in "${!RUNLOG_NAMES[@]}"; do printf '%s %s\n' "${RUNLOG_ORDER[$i]}" "$i"; done |
-      sort -n -k1,1 | cut -d' ' -f2
-  )
-  echo "logs: ${RUNLOG_DIR#"$RUNLOG_REPO"/}"
+    output+="$line"
+  done <<<"$indexes"
+  output+="logs: ${RUNLOG_DIR#"$RUNLOG_REPO"/}"$'\n'
   if [ "$RUNLOG_FAILED" -eq 0 ]; then
-    echo "all ${noun}s passed"
+    output+="all ${noun}s passed"$'\n'
   else
-    echo "at least one $noun failed"
+    output+="at least one $noun failed"$'\n'
   fi
-  return "$RUNLOG_FAILED"
+  verdict="$RUNLOG_FAILED"
+  if ! printf '%s' "$output"; then
+    RUNLOG_FAILED=1
+    return 1
+  fi
+  return "$verdict"
 }

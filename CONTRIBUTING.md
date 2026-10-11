@@ -136,8 +136,8 @@ path entirely and still compiles, test targets included; that build's one
 behavioural check
 (`cargo test -p focusforge-cli --no-default-features --test cli
 no_gpu_flag_absent_without_the_feature`) is run by hand, not in the standing
-gate. `cargo clippy --workspace --all-targets --all-features` compiles that
-code on every gate pass regardless of the default. The device tests that need
+gate. `cargo clippy --workspace --all-targets -- -D warnings` lints the
+default feature set on every gate pass. The device tests that need
 a real GPU adapter sit behind a separate, non-default `gpu-tests` feature and
 run as `cargo test --workspace --features gpu-tests -- --test-threads=1` —
 run by hand, deliberately, once per change to that code, never inside the
@@ -190,6 +190,9 @@ processing spans, and the closing `timing_summary` span reports both. Add
 `tools/check-all.sh` runs every gate (formatting, licenses, SPDX headers, NOTICE, fixtures, build,
 clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
 check) in one command; `--static` is the fast subset a pre-commit hook runs.
+Run this local gate before acceptance and merge. GitHub Actions calls the same
+gate on Linux, macOS and Windows as additional evidence; a green hosted run
+does not replace a required local run.
 Read `tools/README.md` for what each script does before running cargo
 commands by hand.
 
