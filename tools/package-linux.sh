@@ -19,9 +19,32 @@ write_legal_inputs() {
   if ! python3 - "$source" > "$temporary" <<'PY'
 import re
 import sys
-import tomllib
 
-pins = tomllib.load(open(sys.argv[1], "rb"))
+def parse(text):
+    out, section, item = {}, None, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        array_header = re.fullmatch(r"\[\[\s*([A-Za-z0-9_.-]+)\s*\]\]\s*(?:#.*)?", line)
+        table_header = re.fullmatch(r"\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(?:#.*)?", line)
+        if array_header:
+            section = array_header.group(1)
+            item = {}
+            out.setdefault(section, []).append(item)
+        elif table_header:
+            section = table_header.group(1)
+            item = out.setdefault(section, {})
+        elif line.startswith("["):
+            raise SystemExit("unsupported pin table header")
+        elif section and "=" in line:
+            key, value = (part.strip() for part in line.split("=", 1))
+            if value.startswith('"') and value.endswith('"'):
+                value = value[1:-1]
+            item[key] = value
+    return out
+
+pins = parse(open(sys.argv[1], encoding="utf-8").read())
 sha256 = re.compile(r"[0-9a-f]{64}")
 if not re.fullmatch(r"ubuntu@sha256:[0-9a-f]{64}", pins["linux"]["container"]):
     raise SystemExit("invalid Linux container pin")
@@ -31,7 +54,7 @@ for section in ("cargo_dist", "appimagetool", "type2_runtime"):
         raise SystemExit(f"invalid {section} URL")
     if not isinstance(value.get("sha256"), str) or not sha256.fullmatch(value["sha256"]):
         raise SystemExit(f"invalid {section} SHA-256")
-legal = pins["type2_runtime"].get("legal_inputs")
+legal = pins.get("type2_runtime.legal_inputs")
 if not isinstance(legal, list) or len(legal) != 11:
     raise SystemExit("invalid Type2 legal inputs")
 for item in legal:
@@ -55,17 +78,47 @@ write_input_manifest() {
 }
 
 verify_reuse() {
-  local expected actual
-  test -f "$out/package-inputs.sha256" && test -f "$out/artifacts.sha256" && test -f "$out/inventory.txt" || return 1
+  local expected actual symbol_archive
+  test -f "$out/package-inputs.sha256" && test -f "$out/artifacts.sha256" && test -f "$out/inventory.txt" && test -f "$out/symbols/symbol-inventory.json" && test -f "$out/symbols/symbols.sha256" || return 1
   cmp -s "$input_manifest" "$out/package-inputs.sha256" || return 1
   grep -Fqx "source_revision=$revision" "$out/inventory.txt" || return 1
   grep -Fqx "image=$image" "$out/inventory.txt" || return 1
   (cd "$out" && sha256sum -c artifacts.sha256) || return 1
+  (cd "$out/symbols" && sha256sum -c symbols.sha256) || return 1
+  symbol_archive="FocusForge-$version-x86_64-unknown-linux-gnu-symbols.tar.gz"
+  test -f "$out/symbols/$symbol_archive" || return 1
+  grep -Fq "  $symbol_archive" "$out/symbols/symbols.sha256" || return 1
+  python3 "$root/tools/package-symbols.py" verify "$out/symbols" || return 1
+  python3 "$root/tools/package-symbols.py" verify-archive "$out/symbols" "$out/symbols/$symbol_archive" || return 1
   expected=$(printf '%s\n' "FocusForge-$version-x86_64.AppImage" "focusforge_${version}_amd64.deb" | sort)
   actual=$(awk '{print $2}' "$out/artifacts.sha256" | sort) || return 1
   [ "$actual" = "$expected" ] || return 1
   actual=$(find "$out" -maxdepth 1 -type f \( -name '*.AppImage' -o -name '*.deb' \) -printf '%f\n' | sort)
   [ "$actual" = "$expected" ]
+}
+
+read_pin_values() {
+  python3 - "$1" <<'PY'
+import sys
+import re
+section = None
+values = {}
+for raw in open(sys.argv[1], encoding="utf-8"):
+    line = raw.strip()
+    array_header = re.fullmatch(r"\[\[\s*([A-Za-z0-9_.-]+)\s*\]\]\s*(?:#.*)?", line)
+    table_header = re.fullmatch(r"\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(?:#.*)?", line)
+    if array_header:
+        section = None
+    elif table_header:
+        section = table_header.group(1)
+    elif line.startswith("["):
+        raise SystemExit("unsupported pin table header")
+    elif section and "=" in line:
+        key, value = (part.strip() for part in line.split("=", 1))
+        values[(section, key)] = value.strip('"')
+for item in (("linux", "container"), ("cargo_dist", "url"), ("cargo_dist", "sha256"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256")):
+    print(values[item])
+PY
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
@@ -75,14 +128,7 @@ if [ "${1:-}" = --write-legal-inputs ]; then
   exit $?
 fi
 
-mapfile -t pin_values < <(python3 - "$pins" <<'PY'
-import sys
-import tomllib
-pins = tomllib.load(open(sys.argv[1], "rb"))
-for section, key in (("linux", "container"), ("cargo_dist", "url"), ("cargo_dist", "sha256"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256")):
-    print(pins[section][key])
-PY
-)
+mapfile -t pin_values < <(read_pin_values "$pins")
 image=${pin_values[0]}; dist_url=${pin_values[1]}; dist_sha=${pin_values[2]}
 app_url=${pin_values[3]}; app_sha=${pin_values[4]}; runtime_url=${pin_values[5]}; runtime_sha=${pin_values[6]}
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)
@@ -139,6 +185,19 @@ mkdir /work
 cd /work
 CARGO_TARGET_DIR=/out/target cargo build --release --locked -p focusforge-cli -p focusforge-gui |& tee /out/cargo-build.log
 for bin in focusforge-cli focusforge-gui; do test -x "/out/target/release/$bin"; done
+dump_syms=$(python3 tools/package-symbols.py install dump_syms x86_64-unknown-linux-gnu /out/symbol-tools)
+install -d /out/original /out/native-debug
+for bin in focusforge-cli focusforge-gui; do
+  cp "/out/target/release/$bin" "/out/original/$bin"
+  objcopy --only-keep-debug "/out/original/$bin" "/out/native-debug/$bin.debug"
+  objcopy --strip-debug --add-gnu-debuglink="/out/native-debug/$bin.debug" "/out/target/release/$bin"
+done
+python3 tools/package-symbols.py build --platform x86_64-unknown-linux-gnu --version "$version" --dump-syms "$dump_syms" --output /out/symbols --output-root /out \
+  --native focusforge-cli=/out/native-debug/focusforge-cli.debug --native focusforge-gui=/out/native-debug/focusforge-gui.debug \
+  --binary focusforge-cli=/out/original/focusforge-cli --binary focusforge-gui=/out/original/focusforge-gui
+python3 tools/package-symbols.py verify-linux --root /out/symbols \
+  --identity focusforge-cli=/out/original/focusforge-cli,/out/target/release/focusforge-cli,/out/native-debug/focusforge-cli.debug \
+  --identity focusforge-gui=/out/original/focusforge-gui,/out/target/release/focusforge-gui,/out/native-debug/focusforge-gui.debug
 install -d /out/AppDir/usr/bin /out/AppDir/usr/share/applications /out/AppDir/usr/share/icons/hicolor /out/AppDir/usr/share/doc/focusforge
 install -m 0755 /out/target/release/focusforge-{cli,gui} /out/AppDir/usr/bin/
 install -m 0644 LICENSE NOTICE /out/AppDir/usr/share/doc/focusforge/

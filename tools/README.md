@@ -18,6 +18,8 @@ from the reference stack, and the shared build/GPU lock.
 | `package-windows.ps1 [-OutputDirectory DIR]` | On Windows, verifies the pinned WiX package, builds both executables, and creates a combined MSI below `target/distrib/native/`. |
 | `check-package-windows.ps1 -Msi PATH` | On Windows, silently installs and uninstalls an MSI, retaining installer logs while checking executables, legal files, and Start-menu shortcut. |
 | `collect-native-artifacts.py` | Validates native package receipts and hashes from `target/distrib` before cargo-dist copies the declared DMG/MSI outputs. |
+| `package-symbols.py` | Downloads checksum-pinned `dump_syms`, creates complete native debug plus Breakpad stores, and refuses stale, missing or mismatched GUI/CLI module identities. Its pins and license declarations live in `packaging/symbol-tools.toml`. |
+| `symbolicate.py MINIDUMP SYMBOL_ARCHIVE` | Extracts one verified local archive safely and runs the checksum-pinned offline stackwalker. It accepts only a crashing-thread application frame whose loaded module ID is in the archive. |
 | `check-release-gate.py` | Stdlib fail-closed release gate. Its offline cases live in `check-packaging-selftest.py`; hosted workflow use queries the exact `check.yml` push run and its three platform jobs for the candidate SHA. |
 | `check-packaging-selftest.py` | Offline mutations for package pins/configuration, artifact checker boundaries and release-gate refusal rules. Run it separately before package builds. It needs Bash, Python 3.12 and PowerShell 7+ on `PATH`; its macOS/Windows command journeys use local mocks and do not build installers. |
 | `fixture-e2e.sh` | Runs the built `focusforge-cli` over the checked-in fixtures. Cargo-free on purpose, so `check-all.sh` can run it beside the cargo gates. |
@@ -41,3 +43,18 @@ from the reference stack, and the shared build/GPU lock.
 Every script skips rather than fails when the thing it checks does not exist
 yet — an empty repository is not a broken one. A skip prints `SKIP: <reason>`
 and exits 0.
+
+Release producers retain release line tables only until symbol extraction. The
+installer copies are stripped; Linux carries a GNU debuglink, macOS retains a
+universal `.dSYM`, and Windows retains a matching `.pdb` only in the symbol
+archive. Keep the generated `FocusForge-<version>-<platform>-symbols.tar.gz`
+and its `symbols.sha256` or release `native-artifacts.sha256` checksum entry
+beside the installer when diagnosing a user dump. `package-symbols.py` needs
+Python 3.10+; it verifies dump_syms 2.3.9 (MIT OR Apache-2.0) and
+minidump-stackwalk 0.27.0 (MIT) from the pinned release manifests before
+execution. GitHub Release assets carry the Linux, both macOS and Windows target
+archives next to their installers. Do not use network symbol retrieval:
+`symbolicate.py MINIDUMP SYMBOL_ARCHIVE` uses only the archive `store/` path.
+Line tables provide function/source-line diagnosis, not a promise of native
+types, local variables or deeper inline-debugging detail; missing archived data
+cannot be reconstructed from a stripped published binary.

@@ -217,6 +217,26 @@ macOS produces a universal DMG and Windows produces one combined MSI; their
 target runners validate the installed package before uploading it for the
 release checksum job.
 
+Release builds use line tables to create a same-build native debug archive and
+Breakpad store for both GUI and CLI. Preserve the platform symbol archive and
+its SHA-256 file with each installer; diagnose a retained minidump locally with
+`python3 tools/symbolicate.py MINIDUMP SYMBOL_ARCHIVE`. The command downloads
+only its pinned stackwalker and never contacts a symbol server.
+
+Release assets include `FocusForge-<version>-x86_64-unknown-linux-gnu-symbols.tar.gz`,
+`FocusForge-<version>-x86_64-apple-darwin-symbols.tar.gz`,
+`FocusForge-<version>-aarch64-apple-darwin-symbols.tar.gz`, and
+`FocusForge-<version>-x86_64-pc-windows-msvc-symbols.tar.gz`; keep each with
+its `symbols.sha256` or the release `native-artifacts.sha256` entry. GitHub
+Releases publish these beside the matching installer. `package-symbols.py`
+requires Python 3.10+ and verifies dump_syms 2.3.9 (MIT OR Apache-2.0) and
+minidump-stackwalk 0.27.0 (MIT) before execution. It only supports local
+archives and stores; it does not fetch symbols for a dump.
+
+`line-tables-only` supports function and source-line diagnosis; it does not
+promise native type, local-variable, or deeper inline-debugging detail, and a
+stripped published binary cannot restore debug data that was not archived.
+
 Before tagging, move the `Unreleased` entries into a heading such as
 `## [0.1.0] - YYYY-MM-DD`, add a fresh `Unreleased` heading, and commit the
 result. The release workflow uses that version heading for release notes; tag

@@ -35,7 +35,25 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $staging
 New-Item -ItemType Directory -Force -Path $staging | Out-Null
 $cli = Join-Path $root 'target/x86_64-pc-windows-msvc/release/focusforge-cli.exe'
 $gui = Join-Path $root 'target/x86_64-pc-windows-msvc/release/focusforge-gui.exe'
+$cliPdb = Join-Path (Split-Path $cli) (@(& python $root/tools/package-symbols.py windows-pdb $cli))
+$guiPdb = Join-Path (Split-Path $gui) (@(& python $root/tools/package-symbols.py windows-pdb $gui))
+foreach ($path in $cliPdb, $guiPdb) { if (-not (Test-Path $path)) { throw "missing PDB: $path" } }
+$dumpSyms = @(& python $root/tools/package-symbols.py install dump_syms x86_64-pc-windows-msvc (Join-Path $root '.scratch/package-windows/symbol-tools'))
+if ($LASTEXITCODE -ne 0 -or $dumpSyms.Count -ne 1) { throw 'pinned dump_syms cannot run on this runner' }
+& python $root/tools/package-symbols.py verify-windows "--identity=focusforge-cli=$cli,$cliPdb" "--identity=focusforge-gui=$gui,$guiPdb"
+if ($LASTEXITCODE -ne 0) { throw 'PE/PDB native GUID+age mismatch' }
+foreach ($pair in @(@($cli, $cliPdb), @($gui, $guiPdb))) {
+  $peModule = @(& $dumpSyms[0] --inlines $pair[0] | Select-String '^MODULE ')
+  if ($LASTEXITCODE -ne 0) { throw "cannot read PE debug identity: $($pair[0])" }
+  $pdbModule = @(& $dumpSyms[0] --inlines $pair[1] | Select-String '^MODULE ')
+  if ($LASTEXITCODE -ne 0 -or $peModule.Count -ne 1 -or $pdbModule.Count -ne 1 -or $peModule[0].Line -ne $pdbModule[0].Line) { throw "PE/PDB GUID+age mismatch: $($pair[0])" }
+}
 foreach ($path in $cli, $gui, (Join-Path $root 'LICENSE'), (Join-Path $root 'NOTICE'), (Join-Path $root 'assets/build/focusforge.ico')) { if (-not (Test-Path $path)) { throw "missing input: $path" } }
+$native = Join-Path $staging 'native'; New-Item -ItemType Directory -Force -Path $native | Out-Null
+Copy-Item $cliPdb, $guiPdb -Destination $native -Force
+$symbolOutput = Join-Path $staging 'symbols/x86_64-pc-windows-msvc'
+& python $root/tools/package-symbols.py build --platform x86_64-pc-windows-msvc --version $version --dump-syms $dumpSyms[0] --output $symbolOutput --output-root $staging --symbols-per-native 1 "--native=focusforge-cli=$(Join-Path $native (Split-Path $cliPdb -Leaf))" "--native=focusforge-gui=$(Join-Path $native (Split-Path $guiPdb -Leaf))" "--binary=focusforge-cli=$cli" "--binary=focusforge-gui=$gui"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $msi = Join-Path $staging "FocusForge-$version-x86_64.msi"
 & dotnet $wix build -arch x64 "-dVersion=$version" "-dCli=$cli" "-dGui=$gui" "-dLicense=$(Join-Path $root 'LICENSE')" "-dNotice=$(Join-Path $root 'NOTICE')" "-dIcon=$(Join-Path $root 'assets/build/focusforge.ico')" -o $msi (Join-Path $root 'packaging/windows/focusforge.wxs')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -47,6 +65,8 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $replacement, $previou
 New-Item -ItemType Directory -Force -Path $replacement | Out-Null
 Move-Item $msi (Join-Path $replacement (Split-Path $msi -Leaf))
 Set-Content -NoNewline -Encoding utf8 (Join-Path $replacement 'native-receipt.json') $receipt
+New-Item -ItemType Directory -Force -Path (Join-Path $replacement 'symbols') | Out-Null
+Move-Item $symbolOutput (Join-Path $replacement 'symbols/x86_64-pc-windows-msvc')
 if (Test-Path $destination) { Move-Item $destination $previous }
 try { Move-Item $replacement $destination }
 catch { if (Test-Path $previous) { Move-Item $previous $destination }; throw }

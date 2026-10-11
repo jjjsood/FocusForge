@@ -16,5 +16,17 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Installers retain this same-build information only long enough for the
+# platform packagers to extract native symbols.  Shipping copies are stripped.
+[profile.release]
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "off"
+
+# cargo-dist generic archives are shipping outputs, not symbol containers.
+[profile.dist]
+inherits = "release"
+strip = "debuginfo"
+
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -54,7 +55,13 @@ def check_plan() -> None:
         found = {match.group(1) for item in artifacts if (match := re.fullmatch(rf"{re.escape(name)}-(.+)\.(?:zip|tar\.xz|tar\.gz)", item))}
         if found != TARGETS:
             raise ValueError(f"release plan has unexpected targets for {name}")
-        required = {f"FocusForge-{version()}-universal.dmg", f"FocusForge-{version()}-x86_64.msi", "native-artifacts.sha256", "native-artifacts.json"}
+        if len(artifacts) != len(set(artifacts)):
+            raise ValueError(f"duplicate release artifact for {name}")
+        symbol_assets = {item for item in artifacts if item.endswith("-symbols.tar.gz")}
+        required_symbols = {f"FocusForge-{version()}-{target}-symbols.tar.gz" for target in TARGETS}
+        if symbol_assets != required_symbols:
+            raise ValueError(f"release plan has unexpected symbol assets for {name}")
+        required = {f"FocusForge-{version()}-universal.dmg", f"FocusForge-{version()}-x86_64.msi", *required_symbols, "native-artifacts.sha256", "native-artifacts.json"}
         if not required.issubset(artifacts):
             raise ValueError(f"release plan omits native artifacts for {name}")
 
@@ -78,9 +85,24 @@ def collect() -> None:
         nested = NATIVE / "native" / platform
         if directory.exists() and nested.exists():
             raise ValueError(f"duplicate native inputs for {platform}")
-        if not directory.is_dir() or set(item.name for item in directory.iterdir()) != {name, "native-receipt.json"}:
+        if not directory.is_dir() or set(item.name for item in directory.iterdir()) != {name, "native-receipt.json", "symbols"}:
             raise ValueError(f"unexpected native inputs for {platform}")
         artifact = directory / name
+        symbols = directory / "symbols"
+        targets = {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]
+        if set(child.name for child in symbols.iterdir()) != set(targets):
+            raise ValueError(f"unexpected {platform} symbol targets")
+        for target in targets:
+            symbol_root = symbols / target
+            symbol_archive = symbol_root / f"FocusForge-{version()}-{target}-symbols.tar.gz"
+            if set(path.name for path in symbol_root.iterdir()) != {"native", "store", "symbol-inventory.json", "symbols.sha256", symbol_archive.name}:
+                raise ValueError(f"unexpected {target} symbol inputs")
+            subprocess.run([sys.executable, str(ROOT / "tools/package-symbols.py"), "verify", str(symbol_root)], check=True)
+            inventory = json.loads((symbol_root / "symbol-inventory.json").read_text())
+            symbol_checksum = symbol_root / "symbols.sha256"
+            if inventory.get("platform") != target or inventory.get("version") != version() or not symbol_archive.is_file() or not symbol_checksum.is_file() or symbol_checksum.read_text().split()[:2] != [sha256(symbol_archive), symbol_archive.name]:
+                raise ValueError(f"invalid {target} symbol archive")
+            subprocess.run([sys.executable, str(ROOT / "tools/package-symbols.py"), "verify-archive", str(symbol_root), str(symbol_archive)], check=True)
         entries.append((platform, artifact, receipt(directory, kind, artifact)))
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=OUTPUT.parent, prefix="native-artifacts-") as temporary:
@@ -89,7 +111,13 @@ def collect() -> None:
         for platform, artifact, data in entries:
             destination = staging / artifact.name
             shutil.copyfile(artifact, destination)
-            manifest["artifacts"].append({"platform": platform, **data})
+            targets = {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]
+            symbols = []
+            for target in targets:
+                symbol_archive = NATIVE / platform / "symbols" / target / f"FocusForge-{version()}-{target}-symbols.tar.gz"
+                shutil.copyfile(symbol_archive, staging / symbol_archive.name)
+                symbols.append({"target": target, "archive": symbol_archive.name, "sha256": sha256(symbol_archive)})
+            manifest["artifacts"].append({"platform": platform, **data, "symbols": symbols})
         manifest_path = staging / "native-artifacts.json"
         manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
         sums = "".join(f"{sha256(path)}  {path.name}\n" for path in sorted(staging.glob("FocusForge-*")))
