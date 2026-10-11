@@ -1261,6 +1261,9 @@ def macos_checker_mock() -> None:
         shutil.copy(ROOT / "tools/package-symbols.py", directory / "tools/package-symbols.py")
         shutil.copy(ROOT / "tools/package-cli-assets.py", directory / "tools/package-cli-assets.py")
         shutil.copy(ROOT / "tools/symbolicate.py", directory / "tools/symbolicate.py")
+        smoke = directory / "tools/smoke-release.sh"
+        smoke.write_text("#!/bin/sh\n[ -z \"${MOCK_SMOKE_FAIL:-}\" ] || exit 73\n[ -x \"$1\" ] && [ ! -e \"$2\" ] || exit 74\nmkdir -p \"$2\"\n")
+        smoke.chmod(0o755)
         shutil.copytree(ROOT / "packaging", directory / "packaging")
         for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, resources / name)
         shutil.copy(ROOT / "assets/build/focusforge.icns", resources / "focusforge.icns")
@@ -1270,6 +1273,8 @@ def macos_checker_mock() -> None:
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         for name in ("focusforge-cli", "focusforge-gui"):
             path = binary / name; path.write_text(f"#!/bin/sh\nif [ -n \"$FF_FORCE_CRASH\" ]; then case {name} in focusforge-cli) [ \"${{1:-}}\" = algorithms ] || exit 64;; focusforge-gui) [ \"$#\" -eq 0 ] || exit 65;; esac; mkdir -p \"$FOCUSFORGE_DATA_DIR/focusforge/crashes\"; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_metadata|complete) printf MDMP > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp\";; esac; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_dump|complete) printf '{{\"binary\":\"{name}\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"0.1.0\",\"timestamp\":\"%s\"}}' \"$$\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json\";; esac; exit 1; elif [ \"$1\" = --version ]; then echo \"focusforge-cli $(cat {version_file})\"; elif [ \"$1\" = info ]; then cat {info_file}; fi\n"); path.chmod(0o755)
+        gui = binary / "focusforge-gui"
+        gui.write_text(gui.read_text() + "if [ \"$1\" = --exit-after ]; then while [ $# -gt 0 ]; do if [ \"$1\" = --screenshot ]; then printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\000\\001\\000\\000\\000\\001' > \"$2\"; exit 0; fi; shift; done; exit 64; fi\n")
         symbols = directory / "symbols"
         for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
             write_macos_symbols(symbols / target, target)
@@ -1287,6 +1292,8 @@ def macos_checker_mock() -> None:
         env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_STACKWALK": str(stackwalk)}
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode == 0, (result.stdout, result.stderr)
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_SMOKE_FAIL": "1"})
+        assert result.returncode != 0
         for missing in ("missing_dump", "missing_metadata", "missing_both"):
             templates = list((template / "FocusForge.app/Contents/MacOS").iterdir())
             original_binaries = {path: path.read_text() for path in templates}
@@ -1318,7 +1325,7 @@ def macos_checker_mock() -> None:
         write_macos_symbols(symbols / "x86_64-apple-darwin", "x86_64-apple-darwin")
         info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
-        assert result.returncode != 0 and log.read_text().count("detach") == 10
+        assert result.returncode != 0 and log.read_text().count("detach") == 11
 
 
 def macos_producer_mock() -> None:
@@ -1380,7 +1387,7 @@ def windows_checker_mock() -> None:
     pwsh = shutil.which("pwsh")
     assert pwsh, "PowerShell is required for the Windows checker mock"
     with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp); tools = root / "tools"; tools.mkdir()
+        root = Path(temp) / "space root"; root.mkdir(); tools = root / "tools"; tools.mkdir()
         checker_copy = tools / "check-package-windows.ps1"; checker_copy.write_text((ROOT / "tools/check-package-windows.ps1").read_text())
         shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
         shutil.copy(ROOT / "tools/symbolicate.py", tools / "symbolicate.py")
@@ -1390,7 +1397,12 @@ def windows_checker_mock() -> None:
         shutil.copytree(ROOT / "assets/man", root / "assets/man")
         shutil.copytree(ROOT / "assets/completions", root / "assets/completions")
         shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
+        smoke = tools / "smoke-release.sh"
+        smoke.write_text("#!/bin/sh\n[ -z \"${MOCK_SMOKE_FAIL:-}\" ] || exit 73\n[ -x \"$1\" ] && [ ! -e \"$2\" ] || exit 74\nmkdir -p \"$2\"\n")
+        smoke.chmod(0o755)
         shutil.copytree(ROOT / "fixtures/mantis-64", root / "fixtures/mantis-64")
+        mock = root / "mock"; mock.mkdir()
+        cygpath = mock / "cygpath"; cygpath.write_text("#!/bin/sh\nshift\nprintf '%s\\n' \"$1\"\n"); cygpath.chmod(0o755)
         shipping, template = root / "shipping", root / "symbols-template"; shipping.mkdir()
         write_windows_symbols(template, shipping)
         stackwalk = root / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
@@ -1424,6 +1436,7 @@ function global:msiexec.exe {
     & chmod +x (Join-Path $product 'focusforge-cli.exe')
     Copy-Item (Join-Path $product 'focusforge-cli.exe') (Join-Path $product 'focusforge-gui.exe')
     & chmod +x (Join-Path $product 'focusforge-gui.exe')
+    @('if [[ $1 == --exit-after ]]; then while (($#)); do if [[ $1 == --screenshot ]]; then printf "\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001" > "$2"; exit 0; fi; shift; done; exit 64; fi') | Add-Content (Join-Path $product 'focusforge-gui.exe')
     Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $product
     Copy-Item (Join-Path $PSScriptRoot 'NOTICE') $product
     Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') $product
@@ -1453,8 +1466,8 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
 ''')
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         invocations = root / "invocations"
-        env = {**os.environ, "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
-        for mutation, success in (({}, True), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False)):
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
+        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False)):
             shutil.rmtree(root / "symbols", ignore_errors=True)
             shutil.copytree(template, root / "symbols")
             case_env = env | mutation
@@ -1468,5 +1481,48 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
         assert invocations.read_text().splitlines()[:2] == ["focusforge-cli.exe:1:algorithms", "focusforge-gui.exe:0:"]
 
 
+def smoke_callers() -> None:
+    linux = (ROOT / "tools/check-package-linux.sh").read_text()
+    macos = (ROOT / "tools/check-package-macos.sh").read_text()
+    windows = (ROOT / "tools/check-package-windows.ps1").read_text()
+    native = NATIVE_WORKFLOW.read_text()
+    release = (ROOT / ".github/workflows/release.yml").read_text()
+    assert linux.count("tools/smoke-release.sh") == 2
+    assert '"$tree/bin/focusforge-cli"' in linux and '"/usr/bin/focusforge-cli"' in linux
+    assert 'tools/smoke-release.sh" "$app/Contents/MacOS/focusforge-cli"' in macos
+    assert "cygpath -u \"$1\"" in windows and "cygpath -u \"$2\"" in windows and "cygpath -u \"$3\"" in windows
+    assert "if ($LASTEXITCODE -ne 0) { throw 'installed CLI smoke failed' }" in windows
+    assert native.count("- name: Check native package") == 2
+    assert "uses: ./.github/workflows/package-native.yml" in release
+    build = release.index("- name: Build artifacts")
+    post_build = release.index("- id: cargo-dist", build)
+    linux_check = release.index("- name: Check Linux package", build)
+    check_step = release[linux_check:post_build]
+    assert build < linux_check < post_build
+    assert "if: \"runner.os == 'Linux'\"" in check_step
+    assert "tools/check-package-linux.sh .scratch/package-linux" in check_step
+    assert "|| true" not in check_step
+    upload = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+    receipt_specs = (
+        (native, "tools/check-package-macos.sh", "- name: Upload native artifacts", "package-smoke-receipts-macos", (".scratch/check-package-macos.*/smoke",), True),
+        (native, "tools/check-package-windows.ps1", "- name: Upload native artifacts", "package-smoke-receipts-windows", (".scratch/check-package-windows/*/smoke",), True),
+        (release, "tools/check-package-linux.sh .scratch/package-linux", "- id: cargo-dist", "package-smoke-receipts-linux-${{ join(matrix.targets, '_') }}", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
+    )
+    for source, checker, handoff, name, roots, launch in receipt_specs:
+        checked = source.index(checker)
+        step = source.index("- name: Upload package smoke receipts", checked)
+        end = source.index(handoff, step)
+        block = source[step:end]
+        assert checked < step < end and f"name: {name}" in block and upload in block
+        assert "always()" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
+        assert "continue-on-error" not in block and "|| true" not in block
+        suffixes = ("commands.log", "exit-status", "installed-cli.sha256", "source-os", "logs/*.stdout", "logs/*.stderr", "logs/*.exit")
+        paths = {line.strip() for line in block.split("path: |\n", 1)[1].split("          include-hidden-files: true", 1)[0].splitlines() if line.strip()}
+        expected_paths = {f"{root}/{suffix}" for root in roots for suffix in suffixes}
+        if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
+        assert paths == expected_paths
+        assert "artifacts-" not in name
+
+
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")

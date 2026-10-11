@@ -223,6 +223,7 @@ version=$(sed -n 's/^focusforge-cli //p' /checks/expected/VERSION)
 source /checks/checker.sh
 validate_appimage /checks/appimage /checks/expected /checks/expected/type2-legal.sha256
 validate_symbols "$tree" /artifacts/symbols
+LD_LIBRARY_PATH="$tree/lib" /product/tools/smoke-release.sh "$tree/bin/focusforge-cli" /checks/appimage/smoke
 force_crash() {
   local name=$1 binary=$2
   shift 2
@@ -269,7 +270,7 @@ set +e
 docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'DEB'
 set -euo pipefail
 owner_uid=$1; owner_gid=$2
-trap 'chown -R "$owner_uid:$owner_gid" /checks/crashes /checks/symbolicate /checks/deb-info.txt /checks/deb-info.json 2>/dev/null || true' EXIT
+trap 'chown -R "$owner_uid:$owner_gid" /checks/crashes /checks/symbolicate /checks/deb-info.txt /checks/deb-info.json /checks/deb-smoke 2>/dev/null || true' EXIT
 deb=$(find /artifacts -maxdepth 1 -name '*.deb' -type f -print -quit)
 test -n "$deb"
 version=$(dpkg-deb --field "$deb" Version)
@@ -304,6 +305,7 @@ assert [row.get("name") for row in files] == ["00.tif", "01.tif", "02.tif"]
 for row in files:
     assert (row.get("width"), row.get("height"), row.get("samples_per_pixel"), row.get("bits_per_sample")) == (64, 64, 3, [16, 16, 16])
 PY
+/product/tools/smoke-release.sh "/usr/bin/focusforge-cli" /checks/deb-smoke
 env -i PATH=/usr/bin:/bin HOME=/tmp "$tree/bin/focusforge-gui" --help >/dev/null
 force_crash() {
   local name=$1 binary=$2

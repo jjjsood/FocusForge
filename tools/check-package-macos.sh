@@ -45,6 +45,17 @@ python3 "$root/tools/package-cli-assets.py" verify "$root" "$app/Contents/Resour
 env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" --help >/dev/null
 cp "$root"/fixtures/mantis-64/frames/*.tif "$inspect/"
 env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" info --json "$inspect" | python3 -c 'import json,sys; data=json.load(sys.stdin); files=data["files"]; assert data["frame_count"] == 3 and data["unreadable_count"] == 0 and len(files) == 3; assert all(item["width"] == 64 and item["height"] == 64 and item["samples_per_pixel"] == 3 and item["bits_per_sample"] == [16, 16, 16] for item in files)'
+"$root/tools/smoke-release.sh" "$app/Contents/MacOS/focusforge-cli" "$work/smoke"
+launch="$work/launch.png"
+mkdir -p "$work/gui-data" "$work/gui-config" "$work/gui-cache"
+env -i PATH="$PATH" FOCUSFORGE_DATA_DIR="$work/gui-data" FOCUSFORGE_CONFIG_DIR="$work/gui-config" XDG_DATA_HOME="$work/gui-cache" XDG_CONFIG_HOME="$work/gui-config" "$app/Contents/MacOS/focusforge-gui" --exit-after 3000 --screenshot "$launch"
+python3 - "$launch" <<'PY'
+import struct
+import sys
+data = open(sys.argv[1], "rb").read(24)
+assert data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR"
+assert all(value > 0 for value in struct.unpack(">II", data[16:24]))
+PY
 force_crash() {
   local name=$1 binary=$2
   shift 2

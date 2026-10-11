@@ -80,6 +80,23 @@ try {
   if ($matches -notcontains 'stack') { throw 'installed PowerShell completion is not registered' }
   $info = & $cli info --json $fixtureDirectory; if ($LASTEXITCODE -ne 0) { throw 'CLI info failed' }
   $data = $info | ConvertFrom-Json; if ($data.frame_count -ne 3 -or $data.unreadable_count -ne 0 -or @($data.files).Count -ne 3 -or @($data.files | Where-Object { $_.width -ne 64 -or $_.height -ne 64 -or $_.samples_per_pixel -ne 3 -or (@($_.bits_per_sample) -join ',') -ne '16,16,16' }).Count -ne 0) { throw 'CLI info metadata mismatch' }
+  & bash -c 'exec bash "$(cygpath -u "$1")" "$(cygpath -u "$2")" "$(cygpath -u "$3")"' _ (Join-Path $root 'tools/smoke-release.sh') $cli (Join-Path $logs 'smoke')
+  if ($LASTEXITCODE -ne 0) { throw 'installed CLI smoke failed' }
+  $launch = Join-Path $logs 'launch.png'
+  $gui = Join-Path $product 'focusforge-gui.exe'
+  $guiEnvironment = @{ FOCUSFORGE_DATA_DIR = (Join-Path $logs 'gui-data'); FOCUSFORGE_CONFIG_DIR = (Join-Path $logs 'gui-config'); XDG_DATA_HOME = (Join-Path $logs 'gui-cache'); XDG_CONFIG_HOME = (Join-Path $logs 'gui-config') }
+  $guiPrevious = @{}
+  foreach ($key in $guiEnvironment.Keys) { $guiPrevious[$key] = [Environment]::GetEnvironmentVariable($key, 'Process'); New-Item -ItemType Directory -Force -Path $guiEnvironment[$key] | Out-Null }
+  try {
+    foreach ($key in $guiEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $guiEnvironment[$key], 'Process') }
+    $launchArguments = '--exit-after 3000 --screenshot "' + $launch + '"'
+    $launchProcess = Start-Process -FilePath $gui -ArgumentList $launchArguments -PassThru -Wait -NoNewWindow
+  } finally {
+    foreach ($key in $guiEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $guiPrevious[$key], 'Process') }
+  }
+  if ($launchProcess.ExitCode -ne 0) { throw "installed GUI launch failed: $($launchProcess.ExitCode)" }
+  & python -c 'import struct,sys; data=open(sys.argv[1], "rb").read(24); assert data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR" and all(value > 0 for value in struct.unpack(">II", data[16:24]))' $launch
+  if ($LASTEXITCODE -ne 0) { throw 'installed GUI launch PNG is invalid' }
   if (-not (Test-Path $shortcut)) { throw 'missing Start-menu shortcut' }
   $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
   if ($link.TargetPath -ne (Join-Path $product 'focusforge-gui.exe')) { throw 'invalid Start-menu shortcut target' }

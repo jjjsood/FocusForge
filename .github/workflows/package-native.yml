@@ -51,6 +51,22 @@ jobs:
       - name: Check native package
         shell: bash
         run: tools/check-package-macos.sh target/distrib/native/macos/FocusForge-0.1.0-universal.dmg
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: package-smoke-receipts-macos
+          path: |
+            .scratch/check-package-macos.*/smoke/commands.log
+            .scratch/check-package-macos.*/smoke/exit-status
+            .scratch/check-package-macos.*/smoke/installed-cli.sha256
+            .scratch/check-package-macos.*/smoke/source-os
+            .scratch/check-package-macos.*/smoke/logs/*.stdout
+            .scratch/check-package-macos.*/smoke/logs/*.stderr
+            .scratch/check-package-macos.*/smoke/logs/*.exit
+            .scratch/check-package-macos.*/launch.png
+          include-hidden-files: true
+          if-no-files-found: warn
       - name: Upload native artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -101,6 +117,22 @@ jobs:
       - name: Check native package
         shell: pwsh
         run: tools/check-package-windows.ps1 -Msi target/distrib/native/windows/FocusForge-0.1.0-x86_64.msi
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: package-smoke-receipts-windows
+          path: |
+            .scratch/check-package-windows/*/smoke/commands.log
+            .scratch/check-package-windows/*/smoke/exit-status
+            .scratch/check-package-windows/*/smoke/installed-cli.sha256
+            .scratch/check-package-windows/*/smoke/source-os
+            .scratch/check-package-windows/*/smoke/logs/*.stdout
+            .scratch/check-package-windows/*/smoke/logs/*.stderr
+            .scratch/check-package-windows/*/smoke/logs/*.exit
+            .scratch/check-package-windows/*/launch.png
+          include-hidden-files: true
+          if-no-files-found: warn
       - name: Upload native artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

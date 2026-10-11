@@ -97,6 +97,7 @@ run_gate "source headers"   tools/check-headers.sh
 run_gate "source headers selftest" tools/check-headers-selftest.sh
 run_gate "NOTICE"           tools/with-lock.sh build -- tools/check-notice.sh
 run_gate "NOTICE selftest"  tools/check-notice-selftest.sh
+run_gate "release smoke selftest" tools/smoke-release-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 run_gate "lock directory selftest" tools/with-lock-selftest.sh

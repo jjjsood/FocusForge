@@ -217,6 +217,33 @@ macOS produces a universal DMG and Windows produces one combined MSI; their
 target runners validate the installed package before uploading it for the
 release checksum job.
 
+### Release smoke checklist
+
+Run `tools/check-package-linux.sh .scratch/package-linux` after producing the
+Linux artifacts. It runs `tools/smoke-release.sh` once against the extracted
+AppImage CLI and once against the installed Debian CLI at
+`/usr/bin/focusforge-cli`; each receipt records the installed CLI hash,
+version, commands, output and exit status. On macOS the package check runs the
+same helper while the DMG is mounted, using
+`FocusForge.app/Contents/MacOS/focusforge-cli`. On Windows it runs through Git
+Bash before MSI uninstall, using
+`$env:ProgramFiles\FocusForge\focusforge-cli.exe`. Keep each native job log and
+the helper receipt with the checked artifact; record its source OS, candidate
+artifact SHA-256 and native-run URL.
+
+The helper uses only copied `mantis-64` and `mantis-512` frames, forces CPU
+fusion and disables alignment. It checks the grouping proposal, two completed
+projects, one readable TIFF export, and a mixed corrupt run whose failed record
+survives in the manifest, status stream and `review --json` output.
+
+For each artifact, also launch the installed GUI with `--exit-after 3000
+--screenshot PATH` on its own operating system and retain its exit result and
+nonempty PNG. A working display and graphics driver are required. That launch
+does not prove the interactive journey: on Linux X11 and Wayland, macOS and
+Windows, import one stack, choose Fuse, save and reopen, select a source, paint
+a visible stroke, export TIFF, and record the artifact identity, session type,
+observations and screenshot.
+
 Release builds use line tables to create a same-build native debug archive and
 Breakpad store for both GUI and CLI. Preserve the platform symbol archive and
 its SHA-256 file with each installer; diagnose a retained minidump locally with
