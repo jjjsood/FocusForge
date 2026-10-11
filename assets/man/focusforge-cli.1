@@ -1,0 +1,58 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli 1  "focusforge-cli 0.1.0" 
+.SH NAME
+focusforge\-cli \- FocusForge command\-line interface
+.SH SYNOPSIS
+\fBfocusforge\-cli\fR [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+FocusForge command\-line interface
+.SH OPTIONS
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+focusforge\-cli\-info(1)
+Print project, TIFF or RAW metadata for a file, or for every frame in a directory
+.TP
+focusforge\-cli\-algorithms(1)
+List every registered algorithm, or print one named algorithm\*(Aqs full parameter schema
+.TP
+focusforge\-cli\-stack(1)
+Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+.TP
+focusforge\-cli\-export(1)
+Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
+.TP
+focusforge\-cli\-retouch(1)
+Append an op list to a project as new states, one per op, each the previous one\*(Aqs child: on the current head, or on `\-\-from` as a branch. `export \-\-checkpoint` writes any of them
+.TP
+focusforge\-cli\-history(1)
+List, delete or compact a project\*(Aqs checkpoints. Every history operation is reachable through this command, headless
+.TP
+focusforge\-cli\-align(1)
+Compute and report the per\-frame transforms for a stack: readable text by default, a `\-\-json` document on request, and an optional per\-frame warped\-TIFF dump for a visual check
+.TP
+focusforge\-cli\-review(1)
+Report one record per result found under a directory of projects, or a batch run\*(Aqs output directory: identity, outcome, sharpness ratio and Z\-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non\-recursive listing of `*.ffp` files; never groups frames itself and writes nothing
+.TP
+focusforge\-cli\-cache(1)
+Remove every entry from the stage cache under `.scratch/stage\-cache/`. Never touches `.scratch/resume/` or any project
+.TP
+focusforge\-cli\-diagnostics(1)
+Package this installation\*(Aqs logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere
+.TP
+focusforge\-cli\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -166,6 +167,150 @@ input_manifest="$out/current-inputs.sha256"; write_input_manifest "$input_manife
         shell(setup + '\nprintf stale > "$out/stale.deb"; verify_reuse\n', str(PACKAGE), str(out), success=False)
 
 
+def producer_foreign_owned_output_cleanup() -> None:
+    image = tomllib.loads((ROOT / "packaging/linux-tools.toml").read_text())["linux"]["container"]
+    with tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / "out"
+        output.mkdir()
+        call([
+            "docker", "run", "--rm", "-v", f"{output}:/out", image,
+            "bash", "-c", "mkdir -p /out/check/symbolicate/stackwalk && printf old >/out/check/symbolicate/stackwalk/minidump-stackwalk && chown -R 1001:1001 /out/check",
+        ])
+        try:
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; image="$2"; owner_uid=$(id -u); owner_gid=$(id -g); clean_package_output "$3"',
+                    "selftest", str(PACKAGE), image, str(output),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert not output.exists()
+        finally:
+            if output.exists():
+                call([
+                    "docker", "run", "--rm", "-v", f"{output}:/out", image,
+                    "bash", "-c", "find /out -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
+                ])
+
+
+def producer_cleanup_mock() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        output = directory / "out"
+        output.mkdir()
+        (output / "check").mkdir()
+        (output / "check/old-output").write_text("old")
+        mock = directory / "mock"
+        mock.mkdir()
+        log = directory / "docker.log"
+        docker = mock / "docker"
+        docker.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$MOCK_DOCKER_LOG\"\n")
+        docker.chmod(0o755)
+        result = subprocess.run(
+            [
+                "bash", "-c",
+                'source "$1"; PATH="$4:$PATH"; image=mock-image; owner_uid=$(id -u); owner_gid=$(id -g); printf "%s:%s\\n" "$owner_uid" "$owner_gid"; clean_package_output "$3"',
+                "selftest", str(PACKAGE), "unused", str(output), str(mock),
+            ],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "MOCK_DOCKER_LOG": str(log)},
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert not output.exists()
+        expected_owner = result.stdout.strip()
+        assert f"chown -R {expected_owner} /out" in log.read_text()
+
+
+def cli_asset_helper_cases() -> None:
+    helper_path = ROOT / "tools/package-cli-assets.py"
+    helper_spec = importlib.util.spec_from_file_location("cli_assets", helper_path)
+    helper = importlib.util.module_from_spec(helper_spec)
+    assert helper_spec and helper_spec.loader
+    helper_spec.loader.exec_module(helper)
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        source = directory / "product"
+        shutil.copytree(ROOT / "assets/man", source / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", source / "assets/completions")
+        expected = helper.sources(source)
+        assert len(expected) == 19
+        staged = []
+        for destination in (
+            directory / "appimage/usr",
+            directory / "bundle/FocusForge.app/Contents/Resources",
+            directory / "windows/FocusForge",
+        ):
+            helper.stage(source, destination)
+            for relative in (
+                Path("share/man/man1/system.1.gz"),
+                Path("share/bash-completion/completions/apt"),
+                Path("share/zsh/vendor-completions/_system"),
+                Path("share/fish/vendor_completions.d/system.fish"),
+                Path("share/powershell/completions/_system.ps1"),
+            ):
+                (destination / relative).write_bytes(b"unrelated")
+            helper.verify(source, destination)
+            staged.append(destination)
+        assert {
+            relative: (staged[0] / relative).read_bytes() for relative in expected
+        } == {
+            relative: (staged[1] / relative).read_bytes() for relative in expected
+        }
+        assert all(
+            (destination / relative).read_bytes() == b"unrelated"
+            for destination in staged
+            for relative in (
+                Path("share/man/man1/system.1.gz"),
+                Path("share/bash-completion/completions/apt"),
+                Path("share/zsh/vendor-completions/_system"),
+                Path("share/fish/vendor_completions.d/system.fish"),
+                Path("share/powershell/completions/_system.ps1"),
+            )
+        )
+        for name in helper.MANUALS:
+            data = (staged[0] / "share/man/man1" / f"{name}.gz").read_bytes()
+            assert data[3] == 0 and data[4:8] == b"\0\0\0\0" and data[9] == 255
+            assert gzip.decompress(data) == (source / "assets/man" / name).read_bytes()
+        cases = (
+            (Path("share/man/man1/focusforge-cli.1.gz"), "manual", ("focusforge-cli-extra.1.gz", "focusforge-cli-extra.txt")),
+            (Path("share/bash-completion/completions/focusforge-cli"), "completion", ("focusforge-cli-extra", "focusforge-cli-extra.bak")),
+        )
+        for destination in staged:
+            for relative, resource_class, orphans in cases:
+                target = destination / relative
+                original = target.read_bytes()
+                target.unlink()
+                try:
+                    helper.verify(source, destination)
+                except ValueError as error:
+                    assert str(relative) in str(error), (resource_class, error)
+                else:
+                    raise AssertionError(f"missing {resource_class} passed verification")
+                target.write_bytes(original + b"corrupt")
+                try:
+                    helper.verify(source, destination)
+                except ValueError as error:
+                    assert str(relative) in str(error), (resource_class, error)
+                else:
+                    raise AssertionError(f"corrupt {resource_class} passed verification")
+                target.write_bytes(original)
+                for name in orphans:
+                    orphan = target.parent / name
+                    orphan.write_bytes(b"orphan")
+                    try:
+                        helper.verify(source, destination)
+                    except ValueError as error:
+                        assert str(orphan.relative_to(destination)) in str(error), (resource_class, error)
+                    else:
+                        raise AssertionError(f"orphan {resource_class} passed verification")
+                    orphan.unlink()
+                helper.verify(source, destination)
+
+
 def fake_appimage(directory: Path) -> tuple[Path, Path, Path]:
     expected, app = directory / "expected", directory / "appimage"
     (expected / "frames").mkdir(parents=True)
@@ -175,6 +320,7 @@ def fake_appimage(directory: Path) -> tuple[Path, Path, Path]:
     shutil.copytree(ROOT / "assets/build/hicolor", expected / "hicolor"); (expected / "VERSION").write_text("focusforge-cli 0.1.0\n")
     tree = app / "usr"
     for path in (tree / "bin", tree / "lib", tree / "share/applications", tree / "share/icons", tree / "share/doc/focusforge/native-licenses", tree / "share/doc/focusforge/type2-runtime/notices"): path.mkdir(parents=True, exist_ok=True)
+    call(["/usr/bin/python3", str(ROOT / "tools/package-cli-assets.py"), "stage", str(ROOT), str(tree)])
     shutil.copytree(expected / "hicolor", tree / "share/icons/hicolor"); shutil.copy(expected / "focusforge.desktop", tree / "share/applications/focusforge.desktop")
     for name in ("LICENSE", "NOTICE"): shutil.copy(expected / name, tree / f"share/doc/focusforge/{name}")
     (tree / "share/doc/focusforge/native-notices.txt").write_text("libfontconfig\n")
@@ -436,7 +582,19 @@ def native_boundaries() -> None:
     wix = ET.parse(ROOT / "packaging/windows/focusforge.wxs").getroot()
     package = next(item for item in wix if item.tag.endswith("Package"))
     files = [item for item in wix.iter() if item.tag.endswith("File")]
-    assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and {(item.attrib["Name"], item.attrib["Source"], item.attrib.get("KeyPath")) for item in files} == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
+    root_files = {(item.attrib["Name"], item.attrib["Source"], item.attrib.get("KeyPath")) for item in files if "Name" in item.attrib}
+    asset_sources = {item.attrib["Source"] for item in files if item.attrib["Source"].startswith("$(var.CliAssets)")}
+    asset_components = [
+        component for component in wix.iter() if component.tag.endswith("Component")
+        and any(file.attrib.get("Source", "").startswith("$(var.CliAssets)") for file in component if file.tag.endswith("File"))
+    ]
+    assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and root_files == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
+    assert len(asset_sources) == 19 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
+    assert len(asset_components) == 19 and all(
+        len([file for file in component if file.tag.endswith("File")]) == 1
+        and next(file for file in component if file.tag.endswith("File")).attrib.get("KeyPath") == "yes"
+        for component in asset_components
+    )
     shortcut = next(item for item in wix.iter() if item.tag.endswith("Shortcut")); icon = next(item for item in wix.iter() if item.tag.endswith("Icon"))
     assert shortcut.attrib["Target"] == "[INSTALLFOLDER]focusforge-gui.exe" and shortcut.attrib["Icon"] == "FocusForgeIcon" and icon.attrib == {"Id": "FocusForgeIcon", "SourceFile": "$(var.Icon)"}
     call(["bash", "-n", str(ROOT / "tools/package-macos.sh"), str(ROOT / "tools/check-package-macos.sh")])
@@ -1097,12 +1255,16 @@ def macos_checker_mock() -> None:
         shutil.copy(ROOT / "Cargo.toml", directory / "Cargo.toml")
         shutil.copy(ROOT / "LICENSE", directory / "LICENSE"); shutil.copy(ROOT / "NOTICE", directory / "NOTICE")
         shutil.copytree(ROOT / "assets/build", directory / "assets/build")
+        shutil.copytree(ROOT / "assets/man", directory / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", directory / "assets/completions")
         shutil.copytree(ROOT / "fixtures/mantis-64", directory / "fixtures/mantis-64")
         shutil.copy(ROOT / "tools/package-symbols.py", directory / "tools/package-symbols.py")
+        shutil.copy(ROOT / "tools/package-cli-assets.py", directory / "tools/package-cli-assets.py")
         shutil.copy(ROOT / "tools/symbolicate.py", directory / "tools/symbolicate.py")
         shutil.copytree(ROOT / "packaging", directory / "packaging")
         for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, resources / name)
         shutil.copy(ROOT / "assets/build/focusforge.icns", resources / "focusforge.icns")
+        call(["/usr/bin/python3", str(directory / "tools/package-cli-assets.py"), "stage", str(directory), str(resources)])
         version_file, info_file = directory / "version", directory / "info.json"
         version_file.write_text("0.1.0\n")
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
@@ -1165,8 +1327,11 @@ def macos_producer_mock() -> None:
         shutil.copy(ROOT / "Cargo.toml", root / "Cargo.toml")
         for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)
         shutil.copytree(ROOT / "assets/build", root / "assets/build")
+        shutil.copytree(ROOT / "assets/man", root / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", root / "assets/completions")
         shutil.copytree(ROOT / "packaging", root / "packaging")
         shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
+        shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
         producer_copy = tools / "package-macos.sh"; producer_copy.write_text((ROOT / "tools/package-macos.sh").read_text())
         macho = root / "macho"; macho.write_bytes(universal_macho())
         dump_syms = mock / "dump_syms"; dump_syms.write_text("#!/usr/bin/env bash\nset -euo pipefail\nbinary=${!#}; store= arch=\nwhile (($#)); do case $1 in --store|--arch) [[ $1 == --store ]] && store=$2 || arch=$2; shift 2;; *) shift;; esac; done\nname=$(basename \"$binary\")\ncase $arch in x86_64) id=000000000000000000000000000000010;; arm64) id=111111111111111111111111111111110;; *) exit 2;; esac\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Mac %s %s %s\\nFILE 0 crates/%s/src/main.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$arch\" \"$id\" \"$name\" \"${name#focusforge-}\" \"${name//-/_}\" > \"$store/$name/$id/$name.sym\"\n"); dump_syms.chmod(0o755)
@@ -1222,6 +1387,9 @@ def windows_checker_mock() -> None:
         shutil.copytree(ROOT / "packaging", root / "packaging")
         for name in ("Cargo.toml", "LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)
         shutil.copytree(ROOT / "assets/build", root / "assets/build")
+        shutil.copytree(ROOT / "assets/man", root / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", root / "assets/completions")
+        shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
         shutil.copytree(ROOT / "fixtures/mantis-64", root / "fixtures/mantis-64")
         shipping, template = root / "shipping", root / "symbols-template"; shipping.mkdir()
         write_windows_symbols(template, shipping)
@@ -1260,6 +1428,8 @@ function global:msiexec.exe {
     Copy-Item (Join-Path $PSScriptRoot 'NOTICE') $product
     Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') $product
     Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') (Join-Path $env:ProgramData 'cache.ico')
+    & /usr/bin/python3 (Join-Path $PSScriptRoot 'tools/package-cli-assets.py') stage $PSScriptRoot $product
+    if ($LASTEXITCODE -ne 0) { throw 'mock CLI asset staging failed' }
     Set-Content $shortcut shortcut
   } elseif ($Arguments[0] -eq '/x') { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $product, $shortcut }
   $global:LASTEXITCODE = 0
@@ -1299,4 +1469,4 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
 
 
 if __name__ == "__main__":
-    producer(); checker(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); print("packaging selftest: PASS")

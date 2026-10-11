@@ -241,3 +241,10 @@ Before tagging, move the `Unreleased` entries into a heading such as
 `## [0.1.0] - YYYY-MM-DD`, add a fresh `Unreleased` heading, and commit the
 result. The release workflow uses that version heading for release notes; tag
 only after that commit is ready.
+
+When the CLI parser or workspace version changes, regenerate its packaged
+manuals and shell completions before running the package checks:
+
+```sh
+FOCUSFORGE_REGENERATE_CLI_ASSETS=1 cargo test -p focusforge-cli --bin focusforge-cli tests::regenerate_cli_assets -- --exact
+```

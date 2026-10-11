@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 
+product_root=${FOCUSFORGE_PRODUCT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+
 validate_assets() {
   local tree=$1 expected=$2
   cmp "$expected/focusforge.desktop" "$tree/share/applications/focusforge.desktop"
   test "$(find "$tree/share/icons/hicolor" -type f | wc -l)" = 10
   diff -qr "$expected/hicolor" "$tree/share/icons/hicolor"
+  python3 "$product_root/tools/package-cli-assets.py" verify "$product_root" "$tree"
 }
 
 validate_elfs() {
@@ -203,7 +206,7 @@ with open(sys.argv[2], "w") as output:
 PY
 
 set +e
-docker run --rm --network=none -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'APPIMAGE'
+docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'APPIMAGE'
 set -euo pipefail
 owner_uid=$1; owner_gid=$2
 trap 'chown -R "$owner_uid:$owner_gid" /checks/appimage /checks/crashes /checks/symbolicate 2>/dev/null || true' EXIT
@@ -263,7 +266,7 @@ set -e
 [ "$status" = 0 ] || exit "$status"
 
 set +e
-docker run --rm --network=none -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'DEB'
+docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'DEB'
 set -euo pipefail
 owner_uid=$1; owner_gid=$2
 trap 'chown -R "$owner_uid:$owner_gid" /checks/crashes /checks/symbolicate /checks/deb-info.txt /checks/deb-info.json 2>/dev/null || true' EXIT
@@ -272,7 +275,7 @@ test -n "$deb"
 version=$(dpkg-deb --field "$deb" Version)
 dpkg-deb --field "$deb" Depends | grep -q .
 # The minimal base image excludes documentation; retain the package legal payload.
-apt-get -o 'DPkg::Options::=--path-include=/usr/share/doc/focusforge/*' install -y -qq "$deb"
+apt-get -o 'DPkg::Options::=--path-include=/usr/share/doc/focusforge/*' -o 'DPkg::Options::=--path-include=/usr/share/man/man1/focusforge-cli*.gz' install -y -qq "$deb"
 tree=/usr
 test -x "$tree/bin/focusforge-cli"; test -x "$tree/bin/focusforge-gui"
 test -f "$tree/share/applications/focusforge.desktop"

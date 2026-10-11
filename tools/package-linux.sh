@@ -121,6 +121,14 @@ for item in (("linux", "container"), ("cargo_dist", "url"), ("cargo_dist", "sha2
 PY
 }
 
+clean_package_output() {
+  local path=$1
+  if [ -e "$path" ]; then
+    docker run --rm -v "$path:/out" "$image" chown -R "$owner_uid:$owner_gid" /out
+  fi
+  rm -rf "$path"
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 if [ "${1:-}" = --write-legal-inputs ]; then
   [ "$#" = 2 ] || [ "$#" = 3 ] || { echo 'usage: package-linux.sh --write-legal-inputs OUTPUT [PINS]' >&2; exit 2; }
@@ -148,10 +156,7 @@ fi
 next="$out.next"
 owner_uid=$(id -u)
 owner_gid=$(id -g)
-if [ -e "$next" ]; then
-  docker run --rm -v "$next:/out" "$image" chown -R "$owner_uid:$owner_gid" /out
-fi
-rm -rf "$next"
+clean_package_output "$next"
 mkdir -p "$next"
 set +e
 docker run --rm -i -v "$root:/src:ro" -v "$next:/out" -v "$input_manifest:/inputs/package-inputs.sha256:ro" -v "$legal_inputs:/inputs/type2-legal-inputs.tsv:ro" "$image" bash -s -- "$version" "$dist_url" "$dist_sha" "$app_url" "$app_sha" "$runtime_url" "$runtime_sha" "$revision" "$image" "$owner_uid" "$owner_gid" <<'CONTAINER'
@@ -203,6 +208,7 @@ install -m 0755 /out/target/release/focusforge-{cli,gui} /out/AppDir/usr/bin/
 install -m 0644 LICENSE NOTICE /out/AppDir/usr/share/doc/focusforge/
 install -m 0644 assets/focusforge.desktop /out/AppDir/usr/share/applications/focusforge.desktop
 cp -a assets/build/hicolor/. /out/AppDir/usr/share/icons/hicolor/
+python3 tools/package-cli-assets.py stage /work /out/AppDir/usr
 install -d /out/AppDir/usr/lib
 runtime_libs=/out/runtime-libs.txt
 : > "$runtime_libs"
@@ -265,6 +271,7 @@ install -m 0755 /out/target/release/focusforge-{cli,gui} /out/deb/usr/bin/
 install -m 0644 LICENSE NOTICE /out/deb/usr/share/doc/focusforge/
 install -m 0644 assets/focusforge.desktop /out/deb/usr/share/applications/focusforge.desktop
 cp -a assets/build/hicolor/. /out/deb/usr/share/icons/hicolor/
+python3 tools/package-cli-assets.py stage /work /out/deb/usr
 mkdir -p /out/deb/DEBIAN /tmp/debian
 printf '%s\n' 'Source: focusforge' 'Section: graphics' 'Priority: optional' 'Maintainer: FocusForge <release@focusforge.invalid>' 'Standards-Version: 4.6.0' '' 'Package: focusforge' 'Architecture: any' 'Description: Focus stacking desktop and command-line tools' > /tmp/debian/control
 depends=$(cd /tmp && dpkg-shlibdeps -O -e/out/deb/usr/bin/focusforge-cli -e/out/deb/usr/bin/focusforge-gui | sed -n 's/^shlibs:Depends=//p')
@@ -280,7 +287,7 @@ CONTAINER
 status=$?
 set -e
 [ "$status" = 0 ] || exit "$status"
-rm -rf "$out"
+clean_package_output "$out"
 mv "$next" "$out"
 printf '%s\n' "$out/FocusForge-$version-x86_64.AppImage" "$out/focusforge_${version}_amd64.deb"
 fi

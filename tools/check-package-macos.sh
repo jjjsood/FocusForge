@@ -40,6 +40,7 @@ plist="$app/Contents/Info.plist"
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$plist") == focusforge ]]
 for file in LICENSE NOTICE; do cmp "$root/$file" "$app/Contents/Resources/$file"; done
 cmp "$root/assets/build/focusforge.icns" "$app/Contents/Resources/focusforge.icns"
+python3 "$root/tools/package-cli-assets.py" verify "$root" "$app/Contents/Resources"
 [[ $(env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" --version) == "focusforge-cli $version" ]]
 env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" --help >/dev/null
 cp "$root"/fixtures/mantis-64/frames/*.tif "$inspect/"

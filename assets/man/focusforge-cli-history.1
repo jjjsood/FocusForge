@@ -1,0 +1,34 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-history 1  "history 0.1.0" 
+.SH NAME
+focusforge\-cli\-history \- List, delete or compact a project\*(Aqs checkpoints. Every history operation is reachable through this command, headless
+.SH SYNOPSIS
+\fBfocusforge\-cli history\fR [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+List, delete or compact a project\*(Aqs checkpoints. Every history operation is reachable through this command, headless
+.SH OPTIONS
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SH SUBCOMMANDS
+.TP
+focusforge\-cli\-history\-list(1)
+List every visible checkpoint, newest first
+.TP
+focusforge\-cli\-history\-delete(1)
+Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint
+.TP
+focusforge\-cli\-history\-compact(1)
+Rewrite the project to its live checkpoints only and report the bytes reclaimed
+.TP
+focusforge\-cli\-history\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0

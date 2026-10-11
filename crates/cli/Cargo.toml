@@ -31,6 +31,8 @@ toml = "1"
 tracing = "0.1.44"
 
 [dev-dependencies]
+clap_complete = "=4.6.11"
+clap_mangen = "=0.3.3"
 focusforge-core = { path = "../core", features = ["test-algorithms"] }
 tempfile = "3"
 # An independent TIFF reader for `export_formats.rs`'s 8-bit round trip:

@@ -43,6 +43,7 @@ sed "s/__VERSION__/$version/g" "$root/packaging/macos/Info.plist" > "$app/Conten
 plutil -lint "$app/Contents/Info.plist"
 cp "$root/assets/build/focusforge.icns" "$app/Contents/Resources/focusforge.icns"
 cp "$root/LICENSE" "$root/NOTICE" "$app/Contents/Resources/"
+python3 "$root/tools/package-cli-assets.py" stage "$root" "$app/Contents/Resources"
 mkdir -p "$output"
 candidate="$staging/FocusForge-$version-universal.dmg"
 hdiutil create -quiet -volname FocusForge -srcfolder "$app" -ov -format UDZO "$candidate"

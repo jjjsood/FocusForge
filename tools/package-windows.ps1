@@ -50,12 +50,14 @@ foreach ($pair in @(@($cli, $cliPdb), @($gui, $guiPdb))) {
 }
 foreach ($path in $cli, $gui, (Join-Path $root 'LICENSE'), (Join-Path $root 'NOTICE'), (Join-Path $root 'assets/build/focusforge.ico')) { if (-not (Test-Path $path)) { throw "missing input: $path" } }
 $native = Join-Path $staging 'native'; New-Item -ItemType Directory -Force -Path $native | Out-Null
+$resources = Join-Path $staging 'resources'; & python $root/tools/package-cli-assets.py stage $root $resources
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Copy-Item $cliPdb, $guiPdb -Destination $native -Force
 $symbolOutput = Join-Path $staging 'symbols/x86_64-pc-windows-msvc'
 & python $root/tools/package-symbols.py build --platform x86_64-pc-windows-msvc --version $version --dump-syms $dumpSyms[0] --output $symbolOutput --output-root $staging --symbols-per-native 1 "--native=focusforge-cli=$(Join-Path $native (Split-Path $cliPdb -Leaf))" "--native=focusforge-gui=$(Join-Path $native (Split-Path $guiPdb -Leaf))" "--binary=focusforge-cli=$cli" "--binary=focusforge-gui=$gui"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $msi = Join-Path $staging "FocusForge-$version-x86_64.msi"
-& dotnet $wix build -arch x64 "-dVersion=$version" "-dCli=$cli" "-dGui=$gui" "-dLicense=$(Join-Path $root 'LICENSE')" "-dNotice=$(Join-Path $root 'NOTICE')" "-dIcon=$(Join-Path $root 'assets/build/focusforge.ico')" -o $msi (Join-Path $root 'packaging/windows/focusforge.wxs')
+& dotnet $wix build -arch x64 "-dVersion=$version" "-dCli=$cli" "-dGui=$gui" "-dLicense=$(Join-Path $root 'LICENSE')" "-dNotice=$(Join-Path $root 'NOTICE')" "-dIcon=$(Join-Path $root 'assets/build/focusforge.ico')" "-dCliAssets=$(Join-Path $resources 'share')" -o $msi (Join-Path $root 'packaging/windows/focusforge.wxs')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $revision = (git -C $root rev-parse HEAD).Trim()
 $receipt = [ordered]@{ kind = 'msi'; version = $version; revision = $revision; artifact = (Split-Path $msi -Leaf); sha256 = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant() } | ConvertTo-Json -Compress

@@ -71,6 +71,13 @@ try {
   if (Get-ChildItem $product -Recurse -Filter '*.pdb' -File | Select-Object -First 1) { throw 'MSI installed a PDB' }
   $cliVersion = & $cli --version; if ($LASTEXITCODE -ne 0 -or $cliVersion -ne "focusforge-cli $version") { throw 'CLI version mismatch' }
   & $cli --help | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'CLI help failed' }
+  & python (Join-Path $root 'tools/package-cli-assets.py') verify $root $product
+  if ($LASTEXITCODE -ne 0) { throw 'installed CLI assets differ' }
+  $completion = Join-Path $product 'share/powershell/completions/_focusforge-cli.ps1'
+  . $completion
+  $input = 'focusforge-cli '
+  $matches = [System.Management.Automation.CommandCompletion]::CompleteInput($input, $input.Length, $null).CompletionMatches.CompletionText
+  if ($matches -notcontains 'stack') { throw 'installed PowerShell completion is not registered' }
   $info = & $cli info --json $fixtureDirectory; if ($LASTEXITCODE -ne 0) { throw 'CLI info failed' }
   $data = $info | ConvertFrom-Json; if ($data.frame_count -ne 3 -or $data.unreadable_count -ne 0 -or @($data.files).Count -ne 3 -or @($data.files | Where-Object { $_.width -ne 64 -or $_.height -ne 64 -or $_.samples_per_pixel -ne 3 -or (@($_.bits_per_sample) -join ',') -ne '16,16,16' }).Count -ne 0) { throw 'CLI info metadata mismatch' }
   if (-not (Test-Path $shortcut)) { throw 'missing Start-menu shortcut' }
