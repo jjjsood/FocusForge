@@ -443,6 +443,7 @@ export component FFExportDialog inherits FFModalPanel {
                     text: row.label;
                 }
                 FFMenu {
+                    name: row.label;
                     x: 128px;
                     width: 110px;
                     label: row.value-text;
@@ -508,6 +509,7 @@ export component FFExportDialog inherits FFModalPanel {
             text: "Metadata";
         }
         FFToggle {
+            name: "Metadata";
             x: 0px;
             // 2px above the label's own top: a toggle's knob sits taller
             // than a text row's cap-height, so this aligns their centers.

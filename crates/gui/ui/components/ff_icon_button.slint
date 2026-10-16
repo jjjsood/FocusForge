@@ -21,6 +21,8 @@ export component FFIconButton inherits Rectangle {
     in property <bool> filled: false;
     // An armed toggle: accent fill, glyph in `Theme.text-on-accent`.
     in property <bool> selected: false;
+    // The accessible name; an icon carries no text of its own.
+    in property <string> name: "";
     callback triggered();
 
     width: root.glyph-size + 2 * root.pad;
@@ -32,6 +34,7 @@ export component FFIconButton inherits Rectangle {
     border-radius: Theme.radius-sm;
     opacity: root.enabled || root.filled ? 1.0 : 0.5;
     accessible-role: button;
+    accessible-label: root.name;
     accessible-enabled: root.enabled;
     accessible-checked: root.selected;
 

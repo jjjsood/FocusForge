@@ -1744,3 +1744,53 @@ fn a_hidden_overlay_publishes_nothing_until_reopened() {
     assert!(!want.is_empty(), "the seeded project is recent");
     assert_eq!(recent, want);
 }
+
+/// Every rail entry is found by its own id as a labelled button; Save
+/// follows `projects-save-enabled`, and Recent has one entry per row.
+#[test]
+fn rail_entries_are_labelled_buttons() {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_projects_overlay_open(true);
+
+    let find = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(format!("FFProjectsRail::{id}"))
+            .find_all()
+    };
+    let only = |id: &str, label: &str| {
+        let found = find(id);
+        assert_eq!(found.len(), 1, "one {id}");
+        assert_eq!(found[0].accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(found[0].accessible_label().as_deref(), Some(label));
+        found[0].accessible_enabled()
+    };
+
+    app.set_projects_save_enabled(false);
+    assert_eq!(only("new-project", "New project"), Some(true));
+    assert_eq!(only("open-project", "Open project…"), Some(true));
+    assert_eq!(only("save-project", "Save project"), Some(false));
+    assert_eq!(only("close-project", "Close project"), Some(true));
+    assert!(find("recent-row").is_empty(), "no Recent rows, no entries");
+
+    app.set_projects_save_enabled(true);
+    assert_eq!(only("save-project", "Save project"), Some(true));
+
+    let recent = |name: &str| focusforge_gui::RecentRowView {
+        name: name.into(),
+        ..Default::default()
+    };
+    app.set_recent_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![recent("alpha"), recent("beta")])).into(),
+    );
+    let rows = find("recent-row");
+    assert_eq!(rows.len(), 2);
+    for (row, name) in rows.iter().zip(["alpha", "beta"]) {
+        assert_eq!(row.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(row.accessible_label().as_deref(), Some(name));
+    }
+}

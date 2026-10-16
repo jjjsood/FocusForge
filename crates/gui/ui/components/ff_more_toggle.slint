@@ -58,6 +58,9 @@ export component FFMoreToggle inherits Rectangle {
         width: 100%;
         height: ShellGeometry.more-height;
         enabled: !root.disabled;
+        accessible-role: button;
+        accessible-label: "More...";
+        accessible-enabled: !root.disabled;
         clicked => { root.toggled(); }
     }
 }

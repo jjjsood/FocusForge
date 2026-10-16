@@ -21,6 +21,9 @@ component FFRailAction inherits Rectangle {
 
     height: 36px;
     opacity: root.enabled ? 1.0 : 0.5;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
 
     TouchArea {
         enabled: root.enabled;
@@ -64,6 +67,8 @@ component FFRecentRow inherits Rectangle {
     callback triggered();
 
     height: 46px;
+    accessible-role: button;
+    accessible-label: root.view.name;
 
     TouchArea {
         width: 100%;
@@ -116,7 +121,7 @@ export component FFProjectsRail inherits Rectangle {
 
     background: transparent;
 
-    FFRailAction {
+    new-project := FFRailAction {
         x: 0px;
         y: 20px;
         width: parent.width;
@@ -125,7 +130,7 @@ export component FFProjectsRail inherits Rectangle {
         shortcut: "Ctrl+N";
         triggered => { root.new-project-requested(); }
     }
-    FFRailAction {
+    open-project := FFRailAction {
         x: 0px;
         y: 56px;
         width: parent.width;
@@ -134,7 +139,7 @@ export component FFProjectsRail inherits Rectangle {
         shortcut: "Ctrl+O";
         triggered => { root.open-project-requested(); }
     }
-    FFRailAction {
+    save-project := FFRailAction {
         x: 0px;
         y: 92px;
         width: parent.width;
@@ -144,7 +149,7 @@ export component FFProjectsRail inherits Rectangle {
         enabled: root.save-enabled;
         triggered => { root.save-project-requested(); }
     }
-    FFRailAction {
+    close-project := FFRailAction {
         x: 0px;
         y: 128px;
         width: parent.width;
@@ -172,7 +177,7 @@ export component FFProjectsRail inherits Rectangle {
         y: 192px;
     }
 
-    for row[i] in root.recent: FFRecentRow {
+    for row[i] in root.recent: recent-row := FFRecentRow {
         x: 0px;
         y: 222px + i * 46px;
         width: parent.width;

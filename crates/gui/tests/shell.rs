@@ -2558,3 +2558,247 @@ fn about_tab_composes_only_shared_components() {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
 }
+
+fn string_model(items: &[&str]) -> slint::ModelRc<slint::SharedString> {
+    let items: Vec<slint::SharedString> = items.iter().map(|s| (*s).into()).collect();
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
+
+fn all(app: &AppWindow, id: &str) -> Vec<ElementHandle> {
+    ElementQuery::from_root(app).match_id(id).find_all()
+}
+
+fn one(app: &AppWindow, id: &str) -> ElementHandle {
+    let mut found = all(app, id);
+    assert_eq!(found.len(), 1, "exactly one {id}");
+    found.remove(0)
+}
+
+/// The label and checked state of every segment under each `FFSegmented`.
+fn segment_rows(app: &AppWindow) -> Vec<Vec<(String, Option<bool>)>> {
+    all(app, "FFSegmented::root")
+        .iter()
+        .map(|row| {
+            row.query_descendants()
+                .match_id("FFSegmented::segment")
+                .find_all()
+                .iter()
+                .inspect(|s| assert_eq!(s.accessible_role(), Some(AccessibleRole::Button)))
+                .map(|s| {
+                    (
+                        s.accessible_label().unwrap().to_string(),
+                        s.accessible_checked(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Each segment of an `FFSegmented` is a button carrying its label, and only
+/// the selected one reports checked.
+#[test]
+fn segmented_segments_are_labelled_buttons() {
+    let app = app_at(1440, 900);
+    app.set_export_open(true);
+    app.set_export_format_segments(string_model(&["TIFF", "PNG", "JPEG"]));
+    app.set_export_format_selected("JPEG".into());
+    let row = |id: &str, choices: &[&str], selected: &str| focusforge_gui::ExportRowView {
+        id: id.into(),
+        choices: string_model(choices),
+        value_text: selected.into(),
+        ..Default::default()
+    };
+    app.set_export_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![
+            row("quality", &[], "90"),
+            row("chroma", &["4:4:4", "4:2:0"], "4:2:0"),
+        ]))
+        .into(),
+    );
+    app.set_export_slider_group(true);
+
+    let mark = |label: &str, selected: &str| (label.to_string(), Some(label == selected));
+    assert_eq!(
+        segment_rows(&app),
+        [
+            ["TIFF", "PNG", "JPEG"].map(|l| mark(l, "JPEG")).to_vec(),
+            ["4:4:4", "4:2:0"].map(|l| mark(l, "4:2:0")).to_vec(),
+        ]
+    );
+    let window_wide: Vec<_> = all(&app, "FFSegmented::segment")
+        .iter()
+        .map(|s| s.accessible_label().unwrap().to_string())
+        .collect();
+    assert_eq!(window_wide, ["TIFF", "PNG", "JPEG", "4:4:4", "4:2:0"]);
+
+    app.set_export_format_selected("TIFF".into());
+    assert_eq!(
+        segment_rows(&app)[0],
+        ["TIFF", "PNG", "JPEG"].map(|l| mark(l, "TIFF")).to_vec()
+    );
+}
+
+/// The toolbar's pipette, undo and redo are addressed by their own ids; undo
+/// and redo follow the history, the pipette follows picking.
+#[test]
+fn editor_undo_redo_are_labelled_buttons() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_mode("editor".into());
+    let state = |id: &str| {
+        let button = one(&app, &format!("FFEditorToolbar::{id}"));
+        assert_eq!(button.accessible_role(), Some(AccessibleRole::Button));
+        (
+            button.accessible_label().unwrap().to_string(),
+            button.accessible_enabled(),
+            button.accessible_checked(),
+        )
+    };
+
+    app.set_can_undo(false);
+    app.set_can_redo(true);
+    app.set_brush_picking(false);
+    assert_eq!(state("undo"), ("Undo".into(), Some(false), Some(false)));
+    assert_eq!(state("redo"), ("Redo".into(), Some(true), Some(false)));
+    assert_eq!(
+        state("pipette"),
+        ("Pipette".into(), Some(true), Some(false))
+    );
+
+    app.set_can_undo(true);
+    app.set_can_redo(false);
+    app.set_brush_picking(true);
+    assert_eq!(state("undo").1, Some(true));
+    assert_eq!(state("redo").1, Some(false));
+    assert_eq!(state("pipette").2, Some(true));
+}
+
+fn move_pointer(app: &AppWindow, position: slint::LogicalPosition) {
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+}
+
+/// Moves the pointer to the centre of match `index` of `id`.
+fn hover(app: &AppWindow, id: &str, index: usize) {
+    let handle = all(app, id).remove(index);
+    let (pos, size) = (handle.absolute_position(), handle.size());
+    move_pointer(
+        app,
+        slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0),
+    );
+}
+
+fn assert_button(handle: &ElementHandle, label: &str) {
+    assert_eq!(handle.accessible_role(), Some(AccessibleRole::Button));
+    assert_eq!(handle.accessible_label().as_deref(), Some(label));
+}
+
+/// The trash and the close glyph exist only under the pointer, and then
+/// only on a deletable row or an opened card.
+#[test]
+fn hover_only_controls_appear_with_id_only_under_the_pointer() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_project_loaded(true);
+    let rows = |deletable: bool, count: usize| {
+        let row = |i: usize| focusforge_gui::CheckpointEntryView {
+            kind: "row".into(),
+            algorithm: "Pyramid".into(),
+            time_text: "10:00".into(),
+            top: 40.0 * i as f32,
+            deletable,
+            ..Default::default()
+        };
+        std::rc::Rc::new(slint::VecModel::from(
+            (0..count).map(row).collect::<Vec<_>>(),
+        ))
+    };
+    let away = slint::LogicalPosition::new(4.0, 4.0);
+
+    app.set_checkpoint_rows(rows(true, 2).into());
+    assert!(all(&app, "FFCheckpointRow::trash").is_empty());
+    hover(&app, "FFCheckpointRow::area", 1);
+    let trash = all(&app, "FFCheckpointRow::trash");
+    assert_eq!(trash.len(), 1);
+    assert_button(&trash[0], "Delete checkpoint");
+    let row = all(&app, "FFCheckpointRow::area").remove(1);
+    assert!(
+        trash[0].absolute_position().y >= row.absolute_position().y,
+        "the trash belongs to the hovered row, not the first"
+    );
+    move_pointer(&app, away);
+    assert!(all(&app, "FFCheckpointRow::trash").is_empty());
+
+    app.set_checkpoint_rows(rows(false, 1).into());
+    hover(&app, "FFCheckpointRow::area", 0);
+    assert!(
+        all(&app, "FFCheckpointRow::trash").is_empty(),
+        "a lone row offers no delete"
+    );
+    move_pointer(&app, away);
+
+    app.set_projects_overlay_open(true);
+    let card = |opened: bool| focusforge_gui::ProjectCardView {
+        kind: "open".into(),
+        opened,
+        project_name: "demo".into(),
+        ..Default::default()
+    };
+    app.set_gallery_content_height(300.0);
+    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(vec![card(true)])).into());
+    assert!(all(&app, "FFProjectCard::close").is_empty());
+    hover(&app, "FFProjectCard::card-area", 0);
+    let close = all(&app, "FFProjectCard::close");
+    assert_eq!(close.len(), 1);
+    assert_button(&close[0], "Close");
+    move_pointer(&app, away);
+    assert!(all(&app, "FFProjectCard::close").is_empty());
+
+    app.set_project_cards(std::rc::Rc::new(slint::VecModel::from(vec![card(false)])).into());
+    hover(&app, "FFProjectCard::card-area", 0);
+    assert!(
+        all(&app, "FFProjectCard::close").is_empty(),
+        "a card that is not opened has no close glyph"
+    );
+}
+
+/// The one switch window-wide carrying `name`.
+fn switch(app: &AppWindow, name: &str) -> ElementHandle {
+    let mut found: Vec<_> = all(app, "FFToggle::area")
+        .into_iter()
+        .filter(|s| s.accessible_label().as_deref() == Some(name))
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one switch named {name:?}");
+    let found = found.remove(0);
+    assert_eq!(found.accessible_role(), Some(AccessibleRole::Button));
+    found
+}
+
+/// The switches outside the dock panel carry their row name and report
+/// their on state.
+#[test]
+fn switches_carry_their_row_name() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+
+    for on in [true, false] {
+        app.set_overlay_on(on);
+        assert_eq!(switch(&app, "Overlay").accessible_checked(), Some(on));
+    }
+
+    app.set_export_open(true);
+    for on in [true, false] {
+        app.set_export_metadata_on(on);
+        assert_eq!(switch(&app, "Metadata").accessible_checked(), Some(on));
+    }
+
+    app.set_settings_open(true);
+    let mut performance = app.get_performance();
+    performance.gpu = true;
+    app.set_performance(performance);
+    assert_eq!(
+        switch(&app, "GPU processing").accessible_checked(),
+        Some(true)
+    );
+}

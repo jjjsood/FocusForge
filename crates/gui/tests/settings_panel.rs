@@ -2350,3 +2350,106 @@ fn more_strip_is_disabled_while_running() {
         assert!(panel.is_open(section), "{section} opens once enabled again");
     }
 }
+
+/// The panel's controls are found by role: Reset All carries its enabled
+/// state, each switch its row label and on state, each menu its row label and
+/// shown value, each fold-out header its label.
+#[test]
+fn reset_all_and_switches_report_their_state() {
+    use focusforge_gui::AppWindow;
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::{ComponentHandle, Model as _};
+
+    init_window_backend();
+    let app = AppWindow::new().unwrap();
+    // Tall enough that no row is clipped out of the panel's viewport, where
+    // an element query does not look.
+    app.window().set_size(slint::PhysicalSize::new(1440, 2400));
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
+    controller.toggle_section_more("fuse");
+    controller.set_align_algorithm("pyramidal-ecc");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+
+    let find = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::settings-panel")
+            .match_descendants()
+            .match_id(id)
+            .find_all()
+    };
+    let reset_enabled = || {
+        let reset = find("FFResetAll::area");
+        assert_eq!(reset.len(), 1, "one Reset All in the panel");
+        assert_eq!(reset[0].accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(
+            reset[0].accessible_label().as_deref(),
+            Some("Reset All to Default")
+        );
+        reset[0].accessible_enabled()
+    };
+    assert_eq!(reset_enabled(), Some(false), "disabled while at defaults");
+
+    controller.set_param_text("finish", "auto-crop", "false");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(reset_enabled(), Some(true), "enabled once a value is set");
+
+    let rows = app.get_settings_rows();
+    let of_kind = |kinds: &[&str]| {
+        (0..rows.row_count())
+            .map(|i| rows.row_data(i).unwrap())
+            .filter(|r| kinds.contains(&r.kind.as_str()))
+            .collect::<Vec<_>>()
+    };
+
+    let switches = find("FFToggle::area");
+    let bools = of_kind(&["bool"]);
+    assert!(!bools.is_empty(), "the registry has bool rows");
+    assert_eq!(switches.len(), bools.len());
+    for (switch, row) in switches.iter().zip(&bools) {
+        assert_eq!(switch.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(
+            switch.accessible_label().as_deref(),
+            Some(row.label.as_str())
+        );
+        assert_eq!(switch.accessible_checked(), Some(row.selected == "true"));
+    }
+    let crop = bools.iter().position(|r| r.id == "auto-crop").unwrap();
+    assert_eq!(switches[crop].accessible_checked(), Some(false));
+    controller.set_param_text("finish", "auto-crop", "true");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(
+        find("FFToggle::area")[crop].accessible_checked(),
+        Some(true),
+        "checked follows the value"
+    );
+
+    let menus = find("FFMenu::area");
+    let fields = of_kind(&["picker", "enum"]);
+    assert!(!fields.is_empty(), "the registry has picker and enum rows");
+    assert_eq!(menus.len(), fields.len());
+    for (menu, row) in menus.iter().zip(&fields) {
+        assert_eq!(menu.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(menu.accessible_label().as_deref(), Some(row.label.as_str()));
+        assert_eq!(
+            menu.accessible_value().as_deref(),
+            Some(row.value_text.as_str())
+        );
+    }
+
+    let mores = find("FFMoreToggle::header-area");
+    assert!(!of_kind(&["more"]).is_empty(), "the registry has fold-outs");
+    assert_eq!(mores.len(), of_kind(&["more"]).len());
+    for more in &mores {
+        assert_eq!(more.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(more.accessible_label().as_deref(), Some("More..."));
+    }
+
+    controller.reset_all_sections();
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(reset_enabled(), Some(false), "disabled again after a reset");
+}

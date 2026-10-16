@@ -16,6 +16,9 @@ export component FFResetAll inherits Rectangle {
 
     area := TouchArea {
         enabled: root.enabled;
+        accessible-role: button;
+        accessible-label: "Reset All to Default";
+        accessible-enabled: root.enabled;
         width: 100%;
         height: 100%;
         clicked => { root.clicked(); }
