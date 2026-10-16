@@ -9,6 +9,7 @@ export component FFIconButton inherits Rectangle {
     in property <image> icon;
     in property <length> glyph-size: Theme.icon-md;
     in property <length> pad: Theme.space-2;
+    in property <color> glyph-color: Theme.text-secondary;
     // Half opacity and inert while false -- there is nothing this button can
     // do.
     in property <bool> enabled: true;
@@ -44,7 +45,7 @@ export component FFIconButton inherits Rectangle {
         colorize: root.selected ? Theme.text-on-accent
             : !root.enabled && root.filled ? Theme.text-disabled
             : root.recolor-on-hover && area.has-hover && root.enabled ? Theme.text-primary
-            : Theme.text-secondary;
+            : root.glyph-color;
         width: root.glyph-size;
         height: root.glyph-size;
     }

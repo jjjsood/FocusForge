@@ -19,9 +19,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::canvas::{FrameView, OverlayDraw, PaneSource};
 use crate::checkpoints;
@@ -41,6 +43,9 @@ use crate::performance_settings::{self, DeviceState, PerformanceSettings, Reject
 use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
+};
+use crate::source_previews::{
+    MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 use focusforge_gpu::blend::Blender;
@@ -78,6 +83,7 @@ pub enum DockTab {
 pub enum SettingsSection {
     #[default]
     Performance,
+    Appearance,
     Storage,
     InputMap,
     Diagnostics,
@@ -86,8 +92,9 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Every section, in nav-rail order.
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Performance,
+        SettingsSection::Appearance,
         SettingsSection::Storage,
         SettingsSection::InputMap,
         SettingsSection::Diagnostics,
@@ -98,6 +105,7 @@ impl SettingsSection {
     pub fn slug(self) -> &'static str {
         match self {
             SettingsSection::Performance => "performance",
+            SettingsSection::Appearance => "appearance",
             SettingsSection::Storage => "storage",
             SettingsSection::InputMap => "input-map",
             SettingsSection::Diagnostics => "diagnostics",
@@ -1395,8 +1403,8 @@ struct ShellState {
     /// Whether the `Images` panel's sort menu is open -- the same
     /// externally-driven convention `tab.menu_open` uses for a settings row.
     images_sort_menu_open: bool,
-    /// A live grip drag, if any: which row it started on and the raw
-    /// row-local `y` the grip reported at press time -- later `y` values
+    /// A live filename/image drag, if any: which row it started on and the raw
+    /// row-local `y` it reported at press time -- later `y` values
     /// minus this one, in whole [`images::ROW_HEIGHT`] steps, is how far
     /// the row has moved.
     drag_row: Option<DragRow>,
@@ -1601,6 +1609,9 @@ struct DragRow {
     /// The grip's own `mouse_y` as of the most recent `Move` -- `press_y`
     /// until the first one arrives.
     current_y: f32,
+    /// Remains true after the first movement so capture survives an origin
+    /// return until the gesture releases.
+    capture_active: bool,
 }
 
 /// An import's resolved shape, staged for [`AppController::apply_add_frames`]:
@@ -1777,6 +1788,19 @@ pub struct AppController {
     /// off, so a headless test never probes an adapter; the window installs
     /// the loaded value ([`Self::install_performance`]).
     performance: PerformanceSettings,
+    appearance: AppearanceSettings,
+    appearance_save_error: Option<String>,
+    /// Owns the persistent source decoder. It is created with the controller
+    /// and never runs on the window thread.
+    previews: Option<PreviewWorker>,
+    preview_generation: u64,
+    preview_requests: Vec<PreviewRequest>,
+    preview_budget_bytes: u64,
+    preview_cache: HashMap<PreviewRequest, Arc<PreviewPixels>>,
+    preview_cache_bytes: u64,
+    preview_failures: HashMap<PreviewRequest, String>,
+    published_preview_bytes: AtomicU64,
+    peak_published_preview_bytes: AtomicU64,
     /// Cap field text that did not parse, shown until the next edit; the
     /// cap in `performance` stays as it was.
     rejected_caps: RejectedCaps,
@@ -1794,6 +1818,26 @@ pub struct AppController {
     /// The blend kernel on the display device, handed to every edit session
     /// while the device is attached.
     blender: Option<Blender>,
+}
+
+/// Bounded source-preview state for diagnostics and deterministic tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePreviewSnapshot {
+    pub configured_cap: u64,
+    pub admission_bytes: u64,
+    pub scheduled: usize,
+    pub active_workers: u64,
+    pub peak_workers: u64,
+    pub cache_entries: usize,
+    pub cache_bytes: u64,
+    pub resident_bytes: u64,
+    pub conversion_bytes: u64,
+    pub native_bytes: u64,
+    pub peak_native_bytes: u64,
+    pub host_remaining: u64,
+    pub outcome_bytes: u64,
+    pub peak_outcome_bytes: u64,
+    pub owned_bytes: u64,
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -1838,6 +1882,7 @@ impl AppController {
     pub fn new() -> Self {
         let mut controller = Self::default();
         controller.performance.gpu = false;
+        controller.previews = Some(PreviewWorker::new());
         controller.state.tab_region_width = Self::BASE_TAB_REGION_WIDTH;
         controller
     }
@@ -1968,7 +2013,11 @@ impl AppController {
         if mode != ShellMode::Editor {
             self.discard_live_stroke();
         }
+        if self.state.mode != mode {
+            self.cancel_frame_drag();
+        }
         self.state.mode = mode;
+        self.refresh_source_previews();
         self.emit(ShellEvent::ModeChanged(mode));
         true
     }
@@ -3042,6 +3091,7 @@ impl AppController {
     /// mode.
     pub fn images_list_wheel(&mut self, steps: f32) {
         self.step_source_frame(steps);
+        self.keep_selected_image_visible();
     }
 
     /// The active tab's fused image's shorter side -- `Size`'s ceiling.
@@ -4319,6 +4369,7 @@ impl AppController {
         self.settle_tab_scroll();
         self.state.settings_scroll_y = 0.0;
         self.settle_settings_scroll();
+        self.invalidate_source_previews();
         // `ProjectsChanged` alone: its own push already rebuilds the panel
         // for the newly active tab (`push_projects`, `src/bridge.rs`) --
         // a second `SettingsChanged` here would schedule a second, redundant
@@ -4395,10 +4446,13 @@ impl AppController {
     fn set_active_tab(&mut self, active: Option<usize>) {
         if self.state.active != active {
             self.discard_live_stroke();
+            self.cancel_frame_drag();
             self.state.pending_frame_change = None;
         }
         self.state.active = active;
         self.leave_editor_if_unfit();
+        self.keep_selected_image_visible();
+        self.refresh_source_previews();
     }
 
     /// "+": selects the pseudo-tab, leaving every project tab open and the
@@ -4492,6 +4546,7 @@ impl AppController {
     /// Closes tab `index`, re-selecting its neighbour -- "+" when the last
     /// tab closes, and "+" stays selected if it already was.
     fn remove_tab(&mut self, index: usize, now: Instant) {
+        self.cancel_frame_drag();
         self.state.last_close = Some(now);
         let closed = self.state.projects.remove(index);
         if self.state.pending_close == Some(closed.id) {
@@ -4558,6 +4613,10 @@ impl AppController {
                 .push(std::thread::spawn(move || job::compact_quietly(&path)));
         }
         self.leave_editor_if_unfit();
+        if closed_was_active {
+            self.keep_selected_image_visible();
+            self.refresh_source_previews();
+        }
         // A close renumbers every later tab down by one, so an index-shaped
         // owner marker can end up comparing equal to a *different* tab --
         // force a reload rather than trust the comparison.
@@ -5019,6 +5078,7 @@ impl AppController {
                         if matches!(&self.state.sources_notice, Some(n) if n.tab_id == id) {
                             self.state.sources_notice = None;
                         }
+                        self.invalidate_source_previews();
                         self.emit(ShellEvent::OverlayChanged);
                     }
                     if matches!(&self.state.export_dialog, Some(d) if d.tab_id == id && matches!(d.stage, ExportStage::Refused { .. }))
@@ -5466,10 +5526,307 @@ impl AppController {
         )
     }
 
+    /// Queues only the active virtual window. The worker owns all source I/O
+    /// and admission; this controller path only replaces immutable identities.
+    pub fn refresh_source_previews(&mut self) {
+        if self.any_job_running() {
+            self.preview_requests.clear();
+            self.preview_budget_bytes = 0;
+            if let Some(worker) = &self.previews {
+                worker.set_visible(Vec::new(), job::HostBudget::explicit(0));
+            }
+            return;
+        }
+        let requests = if self.mode() == ShellMode::Editor
+            || self.source_presentation() == SourcePresentation::List
+        {
+            Vec::new()
+        } else if let Some(tab) = self.state.active() {
+            let height = self.image_row_height();
+            if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+                Vec::new()
+            } else {
+                let scroll_y = self.images_scroll_y();
+                let first = (scroll_y / height).floor().max(0.0) as usize;
+                let visible_end = ((scroll_y + self.state.images_viewport_height) / height)
+                    .ceil()
+                    .max(1.0) as usize;
+                let start = first.saturating_sub(2);
+                let end = visible_end.saturating_add(2).min(tab.frames.len());
+                tab.frames[start..end]
+                    .iter()
+                    .filter(|path| tab.meta.get(*path).is_some_and(|meta| !meta.unresolved))
+                    .map(|path| PreviewRequest {
+                        tab_id: tab.id,
+                        generation: self.preview_generation,
+                        path: path.clone(),
+                    })
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        self.preview_cache
+            .retain(|request, _| requests.contains(request));
+        self.preview_failures
+            .retain(|request, _| requests.contains(request));
+        self.preview_cache_bytes = self
+            .preview_cache
+            .values()
+            .map(|pixels| pixels.rgba.len() as u64 * 2)
+            .sum();
+        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
+        let remaining = host_budget
+            .bytes()
+            .saturating_sub(self.preview_cache_bytes)
+            .saturating_sub(self.published_preview_bytes.load(Ordering::Acquire));
+        let budget = job::HostBudget::explicit(remaining);
+        let pending: Vec<_> = if remaining == 0 {
+            Vec::new()
+        } else {
+            requests
+                .iter()
+                .filter(|request| {
+                    !self.preview_cache.contains_key(*request)
+                        && !self.preview_failures.contains_key(*request)
+                })
+                .cloned()
+                .collect()
+        };
+        if pending == self.preview_requests && remaining == self.preview_budget_bytes {
+            return;
+        }
+        self.preview_requests = pending;
+        self.preview_budget_bytes = remaining;
+        if let Some(worker) = &self.previews {
+            worker.set_visible(self.preview_requests.clone(), budget);
+        }
+    }
+
+    /// Publishes settled worker outcomes only when their immutable identity
+    /// still belongs to the active virtual window.
+    pub fn poll_source_previews(&mut self) -> bool {
+        let outcomes = self
+            .previews
+            .as_ref()
+            .map(PreviewWorker::drain)
+            .unwrap_or_default();
+        let mut changed = false;
+        for outcome in outcomes {
+            if !self.preview_requests.contains(&outcome.request) {
+                continue;
+            }
+            match outcome.result {
+                Ok(pixels) => {
+                    let bytes = pixels.rgba.len() as u64 * 2;
+                    if bytes > MAX_CACHE_BYTES {
+                        self.preview_failures
+                            .insert(outcome.request, "preview exceeds cache limit".to_string());
+                    } else {
+                        let native = self.published_preview_bytes.load(Ordering::Acquire);
+                        while self
+                            .preview_cache_bytes
+                            .saturating_add(native)
+                            .saturating_add(bytes)
+                            > MAX_CACHE_BYTES
+                        {
+                            let Some(key) = self.preview_cache.keys().next().cloned() else {
+                                break;
+                            };
+                            if let Some(removed) = self.preview_cache.remove(&key) {
+                                self.preview_cache_bytes = self
+                                    .preview_cache_bytes
+                                    .saturating_sub(removed.rgba.len() as u64 * 2);
+                            }
+                        }
+                        if self
+                            .preview_cache_bytes
+                            .saturating_add(native)
+                            .saturating_add(bytes)
+                            > MAX_CACHE_BYTES
+                        {
+                            self.preview_failures
+                                .insert(outcome.request, "preview exceeds cache limit".to_string());
+                        } else {
+                            self.preview_cache_bytes =
+                                self.preview_cache_bytes.saturating_add(bytes);
+                            self.preview_cache.insert(outcome.request, pixels);
+                        }
+                    }
+                    changed = true;
+                }
+                Err(PreviewError::Cancelled) => {}
+                Err(error) => {
+                    self.preview_failures
+                        .insert(outcome.request, error.to_string());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.refresh_source_previews();
+        }
+        changed
+    }
+
+    pub fn source_preview(&self, path: &Path) -> Option<&Arc<PreviewPixels>> {
+        let tab_id = self.state.active()?.id;
+        self.preview_cache.get(&PreviewRequest {
+            tab_id,
+            generation: self.preview_generation,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Whether this model row intersects the current source-list viewport.
+    /// Prefetched pixels remain Rust-side only until their row becomes visible.
+    pub fn source_preview_row_visible(&self, index: usize) -> bool {
+        let height = self.image_row_height();
+        if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+            return false;
+        }
+        let first = (self.state.images_scroll_y / height).floor().max(0.0) as usize;
+        let end = ((self.state.images_scroll_y + self.state.images_viewport_height) / height)
+            .ceil()
+            .max(1.0) as usize;
+        index >= first && index < end
+    }
+
+    pub fn source_preview_state(&self, path: &Path, unresolved: bool) -> &'static str {
+        if unresolved {
+            return "missing";
+        }
+        if self.source_preview(path).is_some() {
+            return "ready";
+        }
+        let active = self.state.active().map(|tab| tab.id);
+        if self.preview_failures.keys().any(|request| {
+            Some(request.tab_id) == active
+                && request.generation == self.preview_generation
+                && request.path == path
+        }) {
+            return "unavailable";
+        }
+        "loading"
+    }
+
+    pub fn source_preview_snapshot(&self) -> SourcePreviewSnapshot {
+        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
+        let metrics = self
+            .previews
+            .as_ref()
+            .map(PreviewWorker::metrics)
+            .unwrap_or(crate::source_previews::PreviewMetrics {
+                active_workers: 0,
+                peak_workers: 0,
+                outcome_bytes: 0,
+                peak_outcome_bytes: 0,
+            });
+        let snapshot = SourcePreviewSnapshot {
+            configured_cap: host_budget.bytes(),
+            admission_bytes: self.preview_budget_bytes,
+            scheduled: self.preview_requests.len(),
+            active_workers: metrics.active_workers,
+            peak_workers: metrics.peak_workers,
+            cache_entries: self.preview_cache.len(),
+            cache_bytes: self.preview_cache_bytes,
+            resident_bytes: self.preview_cache_bytes / 2,
+            conversion_bytes: self.preview_cache_bytes / 2,
+            native_bytes: self.published_preview_bytes.load(Ordering::Acquire),
+            peak_native_bytes: self.peak_published_preview_bytes.load(Ordering::Acquire),
+            host_remaining: host_budget
+                .bytes()
+                .saturating_sub(self.preview_cache_bytes)
+                .saturating_sub(self.published_preview_bytes.load(Ordering::Acquire)),
+            outcome_bytes: metrics.outcome_bytes,
+            peak_outcome_bytes: metrics.peak_outcome_bytes,
+            owned_bytes: self
+                .preview_cache_bytes
+                .saturating_add(self.published_preview_bytes.load(Ordering::Acquire))
+                .saturating_add(metrics.outcome_bytes),
+        };
+        tracing::debug!(
+            configured_cap = snapshot.configured_cap,
+            admission_bytes = snapshot.admission_bytes,
+            scheduled = snapshot.scheduled,
+            active_workers = snapshot.active_workers,
+            peak_workers = snapshot.peak_workers,
+            cache_entries = snapshot.cache_entries,
+            cache_bytes = snapshot.cache_bytes,
+            resident_bytes = snapshot.resident_bytes,
+            conversion_bytes = snapshot.conversion_bytes,
+            native_bytes = snapshot.native_bytes,
+            peak_native_bytes = snapshot.peak_native_bytes,
+            host_remaining = snapshot.host_remaining,
+            outcome_bytes = snapshot.outcome_bytes,
+            peak_outcome_bytes = snapshot.peak_outcome_bytes,
+            owned_bytes = snapshot.owned_bytes,
+            "source preview resources"
+        );
+        snapshot
+    }
+
+    /// Replaces the Slint-owned preview allocation after a whole model push.
+    /// The value stays charged until the next model replacement or retirement.
+    pub fn set_published_preview_bytes(&self, bytes: u64) {
+        self.published_preview_bytes.store(bytes, Ordering::Release);
+        self.peak_published_preview_bytes
+            .fetch_max(bytes, Ordering::AcqRel);
+    }
+
+    fn invalidate_source_previews(&mut self) {
+        self.cancel_frame_drag();
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_cache.clear();
+        self.preview_cache_bytes = 0;
+        self.preview_failures.clear();
+        self.keep_selected_image_visible();
+        self.refresh_source_previews();
+    }
+
     fn images_content_height(&self) -> f32 {
         self.state
             .active()
-            .map_or(0.0, |tab| tab.frames.len() as f32 * images::ROW_HEIGHT)
+            .map_or(0.0, |tab| tab.frames.len() as f32 * self.image_row_height())
+    }
+
+    fn keep_selected_image_visible(&mut self) {
+        let Some(selected) = self.state.active().map(|tab| tab.selected) else {
+            return;
+        };
+        self.keep_image_visible(selected);
+    }
+
+    /// Scrolls a valid source row into the source-list viewport without
+    /// changing which source is selected.
+    fn keep_image_visible(&mut self, index: usize) {
+        let Some(frame_count) = self.state.active().map(|tab| tab.frames.len()) else {
+            return;
+        };
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 || index >= frame_count {
+            return;
+        }
+        let row_height = self.image_row_height();
+        let top = index as f32 * row_height;
+        let bottom = top + row_height;
+        let current = self.state.images_scroll_y;
+        let target = if top < current {
+            top
+        } else if bottom > current + viewport {
+            bottom - viewport
+        } else {
+            current
+        };
+        self.set_images_scroll(target);
+    }
+
+    fn image_row_height(&self) -> f32 {
+        match self.source_presentation() {
+            SourcePresentation::List => images::ROW_HEIGHT,
+            SourcePresentation::ImageList => 120.0,
+            SourcePresentation::Large => 200.0,
+        }
     }
 
     /// The active tab's checkpoint count, `0` with none active -- what every
@@ -5509,6 +5866,40 @@ impl AppController {
         }
         tab.selected = index;
         self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Selects the next resolved source in `direction`, retaining the current
+    /// source when the selection is already at that edge.
+    pub fn select_adjacent_resolved_frame(&mut self, direction: i32) {
+        let step = direction.signum() as isize;
+        let next = {
+            let Some(tab) = self.state.active() else {
+                return;
+            };
+            if step == 0 {
+                None
+            } else {
+                let mut index = tab.selected as isize;
+                loop {
+                    index += step;
+                    if index < 0 || index >= tab.frames.len() as isize {
+                        break None;
+                    }
+                    let index = index as usize;
+                    if tab
+                        .meta
+                        .get(&tab.frames[index])
+                        .is_some_and(|meta| !meta.unresolved)
+                    {
+                        break Some(index);
+                    }
+                }
+            }
+        };
+        if let Some(next) = next {
+            self.select_frame(next);
+        }
+        self.keep_selected_image_visible();
     }
 
     /// The selected frame's path -- `None` with no tab active or an empty
@@ -5671,6 +6062,7 @@ impl AppController {
             .extend(std::iter::repeat_n(false, plan.add.len()));
         tab.frame_sort = None;
         tab.read_missing_meta();
+        self.invalidate_source_previews();
     }
 
     /// Removes the frame at `index` -- immediately, before the first
@@ -5711,6 +6103,7 @@ impl AppController {
         } else {
             tab.selected.min(tab.frames.len().saturating_sub(1))
         };
+        self.invalidate_source_previews();
     }
 
     /// Drags the frame at `from` to `to` -- the manual order, which clears
@@ -5742,6 +6135,8 @@ impl AppController {
         let order = images::move_order(tab.frames.len(), from, to);
         tab.reorder(&order);
         tab.frame_sort = None;
+        self.refresh_source_previews();
+        self.keep_image_visible(to);
     }
 
     /// Sorts the active tab's frame list by `sort` -- one code path for "the
@@ -5783,6 +6178,12 @@ impl AppController {
         self.state.drag_row.map(|drag| drag.from)
     }
 
+    /// A moved drag keeps its panel-wide capture through a zero offset. A
+    /// stationary source press remains uncaptured for ordinary row actions.
+    pub fn drag_capture_active(&self) -> bool {
+        self.state.drag_row.is_some_and(|drag| drag.capture_active)
+    }
+
     /// The live pixel offset a drag has moved by since the press, clamped so
     /// the dragged row's floating copy never leaves the list's own content
     /// band. `0.0` with no drag in progress.
@@ -5793,9 +6194,10 @@ impl AppController {
         let Some(tab) = self.state.active() else {
             return 0.0;
         };
-        let top = drag.from as f32 * images::ROW_HEIGHT;
-        let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
-        let max = (content_height - images::ROW_HEIGHT - top).max(0.0);
+        let row_height = self.image_row_height();
+        let top = drag.from as f32 * row_height;
+        let content_height = tab.frames.len() as f32 * row_height;
+        let max = (content_height - row_height - top).max(0.0);
         (drag.current_y - drag.press_y).clamp(-top, max)
     }
 
@@ -5808,7 +6210,7 @@ impl AppController {
         Some(self.drag_target(&drag, drag.current_y))
     }
 
-    /// The grip's raw pointer stream for the row at `index`: `Down` starts a
+    /// The filename/image raw pointer stream for the row at `index`: `Down` starts a
     /// drag there; `Up` commits it, moving the row by however many whole
     /// [`images::ROW_HEIGHT`] steps `mouse_y` has travelled from the press;
     /// `Move` updates [`Self::drag_offset`], the floating copy's live
@@ -5834,6 +6236,7 @@ impl AppController {
                     from: index,
                     press_y: mouse_y,
                     current_y: mouse_y,
+                    capture_active: false,
                 });
                 self.emit(ShellEvent::ImagesChanged);
             }
@@ -5842,6 +6245,7 @@ impl AppController {
                     return;
                 };
                 drag.current_y = mouse_y;
+                drag.capture_active |= mouse_y != drag.press_y;
                 self.emit(ShellEvent::ImagesChanged);
             }
             PointerKind::Up => {
@@ -5858,12 +6262,54 @@ impl AppController {
         }
     }
 
+    /// Advances a moved source drag while its physical pointer remains in the
+    /// viewport's top or bottom row band. The bridge's existing preview timer
+    /// calls this every 30 ms; a stationary press never reaches this path.
+    pub fn advance_frame_drag_autoscroll(&mut self) -> bool {
+        if self.mode() != ShellMode::Stacking || self.job_running() {
+            return false;
+        }
+        let Some(drag) = self.state.drag_row else {
+            return false;
+        };
+        if !drag.capture_active {
+            return false;
+        }
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 {
+            return false;
+        }
+        let row_height = self.image_row_height();
+        let edge = (row_height / 2.0).min(viewport / 2.0);
+        let physical_y = drag.current_y - self.state.images_scroll_y;
+        let direction = if physical_y <= edge {
+            -1.0
+        } else if physical_y >= viewport - edge {
+            1.0
+        } else {
+            return false;
+        };
+        let before = self.state.images_scroll_y;
+        if !self.images_viewport_scrolled(before + direction * row_height / 4.0) {
+            return false;
+        }
+        let moved = self.state.images_scroll_y - before;
+        if let Some(drag) = self.state.drag_row.as_mut() {
+            drag.current_y += moved;
+        }
+        true
+    }
+
+    fn cancel_frame_drag(&mut self) {
+        self.state.drag_row = None;
+    }
+
     fn drag_target(&self, drag: &DragRow, mouse_y: f32) -> usize {
         let Some(tab) = self.state.active() else {
             return drag.from;
         };
         let last = tab.frames.len().saturating_sub(1);
-        let steps = ((mouse_y - drag.press_y) / images::ROW_HEIGHT).round() as isize;
+        let steps = ((mouse_y - drag.press_y) / self.image_row_height()).round() as isize;
         (drag.from as isize + steps).clamp(0, last as isize) as usize
     }
 
@@ -5874,6 +6320,7 @@ impl AppController {
         let order = images::sort_order(&tab.frames, sort, &tab.meta);
         tab.reorder(&order);
         tab.frame_sort = Some(sort);
+        self.refresh_source_previews();
     }
 
     /// The sort menu's own selection -- `None` while the order came from a
@@ -6394,6 +6841,9 @@ impl AppController {
         );
         let moved = offset != self.state.images_scroll_y;
         self.state.images_scroll_y = offset;
+        if moved {
+            self.refresh_source_previews();
+        }
         moved
     }
 
@@ -6448,6 +6898,7 @@ impl AppController {
     pub fn set_images_viewport_height(&mut self, height: f32) {
         self.state.images_viewport_height = height.max(0.0);
         self.images_viewport_scrolled(self.state.images_scroll_y);
+        self.refresh_source_previews();
         self.emit(ShellEvent::ImagesScrolled);
     }
 
@@ -6667,6 +7118,7 @@ impl AppController {
                 self.performance.max_host_memory = cap;
                 self.rejected_caps.host_memory = None;
                 self.save_performance();
+                self.refresh_source_previews();
             }
             Err(_) => self.rejected_caps.host_memory = Some(text.to_string()),
         }
@@ -6705,6 +7157,40 @@ impl AppController {
     /// Installs the settings loaded at startup.
     pub fn install_performance(&mut self, settings: PerformanceSettings) {
         self.performance = settings;
+    }
+
+    pub fn install_appearance(&mut self, settings: AppearanceSettings) {
+        self.appearance = settings;
+        self.appearance_save_error = None;
+    }
+
+    pub fn source_presentation(&self) -> SourcePresentation {
+        if self.mode() == ShellMode::Editor {
+            SourcePresentation::List
+        } else {
+            self.appearance.presentation
+        }
+    }
+
+    pub fn appearance_save_error(&self) -> Option<&str> {
+        self.appearance_save_error.as_deref()
+    }
+
+    pub fn set_source_presentation(&mut self, presentation: SourcePresentation) {
+        self.appearance.presentation = presentation;
+        // A row's pixel geometry changes with its presentation.  A drag is
+        // only meaningful in the geometry in which it began.
+        self.cancel_frame_drag();
+        self.set_images_scroll(self.state.images_scroll_y);
+        self.keep_selected_image_visible();
+        self.appearance_save_error = self
+            .state
+            .config_dir
+            .as_deref()
+            .and_then(|dir| appearance_settings::save(dir, self.appearance).err())
+            .map(|error| error.to_string());
+        self.refresh_source_previews();
+        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// Saves `performance` when a config directory is installed; a failed
@@ -6849,6 +7335,7 @@ impl AppController {
             return Some(false);
         }
         self.job.queue.push_back(id);
+        self.cancel_frame_drag();
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
         self.leave_editor_if_unfit();
@@ -7009,6 +7496,18 @@ impl AppController {
                 return false;
             }
         };
+        let retained_preview_bytes = self
+            .preview_cache_bytes
+            .saturating_add(self.published_preview_bytes.load(Ordering::Acquire));
+        let processing_budget = job::host_budget()
+            .capped_to(request.max_host_memory)
+            .bytes()
+            .saturating_sub(retained_preview_bytes);
+        if processing_budget == 0 {
+            self.refuse_message("Source previews use the available host memory. Close or change the source view before starting processing.".to_string());
+            return false;
+        }
+        self.cancel_frame_drag();
         let control = job::JobControl::new();
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
@@ -7020,7 +7519,20 @@ impl AppController {
                 remove_held(std::slice::from_ref(&parked.held));
             }
         }
-        self.job.handle = Some(job::spawn(request.clone(), algorithms, control, observer));
+        let mut worker_request = request.clone();
+        worker_request.max_host_memory = Some(processing_budget);
+        let preview_barrier = self.previews.as_ref().map(PreviewWorker::quiesce);
+        self.job.handle = Some(job::spawn_after(
+            worker_request,
+            algorithms,
+            control,
+            observer,
+            move || {
+                if let Some(barrier) = preview_barrier {
+                    barrier.wait();
+                }
+            },
+        ));
         if let Some(tab) = self.state.projects.get_mut(tab_index) {
             tab.run = job::RunState::Running;
             tab.request = Some(request);
@@ -7244,6 +7756,7 @@ impl AppController {
                 break;
             }
         }
+        self.refresh_source_previews();
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
         planes
@@ -8991,7 +9504,133 @@ fn notice_line(skipped: &[PathBuf]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_cause;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use focusforge_core::io::test_frames::write_frame_with_capture_time;
+
+    use super::{AppController, OpenOutcome, plain_cause};
+    use crate::appearance_settings::{AppearanceSettings, SourcePresentation};
+    use crate::source_previews::{PreviewError, PreviewPixels, PreviewReservation, PreviewWorker};
+
+    fn install_blocked_preview_worker(
+        controller: &mut AppController,
+        blocked_path: PathBuf,
+    ) -> (
+        mpsc::Receiver<PathBuf>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<PathBuf>,
+    ) {
+        controller.preview_requests.clear();
+        controller.preview_budget_bytes = 0;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (completed_tx, completed_rx) = mpsc::channel();
+        controller.previews = Some(PreviewWorker::new_with_renderer(Arc::new(
+            move |path, _, _| {
+                if path != blocked_path {
+                    return Err(PreviewError::Cancelled);
+                }
+                started_tx.send(path.to_path_buf()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                completed_tx.send(path.to_path_buf()).unwrap();
+                Ok((
+                    PreviewPixels {
+                        width: 1,
+                        height: 1,
+                        rgba: vec![0, 0, 0, 255],
+                    },
+                    PreviewReservation {
+                        decoder_cache: 0,
+                        read_scratch: 0,
+                        band: 0,
+                        accumulator: 0,
+                        reduced_samples: 0,
+                        result: 4,
+                        resident_and_conversion: 8,
+                        total: 12,
+                        band_rows: 1,
+                    },
+                ))
+            },
+        )));
+        (started_rx, release_tx, completed_rx)
+    }
+
+    fn wait_for_preview_quiescence(controller: &mut AppController) {
+        while controller
+            .previews
+            .as_ref()
+            .expect("controlled preview worker remains installed")
+            .metrics()
+            .active_workers
+            != 0
+        {
+            controller.poll_source_previews();
+            std::thread::yield_now();
+        }
+        controller.poll_source_previews();
+    }
+
+    fn cache_has_source(controller: &AppController, source: &Path) -> bool {
+        controller
+            .preview_cache
+            .keys()
+            .any(|request| request.path == source)
+    }
+
+    fn seal_project_with_sources(dir: &Path, sources: &[PathBuf]) -> PathBuf {
+        use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+        use focusforge_core::params::ParamValues;
+        use focusforge_core::project::{Metrics, SealRequest, seal};
+        use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let composite = dir.join("composite.tif");
+        let zmap = dir.join("zmap.tif");
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let mut writer = TiffWriter::create(
+            &composite,
+            TiffSpec {
+                width: 4,
+                height: 4,
+                samples_per_pixel: 3,
+                description: Some("staged".to_string()),
+            },
+        )
+        .unwrap();
+        writer.write_tile(full, &[0u16; 4 * 4 * 3]).unwrap();
+        writer.finish().unwrap();
+
+        let mut map =
+            ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, sources.len() as u32).unwrap()).unwrap();
+        map.write_tile(full, &[0u16; 4 * 4]).unwrap();
+        map.finish().unwrap();
+
+        let project_path = dir.join("test.ffp");
+        seal(SealRequest {
+            project_path: &project_path,
+            staged_composite: &composite,
+            staged_zmap: &zmap,
+            sources,
+            algorithm: "laplacian",
+            params: &ParamValues::new(),
+            align: None,
+            registration: focusforge_core::align::Registration::default(),
+            composite_description: "staged".to_string(),
+            label: None,
+            metrics: Metrics::default(),
+        })
+        .unwrap();
+        project_path
+    }
 
     #[test]
     fn plain_cause_drops_the_os_error_tail_and_a_closing_period() {
@@ -9013,5 +9652,263 @@ mod tests {
         );
         assert_eq!(plain_cause("odd (os error x)"), "odd (os error x)");
         assert_eq!(plain_cause("odd (os error )"), "odd (os error )");
+    }
+
+    #[test]
+    fn a_removed_source_drops_its_blocked_preview_before_it_can_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.tif");
+        write_frame_with_capture_time(&source, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&root))
+            .expect("the source opens")
+            .join()
+            .expect("the open worker does not panic");
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, source.clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            source,
+            "the controlled worker owns the old source identity"
+        );
+
+        controller.remove_frame(0);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            completed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the blocked renderer finishes before stale outcome polling"),
+            source
+        );
+        wait_for_preview_quiescence(&mut controller);
+        assert_eq!(controller.source_preview_snapshot().cache_entries, 0);
+        assert!(controller.source_preview(&source).is_none());
+        assert!(!cache_has_source(&controller, &source));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_tab_switch_drops_its_blocked_preview_before_it_can_publish() {
+        let first = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-tab-first-{}",
+            std::process::id()
+        ));
+        let second = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-tab-second-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let source = first.join("first.tif");
+        write_frame_with_capture_time(&source, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        write_frame_with_capture_time(
+            &second.join("second.tif"),
+            4,
+            4,
+            Some("2026:08:29 10:00:00"),
+        )
+        .unwrap();
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&first))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, source.clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            source
+        );
+
+        controller
+            .open_paths(std::slice::from_ref(&second))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.select_project(1);
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the switched-away renderer completes");
+        wait_for_preview_quiescence(&mut controller);
+
+        assert!(!cache_has_source(&controller, &source));
+        assert!(controller.source_preview(&source).is_none());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn a_relink_drops_its_blocked_preview_before_it_can_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-relink-{}",
+            std::process::id()
+        ));
+        let old_sources = root.join("old-sources");
+        let new_sources = root.join("new-sources");
+        let project_dir = root.join("project");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&old_sources).unwrap();
+        std::fs::create_dir_all(&new_sources).unwrap();
+        let old_source = old_sources.join("source.tif");
+        write_frame_with_capture_time(&old_source, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        let project = seal_project_with_sources(&project_dir, std::slice::from_ref(&old_source));
+        let new_source = new_sources.join("source.tif");
+        std::fs::copy(&old_source, &new_source).unwrap();
+
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&project))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, old_source.clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            old_source
+        );
+
+        std::fs::remove_dir_all(&old_sources).unwrap();
+        let tab_id = controller.tab_id_at(0).unwrap();
+        controller
+            .locate_frames(crate::entry::LocateTarget::Tab(tab_id), new_sources.clone())
+            .unwrap()
+            .join()
+            .unwrap();
+        controller.settle_locate();
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the relinked-away renderer completes");
+        wait_for_preview_quiescence(&mut controller);
+
+        assert!(!cache_has_source(&controller, &old_source));
+        assert!(controller.source_preview(&old_source).is_none());
+        assert_eq!(controller.images_panel().rows[0].path, new_source);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retry_keeps_the_original_host_cap_after_preview_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-retry-host-cap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.tif");
+        let second = root.join("second.tif");
+        write_frame_with_capture_time(&first, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        write_frame_with_capture_time(&second, 4, 4, Some("2026:08:29 10:00:01")).unwrap();
+        let mut controller = AppController::new();
+        controller.set_scratch_root_for_test(root.join("scratch"));
+        controller
+            .open_paths(std::slice::from_ref(&root))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.set_align_algorithm("dummy-align");
+        controller.set_host_memory_cap("1MiB");
+        controller.set_published_preview_bytes(512 * 1024);
+        std::fs::write(&second, b"not a tiff").unwrap();
+
+        assert!(controller.start_fuse());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while controller.job_running() {
+            controller.settle_job();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the intentionally unreadable source must fail"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            controller.job_view().state,
+            crate::job::RunState::Failed(_)
+        ));
+        assert_eq!(
+            controller
+                .state
+                .active()
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .max_host_memory,
+            Some(1024 * 1024),
+            "the failed tab keeps its user-selected cap, not the first reduced worker allowance"
+        );
+
+        assert!(
+            controller.retry_fuse(),
+            "the retry subtracts retained previews from the original cap exactly once"
+        );
+        assert_eq!(
+            controller
+                .state
+                .active()
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .max_host_memory,
+            Some(1024 * 1024)
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while controller.job_running() {
+            controller.settle_job();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry must settle its same unreadable-source failure"
+            );
+            std::thread::yield_now();
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -45,6 +45,53 @@ mod display {
         }
 
         #[test]
+        fn full_source_reducer_keeps_landscape_and_portrait_edges() {
+            let mut landscape = Downsampler::new_full_source(9, 3, 1, 3, 3);
+            assert_eq!(
+                landscape.crop(),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 9,
+                    height: 3
+                },
+                "source previews must not inherit project-card centre cropping"
+            );
+            let mut portrait = Downsampler::new_full_source(3, 9, 1, 3, 3);
+            assert_eq!(
+                portrait.crop(),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 3,
+                    height: 9
+                },
+                "every original edge contributes before aspect-fit display"
+            );
+
+            landscape.add_band(
+                &source(9, 3),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 9,
+                    height: 3,
+                },
+            );
+            portrait.add_band(
+                &source(3, 9),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 3,
+                    height: 9,
+                },
+            );
+            assert_ne!(landscape.finish(), vec![0; 9]);
+            assert_ne!(portrait.finish(), vec![0; 9]);
+        }
+
+        #[test]
         fn band_accumulation_matches_a_whole_image_reduction() {
             let (width, height) = (12u32, 8u32);
             let (target_width, target_height) = (4u32, 4u32);

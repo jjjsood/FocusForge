@@ -76,14 +76,32 @@ export global ShellGeometry {
     out property <length> tab-width: 224px;
     out property <length> tab-pitch: 228px;
 
-    // The `Images` list: 200 x 26 content in a 248 x 26 band, a 14 x 14
-    // colour chip at +24.
+    // Source presentation variants.
     out property <length> image-row-height: 26px;
     out property <length> image-row-band-width: 248px;
-    out property <length> image-row-content-width: 200px;
-    out property <length> image-row-content-inset: 24px;
+    out property <length> image-row-content-width: 232px;
+    out property <length> image-row-content-inset: 8px;
     out property <length> image-chip-size: 14px;
     out property <length> image-header-height: 24px;
+    out property <length> image-list-row-height: 120px;
+    out property <length> large-preview-row-height: 200px;
+    out property <length> image-preview-inset: 8px;
+    out property <length> image-list-preview-width: 136px;
+    out property <length> image-list-preview-height: 90px;
+    out property <length> image-list-details-x: 152px;
+    out property <length> image-list-details-width: 88px;
+    out property <length> image-list-name-y: 32px;
+    out property <length> image-list-name-height: 20px;
+    out property <length> image-list-time-height: 36px;
+    out property <length> image-list-color-height: 16px;
+    out property <length> large-preview-width: 224px;
+    out property <length> large-preview-height: 149px;
+    out property <length> large-preview-y: Theme.space-3;
+    out property <length> image-row-marker-width: 4px;
+    out property <length> image-row-action-gap: 4px;
+    out property <length> image-row-action-inset: Theme.space-4;
+    out property <length> image-row-action-pad: 0px;
+    out property <length> tooltip-width: 248px;
 
     // The settings panel. Mirrored one-for-one as `pub const`s in
     // `crates/gui/src/settings_panel.rs`, exactly as `tab-pitch` above is

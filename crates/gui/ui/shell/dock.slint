@@ -64,20 +64,24 @@ export component FFDock inherits Rectangle {
     // `FFImagesPanel`.
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
+    in property <string> images-presentation: "list";
     in-out property <length> images-list-viewport-y: 0px;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
     in property <length> images-drag-offset: 0px;
+    in property <bool> images-drag-capture-active: false;
     in property <int> images-drag-target-row: -1;
     in property <bool> images-enabled: true;
+    in property <length> tooltip-max-width: ShellGeometry.tooltip-width;
     callback images-add-frames-requested();
     callback images-sort-menu-toggled();
     callback images-sort-selected(string);
     callback images-frame-selected(int);
+    callback images-frame-keyboard-moved(int);
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
-    callback images-frame-grip-pointer(int, int, length);
+    callback images-frame-drag-pointer(int, int, length);
     callback images-viewport-scrolled(length);
     callback images-frame-wheel(length);
     callback images-scrollbar-pointer(int, length);
@@ -169,22 +173,27 @@ export component FFDock inherits Rectangle {
         visible: root.project-loaded && (root.mode == "editor" || root.dock-tab == "images");
         rows: root.images-rows;
         header-text: root.images-header-text;
+        presentation: root.images-presentation;
+        tooltip-max-width: root.tooltip-max-width;
         list-viewport-y <=> root.images-list-viewport-y;
-        mutable: root.mode == "stacking" && root.images-enabled;
+        mutable: root.mode == "stacking";
         enabled: root.images-enabled;
+        job-disabled: !root.images-enabled;
         legend: root.mode == "editor";
         sort: root.images-sort;
         sort-menu-open: root.images-sort-menu-open;
         dragging-row: root.images-dragging-row;
         drag-offset: root.images-drag-offset;
+        drag-capture-active: root.images-drag-capture-active;
         drag-target-row: root.images-drag-target-row;
         add-frames-requested => { root.images-add-frames-requested(); }
         sort-menu-toggled => { root.images-sort-menu-toggled(); }
         sort-selected(picked) => { root.images-sort-selected(picked); }
         frame-selected(i) => { root.images-frame-selected(i); }
+        frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
         frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
-        frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
         viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
         frame-wheel(delta) => { root.images-frame-wheel(delta); }
         scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }

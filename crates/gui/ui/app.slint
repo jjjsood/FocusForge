@@ -435,22 +435,34 @@ export component AppWindow inherits Window {
     // one line into `FFDock`.
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
+    in property <string> images-presentation: "list";
     in-out property <length> images-list-viewport-y: 0px;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
     in property <length> images-drag-offset: 0px;
+    in property <bool> images-drag-capture-active: false;
     in property <int> images-drag-target-row: -1;
-    // Whether the mutating controls (row grip/eye/bin, add, sort, drag) are
+    // Whether the mutating controls (row actions, add, sort, drag) are
     // reachable at all -- `false` while this tab's own job is running.
     in property <bool> images-enabled: true;
+    // Inspection rows are independent from live controller publication.
+    in property <bool> list-preview-active: false;
+    in property <string> list-preview-mode: "stacking";
+    in property <[ImageRowView]> list-preview-rows: [];
+    in property <string> list-preview-header-text: "";
+    in property <string> list-preview-presentation: "list";
+    in property <int> list-preview-dragging-row: -1;
+    in property <length> list-preview-drag-offset: 0px;
+    in property <int> list-preview-drag-target-row: -1;
     callback images-add-frames-requested();
     callback images-sort-menu-toggled();
     callback images-sort-selected(string);
     callback images-frame-selected(int);
+    callback images-frame-keyboard-moved(int);
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
-    callback images-frame-grip-pointer(int, int, length);
+    callback images-frame-drag-pointer(int, int, length);
     callback images-viewport-scrolled(length);
     callback images-frame-wheel(length);
     callback images-scrollbar-pointer(int, length);
@@ -463,9 +475,9 @@ export component AppWindow inherits Window {
         width: ShellGeometry.dock-width;
         height: root.height - ShellGeometry.strip-height - ShellGeometry.bottom-bar-height;
         editor-enabled: root.editor-enabled;
-        mode: root.mode;
-        dock-tab: root.dock-tab;
-        project-loaded: root.project-loaded;
+        mode: root.list-preview-active ? root.list-preview-mode : root.mode;
+        dock-tab: root.list-preview-active ? "images" : root.dock-tab;
+        project-loaded: root.project-loaded || root.list-preview-active;
         checkpoint-line: root.checkpoint-line;
         checkpoint-export-enabled: root.checkpoint-export-enabled;
         checkpoint-rows: root.checkpoint-rows;
@@ -476,15 +488,18 @@ export component AppWindow inherits Window {
         settings-scroll-y: root.settings-scroll-y;
         settings-content-height: root.settings-content-height;
         settings-enabled: root.settings-enabled;
-        images-rows: root.images-rows;
-        images-header-text: root.images-header-text;
+        images-rows: root.list-preview-active ? root.list-preview-rows : root.images-rows;
+        images-header-text: root.list-preview-active ? root.list-preview-header-text : root.images-header-text;
+        images-presentation: root.list-preview-active ? root.list-preview-presentation : root.images-presentation;
+        tooltip-max-width: root.width;
         images-list-viewport-y <=> root.images-list-viewport-y;
         images-sort: root.images-sort;
         images-sort-menu-open: root.images-sort-menu-open;
-        images-dragging-row: root.images-dragging-row;
-        images-drag-offset: root.images-drag-offset;
-        images-drag-target-row: root.images-drag-target-row;
-        images-enabled: root.images-enabled;
+        images-dragging-row: root.list-preview-active ? root.list-preview-dragging-row : root.images-dragging-row;
+        images-drag-offset: root.list-preview-active ? root.list-preview-drag-offset : root.images-drag-offset;
+        images-drag-capture-active: root.list-preview-active ? false : root.images-drag-capture-active;
+        images-drag-target-row: root.list-preview-active ? root.list-preview-drag-target-row : root.images-drag-target-row;
+        images-enabled: root.list-preview-active ? true : root.images-enabled;
 
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
@@ -509,9 +524,10 @@ export component AppWindow inherits Window {
         images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
         images-sort-selected(picked) => { root.images-sort-selected(picked); }
         images-frame-selected(i) => { root.images-frame-selected(i); }
+        images-frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
-        images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
         images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
         images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
@@ -546,6 +562,14 @@ export component AppWindow inherits Window {
     callback performance-vram-cap-edited(string);
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <string> appearance-presentation: "image-list";
+    in property <bool> appearance-menu-open: false;
+    in property <bool> appearance-menu-focused: false;
+    in property <bool> appearance-menu-disabled: false;
+    in property <string> appearance-save-error: "";
+    callback appearance-presentation-selected(string);
+    callback appearance-menu-toggled();
 
     in property <StorageState> storage;
     callback storage-clear-requested();
@@ -699,6 +723,13 @@ export component AppWindow inherits Window {
         input-rows: root.input-rows;
         settings-section: root.settings-section;
         performance: root.performance;
+        appearance-presentation: root.appearance-presentation;
+        appearance-menu-open: root.appearance-menu-open;
+        appearance-menu-focused: root.appearance-menu-focused;
+        appearance-menu-disabled: root.appearance-menu-disabled;
+        appearance-save-error: root.appearance-save-error;
+        appearance-presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+        appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
         diagnostics-rows: root.diagnostics-rows;

@@ -258,7 +258,20 @@ pub fn spawn(
     control: Arc<JobControl>,
     observer: Arc<GuiObserver>,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
+    spawn_after(request, algorithms, control, observer, || {})
+}
+
+/// [`spawn`] after a caller-owned background barrier. The barrier runs on
+/// this worker before backend probing and never blocks the UI thread.
+pub fn spawn_after(
+    request: JobRequest,
+    algorithms: Algorithms,
+    control: Arc<JobControl>,
+    observer: Arc<GuiObserver>,
+    before: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
     std::thread::spawn(move || {
+        before();
         let (backend, backend_line) =
             resolve_backend(&request.fuse_id, request.gpu, request.max_vram);
         tracing::info!("{backend_line}");
@@ -279,6 +292,65 @@ pub fn spawn(
             stage_cache.as_ref(),
         )
     })
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use std::sync::{Arc, mpsc};
+
+    use super::{GuiObserver, JobControl, JobRequest, PipelineError, resolve_request, spawn_after};
+
+    #[test]
+    fn spawn_after_keeps_backend_and_cache_work_behind_the_background_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch_root = directory.path().join("cache");
+        let request = JobRequest {
+            frames: Vec::new(),
+            hold_dir: directory.path().join("held"),
+            scratch_root: scratch_root.clone(),
+            staging_key: "source-previews".into(),
+            fuse_id: focusforge_core::registry::default_stack()
+                .unwrap()
+                .id()
+                .to_string(),
+            fuse_values: Default::default(),
+            align_id: None,
+            align_values: Default::default(),
+            align_lax: false,
+            crop: false,
+            equalize: None,
+            gpu: false,
+            max_host_memory: Some(1024 * 1024),
+            max_vram: None,
+        };
+        let algorithms = resolve_request(&request).unwrap();
+        let observer = Arc::new(GuiObserver::new());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let caller = std::thread::current().id();
+        let worker = spawn_after(
+            request,
+            algorithms,
+            JobControl::new(),
+            Arc::clone(&observer),
+            move || {
+                entered_tx.send(std::thread::current().id()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        );
+        let barrier_thread = entered_rx.recv().unwrap();
+        let backend_before_release = observer.backend_line();
+        let cache_before_release = scratch_root.exists();
+        release_tx.send(()).unwrap();
+        let result = worker.join().unwrap();
+
+        assert_ne!(barrier_thread, caller);
+        assert_eq!(backend_before_release, None);
+        assert!(!cache_before_release);
+        assert!(observer.backend_line().is_some());
+        assert!(scratch_root.exists());
+        assert!(matches!(result, Err(PipelineError::Input(_))));
+    }
 }
 
 /// Empties the stage cache under `scratch_root` and returns how many entries

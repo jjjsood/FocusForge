@@ -26,6 +26,8 @@ import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
+import { FFTooltip } from "components/ff_tooltip.slint";
+import { FFDragLandingMarker } from "components/ff_drag_landing_marker.slint";
 import { FFCheckpointRow } from "components/ff_checkpoint_row.slint";
 import { FFDialog } from "components/ff_dialog.slint";
 import { FFDialogFooter } from "components/ff_dialog_footer.slint";
@@ -194,6 +196,39 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "Source presentations: List, Image list and Large previews"; }
+        Rectangle {
+            width: 3 * ShellGeometry.image-row-band-width + 2 * Theme.space-4;
+            height: ShellGeometry.image-header-height + 2 * ShellGeometry.large-preview-row-height;
+
+            GroupHeading { x: 0px; y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "LIST"; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "16:42:09"; selected: true; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height + ShellGeometry.image-row-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-success; name: "IMG_9820.tif"; time-text: ""; excluded: true; hovered: true; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height + 2 * ShellGeometry.image-row-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-warning; name: "IMG_9823.tif"; time-text: ""; unresolved: true; focused: true; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height + 3 * ShellGeometry.image-row-height; width: ShellGeometry.image-row-band-width; chip: Theme.accent-default; name: "IMG_9819-long-filename.tif"; time-text: "16:42:09"; dragging: true; }
+            FFDragLandingMarker { x: 0px; y: ShellGeometry.image-header-height + 4 * ShellGeometry.image-row-height; }
+
+            GroupHeading { x: ShellGeometry.image-row-band-width + Theme.space-4; y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "IMAGE LIST"; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "11.10.26 16:42"; selected: true; hovered: true; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; chip: Theme.status-success; name: "IMG_9821.tif"; time-text: ""; preview-state: "loading"; focused: true; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + 2 * ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; chip: Theme.status-failure; name: "IMG_9823.tif"; time-text: ""; preview-state: "missing"; unresolved: true; }
+
+            GroupHeading { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "LARGE PREVIEWS"; }
+            FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; presentation: "large"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "16:42:09"; selected: true; hovered: true; }
+            FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height + ShellGeometry.large-preview-row-height; width: ShellGeometry.image-row-band-width; presentation: "large"; chip: Theme.status-success; name: "IMG_9821.tif"; time-text: ""; preview-state: "unavailable"; job-disabled: true; focused: true; }
+        }
+
+        GroupHeading { text: "Source presentations: empty, tooltip, presentation menu and save error"; }
+        Rectangle {
+            width: 860px;
+            height: 220px;
+            FFPanePlaceholder { x: 0px; y: 0px; title: "No source images"; body: "Add images to begin."; action-label: "Add images"; }
+            FFMenu { x: 240px; y: 0px; width: ShellGeometry.settings-field-width; label: "Image list"; choices: ["List", "Image list", "Large previews"]; choice-ids: ["list", "image-list", "large"]; show-choice-ids: false; selected: "image-list"; open: true; focused: true; }
+            FFErrorRow { x: 400px; y: 0px; width: ShellGeometry.settings-content-width; message: "Could not save settings. Selected view remains active."; show-icon: true; }
+            FFTooltip { x: 400px; y: 48px; tooltip-max-width: parent.width - self.x; text: "IMG_9819-long-filename.tif"; }
+            FFTooltip { x: 400px; y: 120px; tooltip-max-width: parent.width - self.x; text: "IMG_9819.tif"; }
+        }
 
         GroupHeading { text: "Settings: nav rail, entry default / hover / focus / selected"; }
         FFNavRail {
@@ -1120,53 +1155,6 @@ export component ThemeSheet inherits Window {
 
         GroupHeading { text: "Canvas: pane placeholder"; }
         FFPanePlaceholder { }
-
-        GroupHeading { text: "Images list: row"; }
-        VerticalLayout {
-            spacing: 0px;
-            FFImageRow {
-                width: 248px;
-                chip: Theme.status-failure;
-                name: "00.tif";
-                time-text: "14:12:00";
-            }
-            FFImageRow {
-                width: 248px;
-                chip: Theme.status-warning;
-                name: "01.tif";
-                time-text: "14:13:01";
-                hovered: true;
-            }
-            FFImageRow {
-                width: 248px;
-                chip: Theme.status-success;
-                name: "02.tif";
-                time-text: "14:14:02";
-                excluded: true;
-                hovered: true;
-            }
-            FFImageRow {
-                width: 248px;
-                chip: Theme.accent-default;
-                name: "03.tif";
-                time-text: "";
-                unresolved: true;
-            }
-            FFImageRow {
-                width: 248px;
-                chip: Theme.accent-hover;
-                name: "04.tif";
-                time-text: "14:16:04";
-                dragging: true;
-            }
-            FFImageRow {
-                width: 248px;
-                chip: Theme.status-success;
-                name: "05.tif";
-                time-text: "14:17:05";
-                selected: true;
-            }
-        }
 
         GroupHeading { text: "Checkpoints list: row"; }
         VerticalLayout {

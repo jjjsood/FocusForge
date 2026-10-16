@@ -1306,10 +1306,23 @@ fn no_algorithm_id_in_the_gui() {
         .collect();
     assert!(!ids.is_empty());
 
+    let boundary = "const SHIPPED: &str = \"laplacian\";\n#[cfg(test)]\nmod tests {\nconst FIXTURE: &str = \"dummy-align\";\n}";
+    let production = common::production_rust_source(boundary);
+    assert!(production.contains("laplacian"));
+    assert!(
+        !production.contains("dummy-align"),
+        "only cfg(test) fixture identifiers may leave the production scan"
+    );
+    assert!(
+        common::production_rust_source("const SHIPPED: &str = \"laplacian\";")
+            .contains("laplacian"),
+        "files without a cfg(test) tail stay fully scanned"
+    );
+
     let mut offenders = Vec::new();
     for path in common::find_rust_files(&common::src_dir()) {
         let contents = fs::read_to_string(&path).unwrap();
-        let code = common::strip_line_comments(&contents);
+        let code = common::strip_line_comments(common::production_rust_source(&contents));
         for id in &ids {
             if code.contains(id.as_str()) {
                 offenders.push(format!("{}: {id}", path.display()));

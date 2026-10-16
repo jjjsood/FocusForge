@@ -179,7 +179,7 @@ fn checkpoint_panel_touches_no_storage() {
     // which builds the stored stroke's path in core's own point type.
     // `performance_settings.rs` parses its cap strings with core's size
     // syntax. Excluded by name: this test's own subject is the checkpoint
-    // panel, not the whole crate.
+    // panel, not the whole crate. Source preview reductions also read frames.
     let canvas_files = [
         "checkpoints.rs",
         "brush.rs",
@@ -191,6 +191,7 @@ fn checkpoint_panel_touches_no_storage() {
         "diagnostics.rs",
         "job.rs",
         "images.rs",
+        "source_previews.rs",
         "overlay.rs",
         "performance_settings.rs",
         "recent.rs",
@@ -205,9 +206,10 @@ fn checkpoint_panel_touches_no_storage() {
             continue;
         }
         let contents = fs::read_to_string(&path).unwrap();
+        let production = common::production_rust_source(&contents);
         for needle in ["focusforge_core", "fs::read", "File::open"] {
             assert!(
-                !contents.contains(needle),
+                !production.contains(needle),
                 "{}: contains {needle:?} -- the checkpoint panel must touch no storage",
                 path.display()
             );
@@ -623,8 +625,9 @@ fn settings_path_row_elides_its_path_and_marks_an_unresolved_location() {
 
 /// Tab component each section renders, by slug. Every other tab component is
 /// absent while a section is selected.
-const SETTINGS_TABS: [(&str, &str); 5] = [
+const SETTINGS_TABS: [(&str, &str); 6] = [
     ("performance", "FFPerformanceTab"),
+    ("appearance", "FFAppearanceTab"),
     ("storage", "FFStorageTab"),
     ("input-map", "FFInputMapTab"),
     ("diagnostics", "FFDiagnosticsPanel"),
@@ -686,6 +689,7 @@ fn settings_open_with_performance_selected() {
             Some(false),
             Some(false),
             Some(false),
+            Some(false),
             Some(false)
         ]
     );
@@ -719,6 +723,7 @@ fn settings_nav_rail_lists_only_live_sections() {
             labels,
             [
                 "Performance",
+                "Appearance",
                 "Storage",
                 "Input map",
                 "Diagnostics",
@@ -760,7 +765,7 @@ fn a_mouse_click_on_a_rail_entry_selects_it_without_a_focus_ring() {
 
     nav_rail_entries(&app)[1].mock_single_click(slint::platform::PointerEventButton::Left);
 
-    assert_eq!(*selected.borrow(), ["storage"]);
+    assert_eq!(*selected.borrow(), ["appearance"]);
     assert!(
         ElementQuery::from_root(&app)
             .match_id("FFNavRailEntry::ring")
@@ -814,7 +819,7 @@ fn return_and_space_activate_the_focused_rail_entry() {
     press(Key::Tab.into());
     tab_to_ring();
     press(" ".into());
-    assert_eq!(*selected.borrow(), ["performance", "storage"]);
+    assert_eq!(*selected.borrow(), ["performance", "appearance"]);
 }
 
 /// Exactly the selected section's tab component is instantiated, and each
@@ -844,6 +849,7 @@ fn settings_tabs_render_from_their_own_files() {
     let tabs = common::ui_dir().join("shell").join("settings_modal");
     for (file, component) in [
         ("performance_tab.slint", "FFPerformanceTab"),
+        ("appearance_tab.slint", "FFAppearanceTab"),
         ("storage_tab.slint", "FFStorageTab"),
         ("input_map_tab.slint", "FFInputMapTab"),
         ("diagnostics_panel.slint", "FFDiagnosticsPanel"),
@@ -2557,4 +2563,180 @@ fn about_tab_composes_only_shared_components() {
     for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFRowText {"] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
+}
+
+#[test]
+fn appearance_menu_keyboard_selects_and_escape_keeps_the_session_choice() {
+    use slint::platform::{Key, WindowEvent};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let app = app_at(1440, 900);
+    app.set_settings_open(true);
+    app.set_settings_section("appearance".into());
+    app.set_appearance_presentation("image-list".into());
+    let choices = Rc::new(RefCell::new(Vec::<String>::new()));
+    app.on_appearance_menu_toggled({
+        let weak = app.as_weak();
+        move || {
+            let app = weak.upgrade().unwrap();
+            app.set_appearance_menu_open(!app.get_appearance_menu_open());
+        }
+    });
+    app.on_appearance_presentation_selected({
+        let weak = app.as_weak();
+        let choices = choices.clone();
+        move |choice| {
+            choices.borrow_mut().push(choice.to_string());
+            let app = weak.upgrade().unwrap();
+            app.set_appearance_presentation(choice);
+            app.set_appearance_menu_open(false);
+        }
+    });
+    let press = |key: slint::SharedString| {
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::ZERO);
+    };
+    for _ in 0..40 {
+        press(Key::Tab.into());
+        press(Key::Return.into());
+        if app.get_appearance_menu_open() {
+            break;
+        }
+    }
+    assert!(
+        app.get_appearance_menu_open(),
+        "Tab and Enter must open Presentation"
+    );
+    press(Key::DownArrow.into());
+    assert_eq!(
+        app.get_appearance_presentation(),
+        "image-list",
+        "arrow navigation does not commit a choice"
+    );
+    press(Key::Return.into());
+    assert!(!app.get_appearance_menu_open());
+    assert_eq!(app.get_appearance_presentation(), "large");
+    assert_eq!(*choices.borrow(), ["large"]);
+
+    press(Key::Return.into());
+    press(Key::UpArrow.into());
+    press(Key::Escape.into());
+    assert!(!app.get_appearance_menu_open());
+    assert_eq!(
+        app.get_appearance_presentation(),
+        "large",
+        "Escape discards the pending choice"
+    );
+    assert_eq!(*choices.borrow(), ["large"]);
+
+    press(Key::Return.into());
+    press(Key::UpArrow.into());
+    press(Key::UpArrow.into());
+    press(Key::Return.into());
+    assert_eq!(app.get_appearance_presentation(), "list");
+    press(Key::Return.into());
+    press(Key::DownArrow.into());
+    press(Key::Return.into());
+    assert_eq!(*choices.borrow(), ["large", "list", "image-list"]);
+
+    app.set_appearance_menu_disabled(true);
+    press(Key::Return.into());
+    press(Key::DownArrow.into());
+    press(Key::Return.into());
+    assert!(
+        !app.get_appearance_menu_open(),
+        "disabled Presentation cannot open from the keyboard"
+    );
+    assert_eq!(*choices.borrow(), ["large", "list", "image-list"]);
+}
+
+#[test]
+fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
+    use focusforge_gui::appearance_settings::SourcePresentation;
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir
+        .path()
+        .join(format!("appearance-config-{}", "x".repeat(128)));
+    fs::create_dir_all(&config_dir).unwrap();
+    let settings = config_dir.join("settings.toml");
+    let original = "[appearance";
+    fs::write(&settings, original).unwrap();
+    let controller = Arc::new(Mutex::new(AppController::new()));
+    controller
+        .lock()
+        .unwrap()
+        .install_recent(Vec::new(), config_dir);
+
+    let app = app_at(1200, 760);
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_settings_open(true);
+    app.set_settings_section("appearance".into());
+    app.invoke_appearance_presentation_selected("large".into());
+
+    assert_eq!(
+        controller.lock().unwrap().source_presentation(),
+        SourcePresentation::Large,
+        "a failed settings write does not discard the session presentation"
+    );
+    assert_eq!(app.get_appearance_presentation(), "large");
+    assert!(
+        app.get_appearance_save_error().contains("not valid TOML"),
+        "the Appearance tab exposes the persistence failure"
+    );
+    assert!(
+        app.get_appearance_save_error().contains('\n'),
+        "the native TOML diagnostic retains its detail lines"
+    );
+    assert_eq!(fs::read_to_string(&settings).unwrap(), original);
+
+    let error = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_type_name("FFErrorRow")
+        .find_first()
+        .expect("the Appearance save failure is visible");
+    let legend = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_accessible_role(AccessibleRole::Text)
+        .match_predicate(|element| {
+            element
+                .accessible_label()
+                .is_some_and(|label| label == "Editor source legend stays compact and read-only.")
+        })
+        .find_first()
+        .expect("the legend precedes the save failure");
+    let session_note = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_accessible_role(AccessibleRole::Text)
+        .match_predicate(|element| {
+            element
+                .accessible_label()
+                .is_some_and(|label| label == "The selected view is active for this session.")
+        })
+        .find_first()
+        .expect("the session note follows the save failure");
+    let error_pos = error.absolute_position();
+    let error_size = error.size();
+    assert!(
+        error_size.height > 16.0,
+        "the long native path error reserves its wrapped text height"
+    );
+    assert!(
+        legend.absolute_position().y + legend.size().height <= error_pos.y,
+        "the failure begins after the preceding legend"
+    );
+    assert!(
+        error_pos.y + error_size.height <= session_note.absolute_position().y,
+        "the wrapped failure ends before the session note"
+    );
 }

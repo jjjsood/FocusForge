@@ -83,6 +83,9 @@ pub struct Installed {
     /// toast opens and dropped -- deactivating it -- the moment a new
     /// failure replaces it.
     pub toast_timer: Rc<RefCell<Option<slint::Timer>>>,
+    /// Polls completed source previews; worker admission and source reads stay
+    /// off the event loop.
+    pub preview_timer: slint::Timer,
 }
 
 /// The single open renderer, and which tab's planes it holds -- `None`
@@ -1828,6 +1831,48 @@ fn sync_rows<T: Clone + PartialEq + 'static>(
     updates
 }
 
+fn sync_image_rows(
+    existing: slint::ModelRc<GeneratedImageRow>,
+    rows: Vec<GeneratedImageRow>,
+    install: impl FnOnce(slint::ModelRc<GeneratedImageRow>),
+) -> usize {
+    let Some(model) = existing
+        .as_any()
+        .downcast_ref::<slint::VecModel<GeneratedImageRow>>()
+    else {
+        let count = rows.len();
+        install(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+        return count;
+    };
+    let mut updates = 0;
+    while model.row_count() > rows.len() {
+        model.remove(model.row_count() - 1);
+        updates += 1;
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if index >= model.row_count() {
+            model.push(row);
+            updates += 1;
+        } else if let Some(previous) = model.row_data(index)
+            && (previous.chip != row.chip
+                || previous.name != row.name
+                || previous.time_text != row.time_text
+                || previous.capture_stamp != row.capture_stamp
+                || previous.excluded != row.excluded
+                || previous.unresolved != row.unresolved
+                || previous.selected != row.selected
+                || previous.hovered != row.hovered
+                || previous.focused != row.focused
+                || previous.job_disabled != row.job_disabled
+                || previous.preview_state != row.preview_state)
+        {
+            model.set_row_data(index, row);
+            updates += 1;
+        }
+    }
+    updates
+}
+
 /// `live` when it already lists exactly `strings`, a fresh model otherwise:
 /// `ModelRc` equality is model identity, so only a kept model lets its row
 /// compare equal.
@@ -1919,23 +1964,53 @@ pub fn push_settings_scroll(app: &AppWindow, panel: &PanelModel) {
 /// twin.
 pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     let _scope = measurement_scope("gui_image_rows");
+    prune_source_preview_images();
     app.set_editor_enabled(controller.editor_enabled());
     let panel = controller.images_panel();
+    let mut native_previews = std::collections::HashSet::new();
+    let mut native_preview_bytes = 0_u64;
     let rows: Vec<GeneratedImageRow> = panel
         .rows
         .iter()
-        .map(|row| GeneratedImageRow {
-            chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-            name: row.name.clone().into(),
-            time_text: row.trailing_text.clone().into(),
-            excluded: row.excluded,
-            unresolved: row.unresolved,
-            selected: row.selected,
+        .enumerate()
+        .map(|(index, row)| {
+            let visible = controller.source_preview_row_visible(index);
+            let preview = visible
+                .then(|| controller.source_preview(&row.path))
+                .flatten();
+            if let Some(pixels) = preview
+                && native_previews.insert(Arc::as_ptr(pixels))
+            {
+                native_preview_bytes =
+                    native_preview_bytes.saturating_add(pixels.rgba.len() as u64);
+            }
+            GeneratedImageRow {
+                chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
+                name: row.name.clone().into(),
+                time_text: row.trailing_text.clone().into(),
+                capture_stamp: row.capture_stamp.clone().into(),
+                excluded: row.excluded,
+                unresolved: row.unresolved,
+                selected: row.selected,
+                hovered: false,
+                focused: false,
+                job_disabled: false,
+                preview: source_preview_image(preview),
+                preview_state: if visible {
+                    controller.source_preview_state(&row.path, row.unresolved)
+                } else if row.unresolved {
+                    "missing"
+                } else {
+                    "loading"
+                }
+                .into(),
+            }
         })
         .collect();
-    let updates = sync_rows(app.get_images_rows(), rows, |model| {
+    let updates = sync_image_rows(app.get_images_rows(), rows, |model| {
         app.set_images_rows(model)
     });
+    controller.set_published_preview_bytes(native_preview_bytes);
     record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_images_header_text(panel.header_text.into());
     app.set_images_list_viewport_y(-controller.images_scroll_y());
@@ -1948,8 +2023,10 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     app.set_images_sort_menu_open(controller.images_sort_menu_open());
     app.set_images_dragging_row(controller.dragging_row().map_or(-1, |i| i as i32));
     app.set_images_drag_offset(controller.drag_offset());
+    app.set_images_drag_capture_active(controller.drag_capture_active());
     app.set_images_drag_target_row(controller.drag_target_row().map_or(-1, |i| i as i32));
     app.set_images_enabled(!controller.job_running());
+    app.set_images_presentation(controller.source_presentation().slug().into());
 
     match controller.pending_frame_change() {
         Some(copy) => {
@@ -1963,6 +2040,55 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         }
         None => app.set_frame_warning_open(false),
     }
+}
+
+type PreviewImageCache = Vec<(
+    std::sync::Weak<crate::source_previews::PreviewPixels>,
+    slint::Image,
+)>;
+
+thread_local! {
+    static SOURCE_PREVIEW_IMAGES: RefCell<PreviewImageCache> = const { RefCell::new(Vec::new()) };
+    static EMPTY_SOURCE_PREVIEW_IMAGE: slint::Image = slint::Image::default();
+}
+
+fn source_preview_image(
+    preview: Option<&Arc<crate::source_previews::PreviewPixels>>,
+) -> slint::Image {
+    let cached = SOURCE_PREVIEW_IMAGES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|(weak, _)| weak.strong_count() > 0);
+        preview.and_then(|preview| {
+            cache
+                .iter()
+                .find(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(preview)))
+                .map(|(_, image)| image.clone())
+        })
+    });
+    if let Some(image) = cached {
+        return image;
+    }
+    let Some(preview) = preview else {
+        return EMPTY_SOURCE_PREVIEW_IMAGE.with(Clone::clone);
+    };
+    let mut buffer =
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(preview.width, preview.height);
+    buffer.make_mut_bytes().copy_from_slice(&preview.rgba);
+    let image = slint::Image::from_rgba8(buffer);
+    SOURCE_PREVIEW_IMAGES.with(|cache| {
+        cache
+            .borrow_mut()
+            .push((Arc::downgrade(preview), image.clone()))
+    });
+    image
+}
+
+fn prune_source_preview_images() {
+    SOURCE_PREVIEW_IMAGES.with(|cache| {
+        cache
+            .borrow_mut()
+            .retain(|(weak, _)| weak.strong_count() > 0);
+    });
 }
 
 /// Pushes the `Checkpoints` panel's whole state -- [`push_images_panel`]'s
@@ -2393,6 +2519,28 @@ pub fn install(
 ) -> Installed {
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+    let preview_timer = slint::Timer::default();
+    {
+        let app_weak = app.as_weak();
+        let controller = controller.clone();
+        preview_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(30),
+            move || {
+                let mut controller_guard = controller.lock().unwrap();
+                let previews_changed = controller_guard.poll_source_previews();
+                let drag_scrolled = controller_guard.advance_frame_drag_autoscroll();
+                let changed = previews_changed || drag_scrolled;
+                if previews_changed {
+                    let _ = controller_guard.source_preview_snapshot();
+                }
+                drop(controller_guard);
+                if changed && let Some(app) = app_weak.upgrade() {
+                    push_images_panel(&app, &controller.lock().unwrap());
+                }
+            },
+        );
+    }
 
     {
         let app_weak = app.as_weak();
@@ -3003,6 +3151,38 @@ pub fn install(
                 push_performance_view(&app, &controller);
                 push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
+            }
+        }
+    });
+    app.on_appearance_presentation_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        let canvas = canvas.clone();
+        move |choice| {
+            let Some(presentation) =
+                crate::appearance_settings::SourcePresentation::from_slug(choice.as_str())
+            else {
+                return;
+            };
+            let save_error = {
+                let mut state = controller.lock().unwrap();
+                state.set_source_presentation(presentation);
+                state.appearance_save_error().map(str::to_owned)
+            };
+            if let Some(app) = app_weak.upgrade() {
+                app.set_appearance_presentation(presentation.slug().into());
+                app.set_appearance_menu_open(false);
+                app.set_appearance_save_error(save_error.unwrap_or_default().into());
+                push_images_panel(&app, &controller.lock().unwrap());
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_appearance_menu_toggled({
+        let app_weak = app.as_weak();
+        move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_appearance_menu_open(!app.get_appearance_menu_open());
             }
         }
     });
@@ -3760,6 +3940,17 @@ pub fn install(
             });
         }
     });
+    app.on_images_frame_keyboard_moved({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |delta| {
+            record_images_input();
+            dispatch(&controller, &canvas, &app_weak, |controller| {
+                controller.select_adjacent_resolved_frame(delta);
+            });
+        }
+    });
     app.on_images_frame_remove_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -4088,8 +4279,9 @@ pub fn install(
         .unwrap()
         .set_gallery_width(app.get_gallery_width());
 
-    app.on_images_frame_grip_pointer({
+    app.on_images_frame_drag_pointer({
         let controller = controller.clone();
+        let app_weak = app.as_weak();
         move |i, kind, y| {
             record_images_input();
             let kind = match kind {
@@ -4097,10 +4289,13 @@ pub fn install(
                 2 => PointerKind::Move,
                 _ => PointerKind::Up,
             };
-            controller
-                .lock()
-                .unwrap()
-                .frame_drag_pointer(i as usize, kind, y);
+            {
+                let mut controller = controller.lock().unwrap();
+                controller.frame_drag_pointer(i as usize, kind, y);
+            }
+            if let Some(app) = app_weak.upgrade() {
+                push_images_panel(&app, &controller.lock().unwrap());
+            }
         }
     });
 
@@ -4108,6 +4303,7 @@ pub fn install(
         controller,
         job_timer,
         toast_timer,
+        preview_timer,
     }
 }
 
@@ -4338,9 +4534,13 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             push_projects_overlay(app, &controller);
             push_divergence(app, &controller);
         }
-        ShellEvent::ImagesChanged => push_images_panel(app, &controller.lock().unwrap()),
+        ShellEvent::ImagesChanged => {
+            let controller = controller.lock().unwrap();
+            push_images_panel(app, &controller);
+        }
         ShellEvent::ImagesScrolled => {
-            app.set_images_list_viewport_y(-controller.lock().unwrap().images_scroll_y());
+            let controller = controller.lock().unwrap();
+            push_images_panel(app, &controller);
         }
         ShellEvent::CheckpointsChanged => {
             let mut controller = controller.lock().unwrap();
@@ -4455,6 +4655,32 @@ mod tests {
         InputSurface, finish_input_batches, record_coalesced_input, record_destroyed_window,
         record_input, take_published_input,
     };
+
+    #[test]
+    fn source_preview_cache_releases_expired_images_on_an_empty_publication() {
+        use std::sync::Arc;
+
+        let pixels = Arc::new(crate::source_previews::PreviewPixels {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        });
+        let first = super::source_preview_image(Some(&pixels));
+        let second = super::source_preview_image(Some(&pixels));
+        assert_eq!(
+            first, second,
+            "unchanged pixels reuse one Slint image handle"
+        );
+        assert_eq!(
+            super::SOURCE_PREVIEW_IMAGES.with(|cache| cache.borrow().len()),
+            1
+        );
+        drop(pixels);
+
+        let _ = super::source_preview_image(None);
+
+        assert!(super::SOURCE_PREVIEW_IMAGES.with(|cache| cache.borrow().is_empty()));
+    }
 
     #[test]
     fn controller_events_publish_matching_batches_and_finish_flushes_pending_input() {
