@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // stores on a project tab and passes to a mutator -- `ParamDesc`'s own
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
+use focusforge_core::equalize::EqualizeSettings;
 use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, resolve_in};
 pub(crate) use focusforge_core::params::{
     ParamValue, ParamValues, ParamViolation, StackContext, validate,
@@ -73,7 +74,7 @@ pub(crate) fn seed_algorithm_state(
             }
             let equalization = manifest.registration.equalization.as_ref();
             let equalized_by_default =
-                equalization_bound(&manifest.algorithm, &ParamValues::new()).is_some();
+                equalization_settings(&manifest.algorithm, &ParamValues::new()).is_some();
             if equalization.is_some() != equalized_by_default {
                 project_values.insert(
                     "equalize".to_string(),
@@ -84,6 +85,10 @@ pub(crate) fn seed_algorithm_state(
                 project_values.insert(
                     "equalize-max-gain".to_string(),
                     ParamValue::Float(equalization.max_gain),
+                );
+                project_values.insert(
+                    "equalize-target".to_string(),
+                    ParamValue::Float(equalization.target_stops),
                 );
             }
             (
@@ -121,10 +126,13 @@ fn project_schema(group: &[ParamDesc], fuse_id: &str) -> Vec<ParamDesc> {
     )
 }
 
-/// The gain bound a run fused by `fuse_id` equalizes with, `None` while the
+/// The settings a run fused by `fuse_id` equalizes with, `None` while the
 /// `equalize` switch is off.
-pub(crate) fn equalization_bound(fuse_id: &str, project_values: &ParamValues) -> Option<f64> {
-    focusforge_core::project::equalization_bound(
+pub(crate) fn equalization_settings(
+    fuse_id: &str,
+    project_values: &ParamValues,
+) -> Option<EqualizeSettings> {
+    focusforge_core::project::equalization_settings(
         &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
         project_values,
     )

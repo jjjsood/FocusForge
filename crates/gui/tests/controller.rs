@@ -5739,9 +5739,9 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     controller
 }
 
-/// The prepare section lists the equalization switch (on) and its bound; a
-/// default run is equalized, switching it off records an unequalized run, and
-/// the bound the panel holds reaches the run.
+/// The prepare section lists the equalization switch (on), its bound and its
+/// target; a default run is equalized, switching it off records an unequalized
+/// run, and the bound and target the panel holds reach the run.
 #[test]
 fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
@@ -5768,10 +5768,17 @@ fn equalize_rows_reach_the_run() {
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let default_run = controller.held_checkpoints().last().cloned().unwrap();
+    let default_equalization = default_run
+        .registration
+        .equalization
+        .expect("a default run is equalized");
     assert_eq!(
-        default_run.registration.equalization.map(|e| e.max_gain),
-        Some(1.25),
-        "a default run is equalized with the default bound"
+        (
+            default_equalization.max_gain,
+            default_equalization.target_stops
+        ),
+        (1.25, 0.0),
+        "a default run uses the default bound and the neutral target"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
@@ -5785,11 +5792,13 @@ fn equalize_rows_reach_the_run() {
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.3));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let on = controller.held_checkpoints().last().cloned().unwrap();
     let recorded = on.registration.equalization.expect("the run was equalized");
     assert_eq!(recorded.max_gain, 1.5);
+    assert_eq!(recorded.target_stops, 0.3, "the target reaches the run");
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 

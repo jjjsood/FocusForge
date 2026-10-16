@@ -168,6 +168,7 @@ struct KeyMirror<'a> {
     params: std::collections::BTreeMap<String, KeyParamValue>,
     failure_policy: crate::align::FailurePolicy,
     solver_version: u32,
+    gains: &'a [u32],
 }
 
 /// A stage's cache key: the path-free projection of a [`StackFingerprint`]
@@ -177,11 +178,12 @@ struct KeyMirror<'a> {
 /// **In the key:** every [`FrameFingerprint`] field except `path` (via
 /// [`FrameKey`]), [`AlignIdentity::algorithm`], `AlignIdentity::params`
 /// (`AlignAlgorithm::params()`'s resolved values, nothing else), and the
-/// named driver fields, `AlignIdentity::failure_policy` and
-/// `AlignIdentity::solver_version`
+/// named driver fields, `AlignIdentity::failure_policy`,
+/// `AlignIdentity::solver_version` and `AlignIdentity::gains`
 /// ([`DRIVER_POLICY_FIELDS`](super::record::DRIVER_POLICY_FIELDS)). An entry
 /// stores only the key's digest, so the solver revision lets an alignment
-/// computed by another revision miss.
+/// computed by another revision miss, and other brightness gains let an
+/// alignment of differently prepared sources miss.
 ///
 /// **Deliberately not in the key**, by name: `path` and `mtime` (a moved, renamed or touched
 /// input frame still hits); tile geometry (`tile_size`, `levels` -- the align stage reads
@@ -229,6 +231,7 @@ impl StageKey {
             params,
             failure_policy: self.align.failure_policy,
             solver_version: self.align.solver_version,
+            gains: &self.align.gains,
         };
         serde_json::to_vec(&mirror).expect("KeyMirror serialization cannot fail")
     }

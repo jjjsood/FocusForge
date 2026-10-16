@@ -22,7 +22,7 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
-use crate::equalize::{self, EqualizationReport, GainReader};
+use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
@@ -70,9 +70,9 @@ pub struct FuseRequest {
     pub explicit: ParamValues,
     pub align: Option<AlignRequest>,
     pub crop: bool,
-    /// The bound of the brightness equalization (gains stay within
-    /// `1/bound..=bound`); `None` leaves the frames as delivered.
-    pub equalize: Option<f64>,
+    /// The brightness equalization to run before alignment; `None` leaves the
+    /// frames as delivered.
+    pub equalize: Option<EqualizeSettings>,
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
@@ -194,7 +194,14 @@ pub fn working_space(kind: ReaderKind) -> &'static str {
 /// [`StageObserver::tick`] afterwards, on [`JobProgress`]'s `align_done`/
 /// `align_total`.
 pub enum RunStage {
-    Align { frames: usize, source: AlignSource },
+    /// Brightness preparation of `frames` sources, before alignment.
+    Prepare {
+        frames: usize,
+    },
+    Align {
+        frames: usize,
+        source: AlignSource,
+    },
     Fuse,
     Seal,
     Finished,
@@ -328,6 +335,45 @@ pub fn run(
         options.tile_size = options.tile_size.min(backend.max_tile_size(spp));
     }
 
+    let equalization = match request.equalize {
+        Some(settings) => {
+            control.set_stage(JobStage::Prepare);
+            observer.stage(RunStage::Prepare {
+                frames: frame_reader.len(),
+            });
+            let estimated = {
+                let _prepare = equalize_scope();
+                equalize::estimate(
+                    frame_reader,
+                    frame_reader.len(),
+                    (width, height),
+                    spp,
+                    settings,
+                    &|| control.state() == ControlState::CancelRequested,
+                )
+            };
+            let report = match estimated {
+                Err(AlgorithmError::Cancelled) => {
+                    return Ok(FuseOutcome::Cancelled {
+                        units_done: 0,
+                        unit_total: 0,
+                    });
+                }
+                other => other?,
+            };
+            for notice in report.notices() {
+                observer.notice(&notice);
+            }
+            Some(report)
+        }
+        None => None,
+    };
+    let recorded = equalization.as_ref().map(EqualizationReport::recorded);
+    let prepared_gains: &[u32] = recorded.as_ref().map_or(&[], |e| e.gains.as_slice());
+    // Every reader of a frame beneath this point -- alignment, host fuse,
+    // device upload and the device-loss fallback -- sees the gained samples.
+    let gain_reader = GainReader::new(frame_reader, prepared_gains);
+
     timer.mark(Stage::Setup);
 
     let mut alignment_result: Option<(
@@ -363,7 +409,12 @@ pub fn run(
         } else {
             FailurePolicy::Strict
         };
-        let identity = AlignIdentity::new(align_req.algorithm.id(), align_values.clone(), policy);
+        let identity = AlignIdentity::new(
+            align_req.algorithm.id(),
+            align_values.clone(),
+            policy,
+            prepared_gains.to_vec(),
+        );
 
         let peeked = if request.resume {
             peek_resumable_alignment(
@@ -440,7 +491,7 @@ pub fn run(
                     let result = align_stack_with(
                         align_req.algorithm,
                         stack_ctx,
-                        frame_reader,
+                        &gain_reader,
                         &align_values,
                         policy,
                         &AlignDriverOptions {
@@ -535,48 +586,11 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
-    let equalization = match request.equalize {
-        Some(max_gain) => {
-            let reference = alignment_result
-                .as_ref()
-                .map_or((frame_reader.len() - 1) / 2, |(_, _, _, a)| a.reference);
-            let warped = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
-            let frames = {
-                let _equalize = equalize_scope();
-                equalize::estimate(
-                    &warped,
-                    frame_reader.len(),
-                    (width, height),
-                    spp,
-                    reference,
-                    max_gain,
-                )?
-            };
-            for (index, estimate) in frames.iter().enumerate() {
-                if let Some(message) = estimate.notice(index, max_gain) {
-                    observer.notice(&message);
-                }
-            }
-            Some(EqualizationReport {
-                max_gain,
-                reference,
-                frames,
-            })
-        }
-        None => None,
-    };
-    let recorded = equalization.as_ref().map(EqualizationReport::recorded);
     let registration = Registration {
         transforms: transforms.clone(),
         crop: applied_crop,
         equalization: recorded.clone(),
     };
-    // Every reader of a frame beneath this point -- host fuse, device
-    // upload and the device-loss fallback -- sees the gained samples.
-    let gain_reader = GainReader::new(
-        frame_reader,
-        recorded.as_ref().map_or(&[], |e| e.gains.as_slice()),
-    );
     let warping_reader = WarpingReader::new(&gain_reader, (width, height), spp, transforms.clone());
 
     // The scheduler's own per-tile rect: the largest read rect it plans.
@@ -642,6 +656,7 @@ pub fn run(
                     align_algo.id(),
                     params::resolved_values(align_resolved),
                     *policy,
+                    prepared_gains.to_vec(),
                 )
             }),
         crop: applied_crop,

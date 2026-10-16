@@ -312,6 +312,7 @@ fn gained_pair(name: &str) -> (PathBuf, PathBuf, String, Vec<PathBuf>) {
     let registration = Registration {
         equalization: Some(Equalization {
             max_gain: 2.0,
+            target_stops: 0.0,
             gains: vec![65_536, 81_920],
         }),
         ..Registration::default()

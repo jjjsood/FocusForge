@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
-use focusforge_core::equalize::GainReader;
+use focusforge_core::equalize::{EqualizeSettings, GainReader};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
@@ -141,8 +141,8 @@ pub struct JobRequest {
     pub align_values: ParamValues,
     pub align_lax: bool,
     pub crop: bool,
-    /// The gain bound brightness equalization runs with, `None` when off.
-    pub equalize: Option<f64>,
+    /// What brightness equalization runs with, `None` when off.
+    pub equalize: Option<EqualizeSettings>,
     /// Whether this run may use the headless GPU backend at all -- resolved
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
@@ -601,8 +601,9 @@ impl Phase {
 
 /// Which [`Phase`] `progress` is on: `Aligning` while the engine reports that
 /// stage, `Writing` once every unit of the fuse stage is done (the seal, which
-/// the engine reports as no stage of its own -- `JobStage` has only
-/// `Align`/`Fuse`), `Fusing` otherwise -- including no progress at all yet.
+/// the engine reports as no stage of its own -- `JobStage` has no seal
+/// stage), `Fusing` otherwise -- including no progress at all yet and the
+/// brightness preparation before alignment.
 pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     match progress {
         Some(p) if p.stage == JobStage::Align => Phase::Aligning,

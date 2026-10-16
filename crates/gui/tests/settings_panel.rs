@@ -585,6 +585,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         &ParamValues::new(),
         registration(Some(Equalization {
             max_gain: 1.5,
+            target_stops: 0.3,
             gains: vec![65536, 66000],
         })),
     );
@@ -595,6 +596,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     controller.toggle_section_more("prepare");
     assert_eq!(row(&controller, "equalize").selected, "true");
     assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
+    assert_eq!(row(&controller, "equalize-target").value_text, "0.3");
 
     let mut plain = AppController::new();
     let project = seal_with_registration(
@@ -610,6 +612,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     plain.toggle_section_more("prepare");
     assert_eq!(row(&plain, "equalize").selected, "false");
     assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
+    assert_eq!(row(&plain, "equalize-target").value_text, "0");
 }
 
 fn equalize_selected(controller: &AppController) -> String {
@@ -676,6 +679,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         &ParamValues::new(),
         registration(Some(Equalization {
             max_gain: 1.5,
+            target_stops: 0.0,
             gains: vec![65536, 66000],
         })),
     );
@@ -1717,7 +1721,7 @@ fn more_reveals_that_sections_advanced_rows() {
     let rows = controller.settings_panel().rows;
     assert_eq!(
         field_ids(&rows, "prepare"),
-        ["equalize", "equalize-max-gain"]
+        ["equalize", "equalize-max-gain", "equalize-target"]
     );
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
@@ -1731,6 +1735,38 @@ fn more_reveals_that_sections_advanced_rows() {
         rows[row_index(&rows, "prepare", "equalize")].selected,
         "true",
         "Details equalizes by default"
+    );
+}
+
+#[test]
+fn the_target_row_follows_max_gain_under_more() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    let rows = controller.settings_panel().rows;
+    let target = &rows[row_index(&rows, "prepare", "equalize-target")];
+    assert_eq!(
+        row_index(&rows, "prepare", "equalize-target"),
+        row_index(&rows, "prepare", "equalize-max-gain") + 1,
+        "the target row follows Max brightness gain"
+    );
+    assert_eq!(target.label, "Target brightness (stops)");
+    assert_eq!(target.value_text, "0", "the default is the neutral target");
+    assert!(
+        row_index(&rows, "prepare", "equalize-target")
+            > rows
+                .iter()
+                .position(|r| r.kind == RowKind::More && r.section == "prepare")
+                .unwrap(),
+        "the target is advanced, so it sits under More"
+    );
+
+    controller.toggle_section_more("prepare");
+    let rows = controller.settings_panel().rows;
+    assert!(
+        rows.iter()
+            .all(|r| !(r.section == "prepare" && r.id == "equalize-target")),
+        "More closed hides the target row"
     );
 }
 
@@ -2015,7 +2051,7 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
         let rows = controller.settings_panel().rows;
         assert_eq!(
             field_ids(&rows, "prepare"),
-            ["equalize", "equalize-max-gain"],
+            ["equalize", "equalize-max-gain", "equalize-target"],
             "{method}"
         );
         assert_eq!(
@@ -2151,7 +2187,10 @@ impl MountedPanel {
 
         init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
-        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        // Tall enough that every strip stays inside the panel's viewport with
+        // the Prepare and Fuse sections open: a strip below the viewport's edge
+        // is not mounted.
+        app.window().set_size(slint::PhysicalSize::new(1440, 1200));
         let mut controller = AppController::new();
         open_mantis_512(&mut controller);
         let controller = Arc::new(Mutex::new(controller));
