@@ -1,0 +1,58 @@
+# Fuse again, restore and delete checkpoints
+Start: --open fixtures/mantis-64/frames --fuse-tabs 0
+## Fuse again over a stroke
+1. Click **Keep** (`AppWindow::divergence-warning`).
+   Expect: the dialog "Keep this fused result?" is gone; the bottom bar reads "fused" followed by a time; the CHECKPOINTS list shows 1 row; the toolbar row shows "Size" and "Soft" (within 60 s).
+2. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
+   Expect: (within 60 s) `buttons AppWindow::editor-toolbar` lists the undo arrow and **Save checkpoint** with enabled true.
+3. Click **STACKING** (`FFModeSwitch::stacking-half`).
+   Expect: the toolbar row shows the **Fuse stack** button at its left and no longer shows "Size" or "Soft".
+4. Click **Fuse stack** (`FFToolbar::fuse-button`).
+   Expect: a dialog titled "Save your edits first?" appears with the line "Fusing frames" and the text "1 unsaved brush stroke will be lost."; its buttons read "Cancel", "Save and fuse" and "Fuse anyway".
+5. Click **Cancel** (`AppWindow::close-guard`).
+   Expect: Must not: the stack is fused again; the dialog is gone, the bottom bar still reads "fused" followed by a time, no "Keep this fused result?" dialog is shown and the CHECKPOINTS list still shows 1 row.
+6. Click **EDITOR** (`FFModeSwitch::editor-half`).
+   Expect: the toolbar row shows "Size", "Soft" and **Save checkpoint**; `buttons AppWindow::editor-toolbar` lists the undo arrow and **Save checkpoint** with enabled true (the stroke is still there).
+7. Click **STACKING** (`FFModeSwitch::stacking-half`).
+   Expect: the toolbar row shows the **Fuse stack** button and no longer shows "Size" or "Soft".
+8. Click **Fuse stack** (`FFToolbar::fuse-button`).
+   Expect: the dialog titled "Save your edits first?" appears again with the buttons "Cancel", "Save and fuse" and "Fuse anyway".
+9. Click **Fuse anyway** (`AppWindow::close-guard`).
+   Expect: the dialog "Save your edits first?" is gone and a new dialog "Keep this fused result?" is shown (within 60 s).
+10. Click **Keep** (`AppWindow::divergence-warning`).
+    Expect: the dialog is gone; the CHECKPOINTS list shows 2 rows, each with an algorithm name above a HH:MM:SS time (within 60 s).
+11. Click **EDITOR** (`FFModeSwitch::editor-half`).
+    Expect: the toolbar row shows "Size", "Soft" and **Save checkpoint**; `buttons AppWindow::editor-toolbar` lists the undo arrow and **Save checkpoint** with enabled false (the dropped stroke is gone).
+## Select a checkpoint
+12. Click the second row of the CHECKPOINTS list (`FFCheckpointRow::area` 1).
+    Expect: the second row has a raised background and a vertical accent bar at its left edge; the first row has neither; the right pane (`FFCanvas::pane-right`) shows a filled composite; no dialog is shown.
+13. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+    Expect: the accent bar and raised background are on the first row and gone from the second; the list still shows 2 rows.
+## Restore over a stroke
+14. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
+    Expect: (within 60 s) `buttons AppWindow::editor-toolbar` lists the undo arrow with enabled true; the first row of the CHECKPOINTS list still has the raised background and the accent bar.
+15. Click the second row of the CHECKPOINTS list (`FFCheckpointRow::area` 1).
+    Expect: a dialog titled "Save this state first?" appears with a line starting "Restoring" and ending in a HH:MM:SS time, and the text "1 brush stroke has happened since the last checkpoint."; its buttons read "Cancel", "Save first, then restore" and "Discard and restore".
+16. Click **Cancel** (`AppWindow::close-guard`).
+    Expect: Must not: the second row becomes the selected one; the dialog is gone, the first row of the CHECKPOINTS list still has the raised background and the accent bar, the second row has neither, and `buttons AppWindow::editor-toolbar` still lists the undo arrow with enabled true.
+17. Click the second row of the CHECKPOINTS list (`FFCheckpointRow::area` 1).
+    Expect: the dialog titled "Save this state first?" appears again with the buttons "Cancel", "Save first, then restore" and "Discard and restore".
+18. Click **Discard and restore** (`AppWindow::close-guard`).
+    Expect: the dialog is gone; the second row of the CHECKPOINTS list has the raised background and the accent bar and the first row has neither; the list still shows 2 rows; `buttons AppWindow::editor-toolbar` lists the undo arrow with enabled false.
+19. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+    Expect: Must not: a "Save this state first?" dialog appears; no dialog is shown, the first row has the raised background and the accent bar and the second row has neither.
+## Delete a checkpoint
+20. Drag from the second row of the CHECKPOINTS list to window point 1177,148, so the pointer ends over the right edge of the first row (`FFCheckpointRow::area` 1).
+    Expect: a red trash icon shows at the right edge of the first row; the second row shows none; the list still shows 2 rows and no dialog is shown.
+21. (human only) Click the red trash icon at the right edge of the first row of the CHECKPOINTS list.
+    Expect: a dialog titled "Delete this checkpoint?" opens with the first row's "algorithm · HH:MM:SS" as its context line and the line "The other checkpoint is untouched, and the stack is not fused again."; its buttons read **Cancel** and **Delete**.
+22. (human only) Click **Cancel** (`AppWindow::checkpoint-delete`).
+    Expect: Must not: a row disappears; the dialog is gone and the CHECKPOINTS list still shows 2 rows.
+23. (human only) Move the pointer over the first row again and click the red trash icon at its right edge.
+    Expect: the "Delete this checkpoint?" dialog opens again.
+24. (human only) Click **Delete** (`AppWindow::checkpoint-delete`).
+    Expect: the dialog is gone; the CHECKPOINTS list shows 1 row and no "None yet — fuse a stack" line.
+25. (human only) Move the pointer over the remaining row.
+    Expect: Must not: a red trash icon appears on it.
+26. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+    Expect: no dialog is shown; the first row has the raised background and the accent bar.
