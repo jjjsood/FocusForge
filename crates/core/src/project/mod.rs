@@ -285,8 +285,8 @@ pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
 });
 
 /// The project parameters that change the frames before alignment and
-/// fusing: the brightness-equalization parameters. The settings panel's prepare section
-/// renders exactly this schema.
+/// fusing: the brightness-equalization parameters. The settings panel's
+/// prepare section renders exactly this schema.
 pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
         ParamDesc {
