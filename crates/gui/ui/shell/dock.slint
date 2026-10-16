@@ -50,6 +50,7 @@ export component FFDock inherits Rectangle {
     in property <length> settings-content-height: 0px;
     in property <bool> settings-enabled: true;
     callback settings-param-changed(string, string, float);
+    callback settings-param-stepped(string, string, int);
     callback settings-param-text-edited(string, string, string);
     callback settings-algorithm-selected(string, string);
     callback settings-reset-all();
@@ -153,6 +154,7 @@ export component FFDock inherits Rectangle {
         content-height: root.settings-content-height;
         enabled: root.settings-enabled;
         param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
         param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
         algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
         reset-all => { root.settings-reset-all(); }

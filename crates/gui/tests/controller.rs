@@ -308,6 +308,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
         (path.file_name().and_then(|name| name.to_str()), handler),
         (Some("ff_menu.slint"), "accessible-action-default")
             | (Some("ff_menu.slint"), "key-pressed(event)")
+            | (Some("ff_slider.slint"), "pointer-event(event)")
+            | (Some("ff_slider.slint"), "key-pressed(event)")
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")
             | (Some("images_panel.slint"), "clicked")

@@ -18,6 +18,9 @@ export component FFSectionHeading inherits Rectangle {
     in property <bool> opaque: true;
     // Space kept clear of the label and badge on both sides.
     in property <length> inset: 0px;
+    // Space kept clear of the badge on the trailing side; the label side
+    // keeps `inset`.
+    in property <length> inset-end: root.inset;
     // A settings section's heading: the bare label on a transparent ground,
     // no badge and no rule, `settings-heading-height` tall.
     in property <bool> flat: false;
@@ -49,7 +52,7 @@ export component FFSectionHeading inherits Rectangle {
     }
 
     if !root.compact && !root.flat && root.provenance == "default": badge := Rectangle {
-        x: parent.width - self.width - root.inset;
+        x: parent.width - self.width - root.inset-end;
         y: (root.head-height - self.height) / 2;
         width: badge-text.width + 2 * Theme.space-2;
         height: 14px;

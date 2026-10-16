@@ -5415,6 +5415,26 @@ impl AppController {
         self.set_param_value(section, id, value);
     }
 
+    /// One Left (`direction < 0`) or Right (`> 0`) key press on a slider:
+    /// stores the value one step on, clamped. A no-op when no tab is
+    /// active, the descriptor cannot be found or its slider ignores keys.
+    pub fn step_param(&mut self, section: &str, id: &str, direction: i32) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(desc) = settings_panel::find_desc(section, &tab.fuse_id, &tab.align_id, id) else {
+            return;
+        };
+        let current = tab_values_mut(tab, section)
+            .and_then(|values| values.get(id))
+            .unwrap_or(&desc.default)
+            .as_f64()
+            .unwrap_or_default();
+        if let Some(value) = settings_panel::stepped_value(current, direction, &desc.kind) {
+            self.set_param_value(section, id, value);
+        }
+    }
+
     /// Scrolls the settings panel by `delta_px`, clamped to its current
     /// content/viewport. Pushes only when it moved.
     pub fn scroll_settings_panel(&mut self, delta_px: f32) {

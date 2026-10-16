@@ -420,6 +420,7 @@ export component AppWindow inherits Window {
     in property <length> settings-content-height: 0px;
     in property <bool> settings-enabled: true;
     callback settings-param-changed(string, string, float);
+    callback settings-param-stepped(string, string, int);
     callback settings-param-text-edited(string, string, string);
     callback settings-algorithm-selected(string, string);
     callback settings-reset-all();
@@ -511,6 +512,7 @@ export component AppWindow inherits Window {
         checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
         checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
         settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        settings-param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
         settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
         settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
         settings-reset-all => { root.settings-reset-all(); }

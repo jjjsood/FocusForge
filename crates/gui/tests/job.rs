@@ -326,6 +326,53 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
     }
 }
 
+/// Forwards to a [`job::GuiObserver`] and records the phase the bar would
+/// read the moment the brightness preparation is announced.
+struct PhaseAtStage {
+    inner: job::GuiObserver,
+    at_prepare: Mutex<Option<job::Phase>>,
+}
+
+impl StageObserver for PhaseAtStage {
+    fn stage(&self, stage: pipeline::RunStage) {
+        let prepares = matches!(stage, pipeline::RunStage::Prepare { .. });
+        StageObserver::stage(&self.inner, stage);
+        if prepares {
+            let phase = job::progress_phase(self.inner.last_progress().as_ref());
+            *self.at_prepare.lock().unwrap() = Some(phase);
+        }
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        StageObserver::tick(&self.inner, progress);
+    }
+}
+
+#[test]
+fn the_bar_reads_preparing_from_the_moment_equalization_starts() {
+    let mut request = no_align_request("preparing_phase", 3);
+    request.equalize = Some(focusforge_core::equalize::EqualizeSettings {
+        max_gain: 1.25,
+        target_stops: 0.0,
+    });
+    let observer = PhaseAtStage {
+        inner: job::GuiObserver::new(),
+        at_prepare: Mutex::new(None),
+    };
+    let control = focusforge_core::job::JobControl::new();
+    pipeline::run(&request, &observer, control, None).expect("an equalized run completes");
+    let at_prepare = observer
+        .at_prepare
+        .lock()
+        .unwrap()
+        .expect("an equalized run announces its preparation");
+    assert_eq!(
+        at_prepare,
+        job::Phase::Preparing,
+        "the bar must not read Fusing while the brightness gains are estimated"
+    );
+}
+
 #[test]
 fn pause_then_resume_continues() {
     let request = no_align_request("pause_then_resume", 2);
@@ -1044,6 +1091,28 @@ fn write_progress_text_is_the_name_only() {
 
     let writing = fuse_progress(10, 10);
     assert_eq!(progress_text(&RunState::Running, Some(&writing)), "");
+}
+
+#[test]
+fn progress_phase_names_the_preparation_pass() {
+    use focusforge_core::job::{JobProgress, JobStage};
+    use focusforge_gui::job::{Phase, RunState, phase_line, progress_phase, progress_text};
+
+    // A finished-looking unit count must not read as `Writing`.
+    for (done, total) in [(0, 0), (3, 3), (7, 7)] {
+        let preparing = JobProgress {
+            stage: JobStage::Prepare,
+            units_done: done,
+            unit_total: total,
+            ..fuse_progress(0, 0)
+        };
+        assert_eq!(progress_phase(Some(&preparing)), Phase::Preparing);
+        assert_eq!(progress_text(&RunState::Running, Some(&preparing)), "");
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&preparing)).as_deref(),
+            Some("preparing")
+        );
+    }
 }
 
 #[test]

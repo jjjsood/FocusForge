@@ -516,7 +516,24 @@ impl Default for GuiObserver {
 }
 
 impl StageObserver for GuiObserver {
-    fn stage(&self, _stage: RunStage) {}
+    fn stage(&self, stage: RunStage) {
+        // The engine ticks only while aligning and fusing, so the brightness
+        // preparation, which blocks for seconds before either, is recorded
+        // here.
+        if matches!(stage, RunStage::Prepare { .. }) {
+            self.tick(&JobProgress {
+                stage: JobStage::Prepare,
+                units_done: 0,
+                unit_total: 0,
+                pixels_done: 0,
+                pixel_total: 0,
+                running: Duration::ZERO,
+                eta: None,
+                align_done: 0,
+                align_total: 0,
+            });
+        }
+    }
 
     fn notice(&self, message: &str) {
         tracing::warn!("{message}");
@@ -571,6 +588,7 @@ impl StageObserver for GuiObserver {
 /// phase added later needs only an arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    Preparing,
     Aligning,
     Fusing,
     Writing,
@@ -579,6 +597,7 @@ pub enum Phase {
 impl Phase {
     pub fn name(self) -> &'static str {
         match self {
+            Phase::Preparing => "Preparing",
             Phase::Aligning => "Aligning",
             Phase::Fusing => "Fusing",
             Phase::Writing => "Writing",
@@ -599,23 +618,24 @@ impl Phase {
     }
 }
 
-/// Which [`Phase`] `progress` is on: `Aligning` while the engine reports that
-/// stage, `Writing` once every unit of the fuse stage is done (the seal, which
-/// the engine reports as no stage of its own -- `JobStage` has no seal
-/// stage), `Fusing` otherwise -- including no progress at all yet and the
-/// brightness preparation before alignment.
+/// Which [`Phase`] `progress` is on: `Preparing` while the engine reports the
+/// brightness preparation, `Aligning` while it reports the align stage,
+/// `Writing` once every unit of the fuse stage is done (the seal, which the
+/// engine reports as no stage of its own -- `JobStage` has no seal stage),
+/// `Fusing` otherwise -- including no progress at all yet.
 pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     match progress {
+        Some(p) if p.stage == JobStage::Prepare => Phase::Preparing,
         Some(p) if p.stage == JobStage::Align => Phase::Aligning,
         Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Phase::Writing,
         _ => Phase::Fusing,
     }
 }
 
-/// The stage word the bar shows for `state`/`progress` -- `Aligning`,
-/// `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a completed run's
-/// own `fused HH:MM`. `progress` picks between `Aligning`/`Fusing`/`Writing`
-/// while running, via `progress_phase`.
+/// The stage word the bar shows for `state`/`progress` -- `Preparing`,
+/// `Aligning`, `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a
+/// completed run's own `fused HH:MM`. `progress` picks the phase word while
+/// running, via `progress_phase`.
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused => "Paused".to_string(),

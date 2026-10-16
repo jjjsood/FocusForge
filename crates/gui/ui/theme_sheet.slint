@@ -1024,6 +1024,29 @@ export component ThemeSheet inherits Window {
             FFSlider { scale: "logarithmic"; fraction: 0.5556; value-text: "0.0001"; }
         }
 
+        GroupHeading { text: "Settings panel: slider, signed readout"; }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops)";
+            FFSlider { scale: "linear"; fraction: 0.0; value-text: "\u{2212}0.5"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops)";
+            FFSlider { scale: "linear"; fraction: 0.5; value-text: "0.0"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops)";
+            FFSlider { scale: "linear"; fraction: 1.0; value-text: "+0.5"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops, disabled)";
+            disabled: true;
+            FFSlider { scale: "linear"; fraction: 0.3; value-text: "\u{2212}0.2"; disabled: true; }
+        }
+
         GroupHeading { text: "Settings panel: field states"; }
         HorizontalLayout {
             spacing: Theme.space-3;

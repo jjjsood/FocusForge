@@ -1936,7 +1936,7 @@ pub fn push_settings_panel(app: &AppWindow, controller: &AppController) {
     record_timing(TimingCounter::RowUpdates, updates as u64);
     app.set_settings_content_height(panel.content_height);
     push_settings_scroll(app, &panel);
-    app.set_settings_enabled(!controller.job_running());
+    app.set_settings_enabled(!controller.job_running() && controller.active_project().is_some());
 }
 
 /// Pushes the settings panel's scroll offset and sticky heading alone -- the
@@ -3650,6 +3650,16 @@ pub fn install(
                 .lock()
                 .unwrap()
                 .set_param_fraction(section.as_str(), id.as_str(), fraction);
+        }
+    });
+    app.on_settings_param_stepped({
+        let controller = controller.clone();
+        move |section, id, direction| {
+            record_settings_input();
+            controller
+                .lock()
+                .unwrap()
+                .step_param(section.as_str(), id.as_str(), direction);
         }
     });
     app.on_settings_param_text_edited({
