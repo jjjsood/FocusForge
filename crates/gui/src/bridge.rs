@@ -1472,8 +1472,7 @@ pub fn push_about_view(app: &AppWindow) {
 }
 
 /// Scans for unreported crash evidence, publishes its record and shows the
-/// toast that raises. Called before `run()`, like `src/main.rs`'s own
-/// `--exit-after` timer.
+/// toast that raises. Called before `run()`.
 pub fn install_crash_notice(
     controller: &Arc<Mutex<AppController>>,
     app: &AppWindow,
@@ -1580,7 +1579,7 @@ fn push_tab_scroll(app: &AppWindow, controller: &AppController) {
 /// Shows the notification queue's visible toast on `FFToast`'s tone and arms
 /// one single-shot timer at its deadline. The timer re-enters this function,
 /// whose expiry check closes only a toast whose own deadline has passed, so
-/// a timer left over from an earlier toast never closes a later one.
+/// a timer armed for an earlier toast never closes a later one.
 pub fn push_toast(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,

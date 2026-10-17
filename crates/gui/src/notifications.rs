@@ -195,7 +195,7 @@ impl Notifications {
     }
 
     /// Closes the visible toast when its own deadline has passed and shows
-    /// the next queued one. A deadline left over from an earlier toast closes
+    /// the next queued one. A deadline belonging to an earlier toast closes
     /// nothing.
     pub fn expire_due(&mut self, now: Instant) {
         if self
