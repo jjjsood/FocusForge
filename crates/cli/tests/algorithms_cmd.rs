@@ -278,7 +278,16 @@ fn project_params_json_lists_every_project_descriptor() {
         .as_array()
         .expect("a project_params array");
     let ids: Vec<&str> = params.iter().map(|p| p["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["align", "auto-crop", "equalize", "equalize-max-gain"]);
+    assert_eq!(
+        ids,
+        [
+            "align",
+            "auto-crop",
+            "equalize",
+            "equalize-max-gain",
+            "equalize-target"
+        ]
+    );
     for (json, desc) in params
         .iter()
         .zip(focusforge_core::project::PROJECT_PARAMS.iter())
@@ -290,6 +299,19 @@ fn project_params_json_lists_every_project_descriptor() {
     let equalize = params.iter().find(|p| p["id"] == "equalize").unwrap();
     let help = equalize["help"].as_str().unwrap();
     assert!(help.contains("not a linear-light correction"), "{help}");
+    let target = params
+        .iter()
+        .find(|p| p["id"] == "equalize-target")
+        .unwrap();
+    assert_eq!(target["label"], "Target brightness (stops)");
+    assert_eq!(target["value"], 0.0);
+    assert!(
+        target["help"]
+            .as_str()
+            .unwrap()
+            .contains("0.0 keeps the mean encoded brightness of the stacked sources"),
+        "{target}"
+    );
 }
 
 /// Each fusion method's entry carries the project defaults a run with that
@@ -352,7 +374,7 @@ fn project_params_text_listing_names_them_after_the_algorithms() {
             entry.id()
         );
     }
-    for id in ["auto-crop", "equalize-max-gain"] {
+    for id in ["auto-crop", "equalize-max-gain", "equalize-target"] {
         assert!(stdout.contains(&format!("{id} - ")), "{id} in {stdout}");
     }
 }

@@ -17,6 +17,7 @@ use focusforge_gpu::blend::Blender;
 use focusforge_gpu::device::SharedDevice;
 #[cfg(feature = "gpu-tests")]
 use focusforge_gpu::device::shared_device_or_skip;
+use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation};
 use focusforge_gui::canvas::PaneSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
@@ -234,10 +235,10 @@ fn is_literal_token_accepts_only_true_false_strings_and_numbers() {
     assert!(!is_literal_token(""), "empty is not a literal");
 }
 
-/// Every `... => { ... }` handler body in `contents`, as
-/// `(1-indexed line, trimmed body)`. Handles nested braces so a body that
-/// itself contains a struct literal or a block does not truncate early.
-fn handler_bodies(contents: &str) -> Vec<(usize, String)> {
+/// Every `... => { ... }` handler in `contents`, as its source line, named
+/// handler, and trimmed body. Handles nested braces so a body that itself
+/// contains a struct literal or a block does not truncate early.
+fn handler_bodies(contents: &str) -> Vec<(usize, String, String)> {
     let mut out = Vec::new();
     let bytes = contents.as_bytes();
     let mut search_from = 0;
@@ -245,6 +246,12 @@ fn handler_bodies(contents: &str) -> Vec<(usize, String)> {
         let arrow_pos = search_from + rel;
         let body_start = arrow_pos + "=> {".len();
         let line = contents[..arrow_pos].matches('\n').count() + 1;
+        let handler = contents[..arrow_pos]
+            .rsplit('\n')
+            .next()
+            .expect("arrow has a source line")
+            .trim()
+            .to_owned();
 
         let mut depth = 1i32;
         let mut i = body_start;
@@ -257,7 +264,11 @@ fn handler_bodies(contents: &str) -> Vec<(usize, String)> {
             i += 1;
         }
         let body_end = i - 1;
-        out.push((line, contents[body_start..body_end].trim().to_string()));
+        out.push((
+            line,
+            handler,
+            contents[body_start..body_end].trim().to_string(),
+        ));
         search_from = i;
     }
     out
@@ -275,8 +286,8 @@ fn callbacks_are_one_line_forwards() {
     let mut violations = Vec::new();
     for path in files {
         let contents = fs::read_to_string(&path).unwrap();
-        for (line, body) in handler_bodies(&contents) {
-            if !is_single_root_call(&body) {
+        for (line, handler, body) in handler_bodies(&contents) {
+            if !is_single_root_call(&body) && !is_local_event_seam(&path, &handler) {
                 violations.push(format!("{}:{line}: {body:?}", path.display()));
             }
         }
@@ -286,6 +297,44 @@ fn callbacks_are_one_line_forwards() {
         violations.is_empty(),
         "handler body is not a single `root.<callback>(...)` forward:\n{}",
         violations.join("\n")
+    );
+}
+
+/// Local input state machines are the only permitted non-forwarding Slint
+/// handlers. Their callback boundaries remain root forwards and are covered
+/// by their input behavior tests.
+fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
+    matches!(
+        (path.file_name().and_then(|name| name.to_str()), handler),
+        (Some("ff_menu.slint"), "accessible-action-default")
+            | (Some("ff_menu.slint"), "key-pressed(event)")
+            | (Some("ff_slider.slint"), "pointer-event(event)")
+            | (Some("ff_slider.slint"), "key-pressed(event)")
+            | (Some("ff_image_row.slint"), "pointer-event(event)")
+            | (Some("ff_image_row.slint"), "moved")
+            | (Some("images_panel.slint"), "clicked")
+            | (Some("images_panel.slint"), "key-pressed(event)")
+            | (Some("appearance_tab.slint"), "changed menu-open")
+            | (Some("appearance_tab.slint"), "previous-requested")
+            | (Some("appearance_tab.slint"), "next-requested")
+            | (Some("appearance_tab.slint"), "accepted")
+            | (Some("appearance_tab.slint"), "dismissed")
+            | (Some("app.slint"), "bell-activated")
+            | (Some("app.slint"), "close-requested")
+            | (Some("app.slint"), "link-activated")
+            | (Some("notification_center.slint"), "clicked")
+            | (Some("notification_center.slint"), "changed selected")
+            | (Some("notification_center.slint"), "key-pressed(event)")
+    )
+}
+
+#[test]
+fn local_event_seams_are_named_input_handlers_only() {
+    let panel = common::ui_dir().join("shell/dock/images_panel.slint");
+    assert!(is_local_event_seam(&panel, "key-pressed(event)"));
+    assert!(
+        !is_local_event_seam(&panel, "sort-selected(choice)"),
+        "domain callbacks must remain root forwards"
     );
 }
 
@@ -352,6 +401,25 @@ fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -
     // always converges keeps every run clean.
     controller.set_align_algorithm("dummy-align");
     root
+}
+
+fn open_many_timed_frames(controller: &mut AppController, name: &str, count: usize) {
+    let root = common::tree(&format!("{name}_frames"));
+    for index in 0..count {
+        let path = root.join(format!("{index:04}.tif"));
+        focusforge_core::io::test_frames::write_frame_with_capture_time(
+            &path,
+            4,
+            4,
+            Some("2026:08:29 10:00:00"),
+        )
+        .expect("synthetic frame must write");
+    }
+    assert!(matches!(
+        common::open_and_settle(controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
 }
 
 /// Settles every run, the live one and each one promoted from the queue.
@@ -2453,7 +2521,7 @@ fn diagnostics_bundle_write() {
         let file = fs::File::open(&out).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let mut names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         names.sort();
         let mut shown: Vec<String> = view.entries.iter().map(|e| e.name.clone()).collect();
@@ -2902,40 +2970,57 @@ fn seed_notice_crashes(root: &Path) -> std::path::PathBuf {
     data
 }
 
+fn crash_record(controller: &AppController) -> Option<focusforge_gui::notifications::Notification> {
+    controller
+        .notifications()
+        .iter()
+        .find(|n| n.kind == focusforge_gui::notifications::Kind::Crash)
+        .cloned()
+}
+
 #[test]
-fn crash_notice_counts_and_dismisses() {
+fn crash_notice_counts_and_acknowledges() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
     controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
     controller.scan_crash_notice();
-    assert!(controller.crash_notice_visible());
-    assert_eq!(controller.crash_notice_count(), 2);
-    assert_eq!(controller.crash_notice_text(), "2 crashes found");
+    let record = crash_record(&controller).expect("unreported evidence is announced");
+    assert_eq!(record.title, "Previous session stopped");
+    assert!(
+        record
+            .message
+            .starts_with("A previous session stopped unexpectedly. 2 crash reports were detected"),
+        "{}",
+        record.message
+    );
+    assert_eq!(record.crash.as_ref().unwrap().ids.len(), 2);
+    assert!(!record.read);
+    assert_eq!(controller.notifications().len(), 1, "one record per scan");
 
-    controller.dismiss_crash_notice();
-    assert!(!controller.crash_notice_visible());
-    assert_eq!(controller.crash_notice_count(), 0);
+    controller
+        .acknowledge_crash(record.id)
+        .expect("the marks are written");
+    let record = crash_record(&controller).unwrap();
+    let crash = record.crash.unwrap();
+    assert!(crash.acknowledged && crash.ids.is_empty() && crash.error.is_none());
+    assert_eq!(crash.reports, 2, "the count outlives the cleared ids");
 
     let mut after = AppController::new();
     after.set_diagnostics_dirs(Some(data_dir), None);
     after.scan_crash_notice();
     assert!(
-        !after.crash_notice_visible(),
+        crash_record(&after).is_none(),
         "a fresh controller over the same directory must see nothing pending"
     );
-    assert_eq!(after.crash_notice_count(), 0);
 
-    // A second data directory with an empty crash directory counts 0 from
-    // the start.
     let empty_root = tempfile::tempdir().unwrap();
     fs::create_dir_all(empty_root.path().join("focusforge/crashes")).unwrap();
     let mut empty = AppController::new();
     empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")), None);
     empty.scan_crash_notice();
-    assert!(!empty.crash_notice_visible());
-    assert_eq!(empty.crash_notice_count(), 0);
+    assert!(empty.notifications().is_empty());
 }
 
 #[test]
@@ -2955,47 +3040,105 @@ fn crash_notice_unreadable_dir() {
 
     fs::set_permissions(&crashes, writable).unwrap();
 
-    assert!(
-        !controller.crash_notice_visible(),
-        "an unreadable crash directory must show no notice"
-    );
-    assert_eq!(controller.crash_notice_count(), 0);
+    let crash = crash_record(&controller)
+        .and_then(|r| r.crash)
+        .expect("an unreadable crash directory is announced as unavailable");
+    assert!(crash.unavailable && crash.ids.is_empty());
 }
 
 #[test]
-fn crash_notice_timeout_reports_nothing() {
+fn crash_record_survives_expiry_and_reading() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
     controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
     controller.scan_crash_notice();
-    assert!(controller.crash_notice_visible());
-    let count_before = controller.crash_notice_count();
+    assert!(controller.visible_toast().is_some(), "the crash is toasted");
 
-    controller.crash_notice_timed_out();
-    assert!(!controller.crash_notice_visible());
+    controller.expire_toast(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    assert!(controller.visible_toast().is_none());
+    controller.open_center();
+    assert_eq!(
+        controller.unread_notifications(),
+        0,
+        "viewing reads the record"
+    );
+    let crash = crash_record(&controller).unwrap().crash.unwrap();
+    assert!(!crash.acknowledged && crash.ids.len() == 2);
     assert!(
         !data_dir
             .join("crashes/20260918T010203Z-focusforge-gui-panic.reported")
             .exists(),
-        "a timeout must write no reported marker"
-    );
-    assert!(
-        !data_dir
-            .join("crashes/20260918T010204Z-focusforge-gui-native.reported")
-            .exists(),
-        "a timeout must write no reported marker"
+        "neither expiry nor reading writes a reported marker"
     );
 
     let mut after = AppController::new();
     after.set_diagnostics_dirs(Some(data_dir), None);
     after.scan_crash_notice();
     assert!(
-        after.crash_notice_visible(),
-        "the evidence must still be pending after a timeout"
+        crash_record(&after).is_some(),
+        "the evidence is still pending"
     );
-    assert_eq!(after.crash_notice_count(), count_before);
+}
+
+#[test]
+#[cfg(unix)]
+fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_notice_crashes(root.path());
+    let crashes = data_dir.join("crashes");
+    let writable = fs::metadata(&crashes).unwrap().permissions();
+
+    let mut controller = AppController::new();
+    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.scan_crash_notice();
+    let id = crash_record(&controller).unwrap().id;
+
+    fs::set_permissions(&crashes, fs::Permissions::from_mode(0o555)).unwrap();
+    let outcome = controller.acknowledge_crash(id);
+    let writable_now = fs::write(crashes.join("probe"), "x").is_ok();
+    fs::set_permissions(&crashes, writable).unwrap();
+    if writable_now {
+        return; // privileged user: a read-only directory still accepts writes
+    }
+
+    let error = outcome.expect_err("the marks cannot be written");
+    let crash = crash_record(&controller).unwrap().crash.unwrap();
+    assert!(!crash.acknowledged, "the evidence stays unreported");
+    assert_eq!(crash.ids.len(), 2, "the ids are kept for a retry");
+    assert_eq!(crash.error.as_deref(), Some(error.as_str()));
+
+    controller
+        .acknowledge_crash(id)
+        .expect("the retry succeeds");
+    assert!(
+        crash_record(&controller)
+            .unwrap()
+            .crash
+            .unwrap()
+            .acknowledged
+    );
+}
+
+#[test]
+fn missing_crash_directory_keeps_the_center_usable() {
+    let mut controller = AppController::new();
+    controller.set_diagnostics_dirs(None, None);
+    controller.scan_crash_notice();
+    let record = crash_record(&controller).expect("the unavailable state is announced");
+    assert!(record.crash.as_ref().unwrap().unavailable);
+
+    controller.open_center();
+    assert!(controller.notification_center_open());
+    assert_eq!(controller.unread_notifications(), 0);
+    assert!(
+        controller.crash_diagnostics(record.id),
+        "Diagnostics stays reachable"
+    );
+    assert_eq!(controller.settings_section(), SettingsSection::Diagnostics);
 }
 
 #[test]
@@ -3011,6 +3154,7 @@ fn settings_section_slugs_round_trip() {
         slugs,
         [
             "performance",
+            "appearance",
             "storage",
             "input-map",
             "diagnostics",
@@ -3036,24 +3180,29 @@ fn settings_open_on_performance_by_default() {
 }
 
 #[test]
-fn crash_notice_review_opens_diagnostics() {
+fn crash_notice_diagnostics_acknowledges_and_opens_settings() {
     let root = tempfile::tempdir().unwrap();
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
     controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
     controller.scan_crash_notice();
-    assert!(controller.crash_notice_visible());
+    let id = crash_record(&controller).unwrap().id;
 
-    let open = controller.review_crashes();
-    assert!(open, "review must leave the settings modal open");
+    let open = controller.crash_diagnostics(id);
+    assert!(open, "Diagnostics must leave the settings modal open");
     assert_eq!(controller.settings_section(), SettingsSection::Diagnostics);
-    assert!(!controller.crash_notice_visible());
     assert!(
-        data_dir
-            .join("crashes/20260918T010203Z-focusforge-gui-panic.reported")
-            .exists(),
-        "review must mark the pending evidence reported, same as dismiss"
+        crash_record(&controller)
+            .unwrap()
+            .crash
+            .unwrap()
+            .acknowledged
+    );
+    let marker = data_dir.join("crashes/20260918T010203Z-focusforge-gui-panic.reported");
+    assert!(
+        marker.exists(),
+        "Diagnostics marks the evidence like Acknowledge"
     );
     assert!(
         data_dir
@@ -3061,10 +3210,8 @@ fn crash_notice_review_opens_diagnostics() {
             .exists()
     );
 
-    let marker = data_dir.join("crashes/20260918T010203Z-focusforge-gui-panic.reported");
     let marked_at = fs::read_to_string(&marker).unwrap();
-    let open_again = controller.review_crashes();
-    assert!(open_again);
+    assert!(controller.crash_diagnostics(id));
     assert_eq!(
         fs::read_to_string(&marker).unwrap(),
         marked_at,
@@ -3081,37 +3228,35 @@ fn crash_notice_cleared_by_a_bundle_write() {
     let events = install_recording_sink(&mut controller);
     controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
     controller.scan_crash_notice();
-    assert!(controller.crash_notice_visible());
-    assert_eq!(controller.crash_notice_count(), 2);
+    assert_eq!(
+        crash_record(&controller).unwrap().crash.unwrap().ids.len(),
+        2
+    );
 
     controller.set_destination(root.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Written);
+    let crash = crash_record(&controller).unwrap().crash.unwrap();
     assert!(
-        !controller.crash_notice_visible(),
-        "a bundle written from the window must hide the notice"
+        crash.acknowledged,
+        "a bundle written from the window acknowledges the record"
     );
-    assert_eq!(controller.crash_notice_count(), 0);
 
-    // A failed write leaves it showing.
+    // A failed write leaves it unacknowledged.
     let root2 = tempfile::tempdir().unwrap();
     let data_dir2 = seed_two_crashes(root2.path());
     let mut controller2 = AppController::new();
     let events2 = install_recording_sink(&mut controller2);
     controller2.set_diagnostics_dirs(Some(data_dir2.clone()), None);
     controller2.scan_crash_notice();
-    assert!(controller2.crash_notice_visible());
 
     let blocked_parent = data_dir2.parent().unwrap().join("blocked");
     fs::write(&blocked_parent, b"not a directory").unwrap();
     controller2.set_destination(blocked_parent.join("bundle.zip").to_str().unwrap());
     let status2 = run_write(&mut controller2, &events2);
     assert_eq!(status2, DiagnosticsStatus::Failed);
-    assert!(
-        controller2.crash_notice_visible(),
-        "a failed write must leave the notice showing"
-    );
-    assert_eq!(controller2.crash_notice_count(), 2);
+    let crash2 = crash_record(&controller2).unwrap().crash.unwrap();
+    assert!(!crash2.acknowledged && crash2.ids.len() == 2);
 }
 
 /// A controller with `fixtures/mantis-512` open as one tab, its scratch root
@@ -3150,10 +3295,13 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         format!("fused {at}"),
         "the bar names the run, the notice names the count"
     );
-    assert_eq!(
-        controller.unaligned_notice().as_deref(),
-        Some("4 frames unaligned")
-    );
+    let kept: Vec<_> = controller
+        .notifications()
+        .iter()
+        .filter(|n| n.title == "4 frames unaligned")
+        .collect();
+    assert_eq!(kept.len(), 1, "keeping records the count once");
+    assert!(kept[0].message.contains("4 frames unaligned"));
     let summary = controller.last_alignment().expect("a completed run");
     assert_eq!(
         (summary.source.as_str(), summary.backend.as_str()),
@@ -3169,7 +3317,13 @@ fn a_clean_run_raises_no_unaligned_notice() {
     open_mantis64_tab(&mut controller, "clean_run_no_notice", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
-    assert_eq!(controller.unaligned_notice(), None);
+    assert!(
+        controller
+            .notifications()
+            .iter()
+            .all(|n| !n.title.ends_with("unaligned")),
+        "a clean run records no unaligned notice"
+    );
     assert_eq!(
         controller
             .last_alignment()
@@ -3996,6 +4150,69 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
         "01.tif",
         "the same wheel steps the source in editor mode too, with no Ctrl needed"
     );
+}
+
+#[test]
+fn image_preview_opening_a_short_list_after_a_scrolled_long_list_keeps_bounds_valid() {
+    let mut controller = controller_with_scratch("image_preview_tab_window");
+    open_many_timed_frames(&mut controller, "image_preview_first", 1_000);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_images_viewport_height(120.0);
+    controller.select_frame(500);
+    controller.images_viewport_scrolled(500.0 * 120.0);
+
+    open_many_timed_frames(&mut controller, "image_preview_short", 1);
+    assert_eq!(controller.frame_pane_label(), "0000.tif");
+    assert_eq!(controller.images_scroll_y(), 0.0);
+}
+
+#[test]
+fn image_preview_opening_an_empty_list_after_a_scrolled_long_list_keeps_bounds_valid() {
+    let mut controller = controller_with_scratch("image_preview_empty_tab_window");
+    open_many_timed_frames(&mut controller, "image_preview_empty_first", 1_000);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_images_viewport_height(120.0);
+    controller.select_frame(500);
+    controller.images_viewport_scrolled(500.0 * 120.0);
+
+    open_many_timed_frames(&mut controller, "image_preview_empty_second", 1);
+    controller.remove_frame(0);
+    assert!(controller.images_panel().rows.is_empty());
+
+    controller.select_project(0);
+    controller.select_project(1);
+    assert!(controller.images_panel().rows.is_empty());
+    assert_eq!(controller.images_scroll_y(), 0.0);
+}
+
+#[test]
+fn tab_switches_and_active_closes_reanchor_image_preview_windows() {
+    let mut controller = controller_with_scratch("image_preview_tab_window");
+    open_many_timed_frames(&mut controller, "image_preview_first", 1_000);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_images_viewport_height(120.0);
+    controller.select_frame(500);
+    controller.images_viewport_scrolled(500.0 * 120.0);
+
+    open_many_timed_frames(&mut controller, "image_preview_second", 1_000);
+    controller.select_frame(800);
+    controller.images_viewport_scrolled(800.0 * 120.0);
+    controller.select_project(0);
+    assert_eq!(controller.frame_pane_label(), "0500.tif");
+    assert_eq!(controller.images_scroll_y(), 500.0 * 120.0);
+
+    controller.select_project(1);
+    controller.close_project(1);
+    assert_eq!(controller.active_project(), Some(0));
+    assert_eq!(controller.frame_pane_label(), "0500.tif");
+    controller.refresh_source_previews();
+    assert_eq!(controller.images_scroll_y(), 500.0 * 120.0);
 }
 
 // ---------------------------------------------------------------------
@@ -5615,9 +5832,9 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     controller
 }
 
-/// The prepare section lists the equalization switch (on) and its bound; a
-/// default run is equalized, switching it off records an unequalized run, and
-/// the bound the panel holds reaches the run.
+/// The prepare section lists the equalization switch (on), its bound and its
+/// target; a default run is equalized, switching it off records an unequalized
+/// run, and the bound and target the panel holds reach the run.
 #[test]
 fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
@@ -5644,10 +5861,17 @@ fn equalize_rows_reach_the_run() {
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let default_run = controller.held_checkpoints().last().cloned().unwrap();
+    let default_equalization = default_run
+        .registration
+        .equalization
+        .expect("a default run is equalized");
     assert_eq!(
-        default_run.registration.equalization.map(|e| e.max_gain),
-        Some(1.25),
-        "a default run is equalized with the default bound"
+        (
+            default_equalization.max_gain,
+            default_equalization.target_stops
+        ),
+        (1.25, 0.0),
+        "a default run uses the default bound and the neutral target"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
@@ -5661,11 +5885,13 @@ fn equalize_rows_reach_the_run() {
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.3));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let on = controller.held_checkpoints().last().cloned().unwrap();
     let recorded = on.registration.equalization.expect("the run was equalized");
     assert_eq!(recorded.max_gain, 1.5);
+    assert_eq!(recorded.target_stops, 0.3, "the target reaches the run");
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
@@ -5689,9 +5915,8 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
         1,
         "the default run holds"
     );
-    assert_eq!(
-        controller.notice(),
-        None,
+    assert!(
+        controller.notifications().is_empty(),
         "the default bound 1.25 covers the stack"
     );
 
@@ -5703,14 +5928,13 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
         2,
         "the tight run holds"
     );
-    let notice = controller.notice().expect("a clamped frame is reported");
+    let notices = controller.notifications();
+    assert!(notices.len() > 1, "each clamped frame has its own record");
+    let notice = notices[0].message.as_str();
     assert!(notice.contains("frame "), "{notice}");
     assert!(notice.contains("1.01"), "{notice}");
     assert!(notice.contains("would cover it"), "{notice}");
-    assert!(
-        notice.contains(" (and ") && notice.ends_with(" more)"),
-        "several clamped frames collapse to the first plus a count: {notice}"
-    );
+    assert!(!notice.contains(" more)"), "no collapsed count: {notice}");
 
     let named: usize = notice
         .strip_prefix("frame ")
@@ -5727,9 +5951,6 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
         (gain - 1.01).abs() < 1e-3 || (gain - 1.0 / 1.01).abs() < 1e-3,
         "frame {named} sits at the bound, got {gain}"
     );
-
-    controller.dismiss_notice();
-    assert_eq!(controller.notice(), None);
 }
 
 /// Three fuses on one tab, one per method: each held checkpoint carries its
@@ -7084,7 +7305,11 @@ fn a_save_that_does_not_write_loses_nothing() {
         .join("gone")
         .join("p.ffp");
     assert!(!controller.save_active_project(|_| Some(missing.clone())));
-    assert!(controller.take_settled_failure().is_some());
+    assert_eq!(
+        controller.notifications().len(),
+        1,
+        "the failed save is recorded"
+    );
     assert_eq!(
         controller.checkpoint_count(),
         Some(2),
@@ -8459,4 +8684,291 @@ fn storage_clear_failure_line_names_the_cause_without_the_os_error_code() {
             StorageTone::Failure
         )
     );
+}
+
+mod notification {
+    use super::{AppController, SETTLE, common};
+    use focusforge_core::params::ParamValue;
+    use focusforge_gui::notifications::{Kind, Notification};
+
+    fn every_frame_clamps(name: &str, excluded: Option<usize>) -> AppController {
+        let mut controller = common::controller_with_frames(name, 4);
+        controller.set_align_algorithm("dummy-align");
+        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
+        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
+        if let Some(index) = excluded {
+            controller.toggle_frame_excluded(index);
+        }
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, SETTLE);
+        controller
+    }
+
+    fn warnings(controller: &AppController) -> Vec<Notification> {
+        controller
+            .notifications()
+            .iter()
+            .filter(|n| n.kind == Kind::Warning)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn every_brightness_warning_becomes_its_own_record() {
+        let controller = every_frame_clamps("notification_every_warning", None);
+        let records = warnings(&controller);
+        assert_eq!(records.len(), 4, "one record per clamped frame");
+        for (i, record) in records.iter().enumerate() {
+            assert!(
+                record.message.starts_with(&format!("frame {i}:")),
+                "{}",
+                record.message
+            );
+            assert!(record.message.contains("1.25"), "{}", record.message);
+        }
+    }
+
+    #[test]
+    fn a_brightness_record_names_its_frame_file() {
+        let controller = every_frame_clamps("notification_frame_file", Some(0));
+        let records = warnings(&controller);
+        assert_eq!(
+            records.len(),
+            3,
+            "the excluded frame is not part of the run"
+        );
+        let files: Vec<_> = records.iter().map(|r| r.frame.as_deref()).collect();
+        assert_eq!(files, [Some("01.tif"), Some("02.tif"), Some("03.tif")]);
+        assert!(
+            records[0].message.starts_with("frame 0:"),
+            "the index is the run's own"
+        );
+    }
+
+    #[test]
+    fn kept_unaligned_frames_record_the_count() {
+        let mut controller = super::controller_on_mantis_512("notification_kept_unaligned");
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, std::time::Duration::from_secs(300));
+        assert!(
+            controller
+                .notifications()
+                .iter()
+                .all(|n| !n.title.ends_with("unaligned")),
+            "nothing is recorded before Keep"
+        );
+        controller.keep_fused().expect("a parked run keeps");
+        let kept: Vec<_> = controller
+            .notifications()
+            .iter()
+            .filter(|n| n.title == "4 frames unaligned")
+            .collect();
+        assert_eq!(kept.len(), 1, "Keep records the count once");
+        assert_eq!(kept[0].kind, Kind::Warning);
+        assert!(kept[0].message.contains("4 frames unaligned"));
+        assert!(kept[0].project_title.is_some());
+    }
+
+    #[test]
+    fn a_settled_run_publishes_once_across_polls() {
+        let mut controller = every_frame_clamps("notification_once", None);
+        let before = controller.notifications().len();
+        assert!(before > 0);
+        for _ in 0..5 {
+            assert!(controller.settle_job().is_none());
+        }
+        assert_eq!(controller.notifications().len(), before);
+    }
+
+    #[test]
+    fn refused_add_records_its_full_message() {
+        let mut controller = common::controller_with_frames("notification_refused", 3);
+        controller.set_align_algorithm("dummy-align");
+        assert!(controller.start_fuse());
+        let refused = controller
+            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+            .expect_err("a running job refuses an add");
+        let record = controller
+            .notifications()
+            .last()
+            .expect("the refusal is recorded");
+        assert_eq!(record.message, refused.to_string());
+        assert_eq!(record.kind, Kind::Failure);
+        assert_eq!(
+            controller.notifications().len(),
+            1,
+            "one refusal, one record"
+        );
+        common::wait_for_settle(&mut controller, SETTLE);
+    }
+
+    #[test]
+    fn bell_over_projects_closes_projects_and_opens_the_center() {
+        let mut controller = AppController::new();
+        controller.toggle_projects_overlay();
+        controller.set_diagnostics_dirs(None, None);
+        controller.scan_crash_notice();
+        assert_eq!(controller.unread_notifications(), 1);
+        assert!(
+            controller.visible_toast().is_none(),
+            "Projects shows no toast"
+        );
+
+        controller.open_center();
+        assert!(!controller.projects_overlay_open());
+        assert!(controller.notification_center_open());
+        assert_eq!(controller.unread_notifications(), 0);
+    }
+
+    #[test]
+    fn opening_projects_closes_the_center_without_reading() {
+        let mut controller = AppController::new();
+        controller.open_center();
+        controller.set_window_focused(1, false);
+        controller.set_diagnostics_dirs(None, None);
+        controller.scan_crash_notice();
+        assert_eq!(
+            controller.unread_notifications(),
+            1,
+            "background arrival stays unread"
+        );
+
+        controller.toggle_projects_overlay();
+        assert!(!controller.notification_center_open());
+        assert_eq!(controller.unread_notifications(), 1);
+    }
+
+    #[test]
+    fn closing_projects_shows_unread_without_toast_replay() {
+        let mut controller = AppController::new();
+        controller.toggle_projects_overlay();
+        controller.set_diagnostics_dirs(None, None);
+        controller.scan_crash_notice();
+        controller.toggle_projects_overlay();
+        assert!(
+            controller.visible_toast().is_none(),
+            "nothing suppressed replays"
+        );
+        assert!(!controller.notification_center_open());
+        assert_eq!(controller.unread_notifications(), 1);
+    }
+}
+
+mod native_delivery {
+    use super::{AppController, SETTLE, common};
+    use focusforge_gui::native_notify;
+    use focusforge_gui::notifications::{Banner, context_line};
+    use std::cell::Cell;
+
+    fn crash_notice(controller: &mut AppController) {
+        controller.set_diagnostics_dirs(None, None);
+        controller.scan_crash_notice();
+    }
+
+    #[test]
+    fn background_arrival_is_banner_once() {
+        let mut controller = common::controller_with_frames("native_once", 3);
+        controller.set_align_algorithm("dummy-align");
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        assert!(controller.start_fuse());
+        controller
+            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+            .expect_err("a running job refuses an add");
+
+        let titles: Vec<_> = controller
+            .take_native_notifications()
+            .into_iter()
+            .map(|b| b.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert_ne!(titles[0], titles[1]);
+        for focused in [true, false, true, false] {
+            controller.set_window_focused(1, focused);
+            assert!(controller.take_native_notifications().is_empty());
+        }
+        common::wait_for_settle(&mut controller, SETTLE);
+    }
+
+    #[test]
+    fn focus_moving_between_app_windows_is_not_background() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, true);
+        controller.set_window_focused(1, false);
+        controller.set_window_focused(2, true);
+        crash_notice(&mut controller);
+        controller.set_window_focused(2, false);
+        controller.set_window_focused(1, true);
+        crash_notice(&mut controller);
+        assert!(controller.take_native_notifications().is_empty());
+
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        assert_eq!(controller.take_native_notifications().len(), 1);
+    }
+
+    #[test]
+    fn destroyed_focused_window_stops_counting() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(2, true);
+        controller.set_window_focused(2, false);
+        crash_notice(&mut controller);
+        assert_eq!(controller.take_native_notifications().len(), 1);
+    }
+
+    #[test]
+    fn projects_suppresses_native_delivery() {
+        let mut controller = AppController::new();
+        controller.toggle_projects_overlay();
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        assert_eq!(controller.unread_notifications(), 1);
+        assert!(controller.take_native_notifications().is_empty());
+    }
+
+    #[test]
+    fn foreground_arrival_is_never_native() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, true);
+        crash_notice(&mut controller);
+        assert!(controller.take_native_notifications().is_empty());
+    }
+
+    #[test]
+    fn banner_carries_title_and_context_only() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        let record = controller.notifications()[0].clone();
+        let banners = controller.take_native_notifications();
+        assert_eq!(
+            banners,
+            [Banner {
+                title: record.title.clone(),
+                body: context_line(&record),
+            }]
+        );
+        assert!(!banners[0].body.contains(&record.message));
+    }
+
+    #[test]
+    fn native_send_failure_keeps_history_and_unread() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        crash_notice(&mut controller);
+        let banners = controller.take_native_notifications();
+        assert_eq!(banners.len(), 2);
+
+        let calls = Cell::new(0);
+        native_notify::deliver(banners, |_| {
+            calls.set(calls.get() + 1);
+            Err::<(), _>("no notification service")
+        });
+        assert_eq!(calls.get(), 2, "one attempt per banner, no retry");
+        assert_eq!(controller.notifications().len(), 2);
+        assert_eq!(controller.unread_notifications(), 2);
+        assert!(controller.take_native_notifications().is_empty());
+    }
 }

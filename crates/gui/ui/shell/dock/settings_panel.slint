@@ -66,6 +66,7 @@ export component FFSettingsPanel inherits Rectangle {
     in property <bool> enabled: true;
 
     callback param-changed(string, string, float);
+    callback param-stepped(string, string, int);
     callback param-text-edited(string, string, string);
     callback algorithm-selected(string, string);
     callback reset-all();
@@ -175,6 +176,7 @@ export component FFSettingsPanel inherits Rectangle {
                         disabled: !root.enabled || row.disabled;
                         recessed: row.nested;
                         fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
+                        stepped(direction) => { root.param-stepped(row.section, row.id, direction); }
                     }
                 }
 
@@ -280,6 +282,7 @@ export component FFSettingsPanel inherits Rectangle {
             y: -root.sticky.push;
             width: parent.width;
             inset: ShellGeometry.dock-content-inset;
+            inset-end: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.panel-content-width;
             label: root.sticky.label;
             provenance: root.sticky.provenance;
         }

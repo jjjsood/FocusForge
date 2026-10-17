@@ -18,10 +18,10 @@ use focusforge_gui::{
 use slint::ComponentHandle;
 use slint::platform::{PointerEventButton, WindowEvent};
 
-/// `tabs-region` in a strip `window` wide: less the 46 px projects slot,
+/// `tabs-region` in a strip `window` wide: less the 47 px projects slot,
 /// the 105 px window glyphs and the 32 px cluster gap.
 fn region(window: f32) -> f32 {
-    window - 46.0 - 105.0 - 32.0
+    window - 47.0 - 105.0 - 32.0
 }
 
 /// Advances mock time past `Theme.motion-fast` (150 ms), so a rendered

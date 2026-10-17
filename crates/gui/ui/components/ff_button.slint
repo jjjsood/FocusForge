@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A labelled button with an optional leading glyph or icon, in two heights
-// and five tones.
+// and six tones.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 
 export component FFButton inherits Rectangle {
-    // "primary" | "default" | "quiet" | "danger" | "outlined".
+    // "primary" | "default" | "quiet" | "danger" | "outlined" | "secondary" (the
+    // default fill, label in `Theme.text-secondary`, dimmed to 40 % when disabled).
     in property <string> kind: "default";
     // The bar height (`ShellGeometry.toolbar-button-height`); the taller,
     // 34 px default otherwise.
@@ -29,7 +30,8 @@ export component FFButton inherits Rectangle {
         ? Theme.text-disabled
         : (root.kind == "primary" || root.kind == "danger")
         ? Theme.text-on-accent
-        : root.kind == "quiet" ? Theme.text-muted : Theme.text-primary;
+        : root.kind == "quiet" ? Theme.text-muted
+        : root.kind == "secondary" ? Theme.text-secondary : Theme.text-primary;
 
     accessible-role: button;
     accessible-enabled: root.enabled;
@@ -44,7 +46,7 @@ export component FFButton inherits Rectangle {
         : Theme.surface-overlay;
     border-width: root.kind == "outlined" ? 1px : 0px;
     border-color: Theme.border-strong;
-    opacity: root.dim-label-only ? 1.0 : (root.enabled ? 1.0 : 0.5);
+    opacity: root.dim-label-only ? 1.0 : (root.enabled ? 1.0 : root.kind == "secondary" ? 0.4 : 0.5);
 
     area := TouchArea {
         enabled: root.enabled;

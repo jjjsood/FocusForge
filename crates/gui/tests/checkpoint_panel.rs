@@ -842,7 +842,7 @@ fn restore_asks_only_when_live_is_modified() {
     paint(&mut controller, stroke(1, 1, 0));
     click(&mut controller, &project.root);
     assert!(!controller.close_guard_secondary_pressed(|_| None));
-    assert!(controller.take_settled_failure().is_none(), "no toast");
+    assert!(controller.notifications().is_empty(), "no toast");
     assert_eq!(controller.checkpoints_panel().row_count, 3);
     assert_eq!(
         current_row(&controller).as_deref(),

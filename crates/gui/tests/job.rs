@@ -326,6 +326,53 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
     }
 }
 
+/// Forwards to a [`job::GuiObserver`] and records the phase the bar would
+/// read the moment the brightness preparation is announced.
+struct PhaseAtStage {
+    inner: job::GuiObserver,
+    at_prepare: Mutex<Option<job::Phase>>,
+}
+
+impl StageObserver for PhaseAtStage {
+    fn stage(&self, stage: pipeline::RunStage) {
+        let prepares = matches!(stage, pipeline::RunStage::Prepare { .. });
+        StageObserver::stage(&self.inner, stage);
+        if prepares {
+            let phase = job::progress_phase(self.inner.last_progress().as_ref());
+            *self.at_prepare.lock().unwrap() = Some(phase);
+        }
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        StageObserver::tick(&self.inner, progress);
+    }
+}
+
+#[test]
+fn the_bar_reads_preparing_from_the_moment_equalization_starts() {
+    let mut request = no_align_request("preparing_phase", 3);
+    request.equalize = Some(focusforge_core::equalize::EqualizeSettings {
+        max_gain: 1.25,
+        target_stops: 0.0,
+    });
+    let observer = PhaseAtStage {
+        inner: job::GuiObserver::new(),
+        at_prepare: Mutex::new(None),
+    };
+    let control = focusforge_core::job::JobControl::new();
+    pipeline::run(&request, &observer, control, None).expect("an equalized run completes");
+    let at_prepare = observer
+        .at_prepare
+        .lock()
+        .unwrap()
+        .expect("an equalized run announces its preparation");
+    assert_eq!(
+        at_prepare,
+        job::Phase::Preparing,
+        "the bar must not read Fusing while the brightness gains are estimated"
+    );
+}
+
 #[test]
 fn pause_then_resume_continues() {
     let request = no_align_request("pause_then_resume", 2);
@@ -384,7 +431,7 @@ fn settings_journey_pause_resume_and_cancel() {
         );
         assert_eq!(newest_composite(&controller), reference, "{id}: resumed");
 
-        controller.dismiss_notice();
+        let reported = controller.notifications().len();
         // Paused straight after the start, not after a progress tick: the
         // worker parks at its first boundary, so a short run cannot finish
         // while the test thread waits for a tick and the cancel lands on it.
@@ -394,8 +441,8 @@ fn settings_journey_pause_resume_and_cancel() {
         controller.cancel_fuse();
         common::wait_for_settle(&mut controller, timeout);
         assert_eq!(
-            controller.notice(),
-            None,
+            controller.notifications().len(),
+            reported,
             "{id}: a cancelled run reports nothing"
         );
         assert_eq!(controller.job_view().state, job::RunState::Idle, "{id}");
@@ -827,7 +874,6 @@ fn failure_summary_names_the_failed_operation() {
         assert_eq!(alignment_operation, job::FailedOperation::Alignment);
     }
 
-    let setup_operation;
     let setup_summary;
     {
         let root = common::tree("summary_setup_frames");
@@ -853,12 +899,10 @@ fn failure_summary_names_the_failed_operation() {
             .last()
             .expect("the failed run must append a notification");
         assert_eq!(notification.message, message);
-        setup_operation = notification.operation;
-        setup_summary = notification.operation.summary();
-        assert_eq!(setup_operation, job::FailedOperation::Setup);
+        assert_eq!(notification.title, job::FailedOperation::Setup.summary());
+        setup_summary = job::FailedOperation::Setup.summary();
     }
 
-    let fusion_operation;
     let fusion_summary;
     {
         let mut controller = controller_with_frames("summary_fusion", 2);
@@ -877,9 +921,8 @@ fn failure_summary_names_the_failed_operation() {
             .last()
             .expect("the failed run must append a notification");
         assert_eq!(notification.message, message);
-        fusion_operation = notification.operation;
-        fusion_summary = notification.operation.summary();
-        assert_eq!(fusion_operation, job::FailedOperation::Fusion);
+        assert_eq!(notification.title, job::FailedOperation::Fusion.summary());
+        fusion_summary = job::FailedOperation::Fusion.summary();
     }
 
     let mut summaries = vec![alignment_summary, setup_summary, fusion_summary];
@@ -1044,6 +1087,28 @@ fn write_progress_text_is_the_name_only() {
 
     let writing = fuse_progress(10, 10);
     assert_eq!(progress_text(&RunState::Running, Some(&writing)), "");
+}
+
+#[test]
+fn progress_phase_names_the_preparation_pass() {
+    use focusforge_core::job::{JobProgress, JobStage};
+    use focusforge_gui::job::{Phase, RunState, phase_line, progress_phase, progress_text};
+
+    // A finished-looking unit count must not read as `Writing`.
+    for (done, total) in [(0, 0), (3, 3), (7, 7)] {
+        let preparing = JobProgress {
+            stage: JobStage::Prepare,
+            units_done: done,
+            unit_total: total,
+            ..fuse_progress(0, 0)
+        };
+        assert_eq!(progress_phase(Some(&preparing)), Phase::Preparing);
+        assert_eq!(progress_text(&RunState::Running, Some(&preparing)), "");
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&preparing)).as_deref(),
+            Some("preparing")
+        );
+    }
 }
 
 #[test]
@@ -1639,10 +1704,10 @@ fn two_failures_keep_their_own_messages_and_requests() {
     );
 }
 
-/// Notification records outlive the single-slot toast they came from: a
-/// second failure replaces the first, still-unread toast, a retry appends
-/// its own record, and switching tabs afterwards drops nothing. Every
-/// record keeps its own tab's title, path and full message.
+/// Notification records outlive the toast queue they came from: a second
+/// failure queues its toast behind the first, each retry appends its own
+/// record, and switching tabs afterwards drops nothing. Every record keeps
+/// its own tab's title, path and full message.
 #[test]
 fn failure_notifications_outlive_the_toast() {
     let mut controller = AppController::new();
@@ -1668,47 +1733,54 @@ fn failure_notifications_outlive_the_toast() {
         .expect("tab B must fail")
         .to_string();
 
-    // The second failure replaces the first, still-unread toast slot.
-    let taken = controller
-        .take_settled_failure()
-        .expect("the most recent failure must still be pending");
-    assert_eq!(taken.message, message_b);
-    assert!(
-        controller.take_settled_failure().is_none(),
-        "a taken failure does not reappear"
-    );
+    // The second failure queues its toast behind the first; both records stay.
+    let latest = controller
+        .notifications()
+        .last()
+        .cloned()
+        .expect("the most recent failure must be recorded");
+    assert_eq!(latest.message, message_b);
 
-    assert!(
-        controller.retry_fuse(),
-        "retry on the active tab must start a run"
-    );
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
-    let retry_message = controller
-        .job_failure_message()
-        .expect("the retried tab must fail the same way")
-        .to_string();
+    let mut retry_messages = Vec::new();
+    for _ in 0..2 {
+        assert!(
+            controller.retry_fuse(),
+            "retry on the active tab must start a run"
+        );
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        retry_messages.push(
+            controller
+                .job_failure_message()
+                .expect("the retried tab must fail the same way")
+                .to_string(),
+        );
+    }
 
     controller.select_project(0);
 
     let notifications = controller.notifications();
     assert_eq!(
         notifications.len(),
-        3,
+        4,
         "every failure must be recorded, in order"
     );
 
     assert_eq!(notifications[0].message, message_a);
-    assert_eq!(notifications[0].operation, job::FailedOperation::Setup);
+    assert_eq!(
+        notifications[0].title,
+        job::FailedOperation::Setup.summary()
+    );
     assert_eq!(notifications[0].project_title, Some(title_a));
     assert_eq!(notifications[0].project_path, Some(path_a));
     assert_eq!(notifications[0].target, None);
 
     for (notification, message) in [
         (&notifications[1], &message_b),
-        (&notifications[2], &retry_message),
+        (&notifications[2], &retry_messages[0]),
+        (&notifications[3], &retry_messages[1]),
     ] {
         assert_eq!(notification.message, *message);
-        assert_eq!(notification.operation, job::FailedOperation::Setup);
+        assert_eq!(notification.title, job::FailedOperation::Setup.summary());
         assert_eq!(notification.project_title, Some(title_b.clone()));
         assert_eq!(notification.project_path, Some(path_b.clone()));
         assert_eq!(notification.target, None);
@@ -1729,13 +1801,12 @@ fn init_window_backend() {
     });
 }
 
-/// A failure that settles while the Projects overview is open is announced
-/// through the failure toast regardless of which tab is active: the run
-/// starts on the tab that will fail, a different tab is then selected, and
-/// the toast still opens once the overview is up.
+/// A failure that settles while the Projects overview is open raises no
+/// toast regardless of which tab is active: the run starts on the tab that
+/// will fail, a different tab is then selected, and the failure is recorded
+/// while the overview stays open.
 #[test]
-fn failure_while_the_overview_is_open_is_announced() {
-    use i_slint_backend_testing::ElementQuery;
+fn failure_while_the_overview_is_open_raises_no_toast() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
@@ -1764,35 +1835,21 @@ fn failure_while_the_overview_is_open_is_announced() {
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
 
     assert!(
-        app.get_job_toast_open(),
-        "a failure settling under the open overview must open the toast, \
-         regardless of which tab is active"
+        !app.get_toast_open(),
+        "Projects shows no toast, regardless of which tab is active"
     );
-    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert_eq!(controller.lock().unwrap().notifications().len(), 1);
     assert!(
         app.get_projects_overlay_open(),
         "the overview must stay open"
     );
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
-    let opacity = ElementQuery::from_root(&app)
-        .match_id("AppWindow::job-toast")
-        .find_first()
-        .expect("the toast is always in the tree")
-        .computed_opacity();
-    assert!(
-        opacity > 0.99,
-        "the toast must fade in to fully visible, got opacity {opacity}"
-    );
 }
 
-/// Display time counts only visible time: the toast's 6 s auto-dismiss runs
-/// from the moment it opens, so a failure settling under the open overview
-/// stays visible for its whole display time once shown, and closing the
-/// overview afterwards never brings a stale, already-expired toast back.
+/// A failure settling under the open overview raises no toast, and closing
+/// the overview afterwards replays nothing: the record stays unread and is
+/// the only trace of the failure.
 #[test]
-fn a_failure_toast_is_not_spent_while_hidden() {
-    use i_slint_backend_testing::ElementQuery;
+fn projects_suppresses_a_failure_toast_without_replay() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
@@ -1801,13 +1858,14 @@ fn a_failure_toast_is_not_spent_while_hidden() {
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let controller = Arc::new(Mutex::new(controller_with_an_unreadable_frame(
-        "toast_not_spent_while_hidden",
+        "toast_suppressed_by_projects",
     )));
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
         common::empty_canvas(),
-        std::rc::Rc::new(std::cell::RefCell::new(None)),
+        slot.clone(),
     );
     app.set_project_loaded(true);
 
@@ -1817,48 +1875,21 @@ fn a_failure_toast_is_not_spent_while_hidden() {
     app.invoke_fuse_requested();
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
     assert!(
-        app.get_job_toast_open(),
-        "the toast must open the moment the run settles, whether or not the overview is open"
+        !app.get_toast_open(),
+        "Projects shows no toast for a failure settling under it"
     );
-
-    let toast_opacity = || {
-        ElementQuery::from_root(&app)
-            .match_id("AppWindow::job-toast")
-            .find_first()
-            .expect("the toast is always in the tree")
-            .computed_opacity()
-    };
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
-    assert!(
-        toast_opacity() > 0.99,
-        "the toast must be fully visible once its fade-in completes"
-    );
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(5100));
-    assert!(
-        app.get_job_toast_open(),
-        "the toast must still be open at 5.5 s, not expired unseen"
-    );
-    assert!(
-        toast_opacity() > 0.99,
-        "the toast must still be fully visible at 5.5 s"
-    );
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
-    assert!(
-        !app.get_job_toast_open(),
-        "the toast must have auto-dismissed by 6.1 s"
-    );
+    assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
 
     controller.lock().unwrap().toggle_projects_overlay();
-    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    focusforge_gui::bridge::push_toast(&app, &controller, &slot);
+    assert!(!app.get_toast_open(), "closing Projects replays nothing");
+    let controller = controller.lock().unwrap();
     assert_eq!(
-        toast_opacity(),
-        0.0,
-        "closing the overview after the toast expired must not bring a stale toast back"
+        controller.unread_notifications(),
+        1,
+        "the record stays unread"
     );
+    assert_eq!(controller.notifications().len(), 1);
 }
 
 #[test]
@@ -3158,7 +3189,7 @@ fn a_failed_save_keeps_the_project_in_memory() {
 
     assert!(!controller.save_active_project(|_| None));
     assert!(
-        controller.take_settled_failure().is_none(),
+        controller.notifications().is_empty(),
         "a cancelled dialog is not a failure"
     );
     assert!(
@@ -3176,9 +3207,11 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert!(!saved);
     assert!(left.is_empty(), "nothing was left behind: {left:?}");
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("a failed save says why");
-    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.title, job::FailedOperation::Save.summary());
     assert_eq!(notification.target, Some(target.clone()));
     assert!(
         notification.message.contains(&target.display().to_string()),
@@ -3205,9 +3238,11 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert_eq!(left, [PathBuf::from("existing.ffp")]);
     assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("a failed save says why");
-    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.title, job::FailedOperation::Save.summary());
     assert_eq!(notification.target, Some(existing.clone()));
     assert!(
         notification
@@ -4263,7 +4298,11 @@ fn a_failed_save_keeps_the_tab_and_its_ops() {
     c.request_close(0);
     assert!(!c.save_and_close(|_| Some(missing.clone())));
     assert_eq!(c.project_tabs().len(), 1);
-    let note = c.take_settled_failure().expect("the failure is reported");
+    let note = c
+        .notifications()
+        .last()
+        .cloned()
+        .expect("the failure is reported");
     assert!(
         note.message.contains(&missing.display().to_string()),
         "{}",
@@ -5766,9 +5805,11 @@ fn a_failed_save_under_a_file_keeps_everything_held() {
         target.clone()
     )));
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("a failed save says why");
-    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.title, job::FailedOperation::Save.summary());
     assert_eq!(notification.target, Some(target.clone()));
     assert!(
         notification.message.contains(&target.display().to_string()),
@@ -5792,7 +5833,9 @@ fn a_failed_save_under_a_file_keeps_everything_held() {
     assert_eq!(held_paths(&controller), held_before);
     assert_eq!(controller.checkpoints_panel().row_count, rows);
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("Save and close says why too");
     assert_eq!(notification.target, Some(target));
 }

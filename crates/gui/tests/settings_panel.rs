@@ -585,6 +585,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         &ParamValues::new(),
         registration(Some(Equalization {
             max_gain: 1.5,
+            target_stops: 0.3,
             gains: vec![65536, 66000],
         })),
     );
@@ -595,6 +596,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     controller.toggle_section_more("prepare");
     assert_eq!(row(&controller, "equalize").selected, "true");
     assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
+    assert_eq!(row(&controller, "equalize-target").value_text, "+0.3");
 
     let mut plain = AppController::new();
     let project = seal_with_registration(
@@ -610,6 +612,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     plain.toggle_section_more("prepare");
     assert_eq!(row(&plain, "equalize").selected, "false");
     assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
+    assert_eq!(row(&plain, "equalize-target").value_text, "0.0");
 }
 
 fn equalize_selected(controller: &AppController) -> String {
@@ -676,6 +679,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         &ParamValues::new(),
         registration(Some(Equalization {
             max_gain: 1.5,
+            target_stops: 0.0,
             gains: vec![65536, 66000],
         })),
     );
@@ -1306,10 +1310,23 @@ fn no_algorithm_id_in_the_gui() {
         .collect();
     assert!(!ids.is_empty());
 
+    let boundary = "const SHIPPED: &str = \"laplacian\";\n#[cfg(test)]\nmod tests {\nconst FIXTURE: &str = \"dummy-align\";\n}";
+    let production = common::production_rust_source(boundary);
+    assert!(production.contains("laplacian"));
+    assert!(
+        !production.contains("dummy-align"),
+        "only cfg(test) fixture identifiers may leave the production scan"
+    );
+    assert!(
+        common::production_rust_source("const SHIPPED: &str = \"laplacian\";")
+            .contains("laplacian"),
+        "files without a cfg(test) tail stay fully scanned"
+    );
+
     let mut offenders = Vec::new();
     for path in common::find_rust_files(&common::src_dir()) {
         let contents = fs::read_to_string(&path).unwrap();
-        let code = common::strip_line_comments(&contents);
+        let code = common::strip_line_comments(common::production_rust_source(&contents));
         for id in &ids {
             if code.contains(id.as_str()) {
                 offenders.push(format!("{}: {id}", path.display()));
@@ -1704,7 +1721,7 @@ fn more_reveals_that_sections_advanced_rows() {
     let rows = controller.settings_panel().rows;
     assert_eq!(
         field_ids(&rows, "prepare"),
-        ["equalize", "equalize-max-gain"]
+        ["equalize", "equalize-max-gain", "equalize-target"]
     );
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
@@ -1718,6 +1735,41 @@ fn more_reveals_that_sections_advanced_rows() {
         rows[row_index(&rows, "prepare", "equalize")].selected,
         "true",
         "Details equalizes by default"
+    );
+}
+
+#[test]
+fn the_target_row_follows_max_gain_under_more() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    let rows = controller.settings_panel().rows;
+    let target = &rows[row_index(&rows, "prepare", "equalize-target")];
+    assert_eq!(
+        row_index(&rows, "prepare", "equalize-target"),
+        row_index(&rows, "prepare", "equalize-max-gain") + 1,
+        "the target row follows Max brightness gain"
+    );
+    assert_eq!(target.label, "Target brightness (stops)");
+    assert_eq!(
+        target.value_text, "0.0",
+        "the default is the neutral target"
+    );
+    assert!(
+        row_index(&rows, "prepare", "equalize-target")
+            > rows
+                .iter()
+                .position(|r| r.kind == RowKind::More && r.section == "prepare")
+                .unwrap(),
+        "the target is advanced, so it sits under More"
+    );
+
+    controller.toggle_section_more("prepare");
+    let rows = controller.settings_panel().rows;
+    assert!(
+        rows.iter()
+            .all(|r| !(r.section == "prepare" && r.id == "equalize-target")),
+        "More closed hides the target row"
     );
 }
 
@@ -2002,7 +2054,7 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
         let rows = controller.settings_panel().rows;
         assert_eq!(
             field_ids(&rows, "prepare"),
-            ["equalize", "equalize-max-gain"],
+            ["equalize", "equalize-max-gain", "equalize-target"],
             "{method}"
         );
         assert_eq!(
@@ -2138,7 +2190,10 @@ impl MountedPanel {
 
         init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
-        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        // Tall enough that every strip stays inside the panel's viewport with
+        // the Prepare and Fuse sections open: a strip below the viewport's edge
+        // is not mounted.
+        app.window().set_size(slint::PhysicalSize::new(1440, 1200));
         let mut controller = AppController::new();
         open_mantis_512(&mut controller);
         let controller = Arc::new(Mutex::new(controller));
@@ -2349,4 +2404,207 @@ fn more_strip_is_disabled_while_running() {
         panel.click_strip(section);
         assert!(panel.is_open(section), "{section} opens once enabled again");
     }
+}
+
+fn prepare_row(controller: &AppController, id: &str) -> SettingsRow {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "prepare" && r.id == id && r.kind != RowKind::Error)
+        .unwrap_or_else(|| panic!("the prepare section has a {id} row"))
+}
+
+#[test]
+fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.3));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
+    let disabled_prepare_rows = |controller: &AppController| -> Vec<String> {
+        controller
+            .settings_panel()
+            .rows
+            .iter()
+            .filter(|r| r.section == "prepare" && r.disabled)
+            .map(|r| r.id.clone())
+            .collect()
+    };
+
+    assert!(disabled_prepare_rows(&controller).is_empty());
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
+    assert_eq!(
+        disabled_prepare_rows(&controller),
+        ["equalize-max-gain", "equalize-target"],
+        "exactly the two dependent rows grey; the switch stays enabled"
+    );
+    assert!(!prepare_row(&controller, "equalize").disabled);
+    assert_eq!(
+        prepare_row(&controller, "equalize-target").value_text,
+        "+0.3"
+    );
+    assert_eq!(
+        prepare_row(&controller, "equalize-max-gain").value_text,
+        "1.5"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    assert!(disabled_prepare_rows(&controller).is_empty());
+    assert_eq!(
+        prepare_row(&controller, "equalize-target").value_text,
+        "+0.3"
+    );
+    assert_eq!(
+        prepare_row(&controller, "equalize-max-gain").value_text,
+        "1.5"
+    );
+}
+
+#[test]
+fn target_slider_snaps_to_its_step() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+
+    for (fraction, shown) in [(0.0, "\u{2212}0.5"), (0.37, "\u{2212}0.1"), (1.0, "+0.5")] {
+        controller.set_param_fraction("prepare", "equalize-target", fraction);
+        assert_eq!(
+            prepare_row(&controller, "equalize-target").value_text,
+            shown,
+            "target at fraction {fraction}"
+        );
+    }
+
+    // The other step (0.01) and the unsigned format: 1.01 + 0.37 * 0.99 snaps
+    // to 1.38, written without residue.
+    controller.set_param_fraction("prepare", "equalize-max-gain", 0.37);
+    assert_eq!(
+        prepare_row(&controller, "equalize-max-gain").value_text,
+        "1.38"
+    );
+}
+
+#[test]
+fn signed_readout_formats_negative_zero_and_positive() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+
+    for (value, shown) in [
+        (-0.5, "\u{2212}0.5"),
+        (0.0, "0.0"),
+        (0.2, "+0.2"),
+        (-0.0, "0.0"),
+    ] {
+        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(value));
+        assert_eq!(
+            prepare_row(&controller, "equalize-target").value_text,
+            shown,
+            "target {value:?}"
+        );
+    }
+
+    // A range that stays non-negative keeps the plain number.
+    controller.toggle_section_more("fuse");
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
+}
+
+#[test]
+fn keyboard_step_moves_the_target_by_one_step_and_clamps() {
+    use slint::ComponentHandle;
+    use slint::platform::{Key, WindowEvent};
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    let shown = |controller: &AppController| prepare_row(controller, "equalize-target").value_text;
+
+    controller.step_param("prepare", "equalize-target", 1);
+    assert_eq!(shown(&controller), "+0.1");
+
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(-0.5));
+    controller.step_param("prepare", "equalize-target", -1);
+    assert_eq!(
+        shown(&controller),
+        "\u{2212}0.5",
+        "Left at the minimum stays"
+    );
+
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.0));
+    for _ in 0..7 {
+        controller.step_param("prepare", "equalize-target", 1);
+    }
+    assert_eq!(shown(&controller), "+0.5", "Right at the maximum stays");
+
+    // The same press through the mounted window: a pointer press at the
+    // track's left end sets -0.5 and focuses the slider, Right then steps it.
+    let panel = MountedPanel::open();
+    panel.click_strip("prepare");
+    let rows = panel.rows();
+    let target_at = row_index(&rows, "prepare", "equalize-target");
+    let slider_position = rows[..target_at]
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                RowKind::LinearFloat | RowKind::LogFloat | RowKind::Int
+            )
+        })
+        .count();
+    let track = panel
+        .elements("FFSlider::drag-area")
+        .remove(slider_position);
+    let (origin, size) = (track.absolute_position(), track.size());
+    panel.click(slint::LogicalPosition::new(
+        origin.x + 1.0,
+        origin.y + size.height / 2.0,
+    ));
+    assert_eq!(
+        prepare_row(&panel.controller.lock().unwrap(), "equalize-target").value_text,
+        "\u{2212}0.5"
+    );
+
+    for key in [Key::RightArrow, Key::RightArrow] {
+        panel
+            .app
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+        panel
+            .app
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+        panel.perform();
+    }
+    assert_eq!(
+        prepare_row(&panel.controller.lock().unwrap(), "equalize-target").value_text,
+        "\u{2212}0.3",
+        "two Right presses move the stored target two steps"
+    );
+}
+
+#[test]
+fn the_panel_is_disabled_without_a_project() {
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    let mut controller = AppController::new();
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert!(!app.get_settings_enabled(), "no project open");
+
+    open_mantis_512(&mut controller);
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert!(app.get_settings_enabled(), "a project is open");
+}
+
+#[test]
+fn settings_opens_from_the_icon_bar() {
+    let panel = MountedPanel::open();
+    assert!(!panel.app.get_settings_open());
+
+    // The bar's lower control, 8 px above the window's bottom edge.
+    panel.click(slint::LogicalPosition::new(24.0, 1200.0 - 24.0));
+    assert!(panel.app.get_settings_open());
 }

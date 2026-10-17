@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A notification kind's own icon in its own colour; `tone` carries that
+// colour to whatever else marks the kind.
+
+import { Theme } from "../theme.slint";
+
+export component FFNotificationGlyph inherits Image {
+    // "info" | "warning" | "failure" | "crash".
+    in property <string> kind: "info";
+    out property <color> tone: root.kind == "failure" ? Theme.status-failure
+        : root.kind == "info" ? Theme.text-secondary
+        : Theme.status-warning;
+
+    source: root.kind == "info" ? @image-url("../../../../assets/icons/info.svg")
+        : @image-url("../../../../assets/icons/triangle-alert.svg");
+    colorize: root.tone;
+    width: Theme.icon-md;
+    height: Theme.icon-md;
+}
