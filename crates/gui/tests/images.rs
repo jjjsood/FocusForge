@@ -4157,3 +4157,62 @@ fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
     }
     assert_eq!(controller.lock().unwrap().checkpoint_count(), Some(2));
 }
+
+#[test]
+fn source_row_actions_and_panel_header_buttons_carry_their_names() {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode("stacking".into());
+    app.set_list_preview_dragging_row(-1);
+    app.set_list_preview_drag_target_row(-1);
+    let named = |id: &str| {
+        let handle = ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("{id} is mounted"));
+        assert_eq!(
+            handle.accessible_role(),
+            Some(AccessibleRole::Button),
+            "{id}"
+        );
+        handle.accessible_label().unwrap_or_default().to_string()
+    };
+
+    for presentation in ["list", "image-list", "large"] {
+        app.set_list_preview_presentation(presentation.into());
+        for (excluded, exclude_label) in [(false, "Exclude"), (true, "Include")] {
+            let row = focusforge_gui::ImageRowView {
+                chip: slint::Color::from_rgb_u8(220, 201, 55),
+                name: "IMG_9819.tif".into(),
+                time_text: "16:42:09".into(),
+                capture_stamp: "2026:08:29 16:42:09".into(),
+                excluded,
+                unresolved: false,
+                selected: false,
+                hovered: true,
+                focused: false,
+                job_disabled: false,
+                preview: slint::Image::default(),
+                preview_state: "ready".into(),
+            };
+            app.set_list_preview_rows(std::rc::Rc::new(slint::VecModel::from(vec![row])).into());
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            assert_eq!(
+                named(&format!("FFImageRow::{presentation}-exclude-button")),
+                exclude_label,
+                "{presentation}, excluded {excluded}"
+            );
+            assert_eq!(
+                named(&format!("FFImageRow::{presentation}-remove-button")),
+                "Remove"
+            );
+        }
+    }
+    assert_eq!(named("FFImagesPanel::add-button"), "Add images");
+    assert_eq!(named("FFImagesPanel::sort-button"), "Sort");
+}

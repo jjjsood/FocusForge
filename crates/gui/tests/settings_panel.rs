@@ -2483,12 +2483,19 @@ fn reset_all_and_switches_report_their_state() {
         "checked follows the value"
     );
 
-    let menus = find("FFMenu::area");
+    assert!(
+        find("FFMenu::area")
+            .iter()
+            .all(|area| area.accessible_role() == Some(AccessibleRole::None)),
+        "a menu is one accessible node, its root"
+    );
+    let menus = find("FFMenu::root");
     let fields = of_kind(&["picker", "enum"]);
     assert!(!fields.is_empty(), "the registry has picker and enum rows");
     assert_eq!(menus.len(), fields.len());
     for (menu, row) in menus.iter().zip(&fields) {
-        assert_eq!(menu.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(menu.accessible_role(), Some(AccessibleRole::Combobox));
+        assert_eq!(menu.accessible_enabled(), Some(true));
         assert_eq!(menu.accessible_label().as_deref(), Some(row.label.as_str()));
         assert_eq!(
             menu.accessible_value().as_deref(),

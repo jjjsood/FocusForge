@@ -2599,6 +2599,27 @@ fn segmented_segments_are_labelled_buttons() {
     );
 }
 
+/// Icon-only buttons in the bottom bar and the settings window carry a name.
+#[test]
+fn zoom_and_settings_close_are_labelled_buttons() {
+    let app = app_at(1440, 900);
+    app.set_project_loaded(true);
+    app.set_settings_open(true);
+    for (id, label) in [
+        ("FFZoomCluster::zoom-out", "Zoom out"),
+        ("FFZoomCluster::zoom-in", "Zoom in"),
+        ("FFSettingsModal::close", "Close settings"),
+    ] {
+        let button = one(&app, id);
+        assert_eq!(
+            button.accessible_role(),
+            Some(AccessibleRole::Button),
+            "{id}"
+        );
+        assert_eq!(button.accessible_label().as_deref(), Some(label), "{id}");
+    }
+}
+
 /// The toolbar's pipette, undo and redo are addressed by their own ids; undo
 /// and redo follow the history, the pipette follows picking.
 #[test]

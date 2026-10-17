@@ -39,6 +39,7 @@ export component FFMenu inherits Rectangle {
     // counted in this element's own layout height.
     height: ShellGeometry.field-height;
     accessible-role: combobox;
+    accessible-label: root.name;
     accessible-value: root.label;
     accessible-enabled: !root.disabled;
     accessible-expandable: true;
@@ -66,10 +67,6 @@ export component FFMenu inherits Rectangle {
         width: 100%;
         height: ShellGeometry.field-height;
         enabled: !root.disabled;
-        accessible-role: button;
-        accessible-label: root.name;
-        accessible-value: root.label;
-        accessible-enabled: !root.disabled;
         clicked => { root.toggled(); }
     }
 

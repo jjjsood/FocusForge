@@ -133,6 +133,7 @@ export component FFSettingsModal inherits FFModalPanel {
         x: root.panel-width - ShellGeometry.settings-header-inset-x - Theme.icon-md - self.pad;
         y: (ShellGeometry.settings-header-height - self.height) / 2;
         icon: @image-url("../../../../assets/icons/x.svg");
+        name: "Close settings";
         triggered => { root.settings-close-requested(); }
     }
 

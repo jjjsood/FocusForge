@@ -112,12 +112,14 @@ export component FFImagesPanel inherits Rectangle {
             if root.mutable && !root.job-disabled: HorizontalLayout {
                 spacing: Theme.space-1;
                 add-button := FFIconButton {
+                    name: "Add images";
                     icon: @image-url("../../../../../assets/icons/folder-plus.svg");
                     glyph-size: Theme.icon-sm;
                     pad: Theme.space-1;
                     triggered => { root.add-frames-requested(); }
                 }
                 sort-button := FFIconButton {
+                    name: "Sort";
                     icon: @image-url("../../../../../assets/icons/arrow-up-down.svg");
                     glyph-size: Theme.icon-sm;
                     pad: Theme.space-1;
