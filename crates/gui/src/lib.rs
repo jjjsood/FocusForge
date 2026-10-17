@@ -100,6 +100,9 @@ pub mod job;
 /// types directly.
 pub mod notifications;
 
+/// The boundary to the operating system's notification service.
+pub mod native_notify;
+
 /// The `Images` dock panel model, and the frame-set-change warnings' copy --
 /// no `use slint::` anywhere in it. `pub` so `tests/images.rs` reaches its
 /// types directly.

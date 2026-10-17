@@ -1667,18 +1667,22 @@ fn dispatch_notifications(
 }
 
 fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
-    let (shown, wait) = {
+    let (shown, wait, banners) = {
         let mut controller = controller.lock().unwrap();
         let now = Instant::now();
         controller.expire_toast(now);
+        let banners = controller.take_native_notifications();
         let shown = controller
             .visible_toast()
             .map(|n| (n.id, kind_word(n.kind), n.title.clone()));
         let wait = controller
             .toast_deadline()
             .map(|deadline| deadline.saturating_duration_since(now));
-        (shown, wait)
+        (shown, wait, banners)
     };
+    if !banners.is_empty() {
+        crate::native_notify::spawn(banners);
+    }
     match shown {
         Some((id, kind, title)) => {
             app.set_toast_id(i32::try_from(id).unwrap_or(i32::MAX));
@@ -2436,14 +2440,35 @@ impl CustomApplicationHandler for DropHandler {
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         _winit_window: Option<&winit::window::Window>,
         _slint_window: Option<&slint::Window>,
         event: &winit::event::WindowEvent,
     ) -> EventResult {
-        if let winit::event::WindowEvent::DroppedFile(path) = event {
-            record_gallery_input();
-            self.pending.push(path.clone());
+        use winit::event::WindowEvent;
+        let focused = match event {
+            WindowEvent::DroppedFile(path) => {
+                record_gallery_input();
+                self.pending.push(path.clone());
+                None
+            }
+            WindowEvent::Focused(focused) => Some(*focused),
+            WindowEvent::Destroyed => Some(false),
+            _ => None,
+        };
+        if let Some(focused) = focused {
+            self.controller
+                .lock()
+                .unwrap()
+                .set_window_focused(window_id.into(), focused);
+            let app = self
+                .app_handle
+                .borrow()
+                .as_ref()
+                .and_then(|app| app.upgrade());
+            if let Some(app) = app {
+                push_toast(&app, &self.controller, &self.toast_timer);
+            }
         }
         EventResult::Propagate
     }

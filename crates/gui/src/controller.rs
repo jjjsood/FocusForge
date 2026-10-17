@@ -38,7 +38,7 @@ use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
-use crate::notifications::{CrashEvidence, Kind, Notification, Notifications, Source};
+use crate::notifications::{Banner, CrashEvidence, Kind, Notification, Notifications, Source};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
 use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
 use crate::recent;
@@ -7663,9 +7663,14 @@ impl AppController {
         }
     }
 
-    /// Records whether the app window has focus.
-    pub fn set_window_focused(&mut self, focused: bool) {
-        self.notifications.set_focused(focused);
+    /// Records whether the app window `window` has focus.
+    pub fn set_window_focused(&mut self, window: u64, focused: bool) {
+        self.notifications.set_window_focused(window, focused);
+    }
+
+    /// The native banners due since the last call, each record once.
+    pub fn take_native_notifications(&mut self) -> Vec<Banner> {
+        self.notifications.take_native()
     }
 
     /// Stamps `record` with the local time and appends it, returning its id.

@@ -1,7 +1,7 @@
 //! The session's retained notifications and the rules that decide which of
 //! them reach the user as a toast.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,14 @@ impl Notification {
     }
 }
 
+/// What an operating-system banner shows: the record's title and its context
+/// line, never the full message or a full path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Banner {
+    pub title: String,
+    pub body: String,
+}
+
 /// The toast on screen. `deadline` is `None` while paused, with the time
 /// left in `remaining`.
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +131,7 @@ pub struct Notifications {
     projects_open: bool,
     center_open: bool,
     focused: bool,
+    focused_windows: HashSet<u64>,
     selected: Option<u64>,
     expanded: bool,
 }
@@ -136,6 +145,7 @@ impl Default for Notifications {
             projects_open: false,
             center_open: false,
             focused: true,
+            focused_windows: HashSet::new(),
             selected: None,
             expanded: false,
         }
@@ -324,6 +334,33 @@ impl Notifications {
         if focused && self.center_open {
             self.mark_all_read();
         }
+    }
+
+    /// Records that app window `window` gained or lost focus. The app counts
+    /// as focused while any window holds it, so focus moving between its own
+    /// windows is not a background transition.
+    pub fn set_window_focused(&mut self, window: u64, focused: bool) {
+        if focused {
+            self.focused_windows.insert(window);
+        } else {
+            self.focused_windows.remove(&window);
+        }
+        self.set_focused(!self.focused_windows.is_empty());
+    }
+
+    /// The native banner due for every record marked for one, each handed out
+    /// once.
+    pub fn take_native(&mut self) -> Vec<Banner> {
+        let mut banners = Vec::new();
+        for record in &mut self.records {
+            if std::mem::take(&mut record.native) {
+                banners.push(Banner {
+                    title: record.title.clone(),
+                    body: context_line(record),
+                });
+            }
+        }
+        banners
     }
 
     /// Drops the visible and queued toasts; the records stay.

@@ -188,6 +188,47 @@ window with unsaved work — including through the window manager, e.g.
 Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
 **Quit without saving**. Dismissing either question leaves everything open.
 
+## Notifications
+
+Everything the window has to tell you outside a dialog is kept as a
+notification for the rest of the session: a failed run or save, a processing
+notice such as a held brightness gain, skipped subfolders on an open and a
+notice about crash reports left by an earlier session. Nothing is written to
+disk, so closing the window ends the history.
+
+A bell sits in the icon bar down the left edge, just above the gear. Its badge
+counts the notifications you have not read and disappears at zero. Clicking
+the bell opens the **Notifications** center beside the bar; opening it marks
+every notification read, and it stays reachable with no project open and over
+the projects overlay (which it closes first). Each row shows a title, a
+context line with the source, project, file and time; select a row to read
+its full message.
+
+A new notification that arrives while the window is in front also appears as a
+toast: six seconds for most, ten for a crash notice, one at a time with the
+rest queued. Hovering a toast or focusing it from the keyboard pauses its
+timer, and clicking it opens the center on that notification. While the center
+or the projects overlay is open no toast is shown; what arrives meanwhile is
+kept, counted on the badge and never replayed as a toast.
+
+### Banners while the window is in the background
+
+When every FocusForge window is behind other applications, a new notification
+also appears once as a banner from your operating system, carrying only its
+title and a one-line context. The full message and any file paths stay in the
+center, which marks them read when you return to it. Switching between the
+main window and the detached pane does not count as leaving, no banner repeats
+when you come back, and none is shown while the projects overlay is open.
+Dismissing a banner, or the system refusing it, changes nothing in the app: the
+notification stays in the center and on the badge, and a send that fails is
+logged once and not retried.
+
+Banners use the identity `org.focusforge.FocusForge`. On Linux they go through
+the desktop's notification service, which attributes them to FocusForge when
+`assets/focusforge.desktop` is installed as
+`~/.local/share/applications/focusforge.desktop`. Without a running
+notification service there is no banner and everything else works as usual.
+
 ## The settings window
 
 The gear at the bottom of the window opens the settings window, which has

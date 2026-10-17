@@ -8825,7 +8825,7 @@ mod notification {
     fn opening_projects_closes_the_center_without_reading() {
         let mut controller = AppController::new();
         controller.open_center();
-        controller.set_window_focused(false);
+        controller.set_window_focused(1, false);
         controller.set_diagnostics_dirs(None, None);
         controller.scan_crash_notice();
         assert_eq!(
@@ -8852,5 +8852,123 @@ mod notification {
         );
         assert!(!controller.notification_center_open());
         assert_eq!(controller.unread_notifications(), 1);
+    }
+}
+
+mod native_delivery {
+    use super::{AppController, SETTLE, common};
+    use focusforge_gui::native_notify;
+    use focusforge_gui::notifications::{Banner, context_line};
+    use std::cell::Cell;
+
+    fn crash_notice(controller: &mut AppController) {
+        controller.set_diagnostics_dirs(None, None);
+        controller.scan_crash_notice();
+    }
+
+    #[test]
+    fn background_arrival_is_banner_once() {
+        let mut controller = common::controller_with_frames("native_once", 3);
+        controller.set_align_algorithm("dummy-align");
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        assert!(controller.start_fuse());
+        controller
+            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+            .expect_err("a running job refuses an add");
+
+        let titles: Vec<_> = controller
+            .take_native_notifications()
+            .into_iter()
+            .map(|b| b.title)
+            .collect();
+        assert_eq!(titles.len(), 2, "{titles:?}");
+        assert_ne!(titles[0], titles[1]);
+        for focused in [true, false, true, false] {
+            controller.set_window_focused(1, focused);
+            assert!(controller.take_native_notifications().is_empty());
+        }
+        common::wait_for_settle(&mut controller, SETTLE);
+    }
+
+    #[test]
+    fn focus_moving_between_app_windows_is_not_background() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, true);
+        controller.set_window_focused(1, false);
+        controller.set_window_focused(2, true);
+        crash_notice(&mut controller);
+        controller.set_window_focused(2, false);
+        controller.set_window_focused(1, true);
+        crash_notice(&mut controller);
+        assert!(controller.take_native_notifications().is_empty());
+
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        assert_eq!(controller.take_native_notifications().len(), 1);
+    }
+
+    #[test]
+    fn destroyed_focused_window_stops_counting() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(2, true);
+        controller.set_window_focused(2, false);
+        crash_notice(&mut controller);
+        assert_eq!(controller.take_native_notifications().len(), 1);
+    }
+
+    #[test]
+    fn projects_suppresses_native_delivery() {
+        let mut controller = AppController::new();
+        controller.toggle_projects_overlay();
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        assert_eq!(controller.unread_notifications(), 1);
+        assert!(controller.take_native_notifications().is_empty());
+    }
+
+    #[test]
+    fn foreground_arrival_is_never_native() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, true);
+        crash_notice(&mut controller);
+        assert!(controller.take_native_notifications().is_empty());
+    }
+
+    #[test]
+    fn banner_carries_title_and_context_only() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        let record = controller.notifications()[0].clone();
+        let banners = controller.take_native_notifications();
+        assert_eq!(
+            banners,
+            [Banner {
+                title: record.title.clone(),
+                body: context_line(&record),
+            }]
+        );
+        assert!(!banners[0].body.contains(&record.message));
+    }
+
+    #[test]
+    fn native_send_failure_keeps_history_and_unread() {
+        let mut controller = AppController::new();
+        controller.set_window_focused(1, false);
+        crash_notice(&mut controller);
+        crash_notice(&mut controller);
+        let banners = controller.take_native_notifications();
+        assert_eq!(banners.len(), 2);
+
+        let calls = Cell::new(0);
+        native_notify::deliver(banners, |_| {
+            calls.set(calls.get() + 1);
+            Err::<(), _>("no notification service")
+        });
+        assert_eq!(calls.get(), 2, "one attempt per banner, no retry");
+        assert_eq!(controller.notifications().len(), 2);
+        assert_eq!(controller.unread_notifications(), 2);
+        assert!(controller.take_native_notifications().is_empty());
     }
 }
