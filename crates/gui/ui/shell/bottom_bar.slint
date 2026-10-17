@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The bottom bar: the only band that spans the dock. Holds the gear
-// control (the only reach to `Input map` settings) and the zoom cluster.
+// The bottom bar: the only band that spans the dock. Holds the status line,
+// the run's progress, the overlay controls and the zoom cluster.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -11,37 +11,7 @@ import { FFToggle } from "../components/ff_toggle.slint";
 import { FFSlider } from "../components/ff_slider.slint";
 import { FFRowText } from "../components/ff_row_text.slint";
 
-// The gear's own persistently-boxed button -- the "icon button" catalogue
-// entry, whose default state already carries a visible background. Not
-// shared with the zoom cluster's own buttons: the gear is a single
-// standalone control, not a segment of a grouped surface, so it keeps its
-// own box at rest rather than the zoom buttons' hover-only convention
-// below.
-component FFGearButton inherits Rectangle {
-    in property <image> icon;
-    callback pressed();
-
-    // Matches the zoom cluster's own icon buttons for one shared baseline
-    // across the bar (`Theme.icon-md + 2 * Theme.space-2` = 32px).
-    width: Theme.icon-md + 2 * Theme.space-2;
-    height: self.width;
-    background: area.has-hover ? Theme.surface-hover : Theme.surface-overlay;
-    border-radius: Theme.radius-sm;
-    accessible-role: button;
-
-    area := TouchArea {
-        clicked => { root.pressed(); }
-    }
-    Image {
-        source: root.icon;
-        colorize: area.has-hover ? Theme.text-primary : Theme.text-secondary;
-        width: Theme.icon-md;
-        height: Theme.icon-md;
-    }
-}
-
 export component FFBottomBar inherits Rectangle {
-    callback settings-requested();
     in property <string> zoom-readout: "";
     in property <bool> project-loaded: false;
     callback zoom-in-requested();
@@ -71,29 +41,12 @@ export component FFBottomBar inherits Rectangle {
     height: ShellGeometry.bottom-bar-height;
     background: Theme.surface-raised;
 
-    gear := FFGearButton {
-        x: Theme.space-3;
-        y: (parent.height - self.height) / 2;
-        icon: @image-url("../../../../assets/icons/settings.svg");
-        pressed => { root.settings-requested(); }
-    }
-
-    // The status line: a 1 x 20 rule one grid step right of the gear, then
-    // the text a further 16 px on, both centred on the bar. Without a
-    // project it reads `No project open` in `text.disabled`; with one open
-    // and nothing to report it reads `No job running`; otherwise it is the
-    // run's own stage word, bold, in the failure colour once the run has
-    // failed.
-    status-rule := Rectangle {
-        x: gear.x + gear.width + Theme.space-2;
-        y: (parent.height - self.height) / 2;
-        width: 1px;
-        height: 20px;
-        background: Theme.border-default;
-    }
-
+    // The status line, centred on the bar. Without a project it reads `No
+    // project open` in `text.disabled`; with one open and nothing to report
+    // it reads `No job running`; otherwise it is the run's own stage word,
+    // bold, in the failure colour once the run has failed.
     status-text := Text {
-        x: status-rule.x + Theme.space-4;
+        x: Theme.space-4 + Theme.space-1;
         y: 0px;
         height: parent.height;
         text: !root.project-loaded ? "No project open"
@@ -175,7 +128,7 @@ export component FFBottomBar inherits Rectangle {
         value-text: root.overlay-text;
         fraction-changed(f) => { root.overlay-fraction-changed(f); }
     }
-    // Mirrors `status-rule`'s own divider, separating the overlay cluster
+    // A 1 x 20 divider separating the overlay cluster
     // from the zoom cluster.
     Rectangle {
         x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-rule-offset;

@@ -71,6 +71,8 @@ GNU General Public License v3.
   Finish sections, switch alignment on or off, run, pause, cancel or retry a fuse,
   and switch into editor mode to retouch the result, browse its
   checkpoints and export an image in the format you choose
+- Choose List, Image list or Large previews for the source panel; the chosen presentation persists with the rest of the window settings
+- Keeps every failure and processing notice in a notification center behind a bell, and raises an operating-system banner when the window is in the background
 
 ## Quick start
 

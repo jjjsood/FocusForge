@@ -67,7 +67,43 @@ impl Downsampler {
         target_width: u32,
         target_height: u32,
     ) -> Self {
-        let crop = center_crop(source_width, source_height, target_width, target_height);
+        Self::with_source_rect(
+            center_crop(source_width, source_height, target_width, target_height),
+            samples_per_pixel,
+            target_width,
+            target_height,
+        )
+    }
+
+    /// Seeds a reduction that maps the full original source into its target.
+    /// The caller chooses an aspect-fitting target, so every source edge
+    /// contributes before display adds its own letterboxing.
+    pub fn new_full_source(
+        source_width: u32,
+        source_height: u32,
+        samples_per_pixel: u32,
+        target_width: u32,
+        target_height: u32,
+    ) -> Self {
+        Self::with_source_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: source_width,
+                height: source_height,
+            },
+            samples_per_pixel,
+            target_width,
+            target_height,
+        )
+    }
+
+    fn with_source_rect(
+        crop: Rect,
+        samples_per_pixel: u32,
+        target_width: u32,
+        target_height: u32,
+    ) -> Self {
         let cells = target_width as usize * target_height as usize;
         Downsampler {
             crop,

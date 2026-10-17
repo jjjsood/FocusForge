@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One retained notification in the center: kind icon, title and context line;
+// selected it takes the overlay fill, expanded it shows the full message and,
+// for a crash record, its state line and the Acknowledge and Diagnostics
+// actions. A rule closes the row.
+
+import { Theme } from "../theme.slint";
+import { FFButton } from "ff_button.slint";
+import { FFDivider } from "ff_divider.slint";
+import { FFHeading } from "ff_heading.slint";
+import { FFNotificationGlyph } from "ff_notification_glyph.slint";
+import { FFRowText } from "ff_row_text.slint";
+
+export component FFNotificationRow inherits Rectangle {
+    // "info" | "warning" | "failure" | "crash".
+    in property <string> kind: "info";
+    in property <string> title: "";
+    in property <string> context: "";
+    in property <string> message: "";
+    in property <bool> selected: false;
+    // The full message (and the crash actions) show; a selected row is
+    // normally expanded.
+    in property <bool> expanded: false;
+    // Keyboard focus ring around the card.
+    in property <bool> focused: false;
+    // "" for a record without crash actions; otherwise "unacknowledged" |
+    // "failed" | "unavailable" | "acknowledged".
+    in property <string> crash-state: "";
+    // The stored failure text, shown under the failed-acknowledgement line.
+    in property <string> crash-error: "";
+    callback clicked();
+    callback acknowledge();
+    callback diagnostics();
+
+    // The card's inset on the left, right and bottom; the text column starts
+    // one glyph and its gap after the left inset.
+    property <length> pad: Theme.space-4;
+    property <length> text-x: root.pad + 26px;
+    property <length> card-min-height: 76px;
+
+    height: Theme.space-4 + card.height + 1px;
+
+    VerticalLayout {
+        padding-top: Theme.space-4;
+
+        card := Rectangle {
+            height: root.expanded
+                ? max(root.card-min-height, body.y + body.preferred-height + root.pad)
+                : root.card-min-height;
+            background: root.selected ? Theme.surface-overlay : transparent;
+            border-width: root.focused ? 1px : 0px;
+            border-color: Theme.accent-default;
+            accessible-role: list-item;
+            accessible-label: root.title;
+            accessible-checked: root.selected;
+
+            TouchArea {
+                clicked => { root.clicked(); }
+            }
+
+            FFNotificationGlyph {
+                x: root.pad;
+                y: Theme.space-3;
+                kind: root.kind;
+            }
+            FFHeading {
+                x: root.text-x;
+                y: Theme.space-2;
+                width: parent.width - self.x - root.pad;
+                height: 20px;
+                size: "body";
+                text: root.title;
+                overflow: elide;
+            }
+            FFRowText {
+                x: root.text-x;
+                y: 32px;
+                width: parent.width - self.x - root.pad;
+                height: 20px;
+                text: root.context;
+                muted: true;
+                overflow: elide;
+            }
+
+            body := VerticalLayout {
+                x: root.text-x;
+                y: 61px;
+                width: parent.width - self.x - root.pad;
+                spacing: Theme.space-6;
+                alignment: start;
+
+                if root.expanded: Text {
+                    text: root.message;
+                    color: Theme.text-secondary;
+                    font-size: Theme.text-body.size;
+                    wrap: word-wrap;
+                }
+                if root.expanded && (root.crash-state == "failed" || root.crash-state == "unavailable"): VerticalLayout {
+                    spacing: Theme.space-1;
+                    alignment: start;
+
+                    Text {
+                        text: root.crash-state == "failed"
+                            ? "Could not acknowledge report. Evidence remains unreported. Try the explicit action again."
+                            : "Crash report folder unavailable. Notifications remain usable; Diagnostics is still reachable.";
+                        color: Theme.status-failure;
+                        font-size: Theme.text-body.size;
+                        wrap: word-wrap;
+                    }
+                    if root.crash-state == "failed" && root.crash-error != "": Text {
+                        text: root.crash-error;
+                        color: Theme.status-failure;
+                        font-size: Theme.text-body.size;
+                        wrap: word-wrap;
+                    }
+                }
+                if root.expanded && root.crash-state == "acknowledged": FFRowText {
+                    text: "Acknowledged";
+                    muted: true;
+                    height: 20px;
+                }
+                if root.expanded && root.crash-state != "": HorizontalLayout {
+                    FFButton {
+                        kind: "secondary";
+                        text: "Acknowledge";
+                        enabled: root.crash-state == "unacknowledged" || root.crash-state == "failed";
+                        clicked => { root.acknowledge(); }
+                    }
+                    FFButton {
+                        kind: "secondary";
+                        text: "Diagnostics";
+                        clicked => { root.diagnostics(); }
+                    }
+                }
+            }
+        }
+        FFDivider { }
+    }
+}

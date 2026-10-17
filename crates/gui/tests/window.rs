@@ -219,13 +219,13 @@ fn dock_back_restores_two_panes() {
     controller.undock_requested(PaneSource::Frame);
     app.set_detached_pane("frame".into());
     assert_eq!(app.get_canvas_pane_left_width(), 0.0);
-    assert_eq!(app.get_canvas_pane_right_width(), 1148.0);
+    assert_eq!(app.get_canvas_pane_right_width(), 1100.0);
 
     controller.undocked_window_closed(PaneSource::Frame);
     app.set_detached_pane("".into());
     assert_eq!(controller.detached_pane(), None);
-    assert_eq!(app.get_canvas_pane_left_width(), 566.0);
-    assert_eq!(app.get_canvas_pane_right_width(), 566.0);
+    assert_eq!(app.get_canvas_pane_left_width(), 542.0);
+    assert_eq!(app.get_canvas_pane_right_width(), 542.0);
 }
 
 #[test]

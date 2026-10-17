@@ -856,15 +856,16 @@ fn device_lost_falls_back() {
 /// An equalized run on a real adapter applies the same gains as with
 /// `--cpu`. Near-tie winners move single samples by hundreds of LSB, so
 /// parity is judged on the mean level equalization shifts each composite
-/// by; a path whose reader lacks the gain shifts by zero.
+/// by, with a target above the stack's own mean so the shift is real; a path
+/// whose reader lacks the gain shifts by zero.
 #[test]
 fn equalized_stack_gpu_matches_no_gpu() {
     /// Per-sample bound between the two equalized composites, the same
     /// measured near-tie bound as `stack_gpu_matches_stack_no_gpu`.
     const TOLERANCE: i32 = 512;
-    /// The CPU path's equalized mean sat 153.8 LSB above its unequalized one
-    /// (mean 36 455.95 to 36 609.72); a shift under this is not equalization.
-    const MIN_SHIFT: f64 = 100.0;
+    /// At a target of +0.2 stops the CPU path's equalized mean sat 5 420.4 LSB
+    /// above its unequalized one; a shift under this is not equalization.
+    const MIN_SHIFT: f64 = 1000.0;
     /// How far the two paths' shifts may differ, as a share of the CPU's.
     const SHIFT_AGREEMENT: f64 = 0.1;
 
@@ -881,11 +882,12 @@ fn equalized_stack_gpu_matches_no_gpu() {
     };
     let mean =
         |samples: &[u16]| samples.iter().map(|&s| f64::from(s)).sum::<f64>() / samples.len() as f64;
+    let on = ["--set", "equalize=true", "--set", "equalize-target=0.2"];
 
     let (gpu_off, gpu_off_report) = composite("gpu-off", &[]);
-    let (gpu_on, gpu_on_report) = composite("gpu-on", &["--set", "equalize=true"]);
+    let (gpu_on, gpu_on_report) = composite("gpu-on", &on);
     let (cpu_off, _) = composite("cpu-off", &["--cpu"]);
-    let (cpu_on, cpu_on_report) = composite("cpu-on", &["--cpu", "--set", "equalize=true"]);
+    let (cpu_on, cpu_on_report) = composite("cpu-on", &[&["--cpu"], &on[..]].concat());
 
     assert_ne!(gpu_on_report["backend"], "cpu", "{gpu_on_report}");
     assert_ne!(gpu_off_report["backend"], "cpu", "{gpu_off_report}");

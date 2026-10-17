@@ -645,12 +645,11 @@ fn init_window_backend() {
 }
 
 /// Run again on a failed card, started from inside the open overview,
-/// announces its own failure there too: the overview stays open, the toast
-/// carries the operation's summary, and the card it re-ran still reads
-/// `failed` with one card per tab.
+/// raises no toast for its own failure: the overview stays open, a second
+/// record is kept, and the card it re-ran still reads `failed` with one
+/// card per tab.
 #[test]
-fn run_again_failure_is_announced_over_the_overview() {
-    use i_slint_backend_testing::ElementQuery;
+fn run_again_failure_over_the_overview_raises_no_toast() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
@@ -675,10 +674,18 @@ fn run_again_failure_is_announced_over_the_overview() {
     // expire so the second opening below is the one under test.
     app.invoke_fuse_requested();
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
-    assert!(app.get_job_toast_open());
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(6100));
+    assert!(app.get_toast_open());
+    controller
+        .lock()
+        .unwrap()
+        .expire_toast(std::time::Instant::now() + Duration::from_secs(7));
+    focusforge_gui::bridge::push_toast(
+        &app,
+        &controller,
+        &std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     assert!(
-        !app.get_job_toast_open(),
+        !app.get_toast_open(),
         "the first toast must have expired before the retry"
     );
 
@@ -690,23 +697,13 @@ fn run_again_failure_is_announced_over_the_overview() {
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
 
     assert!(
-        app.get_job_toast_open(),
-        "Run again's own failure must be announced too"
+        !app.get_toast_open(),
+        "Projects shows no toast for Run again's failure"
     );
-    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert_eq!(controller.lock().unwrap().notifications().len(), 2);
     assert!(
         app.get_projects_overlay_open(),
         "the overview must stay open"
-    );
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
-    let opacity = ElementQuery::from_root(&app)
-        .match_id("AppWindow::job-toast")
-        .find_first()
-        .expect("the toast is always in the tree")
-        .computed_opacity();
-    assert!(
-        opacity > 0.99,
-        "the toast must be visible over the overview, got opacity {opacity}"
     );
 
     let cards = controller.lock().unwrap().project_cards();
@@ -1793,4 +1790,130 @@ fn rail_entries_are_labelled_buttons() {
         assert_eq!(row.accessible_role(), Some(AccessibleRole::Button));
         assert_eq!(row.accessible_label().as_deref(), Some(name));
     }
+}
+
+/// The bell stays reachable over the overview: a pointer press, or Tab to it
+/// and Return, closes the overview and opens the center with the keyboard
+/// inside it, and opening the overview again closes the center without
+/// touching the unread count.
+#[test]
+fn bell_in_projects_opens_the_center_with_focus_inside() {
+    use slint::ComponentHandle;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+
+    let mut controller = controller_with_frames("bell_in_projects", 4);
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    for _ in 0..2 {
+        assert!(
+            controller
+                .add_frames(&[common::fixture_frame("mantis-64", 4)])
+                .is_err(),
+            "a running job refuses an add"
+        );
+    }
+    wait_for_settle(&mut controller, Duration::from_secs(60));
+    let newest = controller.notifications().last().unwrap().id;
+    let controller = Arc::new(Mutex::new(controller));
+    let slot = Rc::new(RefCell::new(None));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        slot.clone(),
+    );
+    focusforge_gui::bridge::push_toast(&app, &controller, &slot);
+
+    let event = |event: WindowEvent| {
+        app.window().dispatch_event(event);
+        slint::platform::update_timers_and_animations();
+    };
+    let key = |key: Key| {
+        let text: slint::SharedString = key.into();
+        event(WindowEvent::KeyPressed { text: text.clone() });
+        event(WindowEvent::KeyReleased { text });
+    };
+    let settle_slide = || {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+        slint::platform::update_timers_and_animations();
+    };
+    let open_projects = || {
+        controller.lock().unwrap().toggle_projects_overlay();
+        focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
+        focusforge_gui::bridge::push_toast(&app, &controller, &slot);
+        settle_slide();
+    };
+    let bell_ringed = || {
+        i_slint_backend_testing::ElementQuery::from_root(&app)
+            .match_id("FFIconButton::ring")
+            .find_all()
+            .iter()
+            .any(|ring| {
+                let at = ring.absolute_position();
+                (at.x, at.y) == (8.0, 820.0)
+            })
+    };
+    let selection = || controller.lock().unwrap().notification_selection();
+    let center_open = || controller.lock().unwrap().notification_center_open();
+    let projects_open = || controller.lock().unwrap().projects_overlay_open();
+
+    open_projects();
+    assert!(app.get_projects_overlay_open() && !app.get_toast_open());
+    assert_eq!(
+        app.get_notifications_unread(),
+        2,
+        "the badge stays over Projects"
+    );
+
+    // Pointer.
+    let position = slint::LogicalPosition::new(24.0, 836.0);
+    event(WindowEvent::PointerMoved { position });
+    event(WindowEvent::PointerPressed {
+        position,
+        button: PointerEventButton::Left,
+    });
+    event(WindowEvent::PointerReleased {
+        position,
+        button: PointerEventButton::Left,
+    });
+    settle_slide();
+    assert!(!projects_open() && !app.get_projects_overlay_open());
+    assert!(center_open() && app.get_notification_center_open());
+    assert_eq!(app.get_notifications_unread(), 0);
+    key(Key::DownArrow);
+    assert_eq!(
+        selection(),
+        (Some(newest), false),
+        "the keys reach the center"
+    );
+
+    // Keyboard.
+    open_projects();
+    assert!(!center_open(), "Projects closes the center");
+    assert_eq!(
+        app.get_notifications_unread(),
+        0,
+        "and changes no unread state"
+    );
+    let mut tabs = 0;
+    while !bell_ringed() {
+        assert!(tabs < 60, "Tab never reached the bell");
+        key(Key::Tab);
+        tabs += 1;
+    }
+    key(Key::Return);
+    settle_slide();
+    assert!(!projects_open() && center_open());
+    let before = selection();
+    key(Key::DownArrow);
+    assert_ne!(selection(), before, "Down moves the center's selection");
 }

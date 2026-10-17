@@ -12,6 +12,63 @@ use focusforge_gui::input_map::InputTable;
 use focusforge_gui::recent::{self, RecentEntry};
 
 #[test]
+fn appearance_presentation_loads_defaults_and_round_trips_saved_choice() {
+    use focusforge_gui::appearance_settings::{self, AppearanceSettings, SourcePresentation};
+
+    let absent = tempfile::tempdir().unwrap();
+    assert_eq!(
+        appearance_settings::load(absent.path()),
+        AppearanceSettings::default(),
+        "an absent settings file keeps the default presentation"
+    );
+
+    for source in [
+        "[recent]\nkeep = \"yes\"\n",
+        "[appearance]\npresentation = 3\n",
+        "[appearance]\npresentation = \"gallery\"\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.toml"), source).unwrap();
+        assert_eq!(
+            appearance_settings::load(dir.path()),
+            AppearanceSettings::default(),
+            "{source:?} must fall back without accepting an invalid appearance choice"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    fs::write(
+        &path,
+        "[recent]\nkeep = \"yes\"\n\n[appearance]\npresentation = \"list\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        appearance_settings::load(dir.path()),
+        AppearanceSettings {
+            presentation: SourcePresentation::List,
+        }
+    );
+    appearance_settings::save(
+        dir.path(),
+        AppearanceSettings {
+            presentation: SourcePresentation::Large,
+        },
+    )
+    .unwrap();
+    let saved = fs::read_to_string(path).unwrap();
+    assert!(saved.contains("[recent]\nkeep = \"yes\""));
+    assert!(saved.contains("[appearance]\npresentation = \"large\""));
+    assert_eq!(
+        appearance_settings::load(dir.path()),
+        AppearanceSettings {
+            presentation: SourcePresentation::Large,
+        },
+        "the saved appearance choice survives a fresh load"
+    );
+}
+
+#[test]
 fn absent_tables_read_as_defaults() {
     // Neither table, no file at all.
     let dir = tempfile::tempdir().unwrap();
@@ -198,6 +255,8 @@ fn saving_recent_keeps_hand_edited_input() {
 
 #[test]
 fn unparseable_file_is_never_overwritten() {
+    use focusforge_gui::appearance_settings::{self, AppearanceSettings, SourcePresentation};
+
     for original in ["not valid toml {{{", "[inp"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
@@ -214,14 +273,29 @@ fn unparseable_file_is_never_overwritten() {
 
         let result = recent::save(dir.path(), &[]);
         assert!(result.is_err(), "{original:?}");
+        assert!(
+            appearance_settings::save(
+                dir.path(),
+                AppearanceSettings {
+                    presentation: SourcePresentation::Large,
+                },
+            )
+            .is_err()
+        );
 
-        let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, original, "the unparseable file must be untouched");
+        let after = fs::read(&path).unwrap();
+        assert_eq!(
+            after,
+            original.as_bytes(),
+            "the unparseable file must be untouched"
+        );
     }
 }
 
 #[test]
 fn non_utf8_file_is_never_overwritten() {
+    use focusforge_gui::appearance_settings::{self, AppearanceSettings, SourcePresentation};
+
     // A `settings.toml` that exists but cannot even be read as UTF-8 must
     // never be treated as "absent": that would silently wipe its `[input]`
     // table on the very next `[recent]` save.
@@ -243,6 +317,15 @@ fn non_utf8_file_is_never_overwritten() {
     assert!(
         result.is_err(),
         "a save must refuse, not silently wipe the file"
+    );
+    assert!(
+        appearance_settings::save(
+            dir.path(),
+            AppearanceSettings {
+                presentation: SourcePresentation::Large,
+            },
+        )
+        .is_err()
     );
 
     let after = fs::read(&path).unwrap();

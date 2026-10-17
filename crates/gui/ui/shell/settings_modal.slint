@@ -16,6 +16,7 @@ import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
 import { FFPerformanceTab, PerformanceCap, PerformanceState } from "settings_modal/performance_tab.slint";
 import { FFStorageTab, StoragePathState, StorageState } from "settings_modal/storage_tab.slint";
 import { AboutState, FFAboutTab } from "settings_modal/about_tab.slint";
+import { FFAppearanceTab } from "settings_modal/appearance_tab.slint";
 export { AboutState, FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 
 export component FFSettingsModal inherits FFModalPanel {
@@ -31,6 +32,14 @@ export component FFSettingsModal inherits FFModalPanel {
     callback performance-vram-cap-edited(string);
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <string> appearance-presentation: "image-list";
+    in property <bool> appearance-menu-open: false;
+    in property <bool> appearance-menu-focused: false;
+    in property <bool> appearance-menu-disabled: false;
+    in property <string> appearance-save-error: "";
+    callback appearance-presentation-selected(string);
+    callback appearance-menu-toggled();
 
     in property <StorageState> storage;
     callback storage-clear-requested();
@@ -74,6 +83,12 @@ export component FFSettingsModal inherits FFModalPanel {
             icon-source: @image-url("../../../../assets/icons/cpu.svg");
             selected: root.settings-section == "performance";
             clicked => { root.settings-section-selected("performance"); }
+        }
+        FFNavRailEntry {
+            label: "Appearance";
+            icon-source: @image-url("../../../../assets/icons/picture-in-picture-2.svg");
+            selected: root.settings-section == "appearance";
+            clicked => { root.settings-section-selected("appearance"); }
         }
         FFNavRailEntry {
             label: "Storage";
@@ -163,6 +178,18 @@ export component FFSettingsModal inherits FFModalPanel {
             vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
             host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
             vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        }
+
+        if root.settings-section == "appearance": FFAppearanceTab {
+            width: 100%;
+            height: 100%;
+            presentation: root.appearance-presentation;
+            menu-open: root.appearance-menu-open;
+            menu-focused: root.appearance-menu-focused;
+            menu-disabled: root.appearance-menu-disabled;
+            save-error: root.appearance-save-error;
+            presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+            menu-toggled => { root.appearance-menu-toggled(); }
         }
 
         if root.settings-section == "storage": FFStorageTab {

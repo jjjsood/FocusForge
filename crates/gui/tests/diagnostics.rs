@@ -94,6 +94,7 @@ fn live_slugs() -> Vec<&'static str> {
         slugs,
         [
             "performance",
+            "appearance",
             "storage",
             "input-map",
             "diagnostics",

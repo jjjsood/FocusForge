@@ -552,8 +552,15 @@ fn resume_refuses_changed_equalization() {
     let mut record = job_record(&stack, &values, &composite_path, None);
     record.equalization = Some(Equalization {
         max_gain: 1.25,
+        target_stops: 0.0,
         gains: vec![UNIT_GAIN; stack.len()],
     });
+    record.align = Some(AlignIdentity::new(
+        "pyramidal-ecc",
+        ParamValues::new(),
+        FailurePolicy::Strict,
+        vec![UNIT_GAIN; stack.len()],
+    ));
     store.begin(&record).unwrap();
 
     let same = record.clone();
@@ -568,9 +575,24 @@ fn resume_refuses_changed_equalization() {
     other_gain.equalization.as_mut().unwrap().gains[0] = UNIT_GAIN + 1;
     let mut other_bound = record.clone();
     other_bound.equalization.as_mut().unwrap().max_gain = 1.5;
-    for changed in [off, other_gain, other_bound] {
+    let mut other_target = record.clone();
+    other_target.equalization.as_mut().unwrap().target_stops = 0.1;
+    for changed in [off, other_gain, other_bound, other_target] {
         match store.find(&changed).unwrap() {
             Resumable::Mismatch(mismatch) => assert_eq!(mismatch.field, "equalization"),
+            other => panic!("expected Resumable::Mismatch, got {other:?}"),
+        }
+    }
+
+    // The alignment read the prepared sources: other prepared gains, or none,
+    // are another alignment.
+    let mut other_prepared = record.clone();
+    other_prepared.align.as_mut().unwrap().gains[0] = UNIT_GAIN + 1;
+    let mut unprepared = record.clone();
+    unprepared.align.as_mut().unwrap().gains.clear();
+    for changed in [other_prepared, unprepared] {
+        match store.find(&changed).unwrap() {
+            Resumable::Mismatch(mismatch) => assert_eq!(mismatch.field, "align"),
             other => panic!("expected Resumable::Mismatch, got {other:?}"),
         }
     }
@@ -809,6 +831,7 @@ fn a_record_from_another_solver_revision_is_not_resumable() {
         "pyramidal-ecc",
         ParamValues::new(),
         FailurePolicy::Strict,
+        Vec::new(),
     ));
     let store = ResumeStore::open(&scratch).unwrap();
     let _ledger = store.begin(&record).unwrap();

@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The notification center: a header, the count line and the session's
+// retained records, newest first.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFDivider } from "../components/ff_divider.slint";
+import { FFHeading } from "../components/ff_heading.slint";
+import { FFIconButton } from "../components/ff_icon_button.slint";
+import { FFNavRail } from "../components/ff_nav_rail.slint";
+import { FFNotificationRow } from "../components/ff_notification_row.slint";
+import { FFRowText } from "../components/ff_row_text.slint";
+import { FFScrollbar } from "../components/ff_scrollbar.slint";
+
+/// One record of the center's list.
+export struct NotificationRowView {
+    id: int,
+    // "info" | "warning" | "failure" | "crash".
+    kind: string,
+    title: string,
+    context: string,
+    message: string,
+    selected: bool,
+    expanded: bool,
+    // `FFNotificationRow.crash-state`.
+    crash-state: string,
+    crash-error: string,
+}
+
+export component FFNotificationCenter inherits Rectangle {
+    in property <bool> center-open: false;
+    in property <string> count-text: "";
+    in property <[NotificationRowView]> rows: [];
+    callback row-clicked(int);
+    callback acknowledge-requested(int);
+    callback diagnostics-requested(int);
+    // Up (-1) and Down (+1) through the list.
+    callback selection-moved(int);
+    callback expansion-toggled();
+    callback close-requested();
+
+    public function focus-center() {
+        keys.focus();
+    }
+
+    width: ShellGeometry.notification-center-width;
+    clip: true;
+    visible: root.center-open || panel.x > -root.width;
+
+    // Slides in from behind the icon bar and back out.
+    panel := Rectangle {
+        x: root.center-open ? 0px : -root.width;
+        width: parent.width;
+        height: parent.height;
+        animate x { duration: Theme.motion-fast; easing: ease-out; }
+
+        FFNavRail {
+            width: 100%;
+            height: 100%;
+            raised: true;
+        }
+
+        FFHeading {
+            x: Theme.space-4;
+            y: Theme.space-3;
+            height: 24px;
+            text: "Notifications";
+        }
+        FFIconButton {
+            x: parent.width - self.width - Theme.space-3;
+            y: 14px;
+            icon: @image-url("../../../../assets/icons/x.svg");
+            quiet: true;
+            pad: Theme.space-1;
+            focusable: true;
+            accessible-label: "Close notifications";
+            triggered => { root.close-requested(); }
+        }
+        FFRowText {
+            x: Theme.space-4;
+            y: 46px;
+            height: 20px;
+            text: root.count-text;
+            muted: true;
+        }
+        FFDivider {
+            x: Theme.space-4;
+            y: 80px;
+            width: parent.width - 2 * Theme.space-4;
+        }
+
+        scroller := Flickable {
+            x: Theme.space-4;
+            y: 81px;
+            width: parent.width - 2 * Theme.space-4;
+            height: parent.height - self.y;
+
+            VerticalLayout {
+                alignment: start;
+
+                for row in root.rows: FFNotificationRow {
+                    kind: row.kind;
+                    title: row.title;
+                    context: row.context;
+                    message: row.message;
+                    selected: row.selected;
+                    expanded: row.expanded;
+                    focused: keys.has-focus && row.selected;
+                    crash-state: row.crash-state;
+                    crash-error: row.crash-error;
+                    clicked => {
+                        keys.focus();
+                        root.row-clicked(row.id);
+                    }
+                    acknowledge => { root.acknowledge-requested(row.id); }
+                    diagnostics => { root.diagnostics-requested(row.id); }
+                    changed selected => {
+                        if self.selected {
+                            if self.y + self.height > scroller.height - scroller.viewport-y {
+                                scroller.viewport-y = min(0px, scroller.height - self.y - self.height);
+                            }
+                            if self.y < -scroller.viewport-y {
+                                scroller.viewport-y = -self.y;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        FFScrollbar {
+            x: parent.width - self.width - Theme.space-2;
+            y: scroller.y;
+            height: scroller.height;
+            content-height: scroller.viewport-height;
+            viewport-height: scroller.height;
+            offset: -scroller.viewport-y;
+        }
+
+        if root.rows.length == 0: FFHeading {
+            x: Theme.space-4;
+            y: 110px;
+            height: 20px;
+            size: "body";
+            text: "No notifications yet";
+        }
+        if root.rows.length == 0: FFRowText {
+            x: Theme.space-4;
+            y: 146px;
+            height: 20px;
+            text: "Messages will remain here for this session.";
+            muted: true;
+        }
+
+        // Spans the panel, so it stays inside the clipped frame while the panel
+        // slides and keeps the keyboard focus a key release would otherwise drop.
+        keys := FocusScope {
+            width: parent.width;
+            height: parent.height;
+            focus-on-click: false;
+            key-pressed(event) => {
+                if event.text == Key.UpArrow {
+                    root.selection-moved(-1);
+                    return accept;
+                } else if event.text == Key.DownArrow {
+                    root.selection-moved(1);
+                    return accept;
+                } else if event.text == Key.Return || event.text == Key.Space {
+                    root.expansion-toggled();
+                    return accept;
+                } else if event.text == Key.Escape {
+                    root.close-requested();
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+}

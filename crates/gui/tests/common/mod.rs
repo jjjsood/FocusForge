@@ -78,6 +78,15 @@ pub fn strip_line_comments(contents: &str) -> String {
         .join("\n")
 }
 
+/// Production Rust before this crate's conventional test-only module. Source
+/// architecture scans enforce shipped code, not fixture identifiers.
+#[allow(dead_code)]
+pub fn production_rust_source(contents: &str) -> &str {
+    contents
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map_or(contents, |(production, _)| production)
+}
+
 fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
