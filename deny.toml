@@ -67,6 +67,11 @@ ignore = [
     # ttf-parser v0.25.1, via ttf-parser -> fontdb -> usvg -> resvg ->
     # (i-slint-common, i-slint-compiler, i-slint-core) -> focusforge-gui
     { id = "RUSTSEC-2026-0192", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # zvariant, zbus_names and zvariant_derive (the zbus family), via zbus ->
+    # i-slint-backend-winit -> slint -> focusforge-gui
+    { id = "RUSTSEC-2026-0370", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    { id = "RUSTSEC-2026-0371", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    { id = "RUSTSEC-2026-0372", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
 ]
 
 # `akaze` is taken from the one git revision that carries the detector fixes
