@@ -87,21 +87,6 @@ impl From<&PipelineError> for FailedOperation {
     }
 }
 
-/// One failure's durable record: the complete text a toast never shows in
-/// full, plus the context to identify which project and (for a save) which
-/// target it belongs to. Appended, never edited or removed, so a later
-/// failure, a retry or a tab switch never drops what an earlier one
-/// recorded.
-#[derive(Debug, Clone)]
-pub struct Notification {
-    pub operation: FailedOperation,
-    pub message: String,
-    pub project_title: Option<String>,
-    pub project_path: Option<PathBuf>,
-    /// The save target, `None` for a run failure.
-    pub target: Option<PathBuf>,
-}
-
 /// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -429,8 +414,9 @@ pub struct GuiObserver {
     /// [`resolve_backend`]'s own account of this run's processing backend,
     /// set once from the worker thread before the pipeline starts.
     backend_line: Mutex<Option<String>>,
-    /// Every [`StageObserver::notice`] the run raised, in order.
-    notices: Mutex<Vec<String>>,
+    /// Every [`StageObserver::notice`] and [`StageObserver::frame_notice`]
+    /// the run raised, in order, with the frame index a frame notice names.
+    notices: Mutex<Vec<(Option<usize>, String)>>,
     /// Where the align backend names the adapter once a level opens it; unset
     /// for a run with no accelerator on offer.
     align_adapter: OnceLock<&'static OnceLock<String>>,
@@ -451,8 +437,26 @@ impl GuiObserver {
         }
     }
 
+    fn record_notice(&self, frame: Option<usize>, message: &str) {
+        tracing::warn!("{message}");
+        // The CPU rerun reaches the user through the alignment toast, so it
+        // stays out of the run's own notice list.
+        if let Some(reason) = message.strip_suffix(pipeline::ALIGN_RERUN_NOTICE) {
+            *self
+                .rerun_reason
+                .lock()
+                .expect("no thread panicked while holding the rerun lock") =
+                Some(reason.to_string());
+            return;
+        }
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .push((frame, message.to_string()));
+    }
+
     /// The notices the pipeline raised so far, in order.
-    pub fn notices(&self) -> Vec<String> {
+    pub fn notices(&self) -> Vec<(Option<usize>, String)> {
         self.notices
             .lock()
             .expect("no thread panicked while holding the notices lock")
@@ -536,21 +540,11 @@ impl StageObserver for GuiObserver {
     }
 
     fn notice(&self, message: &str) {
-        tracing::warn!("{message}");
-        // The CPU rerun reaches the user through the alignment toast, so it
-        // stays out of the run's own notice list.
-        if let Some(reason) = message.strip_suffix(pipeline::ALIGN_RERUN_NOTICE) {
-            *self
-                .rerun_reason
-                .lock()
-                .expect("no thread panicked while holding the rerun lock") =
-                Some(reason.to_string());
-            return;
-        }
-        self.notices
-            .lock()
-            .expect("no thread panicked while holding the notices lock")
-            .push(message.to_string());
+        self.record_notice(None, message);
+    }
+
+    fn frame_notice(&self, frame: usize, message: &str) {
+        self.record_notice(Some(frame), message);
     }
 
     fn tick(&self, progress: &JobProgress) {

@@ -537,17 +537,6 @@ export component AppWindow inherits Window {
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
     }
 
-    if root.crash-notice-visible : crash-notice := FFToast {
-        x: ShellGeometry.pane-gutter;
-        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + ShellGeometry.pane-gutter;
-        toast-open: true;
-        message: root.crash-notice-title;
-        link-label: "Review";
-
-        dismissed => { root.crash-notice-dismissed(); }
-        link-activated => { root.crash-notice-review-requested(); }
-    }
-
     // Settings modal state -- pushed from Rust once at startup
     // (`src/main.rs`, `--settings-section`) and toggled through
     // `AppController::open_settings`/`close_settings`.
@@ -598,11 +587,6 @@ export component AppWindow inherits Window {
     callback diagnostics-manifest-scrollbar-dragged(length);
     callback diagnostics-manifest-viewport-height-changed(length);
     callback diagnostics-manifest-scrolled(length);
-
-    in property <bool> crash-notice-visible: false;
-    in property <string> crash-notice-title: "";
-    callback crash-notice-dismissed();
-    callback crash-notice-review-requested();
 
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
@@ -794,8 +778,6 @@ export component AppWindow inherits Window {
     in property <string> sources-missing-body: "";
     callback sources-missing-locate-frames();
     callback sources-missing-closed();
-    in property <string> skipped-notice: "";
-    callback skipped-notice-dismissed();
 
     // The checkpoint panel's `Export image` modal.
     in property <bool> export-open: false;
@@ -943,18 +925,6 @@ export component AppWindow inherits Window {
         body: root.refusal-body;
         button-label: root.refusal-button-label;
         pick-another-folder => { root.refusal-pick-another-folder(); }
-    }
-
-    // The skipped-subfolders notice waits, still armed, until the overview
-    // closes -- it announces an import result, not a background failure, so
-    // losing it to the overview's own focus costs nothing.
-    skipped-toast := FFToast {
-        x: canvas-ground.x + Theme.space-3;
-        y: canvas-ground.y + Theme.space-3;
-        tone: "info";
-        toast-open: root.skipped-notice != "" && !root.projects-overlay-open;
-        message: root.skipped-notice;
-        dismissed => { root.skipped-notice-dismissed(); }
     }
 
     // The job toast shows over whichever surface is up: the gallery's own

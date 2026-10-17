@@ -235,6 +235,12 @@ pub trait StageObserver: Sync {
     /// it into the diagnostics log; `core` itself never depends on that
     /// crate and never decides how (or whether) a message is displayed.
     fn notice(&self, _message: &str) {}
+    /// A [`Self::notice`] about one source frame, `frame` being its position
+    /// in the request's frame list. Defaults to the plain notice, so an
+    /// observer that ignores the index prints the same text.
+    fn frame_notice(&self, _frame: usize, message: &str) {
+        self.notice(message);
+    }
 }
 
 /// The tail of the [`StageObserver::notice`] raised when the align stage
@@ -361,8 +367,8 @@ pub fn run(
                 }
                 other => other?,
             };
-            for notice in report.notices() {
-                observer.notice(&notice);
+            for (frame, notice) in report.notices() {
+                observer.frame_notice(frame, &notice);
             }
             Some(report)
         }

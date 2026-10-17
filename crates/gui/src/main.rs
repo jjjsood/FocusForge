@@ -1652,7 +1652,7 @@ fn run(args: &Args) -> ExitCode {
         install_input_table(&controller, &app, args);
         apply_appearance_preview(&app, args.appearance_preview);
         install_diagnostics(&controller, &app);
-        bridge::install_crash_notice(&controller, &app);
+        bridge::install_crash_notice(&controller, &app, &toast_timer);
         install_recent(&controller, &app, args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);

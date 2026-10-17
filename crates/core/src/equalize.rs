@@ -95,12 +95,13 @@ impl EqualizationReport {
         )
     }
 
-    /// The notices the frames raise, in frame order.
-    pub fn notices(&self) -> impl Iterator<Item = String> + '_ {
-        self.frames
-            .iter()
-            .enumerate()
-            .filter_map(|(index, f)| f.notice(index, self.max_gain, self.target))
+    /// The notices the frames raise with the index of the frame each names,
+    /// in frame order.
+    pub fn notices(&self) -> impl Iterator<Item = (usize, String)> + '_ {
+        self.frames.iter().enumerate().filter_map(|(index, f)| {
+            f.notice(index, self.max_gain, self.target)
+                .map(|text| (index, text))
+        })
     }
 }
 

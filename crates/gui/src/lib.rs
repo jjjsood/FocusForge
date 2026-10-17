@@ -95,6 +95,11 @@ pub mod screenshot;
 /// reaches its types directly.
 pub mod job;
 
+/// The session's retained notifications, toast queue and read/routing rules.
+/// No `use slint::` anywhere in it. `pub` so the integration tests reach its
+/// types directly.
+pub mod notifications;
+
 /// The `Images` dock panel model, and the frame-set-change warnings' copy --
 /// no `use slint::` anywhere in it. `pub` so `tests/images.rs` reaches its
 /// types directly.

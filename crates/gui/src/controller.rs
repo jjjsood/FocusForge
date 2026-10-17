@@ -38,6 +38,7 @@ use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
+use crate::notifications::{CrashEvidence, Kind, Notification, Notifications, Source};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
 use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
 use crate::recent;
@@ -508,11 +509,6 @@ struct DiagnosticsState {
     /// [`AppController::diagnostics_destination_cursor_moved`] whenever the
     /// cursor would otherwise land outside the field's visible width.
     destination_scroll_x: f32,
-    /// The crash notice's own snapshot: the unreported crash ids found at
-    /// start and whether the notice is currently shown for them. Taken once
-    /// by [`AppController::scan_crash_notice`]; nothing re-scans mid-session.
-    crash_notice_ids: Vec<String>,
-    crash_notice_visible: bool,
     /// Bumped by every [`AppController::start_manifest_scan`] call, so a
     /// report from a superseded scan can be told apart from the current one.
     scan_generation: u64,
@@ -1339,9 +1335,6 @@ struct ShellState {
     /// [`AppController::cancel_mismatch`] -- no tab exists for it while
     /// this is `Some`.
     pending_mismatch: Option<PendingOpen>,
-    /// The info notice: the most recent open's skipped-subfolder line or the
-    /// most recent finished run's notices, if any.
-    notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
     /// The most recent refusal's own title, `Some` only for a project or
@@ -1767,15 +1760,9 @@ pub struct AppController {
     /// Test-only override for the resident display tiles' edge, applied to
     /// every edit session opened afterwards.
     resident_tile_size_for_test: Option<u32>,
-    /// The most recent run or save failure, taken exactly once by
-    /// [`Self::take_settled_failure`] -- what lets the failure toast
-    /// announce the run that actually failed without reopening itself on
-    /// every later poll.
-    settled_failure: Option<job::Notification>,
-    /// Every run and save failure since the window opened, oldest first --
-    /// append-only, so a later failure replacing the toast's own slot, a
-    /// retry or a tab switch never drops what an earlier one recorded.
-    notifications: Vec<job::Notification>,
+    /// Every user-facing event since the window opened, with the toast queue
+    /// and read state.
+    notifications: Notifications,
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
@@ -1848,6 +1835,9 @@ pub struct SourcePreviewSnapshot {
 struct JobSlot {
     control: Option<Arc<job::JobControl>>,
     observer: Option<Arc<job::GuiObserver>>,
+    /// The live run's request frames, the list a frame notice's index points
+    /// into.
+    frames: Vec<PathBuf>,
     tab_id: Option<u64>,
     handle: Option<std::thread::JoinHandle<Result<job::FuseOutcome, job::PipelineError>>>,
     /// Tab ids waiting for the live run to settle, in press order. The live
@@ -4167,24 +4157,6 @@ impl AppController {
         self.state.pending.as_ref().map(|(question, _)| question)
     }
 
-    /// The info notice the window shows, if any: the skipped-subfolder line
-    /// of the most recent open, or the notices of the most recent finished
-    /// run (a clamped equalization frame among them).
-    pub fn notice(&self) -> Option<&str> {
-        self.state.notice.as_deref()
-    }
-
-    /// Clears the info notice. Manual dismiss only -- unlike
-    /// the run-failure toast, this one names something already finished,
-    /// not a live status to time out on its own, so it waits for its own
-    /// `x`. Clearing `self.state.notice` here, not only the Slint-side
-    /// property, is what stops a later, unrelated push from resurrecting
-    /// the old text.
-    pub fn dismiss_notice(&mut self) {
-        self.state.notice = None;
-        self.emit(ShellEvent::ProjectsChanged);
-    }
-
     /// The most recent refusal's already-rendered message, if any.
     pub fn last_refusal(&self) -> Option<&str> {
         self.state.last_refusal.as_deref()
@@ -4313,7 +4285,7 @@ impl AppController {
     /// failure on its own tab; a path that opens successfully clears any
     /// `Not a project` card already held for it.
     fn accept(&mut self, opened: Opened, thumbnails: Vec<Preloaded>) {
-        self.state.notice = notice_line(&opened.skipped);
+        self.publish_skipped(&opened.skipped);
         self.state.last_refusal = None;
         for skipped in &opened.skipped {
             self.record_failure(not_a_project_card(skipped.clone()));
@@ -4728,6 +4700,8 @@ impl AppController {
     /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
+        self.notifications
+            .set_projects_open(self.state.overlay_open);
         self.set_gallery_scroll(self.state.gallery_scroll_y);
         self.emit(ShellEvent::OverlayChanged);
     }
@@ -4736,6 +4710,7 @@ impl AppController {
     pub fn close_projects_overlay(&mut self) {
         if self.state.overlay_open {
             self.state.overlay_open = false;
+            self.notifications.set_projects_open(false);
             self.emit(ShellEvent::OverlayChanged);
         }
     }
@@ -5962,6 +5937,21 @@ impl AppController {
     /// [`Self::settle_import`] applies the scan. An [`ImportRefused`] leaves
     /// the tab untouched.
     pub fn add_frames(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        let result = self.try_add_frames(paths);
+        if let Err(refused) = &result {
+            let message = refused.to_string();
+            let mut record =
+                Notification::new(Kind::Failure, Source::Import, message.clone(), message);
+            self.fill_active_project(&mut record);
+            self.publish_notification(record);
+        }
+        result
+    }
+
+    fn try_add_frames(
         &mut self,
         paths: &[PathBuf],
     ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
@@ -7532,6 +7522,7 @@ impl AppController {
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
+        self.job.frames = request.frames.clone();
         self.job.tab_id = self.state.projects.get(tab_index).map(|tab| tab.id);
         if let Some(tab) = self.state.projects.get_mut(tab_index) {
             // The new run holds into the same directory the parked one uses.
@@ -7571,18 +7562,99 @@ impl AppController {
         }
     }
 
-    /// The most recent run or save failure, taken exactly once -- `None`
-    /// once already read, or with no failure to announce. What the failure
-    /// toast names, so it fires only for the run that actually failed and
-    /// never re-opens on a later poll.
-    pub fn take_settled_failure(&mut self) -> Option<job::Notification> {
-        self.settled_failure.take()
+    /// Every retained notification since the window opened, oldest first,
+    /// kept after its toast has closed.
+    pub fn notifications(&self) -> &[Notification] {
+        self.notifications.records()
     }
 
-    /// Every run and save failure since the window opened, oldest first,
-    /// kept after its toast has been dismissed.
-    pub fn notifications(&self) -> &[job::Notification] {
-        &self.notifications
+    /// How many retained notifications are unread.
+    pub fn unread_notifications(&self) -> usize {
+        self.notifications.unread()
+    }
+
+    /// The toast on screen, if any.
+    pub fn visible_toast(&self) -> Option<&Notification> {
+        self.notifications.visible()
+    }
+
+    /// When the visible toast closes; `None` with no toast or while paused.
+    pub fn toast_deadline(&self) -> Option<Instant> {
+        self.notifications.deadline()
+    }
+
+    /// Closes the visible toast once its own deadline has passed.
+    pub fn expire_toast(&mut self, now: Instant) {
+        self.notifications.expire_due(now);
+    }
+
+    /// Closes the visible toast ahead of its deadline.
+    pub fn dismiss_visible_toast(&mut self) {
+        if let Some(id) = self.notifications.visible().map(|n| n.id) {
+            self.notifications.dismiss(id, Instant::now());
+        }
+    }
+
+    pub fn notification_center_open(&self) -> bool {
+        self.notifications.center_open()
+    }
+
+    /// Opens the notification center, closing the Projects overview in the
+    /// same call, and marks every record read.
+    pub fn open_center(&mut self) {
+        self.close_projects_overlay();
+        self.notifications.open_center();
+    }
+
+    pub fn close_center(&mut self) {
+        self.notifications.close_center();
+    }
+
+    /// Records whether the app window has focus.
+    pub fn set_window_focused(&mut self, focused: bool) {
+        self.notifications.set_focused(focused);
+    }
+
+    /// Stamps `record` with the local time and appends it, returning its id.
+    fn publish_notification(&mut self, mut record: Notification) -> u64 {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        record.at = checkpoints::local_hhmm(unix);
+        self.notifications.publish(record, Instant::now())
+    }
+
+    /// Names the project of tab `index` on `record`.
+    fn fill_project(&self, record: &mut Notification, index: Option<usize>) {
+        if let Some(tab) = index.and_then(|i| self.state.projects.get(i)) {
+            record.project_title = Some(tab.title.clone());
+            record.project_path = Some(project_identity_path(&tab.project));
+        }
+    }
+
+    fn fill_active_project(&self, record: &mut Notification) {
+        self.fill_project(record, self.state.active);
+    }
+
+    /// One info record for an open that skipped subfolders; its message
+    /// lists every full path.
+    fn publish_skipped(&mut self, skipped: &[PathBuf]) {
+        if skipped.is_empty() {
+            return;
+        }
+        let title = format!(
+            "{} subfolder{} skipped",
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" }
+        );
+        let paths: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+        let message = format!("{title}:\n{}", paths.join("\n"));
+        self.publish_notification(Notification::new(
+            Kind::Info,
+            Source::Import,
+            title,
+            message,
+        ));
     }
 
     /// The toolbar/bottom-bar surfaces' current view of the active tab's
@@ -7686,24 +7758,37 @@ impl AppController {
             // checkpoint just changed.
             self.state.canvas_dirty = true;
         }
-        let tab_info = tab_index
-            .and_then(|i| self.state.projects.get(i))
-            .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
+        let run_frames = std::mem::take(&mut self.job.frames);
+        // Preparation finishes before any later failure, so every notice is
+        // published, ahead of the failure itself.
+        for (frame, text) in run_notices {
+            let frame = frame
+                .and_then(|i| run_frames.get(i))
+                .map(|p| images::file_name(p));
+            let title = if frame.is_some() {
+                "Brightness warning"
+            } else {
+                "Processing notice"
+            };
+            let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
+            record.frame = frame;
+            self.fill_project(&mut record, tab_index);
+            self.publish_notification(record);
+        }
 
         match &settled.state {
             job::RunState::Failed(message) => {
                 let operation = settled
                     .operation
                     .expect("settle() sets operation exactly when state is Failed");
-                let notification = job::Notification {
-                    operation,
-                    message: message.clone(),
-                    project_title: tab_info.as_ref().map(|(_, title)| title.clone()),
-                    project_path: tab_info.as_ref().map(|(path, _)| path.clone()),
-                    target: None,
-                };
-                self.notifications.push(notification.clone());
-                self.settled_failure = Some(notification);
+                let mut record = Notification::new(
+                    Kind::Failure,
+                    Source::Run,
+                    operation.summary(),
+                    message.clone(),
+                );
+                self.fill_project(&mut record, tab_index);
+                self.publish_notification(record);
                 if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
@@ -7725,12 +7810,6 @@ impl AppController {
         }
 
         let owner = tab_index.filter(|&i| i < self.state.projects.len());
-        if settled.held.is_some()
-            && let Some(line) = run_notice_line(&run_notices)
-        {
-            self.state.notice = Some(line);
-            self.emit(ShellEvent::ProjectsChanged);
-        }
         let planes = match (settled.held, owner) {
             (None, _) => None,
             (Some(held), None) => {
@@ -7871,15 +7950,6 @@ impl AppController {
         self.state.active()?.alignment.as_ref()
     }
 
-    /// The toast a kept run with unregistered frames raises, read after
-    /// [`AppController::keep_fused`]; `None` when every frame registered.
-    pub fn unaligned_notice(&self) -> Option<String> {
-        match &self.state.active()?.run {
-            job::RunState::Fused { unaligned, .. } => job::unaligned_notice(*unaligned),
-            _ => None,
-        }
-    }
-
     /// `Keep` on the active tab's parked run: commits it exactly as a run
     /// without divergence commits, returning the planes the canvas reloads
     /// from. `None` with nothing parked.
@@ -7894,6 +7964,12 @@ impl AppController {
         let planes = self.commit_held(index, parked.held);
         self.state.projects[index].run = job::RunState::Fused { at, unaligned };
         self.state.canvas_dirty = true;
+        if let Some(title) = job::unaligned_notice(unaligned) {
+            let message = format!("Kept the fused result with {title}.");
+            let mut record = Notification::new(Kind::Warning, Source::Run, title, message);
+            self.fill_project(&mut record, Some(index));
+            self.publish_notification(record);
+        }
         self.emit(ShellEvent::JobChanged);
         Some(planes)
     }
@@ -8523,19 +8599,17 @@ impl AppController {
         Some(self.advance_saves())
     }
 
-    /// Records a failed save of tab `index` to `target` as a notification
-    /// and the settled failure.
+    /// Records a failed save of tab `index` to `target` as a notification.
     fn report_failed_save(&mut self, index: usize, target: &Path, cause: String) {
-        let tab = &self.state.projects[index];
-        let notification = job::Notification {
-            operation: job::FailedOperation::Save,
-            message: format!("Could not save {}: {cause}", target.display()),
-            project_title: Some(tab.title.clone()),
-            project_path: Some(project_identity_path(&tab.project)),
-            target: Some(target.to_path_buf()),
-        };
-        self.notifications.push(notification.clone());
-        self.settled_failure = Some(notification);
+        let mut record = Notification::new(
+            Kind::Failure,
+            Source::Save,
+            job::FailedOperation::Save.summary(),
+            format!("Could not save {}: {cause}", target.display()),
+        );
+        self.fill_project(&mut record, Some(index));
+        record.target = Some(target.to_path_buf());
+        self.publish_notification(record);
     }
 
     /// What the open renderer cell should do for the frame about to draw,
@@ -8852,8 +8926,13 @@ impl AppController {
         // A bundle written from the window already marks the crashes it
         // packaged; dropping the notice's own snapshot means a user who
         // only ever bundles never sees it return for that evidence.
-        self.state.diagnostics.crash_notice_ids.clear();
-        self.state.diagnostics.crash_notice_visible = false;
+        for record in self.notifications.records_mut() {
+            if let Some(crash) = record.crash.as_mut() {
+                crash.ids.clear();
+                crash.acknowledged = true;
+                crash.error = None;
+            }
+        }
     }
 
     /// Stores a background scan's outcome, called once
@@ -8868,70 +8947,98 @@ impl AppController {
         self.diagnostics_view();
     }
 
-    /// Snapshots `data_dir`'s unreported crash evidence and shows the notice
-    /// exactly when that snapshot is non-empty. No data directory and an
-    /// unreadable crash directory both yield an empty snapshot and a hidden
-    /// notice -- neither ever fails the window's start-up. Called once at
-    /// start; nothing re-scans mid-session.
+    /// Publishes one crash record for the unreported crash evidence in
+    /// `data_dir`, or for crash reports that cannot be located or read (no
+    /// data directory, or an unreadable crash directory); nothing for a clean
+    /// start. Never fails the window's start-up. Called once at start;
+    /// nothing re-scans mid-session.
     pub fn scan_crash_notice(&mut self) {
-        let ids = match &self.state.diagnostics.data_dir {
-            Some(dir) => focusforge_diagnostics::crash_notice::unreported(dir),
-            None => Vec::new(),
+        let (ids, unavailable) = match &self.state.diagnostics.data_dir {
+            Some(dir) => {
+                let unreadable = focusforge_diagnostics::crash_dir(dir)
+                    .read_dir()
+                    .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+                (
+                    focusforge_diagnostics::crash_notice::unreported(dir),
+                    unreadable,
+                )
+            }
+            None => (Vec::new(), true),
         };
-        self.state.diagnostics.crash_notice_visible = !ids.is_empty();
-        self.state.diagnostics.crash_notice_ids = ids;
-    }
-
-    pub fn crash_notice_visible(&self) -> bool {
-        self.state.diagnostics.crash_notice_visible
-    }
-
-    pub fn crash_notice_count(&self) -> usize {
-        self.state.diagnostics.crash_notice_ids.len()
-    }
-
-    /// "1 crash found" / "N crashes found", worded for the toast's title.
-    pub fn crash_notice_text(&self) -> String {
-        match self.crash_notice_count() {
-            1 => "1 crash found".to_string(),
-            n => format!("{n} crashes found"),
-        }
-    }
-
-    /// Marks the snapshot's crash ids reported, best-effort: a write
-    /// failure is logged and never surfaced, mirroring the CLI's own
-    /// precedent. Takes the snapshot, so a second call marks nothing.
-    fn mark_crash_notice_reported(&mut self) {
-        self.state.diagnostics.crash_notice_visible = false;
-        let ids = std::mem::take(&mut self.state.diagnostics.crash_notice_ids);
-        if ids.is_empty() {
+        let mut record = if unavailable {
+            Notification::new(
+                Kind::Crash,
+                Source::Startup,
+                "Crash reports unavailable",
+                "The crash reports of earlier sessions could not be read. Diagnostics can still \
+                 write a bundle.",
+            )
+        } else if ids.is_empty() {
             return;
-        }
-        let Some(data_dir) = self.state.diagnostics.data_dir.clone() else {
-            return;
+        } else {
+            let count = match ids.len() {
+                1 => "1 crash report".to_string(),
+                n => format!("{n} crash reports"),
+            };
+            Notification::new(
+                Kind::Crash,
+                Source::Startup,
+                "Previous session stopped",
+                format!(
+                    "{count} from an earlier session {} unreported.",
+                    if ids.len() == 1 { "is" } else { "are" }
+                ),
+            )
         };
-        if let Err(e) = focusforge_diagnostics::crash_notice::mark_reported(&data_dir, &ids) {
-            tracing::warn!(error = %e, "the crash notice's evidence could not be marked as reported");
+        record.crash = Some(CrashEvidence {
+            ids,
+            unavailable,
+            ..CrashEvidence::default()
+        });
+        self.publish_notification(record);
+    }
+
+    /// Marks the crash evidence of record `id` reported. A failed write
+    /// keeps the evidence unreported and stores its error on the record.
+    /// Viewing or timing out a record never calls this.
+    pub fn acknowledge_crash(&mut self, id: u64) -> Result<(), String> {
+        let data_dir = self.state.diagnostics.data_dir.clone();
+        let Some(crash) = self
+            .notifications
+            .get_mut(id)
+            .and_then(|record| record.crash.as_mut())
+        else {
+            return Ok(());
+        };
+        if crash.acknowledged || crash.ids.is_empty() {
+            return Ok(());
+        }
+        let outcome = match data_dir {
+            Some(dir) => focusforge_diagnostics::crash_notice::mark_reported(&dir, &crash.ids)
+                .map_err(|e| e.to_string()),
+            None => Err("no data directory is available".to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                crash.ids.clear();
+                crash.acknowledged = true;
+                crash.error = None;
+                Ok(())
+            }
+            Err(error) => {
+                crash.error = Some(error.clone());
+                Err(error)
+            }
         }
     }
 
-    /// Hides the notice without writing anything: the evidence stays
-    /// unreported, so it returns on the next start.
-    pub fn crash_notice_timed_out(&mut self) {
-        self.state.diagnostics.crash_notice_visible = false;
-    }
-
-    /// Hides the notice and marks its evidence reported.
-    pub fn dismiss_crash_notice(&mut self) {
-        self.mark_crash_notice_reported();
-    }
-
-    /// Marks the notice's evidence reported the same way [`Self::dismiss_crash_notice`]
-    /// does, then opens the settings modal on the diagnostics section.
-    /// Returns the settings-open state the way [`Self::open_settings`] does,
-    /// so a caller pushes it without a second lock.
-    pub fn review_crashes(&mut self) -> bool {
-        self.mark_crash_notice_reported();
+    /// Acknowledges record `id` the way [`Self::acknowledge_crash`] does, then
+    /// opens the settings modal on the diagnostics section, whether or not
+    /// the mark succeeded. Returns the settings-open state the way
+    /// [`Self::open_settings`] does, so a caller pushes it without a second
+    /// lock.
+    pub fn crash_diagnostics(&mut self, id: u64) -> bool {
+        let _ = self.acknowledge_crash(id);
         let open = self.open_settings();
         self.select_settings_section(SettingsSection::Diagnostics);
         open
@@ -9495,31 +9602,6 @@ fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>
         "{frame_count} {frames} · {}",
         checkpoint_phrase(checkpoints)
     )
-}
-
-/// The info notice's text for a finished run: the first pipeline notice,
-/// plus ` (and N more)` when it raised several; `None` when it raised none.
-fn run_notice_line(notices: &[String]) -> Option<String> {
-    let (first, rest) = notices.split_first()?;
-    Some(match rest.len() {
-        0 => first.clone(),
-        more => format!("{first} (and {more} more)"),
-    })
-}
-
-/// The info notice's text for a skipped-subfolder open, `None` when nothing
-/// was skipped -- not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
-/// `FFToast`, `tone: "info"`). Short enough to stay on the toast's one
-/// line regardless of how many subfolders it names.
-fn notice_line(skipped: &[PathBuf]) -> Option<String> {
-    if skipped.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{} subfolder{} skipped",
-        skipped.len(),
-        if skipped.len() == 1 { "" } else { "s" }
-    ))
 }
 
 #[cfg(test)]

@@ -1294,76 +1294,34 @@ fn input_map_rows_stay_inside_the_content_area() {
     }
 }
 
-/// The toast paints at the pane gutter under the tab strip and toolbar, at
-/// its fixed size, regardless of window width; with no notice pending, no
-/// element matches its id at all -- the conditional `if` never instantiates
-/// it, rather than leaving it merely invisible.
+/// Under the Projects overview a failure shows no toast and stays unread,
+/// and the closed toast never blocks a click on the card underneath it.
 #[test]
-fn crash_notice_placement_and_absence() {
-    let app = app_at(1440, 900);
+fn projects_suppresses_a_failure_toast_and_keeps_it_unread() {
+    let mut controller = common::controller_with_frames("shell_projects_failure", 3);
+    controller.set_align_algorithm("dummy-align");
+    controller.toggle_projects_overlay();
+    assert!(controller.start_fuse());
     assert!(
-        ElementQuery::from_root(&app)
-            .match_id("AppWindow::crash-notice")
-            .find_first()
-            .is_none(),
-        "no element must match the toast's id while no notice is pending"
+        controller
+            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+            .is_err(),
+        "a running job refuses an add"
     );
-
-    app.set_crash_notice_visible(true);
-    app.set_crash_notice_title("1 crash found".into());
-    assert_rect(&app, "AppWindow::crash-notice", (16.0, 92.0, 300.0, 84.0));
-
-    let narrow = app_at(1200, 760);
-    narrow.set_crash_notice_visible(true);
-    narrow.set_crash_notice_title("1 crash found".into());
-    let (x, y, _, _) = rect(&narrow, "AppWindow::crash-notice");
-    assert!(
-        (x - 16.0).abs() < EPS && (y - 92.0).abs() < EPS,
-        "the toast's top-left must stay at the pane gutter regardless of window width: got ({x}, {y})"
+    common::wait_for_settle(&mut controller, std::time::Duration::from_secs(60));
+    let controller: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
+    let app = app_at(1440, 900);
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        slot.clone(),
     );
-}
+    focusforge_gui::bridge::push_toast(&app, &controller, &slot);
+    assert!(!app.get_job_toast_open(), "Projects shows no toast");
+    assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
 
-/// With a link, the toast's link row (its touch area and its text) stays
-/// inside the toast's own rectangle, whatever the message length.
-#[test]
-fn toast_link_row_stays_inside_the_toast() {
-    let app = app_at(1440, 900);
-    app.set_crash_notice_visible(true);
-    for message in [
-        "1 crash found",
-        "12 crashes found while the previous session was running in the background",
-    ] {
-        app.set_crash_notice_title(message.into());
-        let (tx, ty, tw, th) = rect(&app, "AppWindow::crash-notice");
-        for id in ["FFToast::link-area", "FFToast::link-text"] {
-            let (x, y, w, h) = rect(&app, id);
-            assert!(
-                x >= tx - EPS && y >= ty - EPS && x + w <= tx + tw + EPS && y + h <= ty + th + EPS,
-                "{id} for {message:?}: ({x}, {y}, {w}, {h}) must lie inside the toast ({tx}, {ty}, {tw}, {th})"
-            );
-        }
-    }
-}
-
-/// The failure toast paints over the gallery's gutter while the Projects
-/// overview is open, at the pane gutter otherwise, and (closed) never blocks
-/// a click on the card underneath it.
-#[test]
-fn failure_toast_placement_over_the_projects_overview() {
-    let app = app_at(1440, 900);
-    app.set_projects_overlay_open(true);
-    app.set_job_toast_open(true);
-    assert_rect(&app, "AppWindow::job-toast", (312.0, 108.0, 300.0, 84.0));
-
-    let narrow = app_at(1200, 760);
-    narrow.set_projects_overlay_open(true);
-    narrow.set_job_toast_open(true);
-    assert_rect(&narrow, "AppWindow::job-toast", (312.0, 108.0, 300.0, 84.0));
-
-    app.set_projects_overlay_open(false);
-    assert_rect(&app, "AppWindow::job-toast", (12.0, 88.0, 300.0, 84.0));
-
-    app.set_job_toast_open(false);
     app.set_projects_overlay_open(true);
     let card = focusforge_gui::ProjectCardView {
         kind: "open".into(),

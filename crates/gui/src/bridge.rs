@@ -44,6 +44,7 @@ use crate::generated::{
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
+use crate::notifications::Kind;
 use crate::overlay::Thumbnail;
 use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::{PaneDraw, PaneRect};
@@ -1470,32 +1471,16 @@ pub fn push_about_view(app: &AppWindow) {
     });
 }
 
-/// Pushes the crash notice's own two properties into the window -- mirrors
-/// [`push_diagnostics_view`] for the toast.
-pub fn push_crash_notice(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
-    let controller = controller.lock().unwrap();
-    app.set_crash_notice_visible(controller.crash_notice_visible());
-    app.set_crash_notice_title(controller.crash_notice_text().into());
-}
-
-/// Scans for unreported crash evidence and pushes the notice, then --
-/// only when it is showing -- arms its auto-dismiss timeout. The timer is
-/// armed before `run()`, the same precedent `src/main.rs`'s own
-/// `--exit-after` timer sets.
-pub fn install_crash_notice(controller: &Arc<Mutex<AppController>>, app: &AppWindow) {
+/// Scans for unreported crash evidence, publishes its record and shows the
+/// toast that raises. Called before `run()`, like `src/main.rs`'s own
+/// `--exit-after` timer.
+pub fn install_crash_notice(
+    controller: &Arc<Mutex<AppController>>,
+    app: &AppWindow,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
     controller.lock().unwrap().scan_crash_notice();
-    push_crash_notice(app, controller);
-    if !controller.lock().unwrap().crash_notice_visible() {
-        return;
-    }
-    let timer_controller = controller.clone();
-    let app_weak = app.as_weak();
-    slint::Timer::single_shot(Duration::from_secs(10), move || {
-        timer_controller.lock().unwrap().crash_notice_timed_out();
-        if let Some(app) = app_weak.upgrade() {
-            push_crash_notice(&app, &timer_controller);
-        }
-    });
+    push_toast(app, controller, toast_timer);
 }
 
 /// Pushes the controller's project-tab state (`project_tabs`,
@@ -1548,7 +1533,6 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_overlay_controls(app, &controller);
     app.set_checkpoint_line(controller.checkpoint_panel_line().into());
     app.set_plus_selected(controller.plus_selected());
-    app.set_skipped_notice(controller.notice().unwrap_or_default().into());
     // The active tab may have changed with no `JobChanged`/poll event of its
     // own in between -- push its own run onto the bar right here rather than
     // leaving the words the previously active tab last wrote.
@@ -1593,44 +1577,76 @@ fn push_tab_scroll(app: &AppWindow, controller: &AppController) {
     app.set_can_scroll_right(controller.can_scroll_right());
 }
 
-/// How long the failure toast stays up before closing itself.
-const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(6);
-
-/// Opens the failure toast with `message` and arms its auto-dismiss timer,
-/// replacing any timer already running -- dropping the old one deactivates
-/// it, so a second failure while the first toast is still up restarts the
-/// count rather than closing early.
-fn open_job_toast(
+/// Shows the notification queue's visible toast on `FFToast`'s tone and arms
+/// one single-shot timer at its deadline. The timer re-enters this function,
+/// whose expiry check closes only a toast whose own deadline has passed, so
+/// a timer left over from an earlier toast never closes a later one.
+pub fn push_toast(
     app: &AppWindow,
-    message: String,
+    controller: &Arc<Mutex<AppController>>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
 ) {
-    open_toast(app, message, "failure", toast_timer);
+    TOAST_SLOT.with(|slot| *slot.borrow_mut() = Rc::downgrade(toast_timer));
+    refresh_toast(app, controller);
 }
 
-/// [`open_job_toast`] with `FFToast`'s own `tone`: `"failure"` or the plain
-/// `"info"` notice.
-fn open_toast(
-    app: &AppWindow,
-    message: String,
-    tone: &str,
-    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
-) {
-    app.set_job_toast_tone(tone.into());
-    app.set_job_toast_message(message.into());
-    app.set_job_toast_open(true);
-    let timer = slint::Timer::default();
-    let app_weak = app.as_weak();
-    timer.start(
-        slint::TimerMode::SingleShot,
-        TOAST_AUTO_DISMISS,
-        move || {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_job_toast_open(false);
+thread_local! {
+    /// The timer slot [`push_toast`] last armed, so a push that arrives from
+    /// the event sink, which holds no slot of its own, arms the same one.
+    static TOAST_SLOT: RefCell<std::rc::Weak<RefCell<Option<slint::Timer>>>> =
+        const { RefCell::new(std::rc::Weak::new()) };
+}
+
+/// [`push_toast`] through the slot registered by the last call to it.
+fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let (shown, wait) = {
+        let mut controller = controller.lock().unwrap();
+        let now = Instant::now();
+        controller.expire_toast(now);
+        let shown = controller.visible_toast().map(|n| {
+            let tone = match n.kind {
+                Kind::Failure | Kind::Crash => "failure",
+                Kind::Info | Kind::Warning => "info",
+            };
+            (n.title.clone(), tone)
+        });
+        let wait = controller
+            .toast_deadline()
+            .map(|deadline| deadline.saturating_duration_since(now));
+        (shown, wait)
+    };
+    match shown {
+        Some((message, tone)) => {
+            app.set_job_toast_tone(tone.into());
+            app.set_job_toast_message(message.into());
+            app.set_job_toast_open(true);
+        }
+        None => app.set_job_toast_open(false),
+    }
+    let Some(toast_timer) = TOAST_SLOT.with(|slot| slot.borrow().upgrade()) else {
+        return;
+    };
+    let mut slot = toast_timer.borrow_mut();
+    match wait {
+        Some(wait) => {
+            let app_weak = app.as_weak();
+            let controller = controller.clone();
+            slot.get_or_insert_with(slint::Timer::default).start(
+                slint::TimerMode::SingleShot,
+                wait,
+                move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        refresh_toast(&app, &controller);
+                    }
+                },
+            );
+        }
+        None => {
+            if let Some(timer) = slot.as_ref() {
+                timer.stop();
             }
-        },
-    );
-    *toast_timer.borrow_mut() = Some(timer);
+        }
+    }
 }
 
 /// Pushes the run's current view onto the toolbar/bottom-bar properties --
@@ -1676,13 +1692,8 @@ fn start_job_timer(
         if settled.is_some() {
             push_projects(&app, &controller);
             repaint(&app, &controller, &canvas);
-        } else if let Some(notification) = controller.lock().unwrap().take_settled_failure() {
-            open_job_toast(
-                &app,
-                notification.operation.summary().to_string(),
-                &toast_timer,
-            );
         }
+        push_toast(&app, &controller, &toast_timer);
         let view = controller.lock().unwrap().job_view();
         let live = controller.lock().unwrap().work_pending();
         push_job(&app, &view);
@@ -2384,9 +2395,9 @@ impl CustomApplicationHandler for DropHandler {
                         );
                     }
                 }
-                Err(refused) => {
+                Err(_) => {
                     if let Some(app) = self.app_handle.borrow().clone().and_then(|w| w.upgrade()) {
-                        open_job_toast(&app, refused.to_string(), &self.toast_timer);
+                        push_toast(&app, &self.controller, &self.toast_timer);
                     }
                 }
             }
@@ -2451,18 +2462,11 @@ fn save_project(
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
     start: impl FnOnce(&mut AppController) -> bool,
 ) {
-    let failure = {
-        let mut controller = controller.lock().unwrap();
-        if start(&mut controller) {
-            None
-        } else {
-            controller.take_settled_failure()
-        }
-    };
+    start(&mut controller.lock().unwrap());
     let Some(app) = app_weak.upgrade() else {
         return;
     };
-    show_save_state(&app, controller, canvas, toast_timer, failure);
+    show_save_state(&app, controller, canvas, toast_timer);
 }
 
 /// Publishes a save worker's result: settles it, then shows what it changed
@@ -2473,31 +2477,19 @@ fn publish_saved(
     canvas: &Rc<RefCell<Canvas>>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
 ) {
-    let failure = {
-        let mut controller = controller.lock().unwrap();
-        controller.settle_save();
-        controller.take_settled_failure()
-    };
-    show_save_state(app, controller, canvas, toast_timer, failure);
+    controller.lock().unwrap().settle_save();
+    show_save_state(app, controller, canvas, toast_timer);
 }
 
-/// Toasts a failed save over a closed projects overlay, then refreshes the
-/// busy indicator, the tabs and the canvas.
+/// Shows the toast a failed save queued, then refreshes the busy indicator,
+/// the tabs and the canvas.
 fn show_save_state(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
-    failure: Option<job::Notification>,
 ) {
-    if let Some(notification) = failure {
-        controller.lock().unwrap().close_projects_overlay();
-        open_job_toast(
-            app,
-            notification.operation.summary().to_string(),
-            toast_timer,
-        );
-    }
+    push_toast(app, controller, toast_timer);
     push_busy(app, &controller.lock().unwrap());
     push_projects(app, controller);
     direct_publication_scope(InputSurface::Gallery);
@@ -2517,6 +2509,7 @@ pub fn install(
     canvas: Rc<RefCell<Canvas>>,
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Installed {
+    TOAST_SLOT.with(|slot| *slot.borrow_mut() = Rc::downgrade(&toast_timer));
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let preview_timer = slint::Timer::default();
@@ -3370,34 +3363,6 @@ pub fn install(
         }
     });
 
-    app.on_crash_notice_dismissed({
-        let controller = controller.clone();
-        let app_weak = app.as_weak();
-        move || {
-            record_surface_input(InputSurface::Other);
-            controller.lock().unwrap().dismiss_crash_notice();
-            if let Some(app) = app_weak.upgrade() {
-                push_crash_notice(&app, &controller);
-                direct_publication_scope(InputSurface::Other);
-            }
-        }
-    });
-    app.on_crash_notice_review_requested({
-        let controller = controller.clone();
-        let app_weak = app.as_weak();
-        move || {
-            record_surface_input(InputSurface::Other);
-            let open = controller.lock().unwrap().review_crashes();
-            if let Some(app) = app_weak.upgrade() {
-                app.set_settings_open(open);
-                app.set_settings_section(SettingsSection::Diagnostics.slug().into());
-                push_crash_notice(&app, &controller);
-                push_diagnostics_view(&app, &controller);
-                direct_publication_scope(InputSurface::Other);
-            }
-        }
-    });
-
     // The entry path: `open_paths`'s own sink pushes every property a load
     // raises (`ShellEvent::LoadReady` and friends); the load timer's repaint
     // feeds the canvas for whichever tab the open landed on.
@@ -3616,24 +3581,15 @@ pub fn install(
             }
         }
     });
-    app.on_skipped_notice_dismissed({
-        let controller = controller.clone();
-        let app_weak = app.as_weak();
-        move || {
-            record_gallery_input();
-            controller.lock().unwrap().dismiss_notice();
-            if let Some(app) = app_weak.upgrade() {
-                app.set_skipped_notice("".into());
-                direct_publication_scope(InputSurface::Gallery);
-            }
-        }
-    });
     app.on_job_toast_dismissed({
+        let controller = controller.clone();
+        let toast_timer = toast_timer.clone();
         let app_weak = app.as_weak();
         move || {
             record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().dismiss_visible_toast();
             if let Some(app) = app_weak.upgrade() {
-                app.set_job_toast_open(false);
+                push_toast(&app, &controller, &toast_timer);
                 direct_publication_scope(InputSurface::Other);
             }
         }
@@ -3899,14 +3855,11 @@ pub fn install(
         move || {
             record_images_input();
             if let Some(paths) = crate::picker::pick_frames() {
-                let mut refused = None;
                 dispatch(&controller, &canvas, &app_weak, |controller| {
-                    refused = controller.add_frames(&paths).err();
+                    let _ = controller.add_frames(&paths);
                 });
-                if let Some(refused) = refused
-                    && let Some(app) = app_weak.upgrade()
-                {
-                    open_job_toast(&app, refused.to_string(), &toast_timer);
+                if let Some(app) = app_weak.upgrade() {
+                    push_toast(&app, &controller, &toast_timer);
                 }
             }
         }
@@ -4035,17 +3988,11 @@ pub fn install(
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         move || {
-            let notice = {
-                let mut controller = controller.lock().unwrap();
-                controller.keep_fused();
-                controller.unaligned_notice()
-            };
+            controller.lock().unwrap().keep_fused();
             if let Some(app) = app_weak.upgrade() {
                 push_projects(&app, &controller);
                 repaint(&app, &controller, &canvas);
-                if let Some(notice) = notice {
-                    open_toast(&app, notice, "info", &toast_timer);
-                }
+                push_toast(&app, &controller, &toast_timer);
             }
         }
     });
@@ -4518,6 +4465,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::ProjectsChanged => {
             push_projects(app, controller);
             push_project_dialogs(app, &controller.lock().unwrap());
+            refresh_toast(app, controller);
         }
         ShellEvent::TabScrollChanged => push_tab_scroll(app, &controller.lock().unwrap()),
         ShellEvent::QuestionRaised(question) => push_question(app, &question),
@@ -4563,6 +4511,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             app.set_projects_save_enabled(controller.save_enabled());
         }
         ShellEvent::OverlayChanged => {
+            refresh_toast(app, controller);
             let controller = controller.lock().unwrap();
             push_projects_overlay(app, &controller);
             push_project_dialogs(app, &controller);

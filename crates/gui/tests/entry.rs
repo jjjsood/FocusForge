@@ -251,15 +251,43 @@ fn skipped_subfolders_are_reported_not_failed() {
     let outcome = common::open_and_settle(&mut controller, &[root]);
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     assert_eq!(controller.project_tabs().len(), 1);
-    let notice = controller
-        .notice()
+    let record = controller
+        .notifications()
+        .first()
         .expect("the skipped subfolder must be reported");
+    let notice = record.title.as_str();
+    assert!(record.message.contains("thumbs"), "{}", record.message);
     assert!(notice.contains("1 subfolder"));
     assert!(notice.contains("skipped"));
     assert!(
         controller.last_refusal().is_none(),
         "a skipped subfolder is not a failure"
     );
+}
+
+#[test]
+fn two_skipped_subfolders_make_one_record_naming_both_paths() {
+    let root = tree("entry_two_skipped");
+    copy_frame(&root.join("subject"), "00.tif", 0);
+    for name in ["thumbs", "notes"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("readme.txt"), b"not a frame").unwrap();
+    }
+
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(controller.notifications().len(), 1, "one open, one record");
+    let record = &controller.notifications()[0];
+    assert_eq!(record.title, "2 subfolders skipped");
+    for name in ["thumbs", "notes"] {
+        let full = root.join(name).display().to_string();
+        assert!(
+            record.message.contains(&full),
+            "{full} in {}",
+            record.message
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

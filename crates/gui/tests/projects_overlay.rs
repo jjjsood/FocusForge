@@ -645,12 +645,11 @@ fn init_window_backend() {
 }
 
 /// Run again on a failed card, started from inside the open overview,
-/// announces its own failure there too: the overview stays open, the toast
-/// carries the operation's summary, and the card it re-ran still reads
-/// `failed` with one card per tab.
+/// raises no toast for its own failure: the overview stays open, a second
+/// record is kept, and the card it re-ran still reads `failed` with one
+/// card per tab.
 #[test]
-fn run_again_failure_is_announced_over_the_overview() {
-    use i_slint_backend_testing::ElementQuery;
+fn run_again_failure_over_the_overview_raises_no_toast() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
@@ -676,7 +675,15 @@ fn run_again_failure_is_announced_over_the_overview() {
     app.invoke_fuse_requested();
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
     assert!(app.get_job_toast_open());
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(6100));
+    controller
+        .lock()
+        .unwrap()
+        .expire_toast(std::time::Instant::now() + Duration::from_secs(7));
+    focusforge_gui::bridge::push_toast(
+        &app,
+        &controller,
+        &std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
     assert!(
         !app.get_job_toast_open(),
         "the first toast must have expired before the retry"
@@ -690,23 +697,13 @@ fn run_again_failure_is_announced_over_the_overview() {
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
 
     assert!(
-        app.get_job_toast_open(),
-        "Run again's own failure must be announced too"
+        !app.get_job_toast_open(),
+        "Projects shows no toast for Run again's failure"
     );
-    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert_eq!(controller.lock().unwrap().notifications().len(), 2);
     assert!(
         app.get_projects_overlay_open(),
         "the overview must stay open"
-    );
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
-    let opacity = ElementQuery::from_root(&app)
-        .match_id("AppWindow::job-toast")
-        .find_first()
-        .expect("the toast is always in the tree")
-        .computed_opacity();
-    assert!(
-        opacity > 0.99,
-        "the toast must be visible over the overview, got opacity {opacity}"
     );
 
     let cards = controller.lock().unwrap().project_cards();

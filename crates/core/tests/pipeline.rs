@@ -1203,6 +1203,21 @@ impl StageObserver for NoticeObserver {
     }
 }
 
+/// Collects the frame index each frame notice names.
+#[derive(Default)]
+struct FrameNoticeObserver {
+    notices: Mutex<Vec<(usize, String)>>,
+}
+
+impl StageObserver for FrameNoticeObserver {
+    fn frame_notice(&self, frame: usize, message: &str) {
+        self.notices
+            .lock()
+            .unwrap()
+            .push((frame, message.to_string()));
+    }
+}
+
 /// A held run's report with the bytes of the composite and Z-Map it wrote.
 struct HeldRun {
     report: Box<FuseReport>,
@@ -1855,6 +1870,26 @@ fn equalization_clamps_a_frame_beyond_the_bound_with_a_notice() {
     for part in ["1.444", "1.25", "1.45"] {
         assert!(clamp[0].contains(part), "{part} in {:?}", clamp[0]);
     }
+}
+
+#[test]
+fn equalization_frame_notice_carries_the_frame_index() {
+    let frames = brightness_stack("eq_frame_notice", 3, &[1.0, 1.0, 0.6]);
+    let observer = FrameNoticeObserver::default();
+    let run = eq_run(
+        "eq_frame_notice_run",
+        &frames,
+        "laplacian",
+        eq_settings(1.25, 0.0),
+        None,
+        &observer,
+    );
+    let estimate = run.report.equalization.as_ref().unwrap();
+    assert!(estimate.frames[2].clamped && !estimate.frames[0].clamped);
+    let notices = observer.notices.lock().unwrap();
+    assert_eq!(notices.len(), 1, "one clamped frame: {notices:?}");
+    assert_eq!(notices[0].0, 2, "the clamped frame sits at index 2");
+    assert!(notices[0].1.contains("frame 2"), "{:?}", notices[0].1);
 }
 
 #[test]
