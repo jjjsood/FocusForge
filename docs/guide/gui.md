@@ -37,7 +37,8 @@ between two tabs of its own:
   project adds them to it the same way, rather than opening a second project;
   a frame that would replace one already in the stack asks before doing so.
   The panel dims while its own tab's fuse is running, the same as
-  **Settings**.
+  **Settings**. The Appearance tab of the settings window sets whether the panel shows each frame as a
+  plain row, a row with a preview, or a large preview.
 - **Settings** holds every setting of the next fuse on this tab, in four
   sections; see [Settings](#settings) below. A value outside its declared
   range is flagged before the run starts.
@@ -84,9 +85,13 @@ moment later rather than hanging; see
 The **Settings** tab is generated from the same parameter schema
 `focusforge-cli algorithms` prints. It has four sections, top to bottom:
 
-- **PREPARE** — **Equalize brightness** (on by default) and **Max brightness
-  gain** (1.01 to 2.0, default 1.25). Every frame gets one gain, matching the
-  reference frame's mid-tone brightness, bounded by the max gain.
+- **PREPARE** — **Equalize brightness** (on by default), **Max brightness
+  gain** (1.01 to 2.0, default 1.25) and **Target brightness (stops)**, a
+  signed slider from -0.5 to 0.5 in steps of 0.1 (Left and Right step it from
+  the keyboard). Every frame gets one gain, bringing its mean to one target
+  shared by all frames, bounded by the max gain; the target sits at the
+  frames' average brightness at 0.0 and a stop higher or lower doubles or
+  halves it. While the gains are measured the bottom bar reads **Preparing**.
 - **FUSE** — the fusion method and the parameters it declares. The picker
   lists every method: **Details** (the default), **Soft transitions** and
   **Focus map**. Each method remembers its own settings while the tab is open.
@@ -196,7 +201,7 @@ notice such as a held brightness gain, skipped subfolders on an open and a
 notice about crash reports left by an earlier session. Nothing is written to
 disk, so closing the window ends the history.
 
-A bell sits in the icon bar down the left edge, just above the gear. Its badge
+A bell sits in the icon bar down the left edge, just above the **Settings** icon. Its badge
 counts the notifications you have not read and disappears at zero. Clicking
 the bell opens the **Notifications** center beside the bar; opening it marks
 every notification read, and it stays reachable with no project open and over
@@ -231,8 +236,8 @@ notification service there is no banner and everything else works as usual.
 
 ## The settings window
 
-The gear at the bottom of the window opens the settings window, which has
-five tabs:
+The **Settings** icon at the foot of the icon bar opens the settings window,
+which has six tabs:
 
 - **Performance** switches GPU processing on or off, shows the backend the
   last run resolved, and takes an optional **Host memory cap** and **VRAM
@@ -240,6 +245,10 @@ five tabs:
   example `8GiB`). A cap only lowers a budget; the **Host budget** and
   **VRAM budget** rows show the budgets in effect. A field holding an
   unparsable size is flagged. A changed VRAM cap applies from the next start.
+- **Appearance** chooses how the **Images** panel presents the source frames:
+  **List**, **Image list** (the default) or **Large previews**. The latter two
+  show a preview of each original source image beside its name. The choice is
+  saved in the `[appearance]` table of `settings.toml`.
 - **Storage** lists where the settings file, the logs, the crash reports and
   the scratch directory live, and marks one that does not exist yet. **Clear
   cache** deletes the cached fuse stages.
@@ -251,7 +260,7 @@ five tabs:
 - **About** shows the version, the licence (GPL-3.0), the copyright and
   warranty notice, and the source repository.
 
-`focusforge-gui --settings-section performance|storage|input-map|diagnostics|about`
+`focusforge-gui --settings-section performance|appearance|storage|input-map|diagnostics|about`
 opens the window on that tab at startup.
 
 ## Keyboard and mouse bindings
@@ -267,7 +276,8 @@ such as `alt+wheel`. Alt is not a wheel modifier; it is only the pipette.
 
 `settings.toml` in the platform's per-user config directory holds
 everything the window remembers, one table per concern: `[recent]` (the
-rail's recent projects, up to five, each row needing its `path`), `[input]`
+rail's recent projects, up to five, each row needing its `path`), `[appearance]`
+(`presentation = "list"|"image-list"|"large"`), `[input]`
 (the bindings above), `[export]` (the export dialog's last choice) and
 `[performance]` (`gpu = true|false`, and optional `max-host-memory` and
 `max-vram` size strings, as set on the Performance tab). The

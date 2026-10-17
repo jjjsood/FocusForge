@@ -62,7 +62,8 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   declares, and `unstable-winit-030`), `slint-build` (build dependency),
   `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
   folder/file picker), `toml`/`toml_edit`/`serde` (`settings.toml`'s
-  `[recent]`, `[input]` and `[export]` tables), `directories` (per-platform data/config
+  `[recent]`, `[appearance]`, `[input]` and `[export]` tables), `notify-rust`
+  (desktop banners while the window is in the background), `directories` (per-platform data/config
   paths), `png`
   (`--screenshot`), `tracing`. Inter ships bundled under `assets/fonts/`;
   the icon set is vendored from Lucide under `assets/icons/`.
