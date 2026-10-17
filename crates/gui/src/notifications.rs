@@ -327,7 +327,7 @@ impl Notifications {
     }
 
     /// Drops the visible and queued toasts; the records stay.
-    pub fn suppress(&mut self) {
+    fn suppress(&mut self) {
         self.queue.clear();
         self.shown = None;
     }
