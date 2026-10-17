@@ -13,14 +13,14 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
    Expect: (within 30 s) the **Fuse stack** button is back in the toolbar, the buttons **Pause**, **Resume** and **Cancel** are gone and the Settings panel is no longer dimmed.
 ## Defaults and Reset All on the second tab
 6. Drag the Settings scrollbar (`FFScrollbar::track-area`) from the top to the end of its track (`$M drag FFScrollbar::track-area 0 1193 705`).
-   Expect: the row "Reset All to Default" is visible below the FINISH rows with its label in grey, the Auto-crop switch is on and the FINISH heading shows "DEFAULT".
-7. Click **Reset All to Default** (`FFResetAll::area`) while its label is grey.
-   Expect: Must not: the label turns orange or the Auto-crop switch turns off.
+   Expect: the row "Reset All to Default" is visible below the FINISH rows; `buttons FFDock::settings-panel` lists **Reset All to Default** with its line starting `x` (disabled); the Auto-crop switch is on and the FINISH heading shows "DEFAULT".
+7. Click **Reset All to Default** (`FFResetAll::area`) while it is disabled.
+   Expect: Must not: it becomes enabled or the Auto-crop switch turns off; `buttons FFDock::settings-panel` lists **Reset All to Default** still with its line starting `x`.
 8. Click the **Auto-crop** switch (`FFToggle::area` 1) on the second tab.
-   Expect: the switch is off, the FINISH heading has no "DEFAULT" badge and the label "Reset All to Default" is orange.
+   Expect: the switch is off, the FINISH heading has no "DEFAULT" badge and `buttons FFDock::settings-panel` lists **Reset All to Default** with its line not starting `x` (enabled).
 ## Values stay with their tab
 9. Click the first project tab (`FFTab::area` 0).
-   Expect: the Auto-crop switch is on, the FINISH heading shows "DEFAULT" and the label "Reset All to Default" is grey.
+   Expect: the Auto-crop switch is on, the FINISH heading shows "DEFAULT" and `buttons FFDock::settings-panel` lists **Reset All to Default** with its line starting `x`.
 10. Drag the Settings scrollbar (`FFScrollbar::track-area`) back to the start of its track (`$M drag FFScrollbar::track-area 0 1193 225`).
    Expect: the headings "PREPARE", "FUSE" and "ALIGN" each show "DEFAULT"; the FUSE "Algorithm" field reads "Details" and the ALIGN "Algorithm" field reads "Pyramidal ECC".
 ## Algorithm picker
@@ -66,14 +66,14 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
    Expect: the row "Mode" is gone.
 ## Reset All
 30. Drag the Settings scrollbar (`FFScrollbar::track-area`) from the top to the end of its track (`$M drag FFScrollbar::track-area 0 1193 705`).
-   Expect: the row "Reset All to Default" is visible below the FINISH rows and its label is orange.
+   Expect: the row "Reset All to Default" is visible below the FINISH rows and `buttons FFDock::settings-panel` lists **Reset All to Default** with its line not starting `x`.
 31. Click the **Auto-crop** switch (`FFToggle::area` 1) on the first tab.
    Expect: the switch is off and the FINISH heading has no "DEFAULT" badge.
 32. Click **Reset All to Default** (`FFResetAll::area`).
-   Expect: the Auto-crop switch is on, the FINISH heading shows "DEFAULT" again and the label "Reset All to Default" is grey.
+   Expect: the Auto-crop switch is on, the FINISH heading shows "DEFAULT" again and `buttons FFDock::settings-panel` lists **Reset All to Default** with its line starting `x`.
 33. Drag the Settings scrollbar (`FFScrollbar::track-area`) back to the start of its track (`$M drag FFScrollbar::track-area 0 1193 225`).
    Expect: the headings "PREPARE", "FUSE" and "ALIGN" each show "DEFAULT" and the FUSE Algorithm field still reads "Focus map".
 34. Click the second project tab (`FFTab::area` 1).
    Expect: Must not: the FUSE Algorithm field of this tab reads "Focus map" (it reads "Details") or the FINISH heading shows "DEFAULT" (it has no badge).
 35. Drag the Settings scrollbar (`FFScrollbar::track-area`) from the top to the end of its track (`$M drag FFScrollbar::track-area 0 1193 705`).
-   Expect: the Auto-crop switch is off, the FINISH heading has no "DEFAULT" badge and the label "Reset All to Default" is orange.
+   Expect: the Auto-crop switch is off, the FINISH heading has no "DEFAULT" badge and `buttons FFDock::settings-panel` lists **Reset All to Default** with its line not starting `x`.

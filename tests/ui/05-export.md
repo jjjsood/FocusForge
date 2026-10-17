@@ -27,27 +27,31 @@ Start: --open fixtures/mantis-64/frames
 ## Change the format
 12. Click the middle segment **PNG** of the Format row (`FFSegmented::root`, match 0; its centre is the PNG segment).
    Expect: the heading reads "PNG SETTINGS" over "Bit depth" and "Compression" reading "Default"; "TIFF SETTINGS" and "Quality" are not shown.
-13. (human only) Click **JPEG** in the Format row (the right segment; the segments have no id).
-   Expect: the heading reads "JPEG SETTINGS" over a "Quality" row with a slider whose value reads "95" and a "Chroma subsampling" row with the segments 4:4:4 and 4:2:0; "Bit depth" and "Compression" are not shown.
-14. (human only) Drag the Quality slider in the dialog to its left end.
+13. Click **JPEG** in the Format row (`FFSegmented::segment` 2).
+   Expect: the heading reads "JPEG SETTINGS" over a "Quality" row with a slider whose value reads "95" and a "Chroma subsampling" row with the segments 4:4:4 and 4:2:0; "Bit depth" and "Compression" are not shown; `buttons AppWindow::export-dialog` lists **JPEG** with checked=true and **PNG** with checked=false.
+14. Click **4:4:4** in the Chroma subsampling row (`FFSegmented::segment` 3).
+   Expect: `buttons AppWindow::export-dialog` lists **4:4:4** with checked=true and **4:2:0** with checked=false.
+15. Click **4:2:0** in the Chroma subsampling row (`FFSegmented::segment` 4).
+   Expect: `buttons AppWindow::export-dialog` lists **4:2:0** with checked=true and **4:4:4** with checked=false.
+16. (human only) Drag the Quality slider in the dialog to its left end.
    Expect: the value beside the slider reads "1".
 ## Cancel writes nothing
-15. Click **Cancel** (`AppWindow::export-dialog`).
-   Expect: Must not: a heading "Writing image…" or a file chooser is shown; the "Export image" dialog is gone, the CHECKPOINTS list still shows 1 row and the bottom bar still reads "fused" followed by a time.
-16. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
-   Expect: the dialog "Export image" opens with the heading "TIFF SETTINGS", the "Compression" field reading "None" and the "Metadata" switch's knob at its right end; "JPEG SETTINGS" and "Deflate" are not shown.
 17. Click **Cancel** (`AppWindow::export-dialog`).
+   Expect: Must not: a heading "Writing image…" or a file chooser is shown; the "Export image" dialog is gone, the CHECKPOINTS list still shows 1 row and the bottom bar still reads "fused" followed by a time.
+18. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
+   Expect: the dialog "Export image" opens with the heading "TIFF SETTINGS", the "Compression" field reading "None" and the "Metadata" switch's knob at its right end; "JPEG SETTINGS" and "Deflate" are not shown.
+19. Click **Cancel** (`AppWindow::export-dialog`).
    Expect: the "Export image" dialog is gone.
 ## What the dialog says it exports
-18. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
+20. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
    Expect: **Save checkpoint** is no longer greyed out (read with `buttons` within `AppWindow::editor-toolbar`: enabled true).
-19. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
+21. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
    Expect: the dialog "Export image" opens with the line "Exporting your current unsaved retouch edits."; the line "Exporting the unsaved fuse result held in this tab." is not shown.
-20. Click **Cancel** (`AppWindow::export-dialog`).
+22. Click **Cancel** (`AppWindow::export-dialog`).
    Expect: the "Export image" dialog is gone.
-21. Click **Save checkpoint** (`AppWindow::editor-toolbar`).
+23. Click **Save checkpoint** (`AppWindow::editor-toolbar`).
    Expect: the CHECKPOINTS list shows 2 rows; **Save checkpoint** is greyed out (read with `buttons` within `AppWindow::editor-toolbar`: enabled false).
-22. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
+24. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
    Expect: the dialog "Export image" opens with the context line "frames · unsaved edits on Details" followed by a date and time and the line "Exporting your current unsaved retouch edits." (the checkpoint lives only in this tab until the project is saved); the line "Exporting the saved checkpoint you selected." is not shown.
-23. Click **Cancel** (`AppWindow::export-dialog`).
+25. Click **Cancel** (`AppWindow::export-dialog`).
    Expect: the "Export image" dialog is gone and the CHECKPOINTS list shows 2 rows.
