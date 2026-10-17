@@ -24,7 +24,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
 10. Drag the Settings scrollbar (`FFScrollbar::track-area`) back to the start of its track (`$M drag FFScrollbar::track-area 0 1193 225`).
    Expect: the headings "PREPARE", "FUSE" and "ALIGN" each show "DEFAULT"; the FUSE "Algorithm" field reads "Details" and the ALIGN "Algorithm" field reads "Pyramidal ECC".
 ## Algorithm picker
-11. Click the **Algorithm** menu under FUSE (`FFMenu::area` 0).
+11. Click the **Algorithm** menu under FUSE (`FFMenu::root` 0).
    Expect: a list opens under it with the entries "Details", "Soft transitions" and "Focus map" in that order, their ids "laplacian", "weighted-average" and "depth-map" in grey, and a check mark beside "Details"; a build for developers may list one more entry, "Dummy Stack (test-only)", between "Details" and "Soft transitions" (then the list has 4 entries).
 12. Click the entry **Soft transitions**, grey id "weighted-average" (`FFMenuList::option-area` 1, or 2 when the list shows "Dummy Stack (test-only)" as its second entry).
    Expect: the list is gone; the field reads "Soft transitions"; a row "Sharp-source preference" with a value field reading "4" appears under FUSE; the FUSE heading still shows its "DEFAULT" badge.
@@ -34,7 +34,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
    Expect: the value field reads a number from 4.4 to 4.6 and the FUSE heading has no "DEFAULT" badge.
 15. Click the middle of the track of the **Radius** slider (`FFSlider::drag-area` 1).
    Expect: the Radius value field reads "8".
-16. Click the **Algorithm** menu under FUSE (`FFMenu::area` 0).
+16. Click the **Algorithm** menu under FUSE (`FFMenu::root` 0).
    Expect: the list opens with a check mark beside "Soft transitions" (grey id "weighted-average").
 17. Click the entry **Focus map**, grey id "depth-map", the last entry of the list (`FFMenuList::option-area` 2, or 3 when the list shows "Dummy Stack (test-only)").
    Expect: the field reads "Focus map"; the row "Sharp-source preference" is gone; the rows "Score Radius" (value "4") and "Smoothing Radius" (value "8") are shown under "More...".
@@ -45,13 +45,13 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
    Expect: a row "Mode" appears below that bar, at the bottom edge of the dock, and reads "Rotation + Scale".
 20. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
    Expect: the switch is off; the ALIGN "Algorithm" label and field, the "More..." bar and the "Mode" label are drawn greyed out; the "Enabled" label is not greyed out.
-21. Click the **Algorithm** menu under ALIGN (`FFMenu::area` 1) while ALIGN is switched off.
+21. Click the **Algorithm** menu under ALIGN (`FFMenu::root` 1) while ALIGN is switched off.
    Expect: Must not: a list opens under it; the grey id text "pyramidal-ecc" is not shown.
 22. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
    Expect: the switch is on; the ALIGN "Algorithm" label and field, the "More..." bar and the "Mode" label are no longer greyed out.
 23. Drag the Settings scrollbar (`FFScrollbar::track-area`) to the middle of its track (`$M drag FFScrollbar::track-area 0 1193 480`).
    Expect: the ALIGN heading with its "DEFAULT" badge is at the top of the dock; the rows "Mode" (reading "Rotation + Scale") and "Max Iterations" (reading "400") are shown.
-24. Click the **Mode** field (`FFMenu::area` 1).
+24. Click the **Mode** field (`FFMenu::root` 1).
    Expect: a list opens under it with the entries "Translation only" and "Rotation + Scale", the grey ids "translation" and "rotation-scale" and a check mark beside "Rotation + Scale".
 25. Click **Translation only** (`FFMenuList::option-area` 0).
    Expect: the list is gone; the Mode field reads "Translation only"; the ALIGN heading at the top of the dock has no "DEFAULT" badge.

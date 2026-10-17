@@ -36,11 +36,11 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 16. Click **Fit** (`FFZoomCluster::zoom-fit`).
     Expect: the zoom readout shows the fit value of step 9 again.
 ## The settings window blocks the main window
-17. Click the gear (`FFBottomBar::gear`).
-    Expect: a window titled "Settings" opens (`AppWindow::settings-modal`) with five rail entries Performance, Storage, Input map, Diagnostics and About.
+17. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
+    Expect: a window titled "Settings" opens (`AppWindow::settings-modal`) with six rail entries Performance, Appearance, Storage, Input map, Diagnostics and About.
 18. Click **Zoom in** (`FFZoomCluster::zoom-in`) while the Settings window is open.
     Expect: Must not: the zoom readout behind the window rises above the fit value; it still shows the fit value of step 9.
-19. Click the close button (`FFSettingsModal::close`).
+19. Click **Close settings** (`FFSettingsModal::close`).
     Expect: the "Settings" window and its rail are gone; the canvas panes are visible and the zoom readout shows the fit value.
 ## Must not work: the overlay before a fuse
 20. Click the **Overlay** toggle (`FFToggle::area` 0, the one at the right of the bottom bar).

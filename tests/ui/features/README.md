@@ -9,11 +9,12 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [checkpoints-export](checkpoints-export.md) | 04, 05 | CHECKPOINTS list, the export dialog and its states |
 | [close-and-quit](close-and-quit.md) | 06 | close-tab and quit questions, Quit without saving |
 | [navigation-and-settings](navigation-and-settings.md) | 07 | dock tabs, zoom, two tabs, Z-Map overlay, detached pane, the settings window blocking the main window |
-| [settings-window](settings-window.md) | 08 | Performance, Storage, Input map, Diagnostics, About |
-| [stacking-parameters](stacking-parameters.md) | 09 | the dock's Settings tab: sections, values, algorithm picker, Reset All, per-tab values |
-| [images-panel](images-panel.md) | 10 | frame list, exclude, remove, sort, reorder, add |
+| [settings-window](settings-window.md) | 08 | Performance, Appearance, Storage, Input map, Diagnostics, About |
+| [stacking-parameters](stacking-parameters.md) | 09, 14 | the dock's Settings tab: sections, values, algorithm picker, Reset All, per-tab values, brightness target |
+| [images-panel](images-panel.md) | 10, 13 | frame list, exclude, remove, sort, reorder, add, List / Image list / Large previews |
 | [projects](projects.md) | 11 | projects overview, cards, cancelled run, close from card, rail |
 | [open-and-refusals](open-and-refusals.md) | 12 | RAW folder, compressed TIFF variants, empty start |
+| [notifications](notifications.md) | 15 | bell and unread count, notification center, toasts, crash record |
 
 ## Human only
 

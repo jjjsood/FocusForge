@@ -12,7 +12,7 @@ Start: --open fixtures/mantis-64/frames
 ## Read the dialog
 5. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
    Expect: a dialog titled "Export image" opens with the line "Exporting the unsaved fuse result held in this tab.", a "Format" row with the segments TIFF, PNG and JPEG with TIFF highlighted, the heading "TIFF SETTINGS" over "Bit depth" reading "16-bit" and "Compression" reading "None", no "Quality" row, and a "METADATA" heading.
-6. Click the "Bit depth" field showing "16-bit" (`FFMenu::area`, match 0; match 1 is "Compression").
+6. Click the "Bit depth" field showing "16-bit" (`FFMenu::root`, match 0; match 1 is "Compression").
    Expect: a list with the options 16-bit and 8-bit opens under the field, with a check mark beside 16-bit.
 7. Click the option 8-bit (`FFMenuList::option-area`, match 1).
    Expect: the list is closed and the "Bit depth" field reads "8-bit".
@@ -20,7 +20,7 @@ Start: --open fixtures/mantis-64/frames
    Expect: the switch's knob is at its left end (it was at its right end before the click).
 9. Click the switch beside "Metadata" (`FFToggle::area`, match 1).
    Expect: the switch's knob is at its right end again.
-10. Click the "Compression" field showing "None" (`FFMenu::area`, match 1; match 0 is "Bit depth").
+10. Click the "Compression" field showing "None" (`FFMenu::root`, match 1; match 0 is "Bit depth").
    Expect: a list with the options None, LZW and Deflate opens under the field, with a check mark beside None.
 11. Click the option Deflate (`FFMenuList::option-area`, match 2).
    Expect: the list is closed and the "Compression" field reads "Deflate".
