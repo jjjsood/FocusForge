@@ -2801,7 +2801,8 @@ mod notification {
     }
 
     /// A project whose run is still going when `refusals` adds are refused,
-    /// settled afterwards: one failure record per refusal.
+    /// settled afterwards: one failure record per refusal. The first toast is
+    /// held while the run settles, so a slow settle cannot expire it.
     fn controller_with_refusals(name: &str, refusals: usize) -> AppController {
         let mut controller = common::controller_with_frames(name, 4);
         controller.set_align_algorithm("dummy-align");
@@ -2813,8 +2814,10 @@ mod notification {
                     .is_err(),
                 "a running job refuses an add"
             );
+            controller.hold_toast(true);
         }
         common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        controller.hold_toast(false);
         controller
     }
 
