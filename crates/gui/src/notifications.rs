@@ -329,7 +329,7 @@ impl Notifications {
 
     /// Records whether the app window has focus. Regaining it with the center
     /// open reads what arrived meanwhile.
-    pub fn set_focused(&mut self, focused: bool) {
+    fn set_focused(&mut self, focused: bool) {
         self.focused = focused;
         if focused && self.center_open {
             self.mark_all_read();
