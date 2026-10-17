@@ -2598,3 +2598,13 @@ fn the_panel_is_disabled_without_a_project() {
     focusforge_gui::bridge::push_settings_panel(&app, &controller);
     assert!(app.get_settings_enabled(), "a project is open");
 }
+
+#[test]
+fn settings_opens_from_the_icon_bar() {
+    let panel = MountedPanel::open();
+    assert!(!panel.app.get_settings_open());
+
+    // The bar's lower control, 8 px above the window's bottom edge.
+    panel.click(slint::LogicalPosition::new(24.0, 1200.0 - 24.0));
+    assert!(panel.app.get_settings_open());
+}

@@ -66,20 +66,25 @@ fn shell_bands_match_the_spec() {
     app.set_show_empty_state(false);
 
     assert_rect(&app, "AppWindow::tab-strip", (0.0, 0.0, 1440.0, 36.0));
-    assert_rect(&app, "AppWindow::toolbar", (0.0, 36.0, 1180.0, 40.0));
-    assert_rect(&app, "AppWindow::canvas-ground", (0.0, 76.0, 1180.0, 780.0));
+    assert_rect(&app, "AppWindow::icon-bar", (0.0, 36.0, 48.0, 864.0));
+    assert_rect(&app, "AppWindow::toolbar", (48.0, 36.0, 1132.0, 40.0));
+    assert_rect(
+        &app,
+        "AppWindow::canvas-ground",
+        (48.0, 76.0, 1132.0, 780.0),
+    );
     assert_rect(
         &app,
         "FFCanvas::pane-left",
-        (16.0, 76.0 + 16.0, 566.0, 748.0),
+        (48.0 + 16.0, 76.0 + 16.0, 542.0, 748.0),
     );
     assert_rect(
         &app,
         "FFCanvas::pane-right",
-        (1180.0 - 16.0 - 566.0, 76.0 + 16.0, 566.0, 748.0),
+        (1180.0 - 16.0 - 542.0, 76.0 + 16.0, 542.0, 748.0),
     );
     assert_rect(&app, "AppWindow::dock", (1180.0, 36.0, 260.0, 820.0));
-    assert_rect(&app, "AppWindow::bottom-bar", (0.0, 856.0, 1440.0, 44.0));
+    assert_rect(&app, "AppWindow::bottom-bar", (48.0, 856.0, 1392.0, 44.0));
 }
 
 #[test]
@@ -96,12 +101,12 @@ fn shell_bands_hold_at_the_minimum() {
     assert_rect(
         &app,
         "FFCanvas::pane-left",
-        (16.0, 76.0 + 16.0, 446.0, 608.0),
+        (48.0 + 16.0, 76.0 + 16.0, 422.0, 608.0),
     );
     assert_rect(
         &app,
         "FFCanvas::pane-right",
-        (940.0 - 16.0 - 446.0, 76.0 + 16.0, 446.0, 608.0),
+        (940.0 - 16.0 - 422.0, 76.0 + 16.0, 422.0, 608.0),
     );
 
     for id in [
@@ -217,8 +222,8 @@ fn checkpoint_panel_touches_no_storage() {
     }
 }
 
-/// The zoom cluster sits at the bottom bar's right end, 216 x 32,
-/// mirroring the gear's `Theme.space-3` inset at the left. Zoom-out,
+/// The zoom cluster sits at the bottom bar's right end, 216 x 32, inset
+/// `Theme.space-3` from the window edge. Zoom-out,
 /// readout and zoom-in share one rounded surface (`zoom-group`, 120 px, no
 /// internal gaps), with `Fit` kept visually separate by a full
 /// `Theme.space-4` (16 px) gap.
@@ -667,7 +672,7 @@ fn settings_slint_sources() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Opening Settings without choosing a section (the gear) shows Performance:
+/// Opening Settings without choosing a section (the icon bar's Settings button) shows Performance:
 /// the window's initial section is the controller's default, and the rail
 /// marks that entry selected.
 #[test]
@@ -1319,7 +1324,7 @@ fn projects_suppresses_a_failure_toast_and_keeps_it_unread() {
         slot.clone(),
     );
     focusforge_gui::bridge::push_toast(&app, &controller, &slot);
-    assert!(!app.get_job_toast_open(), "Projects shows no toast");
+    assert!(!app.get_toast_open(), "Projects shows no toast");
     assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
 
     app.set_projects_overlay_open(true);
@@ -1367,68 +1372,59 @@ fn projects_suppresses_a_failure_toast_and_keeps_it_unread() {
     );
 }
 
-/// The gear carries its own persistently-boxed background -- the "icon
-/// button" catalogue entry's default state already carries a visible box --
-/// rather than a bare `TouchArea`. It does **not** share the zoom
-/// cluster's own `FFZoomIconButton`, whose grouped, hover-only convention
-/// is a different at-rest state. The gear is a single standalone control,
-/// so it keeps its own individual box, sized to the same 32 x 32 baseline
-/// the zoom buttons use for one shared bar-wide rhythm.
-#[test]
-fn gear_has_its_own_persistent_box() {
-    let app = app_at(1440, 900);
-
-    let (_, _, w, h) = rect(&app, "FFBottomBar::gear");
-    assert_eq!(
-        (w, h),
-        (32.0, 32.0),
-        "the gear's hit box must match the zoom cluster's own 32 x 32 baseline \
-         (Theme.icon-md + 2 * Theme.space-2)"
-    );
-
-    let bottom_bar_slint =
-        fs::read_to_string(common::ui_dir().join("shell").join("bottom_bar.slint")).unwrap();
-    let code = common::strip_line_comments(&bottom_bar_slint);
-    assert!(
-        code.contains("gear := FFGearButton"),
-        "bottom_bar.slint: the gear must use its own FFGearButton component, not the zoom \
-         cluster's FFZoomIconButton -- the two must not share chrome"
-    );
-    assert!(
-        !code.contains("gear := FFZoomIconButton"),
-        "bottom_bar.slint: the gear must not reuse the zoom cluster's own icon-button component"
-    );
-
-    // `FFGearButton`'s default (non-hover) background must not be
-    // `transparent`: a button with chrome only on hover reads as no button
-    // at all until the mouse finds it.
-    let default_background = code
-        .split("background: area.has-hover ? Theme.surface-hover : ")
-        .nth(1)
-        .and_then(|rest| rest.split(';').next())
-        .expect("FFGearButton must bind its background to a hover/default pair");
-    assert_ne!(
-        default_background.trim(),
-        "transparent",
-        "FFGearButton's default state must carry a visible background"
-    );
-}
-
 /// The four-square Projects-overlay button sits at the strip's far left and
 /// the tabs start after it -- `ShellGeometry.projects-button-slot` wired to
 /// `tabs-region`'s `x`, not merely declared and left unused: button x
-/// 8..38, first tab x 46.
+/// 9..39, first tab x 47.
 #[test]
 fn tab_strip_reserves_the_projects_button_slot() {
     let app = app_at(1440, 900);
 
     let (x, _, _, _) = rect(&app, "FFTabStrip::tabs-region");
     assert_eq!(
-        x, 46.0,
-        "tabs-region must start at ShellGeometry.projects-button-slot (46px), not flush at x=0"
+        x, 47.0,
+        "tabs-region must start at ShellGeometry.projects-button-slot (47px), not flush at x=0"
     );
-    // The projects button is a 30x30 strip box at x 8, on the tabs' top edge.
-    assert_rect(&app, "FFTabStrip::projects-button", (8.0, 6.0, 30.0, 30.0));
+    // The projects button is a 30x30 strip box at x 9, on the tabs' top edge.
+    assert_rect(&app, "FFTabStrip::projects-button", (9.0, 6.0, 30.0, 30.0));
+}
+
+/// The tab strip and the icon bar under it are one column: the bar starts
+/// on the strip boxes' bottom edge, the first tab's left frame sits on the
+/// bar's 1 px right rule so the line runs unbroken from the tab into the
+/// bar, and the projects button is centred on the bell and Settings glyphs.
+#[test]
+fn tab_strip_lines_up_with_the_icon_bar() {
+    for (width, height) in [(1440, 900), (1200, 760)] {
+        let app = app_at(width, height);
+        let (bar_x, bar_y, bar_w, _) = rect(&app, "AppWindow::icon-bar");
+        let (button_x, button_y, button_w, button_h) = rect(&app, "FFTabStrip::projects-button");
+        let (tabs_x, ..) = rect(&app, "FFTabStrip::tabs-region");
+        let (bell_x, _, bell_w, _) = rect(&app, "FFIconBar::bell");
+        let (gear_x, _, gear_w, _) = rect(&app, "FFIconBar::settings");
+
+        assert_eq!(
+            bar_y,
+            button_y + button_h,
+            "the icon bar must start on the strip boxes' bottom edge at {width}x{height}"
+        );
+        assert_eq!(
+            tabs_x,
+            bar_x + bar_w - 1.0,
+            "the first tab's left frame must sit on the icon bar's right rule at {width}x{height}"
+        );
+        let button_centre = button_x + button_w / 2.0;
+        assert_eq!(
+            button_centre,
+            bell_x + bell_w / 2.0,
+            "bell at {width}x{height}"
+        );
+        assert_eq!(
+            button_centre,
+            gear_x + gear_w / 2.0,
+            "Settings at {width}x{height}"
+        );
+    }
 }
 
 /// The tab strip's scroll arrows must actually be wired to the
@@ -1658,11 +1654,11 @@ fn empty_state_is_a_card_under_the_wordmark() {
     let app = app_at(1440, 900);
 
     let card = rect(&app, "FFEmptyState::empty-card");
-    assert_eq!((card.0, card.2), (330.0, 520.0), "card x/width: {card:?}");
+    assert_eq!((card.0, card.2), (354.0, 520.0), "card x/width: {card:?}");
     let wordmark = rect(&app, "FFEmptyState::wordmark");
     assert_eq!(
         (wordmark.0, wordmark.2),
-        (446.0, 288.0),
+        (470.0, 288.0),
         "wordmark: {wordmark:?}"
     );
     assert!(
@@ -1758,14 +1754,13 @@ fn dock_without_a_project_says_so() {
     );
 }
 
-/// The bottom bar's status line without a project: a rule one grid step
-/// right of the gear, then `No project open` (rule x 52, text x 68).
+/// The bottom bar's status line without a project: `No project open`, 20 px
+/// in from the bar's left edge.
 #[test]
 fn bottom_bar_status_reads_no_project_open() {
     let app = app_at(1440, 900);
 
     assert_eq!(label(&app, "FFBottomBar::status-text"), "No project open");
-    assert_rect(&app, "FFBottomBar::status-rule", (52.0, 868.0, 1.0, 20.0));
     let (x, _, _, _) = rect(&app, "FFBottomBar::status-text");
     assert_eq!(x, 68.0);
 
@@ -1777,8 +1772,9 @@ fn bottom_bar_status_reads_no_project_open() {
     );
 }
 
-/// The toolbar's transport buttons: 116 x 26, 10 px apart, the first at
-/// `Theme.space-3` (12px) and the second at 138px -- the running state's
+/// The toolbar's transport buttons: 116 x 26, 10 px apart, the first
+/// `Theme.space-3` (12px) inside the toolbar (x 60) and the second at 186px
+/// -- the running state's
 /// `Pause`/`Cancel` pair.
 #[test]
 fn transport() {
@@ -1786,8 +1782,8 @@ fn transport() {
     app.set_show_empty_state(false);
     app.set_toolbar_run_state("running".into());
 
-    assert_rect(&app, "FFToolbar::pause-button", (12.0, 43.0, 116.0, 26.0));
-    assert_rect(&app, "FFToolbar::cancel-button", (138.0, 43.0, 116.0, 26.0));
+    assert_rect(&app, "FFToolbar::pause-button", (60.0, 43.0, 116.0, 26.0));
+    assert_rect(&app, "FFToolbar::cancel-button", (186.0, 43.0, 116.0, 26.0));
 }
 
 /// The bottom bar's progress track, in reading order (stage -> step -> bar
@@ -1992,11 +1988,11 @@ fn detached_main_pane_fills_the_canvas_on_either_side() {
         ("composite", "FFCanvas::pane-left"),
     ] {
         app.set_detached_pane(detached.into());
-        assert_rect(&app, remaining, (16.0, 92.0, 1148.0, 748.0));
+        assert_rect(&app, remaining, (64.0, 92.0, 1100.0, 748.0));
     }
     app.set_detached_pane("".into());
-    assert_rect(&app, "FFCanvas::pane-left", (16.0, 92.0, 566.0, 748.0));
-    assert_rect(&app, "FFCanvas::pane-right", (598.0, 92.0, 566.0, 748.0));
+    assert_rect(&app, "FFCanvas::pane-left", (64.0, 92.0, 542.0, 748.0));
+    assert_rect(&app, "FFCanvas::pane-right", (622.0, 92.0, 542.0, 748.0));
 }
 
 // --- Performance tab -------------------------------------------------------
@@ -2697,4 +2693,472 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         error_pos.y + error_size.height <= session_note.absolute_position().y,
         "the wrapped failure ends before the session note"
     );
+}
+
+// --- Notification surface --------------------------------------------------
+
+mod notification {
+    use super::*;
+    use focusforge_core::params::ParamValue;
+    use focusforge_gui::notifications::Kind;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    type Slot = Rc<RefCell<Option<slint::Timer>>>;
+
+    /// A window over `controller`, wired the way the application runs it,
+    /// with the toast already pushed.
+    struct Rig {
+        app: AppWindow,
+        controller: SharedController,
+        slot: Slot,
+        _installed: focusforge_gui::bridge::Installed,
+    }
+
+    fn rig(controller: AppController, width: u32, height: u32) -> Rig {
+        let controller: SharedController = Arc::new(Mutex::new(controller));
+        let app = app_at(width, height);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        let slot: Slot = Rc::new(RefCell::new(None));
+        let installed = focusforge_gui::bridge::install(
+            &app,
+            controller.clone(),
+            common::empty_canvas(),
+            slot.clone(),
+        );
+        focusforge_gui::bridge::push_toast(&app, &controller, &slot);
+        Rig {
+            app,
+            controller,
+            slot,
+            _installed: installed,
+        }
+    }
+
+    impl Rig {
+        fn event(&self, event: WindowEvent) {
+            self.app.window().dispatch_event(event);
+            slint::platform::update_timers_and_animations();
+        }
+
+        fn move_to(&self, x: f32, y: f32) {
+            self.event(WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(x, y),
+            });
+        }
+
+        fn click(&self, x: f32, y: f32) {
+            let position = slint::LogicalPosition::new(x, y);
+            self.move_to(x, y);
+            self.event(WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            });
+            self.event(WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            });
+        }
+
+        /// Lets the center finish sliding in or out.
+        fn settle_slide(&self) {
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+            slint::platform::update_timers_and_animations();
+        }
+
+        fn key(&self, key: Key) {
+            let text: slint::SharedString = key.into();
+            self.event(WindowEvent::KeyPressed { text: text.clone() });
+            self.event(WindowEvent::KeyReleased { text });
+        }
+
+        /// The bell's centre in a window `height` tall.
+        fn bell(height: f32) -> (f32, f32) {
+            (24.0, height - 64.0)
+        }
+
+        fn selection(&self) -> (Option<u64>, bool) {
+            self.controller.lock().unwrap().notification_selection()
+        }
+
+        fn center_open(&self) -> bool {
+            self.controller.lock().unwrap().notification_center_open()
+        }
+
+        fn ids(&self) -> Vec<u64> {
+            self.controller
+                .lock()
+                .unwrap()
+                .notifications()
+                .iter()
+                .map(|n| n.id)
+                .collect()
+        }
+    }
+
+    /// A project whose run is still going when `refusals` adds are refused,
+    /// settled afterwards: one failure record per refusal.
+    fn controller_with_refusals(name: &str, refusals: usize) -> AppController {
+        let mut controller = common::controller_with_frames(name, 4);
+        controller.set_align_algorithm("dummy-align");
+        assert!(controller.start_fuse());
+        for _ in 0..refusals {
+            assert!(
+                controller
+                    .add_frames(&[common::fixture_frame("mantis-64", 4)])
+                    .is_err(),
+                "a running job refuses an add"
+            );
+        }
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        controller
+    }
+
+    /// Two unreported crash reports under a fresh data directory.
+    fn crash_data_dir(name: &str) -> std::path::PathBuf {
+        let data = common::tree(name);
+        let crashes = data.join("crashes");
+        fs::create_dir_all(&crashes).unwrap();
+        for stamp in ["20260918T010203Z", "20260918T010204Z"] {
+            fs::write(
+                crashes.join(format!("{stamp}-focusforge-gui-panic.json")),
+                "{\"format\":1,\"payload\":\"boom\"}",
+            )
+            .unwrap();
+        }
+        data
+    }
+
+    fn count_badge(app: &AppWindow) -> Option<String> {
+        ElementQuery::from_root(app)
+            .match_id("FFIconButton::count")
+            .find_first()
+            .map(|_| label(app, "FFIconButton::count"))
+    }
+
+    #[test]
+    fn icon_bar_places_bell_above_settings() {
+        for (width, height) in [(1440u32, 900u32), (1200, 760)] {
+            let app = app_at(width, height);
+            app.set_show_empty_state(false);
+            app.set_projects_overlay_open(true);
+            let (w, h) = (width as f32, height as f32);
+
+            assert_rect(&app, "AppWindow::icon-bar", (0.0, 36.0, 48.0, h - 36.0));
+            assert_rect(&app, "FFIconBar::bell", (8.0, h - 80.0, 32.0, 32.0));
+            assert_rect(&app, "FFIconBar::settings", (8.0, h - 40.0, 32.0, 32.0));
+            for id in [
+                "AppWindow::toolbar",
+                "AppWindow::canvas-ground",
+                "AppWindow::bottom-bar",
+                "AppWindow::projects-overlay",
+            ] {
+                assert_eq!(rect(&app, id).0, 48.0, "{id} at {width}x{height}");
+            }
+            assert_eq!(rect(&app, "AppWindow::bottom-bar").2, w - 48.0);
+        }
+    }
+
+    #[test]
+    fn unread_badge_counts_and_hides_at_zero() {
+        let rig = rig(controller_with_refusals("shell_badge", 3), 1440, 900);
+        assert_eq!(rig.app.get_notifications_unread(), 3);
+        assert_eq!(count_badge(&rig.app).as_deref(), Some("3"));
+
+        let (x, y) = Rig::bell(900.0);
+        rig.click(x, y);
+        assert!(rig.app.get_notification_center_open());
+        assert_eq!(rig.app.get_notifications_unread(), 0);
+        assert_eq!(count_badge(&rig.app), None, "no badge at zero");
+    }
+
+    #[test]
+    fn the_bell_toggles_the_center() {
+        let rig = rig(controller_with_refusals("shell_bell_toggle", 1), 1440, 900);
+        let (x, y) = Rig::bell(900.0);
+        rig.click(x, y);
+        assert!(rig.center_open());
+        rig.click(x, y);
+        assert!(!rig.center_open(), "the bell closes an open center");
+        assert!(!rig.app.get_notification_center_open());
+        assert_eq!(
+            rig.app.get_notifications_unread(),
+            0,
+            "closing reads nothing new"
+        );
+    }
+
+    #[test]
+    fn toast_activation_selects_its_record_after_later_events() {
+        let rig = rig(controller_with_refusals("shell_toast_select", 3), 1440, 900);
+        let ids = rig.ids();
+        assert!(rig.app.get_toast_open());
+        assert_eq!(
+            rig.app.get_toast_id() as u64,
+            ids[0],
+            "the first record is up"
+        );
+        assert_eq!(rig.app.get_toast_kind(), "failure");
+
+        // The `Open notification` link.
+        rig.click(64.0 + 80.0, 92.0 + 44.0);
+        assert!(!rig.app.get_toast_open());
+        assert!(rig.center_open());
+        assert_eq!(rig.selection(), (Some(ids[0]), true));
+        let rows = rig.app.get_notification_rows();
+        assert_eq!(slint::Model::row_count(&rows), 3);
+        for (row, id) in (0..3).zip(ids.iter().rev()) {
+            let view = slint::Model::row_data(&rows, row).unwrap();
+            assert_eq!(view.id as u64, *id, "newest first");
+            assert_eq!(view.selected, *id == ids[0]);
+            assert_eq!(view.expanded, *id == ids[0]);
+        }
+    }
+
+    #[test]
+    fn a_closed_toast_lets_the_pointer_reach_the_canvas() {
+        let rig = rig(controller_with_refusals("shell_closed_toast", 1), 1440, 900);
+        rig.app.set_show_empty_state(false);
+        rig.app.set_project_loaded(true);
+        let reached = Rc::new(RefCell::new(0usize));
+        rig.app.on_canvas_pointer({
+            let reached = reached.clone();
+            move |_, kind, _, _, _, _, _| {
+                if kind == 0 {
+                    *reached.borrow_mut() += 1;
+                }
+            }
+        });
+
+        assert!(rig.app.get_toast_open());
+
+        rig.controller
+            .lock()
+            .unwrap()
+            .expire_toast(Instant::now() + Duration::from_secs(7));
+        focusforge_gui::bridge::push_toast(&rig.app, &rig.controller, &rig.slot);
+        assert!(!rig.app.get_toast_open());
+        rig.click(150.0, 130.0);
+        assert!(*reached.borrow() > 0, "the closed toast takes no input");
+    }
+
+    #[test]
+    fn center_keys_select_expand_and_escape_returns_focus_to_the_bell() {
+        let rig = rig(controller_with_refusals("shell_center_keys", 2), 1440, 900);
+        let ids = rig.ids();
+        let (x, y) = Rig::bell(900.0);
+        rig.click(x, y);
+        rig.settle_slide();
+        assert!(rig.center_open());
+
+        rig.key(Key::DownArrow);
+        assert_eq!(
+            rig.selection(),
+            (Some(ids[1]), false),
+            "the first row is the newest"
+        );
+        rig.key(Key::DownArrow);
+        assert_eq!(rig.selection(), (Some(ids[0]), false));
+        rig.key(Key::Return);
+        assert_eq!(rig.selection(), (Some(ids[0]), true));
+
+        rig.key(Key::Escape);
+        assert!(!rig.center_open(), "Escape closes the center");
+        assert!(
+            !rig.controller.lock().unwrap().projects_overlay_open(),
+            "Escape never opens Projects"
+        );
+
+        rig.key(Key::Return);
+        assert!(
+            rig.center_open(),
+            "focus is on the bell, so Return opens the center again"
+        );
+    }
+
+    #[test]
+    fn a_long_message_scrolls_inside_the_center() {
+        let root = common::tree("shell_long_message");
+        common::copy_frame(&root, "00.tif", 0);
+        for i in 0..40 {
+            let dir = root.join(format!("skipped-{i:02}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("readme.txt"), b"not a frame").unwrap();
+        }
+        let mut controller = AppController::new();
+        common::open_and_settle(&mut controller, &[root]);
+        let rig = rig(controller, 1200, 760);
+        assert_eq!(rig.app.get_toast_title(), "Some images were skipped");
+        assert_eq!(rig.app.get_toast_kind(), "info");
+
+        rig.app.invoke_toast_activated(rig.app.get_toast_id());
+        let rows = rig.app.get_notification_rows();
+        let view = slint::Model::row_data(&rows, 0).unwrap();
+        assert!(view.expanded);
+        assert_eq!(
+            view.message.lines().count(),
+            41,
+            "the count line and every path"
+        );
+
+        let (_, _, _, card) = rect(&rig.app, "FFNotificationRow::card");
+        let (_, _, _, viewport) = rect(&rig.app, "FFNotificationCenter::scroller");
+        assert!(
+            card > viewport,
+            "the expanded card ({card}) outgrows the list viewport ({viewport})"
+        );
+    }
+
+    #[test]
+    fn toast_hover_pauses_its_timer() {
+        let rig = rig(controller_with_refusals("shell_toast_hover", 1), 1440, 900);
+        let original = rig.controller.lock().unwrap().toast_deadline().unwrap();
+        let running = || rig.slot.borrow().as_ref().is_some_and(|t| t.running());
+        assert!(running(), "one timer is armed for the deadline");
+
+        rig.move_to(150.0, 130.0);
+        assert_eq!(rig.controller.lock().unwrap().toast_deadline(), None);
+        assert!(!running(), "the same timer is stopped, not replaced");
+
+        rig.move_to(900.0, 500.0);
+        let resumed = rig.controller.lock().unwrap().toast_deadline().unwrap();
+        assert!(resumed > original, "the time spent paused is added back");
+        assert!(running());
+    }
+
+    #[test]
+    fn a_brightness_row_names_the_frame_file() {
+        let mut controller = common::controller_with_frames("shell_brightness_row", 4);
+        controller.set_align_algorithm("dummy-align");
+        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
+        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
+        controller.toggle_frame_excluded(0);
+        assert!(controller.start_fuse());
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let project = controller.notifications()[0]
+            .project_title
+            .clone()
+            .expect("a brightness record names its project");
+        assert!(
+            controller
+                .notifications()
+                .iter()
+                .all(|n| n.kind == Kind::Warning)
+        );
+
+        let rig = rig(controller, 1440, 900);
+        assert_eq!(rig.app.get_toast_title(), "Brightness target limited");
+        assert_eq!(rig.app.get_toast_kind(), "warning");
+        let (x, y) = Rig::bell(900.0);
+        rig.click(x, y);
+        let rows = rig.app.get_notification_rows();
+        let contexts: Vec<String> = (0..slint::Model::row_count(&rows))
+            .map(|i| {
+                slint::Model::row_data(&rows, i)
+                    .unwrap()
+                    .context
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            contexts.len(),
+            3,
+            "the excluded frame is not part of the run"
+        );
+        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif", "03.tif"]) {
+            assert!(
+                context.starts_with(&format!("{project} · {file}")),
+                "{context:?} names {file}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crash_toast_carries_the_crash_kind() {
+        let mut controller = AppController::new();
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")), None);
+        controller.scan_crash_notice();
+        let rig = rig(controller, 1440, 900);
+        assert!(rig.app.get_toast_open());
+        assert_eq!(rig.app.get_toast_kind(), "crash");
+        assert_eq!(rig.app.get_toast_title(), "Previous session stopped");
+    }
+
+    /// The crash row's Diagnostics button opens the settings modal on its
+    /// Diagnostics section, not on the section the modal last showed.
+    #[test]
+    fn crash_diagnostics_opens_settings_on_the_diagnostics_section() {
+        let mut controller = AppController::new();
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")), None);
+        controller.scan_crash_notice();
+        let rig = rig(controller, 1440, 900);
+        assert_eq!(rig.app.get_settings_section().as_str(), "performance");
+
+        rig.app
+            .invoke_notification_diagnostics_requested(rig.ids()[0] as i32);
+
+        assert!(rig.app.get_settings_open());
+        assert_eq!(rig.app.get_settings_section().as_str(), "diagnostics");
+    }
+
+    /// The icon bar and the center compose primitives and set no colour: the
+    /// unread bell glyph and the muted close glyph are `FFIconButton`'s own.
+    #[test]
+    fn icon_bar_and_center_set_no_colour_themselves() {
+        for file in ["shell/icon_bar.slint", "shell/notification_center.slint"] {
+            let source = ui_source(file);
+            for needle in [
+                "color:",
+                "background",
+                "border-",
+                "font-",
+                "Theme.text-",
+                "Theme.accent-",
+                "Theme.surface-",
+            ] {
+                assert!(!source.contains(needle), "{file} sets {needle:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_row_shows_the_failed_acknowledgement_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = crash_data_dir("shell_crash_row");
+        let crashes = data.join("crashes");
+        let writable = fs::metadata(&crashes).unwrap().permissions();
+        let mut controller = AppController::new();
+        controller.set_diagnostics_dirs(Some(data), None);
+        controller.scan_crash_notice();
+        let rig = rig(controller, 1440, 900);
+        let id = rig.ids()[0];
+        let row = || slint::Model::row_data(&rig.app.get_notification_rows(), 0).unwrap();
+        assert_eq!(row().crash_state, "unacknowledged");
+
+        fs::set_permissions(&crashes, fs::Permissions::from_mode(0o555)).unwrap();
+        rig.app.invoke_notification_acknowledge_requested(id as i32);
+        let writable_now = fs::write(crashes.join("probe"), "x").is_ok();
+        fs::set_permissions(&crashes, writable).unwrap();
+        if writable_now {
+            return; // privileged user: a read-only directory still accepts writes
+        }
+        let stored = rig.controller.lock().unwrap().notifications()[0]
+            .crash
+            .as_ref()
+            .and_then(|c| c.error.clone())
+            .expect("the refused write is stored");
+        assert_eq!(row().crash_state, "failed");
+        assert_eq!(row().crash_error, stored.as_str());
+
+        rig.app.invoke_notification_acknowledge_requested(id as i32);
+        assert_eq!(row().crash_state, "acknowledged");
+        assert_eq!(row().crash_error, "");
+    }
 }

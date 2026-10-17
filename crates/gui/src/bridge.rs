@@ -36,8 +36,8 @@ use crate::diagnostics::{
 };
 use crate::generated::{
     AboutState, AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow,
-    ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow, PerformanceCap,
-    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView,
+    PerformanceCap, PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
     RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
     StoragePathState, StorageState,
 };
@@ -1576,7 +1576,7 @@ fn push_tab_scroll(app: &AppWindow, controller: &AppController) {
     app.set_can_scroll_right(controller.can_scroll_right());
 }
 
-/// Shows the notification queue's visible toast on `FFToast`'s tone and arms
+/// Shows the notification queue's visible toast and arms
 /// one single-shot timer at its deadline. The timer re-enters this function,
 /// whose expiry check closes only a toast whose own deadline has passed, so
 /// a timer armed for an earlier toast never closes a later one.
@@ -1597,30 +1597,104 @@ thread_local! {
 }
 
 /// [`push_toast`] through the slot registered by the last call to it.
+/// Pushes the center's count line and its rows, newest first.
+fn push_notification_rows(app: &AppWindow, controller: &AppController) {
+    let records = controller.notifications();
+    let (selected, expanded) = controller.notification_selection();
+    let rows: Vec<NotificationRowView> = records
+        .iter()
+        .rev()
+        .map(|n| {
+            let is_selected = selected == Some(n.id);
+            let (crash_state, crash_error) = match &n.crash {
+                None => ("", String::new()),
+                Some(c) if c.acknowledged => ("acknowledged", String::new()),
+                Some(c) if c.unavailable => ("unavailable", String::new()),
+                Some(c) => match &c.error {
+                    Some(error) => ("failed", error.clone()),
+                    None => ("unacknowledged", String::new()),
+                },
+            };
+            let message = if crash_state == "acknowledged" {
+                "This crash report was acknowledged. Its original notification remains available \
+                 for this session."
+            } else {
+                n.message.as_str()
+            };
+            NotificationRowView {
+                id: i32::try_from(n.id).unwrap_or(i32::MAX),
+                kind: kind_word(n.kind).into(),
+                title: n.title.as_str().into(),
+                context: crate::notifications::context_line(n).into(),
+                message: message.into(),
+                selected: is_selected,
+                expanded: is_selected && expanded,
+                crash_state: crash_state.into(),
+                crash_error: crash_error.into(),
+            }
+        })
+        .collect();
+    let count_text = format!(
+        "{} notification{} · this session",
+        records.len(),
+        if records.len() == 1 { "" } else { "s" }
+    );
+    app.set_notification_count_text(count_text.into());
+    sync_rows(app.get_notification_rows(), rows, |model| {
+        app.set_notification_rows(model)
+    });
+}
+
+fn kind_word(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Info => "info",
+        Kind::Warning => "warning",
+        Kind::Failure => "failure",
+        Kind::Crash => "crash",
+    }
+}
+
+/// Runs `act` on the controller, then pushes the notification views.
+fn dispatch_notifications(
+    controller: &Arc<Mutex<AppController>>,
+    app_weak: &slint::Weak<AppWindow>,
+    act: impl FnOnce(&mut AppController),
+) {
+    act(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        refresh_toast(&app, controller);
+    }
+}
+
 fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     let (shown, wait) = {
         let mut controller = controller.lock().unwrap();
         let now = Instant::now();
         controller.expire_toast(now);
-        let shown = controller.visible_toast().map(|n| {
-            let tone = match n.kind {
-                Kind::Failure | Kind::Crash => "failure",
-                Kind::Info | Kind::Warning => "info",
-            };
-            (n.title.clone(), tone)
-        });
+        let shown = controller
+            .visible_toast()
+            .map(|n| (n.id, kind_word(n.kind), n.title.clone()));
         let wait = controller
             .toast_deadline()
             .map(|deadline| deadline.saturating_duration_since(now));
         (shown, wait)
     };
     match shown {
-        Some((message, tone)) => {
-            app.set_job_toast_tone(tone.into());
-            app.set_job_toast_message(message.into());
-            app.set_job_toast_open(true);
+        Some((id, kind, title)) => {
+            app.set_toast_id(i32::try_from(id).unwrap_or(i32::MAX));
+            app.set_toast_kind(kind.into());
+            app.set_toast_title(title.into());
+            app.set_toast_open(true);
         }
-        None => app.set_job_toast_open(false),
+        None => app.set_toast_open(false),
+    }
+    {
+        let controller = controller.lock().unwrap();
+        app.set_notifications_unread(
+            i32::try_from(controller.unread_notifications()).unwrap_or(i32::MAX),
+        );
+        app.set_notification_center_open(controller.notification_center_open());
+        push_notification_rows(app, &controller);
     }
     let Some(toast_timer) = TOAST_SLOT.with(|slot| slot.borrow().upgrade()) else {
         return;
@@ -3099,6 +3173,97 @@ pub fn install(
             controller.lock().unwrap().clear_input_modifiers()
         }
     });
+    app.on_notification_row_clicked({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id| {
+            dispatch_notifications(&controller, &app_weak, |c| {
+                c.select_notification(u64::try_from(id).unwrap_or_default());
+            });
+        }
+    });
+    app.on_notification_selection_moved({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |delta| {
+            dispatch_notifications(&controller, &app_weak, |c| {
+                c.move_notification_selection(delta as isize);
+            });
+        }
+    });
+    app.on_notification_expansion_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch_notifications(&controller, &app_weak, |c| c.toggle_notification_expanded());
+        }
+    });
+    app.on_notification_center_close_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || dispatch_notifications(&controller, &app_weak, |c| c.close_center())
+    });
+    app.on_notification_acknowledge_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id| {
+            dispatch_notifications(&controller, &app_weak, |c| {
+                let _ = c.acknowledge_crash(u64::try_from(id).unwrap_or_default());
+            });
+        }
+    });
+    app.on_notification_diagnostics_requested({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |id| {
+            record_settings_input();
+            let (open, section) = {
+                let mut controller = controller.lock().unwrap();
+                let open = controller.crash_diagnostics(u64::try_from(id).unwrap_or_default());
+                (open, controller.settings_section())
+            };
+            if let Some(app) = app_weak.upgrade() {
+                app.set_settings_open(open);
+                app.set_settings_section(section.slug().into());
+                push_performance_view(&app, &controller);
+                push_storage_view(&app, &controller);
+                refresh_toast(&app, &controller);
+                direct_publication_scope(InputSurface::Settings);
+                repaint(&app, &controller, &canvas);
+            }
+        }
+    });
+    app.on_toast_activated({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |id| {
+            controller
+                .lock()
+                .unwrap()
+                .open_center_at(u64::try_from(id).unwrap_or_default());
+            if let Some(app) = app_weak.upgrade() {
+                refresh_toast(&app, &controller);
+                push_projects_overlay(&app, &controller.lock().unwrap());
+            }
+        }
+    });
+    app.on_toast_hold_changed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |held| dispatch_notifications(&controller, &app_weak, |c| c.hold_toast(held))
+    });
+    app.on_bell_activated({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            controller.lock().unwrap().toggle_center();
+            if let Some(app) = app_weak.upgrade() {
+                refresh_toast(&app, &controller);
+                push_projects_overlay(&app, &controller.lock().unwrap());
+            }
+        }
+    });
     app.on_settings_open_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -3580,7 +3745,7 @@ pub fn install(
             }
         }
     });
-    app.on_job_toast_dismissed({
+    app.on_toast_dismissed({
         let controller = controller.clone();
         let toast_timer = toast_timer.clone();
         let app_weak = app.as_weak();

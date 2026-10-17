@@ -7588,6 +7588,20 @@ impl AppController {
         self.notifications.expire_due(now);
     }
 
+    /// Freezes the visible toast's countdown while `held`, restarts it with
+    /// the time it had left once released.
+    pub fn hold_toast(&mut self, held: bool) {
+        let Some(id) = self.notifications.visible().map(|n| n.id) else {
+            return;
+        };
+        let now = Instant::now();
+        if held {
+            self.notifications.pause(id, now);
+        } else {
+            self.notifications.resume(id, now);
+        }
+    }
+
     /// Closes the visible toast ahead of its deadline.
     pub fn dismiss_visible_toast(&mut self) {
         if let Some(id) = self.notifications.visible().map(|n| n.id) {
@@ -7608,6 +7622,45 @@ impl AppController {
 
     pub fn close_center(&mut self) {
         self.notifications.close_center();
+    }
+
+    /// Opens the center on record `id`, selected and expanded, closing the
+    /// Projects overview as [`open_center`](Self::open_center) does.
+    pub fn open_center_at(&mut self, id: u64) {
+        self.close_projects_overlay();
+        self.notifications.open_center_at(id);
+    }
+
+    /// Selects record `id` and shows its full message.
+    pub fn select_notification(&mut self, id: u64) {
+        if self.notifications.get(id).is_some() {
+            self.notifications.select(id);
+            self.notifications.toggle_expanded();
+        }
+    }
+
+    /// Moves the center's selection `delta` rows down the list, newest first.
+    pub fn move_notification_selection(&mut self, delta: isize) {
+        self.notifications.move_selection(delta);
+    }
+
+    pub fn toggle_notification_expanded(&mut self) {
+        self.notifications.toggle_expanded();
+    }
+
+    /// The center's selected record and whether it shows its full message.
+    pub fn notification_selection(&self) -> (Option<u64>, bool) {
+        (self.notifications.selected(), self.notifications.expanded())
+    }
+
+    /// Closes the center when it is open, opens it (as
+    /// [`open_center`](Self::open_center) does) otherwise.
+    pub fn toggle_center(&mut self) {
+        if self.notifications.center_open() {
+            self.close_center();
+        } else {
+            self.open_center();
+        }
     }
 
     /// Records whether the app window has focus.
@@ -7642,17 +7695,17 @@ impl AppController {
         if skipped.is_empty() {
             return;
         }
-        let title = format!(
+        let count = format!(
             "{} subfolder{} skipped",
             skipped.len(),
             if skipped.len() == 1 { "" } else { "s" }
         );
         let paths: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
-        let message = format!("{title}:\n{}", paths.join("\n"));
+        let message = format!("{count}:\n{}", paths.join("\n"));
         self.publish_notification(Notification::new(
             Kind::Info,
             Source::Import,
-            title,
+            "Some images were skipped",
             message,
         ));
     }
@@ -7766,7 +7819,7 @@ impl AppController {
                 .and_then(|i| run_frames.get(i))
                 .map(|p| images::file_name(p));
             let title = if frame.is_some() {
-                "Brightness warning"
+                "Brightness target limited"
             } else {
                 "Processing notice"
             };
@@ -8670,11 +8723,11 @@ impl AppController {
     // [`tab_scroll_into_view`]); `.slint` only reads the results. --
 
     /// `tabs-region`'s width at `ShellGeometry.base-width`: 1440 minus the
-    /// 46 px projects slot, the 105 px window-glyph cluster (`base-width -
+    /// 47 px projects slot, the 105 px window-glyph cluster (`base-width -
     /// glyph-first-x`) and the 32 px
     /// `strip-cluster-gap` -- see [`AppController::new`] for why the region
     /// starts here rather than at zero.
-    const BASE_TAB_REGION_WIDTH: f32 = 1257.0;
+    const BASE_TAB_REGION_WIDTH: f32 = 1256.0;
 
     /// The tabs-region's measured width, pushed from `FFTabStrip`'s
     /// `tabs-region-width` (at install, and on every change). Re-clamps the
@@ -8976,21 +9029,22 @@ impl AppController {
         } else if ids.is_empty() {
             return;
         } else {
-            let count = match ids.len() {
-                1 => "1 crash report".to_string(),
-                n => format!("{n} crash reports"),
+            let detected = match ids.len() {
+                1 => "One crash report was".to_string(),
+                n => format!("{n} crash reports were"),
             };
             Notification::new(
                 Kind::Crash,
                 Source::Startup,
                 "Previous session stopped",
                 format!(
-                    "{count} from an earlier session {} unreported.",
-                    if ids.len() == 1 { "is" } else { "are" }
+                    "A previous session stopped unexpectedly. {detected} detected at startup.\n\n\
+                     Reading or closing this notice does not acknowledge the report."
                 ),
             )
         };
         record.crash = Some(CrashEvidence {
+            reports: ids.len(),
             ids,
             unavailable,
             ..CrashEvidence::default()

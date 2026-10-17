@@ -255,10 +255,9 @@ fn skipped_subfolders_are_reported_not_failed() {
         .notifications()
         .first()
         .expect("the skipped subfolder must be reported");
-    let notice = record.title.as_str();
+    assert_eq!(record.title, "Some images were skipped");
     assert!(record.message.contains("thumbs"), "{}", record.message);
-    assert!(notice.contains("1 subfolder"));
-    assert!(notice.contains("skipped"));
+    assert!(record.message.starts_with("1 subfolder skipped"));
     assert!(
         controller.last_refusal().is_none(),
         "a skipped subfolder is not a failure"
@@ -279,7 +278,8 @@ fn two_skipped_subfolders_make_one_record_naming_both_paths() {
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     assert_eq!(controller.notifications().len(), 1, "one open, one record");
     let record = &controller.notifications()[0];
-    assert_eq!(record.title, "2 subfolders skipped");
+    assert_eq!(record.title, "Some images were skipped");
+    assert!(record.message.starts_with("2 subfolders skipped"));
     for name in ["thumbs", "notes"] {
         let full = root.join(name).display().to_string();
         assert!(

@@ -1835,7 +1835,7 @@ fn failure_while_the_overview_is_open_raises_no_toast() {
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
 
     assert!(
-        !app.get_job_toast_open(),
+        !app.get_toast_open(),
         "Projects shows no toast, regardless of which tab is active"
     );
     assert_eq!(controller.lock().unwrap().notifications().len(), 1);
@@ -1875,17 +1875,14 @@ fn projects_suppresses_a_failure_toast_without_replay() {
     app.invoke_fuse_requested();
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
     assert!(
-        !app.get_job_toast_open(),
+        !app.get_toast_open(),
         "Projects shows no toast for a failure settling under it"
     );
     assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
 
     controller.lock().unwrap().toggle_projects_overlay();
     focusforge_gui::bridge::push_toast(&app, &controller, &slot);
-    assert!(
-        !app.get_job_toast_open(),
-        "closing Projects replays nothing"
-    );
+    assert!(!app.get_toast_open(), "closing Projects replays nothing");
     let controller = controller.lock().unwrap();
     assert_eq!(
         controller.unread_notifications(),

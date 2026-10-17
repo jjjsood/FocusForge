@@ -41,6 +41,9 @@ pub enum Source {
 pub struct CrashEvidence {
     /// The crash ids still to be marked reported.
     pub ids: Vec<String>,
+    /// How many crash reports the record stands for; kept when
+    /// acknowledgement clears `ids`.
+    pub reports: usize,
     pub acknowledged: bool,
     /// Why the last attempt to mark the evidence reported failed.
     pub error: Option<String>,
@@ -120,6 +123,8 @@ pub struct Notifications {
     projects_open: bool,
     center_open: bool,
     focused: bool,
+    selected: Option<u64>,
+    expanded: bool,
 }
 
 impl Default for Notifications {
@@ -131,6 +136,8 @@ impl Default for Notifications {
             projects_open: false,
             center_open: false,
             focused: true,
+            selected: None,
+            expanded: false,
         }
     }
 }
@@ -159,6 +166,60 @@ impl Notifications {
 
     pub fn center_open(&self) -> bool {
         self.center_open
+    }
+
+    /// The record selected in the center.
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+
+    /// Whether the selected record shows its full message.
+    pub fn expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Selects record `id`, collapsed. An unknown id changes nothing.
+    pub fn select(&mut self, id: u64) {
+        if self.get(id).is_some() {
+            self.selected = Some(id);
+            self.expanded = false;
+        }
+    }
+
+    /// Moves the selection `delta` rows down the center's list (newest
+    /// first), stopping at the first and last record. With nothing selected
+    /// it selects the first row.
+    pub fn move_selection(&mut self, delta: isize) {
+        let count = self.records.len();
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .selected
+            .and_then(|id| self.records.iter().rev().position(|n| n.id == id));
+        let next = match current {
+            Some(row) => row.saturating_add_signed(delta).min(count - 1),
+            None => 0,
+        };
+        if current != Some(next) {
+            self.select(self.records[count - 1 - next].id);
+        }
+    }
+
+    /// Shows or hides the selected record's full message.
+    pub fn toggle_expanded(&mut self) {
+        if self.selected.is_some() {
+            self.expanded = !self.expanded;
+        }
+    }
+
+    /// Opens the center on record `id`, selected and expanded.
+    pub fn open_center_at(&mut self, id: u64) {
+        self.open_center();
+        if self.get(id).is_some() {
+            self.selected = Some(id);
+            self.expanded = true;
+        }
     }
 
     /// The toast currently on screen.
@@ -295,6 +356,39 @@ impl Notifications {
             }
         }
     }
+}
+
+/// A row's context line: the source (omitted for a run), the project title,
+/// the frame file, save-target file or crash report count, and the time,
+/// each present part joined by ` · `.
+pub fn context_line(record: &Notification) -> String {
+    let source = match record.source {
+        Source::Run => None,
+        Source::Save => Some("Save".to_string()),
+        Source::Import => Some("Import".to_string()),
+        Source::Startup => Some("Startup".to_string()),
+    };
+    let file = |path: &PathBuf| path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let detail = record
+        .frame
+        .clone()
+        .or_else(|| record.target.as_ref().and_then(file))
+        .or_else(|| {
+            record
+                .crash
+                .as_ref()
+                .filter(|crash| crash.reports > 0)
+                .map(|crash| match crash.reports {
+                    1 => "1 crash report".to_string(),
+                    n => format!("{n} crash reports"),
+                })
+        });
+    let time = (!record.at.is_empty()).then(|| record.at.clone());
+    [source, record.project_title.clone(), detail, time]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 #[cfg(test)]
@@ -455,5 +549,107 @@ mod tests {
         assert_eq!((a, b, c), (1, 2, 3));
         let ids: Vec<u64> = store.records().iter().map(|n| n.id).collect();
         assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[test]
+    fn open_center_at_selects_and_expands_that_record() {
+        let t0 = Instant::now();
+        let mut store = Notifications::default();
+        let ids: Vec<u64> = (0..5)
+            .map(|_| store.publish(note(Kind::Info), t0))
+            .collect();
+        store.open_center_at(ids[1]);
+        assert!(store.center_open());
+        assert_eq!(store.selected(), Some(ids[1]), "not the newest");
+        assert!(store.expanded());
+        assert_eq!(store.unread(), 0);
+        store.open_center_at(999);
+        assert_eq!(
+            store.selected(),
+            Some(ids[1]),
+            "an unknown id changes nothing"
+        );
+    }
+
+    #[test]
+    fn selection_moves_and_clamps_at_both_ends() {
+        let t0 = Instant::now();
+        let mut store = Notifications::default();
+        let ids: Vec<u64> = (0..3)
+            .map(|_| store.publish(note(Kind::Info), t0))
+            .collect();
+        store.move_selection(1);
+        assert_eq!(
+            store.selected(),
+            Some(ids[2]),
+            "the first row is the newest"
+        );
+        store.move_selection(-1);
+        assert_eq!(
+            store.selected(),
+            Some(ids[2]),
+            "Up at the first row stays put"
+        );
+        store.move_selection(1);
+        store.move_selection(1);
+        assert_eq!(store.selected(), Some(ids[0]));
+        store.move_selection(1);
+        assert_eq!(
+            store.selected(),
+            Some(ids[0]),
+            "Down at the last row stays put"
+        );
+        store.toggle_expanded();
+        store.move_selection(-1);
+        assert!(!store.expanded(), "a new selection starts collapsed");
+    }
+
+    #[test]
+    fn context_line_names_project_frame_and_time() {
+        let mut brightness = note(Kind::Warning);
+        brightness.project_title = Some("Mantis".into());
+        brightness.frame = Some("02.tif".into());
+        brightness.at = "16:41".into();
+        assert_eq!(context_line(&brightness), "Mantis · 02.tif · 16:41");
+
+        let mut save = Notification::new(Kind::Failure, Source::Save, "t", "m");
+        save.project_title = Some("Mantis".into());
+        save.target = Some(PathBuf::from("/data/out/mantis.ffp"));
+        save.at = "16:43".into();
+        assert_eq!(context_line(&save), "Save · Mantis · mantis.ffp · 16:43");
+
+        let mut import = Notification::new(Kind::Info, Source::Import, "t", "m");
+        import.project_title = Some("Mantis".into());
+        import.at = "16:42".into();
+        assert_eq!(context_line(&import), "Import · Mantis · 16:42");
+
+        let mut crash = Notification::new(Kind::Crash, Source::Startup, "t", "m");
+        crash.at = "16:40".into();
+        crash.crash = Some(CrashEvidence {
+            reports: 1,
+            ..CrashEvidence::default()
+        });
+        assert_eq!(context_line(&crash), "Startup · 1 crash report · 16:40");
+
+        assert_eq!(
+            context_line(&note(Kind::Info)),
+            "",
+            "missing parts are skipped"
+        );
+    }
+
+    #[test]
+    fn crash_context_keeps_its_count_after_acknowledgement() {
+        let mut crash = Notification::new(Kind::Crash, Source::Startup, "t", "m");
+        crash.crash = Some(CrashEvidence {
+            ids: vec!["a".into(), "b".into()],
+            reports: 2,
+            ..CrashEvidence::default()
+        });
+        assert_eq!(context_line(&crash), "Startup · 2 crash reports");
+        let evidence = crash.crash.as_mut().unwrap();
+        evidence.ids.clear();
+        evidence.acknowledged = true;
+        assert_eq!(context_line(&crash), "Startup · 2 crash reports");
     }
 }

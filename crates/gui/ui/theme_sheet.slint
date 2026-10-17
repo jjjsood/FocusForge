@@ -43,7 +43,10 @@ import { FFPane } from "components/ff_pane.slint";
 import { FFPaneLabel } from "components/ff_pane_label.slint";
 import { FFUndockControl } from "components/ff_undock_control.slint";
 import { FFWindowBar } from "components/ff_window_bar.slint";
-import { FFToast, FFCheckpointDelete } from "shell/dialogs.slint";
+import { FFCheckpointDelete } from "shell/dialogs.slint";
+import { FFNotificationGlyph } from "components/ff_notification_glyph.slint";
+import { FFToast } from "components/ff_toast.slint";
+import { FFNotificationRow } from "components/ff_notification_row.slint";
 import { FFModalPanel } from "components/ff_modal_panel.slint";
 import { FFTextField } from "components/ff_text_field.slint";
 import { FFNavRail } from "components/ff_nav_rail.slint";
@@ -63,6 +66,21 @@ component SettingsGround inherits Rectangle {
 
     lay := VerticalLayout {
         padding: Theme.space-4;
+        alignment: start;
+        @children
+    }
+}
+
+// The notification center's own ground: its width over the raised fill,
+// rows stacked from the top.
+component CenterGround inherits Rectangle {
+    width: ShellGeometry.notification-center-width;
+    background: Theme.surface-raised;
+    clip: true;
+
+    VerticalLayout {
+        padding-left: Theme.space-4;
+        padding-right: Theme.space-4;
         alignment: start;
         @children
     }
@@ -196,6 +214,175 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "info"; title: "Some images were skipped"; }
+                FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; }
+                FFToast { toast-open: true; kind: "failure"; title: "Could not save project"; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "crash"; title: "Previous session stopped"; }
+                FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; hovered: true; }
+                FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; focused: true; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFNotificationGlyph { kind: "info"; }
+                FFNotificationGlyph { kind: "warning"; }
+                FFNotificationGlyph { kind: "failure"; }
+                FFNotificationGlyph { kind: "crash"; }
+            }
+        }
+
+        GroupHeading { text: "Icon button: badge 0, 3, 12, 128; focus"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 3; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 12; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 128; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 3; focused: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; focused: true; }
+        }
+
+        GroupHeading { text: "Icon bar and raised nav rail"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFNavRail {
+                width: ShellGeometry.icon-bar-width;
+                height: 160px;
+                end-aligned: true;
+                raised: true;
+                FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 3; }
+                FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; }
+            }
+            FFNavRail {
+                width: ShellGeometry.icon-bar-width;
+                height: 160px;
+                end-aligned: true;
+                raised: true;
+                FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; filled: true; }
+                FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; }
+            }
+            FFNavRail {
+                width: 120px;
+                height: 160px;
+                raised: true;
+                FFNavRailEntry {
+                    label: "Storage";
+                    icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                    selected: true;
+                }
+                FFNavRailEntry {
+                    label: "About";
+                    icon-source: @image-url("../../../assets/icons/info.svg");
+                }
+            }
+        }
+
+        GroupHeading { text: "FFNotificationRow: summaries, selected + focus, 40-line message"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            CenterGround {
+                height: 520px;
+                FFNotificationRow { kind: "info"; title: "Some images were skipped"; context: "Import · Mantis · 16:42"; }
+                FFNotificationRow {
+                    kind: "warning";
+                    title: "Brightness target limited";
+                    context: "Mantis · IMG_9823.tif · 16:41";
+                    message: "Requested gain 1.67; maximum 1.25 applied. This source did not reach the target.\n\nThe original source file is unchanged.";
+                    selected: true;
+                    expanded: true;
+                    focused: true;
+                }
+                FFNotificationRow { kind: "failure"; title: "Could not save project"; context: "Save · Mantis · mantis.ffp · 16:39"; }
+                FFNotificationRow { kind: "crash"; title: "Previous session stopped"; context: "Startup · 1 crash report · 16:40"; }
+            }
+            CenterGround {
+                height: 520px;
+                FFNotificationRow {
+                    kind: "info";
+                    title: "Some images were skipped";
+                    context: "Import · Mantis · 16:42";
+                    message: "Skipped source files:\n~/Pictures/Mantis/session-2026-10-11/IMG_9824-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9825-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9826-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9827-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9828-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9829-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9830-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9831-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9832-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9833-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9834-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9835-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9836-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9837-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9838-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9839-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9840-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9841-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9842-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9843-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9844-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9845-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9846-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9847-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9848-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9849-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9850-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9851-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9852-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9853-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9854-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9855-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9856-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9857-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9858-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9859-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9860-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9861-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9862-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9863-source-original.tif";
+                    selected: true;
+                    expanded: true;
+                }
+            }
+        }
+
+        GroupHeading { text: "FFNotificationRow crash: unacknowledged, failed, unavailable, acknowledged"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-4;
+                alignment: start;
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "A previous session stopped unexpectedly. One crash report was detected at startup.\n\nReading or closing this notice does not acknowledge the report.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "unacknowledged";
+                    }
+                }
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "A previous session stopped unexpectedly. One crash report was detected at startup.\n\nReading or closing this notice does not acknowledge the report.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "failed";
+                        crash-error: "Permission denied (os error 13)";
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-4;
+                alignment: start;
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "A previous session stopped unexpectedly. One crash report was detected at startup.\n\nReading or closing this notice does not acknowledge the report.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "unavailable";
+                    }
+                }
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "This crash report was acknowledged. Its original notification remains available for this session.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "acknowledged";
+                    }
+                }
+            }
+        }
 
         GroupHeading { text: "Source presentations: List, Image list and Large previews"; }
         Rectangle {
@@ -982,18 +1169,6 @@ export component ThemeSheet inherits Window {
             }
             FFManifestList {
                 note: "No logs or crash evidence were found.";
-            }
-        }
-
-        GroupHeading { text: "FFToast"; }
-        HorizontalLayout {
-            spacing: Theme.space-4;
-            FFToast { toast-open: true; message: "1 crash found"; }
-            FFToast { toast-open: true; message: "3 crashes found"; tone: "info"; }
-            FFToast {
-                toast-open: true;
-                message: "128 crashes found";
-                link-label: "Review";
             }
         }
 

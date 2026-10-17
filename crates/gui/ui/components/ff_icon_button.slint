@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A glyph button: transparent at rest, `Theme.surface-hover` under the
-// pointer, one centred icon, `Theme.radius-sm` corners.
+// pointer, one centred icon, `Theme.radius-sm` corners. Optionally a count
+// badge on its top-right corner and a place in the keyboard focus order.
 
 import { Theme } from "../theme.slint";
 
@@ -22,8 +23,21 @@ export component FFIconButton inherits Rectangle {
     in property <bool> filled: false;
     // An armed toggle: accent fill, glyph in `Theme.text-on-accent`.
     in property <bool> selected: false;
+    // A count disc on the top-right corner, hidden at 0. While it shows, the
+    // glyph rests in `Theme.text-primary`.
+    in property <int> badge: 0;
+    // A dismiss control: the glyph rests in `Theme.text-muted`.
+    in property <bool> quiet: false;
+    // Takes keyboard focus (a 1 px accent ring); Return and Space trigger.
+    in property <bool> focusable: false;
+    // Drawn focused without the keyboard being there, as `FFField`'s own
+    // `focused` is.
+    in property <bool> focused: false;
+    out property <bool> has-focus: key.has-focus;
+    out property <bool> has-hover: area.has-hover;
     callback triggered();
 
+    forward-focus: key;
     width: root.glyph-size + 2 * root.pad;
     height: self.width;
     background: root.selected ? Theme.accent-default
@@ -36,6 +50,19 @@ export component FFIconButton inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-checked: root.selected;
 
+    key := FocusScope {
+        enabled: root.enabled && root.focusable;
+        focus-on-click: false;
+        KeyBinding {
+            keys: @keys(Return);
+            activated => { root.triggered(); }
+        }
+        KeyBinding {
+            keys: @keys(Space);
+            activated => { root.triggered(); }
+        }
+    }
+
     area := TouchArea {
         enabled: root.enabled;
         clicked => { root.triggered(); }
@@ -45,8 +72,36 @@ export component FFIconButton inherits Rectangle {
         colorize: root.selected ? Theme.text-on-accent
             : !root.enabled && root.filled ? Theme.text-disabled
             : root.recolor-on-hover && area.has-hover && root.enabled ? Theme.text-primary
+            : root.badge > 0 ? Theme.text-primary
+            : root.quiet ? Theme.text-muted
             : root.glyph-color;
         width: root.glyph-size;
         height: root.glyph-size;
+    }
+    if root.focused || key.has-focus: ring := Rectangle {
+        width: 100%;
+        height: 100%;
+        border-width: 1px;
+        border-color: Theme.accent-default;
+        border-radius: Theme.radius-sm;
+    }
+    if root.badge > 0: Rectangle {
+        x: parent.width - 14px;
+        y: -5px;
+        width: max(18px, count.preferred-width + 2 * Theme.space-1);
+        height: 18px;
+        border-radius: Theme.radius-full;
+        background: Theme.accent-default;
+
+        count := Text {
+            width: 100%;
+            height: 100%;
+            text: root.badge;
+            color: Theme.text-on-accent;
+            font-size: Theme.text-section.size;
+            font-weight: Theme.text-section.weight;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 }

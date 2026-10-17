@@ -1,7 +1,7 @@
 # Source image presentations
 Start: --open fixtures/mantis-512/frames --settings-section appearance --dock-tab images
 
-Use a fresh settings directory. Presentation choices belong to the open Appearance modal. Reopen Settings with its gear; Appearance remains selected. Source instances are numbered in visible order. For each drag, resolve the second visible preview image (`FFImageRow::large-identity`, instance 1) immediately before starting, and drop at its centre. The filename or timestamp below that preview is not the drop target. Use the logical coordinates returned by `get_element_properties` for every drag target: centre = absolutePosition + size / 2. Never multiply these coordinates by the window scale factor or derive them from screenshot pixels. Keep the pointer inside the source viewport. A normal filename click also places the pointer over that source before locating its eye or delete button.
+Use a fresh settings directory. Presentation choices belong to the open Appearance modal. Reopen Settings with the Settings icon in the icon bar (bottom-left); Appearance remains selected. Source instances are numbered in visible order. For each drag, resolve the second visible preview image (`FFImageRow::large-identity`, instance 1) immediately before starting, and drop at its centre. The filename or timestamp below that preview is not the drop target. Use the logical coordinates returned by `get_element_properties` for every drag target: centre = absolutePosition + size / 2. Never multiply these coordinates by the window scale factor or derive them from screenshot pixels. Keep the pointer inside the source viewport. A normal filename click also places the pointer over that source before locating its eye or delete button.
 
 ## Appearance and List
 1. Click **Presentation** (`FFMenu::area`).
@@ -10,7 +10,7 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
    Expect: the menu closes and Presentation reads List.
 3. Click **Close Settings** (`FFSettingsModal::close`).
    Expect: the modal disappears; source rows are 26 px high.
-4. Click **Settings gear** (`FFBottomBar::gear`).
+4. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
    Expect: Settings opens on Appearance with List selected.
 5. Click **Presentation** (`FFMenu::area`).
    Expect: the three presentation choices appear.
@@ -38,7 +38,7 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
     Expect: source count decreases by one; no confirmation appears before a first checkpoint.
 
 ## Remaining directed presentation transitions
-16. Click **Settings gear** (`FFBottomBar::gear`).
+16. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
     Expect: Settings opens on Appearance with Large previews selected.
 17. Click **Presentation** (`FFMenu::area`).
     Expect: the three presentation choices appear.
@@ -46,7 +46,7 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
     Expect: the menu closes and Presentation reads Image list.
 19. Click **Close Settings** (`FFSettingsModal::close`).
     Expect: rows return to 120 px; remaining source order and exclusion state persist.
-20. Click **Settings gear** (`FFBottomBar::gear`).
+20. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
     Expect: Settings opens on Appearance with Image list selected.
 21. Click **Presentation** (`FFMenu::area`).
     Expect: the three presentation choices appear.
@@ -54,7 +54,7 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
     Expect: the menu closes and Presentation reads Large previews.
 23. Click **Close Settings** (`FFSettingsModal::close`).
     Expect: rows return to 200 px; remaining source order and exclusion state persist.
-24. Click **Settings gear** (`FFBottomBar::gear`).
+24. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
     Expect: Settings opens on Appearance with Large previews selected.
 25. Click **Presentation** (`FFMenu::area`).
     Expect: the three presentation choices appear.
@@ -62,7 +62,7 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
     Expect: the menu closes and Presentation reads List.
 27. Click **Close Settings** (`FFSettingsModal::close`).
     Expect: rows return to 26 px; remaining source order and exclusion state persist.
-28. Click **Settings gear** (`FFBottomBar::gear`).
+28. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
     Expect: Settings opens on Appearance with List selected.
 29. Click **Presentation** (`FFMenu::area`).
     Expect: the three presentation choices appear.

@@ -20,7 +20,7 @@ export global ShellGeometry {
 
     // The canvas region's two panes. The divider sits
     // centred *inside* the gutter, never added on top of it:
-    // 1180 - 3*16 = 1132, /2 = 566 (base); 940 - 3*16 = 892, /2 = 446 (min).
+    // 1132 - 3*16 = 1084, /2 = 542 (base); 892 - 3*16 = 844, /2 = 422 (min).
     out property <length> pane-gutter: 16px;
     out property <length> pane-divider: 2px;
     out property <length> pane-placeholder-width: 220px;
@@ -53,11 +53,12 @@ export global ShellGeometry {
     // The square boxes (projects button, scroll arrows, "+") -- 30 wide.
     out property <length> strip-box-width: 30px;
 
-    // The four-square Projects-overlay button at the tab strip's far left:
-    // 8 px inset, the 30 px box, 8 px to the first tab (button x
-    // 8..38, first tab x 46). The slot is everything left of the tabs.
-    out property <length> projects-button-inset: 8px;
-    out property <length> projects-button-slot: 46px;
+    // The four-square Projects-overlay button at the tab strip's far left,
+    // centred over the icon bar's column below it (button x 9..39). The slot
+    // is everything left of the tabs: the first tab's left frame sits on the
+    // icon bar's 1 px right rule (first tab x 47).
+    out property <length> projects-button-inset: (icon-bar-width - strip-box-width) / 2;
+    out property <length> projects-button-slot: icon-bar-width - 1px;
 
     // The gap between neighbouring strip boxes: a tab and the next, a scroll
     // arrow and the tabs viewport, the right arrow and the pinned "+".
@@ -141,6 +142,9 @@ export global ShellGeometry {
     out property <length> settings-rail-top-inset: 12px;
     out property <length> settings-rail-icon-x: 16px;
     out property <length> settings-rail-label-x: 40px;
+    // The notification center and the left icon bar beside it.
+    out property <length> notification-center-width: 380px;
+    out property <length> icon-bar-width: 48px;
     out property <length> settings-row-height: 34px;
     out property <length> settings-label-width: 140px;
     // A section heading's own height, down to the top of its first row.
@@ -176,8 +180,8 @@ export global ShellGeometry {
     out property <length> toolbar-button-height: 26px;
     out property <length> toolbar-button-width: 116px;
     out property <length> toolbar-button-gap: 10px;
-    out property <length> progress-step-x: 166px;
-    out property <length> progress-bar-x: 250px;
+    out property <length> progress-step-x: 118px;
+    out property <length> progress-bar-x: 202px;
     out property <length> progress-bar-height: 4px;
     // The ETA's slot, right-bounded by the overlay cluster below; the track
     // ends before it, and a longer readout is elided.

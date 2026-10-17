@@ -319,6 +319,12 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("appearance_tab.slint"), "next-requested")
             | (Some("appearance_tab.slint"), "accepted")
             | (Some("appearance_tab.slint"), "dismissed")
+            | (Some("app.slint"), "bell-activated")
+            | (Some("app.slint"), "close-requested")
+            | (Some("app.slint"), "link-activated")
+            | (Some("notification_center.slint"), "clicked")
+            | (Some("notification_center.slint"), "changed selected")
+            | (Some("notification_center.slint"), "key-pressed(event)")
     )
 }
 
@@ -2983,7 +2989,9 @@ fn crash_notice_counts_and_acknowledges() {
     let record = crash_record(&controller).expect("unreported evidence is announced");
     assert_eq!(record.title, "Previous session stopped");
     assert!(
-        record.message.starts_with("2 crash reports"),
+        record
+            .message
+            .starts_with("A previous session stopped unexpectedly. 2 crash reports were detected"),
         "{}",
         record.message
     );
@@ -2997,6 +3005,7 @@ fn crash_notice_counts_and_acknowledges() {
     let record = crash_record(&controller).unwrap();
     let crash = record.crash.unwrap();
     assert!(crash.acknowledged && crash.ids.is_empty() && crash.error.is_none());
+    assert_eq!(crash.reports, 2, "the count outlives the cleared ids");
 
     let mut after = AppController::new();
     after.set_diagnostics_dirs(Some(data_dir), None);
