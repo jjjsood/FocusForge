@@ -9001,3 +9001,174 @@ fn an_open_hold_keeps_the_load_in_flight() {
         .expect("the load parked an outcome");
     assert!(!controller.load_in_flight());
 }
+
+// --- Checked-in folder and project fixtures: each opens to the result it
+// exists for. Every case works on a copy under `CARGO_TARGET_TMPDIR`. -----
+
+/// A copy of `fixtures/<set>` named `name` under `CARGO_TARGET_TMPDIR`.
+fn fixture_copy(set: &str, name: &str) -> PathBuf {
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let dest = tree(name);
+    copy_dir(&common::workspace_root().join("fixtures").join(set), &dest);
+    dest
+}
+
+#[test]
+fn fixture_two_stacks_ask_the_grouping_question() {
+    let root = fixture_copy("open-two-stacks", "fixture_two_stacks");
+    let mut controller = AppController::new();
+    match common::open_and_settle(&mut controller, &[root]) {
+        OpenOutcome::Question(question, _) => {
+            assert_eq!(question.frame_count, 6);
+            assert_eq!(question.project_count, 2);
+        }
+        _ => panic!("two stacks in one folder must raise the grouping question"),
+    }
+    assert!(controller.pending_question().is_some());
+    assert!(controller.project_tabs().is_empty());
+
+    common::answer_and_settle(&mut controller, OpenAs::NProjects);
+    assert_eq!(controller.project_tabs().len(), 2);
+}
+
+#[test]
+fn fixture_root_and_subfolder_reports_the_skipped_subfolder() {
+    let root = fixture_copy("open-root-and-subfolder", "fixture_root_and_subfolder");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(
+        controller.images_panel().header_text,
+        "3 frames \u{b7} 0 excluded"
+    );
+
+    let record = controller
+        .notifications()
+        .first()
+        .expect("the skipped subfolder must be reported");
+    assert_eq!(record.title, "Some images were skipped");
+    assert_eq!(
+        record.message,
+        format!("1 subfolder skipped:\n{}", root.join("notes").display())
+    );
+    let cards = controller.project_cards();
+    let skipped = cards
+        .iter()
+        .find(|card| card.kind == "not-a-project")
+        .expect("the skipped subfolder keeps a card");
+    assert_eq!(skipped.project_name, "notes");
+}
+
+#[test]
+fn fixture_rejected_stack_opens_then_fails_and_retries() {
+    let root = fixture_copy("open-rejected", "fixture_rejected");
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("fixture_rejected_scratch"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(
+        matches!(controller.job_view().state, job::RunState::Failed(_)),
+        "the cut frame must fail the run, got {:?}",
+        controller.job_view().state
+    );
+    let message = controller.job_failure_message().unwrap_or_default();
+    assert!(message.contains("02.tif"), "{message}");
+
+    assert!(controller.retry_fuse(), "a failed run must be retryable");
+    assert!(controller.job_running());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(matches!(
+        controller.job_view().state,
+        job::RunState::Failed(_)
+    ));
+}
+
+#[test]
+fn fixture_corrupt_project_is_refused() {
+    let dir = fixture_copy("projects", "fixture_corrupt_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("corrupt.ffp")]),
+        OpenOutcome::Refused(_)
+    ));
+    assert_eq!(
+        controller.last_refusal(),
+        Some("This file is not a FocusForge project.")
+    );
+    assert_eq!(
+        controller.refusal_title(),
+        Some("This project cannot be opened")
+    );
+    assert!(controller.project_tabs().is_empty());
+}
+
+#[test]
+fn fixture_mismatched_project_raises_the_mismatch_and_opens_anyway() {
+    let dir = fixture_copy("projects", "fixture_mismatched_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("mismatch.ffp")]),
+        OpenOutcome::Mismatch(_)
+    ));
+    assert!(controller.pending_mismatch().is_some());
+    assert!(controller.project_tabs().is_empty());
+
+    controller.open_anyway();
+    assert!(controller.pending_mismatch().is_none());
+    assert_eq!(controller.project_tabs().len(), 1);
+}
+
+#[test]
+fn fixture_project_without_its_frames_opens_as_sources_missing() {
+    let dir = fixture_copy("projects", "fixture_missing_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("missing.ffp")]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(controller.gallery_failure_kind(0), Some("sources-missing"));
+    let (title, _body, file_name) = controller
+        .sources_notice()
+        .expect("the missing frames raise the notice");
+    assert_eq!(title, "The frames are no longer there");
+    assert_eq!(file_name, "missing");
+}
+
+#[test]
+fn fixture_valid_project_opens_over_its_frames() {
+    let dir = fixture_copy("projects", "fixture_valid_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("valid.ffp")]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert!(controller.pending_mismatch().is_none());
+    assert!(controller.sources_notice().is_none());
+    assert_eq!(controller.gallery_failure_kind(0), None);
+    assert_eq!(
+        controller.images_panel().header_text,
+        "3 frames \u{b7} 0 excluded"
+    );
+}
