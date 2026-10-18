@@ -670,6 +670,7 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
         let picker = methods
             .iter()
+            .filter(|a| !a.test_only())
             .map(|a| PickerOption {
                 id: a.id().to_string(),
                 label: a.display_name().to_string(),
@@ -681,12 +682,13 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             fuse.params(),
             fuse_values,
             &section_ctx,
-            Some((fuse_id, picker)),
+            Some((fuse_id, fuse.display_name(), picker)),
         ));
     }
     if let Ok(align) = registry::find_align(align_id) {
         let picker = registry::align_algorithms()
             .iter()
+            .filter(|a| !a.test_only())
             .map(|a| PickerOption {
                 id: a.id().to_string(),
                 label: a.display_name().to_string(),
@@ -698,7 +700,7 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             align.params(),
             align_values,
             &section_ctx,
-            Some((align_id, picker)),
+            Some((align_id, align.display_name(), picker)),
         );
         // The on/off switch is the project-level `align` value, written to
         // the project map, and is the section's first row after its heading;
@@ -750,7 +752,7 @@ fn section_rows(
     schema: &[ParamDesc],
     values: &ParamValues,
     section_ctx: &SectionContext<'_>,
-    picker: Option<(&str, Vec<PickerOption>)>,
+    picker: Option<(&str, &str, Vec<PickerOption>)>,
 ) -> Vec<SettingsRow> {
     let SectionContext {
         ctx,
@@ -778,18 +780,13 @@ fn section_rows(
 
     let mut rows = vec![SettingsRow::heading(section, heading_label, heading_state)];
 
-    if let Some((selected_id, options)) = picker {
+    if let Some((selected_id, selected_label, options)) = picker {
         let key = menu_key(section, "algorithm");
-        let value_text = options
-            .iter()
-            .find(|o| o.id == selected_id)
-            .map(|o| o.label.clone())
-            .unwrap_or_default();
         let (choice_ids, choices): (Vec<String>, Vec<String>) =
             options.into_iter().map(|o| (o.id, o.label)).unzip();
         rows.push(SettingsRow {
             label: "Algorithm".to_string(),
-            value_text,
+            value_text: selected_label.to_string(),
             choices,
             choice_ids,
             selected: selected_id.to_string(),

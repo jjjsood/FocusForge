@@ -4,7 +4,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
 1. Click the second project tab (`FFTab::area` 1).
    Expect: the Settings dock lists the headings "PREPARE", "FUSE", "ALIGN" and "FINISH"; the toolbar shows the **Fuse stack** button.
 2. Click **Fuse stack** (`FFToolbar::fuse-button`); this is the first run of the launch, which `--slow-run 1` holds in its fuse stage for at least 150 s.
-   Expect: (within 60 s) the bottom bar status reads "Fusing", the toolbar shows the buttons **Pause** and **Cancel**, the **Fuse stack** button is gone and the Settings panel is drawn dimmed.
+   Expect: (within 60 s) the bottom bar status reads "Aligning" or "Fusing" (the run aligns before its held fuse stage), the toolbar shows the buttons **Pause** and **Cancel**, the **Fuse stack** button is gone and the Settings panel is drawn dimmed.
 3. Click **Pause** (`FFToolbar::pause-button`).
    Expect: the toolbar shows the **Resume** button instead of **Pause** and the bottom bar status reads "Paused".
 4. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0) while the run is paused.
@@ -25,8 +25,8 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
    Expect: the headings "PREPARE", "FUSE" and "ALIGN" each show "DEFAULT"; the FUSE "Algorithm" field reads "Details" and the ALIGN "Algorithm" field reads "Pyramidal ECC".
 ## Algorithm picker
 11. Click the **Algorithm** menu under FUSE (`FFMenu::root` 0).
-   Expect: a list opens under it with the entries "Details", "Soft transitions" and "Focus map" in that order, their ids "laplacian", "weighted-average" and "depth-map" in grey, and a check mark beside "Details"; a build for developers may list one more entry, "Dummy Stack (test-only)", between "Details" and "Soft transitions" (then the list has 4 entries).
-12. Click the entry **Soft transitions**, grey id "weighted-average" (`FFMenuList::option-area` 1, or 2 when the list shows "Dummy Stack (test-only)" as its second entry).
+   Expect: a list opens under it with the entries "Details", "Soft transitions" and "Focus map" in that order, their ids "laplacian", "weighted-average" and "depth-map" in grey, and a check mark beside "Details"; the list has 3 entries.
+12. Click the entry **Soft transitions**, grey id "weighted-average" (`FFMenuList::option-area` 1).
    Expect: the list is gone; the field reads "Soft transitions"; a row "Sharp-source preference" with a value field reading "4" appears under FUSE; the FUSE heading still shows its "DEFAULT" badge.
 13. Click the **More...** bar under the FUSE heading, the second **More...** bar of the panel (`FFMoreToggle::header-area` 1).
    Expect: a row "Radius" appears under "More..." with a value field reading "16".
@@ -36,7 +36,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
    Expect: the Radius value field reads "8".
 16. Click the **Algorithm** menu under FUSE (`FFMenu::root` 0).
    Expect: the list opens with a check mark beside "Soft transitions" (grey id "weighted-average").
-17. Click the entry **Focus map**, grey id "depth-map", the last entry of the list (`FFMenuList::option-area` 2, or 3 when the list shows "Dummy Stack (test-only)").
+17. Click the entry **Focus map**, grey id "depth-map", the last entry of the list (`FFMenuList::option-area` 2).
    Expect: the field reads "Focus map"; the row "Sharp-source preference" is gone; the rows "Score Radius" (value "4") and "Smoothing Radius" (value "8") are shown under "More...".
 18. Click the open **More...** bar under the FUSE heading (`FFMoreToggle::header-area` 1).
    Expect: the rows "Score Radius" and "Smoothing Radius" are gone.

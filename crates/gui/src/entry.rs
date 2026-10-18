@@ -152,13 +152,10 @@ pub enum OpenOutcome {
 /// user-facing text.
 #[derive(Debug, thiserror::Error)]
 pub enum EntryError {
-    /// Names the format read and offers the way out -- the whole message
-    /// this variant's `Display` produces is what the refusal dialog and the
-    /// headless controller test both read (AC: "says so, names the format
-    /// it reads, and offers `Pick another folder…`").
+    /// Names the formats read. This `Display` is the refusal dialog's whole
+    /// body; the dialog's button offers the way out.
     #[error(
-        "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none. \
-         Pick another folder…"
+        "FocusForge reads 16-bit TIFF (.tif, .tiff) and camera RAW files. This folder holds none."
     )]
     NoReadableFrames { path: PathBuf },
     /// Any other failure reading the folder's frames.

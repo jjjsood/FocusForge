@@ -754,18 +754,20 @@ struct ExportDialog {
     open_menu: Option<String>,
 }
 
-/// Which position an export modal names -- the three kinds its own
+/// Which position an export modal names -- the four kinds its own
 /// context/what copy tells apart.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExportKind {
     Saved,
     Held,
+    /// A held retouch checkpoint with no unsealed edits after it.
+    HeldRetouch,
     Live,
 }
 
-/// The export modal's own context/what copy for `kind`: a saved or live
-/// row names its algorithm and local time, a held row does not -- it has
-/// neither yet, only its own "just fused" state.
+/// The export modal's own context/what copy for `kind`: a saved, retouch or
+/// live row names its algorithm and local time, a held fuse result does not
+/// -- it has neither yet, only its own "just fused" state.
 fn export_copy_for(
     kind: ExportKind,
     project_file: &str,
@@ -780,6 +782,10 @@ fn export_copy_for(
         ExportKind::Held => (
             format!("{project_file} · unsaved fuse result, held in this tab"),
             "Exporting the unsaved fuse result held in this tab.".to_string(),
+        ),
+        ExportKind::HeldRetouch => (
+            format!("{project_file} · retouch checkpoint on {algorithm} · {timestamp}"),
+            "Exporting the unsaved retouch checkpoint held in this tab.".to_string(),
         ),
         ExportKind::Live => (
             format!("{project_file} · unsaved edits on {algorithm} · {timestamp}"),
@@ -9541,8 +9547,10 @@ fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
 fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
     let editing = tab.edit.as_ref().is_some_and(|edit| edit.op_count() > 0);
     let info = row_export_info(tab)?;
-    let kind = if editing || info.live {
+    let kind = if editing {
         ExportKind::Live
+    } else if info.live {
+        ExportKind::HeldRetouch
     } else if info.held {
         ExportKind::Held
     } else {

@@ -52,7 +52,7 @@ Start: --open fixtures/mantis-64/frames
 23. Click **Save checkpoint** (`AppWindow::editor-toolbar`).
    Expect: the CHECKPOINTS list shows 2 rows; **Save checkpoint** is greyed out (read with `buttons` within `AppWindow::editor-toolbar`: enabled false).
 24. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
-   Expect: the dialog "Export image" opens with the context line "frames · unsaved edits on Details" followed by a date and time and the line "Exporting your current unsaved retouch edits." (the checkpoint lives only in this tab until the project is saved); the line "Exporting the saved checkpoint you selected." is not shown.
+   Expect: the dialog "Export image" opens with the context line "frames · retouch checkpoint on Details" followed by a date and time and the line "Exporting the unsaved retouch checkpoint held in this tab."; the lines "Exporting your current unsaved retouch edits." and "Exporting the saved checkpoint you selected." are not shown.
 25. Click **Cancel** (`AppWindow::export-dialog`).
    Expect: the "Export image" dialog is gone and the CHECKPOINTS list shows 2 rows.
 ## Export writes the file

@@ -1754,6 +1754,52 @@ fn dock_without_a_project_says_so() {
     );
 }
 
+/// The editor-mode dock is tabless: no tab row and no Settings panel even
+/// while the Settings tab is the chosen one, and the frame legend (no add
+/// button) in their place; stacking mode brings the tabs and the Settings
+/// panel back.
+#[test]
+fn editor_dock_has_no_tab_row() {
+    let app = app_at(1440, 900);
+    let found = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .is_some()
+    };
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+
+    app.set_mode("editor".into());
+    assert!(!found("FFDock::dock-tabs"), "editor mode shows no tab row");
+    assert!(
+        !found("FFDock::settings-panel"),
+        "editor mode hides the Settings panel"
+    );
+    assert!(
+        found("FFDock::images-panel"),
+        "editor mode shows the frame legend"
+    );
+    assert!(
+        !found("FFImagesPanel::add-button"),
+        "the legend is read-only"
+    );
+
+    app.set_mode("stacking".into());
+    assert!(
+        found("FFDock::dock-tabs"),
+        "stacking mode shows the tab row"
+    );
+    assert!(
+        found("FFDock::settings-panel"),
+        "stacking mode shows the Settings panel for the chosen tab"
+    );
+    assert!(
+        !found("FFDock::images-panel"),
+        "the Settings tab hides the frame list"
+    );
+}
+
 /// The bottom bar's status line without a project: `No project open`, 20 px
 /// in from the bar's left edge.
 #[test]

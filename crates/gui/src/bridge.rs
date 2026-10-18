@@ -4492,12 +4492,7 @@ fn push_project_dialogs(app: &AppWindow, controller: &AppController) {
             .unwrap_or("No frames here")
             .into(),
     );
-    app.set_refusal_body(
-        controller
-            .last_refusal()
-            .unwrap_or("FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.")
-            .into(),
-    );
+    app.set_refusal_body(controller.last_refusal().unwrap_or_default().into());
     app.set_refusal_button_label(
         if folder_empty_refusal {
             "Pick another folder…"

@@ -741,6 +741,38 @@ fn seeded_ids_are_never_test_only() {
 }
 
 #[test]
+fn pickers_hide_test_only() {
+    assert!(
+        registry::find_stack("dummy-stack").unwrap().test_only(),
+        "the test build registers the dummy stack method"
+    );
+    assert!(registry::find_align("dummy-align").unwrap().test_only());
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let rows = controller.settings_panel().rows;
+    for section in ["fuse", "align"] {
+        let ids = picker_ids(&rows, section);
+        assert!(!ids.is_empty(), "{section} picker lists something");
+        for id in ids {
+            let algorithm = registry::find(&id).unwrap();
+            assert!(!algorithm.test_only(), "{section} picker lists {id}");
+        }
+    }
+
+    // A tab that holds a test-only algorithm keeps its closed-row label but
+    // does not offer it.
+    controller.set_align_algorithm("dummy-align");
+    let rows = controller.settings_panel().rows;
+    let picker = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "align")
+        .expect("align picker row must exist");
+    assert_eq!(picker.value_text, "Dummy Align (test-only)");
+    assert!(!picker.choice_ids.contains(&"dummy-align".to_string()));
+}
+
+#[test]
 fn pickers_list_the_registry() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
@@ -748,8 +780,8 @@ fn pickers_list_the_registry() {
 
     assert_eq!(
         picker_ids(&panel.rows, "fuse"),
-        every_fuse_id(),
-        "the collapsed fuse picker lists every registered method, the default first"
+        listed_fuse_ids(),
+        "the collapsed fuse picker lists every non-test method, the default first"
     );
 
     let align_picker = panel
@@ -759,6 +791,7 @@ fn pickers_list_the_registry() {
         .expect("align picker row must exist");
     let mut expected_align: Vec<String> = registry::align_algorithms()
         .iter()
+        .filter(|a| !a.test_only())
         .map(|a| a.id().to_string())
         .collect();
     expected_align.sort();
@@ -1567,12 +1600,21 @@ fn picker_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
         .clone()
 }
 
-/// Every stack method's id, the default first and the advanced ones last --
-/// what the Fuse picker lists, `More...` open or not.
+/// Every registered stack method's id, test-only ones included, the default
+/// first and the advanced ones last.
 fn every_fuse_id() -> Vec<String> {
     let mut methods = registry::stack_algorithms();
     methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
     methods.iter().map(|a| a.id().to_string()).collect()
+}
+
+/// What the Fuse picker lists, `More...` open or not: [`every_fuse_id`]
+/// without the test-only methods.
+fn listed_fuse_ids() -> Vec<String> {
+    every_fuse_id()
+        .into_iter()
+        .filter(|id| !registry::find_stack(id).unwrap().test_only())
+        .collect()
 }
 
 fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow> {
@@ -1672,7 +1714,7 @@ fn sections_start_collapsed_with_one_adjustment_at_most() {
 
     controller.set_fuse_algorithm("laplacian");
     let fuse_picker = picker_ids(&controller.settings_panel().rows, "fuse");
-    assert_eq!(fuse_picker, every_fuse_id());
+    assert_eq!(fuse_picker, listed_fuse_ids());
     assert_eq!(fuse_picker[0], "laplacian", "the default comes first");
     assert!(fuse_picker.contains(&"weighted-average".to_string()));
     assert!(fuse_picker.contains(&"depth-map".to_string()));
@@ -1877,7 +1919,7 @@ fn fuse_picker_lists_every_method_in_both_more_states() {
     let collapsed = picker_ids(&controller.settings_panel().rows, "fuse");
     assert_eq!(
         collapsed,
-        every_fuse_id(),
+        listed_fuse_ids(),
         "More... closed lists every method"
     );
     assert_eq!(collapsed.last().map(String::as_str), Some("depth-map"));
