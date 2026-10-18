@@ -17,10 +17,11 @@ Start: --open fixtures/mantis-64/frames
 
 - `# Title` names the path; the file is `NN-<flow>.md`.
 - `Start:` holds the arguments for `focusforge-gui`. Inputs come from `fixtures/` only.
-- `## Section` lines group steps. Steps are numbered across the whole file; each is a `Click` or `Drag` with the visible label and the element name in backticks (`Component::id`).
+- `## Section` lines group steps. Steps are numbered across the whole file; each is one action with the visible label and the element name in backticks (`Component::id`): `Click`, `Drag` (press on the element, move to a window point, release), `Hover` (put the pointer on the element, no click), `Type "text" into` a field (click the field, then type the text), `Alt+click` (click with Alt held) or `Press <Key>` (a key such as Escape, Return, Down, Left or Right, sent to the control that holds the keyboard focus; the name may be left out).
 - An id followed by a number (`FFSlider::drag-area` 1, also written "instance 1" or "match 1") is that element of the id in the window's tree order, counted from 0.
 - Each step has one indented `Expect:` line naming something visible: text, enabled or greyed, present or gone, a count. `(within N s)` allows a wait. `Expect: Must not: …` marks a step that checks a refusal. `Expect: Check at end of section.` skips the check for a setup step; the section's last step carries it.
-- A step that needs the window manager, a native dialog, a key press or typing starts with `(human only)`.
+- A step that says "in the second window" acts on that window, not the main one (a script passes `--window N`, counted from 0 in the order the windows were opened).
+- A step that needs the window manager, a native dialog, the mouse wheel or the window's own keyboard focus starts with `(human only)`.
 - A dialog blocks everything under it, so a journey closes it with its own step.
 - A journey is edited when the app changes, never split into small tests. Every journey is listed in a feature file under `features/`.
 

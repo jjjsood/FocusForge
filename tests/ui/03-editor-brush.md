@@ -14,15 +14,15 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
 6. Click **Save checkpoint** (`AppWindow::editor-toolbar`) before any stroke.
    Expect: Must not: the CHECKPOINTS list grows; it still shows 1 row and `buttons AppWindow::editor-toolbar` lists **Save checkpoint** with enabled false.
 ## Brush size and softness
-7. Drag the Size slider thumb a quarter of the way along its track, to window point 74,56 (`FFSlider::drag-area` 0).
+7. Drag the Size slider thumb a quarter of the way along its track, to window point 122,56 (`FFSlider::drag-area` 0).
    Expect: the text beside the Size slider reads "3"; the text beside the Soft slider still reads "30%".
-8. Drag the Size slider thumb to the left end of its track, to window point 56,56 (`FFSlider::drag-area` 0).
+8. Drag the Size slider thumb to the left end of its track, to window point 104,56 (`FFSlider::drag-area` 0).
    Expect: the text beside the Size slider reads "1".
-9. Drag the Size slider thumb to the right end of its track, to window point 128,56 (`FFSlider::drag-area` 0).
+9. Drag the Size slider thumb to the right end of its track, to window point 176,56 (`FFSlider::drag-area` 0).
    Expect: the text beside the Size slider reads "60".
-10. Drag the Soft slider thumb a quarter of the way along its track, to window point 254,56 (`FFSlider::drag-area` 1).
+10. Drag the Soft slider thumb a quarter of the way along its track, to window point 302,56 (`FFSlider::drag-area` 1).
     Expect: the text beside the Soft slider reads "25%"; the text beside the Size slider still reads "60".
-11. Drag the Soft slider thumb to the right end of its track, to window point 308,56 (`FFSlider::drag-area` 1).
+11. Drag the Soft slider thumb to the right end of its track, to window point 356,56 (`FFSlider::drag-area` 1).
     Expect: the text beside the Soft slider reads "100%".
 12. Click **STACKING** (`FFModeSwitch::stacking-half`).
     Expect: the toolbar row shows the **Fuse stack** button and no longer shows "Size" or "Soft"; the dock shows the tabs **Images** and **Settings**.
@@ -41,10 +41,10 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
     Expect: `buttons AppWindow::editor-toolbar` lists **Pipette** with checked=true.
 19. Click **Pipette** again (`FFEditorToolbar::pipette`).
     Expect: `buttons AppWindow::editor-toolbar` lists **Pipette** with checked=false.
-20. (human only) Hold Alt and click a point in the Composite pane.
+20. Alt+click the Composite pane (`FFCanvas::pane-right`).
     Expect: the left pane label shows one of "00.tif", "01.tif" or "02.tif", the frame picked at that point; `buttons AppWindow::editor-toolbar` still lists **Pipette** with checked=false.
 ## Stroke, undo and redo
-21. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`). The stroke takes about a minute to land and the drag call may report a timeout; do not repeat the drag.
+21. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
     Expect: (within 120 s) `buttons AppWindow::editor-toolbar` lists **Undo** and **Save checkpoint** with enabled true and **Redo** with enabled false; **Undo** is drawn bright on a filled button.
 22. Click **Undo** (`FFEditorToolbar::undo`).
     Expect: `buttons AppWindow::editor-toolbar` lists **Undo** with enabled false and **Redo** with enabled true.
@@ -56,7 +56,7 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
     Expect: Must not: **Redo** becomes enabled or **Undo** becomes greyed out; `buttons AppWindow::editor-toolbar` still lists **Redo** with enabled false and **Undo** with enabled true.
 26. Click **Undo** (`FFEditorToolbar::undo`).
     Expect: `buttons AppWindow::editor-toolbar` lists **Undo** with enabled false and **Redo** with enabled true.
-27. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`). The stroke takes about a minute to land and the drag call may report a timeout; do not repeat the drag.
+27. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
     Expect: Must not: **Redo** stays enabled; (within 120 s) `buttons AppWindow::editor-toolbar` lists **Redo** with enabled false and **Undo** with enabled true.
 28. (human only) Drag a long curve across the Composite pane, holding the button down for several seconds.
     Expect: a ring outline follows the pointer for the whole drag and the Composite shows a soft trail along the curve.

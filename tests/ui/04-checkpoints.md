@@ -42,19 +42,19 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0
 19. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: Must not: a "Save this state first?" dialog appears; no dialog is shown, the first row has the raised background and the accent bar and the second row has neither.
 ## Delete a checkpoint
-20. Drag from the second row of the CHECKPOINTS list to window point 1177,148, so the pointer ends over the right edge of the first row (`FFCheckpointRow::area` 1).
+20. Hover the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: a red trash icon shows at the right edge of the first row; the second row shows none; `buttons FFDock::checkpoint-panel` lists **Delete checkpoint** with id `FFCheckpointRow::trash` (once, for the first row); the list still shows 2 rows and no dialog is shown.
 21. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
     Expect: a dialog titled "Delete this checkpoint?" opens with the first row's "algorithm · HH:MM:SS" as its context line and the line "The other checkpoint is untouched, and the stack is not fused again."; its buttons read **Cancel** and **Delete**.
 22. Click **Cancel** (`AppWindow::checkpoint-delete`).
     Expect: Must not: a row disappears; the dialog is gone and the CHECKPOINTS list still shows 2 rows.
-23. Drag from the second row of the CHECKPOINTS list to window point 1177,148 again, so the pointer ends over the first row (`FFCheckpointRow::area` 1; the click on **Cancel** moved the pointer off the row).
+23. Hover the first row of the CHECKPOINTS list again (`FFCheckpointRow::area` 0; the click on **Cancel** moved the pointer off the row).
     Expect: `buttons FFDock::checkpoint-panel` lists **Delete checkpoint** with id `FFCheckpointRow::trash`; no dialog is shown.
 24. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
     Expect: the "Delete this checkpoint?" dialog opens again.
 25. Click **Delete** (`AppWindow::checkpoint-delete`).
     Expect: the dialog is gone; the CHECKPOINTS list shows 1 row and no "None yet — fuse a stack" line.
-26. Drag from **Export image** (`FFCheckpointPanel::checkpoint-export`) to window point 1177,148, so the pointer ends over the remaining row (a release off the button is no click).
+26. Hover the remaining row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: Must not: a red trash icon appears on it; `buttons FFDock::checkpoint-panel` does not list **Delete checkpoint**.
 27. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: no dialog is shown; the first row has the raised background and the accent bar.

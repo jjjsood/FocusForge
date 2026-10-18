@@ -14,15 +14,15 @@ Use a fresh settings directory. The PREPARE section of the Settings dock holds t
 ## Keyboard and snapping
 4. Click **Target brightness track** (`FFSlider::drag-area`, instance 1).
    Expect: the target readout reads 0.0 and has an orange border.
-5. (human only) Press Right once.
+5. Press Right once.
    Expect: the target readout reads +0.1 and keeps its orange border.
-6. (human only) Press Left three times.
+6. Press Left three times.
    Expect: the target readout reads −0.2.
 7. Drag **Target brightness track** (`FFSlider::drag-area`, instance 1) to its 37% point.
    Expect: the target readout reads −0.1, not −0.13.
 8. Drag **Target brightness track** (`FFSlider::drag-area`, instance 1) to 40 px right of its right end.
    Expect: the target readout reads +0.5 and the thumb sits at the right end.
-9. (human only) With the target focused, press Right once more.
+9. Press Right once more (the Target brightness slider keeps the focus from step 8).
    Expect: the target readout still reads +0.5.
 10. Drag **Target brightness track** (`FFSlider::drag-area`, instance 1) to 40 px left of its left end.
    Expect: the target readout reads −0.5 and the thumb sits at the left end.

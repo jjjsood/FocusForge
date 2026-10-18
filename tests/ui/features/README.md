@@ -18,17 +18,14 @@ Each feature file says how a user reaches the feature, which controls matter, an
 
 ## Human only
 
-Races against a running fuse (pause, resume, cancel, queued tab, controls inert while running: journey 02 steps 17-25, journey 09 steps 2-5) are driven: `--slow-run N` holds the Nth run of the launch in its running state for `--slow-run-seconds` (default 150 s). Native dialogs (Open folder, + add frames, Save choosers), key presses, typing, wheel and pan, hover-only controls, pixel judgements, window manager moves and spinner motion are `(human only)` steps, or listed in the feature's Gotchas when no journey can reach them.
+Races against a running fuse (pause, resume, cancel, queued tab, controls inert while running: journey 02 steps 17-25, journey 09 steps 2-5) are driven: `--slow-run N` holds the Nth run of the launch in its running state for `--slow-run-seconds` (default 150 s). Key presses, typed text, hover and clicks in a second window are driven steps (`Press`, `Type`, `Hover`, `--window N`). Native dialogs (Open folder, + add frames, Save choosers), wheel and pan, pixel judgements, window manager moves, spinner motion and what needs the window's own keyboard focus (toasts, journey 15 steps 23-28 and 30-31) are `(human only)` steps, or listed in the feature's Gotchas when no journey can reach them. The crash-record steps (journey 15 steps 29 and 32-35) stay human only too: they need a crash report seeded into the data folder before launch.
 
 ## Not covered yet
 
 What has to exist before the rest can be tested, most valuable first.
 
-1. A way to dismiss the "No frames here" refusal without the native chooser (it blocks the window at launch).
-2. A key step in the driver (Ctrl+Z, Ctrl+N/O/S/W, Esc, Alt+click) and a text input step (parameter values, memory caps, Save to).
-3. A seeded settings folder for the Recent list, and a journey that opens `fixtures/projects/valid.ffp` (the file exists; the corrupt, mismatch and missing projects are covered by journey 16).
-4. A save and export destination that is not the fixture folder; the export writing and refused states need a lone launch (`--export-dialog-preview`).
-5. Element ids on the projects rail entries, the card close glyph and the checkpoint trash icon; a hover step in the driver.
-6. Driver clicks in the second window (detached pane) and a drag that starts at a chosen point.
-7. A slow fixture or a throttle that holds a fuse in the running state for minutes, so pause, resume, cancel and queued tabs can be read step by step.
-8. Fixture folders: a stack that aligns fully, one large enough to show the loading indicator.
+1. A seeded settings folder for the Recent list, and a journey that opens `fixtures/projects/valid.ffp` (the file exists; the corrupt, mismatch and missing projects are covered by journey 16).
+2. The export writing and refused states: they need a lone launch (`--export-dialog-preview`); saves and exports already land in the `--save-folder` destination.
+3. A journey that presses the keyboard shortcuts (Ctrl+Z, Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+W, Escape on the Projects overview): `Press` exists, only Escape on the refusal and in the notification center is pressed so far.
+4. Fixture folders: a stack that aligns fully, one large enough to show the loading indicator.
+5. A driver drag that starts at a chosen point: `drag` and `hover` press at the element's centre.

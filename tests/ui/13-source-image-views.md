@@ -26,8 +26,8 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
     Expect: the first two source names exchange positions; no drag handle appears.
 10. Drag **first visible source image** (`FFImageRow::large-identity`) to the centre of the second visible preview image (`FFImageRow::large-identity`, instance 1), using its logical element geometry without scale conversion.
     Expect: the first two source names return to their order before the filename drag.
-11. (human only) Hover the image, filename, timestamp, gaps and action buttons of one Large preview row.
-    Expect: eye/delete replace the timestamp throughout the row; filename width stays fixed.
+11. Hover the timestamp of the first Large preview row (`FFImageRow::large-timestamp-slot` 0).
+    Expect: eye and delete icons replace the timestamp of that row (`buttons FFDock::images-panel` lists **Exclude** `FFImageRow::large-exclude-button` and **Remove** `FFImageRow::large-remove-button`); the filename beside them reads "00.tif" and the second row still shows "—" as its timestamp.
 12. Click **first visible source filename** (`FFImageRow::large-name-slot`).
     Expect: the first source is selected and eye/delete are visible in its timestamp area.
 13. Click **Exclude**, the eye on the first source (`FFImageRow::large-exclude-button`).

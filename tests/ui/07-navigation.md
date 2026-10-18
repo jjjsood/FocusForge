@@ -70,9 +70,9 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
     Expect: the main window still shows one pane, labelled "Composite", and the zoom readout shows a percentage ending in " %".
 31. Click **Settings** (`FFDockTabs::settings-tab`).
     Expect: Must not: the Composite pane in the main window shows an undock control in its top-right corner (the dock does show a row labelled "Algorithm").
-32. Click the close control in the second window's title bar (`FFWindowBar::close`; with the driver: `$M call find_elements_by_id` with `windowHandle` the last entry of `list_windows` and `elementsId` `FFWindowBar::close`, then `$M call click_element` with that `elementHandle`).
+32. Click the close control in the second window's title bar (`FFWindowBar::close`).
     Expect: the second window is gone; the main window shows two panes, "00.tif" on the left and "Composite" on the right, each with an undock control.
 33. Click the undock control of the left pane (`FFUndockControl::area` 0).
     Expect: (within 5 s) a new second window titled "FocusForge — Frame" opens (`$M shot <png> N --scale 0.5` with N the last entry of `list_windows`, counted from 0) and the main window shows one pane, "Composite".
-34. Click the dock control (label "Dock pane", `FFUndockControl::area` 0) in the second window (with the driver: `find_elements_by_id` and `click_element` as in step 32, on the last entry of `list_windows`).
+34. Click the dock control (label "Dock pane", `FFUndockControl::area` 0) in the second window (`--window N`, N the last entry of `list_windows`, counted from 0; the id is in both windows).
     Expect: the second window is gone and the main window shows two panes again, "00.tif" and "Composite".

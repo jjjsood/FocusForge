@@ -6919,6 +6919,43 @@ fn refusal_dialog_counts_as_modal() {
     assert!(!controller.canvas_blocked());
 }
 
+#[test]
+fn refusal_dismissed_without_picker() {
+    use focusforge_gui::ChromeKey;
+    use focusforge_gui::input_map::Modifiers;
+    let escape = |c: &mut AppController| c.chrome_key("\u{1b}", Modifiers::NONE);
+
+    let mut controller = AppController::new();
+    raise_refusal(&mut controller, "refusal_escape_folder_empty");
+    assert!(controller.modal_open());
+    assert_eq!(escape(&mut controller), ChromeKey::RefusalDismissed);
+    assert!(
+        !controller.modal_open(),
+        "Escape closes the folder-empty refusal"
+    );
+
+    let dir = fixture_copy("projects", "refusal_escape_titled");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("corrupt.ffp")]),
+        OpenOutcome::Refused(_)
+    ));
+    assert!(controller.refusal_title().is_some(), "a titled refusal");
+    assert!(controller.modal_open());
+    assert_eq!(escape(&mut controller), ChromeKey::RefusalDismissed);
+    assert!(!controller.modal_open(), "Escape closes a titled refusal");
+
+    controller.toggle_projects_overlay();
+    raise_refusal(&mut controller, "refusal_escape_over_overlay");
+    assert_eq!(escape(&mut controller), ChromeKey::RefusalDismissed);
+    assert!(!controller.modal_open());
+    assert!(
+        controller.projects_overlay_open(),
+        "the refusal closes first; the overlay stays open"
+    );
+    assert_eq!(escape(&mut controller), ChromeKey::Consumed);
+    assert!(!controller.projects_overlay_open());
+}
+
 // ---------------------------------------------------------------------
 // In-memory checkpoints and the project save.
 // ---------------------------------------------------------------------

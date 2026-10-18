@@ -43,7 +43,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
     Expect: (within 30 s) the overlay is gone and the tab strip shows one tab titled "frames" with no "UNSAVED" marker.
 19. Click **Projects** (`FFTabStrip::projects-button`).
     Expect: the count reads "1 open" and the one card reads "3 frames · 1 checkpoint" with the "CURRENT" chip and no "UNSAVED" chip.
-20. Drag from **Open project…** (`FFProjectsRail::open-project`) to window point 499,276, inside the remaining card and away from its top-right corner (the card spans 334,150 to 664,402 with one card in the gallery; a release off the rail entry is no click). The drag call may report a timeout; do not repeat it.
+20. Hover the remaining card (`FFProjectCard::card-area` 0).
     Expect: `buttons AppWindow::projects-overlay` lists **Close** with id `FFProjectCard::close`; no dialog is shown and the count reads "1 open".
 21. Click **Close** (`FFProjectCard::close`).
     Expect: Must not: a dialog appears; the project closes at once, the count reads "0 open" and the text "No projects open" is shown with no card listed.

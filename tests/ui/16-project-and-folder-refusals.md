@@ -16,7 +16,7 @@ Start: --open fixtures/open-rejected --open fixtures/open-root-and-subfolder --o
 ## The projects overview lists what opened and what did not
 7. Click **Projects** (`FFTabStrip::projects-button`).
    Expect: the overview shows the heading "Projects" and the count "7 · 1 did not open"; the cards "open-rejected" and "open-root-and-subfolder" read "3 frames · no checkpoint yet"; a card headed "Sources missing" with the button "Locate frames…" sits above the card "missing" ("3 frames · 1 checkpoint"), beside the card "mismatch" ("3 frames · 1 checkpoint").
-8. Drag the gallery scrollbar (`FFScrollbar::track-area`, instance 1) to window point 1189,750. The drag call may report a timeout; do not repeat it.
+8. Drag the gallery scrollbar (`FFScrollbar::track-area`, instance 1) to window point 1189,750.
    Expect: the cards "a" and "b" read "3 frames · no checkpoint yet" and the last card is headed "Not a project" with the line "LEFT ALONE" and the name "notes"; no card is named "corrupt".
 9. Click **Projects** (`FFTabStrip::projects-button`).
    Expect: the overview is gone and the toolbar shows **Fuse stack**.

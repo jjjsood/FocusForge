@@ -1262,6 +1262,8 @@ pub enum ChromeKey {
     None,
     /// Already performed; nothing left for the bridge to do.
     Consumed,
+    /// An open refusal was closed; the bridge repaints and opens no picker.
+    RefusalDismissed,
     NewProject,
     OpenProject,
     /// Save the active tab's held checkpoints.
@@ -4180,7 +4182,7 @@ impl AppController {
     }
 
     /// Closes the refusal dialog -- its own "Pick another folder…" button,
-    /// or `Close` for every other refusal.
+    /// or `Close` for every other refusal; `Esc` closes either.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -4744,13 +4746,18 @@ impl AppController {
     /// none of the five can be shadowed by a user's rebind. The four
     /// Ctrl-chords apply anywhere in the window, whether or not the overlay
     /// is open; none of them acts while [`Self::modal_open`] holds. `Esc`
-    /// only closes an open overlay. Every other key press reads
+    /// closes an open refusal first (it paints above the overlay), else an
+    /// open overlay. Every other key press reads
     /// [`ChromeKey::None`] and falls through unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
         };
         if key == '\u{1b}' {
+            if self.state.refusal_open {
+                self.dismiss_refusal();
+                return ChromeKey::RefusalDismissed;
+            }
             if self.state.overlay_open {
                 self.close_projects_overlay();
                 return ChromeKey::Consumed;

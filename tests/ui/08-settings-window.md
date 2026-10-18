@@ -14,10 +14,10 @@ Start: --open fixtures/mantis-64/frames
    Expect: the switch knob is back at the right end on an accent-coloured track.
 6. Click the GPU processing switch (`FFToggle::area` 1).
    Expect: the knob is at the left end on a grey track again.
-7. (human only) Click into the "Host memory cap" field and type "xyz".
-   Expect: the text "xyz" shows in the failure tone (red) and the "Host budget" value is unchanged.
-8. (human only) Click into the "VRAM cap" field and type "1GiB".
-   Expect: below the LIMITS rows the note "Caps only lower the probed budgets. Changes apply from the next start." appears.
+7. Type "xyz" into the "Host memory cap" field (`FFTextField::input` 0).
+   Expect: the field shows "xyz" with a red outline (the failure tone) and the "Host budget" value is unchanged.
+8. Type "1GiB" into the "VRAM cap" field (`FFTextField::input` 1).
+   Expect: the text "1GiB" shows in the neutral tone (no red border) and "VRAM budget" still reads "Not probed yet"; Must not: the note "Caps only lower the probed budgets. Changes apply from the next start." appears below the LIMITS rows (it shows only after a run has probed the GPU).
 ## The GPU switch persists across closing and reopening
 9. Click **Close settings** (`FFSettingsModal::close`).
    Expect: the "Settings" window is gone; the canvas panes are visible again.
