@@ -1,15 +1,15 @@
 # Set stacking parameters, reset them and keep them per project tab
-Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock-tab settings
+Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock-tab settings --slow-run 1
 ## Locked while a fuse runs
 1. Click the second project tab (`FFTab::area` 1).
    Expect: the Settings dock lists the headings "PREPARE", "FUSE", "ALIGN" and "FINISH"; the toolbar shows the **Fuse stack** button.
-2. (human only) Click **Fuse stack** (`FFToolbar::fuse-button`) and go straight on to step 3: the run on this stack ends within about 20 seconds.
-   Expect: (within 10 s) the toolbar shows the buttons **Pause** and **Cancel**, the **Fuse stack** button is gone and the Settings panel is drawn dimmed.
-3. (human only) Click **Pause** (`FFToolbar::pause-button`).
+2. Click **Fuse stack** (`FFToolbar::fuse-button`); this is the first run of the launch, which `--slow-run 1` holds in its fuse stage for at least 150 s.
+   Expect: (within 60 s) the bottom bar status reads "Fusing", the toolbar shows the buttons **Pause** and **Cancel**, the **Fuse stack** button is gone and the Settings panel is drawn dimmed.
+3. Click **Pause** (`FFToolbar::pause-button`).
    Expect: the toolbar shows the **Resume** button instead of **Pause** and the bottom bar status reads "Paused".
-4. (human only) Click the **Enabled** switch under ALIGN (`FFToggle::area` 0) while the run is paused.
+4. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0) while the run is paused.
    Expect: Must not: the switch turns off; the Settings panel stays dimmed and the switch stays on.
-5. (human only) Click **Cancel** (`FFToolbar::cancel-button`).
+5. Click **Cancel** (`FFToolbar::cancel-button`).
    Expect: (within 30 s) the **Fuse stack** button is back in the toolbar, the buttons **Pause**, **Resume** and **Cancel** are gone and the Settings panel is no longer dimmed.
 ## Defaults and Reset All on the second tab
 6. Drag the Settings scrollbar (`FFScrollbar::track-area`) from the top to the end of its track (`$M drag FFScrollbar::track-area 0 1193 705`).

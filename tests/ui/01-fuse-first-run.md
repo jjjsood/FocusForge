@@ -1,4 +1,4 @@
-# Fuse a stack for the first time: refusals before, discard, keep, fuse again
+# Fuse a stack for the first time: refusals before, discard, keep, fuse again, fuse with alignment off
 Start: --open fixtures/mantis-64/frames
 ## Before the first fuse
 1. Click **STACKING** (`FFModeSwitch::stacking-half`).
@@ -44,3 +44,12 @@ Start: --open fixtures/mantis-64/frames
     Expect: the dialog is gone.
 20. Click **STACKING** (`FFModeSwitch::stacking-half`).
     Expect: Must not: the CHECKPOINTS list holds a third row; it still holds exactly two rows.
+## Alignment off: the result is kept with no question
+21. Click **Settings** (`FFDockTabs::settings-tab`).
+    Expect: the Settings dock lists the headings "PREPARE", "FUSE" and "ALIGN" (FINISH sits below the fold), and the **Enabled** switch under ALIGN is on.
+22. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
+    Expect: the switch is off and the ALIGN "Algorithm" label and field are drawn greyed out.
+23. Click **Fuse stack** (`FFToolbar::fuse-button`).
+    Expect: (within 60 s) the bottom bar status reads "fused" followed by a time, and no dialog titled "Keep this fused result?" is on screen.
+24. Click **STACKING** (`FFModeSwitch::stacking-half`).
+    Expect: the CHECKPOINTS list holds three rows.

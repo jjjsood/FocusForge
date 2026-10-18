@@ -470,6 +470,94 @@ fn settings_journey_pause_resume_and_cancel() {
     }
 }
 
+/// Waits until the bar reads "Fusing" after the preparation and alignment
+/// stages, which hold no pause. A freshly started run reads "Fusing" before
+/// its first stage report, so the wait first gives the worker a moment to
+/// leave that state.
+fn wait_until_fusing(controller: &AppController) {
+    let start = Instant::now();
+    let mut left_fusing = false;
+    loop {
+        let fusing = controller.job_view().stage_word == "Fusing";
+        left_fusing |= !fusing;
+        if fusing && (left_fusing || start.elapsed() > Duration::from_secs(1)) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the run never reached Fusing"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_slowed_run_holds_its_floor_and_matches_an_unslowed_run() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("slow_run_floor", 3);
+    controller.set_slow_run(2, Duration::from_secs(2));
+    let newest_composite = |c: &AppController| {
+        std::fs::read(&c.held_checkpoints().last().expect("a held run").composite)
+            .expect("the held composite reads")
+    };
+
+    assert!(controller.start_fuse(), "run 1 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    let unslowed = newest_composite(&controller);
+
+    let started = Instant::now();
+    assert!(controller.start_fuse(), "run 2 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the slowed run settled after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(controller.held_checkpoints().len(), 2);
+    assert_eq!(
+        newest_composite(&controller),
+        unslowed,
+        "a slowed run must produce the unslowed run's composite"
+    );
+}
+
+#[test]
+fn pause_and_cancel_act_inside_a_slowed_run_and_siblings_keep_their_speed() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("slow_run_control", 3);
+    controller.set_slow_run(2, Duration::from_secs(20));
+
+    assert!(controller.start_fuse(), "run 1 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    let held = controller.held_checkpoints().len();
+
+    assert!(controller.start_fuse(), "run 2 starts");
+    wait_until_fusing(&controller);
+    controller.pause_or_resume();
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        held,
+        "a run paused inside its hold must not complete"
+    );
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+
+    controller.pause_or_resume();
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(2));
+    assert_eq!(controller.job_view().state, job::RunState::Idle);
+    assert_eq!(controller.held_checkpoints().len(), held);
+
+    assert!(controller.start_fuse(), "run 3 starts");
+    common::wait_for_settle(&mut controller, Duration::from_secs(20));
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        held + 1,
+        "the run after the slowed one is not slowed"
+    );
+}
+
 #[test]
 fn resume_does_not_reset_the_unit_total() {
     let request = no_align_request("resume_unit_total", 2);

@@ -80,6 +80,9 @@ pub struct JobControl {
     align_total: AtomicUsize,
     /// The live admission cap; [`NO_CAP`] when none is set.
     admission_cap: AtomicUsize,
+    /// Nanoseconds of running time every fuse-stage admission check waits
+    /// for; `0` means none.
+    min_running_nanos: AtomicU64,
 }
 
 impl JobControl {
@@ -102,6 +105,7 @@ impl JobControl {
             align_done: Arc::new(AtomicUsize::new(0)),
             align_total: AtomicUsize::new(0),
             admission_cap: AtomicUsize::new(NO_CAP),
+            min_running_nanos: AtomicU64::new(0),
         })
     }
 
@@ -112,6 +116,15 @@ impl JobControl {
     pub fn set_admission_cap(&self, cap: Option<usize>) {
         self.admission_cap
             .store(cap.map_or(NO_CAP, |c| c.max(1)), Ordering::SeqCst);
+    }
+
+    /// Holds the fuse stage until this job's running time (pauses excluded)
+    /// reaches `floor`: [`TileControl::should_stop`] waits in short slices
+    /// while the job is running and below it, and returns at once on a
+    /// pause or cancel. The output is unchanged. `Duration::ZERO` lifts it.
+    pub fn set_min_running(&self, floor: Duration) {
+        let nanos = u64::try_from(floor.as_nanos()).unwrap_or(u64::MAX);
+        self.min_running_nanos.store(nanos, Ordering::SeqCst);
     }
 
     /// The live admission cap; `usize::MAX` when none is set.
@@ -258,7 +271,18 @@ impl JobControl {
 
 impl TileControl for JobControl {
     fn should_stop(&self) -> bool {
-        self.state() != ControlState::Running
+        const SLICE: Duration = Duration::from_millis(50);
+        let floor = Duration::from_nanos(self.min_running_nanos.load(Ordering::SeqCst));
+        loop {
+            if self.state() != ControlState::Running {
+                return true;
+            }
+            let short = floor.saturating_sub(self.running_now());
+            if short.is_zero() {
+                return false;
+            }
+            std::thread::sleep(short.min(SLICE));
+        }
     }
 
     /// Credits one finished unit, from the rayon worker that finished it.
@@ -440,6 +464,69 @@ mod tests {
             control.progress().running,
             frozen,
             "a closed segment's clock must not keep running -- that is the time spent paused"
+        );
+    }
+
+    #[test]
+    fn a_running_floor_holds_should_stop_until_the_segment_has_run_that_long() {
+        for floor_ms in [100u64, 300] {
+            let control = JobControl::new();
+            control.set_min_running(Duration::from_millis(floor_ms));
+            control.begin_segment();
+            let started = Instant::now();
+            assert!(!control.should_stop());
+            let held = started.elapsed();
+            assert!(
+                held >= Duration::from_millis(floor_ms),
+                "floor {floor_ms} ms released after {held:?}"
+            );
+            assert!(
+                held < Duration::from_millis(floor_ms + 200),
+                "floor {floor_ms} ms held for {held:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_and_cancel_end_a_floor_hold_within_200_ms() {
+        for cancel in [false, true] {
+            let control = JobControl::new();
+            control.set_min_running(Duration::from_secs(30));
+            control.begin_segment();
+            let held = Arc::clone(&control);
+            let waiter = std::thread::spawn(move || {
+                let started = Instant::now();
+                (held.should_stop(), started.elapsed())
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            let signalled = Instant::now();
+            if cancel {
+                control.cancel();
+            } else {
+                control.pause();
+            }
+            let (stopped, _) = waiter.join().unwrap();
+            let lag = signalled.elapsed();
+            assert!(stopped, "a pause or cancel must make should_stop true");
+            assert!(lag < Duration::from_millis(200), "released after {lag:?}");
+        }
+    }
+
+    #[test]
+    fn a_floor_counts_running_time_only_not_the_time_between_segments() {
+        let control = JobControl::new();
+        control.set_min_running(Duration::from_millis(150));
+        control.begin_segment();
+        std::thread::sleep(Duration::from_millis(100));
+        control.end_segment();
+        std::thread::sleep(Duration::from_millis(200));
+        control.begin_segment();
+        let started = Instant::now();
+        assert!(!control.should_stop());
+        let held = started.elapsed();
+        assert!(
+            held >= Duration::from_millis(40),
+            "the paused gap counted toward the floor: held {held:?}"
         );
     }
 

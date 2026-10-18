@@ -1770,6 +1770,14 @@ pub struct AppController {
     checkpoint_generation: u64,
     /// The newest generation [`Self::take_checkpoint_flash`] handed out.
     checkpoint_flash_played: u64,
+    /// The run (counted from 1 over this controller's lifetime) held in its
+    /// fuse stage for the given running time, so a pause, queue or cancel can
+    /// be exercised step by step.
+    slow_run: Option<(usize, Duration)>,
+    /// Runs started so far, counted after the budget refusal.
+    runs_started: usize,
+    /// How long every folder or project load waits before it reads anything.
+    open_hold: Duration,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
@@ -4046,7 +4054,9 @@ impl AppController {
 
         let sink = self.sink.clone();
         let outcome_slot = Arc::clone(&self.state.load.outcome);
+        let hold = self.open_hold;
         Some(std::thread::spawn(move || {
+            std::thread::sleep(hold);
             let mut last_tick: Option<Instant> = None;
             let mut outcome = entry::open(target, |frames_read, frame_total| {
                 let done = frame_total > 0 && frames_read == frame_total;
@@ -4610,6 +4620,21 @@ impl AppController {
     pub fn install_recent(&mut self, entries: Vec<recent::RecentEntry>, config_dir: PathBuf) {
         self.state.recent = entries;
         self.state.config_dir = Some(config_dir);
+    }
+
+    /// Holds the `run`th fuse run started after this call (counted from 1)
+    /// in its fuse stage until it has been running for `floor`. Pause,
+    /// resume and cancel act on it as on any run, and its output is
+    /// unchanged.
+    pub fn set_slow_run(&mut self, run: usize, floor: Duration) {
+        self.slow_run = Some((run, floor));
+        self.runs_started = 0;
+    }
+
+    /// Makes every folder or project load wait `hold` before it reads
+    /// anything, keeping [`Self::load_in_flight`] true meanwhile.
+    pub fn set_open_hold(&mut self, hold: Duration) {
+        self.open_hold = hold;
     }
 
     /// The rail's own `Recent` rows, dates rendered against `now_unix` --
@@ -7519,6 +7544,12 @@ impl AppController {
         }
         self.cancel_frame_drag();
         let control = job::JobControl::new();
+        self.runs_started += 1;
+        if let Some((run, floor)) = self.slow_run
+            && run == self.runs_started
+        {
+            control.set_min_running(floor);
+        }
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));

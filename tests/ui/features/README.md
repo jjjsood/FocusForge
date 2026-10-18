@@ -18,7 +18,7 @@ Each feature file says how a user reaches the feature, which controls matter, an
 
 ## Human only
 
-Races against a running fuse (pause, resume, cancel, queued tab, controls inert while running: journey 02 steps 17-23, journey 09 steps 2-5) are human only too: a fuse of the largest sample stack ends in about 20 s and a step-by-step read takes longer. Native dialogs (Open folder, + add frames, Save choosers), key presses, typing, wheel and pan, hover-only controls, pixel judgements, window manager moves and spinner motion are `(human only)` steps, or listed in the feature's Gotchas when no journey can reach them.
+Races against a running fuse (pause, resume, cancel, queued tab, controls inert while running: journey 02 steps 17-25, journey 09 steps 2-5) are driven: `--slow-run N` holds the Nth run of the launch in its running state for `--slow-run-seconds` (default 150 s). Native dialogs (Open folder, + add frames, Save choosers), key presses, typing, wheel and pan, hover-only controls, pixel judgements, window manager moves and spinner motion are `(human only)` steps, or listed in the feature's Gotchas when no journey can reach them.
 
 ## Not covered yet
 

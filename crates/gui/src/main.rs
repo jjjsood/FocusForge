@@ -149,6 +149,19 @@ struct Args {
     /// settle before it is pressed again, so `0,0` fuses tab 0 twice.
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
+    /// Holds the Nth fuse run started in this launch (counted from 1, a whole
+    /// number) in its fuse stage for `--slow-run-seconds`, so Pause, Resume
+    /// and Cancel can be exercised step by step. Other runs keep their speed.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_run: Option<String>,
+    /// Minimum fuse running time, in whole seconds, of the run `--slow-run`
+    /// selects. Defaults to 150.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_run_seconds: Option<String>,
+    /// Holds every folder or project load for this many whole seconds before
+    /// it reads anything, so the "Loading…" indicator can be inspected.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_open: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1557,6 +1570,43 @@ fn install_recent(
     controller.install_recent(entries, config_dir);
 }
 
+/// Parses a whole number of at least 1; `None` for anything else, including
+/// a negative or non-numeric value.
+fn parse_positive(spec: &str) -> Option<u64> {
+    spec.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// Reads one slow-down option: logs the expected form and returns `None`
+/// for a value that does not parse, leaving that option off.
+fn slow_down_value(name: &str, spec: Option<&String>) -> Option<u64> {
+    let spec = spec?;
+    let parsed = parse_positive(spec);
+    if parsed.is_none() {
+        tracing::warn!("{name} expects a whole number of at least 1, got {spec:?}");
+    }
+    parsed
+}
+
+/// Installs `--slow-run`, `--slow-run-seconds` and `--slow-open` on the
+/// controller.
+fn install_slow_down(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    const DEFAULT_SLOW_RUN_SECONDS: u64 = 150;
+    let run = slow_down_value("--slow-run", args.slow_run.as_ref());
+    let seconds = slow_down_value("--slow-run-seconds", args.slow_run_seconds.as_ref());
+    let hold = slow_down_value("--slow-open", args.slow_open.as_ref());
+    let mut controller = controller.lock().unwrap();
+    if let Some(run) = run {
+        let floor = Duration::from_secs(seconds.unwrap_or(DEFAULT_SLOW_RUN_SECONDS));
+        controller.set_slow_run(run as usize, floor);
+    }
+    if let Some(hold) = hold {
+        controller.set_open_hold(Duration::from_secs(hold));
+    }
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
@@ -1654,6 +1704,7 @@ fn run(args: &Args) -> ExitCode {
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
         install_recent(&controller, &app, args);
+        install_slow_down(&controller, args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);

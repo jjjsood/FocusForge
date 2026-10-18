@@ -1,5 +1,5 @@
 # Fuse from launch, keep or discard it per tab, then pause, queue and cancel by hand
-Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --fuse-tabs 0
+Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --fuse-tabs 0 --slow-run 4
 ## The fuse that started at launch
 1. Click the first tab (`FFTab::area` 0).
    Expect: (within 60 s) a dialog titled "Keep this fused result?" shows two buttons, "Discard" and "Keep", and the text "00.tif, 01.tif, 06.tif and 07.tif could not be aligned", although **Fuse stack** was never clicked; the dock header behind it reads "8 frames · 0 excluded".
@@ -37,17 +37,21 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --fuse
 16. Click **Projects** (`FFTabStrip::projects-button`) again.
     Expect: the overlay is gone and the toolbar shows a **Fuse stack** button (read with `buttons AppWindow::toolbar`).
 ## Pause, queue and cancel a running fuse
-17. (human only) The run ends about 20 s after the click, too soon for a step-by-step read; click **Fuse stack** (`FFToolbar::fuse-button`) on the first tab.
-    Expect: (within 5 s) the toolbar shows **Pause** and **Cancel** and no **Fuse stack** button (the grey text at the right end of the toolbar is not a button).
-18. (human only) Same run: click **Pause** (`FFToolbar::pause-button`).
+17. Click **Fuse stack** (`FFToolbar::fuse-button`) on the first tab; this is the fourth run of the launch, which `--slow-run 4` holds in its fuse stage for at least 150 s.
+    Expect: (within 60 s) the bottom bar status reads "Fusing" and the toolbar shows **Pause** and **Cancel** and no **Fuse stack** button (the grey text at the right end of the toolbar is not a button).
+18. Click **Pause** (`FFToolbar::pause-button`) on the running first tab.
     Expect: the toolbar shows **Resume** (`FFToolbar::resume-button`) instead of **Pause**, and the bottom bar status reads "Paused".
-19. (human only) Same run: click the second tab (`FFTab::area` 1).
+19. Click the second tab (`FFTab::area` 1) while the first tab's run is paused.
     Expect: the toolbar shows a single button reading "Queued" (`FFToolbar::fuse-button`), because the first tab is running.
-20. (human only) Same run: click the first tab (`FFTab::area` 0).
+20. Click the first tab (`FFTab::area` 0).
     Expect: the toolbar shows **Resume** and **Cancel**, not **Pause**, and the bottom bar status reads "Paused".
-21. (human only) Same run: click **Cancel** (`FFToolbar::cancel-button`).
+21. Click **Cancel** (`FFToolbar::cancel-button`) on the paused run.
     Expect: (within 30 s) the **Fuse stack** button is back in the toolbar, and **Pause**, **Resume** and **Cancel** are gone (a greyed "Cancelling…" button may show for a moment first).
-22. (human only) Follows the cancelled run: click **Projects** (`FFTabStrip::projects-button`).
+22. Click **Projects** (`FFTabStrip::projects-button`) after the run was cancelled.
     Expect: the first card is headed "Cancelled", its stage line starts "STOPPED WHILE", its text reads "You stopped this one. Nothing was written.", its second line reads "8 frames · 1 checkpoint", and it shows a button "Run again".
-23. (human only) Follows the cancelled run: click **Run again** (`AppWindow::projects-overlay`).
-    Expect: (within 10 s) the first card no longer reads "Cancelled" and the text "Run again" is gone from it; its second line starts with "8 frames · ".
+23. Click **Run again** (`AppWindow::projects-overlay`) on the cancelled card.
+    Expect: (within 60 s) a dialog titled "Keep this fused result?" shows two buttons, "Discard" and "Keep"; behind it the first card still reads "Cancelled".
+24. Click **Keep** (`AppWindow::divergence-warning`).
+    Expect: the dialog is gone; the first card no longer reads "Cancelled" and the text "Run again" is gone from it; its second line starts with "8 frames · ".
+25. Click **Projects** (`FFTabStrip::projects-button`).
+    Expect: the overlay is gone and the text "Open projects" is not shown.

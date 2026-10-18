@@ -8972,3 +8972,32 @@ mod native_delivery {
         assert!(controller.take_native_notifications().is_empty());
     }
 }
+
+#[test]
+fn an_open_hold_keeps_the_load_in_flight() {
+    let root = common::tree("open_hold_frames");
+    for i in 0..3 {
+        common::copy_frame(&root, &format!("{i:02}.tif"), i);
+    }
+    let mut controller = AppController::new();
+    controller.set_open_hold(std::time::Duration::from_millis(600));
+    let started = std::time::Instant::now();
+    let handle = controller
+        .open_paths(&[root])
+        .expect("the load starts on a folder of frames");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        controller.load_in_flight(),
+        "the hold keeps the load in flight"
+    );
+    handle.join().expect("the load worker did not panic");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(600),
+        "the load finished after {:?}",
+        started.elapsed()
+    );
+    controller
+        .settle_open()
+        .expect("the load parked an outcome");
+    assert!(!controller.load_in_flight());
+}
