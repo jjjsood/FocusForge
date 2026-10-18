@@ -2543,7 +2543,10 @@ fn segment_rows(app: &AppWindow) -> Vec<Vec<(String, Option<bool>)>> {
                 .match_id("FFSegmented::segment")
                 .find_all()
                 .iter()
-                .inspect(|s| assert_eq!(s.accessible_role(), Some(AccessibleRole::Button)))
+                .inspect(|s| {
+                    assert_eq!(s.accessible_role(), Some(AccessibleRole::Button));
+                    assert_eq!(s.accessible_enabled(), Some(true));
+                })
                 .map(|s| {
                     (
                         s.accessible_label().unwrap().to_string(),
@@ -2673,6 +2676,7 @@ fn hover(app: &AppWindow, id: &str, index: usize) {
 fn assert_button(handle: &ElementHandle, label: &str) {
     assert_eq!(handle.accessible_role(), Some(AccessibleRole::Button));
     assert_eq!(handle.accessible_label().as_deref(), Some(label));
+    assert_eq!(handle.accessible_enabled(), Some(true), "{label}");
 }
 
 /// The trash and the close glyph exist only under the pointer, and then

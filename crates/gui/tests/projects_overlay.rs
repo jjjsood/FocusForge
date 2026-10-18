@@ -1789,6 +1789,7 @@ fn rail_entries_are_labelled_buttons() {
     for (row, name) in rows.iter().zip(["alpha", "beta"]) {
         assert_eq!(row.accessible_role(), Some(AccessibleRole::Button));
         assert_eq!(row.accessible_label().as_deref(), Some(name));
+        assert_eq!(row.accessible_enabled(), Some(true), "{name}");
     }
 }
 

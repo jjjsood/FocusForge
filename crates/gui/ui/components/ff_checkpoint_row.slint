@@ -70,6 +70,7 @@ export component FFCheckpointRow inherits Rectangle {
         // right edge.
         if root.deletable && (root.hovered || area.has-hover): trash := TouchArea {
             accessible-role: button;
+            accessible-enabled: true;
             accessible-label: "Delete checkpoint";
             width: Theme.icon-sm;
             height: Theme.icon-sm;

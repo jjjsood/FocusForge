@@ -33,6 +33,7 @@ export component FFSegmented inherits Rectangle {
             }
             segment := TouchArea {
                 accessible-role: button;
+                accessible-enabled: true;
                 accessible-label: label;
                 accessible-checkable: true;
                 accessible-checked: label == root.selected;
