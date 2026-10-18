@@ -6420,6 +6420,41 @@ fn assert_recent_persisted(controller: &AppController, config: &Path, paths: &[&
     assert_eq!(fresh.recent_rows(0), controller.recent_rows(0));
 }
 
+/// The only test in this binary that reaches the real save picker: the save
+/// folder is process-wide and set once.
+#[test]
+fn a_save_folder_receives_the_project_save_and_its_recent_row() {
+    let folder = common::tree("save_folder_out");
+    let config = common::tree("save_folder_config");
+    focusforge_gui::picker::set_save_folder(folder.clone());
+    let mut c = controller_with_two_tabs("save_folder");
+    c.install_recent(vec![], config);
+    fuse_and_settle(&mut c);
+    let current = |c: &AppController| c.project_cards().into_iter().find(|card| card.current);
+    assert!(current(&c).expect("a current card").unsaved);
+
+    let mut proposed = None;
+    assert!(common::save_and_settle(&mut c, |p| {
+        proposed = Some(p.to_path_buf());
+        focusforge_gui::picker::pick_save_project(p)
+    }));
+    let proposed = proposed.expect("a never-saved tab asks where to save");
+    let saved = folder.join(proposed.file_name().unwrap());
+    assert!(saved.is_file(), "{} must be written", saved.display());
+    assert_eq!(saved.extension().unwrap(), "ffp");
+    let frames = proposed.parent().unwrap();
+    assert!(
+        std::fs::read_dir(frames).unwrap().all(|e| e
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|x| x != "ffp")),
+        "nothing may be saved beside the frames"
+    );
+    assert_eq!(recent_pairs(&c), [saved_row(&saved)]);
+    assert!(!current(&c).expect("a current card").unsaved);
+}
+
 #[test]
 fn a_saved_project_is_recorded_in_recent() {
     let out = common::tree("saved_recent_out");

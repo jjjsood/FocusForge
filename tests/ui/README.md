@@ -26,8 +26,9 @@ Start: --open fixtures/mantis-64/frames
 
 ## Run one by hand
 
-1. Build the app, then start it with the journey's `Start:` arguments and a scratch settings folder:
-   `target/debug/focusforge-gui <Start args> --config-dir .scratch/ui/config`
+1. Build the app, create a scratch save folder, then start it with the journey's `Start:` arguments, a scratch settings folder and that save folder (saves and exports land there with no file chooser, never beside the fixtures):
+   `mkdir -p .scratch/ui/save`
+   `target/debug/focusforge-gui <Start args> --config-dir .scratch/ui/config --save-folder .scratch/ui/save`
 2. Do the steps in order. After each step compare the window with its `Expect:`.
 3. A step whose `Expect:` does not hold is a failure; note its number and what the window showed, then carry on with the next step.
 4. Close the window when done.

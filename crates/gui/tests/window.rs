@@ -277,6 +277,52 @@ fn refused_slow_down_values_are_logged_and_the_window_opens() {
 }
 
 #[test]
+fn refused_save_folder_is_logged_and_the_window_opens() {
+    if !has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let dir = common::tree("refused_save_folder");
+    let file = dir.join("not-a-folder");
+    std::fs::write(&file, b"x").expect("write the regular file");
+    let mut refused = vec![dir.join("missing"), file];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).expect("create the folder");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+            .expect("make the folder read-only");
+        // A superuser writes anyway, so the folder would not be refused.
+        if std::fs::File::create(locked.join("probe")).is_err() {
+            refused.push(locked);
+        }
+    }
+    for (i, path) in refused.iter().enumerate() {
+        let output = common::gui_bin(&format!("refused_save_folder_{i}"))
+            .arg("--save-folder")
+            .arg(path)
+            .args(["--exit-after", "500"])
+            .output()
+            .expect("launch focusforge-gui");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{path:?} must still open the window: {stderr}"
+        );
+        assert!(
+            stderr.contains("--save-folder expects"),
+            "{path:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&path.display().to_string()),
+            "{path:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn both_sides_open_a_real_comparison_window() {
     if !has_display() {
         println!("SKIP: comparison windows need DISPLAY or WAYLAND_DISPLAY");

@@ -80,6 +80,35 @@ fn wait_export(controller: &mut AppController) {
     }
 }
 
+/// The only test in this binary that reaches the real save picker: the save
+/// folder is process-wide and set once.
+#[test]
+fn save_folder_receives_the_export_under_its_proposed_name() {
+    let folder = common::tree("save_folder_export_out");
+    focusforge_gui::picker::set_save_folder(folder.clone());
+    let mut controller = scratch_controller("save_folder_export");
+    open_fused_tab(&mut controller, "save_folder_export", 3);
+    controller.checkpoint_export_requested();
+    controller.export_select_format("PNG");
+
+    let mut proposed = None;
+    controller.export_confirmed(|p| {
+        proposed = Some(p.to_path_buf());
+        focusforge_gui::picker::pick_save_image(p, ExportFormat::Png)
+    });
+    assert!(controller.take_export_started(), "the export must start");
+    wait_export(&mut controller);
+
+    let proposed = proposed.expect("the picker is asked for a destination");
+    assert_eq!(proposed.extension().unwrap(), "png");
+    let exported = folder.join(proposed.file_name().unwrap());
+    assert!(exported.is_file(), "{} must be written", exported.display());
+    assert!(
+        !proposed.exists(),
+        "nothing may be exported beside the frames"
+    );
+}
+
 fn dab() -> Op {
     Op::BrushStroke {
         source_id: 0,

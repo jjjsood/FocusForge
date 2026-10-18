@@ -4,7 +4,7 @@
 //! can be observed without a person in front of it.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screenshot};
+use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, picker, screenshot};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
@@ -162,6 +162,10 @@ struct Args {
     /// it reads anything.
     #[arg(long, allow_hyphen_values = true)]
     slow_open: Option<String>,
+    /// Writes every project save and image export into this existing folder
+    /// under its proposed file name, with no save dialog.
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    save_folder: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -350,7 +354,7 @@ fn start_fuse_tabs_timer(
             controller
                 .lock()
                 .unwrap()
-                .save_active_project(|proposed| Some(proposed.to_path_buf()));
+                .save_active_project(|proposed| Some(save_destination(proposed)));
         }
         if close {
             let mut controller = controller.lock().unwrap();
@@ -404,7 +408,7 @@ fn start_export_active_row_timer(
             }
             let mut controller = controller.lock().unwrap();
             controller.checkpoint_export_requested();
-            controller.export_confirmed(|proposed| Some(proposed.to_path_buf()));
+            controller.export_confirmed(|proposed| Some(save_destination(proposed)));
             started = controller.take_export_started();
             pressed = true;
             bridge::push_export_dialog(&app, &controller);
@@ -1607,6 +1611,35 @@ fn install_slow_down(
     }
 }
 
+/// `proposed`, or its file name inside the save folder when one is set.
+fn save_destination(proposed: &Path) -> PathBuf {
+    picker::in_save_folder(proposed).unwrap_or_else(|| proposed.to_path_buf())
+}
+
+/// Hands `--save-folder` to the pickers. A folder that is missing, not a
+/// folder or not writable is logged and leaves the native save dialogs in
+/// place.
+fn install_save_folder(args: &Args) {
+    let Some(spec) = &args.save_folder else {
+        return;
+    };
+    let checked = std::fs::canonicalize(spec).and_then(|dir| {
+        if !dir.is_dir() {
+            return Err(std::io::Error::other("not a folder"));
+        }
+        let probe = dir.join(".focusforge-write-probe");
+        std::fs::File::create_new(&probe)?;
+        std::fs::remove_file(&probe)?;
+        Ok(dir)
+    });
+    match checked {
+        Ok(dir) => picker::set_save_folder(dir),
+        Err(cause) => tracing::warn!(
+            "--save-folder expects an existing folder you can write to, got {spec:?}: {cause}"
+        ),
+    }
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
@@ -1705,6 +1738,7 @@ fn run(args: &Args) -> ExitCode {
         bridge::install_crash_notice(&controller, &app, &toast_timer);
         install_recent(&controller, &app, args);
         install_slow_down(&controller, args);
+        install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);

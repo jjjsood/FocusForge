@@ -1,4 +1,4 @@
-# Export a fused result: refusal before a fuse, dialog, formats, settings, cancel
+# Export a fused result: refusal before a fuse, dialog, formats, settings, cancel, write
 Start: --open fixtures/mantis-64/frames
 ## Export stays unavailable before a kept fuse
 1. Click **Export image** (`FFCheckpointPanel::checkpoint-export`) before anything is fused.
@@ -55,3 +55,8 @@ Start: --open fixtures/mantis-64/frames
    Expect: the dialog "Export image" opens with the context line "frames · unsaved edits on Details" followed by a date and time and the line "Exporting your current unsaved retouch edits." (the checkpoint lives only in this tab until the project is saved); the line "Exporting the saved checkpoint you selected." is not shown.
 25. Click **Cancel** (`AppWindow::export-dialog`).
    Expect: the "Export image" dialog is gone and the CHECKPOINTS list shows 2 rows.
+## Export writes the file
+26. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
+   Expect: the dialog "Export image" opens with the heading "TIFF SETTINGS".
+27. Click **Export** (`AppWindow::export-dialog`).
+   Expect: (within 60 s) no file chooser opens and the "Export image" dialog is gone; the CHECKPOINTS list still shows 2 rows.

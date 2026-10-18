@@ -34,24 +34,31 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
     Expect: the dialog is gone and the count still reads "2 open".
 15. Click the close glyph of the second tab (`FFTab::close-area` 1).
     Expect: Must not: a dialog appears; the project closes at once, the count reads "1 open" and only the card "3 frames · 1 checkpoint" is left, carrying the "CURRENT" chip.
-16. Drag from **Open project…** (`FFProjectsRail::open-project`) to window point 499,276, inside the remaining card and away from its top-right corner (the card spans 334,150 to 664,402 with one card in the gallery; a release off the rail entry is no click). The drag call may report a timeout; do not repeat it.
+## Save, close and reopen from RECENT
+16. Click **Save project** (`FFProjectsRail::save-project`).
+    Expect: (within 30 s) the card's second line still reads "3 frames · 1 checkpoint", it carries the "CURRENT" chip and the "UNSAVED" chip is gone; no file chooser opens.
+17. Click **Close project** (`FFProjectsRail::close-project`).
+    Expect: Must not: a dialog appears; the overlay stays open, the count reads "0 open", the text "No projects open" is shown and one row "frames" sits under "RECENT" in the rail.
+18. Click the RECENT row "frames" (`FFProjectsRail::recent-row` 0).
+    Expect: (within 30 s) the overlay is gone and the tab strip shows one tab titled "frames" with no "UNSAVED" marker.
+19. Click **Projects** (`FFTabStrip::projects-button`).
+    Expect: the count reads "1 open" and the one card reads "3 frames · 1 checkpoint" with the "CURRENT" chip and no "UNSAVED" chip.
+20. Drag from **Open project…** (`FFProjectsRail::open-project`) to window point 499,276, inside the remaining card and away from its top-right corner (the card spans 334,150 to 664,402 with one card in the gallery; a release off the rail entry is no click). The drag call may report a timeout; do not repeat it.
     Expect: `buttons AppWindow::projects-overlay` lists **Close** with id `FFProjectCard::close`; no dialog is shown and the count reads "1 open".
-17. Click **Close** (`FFProjectCard::close`).
-    Expect: a dialog titled "Save this state first?" shows the line "Closing frames".
-18. Click **Close anyway** (`AppWindow::close-guard`).
-    Expect: the dialog is gone, the count reads "0 open" and the text "No projects open" is shown with no card listed.
+21. Click **Close** (`FFProjectCard::close`).
+    Expect: Must not: a dialog appears; the project closes at once, the count reads "0 open" and the text "No projects open" is shown with no card listed.
 ## Rail actions and actions with nothing open
-19. Click **Close project** (`FFProjectsRail::close-project`).
+22. Click **Close project** (`FFProjectsRail::close-project`).
     Expect: Must not: a dialog or an error appears; the overlay stays open, the count reads "0 open" and the text "No projects open" is shown.
-20. (human only) Click **New project** (`FFProjectsRail::new-project`), then cancel the folder chooser that opens.
+23. (human only) Click **New project** (`FFProjectsRail::new-project`), then cancel the folder chooser that opens.
     Expect: the overlay stays open and still shows "No projects open".
-21. (human only) Click **Open project…** (`FFProjectsRail::open-project`), then cancel the file chooser that opens.
+24. (human only) Click **Open project…** (`FFProjectsRail::open-project`), then cancel the file chooser that opens.
     Expect: the overlay stays open and still shows "No projects open".
-22. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overlay is gone; the canvas shows the title "No project open" and a button "Open folder…".
-23. Click **Fuse stack** (`FFToolbar::fuse-button`) with no project open.
-    Expect: Must not: a job starts; the bottom bar status reads "No project open" and **Fuse stack** is greyed out (read with `buttons AppWindow::toolbar`: its line starts with `x`).
-24. Click **Export image** (`FFCheckpointPanel::checkpoint-export`) with no project open.
-    Expect: Must not: an "Export image" dialog opens; **Export image** is greyed out (read with `buttons FFDock::checkpoint-panel`: its line starts with `x`).
 25. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the gallery heading reads "Open projects" with the count "0 open", the centred text "No projects open" is shown, no card is listed and no row sits under "RECENT" in the rail.
+    Expect: the overlay is gone; the canvas shows the title "No project open" and a button "Open folder…".
+26. Click **Fuse stack** (`FFToolbar::fuse-button`) with no project open.
+    Expect: Must not: a job starts; the bottom bar status reads "No project open" and **Fuse stack** is greyed out (read with `buttons AppWindow::toolbar`: its line starts with `x`).
+27. Click **Export image** (`FFCheckpointPanel::checkpoint-export`) with no project open.
+    Expect: Must not: an "Export image" dialog opens; **Export image** is greyed out (read with `buttons FFDock::checkpoint-panel`: its line starts with `x`).
+28. Click **Projects** (`FFTabStrip::projects-button`).
+    Expect: the gallery heading reads "Open projects" with the count "0 open", the centred text "No projects open" is shown, no card is listed and one row "frames" sits under "RECENT" in the rail.

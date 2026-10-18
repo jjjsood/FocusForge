@@ -12,6 +12,7 @@
 //! nothing opens and the empty state stays on screen.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::job::{ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 
@@ -32,11 +33,29 @@ pub fn pick_project() -> Option<PathBuf> {
         .pick_file()
 }
 
+static SAVE_FOLDER: OnceLock<PathBuf> = OnceLock::new();
+
+/// Sends every later project save and image export to `dir`, under its
+/// proposed file name, with no dialog. Set once per process; a second call
+/// is ignored.
+pub fn set_save_folder(dir: PathBuf) {
+    let _ = SAVE_FOLDER.set(dir);
+}
+
+/// `proposed`'s file name inside the save folder; `None` when no save folder
+/// is set.
+pub fn in_save_folder(proposed: &Path) -> Option<PathBuf> {
+    Some(SAVE_FOLDER.get()?.join(proposed.file_name()?))
+}
+
 /// Opens the OS save dialog filtered to `.ffp`, starting at `proposed`'s
 /// directory and name. A chosen name without the extension gets it, since
 /// GTK's dialog does not add it. `None` on cancel (or a missing dialog
-/// backend, rfd#320).
+/// backend, rfd#320). A set save folder answers without a dialog.
 pub fn pick_save_project(proposed: &Path) -> Option<PathBuf> {
+    if let Some(path) = in_save_folder(proposed) {
+        return Some(path);
+    }
     let mut dialog = rfd::FileDialog::new()
         .set_title("Save project")
         .add_filter("FocusForge project", &["ffp"]);
@@ -74,8 +93,12 @@ pub fn default_extension(format: ExportFormat) -> &'static str {
 /// directory and name -- the export modal's own destination picker,
 /// mirroring [`pick_save_project`]. A chosen name that does not carry one
 /// of the format's extensions gets the preferred one appended. `None` on
-/// cancel (or a missing dialog backend, rfd#320).
+/// cancel (or a missing dialog backend, rfd#320). A set save folder answers
+/// without a dialog.
 pub fn pick_save_image(proposed: &Path, format: ExportFormat) -> Option<PathBuf> {
+    if let Some(path) = in_save_folder(proposed) {
+        return Some(path);
+    }
     let name = format!("{} image", format.id().to_uppercase());
     let mut dialog = rfd::FileDialog::new()
         .set_title("Export image")
