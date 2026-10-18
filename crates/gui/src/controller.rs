@@ -1771,8 +1771,7 @@ pub struct AppController {
     /// The newest generation [`Self::take_checkpoint_flash`] handed out.
     checkpoint_flash_played: u64,
     /// The run (counted from 1 over this controller's lifetime) held in its
-    /// fuse stage for the given running time, so a pause, queue or cancel can
-    /// be exercised step by step.
+    /// fuse stage for the given running time.
     slow_run: Option<(usize, Duration)>,
     /// Runs started so far, counted after the budget refusal.
     runs_started: usize,

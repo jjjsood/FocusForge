@@ -150,8 +150,8 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
     /// Holds the Nth fuse run started in this launch (counted from 1, a whole
-    /// number) in its fuse stage for `--slow-run-seconds`, so Pause, Resume
-    /// and Cancel can be exercised step by step. Other runs keep their speed.
+    /// number) in its fuse stage for `--slow-run-seconds`. Other runs keep
+    /// their speed.
     #[arg(long, allow_hyphen_values = true)]
     slow_run: Option<String>,
     /// Minimum fuse running time, in whole seconds, of the run `--slow-run`
@@ -159,7 +159,7 @@ struct Args {
     #[arg(long, allow_hyphen_values = true)]
     slow_run_seconds: Option<String>,
     /// Holds every folder or project load for this many whole seconds before
-    /// it reads anything, so the "Loading…" indicator can be inspected.
+    /// it reads anything.
     #[arg(long, allow_hyphen_values = true)]
     slow_open: Option<String>,
 }
