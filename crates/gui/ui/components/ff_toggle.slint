@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A binary on/off switch.
+
+import { Theme } from "../theme.slint";
+
+export component FFToggle inherits Rectangle {
+    in property <bool> on: false;
+    in property <bool> disabled: false;
+    // The switch's accessible name: the row it sets.
+    in property <string> name: "";
+    // Sits on a tint as light as its own off track: draws the base surface.
+    in property <bool> recessed: false;
+    callback toggled();
+
+    width: 36px;
+    height: 20px;
+    border-radius: root.height / 2;
+    background: root.on ? Theme.accent-default : root.recessed ? Theme.surface-base : Theme.surface-overlay;
+    opacity: root.disabled ? 0.5 : 1.0;
+
+    knob := Rectangle {
+        width: 16px;
+        height: 16px;
+        y: 2px;
+        x: root.on ? parent.width - self.width - 2px : 2px;
+        border-radius: self.height / 2;
+        background: Theme.text-on-accent;
+        animate x { duration: Theme.motion-fast; easing: ease-out; }
+    }
+
+    area := TouchArea {
+        enabled: !root.disabled;
+        accessible-role: button;
+        accessible-label: root.name;
+        accessible-checkable: true;
+        accessible-checked: root.on;
+        accessible-enabled: !root.disabled;
+        clicked => { root.toggled(); }
+    }
+}

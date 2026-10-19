@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The overlay's left rail: the four file-level actions and the `Recent`
+// list -- the shell's only owner of file-level actions.
+
+import { Theme } from "../../theme.slint";
+
+// The plain twin of `crate::controller::RecentRow`.
+export struct RecentRowView {
+    name: string,
+    folder: string,
+    date-text: string,
+}
+
+component FFRailAction inherits Rectangle {
+    in property <image> glyph;
+    in property <string> label;
+    in property <string> shortcut;
+    in property <bool> enabled: true;
+    callback triggered();
+
+    height: 36px;
+    opacity: root.enabled ? 1.0 : 0.5;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+
+    TouchArea {
+        enabled: root.enabled;
+        width: 100%;
+        height: 100%;
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.glyph;
+        colorize: Theme.text-secondary;
+        x: 20px;
+        y: (parent.height - self.height) / 2;
+        width: Theme.icon-md;
+        height: Theme.icon-md;
+    }
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        x: 52px;
+        width: 170px;
+        height: 100%;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.shortcut;
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        x: 0px;
+        width: 280px;
+        height: 100%;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+    }
+}
+
+component FFRecentRow inherits Rectangle {
+    in property <RecentRowView> view;
+    callback triggered();
+
+    height: 46px;
+    accessible-role: button;
+    accessible-enabled: true;
+    accessible-label: root.view.name;
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.triggered(); }
+    }
+    Text {
+        text: root.view.name;
+        color: Theme.text-primary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        x: 20px;
+        y: 0px;
+        width: 190px;
+        height: 20px;
+        overflow: elide;
+    }
+    Text {
+        text: root.view.date-text;
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        x: 0px;
+        y: 0px;
+        width: 280px;
+        height: 20px;
+        horizontal-alignment: right;
+    }
+    Text {
+        text: root.view.folder;
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        x: 20px;
+        y: 22px;
+        width: 260px;
+        height: 18px;
+        overflow: elide;
+    }
+}
+
+export component FFProjectsRail inherits Rectangle {
+    in property <bool> save-enabled: false;
+    in property <[RecentRowView]> recent: [];
+    callback new-project-requested();
+    callback open-project-requested();
+    callback save-project-requested();
+    callback close-project-requested();
+    callback recent-clicked(int);
+
+    background: transparent;
+
+    new-project := FFRailAction {
+        x: 0px;
+        y: 20px;
+        width: parent.width;
+        glyph: @image-url("../../../../../assets/icons/plus.svg");
+        label: "New project";
+        shortcut: "Ctrl+N";
+        triggered => { root.new-project-requested(); }
+    }
+    open-project := FFRailAction {
+        x: 0px;
+        y: 56px;
+        width: parent.width;
+        glyph: @image-url("../../../../../assets/icons/folder-open.svg");
+        label: "Open project…";
+        shortcut: "Ctrl+O";
+        triggered => { root.open-project-requested(); }
+    }
+    save-project := FFRailAction {
+        x: 0px;
+        y: 92px;
+        width: parent.width;
+        glyph: @image-url("../../../../../assets/icons/save.svg");
+        label: "Save project";
+        shortcut: "Ctrl+S";
+        enabled: root.save-enabled;
+        triggered => { root.save-project-requested(); }
+    }
+    close-project := FFRailAction {
+        x: 0px;
+        y: 128px;
+        width: parent.width;
+        glyph: @image-url("../../../../../assets/icons/x.svg");
+        label: "Close project";
+        shortcut: "Ctrl+W";
+        triggered => { root.close-project-requested(); }
+    }
+
+    Rectangle {
+        x: 12px;
+        y: 176px;
+        width: parent.width - 24px;
+        height: 1px;
+        background: Theme.border-default;
+    }
+
+    Text {
+        text: "RECENT";
+        color: Theme.text-muted;
+        font-size: Theme.text-section.size;
+        font-weight: Theme.text-section.weight;
+        letter-spacing: Theme.text-section.letter-spacing;
+        x: 20px;
+        y: 192px;
+    }
+
+    for row[i] in root.recent: recent-row := FFRecentRow {
+        x: 0px;
+        y: 222px + i * 46px;
+        width: parent.width;
+        view: row;
+        triggered => { root.recent-clicked(i); }
+    }
+}

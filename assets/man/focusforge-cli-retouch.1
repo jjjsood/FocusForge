@@ -1,0 +1,36 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-retouch 1  "retouch 0.1.0" 
+.SH NAME
+focusforge\-cli\-retouch \- Append an op list to a project as new states, one per op, each the previous one\*(Aqs child: on the current head, or on `\-\-from` as a branch. `export \-\-checkpoint` writes any of them
+.SH SYNOPSIS
+\fBfocusforge\-cli retouch\fR [\fB\-\-from\fR] [\fB\-\-name\fR] [\fB\-\-json\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-ops\fR> <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Append an op list to a project as new states, one per op, each the previous one\*(Aqs child: on the current head, or on `\-\-from` as a branch. `export \-\-checkpoint` writes any of them
+.SH OPTIONS
+.TP
+\fB\-\-ops\fR \fI<FILE>\fR
+The op list: a JSON array of ops in the persisted `Op` shape. A brush stroke blends frame `source_id` over the image along its path: fully within `radius * (1 \- softness)`, fading linearly to nothing at `radius`. Every op is checked before anything is written; positions in error messages count from 0 in list order
+.TP
+\fB\-\-from\fR \fI<FROM>\fR
+The state to append under \-\- any unique prefix of its id. Defaults to the project\*(Aqs current head
+.TP
+\fB\-\-name\fR \fI<NAME>\fR
+Name the last appended state
+.TP
+\fB\-\-json\fR
+Emit the JSON report instead of human\-readable text
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to append to
+.SH VERSION
+v0.1.0

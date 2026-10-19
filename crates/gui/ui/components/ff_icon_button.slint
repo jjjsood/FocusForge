@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A glyph button: transparent at rest, `Theme.surface-hover` under the
+// pointer, one centred icon, `Theme.radius-sm` corners. Optionally a count
+// badge on its top-right corner and a place in the keyboard focus order.
+
+import { Theme } from "../theme.slint";
+
+export component FFIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <length> glyph-size: Theme.icon-md;
+    in property <length> pad: Theme.space-2;
+    in property <color> glyph-color: Theme.text-secondary;
+    // Half opacity and inert while false -- there is nothing this button can
+    // do.
+    in property <bool> enabled: true;
+    // Whether the pointer lifts the glyph to `Theme.text-primary` -- off for
+    // a glyph that must read the same colour at rest and under the pointer.
+    in property <bool> recolor-on-hover: true;
+    // The bar form: `Theme.surface-overlay` at rest while enabled; disabled
+    // it drops the fill and draws the glyph in `Theme.text-disabled` at full
+    // opacity.
+    in property <bool> filled: false;
+    // An armed toggle: accent fill, glyph in `Theme.text-on-accent`.
+    in property <bool> selected: false;
+    // The accessible name; an icon carries no text of its own.
+    in property <string> name: "";
+    // A count disc on the top-right corner, hidden at 0. While it shows, the
+    // glyph rests in `Theme.text-primary`.
+    in property <int> badge: 0;
+    // A dismiss control: the glyph rests in `Theme.text-muted`.
+    in property <bool> quiet: false;
+    // Takes keyboard focus (a 1 px accent ring); Return and Space trigger.
+    in property <bool> focusable: false;
+    // Drawn focused without the keyboard being there, as `FFField`'s own
+    // `focused` is.
+    in property <bool> focused: false;
+    out property <bool> has-focus: key.has-focus;
+    out property <bool> has-hover: area.has-hover;
+    callback triggered();
+
+    forward-focus: key;
+    width: root.glyph-size + 2 * root.pad;
+    height: self.width;
+    background: root.selected ? Theme.accent-default
+        : root.enabled && area.has-hover ? Theme.surface-hover
+        : root.enabled && root.filled ? Theme.surface-overlay
+        : transparent;
+    border-radius: Theme.radius-sm;
+    opacity: root.enabled || root.filled ? 1.0 : 0.5;
+    accessible-role: button;
+    accessible-label: root.name;
+    accessible-enabled: root.enabled;
+    accessible-checked: root.selected;
+
+    key := FocusScope {
+        enabled: root.enabled && root.focusable;
+        focus-on-click: false;
+        KeyBinding {
+            keys: @keys(Return);
+            activated => { root.triggered(); }
+        }
+        KeyBinding {
+            keys: @keys(Space);
+            activated => { root.triggered(); }
+        }
+    }
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.icon;
+        colorize: root.selected ? Theme.text-on-accent
+            : !root.enabled && root.filled ? Theme.text-disabled
+            : root.recolor-on-hover && area.has-hover && root.enabled ? Theme.text-primary
+            : root.badge > 0 ? Theme.text-primary
+            : root.quiet ? Theme.text-muted
+            : root.glyph-color;
+        width: root.glyph-size;
+        height: root.glyph-size;
+    }
+    if root.focused || key.has-focus: ring := Rectangle {
+        width: 100%;
+        height: 100%;
+        border-width: 1px;
+        border-color: Theme.accent-default;
+        border-radius: Theme.radius-sm;
+    }
+    if root.badge > 0: Rectangle {
+        x: parent.width - 14px;
+        y: -5px;
+        width: max(18px, count.preferred-width + 2 * Theme.space-1);
+        height: 18px;
+        border-radius: Theme.radius-full;
+        background: Theme.accent-default;
+
+        count := Text {
+            width: 100%;
+            height: 100%;
+            text: root.badge;
+            color: Theme.text-on-accent;
+            font-size: Theme.text-section.size;
+            font-weight: Theme.text-section.weight;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

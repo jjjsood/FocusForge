@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Pre-commit hook: the static gate set. Enable with
+# `git config core.hooksPath .githooks`.
+#
+# Only --static: the checks here read files and never build, so a commit costs
+# seconds. The full set (builds, clippy, tests, rustdoc) is tools/check-all.sh
+# with no flag, and belongs at the end of a piece of work rather than in front
+# of every commit.
+set -euo pipefail
+REPO="$(git rev-parse --show-toplevel)"
+exec "$REPO/tools/check-all.sh" --static

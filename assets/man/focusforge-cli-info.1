@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-info 1  "info 0.1.0" 
+.SH NAME
+focusforge\-cli\-info \- Print project, TIFF or RAW metadata for a file, or for every frame in a directory
+.SH SYNOPSIS
+\fBfocusforge\-cli info\fR [\fB\-\-json\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATH\fR> 
+.SH DESCRIPTION
+Print project, TIFF or RAW metadata for a file, or for every frame in a directory
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Emit the JSON document instead of human\-readable text
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPATH\fR>
+Path to a file or directory
+.SH VERSION
+v0.1.0

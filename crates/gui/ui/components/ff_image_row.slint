@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFIconButton } from "ff_icon_button.slint";
+import { FFTooltip } from "ff_tooltip.slint";
+
+export component FFImageRow inherits Rectangle {
+    in property <color> chip;
+    in property <string> name;
+    in property <string> time-text;
+    in property <string> capture-stamp;
+    in property <string> presentation: "list";
+    in property <image> preview;
+    in property <string> preview-state: "ready";
+    in property <bool> excluded: false;
+    in property <bool> unresolved: false;
+    in property <bool> job-disabled: false;
+    in property <bool> dragging: false;
+    in property <bool> selected: false;
+    in property <bool> hovered: false;
+    in property <bool> focused: false;
+    in property <bool> mutable: true;
+    in property <length> tooltip-max-width: ShellGeometry.tooltip-width;
+    in property <bool> floating: false;
+    in property <bool> legend: false;
+
+    callback exclude-toggled();
+    callback remove-requested();
+    callback clicked();
+    // The compact filename surface forwards a drag stream; ordinary clicks
+    // continue selecting the row through `clicked`.
+    callback drag-pointer(int, length);
+    callback wheel(length);
+
+    property <bool> is-list: root.presentation == "list" || root.legend;
+    property <bool> is-image-list: root.presentation == "image-list" && !root.legend;
+    property <bool> is-large: root.presentation == "large" && !root.legend;
+    property <bool> interactive: !root.unresolved && (root.mutable || root.legend);
+    property <bool> drag-pressed: false;
+    timestamp-measure := Text {
+        visible: false;
+        text: root.time-text == "" ? "—" : root.time-text;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+    }
+    property <length> timestamp-width: max(timestamp-measure.preferred-width, root.list-action-width);
+    property <bool> show-controls: root.mutable && !root.job-disabled && root.interactive && !root.dragging && (root.hovered || area.has-hover);
+    property <length> list-action-width: 2 * Theme.icon-sm + ShellGeometry.image-row-action-gap;
+    property <color> label-color: root.unresolved || root.job-disabled ? Theme.text-disabled
+        : root.excluded ? Theme.text-muted : Theme.text-primary;
+    property <color> time-color: root.unresolved || root.job-disabled ? Theme.text-disabled : Theme.text-muted;
+    property <length> row-height: root.is-image-list ? ShellGeometry.image-list-row-height
+        : root.is-large ? ShellGeometry.large-preview-row-height : ShellGeometry.image-row-height;
+
+    height: root.row-height;
+    opacity: root.floating ? 0.75 : 1.0;
+    drop-shadow-color: root.floating ? Theme.surface-canvas.with-alpha(0.5) : transparent;
+    drop-shadow-offset-y: Theme.space-1;
+    drop-shadow-blur: Theme.space-2;
+    background: root.dragging || (root.interactive && area.has-hover) ? Theme.surface-hover
+        : root.selected ? root.chip.with-alpha(0.3) : transparent;
+
+    if root.unresolved: TouchArea {
+        width: 100%;
+        height: 100%;
+        scroll-event(event) => {
+            root.wheel(event.delta-y);
+            accept
+        }
+    }
+
+    // Keep the row input surface in the ancestor chain for visual content and
+    // actions, so moving between them preserves its hover state.
+    area := TouchArea {
+        enabled: root.interactive;
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if root.mutable && !root.job-disabled {
+                if event.kind == PointerEventKind.down
+                    && ((root.is-list
+                            && self.mouse-x >= ShellGeometry.image-row-content-inset
+                                + ShellGeometry.image-chip-size + Theme.space-2
+                            && self.mouse-x < parent.width - ShellGeometry.image-row-content-inset
+                                - root.timestamp-width - Theme.space-2)
+                        || (root.is-image-list
+                            && ((self.mouse-x >= ShellGeometry.image-preview-inset
+                                    && self.mouse-x < ShellGeometry.image-preview-inset
+                                        + ShellGeometry.image-list-preview-width
+                                    && self.mouse-y >= (parent.height
+                                        - ShellGeometry.image-list-preview-height) / 2
+                                    && self.mouse-y < (parent.height
+                                        + ShellGeometry.image-list-preview-height) / 2)
+                                || (self.mouse-x >= ShellGeometry.image-list-details-x
+                                    && self.mouse-y >= ShellGeometry.image-list-name-y
+                                    && self.mouse-y < ShellGeometry.image-list-name-y
+                                        + ShellGeometry.image-list-name-height)))
+                        || (root.is-large
+                            && ((self.mouse-x >= (parent.width
+                                    - ShellGeometry.large-preview-width) / 2
+                                    && self.mouse-x < (parent.width
+                                        + ShellGeometry.large-preview-width) / 2
+                                    && self.mouse-y >= ShellGeometry.large-preview-y
+                                    && self.mouse-y < ShellGeometry.large-preview-y
+                                        + ShellGeometry.large-preview-height)
+                                || (self.mouse-x >= ShellGeometry.image-preview-inset
+                                        + ShellGeometry.image-chip-size + Theme.space-2
+                                    && self.mouse-x < parent.width - 2 * ShellGeometry.image-preview-inset
+                                        - root.timestamp-width - Theme.space-2
+                                    && self.mouse-y >= ShellGeometry.large-preview-y
+                                        + ShellGeometry.large-preview-height)))) {
+                    root.drag-pressed = true;
+                    root.drag-pointer(0, self.mouse-y);
+                } else if root.drag-pressed {
+                    root.drag-pointer(event.kind == PointerEventKind.move ? 2 : 1, self.mouse-y);
+                    if event.kind != PointerEventKind.move { root.drag-pressed = false; }
+                }
+            }
+        }
+        moved => {
+            if root.mutable && !root.job-disabled && root.drag-pressed {
+                root.drag-pointer(2, self.mouse-y);
+            }
+        }
+        scroll-event(event) => {
+            root.wheel(event.delta-y);
+            accept
+        }
+
+    if root.dragging: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: ShellGeometry.image-row-marker-width;
+        height: 100%;
+        background: Theme.accent-default;
+    }
+    if !root.dragging && root.selected: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: ShellGeometry.image-row-marker-width;
+        height: 100%;
+        background: root.chip;
+    }
+    if root.focused: Rectangle {
+        width: 100%;
+        height: 100%;
+        border-width: 1px;
+        border-color: Theme.accent-default;
+    }
+
+    if root.is-list: list-content := HorizontalLayout {
+        x: ShellGeometry.image-row-content-inset;
+        width: parent.width - ShellGeometry.image-row-content-inset - ShellGeometry.image-row-action-inset;
+        height: 100%;
+        spacing: Theme.space-2;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: ShellGeometry.image-chip-size;
+                height: ShellGeometry.image-chip-size;
+                border-radius: Theme.radius-sm;
+                background: root.chip;
+                opacity: root.excluded || root.unresolved ? 0.4 : 1.0;
+            }
+        }
+        list-name-slot := Rectangle {
+            horizontal-stretch: 1;
+            property <bool> show-tooltip: !root.dragging && root.name != ""
+                && list-name.preferred-width > list-name.width;
+            list-name := Text {
+                width: 100%;
+                height: 100%;
+                text: root.name;
+                color: root.label-color;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if self.show-tooltip: Tooltip {
+                FFTooltip { text: root.name; tooltip-max-width: root.tooltip-max-width; }
+            }
+        }
+        list-timestamp-slot := Rectangle {
+            width: root.timestamp-width;
+            height: 100%;
+            list-time := Text {
+                width: 100%;
+                height: 100%;
+                text: root.time-text == "" ? "—" : root.time-text;
+                color: root.time-color;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                overflow: elide;
+                opacity: root.show-controls ? 0 : 1;
+            }
+        }
+    }
+
+    if root.is-image-list: image-list-details := Rectangle {
+        x: ShellGeometry.image-preview-inset;
+        y: (parent.height - ShellGeometry.image-list-preview-height) / 2;
+        width: ShellGeometry.image-list-preview-width;
+        height: ShellGeometry.image-list-preview-height;
+        background: Theme.surface-canvas;
+
+        if root.preview-state == "ready": Image {
+            width: 100%;
+            height: 100%;
+            source: root.preview;
+            image-fit: contain;
+        }
+        if root.preview-state != "ready": Text {
+            width: 100%;
+            height: 100%;
+            text: root.preview-state == "loading" ? "Loading…"
+                : root.preview-state == "missing" ? "Source missing" : "Preview unavailable";
+            color: root.preview-state == "missing" ? Theme.text-muted : Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+        if root.excluded: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: Theme.surface-canvas.with-alpha(0.45);
+        }
+    }
+    if root.is-image-list: Rectangle {
+        x: ShellGeometry.image-list-details-x;
+        width: ShellGeometry.image-list-details-width;
+        height: 100%;
+        image-list-name-slot := Rectangle {
+            y: ShellGeometry.image-list-name-y;
+            width: 100%;
+            height: ShellGeometry.image-list-name-height;
+            property <bool> show-tooltip: !root.dragging && root.name != ""
+                && image-list-name.preferred-width > image-list-name.width;
+            image-list-name := Text {
+                width: 100%;
+                height: 100%;
+                text: root.name;
+                color: root.label-color;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if self.show-tooltip: Tooltip {
+                FFTooltip { text: root.name; tooltip-max-width: root.tooltip-max-width; }
+            }
+        }
+        Text {
+            y: parent.height - ShellGeometry.image-preview-inset - ShellGeometry.image-list-time-height;
+            width: 100%;
+            height: ShellGeometry.image-list-time-height;
+            text: root.capture-stamp == "" ? "—" : root.capture-stamp;
+            color: root.time-color;
+            font-size: Theme.text-body.size;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            overflow: elide;
+            opacity: root.show-controls ? 0 : 1;
+        }
+        Rectangle {
+            y: ShellGeometry.image-preview-inset;
+            width: 100%;
+            height: ShellGeometry.image-list-color-height;
+            border-radius: Theme.radius-sm;
+            background: root.chip;
+            opacity: root.excluded || root.unresolved ? 0.4 : 1.0;
+        }
+    }
+
+    if root.is-large: large-identity := Rectangle {
+        x: (parent.width - ShellGeometry.large-preview-width) / 2;
+        y: ShellGeometry.large-preview-y;
+        width: ShellGeometry.large-preview-width;
+        height: ShellGeometry.large-preview-height;
+        background: Theme.surface-canvas;
+
+        if root.preview-state == "ready": Image {
+            width: 100%;
+            height: 100%;
+            source: root.preview;
+            image-fit: contain;
+        }
+        if root.preview-state != "ready": Text {
+            width: 100%;
+            height: 100%;
+            text: root.preview-state == "loading" ? "Loading preview…"
+                : root.preview-state == "missing" ? "Source missing" : "Preview unavailable";
+            color: root.preview-state == "missing" ? Theme.text-muted : Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+        if root.excluded: Rectangle {
+            width: 100%;
+            height: 100%;
+            background: Theme.surface-canvas.with-alpha(0.45);
+        }
+    }
+    if root.is-large: Rectangle {
+        x: ShellGeometry.image-preview-inset;
+        y: ShellGeometry.large-preview-y + ShellGeometry.large-preview-height;
+        width: parent.width - 2 * ShellGeometry.image-preview-inset;
+        height: parent.height - self.y;
+        Rectangle {
+            x: 0px;
+            y: (parent.height - ShellGeometry.image-chip-size) / 2;
+            width: ShellGeometry.image-chip-size;
+            height: ShellGeometry.image-chip-size;
+            border-radius: Theme.radius-sm;
+            background: root.chip;
+            opacity: root.excluded || root.unresolved ? 0.4 : 1.0;
+        }
+        large-timestamp-slot := Rectangle {
+            width: root.timestamp-width;
+            height: 100%;
+            x: parent.width - ShellGeometry.image-preview-inset - self.width;
+            large-time := Text {
+                width: 100%;
+                height: 100%;
+                text: root.time-text == "" ? "—" : root.time-text;
+                color: root.time-color;
+                font-size: Theme.text-body.size;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                opacity: root.show-controls ? 0 : 1;
+            }
+        }
+        large-name-slot := Rectangle {
+            x: ShellGeometry.image-chip-size + Theme.space-2;
+            width: large-timestamp-slot.x - self.x - Theme.space-2;
+            height: 100%;
+            property <bool> show-tooltip: !root.dragging && root.name != ""
+                && large-name.preferred-width > large-name.width;
+            large-name := Text {
+                width: 100%;
+                height: 100%;
+                text: root.name;
+                color: root.label-color;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if self.show-tooltip: Tooltip {
+                FFTooltip { text: root.name; tooltip-max-width: root.tooltip-max-width; }
+            }
+        }
+    }
+
+        // Actions remain within the row input surface.
+        if root.show-controls && root.is-list: HorizontalLayout {
+            x: parent.width - root.list-action-width - ShellGeometry.image-row-action-inset;
+            y: (parent.height - Theme.icon-sm) / 2;
+            width: root.list-action-width;
+            height: Theme.icon-sm;
+            spacing: ShellGeometry.image-row-action-gap;
+
+            list-exclude-button := FFIconButton {
+                name: root.excluded ? "Include" : "Exclude";
+                glyph-size: Theme.icon-sm;
+                pad: ShellGeometry.image-row-action-pad;
+                icon: root.excluded ? @image-url("../../../../assets/icons/eye-off.svg") : @image-url("../../../../assets/icons/eye.svg");
+                triggered => { root.exclude-toggled(); }
+            }
+            list-remove-button := FFIconButton {
+                name: "Remove";
+                glyph-size: Theme.icon-sm;
+                pad: ShellGeometry.image-row-action-pad;
+                icon: @image-url("../../../../assets/icons/trash.svg");
+                glyph-color: Theme.status-failure;
+                recolor-on-hover: false;
+                triggered => { root.remove-requested(); }
+            }
+        }
+
+        if root.show-controls && root.is-image-list: HorizontalLayout {
+            x: parent.width - root.list-action-width - ShellGeometry.image-row-action-inset;
+            y: parent.height - ShellGeometry.image-preview-inset - ShellGeometry.image-list-time-height
+                + (ShellGeometry.image-list-time-height - Theme.icon-sm) / 2;
+            width: root.list-action-width;
+            height: Theme.icon-sm;
+            spacing: ShellGeometry.image-row-action-gap;
+
+            image-list-exclude-button := FFIconButton {
+                name: root.excluded ? "Include" : "Exclude";
+                glyph-size: Theme.icon-sm;
+                pad: ShellGeometry.image-row-action-pad;
+                icon: root.excluded ? @image-url("../../../../assets/icons/eye-off.svg") : @image-url("../../../../assets/icons/eye.svg");
+                triggered => { root.exclude-toggled(); }
+            }
+            image-list-remove-button := FFIconButton {
+                name: "Remove";
+                glyph-size: Theme.icon-sm;
+                pad: ShellGeometry.image-row-action-pad;
+                icon: @image-url("../../../../assets/icons/trash.svg");
+                glyph-color: Theme.status-failure;
+                recolor-on-hover: false;
+                triggered => { root.remove-requested(); }
+            }
+        }
+
+        if root.show-controls && root.is-large: HorizontalLayout {
+            x: parent.width - root.list-action-width - ShellGeometry.image-row-action-inset;
+            y: ShellGeometry.large-preview-y + ShellGeometry.large-preview-height
+                + (parent.height - ShellGeometry.large-preview-y - ShellGeometry.large-preview-height - Theme.icon-sm) / 2;
+            width: root.list-action-width;
+            height: Theme.icon-sm;
+            spacing: ShellGeometry.image-row-action-gap;
+
+            large-exclude-button := FFIconButton {
+                name: root.excluded ? "Include" : "Exclude";
+                glyph-size: Theme.icon-sm;
+                pad: ShellGeometry.image-row-action-pad;
+                icon: root.excluded ? @image-url("../../../../assets/icons/eye-off.svg") : @image-url("../../../../assets/icons/eye.svg");
+                triggered => { root.exclude-toggled(); }
+            }
+            large-remove-button := FFIconButton {
+                name: "Remove";
+                glyph-size: Theme.icon-sm;
+                pad: ShellGeometry.image-row-action-pad;
+                icon: @image-url("../../../../assets/icons/trash.svg");
+                glyph-color: Theme.status-failure;
+                recolor-on-hover: false;
+                triggered => { root.remove-requested(); }
+            }
+        }
+    }
+
+}

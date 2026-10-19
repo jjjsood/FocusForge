@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFTooltip inherits Rectangle {
+    in property <string> text: "";
+    in property <length> tooltip-max-width: ShellGeometry.tooltip-width;
+
+    property <length> available-content-width: max(1px, root.tooltip-max-width - 2 * Theme.space-2);
+    property <length> balanced-content-width: content.preferred-width > self.available-content-width
+        ? content.preferred-width / ceil(content.preferred-width / self.available-content-width)
+        : content.preferred-width;
+
+    width: min(root.tooltip-max-width, self.balanced-content-width + 2 * Theme.space-2);
+    height: content.preferred-height + 2 * Theme.space-2;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+
+    content := Text {
+        x: Theme.space-2;
+        y: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        text: root.text;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        wrap: word-wrap;
+    }
+}

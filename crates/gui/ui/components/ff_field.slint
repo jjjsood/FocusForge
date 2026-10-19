@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A boxed text/value display, used standalone and nested inside
+// `FFSlider`'s readout and `FFMenu`'s closed row.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFField inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> hovered: false;
+    in property <bool> focused: false;
+    in property <bool> disabled: false;
+    in property <bool> invalid: false;
+    // Sits on a tint as light as its own fill: draws the base surface.
+    in property <bool> recessed: false;
+    in property <TextHorizontalAlignment> text-alignment: left;
+
+    height: ShellGeometry.field-height;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: root.invalid ? Theme.status-failure : root.focused ? Theme.accent-default : Theme.border-default;
+    background: root.hovered ? Theme.surface-hover : root.recessed ? Theme.surface-base : Theme.surface-overlay;
+    opacity: root.disabled ? 0.5 : 1.0;
+
+    Text {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: 100%;
+        text: root.text;
+        color: Theme.text-primary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        horizontal-alignment: root.text-alignment;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}

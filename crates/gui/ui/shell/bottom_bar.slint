@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The bottom bar: the only band that spans the dock. Holds the status line,
+// the run's progress, the overlay controls and the zoom cluster.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFZoomCluster } from "bottom_bar/zoom_cluster.slint";
+import { FFProgressBar } from "../components/ff_progress_bar.slint";
+import { FFToggle } from "../components/ff_toggle.slint";
+import { FFSlider } from "../components/ff_slider.slint";
+import { FFRowText } from "../components/ff_row_text.slint";
+
+export component FFBottomBar inherits Rectangle {
+    in property <string> zoom-readout: "";
+    in property <bool> project-loaded: false;
+    callback zoom-in-requested();
+    callback zoom-out-requested();
+    callback zoom-fit-requested();
+
+    // The run's own words, empty when there is none to report -- an empty
+    // `stage-word` falls back to "No job running" below rather than a blank
+    // slot, so an open project with nothing running still reads as such.
+    in property <string> stage-word: "";
+    in property <string> step-text: "";
+    // 0.0..1.0 of the whole job -- passed straight to `FFProgressBar`.
+    in property <float> bar-fraction: 0.0;
+    // "running" | "held" | "failed" -- `FFProgressBar`'s own tone vocabulary.
+    in property <string> bar-tone: "running";
+    in property <string> eta-text: "";
+
+    // The overlay controls, shown in both modes; the toggle and slider are
+    // greyed and inert while the active tab has no finished fuse.
+    in property <bool> overlay-available: false;
+    in property <bool> overlay-on: false;
+    in property <float> overlay-fraction: 0.0;
+    in property <string> overlay-text: "";
+    callback overlay-toggled(bool);
+    callback overlay-fraction-changed(float);
+
+    height: ShellGeometry.bottom-bar-height;
+    background: Theme.surface-raised;
+
+    // The status line, centred on the bar. Without a project it reads `No
+    // project open` in `text.disabled`; with one open and nothing to report
+    // it reads `No job running`; otherwise it is the run's own stage word,
+    // bold, in the failure colour once the run has failed.
+    status-text := Text {
+        x: Theme.space-4 + Theme.space-1;
+        y: 0px;
+        height: parent.height;
+        text: !root.project-loaded ? "No project open"
+            : root.stage-word == "" ? "No job running" : root.stage-word;
+        color: !root.project-loaded ? Theme.text-disabled
+            : root.bar-tone == "failed" ? Theme.status-failure : Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: root.project-loaded ? Theme.text-title.weight : Theme.text-body.weight;
+        vertical-alignment: center;
+    }
+
+    step-text := Text {
+        x: ShellGeometry.progress-step-x;
+        y: 0px;
+        height: parent.height;
+        visible: root.project-loaded && root.step-text != "";
+        text: root.step-text;
+        color: Theme.text-secondary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        vertical-alignment: center;
+    }
+
+    // Stretches with the window so its right edge stays `Theme.space-4`
+    // before the ETA at every width, never a fixed literal.
+    progress-bar := FFProgressBar {
+        x: ShellGeometry.progress-bar-x;
+        y: (parent.height - self.height) / 2;
+        width: eta-text.x - Theme.space-4 - ShellGeometry.progress-bar-x;
+        visible: root.project-loaded;
+        fraction: root.bar-fraction;
+        tone: root.bar-tone;
+    }
+
+    eta-text := Text {
+        x: overlay-caption.x - Theme.space-4 - ShellGeometry.eta-width;
+        y: 0px;
+        width: ShellGeometry.eta-width;
+        height: parent.height;
+        visible: root.project-loaded && root.eta-text != "";
+        text: root.eta-text;
+        overflow: elide;
+        color: Theme.text-secondary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        vertical-alignment: center;
+    }
+
+    // The 1 px rule along the bar's top edge, full window width.
+    top-rule := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+
+    overlay-caption := FFRowText {
+        x: parent.width - ShellGeometry.overlay-cluster-inset;
+        height: parent.height;
+        text: "Overlay";
+        muted: true;
+    }
+    overlay-toggle := FFToggle {
+        name: "Overlay";
+        x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-toggle-offset;
+        y: (parent.height - self.height) / 2;
+        on: root.overlay-on;
+        disabled: !root.overlay-available;
+        toggled => { root.overlay-toggled(!root.overlay-on); }
+    }
+    overlay-slider := FFSlider {
+        x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-track-offset;
+        y: (parent.height - self.height) / 2;
+        compact: true;
+        track-width: ShellGeometry.overlay-track-width;
+        disabled: !root.overlay-available || !root.overlay-on;
+        fraction: root.overlay-fraction;
+        value-text: root.overlay-text;
+        fraction-changed(f) => { root.overlay-fraction-changed(f); }
+    }
+    // A 1 x 20 divider separating the overlay cluster
+    // from the zoom cluster.
+    Rectangle {
+        x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-rule-offset;
+        y: (parent.height - self.height) / 2;
+        width: 1px;
+        height: 20px;
+        background: Theme.border-default;
+    }
+
+    zoom-cluster := FFZoomCluster {
+        x: parent.width - Theme.space-3 - 216px;
+        y: (parent.height - self.height) / 2;
+        readout: root.zoom-readout;
+        project-loaded: root.project-loaded;
+
+        zoom-in-requested => { root.zoom-in-requested(); }
+        zoom-out-requested => { root.zoom-out-requested(); }
+        zoom-fit-requested => { root.zoom-fit-requested(); }
+    }
+}

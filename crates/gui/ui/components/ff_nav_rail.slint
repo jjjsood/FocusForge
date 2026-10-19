@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A vertical rail of entries closed on its right edge by a 1 px rule: the
+// settings rail's selectable entries over the base ground, or with
+// `end-aligned` a bar of icon buttons stacked up from its bottom edge.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFNavRail inherits Rectangle {
+    // Height of a header drawn over the rail's top: the right rule and the
+    // first entry start below it.
+    in property <length> header-inset: 0px;
+    // Entries stack up from the bottom edge, inset and spaced by
+    // `Theme.space-2`, instead of down from the top.
+    in property <bool> end-aligned: false;
+    // `Theme.surface-raised` ground instead of `Theme.surface-base`.
+    in property <bool> raised: false;
+
+    width: ShellGeometry.settings-rail-width;
+    background: root.raised ? Theme.surface-raised : Theme.surface-base;
+
+    VerticalLayout {
+        padding-top: root.end-aligned ? 0px : root.header-inset + ShellGeometry.settings-rail-top-inset;
+        padding-bottom: root.end-aligned ? Theme.space-2 : 0px;
+        padding-left: root.end-aligned ? Theme.space-2 : 0px;
+        spacing: root.end-aligned ? Theme.space-2 : 0px;
+        alignment: root.end-aligned ? end : start;
+
+        @children
+    }
+
+    Rectangle {
+        x: parent.width - self.width;
+        y: root.header-inset;
+        width: 1px;
+        height: parent.height - root.header-inset;
+        background: Theme.border-default;
+    }
+}

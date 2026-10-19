@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The diagnostics section's content: the file list, the minidump choice
+// and its warning, the destination, and the write result -- every row
+// present in every state, only its text, colour and opacity changing, so
+// the footer sits at one position throughout.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFManifestList, FFManifestRow } from "../../components/ff_manifest_list.slint";
+import { FFToggle } from "../../components/ff_toggle.slint";
+import { FFTextField } from "../../components/ff_text_field.slint";
+import { FFProgressBar } from "../../components/ff_progress_bar.slint";
+import { FFButton } from "../../components/ff_button.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFSettingsRow } from "../../components/ff_settings_row.slint";
+import { FFRowLabel } from "../../components/ff_row_label.slint";
+import { FFStatusText } from "../../components/ff_status_text.slint";
+import { FFDivider } from "../../components/ff_divider.slint";
+
+export { FFManifestRow }
+
+export component FFDiagnosticsPanel inherits Rectangle {
+    in property <[FFManifestRow]> rows: [];
+    in property <string> note: "";
+    in property <bool> include-minidumps: false;
+    in property <string> destination: "";
+    // "idle" | "existing-file" | "writing" | "written" | "failed"
+    in property <string> status: "idle";
+    in property <string> message: "";
+    in property <string> primary-label: "Create bundle";
+    in property <bool> busy: false;
+    in property <bool> loading: false;
+    in property <length> manifest-scroll-offset: 0px;
+    in property <length> manifest-content-height: 0px;
+    in property <length> destination-scroll-offset: 0px;
+
+    callback minidumps-toggled(bool);
+    callback destination-edited(string);
+    callback destination-cursor-moved(length, length);
+    callback primary-clicked();
+    callback manifest-scrollbar-pointer(int, length);
+    callback manifest-scrollbar-dragged(length);
+    callback manifest-viewport-height-changed(length);
+    callback manifest-scrolled(length);
+
+    property <bool> is-writing: root.status == "writing";
+    property <string> message-tone: root.status == "written"
+        ? "success"
+        : root.status == "failed" ? "failure" : "warning";
+    property <string> field-tone: (root.status == "existing-file" || root.status == "failed")
+        ? "warning"
+        : "neutral";
+
+    VerticalLayout {
+        VerticalLayout {
+            padding-left: ShellGeometry.settings-content-inset-left;
+            padding-right: ShellGeometry.settings-content-inset-right;
+            padding-top: ShellGeometry.settings-content-inset-top;
+            spacing: Theme.space-3;
+            alignment: start;
+            vertical-stretch: 1;
+
+            FFSettingsSection {
+                heading: "DIAGNOSTICS";
+                spacing: Theme.space-1;
+
+                FFManifestList {
+                    rows: root.rows;
+                    note: root.note;
+                    content-height: root.manifest-content-height;
+                    scroll-offset: root.manifest-scroll-offset;
+                    pointer(kind, y) => { root.manifest-scrollbar-pointer(kind, y); }
+                    dragged(y) => { root.manifest-scrollbar-dragged(y); }
+                    viewport-height-changed(h) => { root.manifest-viewport-height-changed(h); }
+                    scrolled(delta) => { root.manifest-scrolled(delta); }
+                }
+
+                FFSettingsRow {
+                    label: "Include minidumps";
+                    align-end: true;
+                    divider: false;
+
+                    FFToggle {
+                        name: "Include minidumps";
+                        on: root.include-minidumps;
+                        disabled: root.busy;
+                        toggled => { root.minidumps-toggled(!root.include-minidumps); }
+                    }
+                }
+
+                FFStatusText {
+                    text: "Not redacted — binary memory contents. Marked in the list above.";
+                    tone: "warning";
+                    wrap: word-wrap;
+                    opacity: root.include-minidumps ? 1.0 : 0.0;
+                }
+            }
+
+            FFDivider { }
+
+            FFRowLabel {
+                label-text: "Save to";
+
+                // The field grows by 2 px on every edge when emphasised; its
+                // slot keeps the unemphasised height.
+                Rectangle {
+                    height: ShellGeometry.field-height;
+
+                    dest-field := FFTextField {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        text: root.destination;
+                        enabled: !root.busy;
+                        tone: root.field-tone;
+                        field-width: parent.width;
+                        scroll-offset: root.destination-scroll-offset;
+                        edited(text) => { root.destination-edited(text); }
+                        cursor-moved(x, w) => { root.destination-cursor-moved(x, w); }
+                    }
+                }
+            }
+
+            status-slot := Rectangle {
+                height: ShellGeometry.settings-status-height;
+
+                message := FFStatusText {
+                    width: parent.width;
+                    height: parent.height;
+                    text: root.message;
+                    tone: root.message-tone;
+                    overflow: elide;
+                    opacity: root.is-writing ? 0.0 : 1.0;
+                }
+                FFProgressBar {
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width;
+                    indeterminate: root.is-writing;
+                    opacity: root.is-writing ? 1.0 : 0.0;
+                }
+            }
+        }
+
+        FFDivider { }
+
+        footer := HorizontalLayout {
+            padding-right: ShellGeometry.settings-content-inset-right;
+            padding-top: Theme.space-3;
+            padding-bottom: Theme.space-6;
+            alignment: end;
+
+            bundle-primary := FFButton {
+                kind: "primary";
+                compact: true;
+                has-icon: true;
+                icon-source: @image-url("../../../../../assets/icons/download.svg");
+                text: root.primary-label;
+                enabled: !root.busy && !root.loading;
+                clicked => { root.primary-clicked(); }
+            }
+        }
+    }
+}

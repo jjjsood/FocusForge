@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The dock's images/settings tab row. Content behind each tab lives
+// elsewhere, not here.
+
+import { Theme } from "../../theme.slint";
+
+export component FFDockTabs inherits Rectangle {
+    callback tab-selected(string);
+    in property <string> active: "images";
+
+    height: 28px;
+
+    HorizontalLayout {
+        images-tab := Rectangle {
+            background: root.active == "images" ? Theme.surface-hover : transparent;
+            border-radius: Theme.radius-sm;
+            Text {
+                text: "Images";
+                horizontal-alignment: center;
+                color: Theme.text-primary;
+            }
+            TouchArea {
+                clicked => { root.tab-selected("images"); }
+            }
+        }
+        settings-tab := Rectangle {
+            background: root.active == "settings" ? Theme.surface-hover : transparent;
+            border-radius: Theme.radius-sm;
+            Text {
+                text: "Settings";
+                horizontal-alignment: center;
+                color: Theme.text-primary;
+            }
+            TouchArea {
+                clicked => { root.tab-selected("settings"); }
+            }
+        }
+    }
+}

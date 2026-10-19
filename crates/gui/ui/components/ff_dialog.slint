@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A modal dialog: a scrim, a card with an optional tone icon and title, an
+// optional context line, a body, an optional info line, and its own footer.
+
+import { Theme } from "../theme.slint";
+import { FFDialogFooter } from "ff_dialog_footer.slint";
+import { FFModalPanel } from "ff_modal_panel.slint";
+import { FFDivider } from "ff_divider.slint";
+
+export component FFDialog inherits FFModalPanel {
+    in property <bool> open: false;
+    // "warning" (a red top rule and triangle icon) | "caution" (an amber top
+    // rule and circle icon) | "save" (a save icon, no rule) | "plain".
+    in property <string> tone: "plain";
+    in property <string> title: "";
+    // Empty hides the context line under the title.
+    in property <string> context: "";
+    in property <string> body: "";
+    // Empty hides the info line.
+    in property <string> info: "";
+    // Whether a rule separates the body from the info line.
+    in property <bool> divider: true;
+    in property <string> cancel-label: "Cancel";
+    in property <string> secondary-label: "";
+    in property <string> confirm-label: "Confirm";
+    in property <string> confirm-kind: "primary";
+    callback cancelled();
+    callback secondary-pressed();
+    callback confirmed();
+
+    modal-open: root.open;
+    tone-rule: root.tone == "warning" ? "warning" : root.tone == "caution" ? "caution" : "none";
+
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+
+        // Everything above the footer, packed from the top and given
+        // the whole panel's leftover height -- however little of it
+        // the body actually uses, the footer below stays pinned to the
+        // panel's own bottom edge instead of floating wherever the
+        // content happens to end.
+        VerticalLayout {
+            spacing: Theme.space-3;
+            alignment: start;
+            vertical-stretch: 1;
+
+            HorizontalLayout {
+                spacing: Theme.space-2;
+
+                if root.tone == "warning": Image {
+                    source: @image-url("../../../../assets/icons/triangle-alert.svg");
+                    colorize: Theme.status-failure;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                if root.tone == "caution": Image {
+                    source: @image-url("../../../../assets/icons/circle-alert.svg");
+                    colorize: Theme.status-warning;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                if root.tone == "save": Image {
+                    source: @image-url("../../../../assets/icons/save.svg");
+                    colorize: Theme.text-secondary;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                Text {
+                    text: root.title;
+                    color: Theme.text-primary;
+                    font-size: Theme.text-title.size;
+                    font-weight: Theme.text-title.weight;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            VerticalLayout {
+                spacing: Theme.space-2;
+
+                if root.context != "": Text {
+                    text: root.context;
+                    color: Theme.text-muted;
+                    font-size: Theme.text-body.size;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.body;
+                    color: Theme.text-secondary;
+                    font-size: Theme.text-body.size;
+                    wrap: word-wrap;
+                }
+            }
+
+            if root.divider: FFDivider { }
+
+            if root.info != "": HorizontalLayout {
+                spacing: Theme.space-1;
+                Image {
+                    source: @image-url("../../../../assets/icons/info.svg");
+                    colorize: Theme.text-muted;
+                    width: Theme.icon-lg;
+                    height: Theme.icon-lg;
+                }
+                Text {
+                    text: root.info;
+                    color: Theme.text-muted;
+                    font-size: Theme.text-body.size;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        FFDialogFooter {
+            cancel-label: root.cancel-label;
+            secondary-label: root.secondary-label;
+            confirm-label: root.confirm-label;
+            confirm-kind: root.confirm-kind;
+            cancelled => { root.cancelled(); }
+            secondary-pressed => { root.secondary-pressed(); }
+            confirmed => { root.confirmed(); }
+        }
+    }
+}

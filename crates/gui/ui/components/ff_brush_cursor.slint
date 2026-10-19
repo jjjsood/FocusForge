@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The brush cursor: a dashed ring at the radius around a solid core, or,
+// while picking, the pipette icon beside a swatch of the colour it would pick.
+
+import { Theme } from "../theme.slint";
+
+export component FFBrushCursor inherits Rectangle {
+    // Side of the square the path commands are drawn in, in logical px; the
+    // cursor's centre is the centre of that square.
+    in property <length> extent;
+    // One sub-path per dash of the radius ring; empty for a hard brush.
+    in property <string> ring-commands;
+    in property <string> core-commands;
+    in property <bool> picking: false;
+    in property <color> pick-color;
+
+    property <color> ink: Theme.cursor-ink;
+
+    width: root.extent;
+    height: root.extent;
+
+    if !root.picking: Path {
+        width: root.extent;
+        height: root.extent;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: root.extent / 1px;
+        viewbox-height: root.extent / 1px;
+        commands: root.ring-commands;
+        stroke: root.ink.with-alpha(0.7);
+        stroke-width: 1px;
+    }
+    if !root.picking: Path {
+        width: root.extent;
+        height: root.extent;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: root.extent / 1px;
+        viewbox-height: root.extent / 1px;
+        commands: root.core-commands;
+        stroke: root.ink;
+        stroke-width: 1px;
+    }
+
+    if root.picking: Image {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: Theme.icon-lg;
+        height: Theme.icon-lg;
+        source: @image-url("../../../../assets/icons/pipette-cursor.svg");
+        colorize: root.ink;
+    }
+    // Swatch previewing the colour about to be picked up, offset to the
+    // icon's bottom-right corner so it reads as separate from the icon.
+    if root.picking: Rectangle {
+        width: 8px;
+        height: 8px;
+        x: (root.width - Theme.icon-lg) / 2 + Theme.icon-lg;
+        y: (root.height - Theme.icon-lg) / 2 + Theme.icon-lg - self.height;
+        background: root.pick-color;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: Theme.border-default;
+    }
+}

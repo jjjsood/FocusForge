@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFErrorRow inherits Rectangle {
+    in property <string> message: "";
+    in property <bool> show-icon: false;
+    in property <bool> wrap-message: false;
+    in property <TextHorizontalAlignment> horizontal-alignment: left;
+
+    height: root.wrap-message
+        ? max(ShellGeometry.param-error-height, message-text.preferred-height)
+        : ShellGeometry.param-error-height;
+    opacity: 0;
+    animate opacity { duration: Theme.motion-fast; easing: ease-out; }
+    init => { self.opacity = 1; }
+
+    if root.show-icon: Image {
+        x: 0px;
+        y: (parent.height - self.height) / 2;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+        source: @image-url("../../../../assets/icons/triangle-alert.svg");
+        colorize: Theme.status-failure;
+    }
+    message-text := Text {
+        x: root.show-icon ? Theme.icon-sm + Theme.space-2 : 0px;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - self.x;
+        text: root.message;
+        color: Theme.status-failure;
+        font-size: Theme.text-section.size;
+        horizontal-alignment: root.horizontal-alignment;
+        vertical-alignment: center;
+        wrap: root.wrap-message ? word-wrap : no-wrap;
+        overflow: root.wrap-message ? clip : elide;
+    }
+}

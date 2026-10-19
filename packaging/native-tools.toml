@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[macos]
+xcode = "16.2"
+
+[windows.wix]
+version = "4.0.5"
+url = "https://api.nuget.org/v3-flatcontainer/wix/4.0.5/wix.4.0.5.nupkg"
+sha256 = "df9bdb347183716f82efe2cecb8c54bb3554aa907a69f47a41741d6fa4d0a754"

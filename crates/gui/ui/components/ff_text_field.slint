@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A text field: `tone` colours the outline for the two states a caller
+// reports (warning, failure); otherwise it is the neutral border. Focus
+// grows the control by 2 px on every edge, like every focusable control.
+// Only height follows state; width is the caller's. `placeholder` is muted
+// text drawn only while the input itself is empty; typing replaces it.
+
+import { Theme } from "../theme.slint";
+
+export component FFTextField inherits Rectangle {
+    in property <string> text: "";
+    in property <string> placeholder: "";
+    in property <bool> enabled: true;
+    in property <string> tone: "neutral"; // "neutral" | "warning" | "failure"
+    in property <length> field-width: 110px;
+    // Pushed back by the caller in response to `cursor-moved`, so text
+    // longer than the field scrolls to keep the cursor visible instead of
+    // spilling past the border.
+    in property <length> scroll-offset: 0px;
+    callback edited(string);
+    // The cursor's new x position and the field's visible text width, both
+    // measured from the field's own unscrolled left edge.
+    callback cursor-moved(length, length);
+
+    property <bool> emphasised: input.has-focus || root.tone != "neutral";
+    property <color> outline: root.tone == "warning"
+        ? Theme.status-warning
+        : root.tone == "failure"
+            ? Theme.status-failure
+            : Theme.border-strong;
+    property <length> viewport-width: max(0px, root.width - 2 * Theme.space-2);
+
+    width: root.field-width + (root.emphasised ? 4px : 0px);
+    height: root.emphasised ? 32px : 28px;
+    forward-focus: input;
+    background: Theme.surface-raised;
+    border-radius: Theme.radius-sm;
+    border-width: root.emphasised ? 2px : 1px;
+    border-color: root.outline;
+    opacity: root.enabled ? 1.0 : 0.5;
+    clip: true;
+
+    if input.text == "" && root.placeholder != "": Text {
+        x: Theme.space-2;
+        width: root.viewport-width;
+        height: parent.height;
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    input := TextInput {
+        x: Theme.space-2 + root.scroll-offset;
+        width: max(root.viewport-width, self.preferred-width);
+        height: parent.height;
+        text: root.text;
+        enabled: root.enabled;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        vertical-alignment: center;
+        single-line: true;
+
+        edited => { root.edited(self.text); }
+        cursor-position-changed(position) => { root.cursor-moved(position.x, root.viewport-width); }
+    }
+}

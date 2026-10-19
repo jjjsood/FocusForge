@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="ff-app-icon-title">
+  <title id="ff-app-icon-title">FocusForge</title>
+
+  <!-- The desktop icon carries its own ground. Without it the dark anvil vanishes
+       on a dark taskbar or dock and only the hammer is left floating. The mark is
+       inset to 78 %, which is the padding a rounded icon tile needs to breathe. -->
+  <rect width="128" height="128" rx="28" fill="#23303B"/>
+  <g transform="translate(26.56 26.37) scale(0.78) translate(-16 -15.5)">
+    <g fill="#F2F4F6">
+      <rect x="16" y="58"  width="96" height="6"/>
+      <rect x="25" y="70"  width="78" height="6"/>
+      <rect x="34" y="82"  width="60" height="6"/>
+      <rect x="25" y="94"  width="78" height="6"/>
+      <rect x="16" y="106" width="96" height="6"/>
+    </g>
+    <g fill="#E8763A" transform="rotate(-21.801 50 35)">
+      <rect x="41" y="20" width="18" height="30"/>
+      <rect x="59" y="32" width="36" height="6"/>
+    </g>
+  </g>
+</svg>

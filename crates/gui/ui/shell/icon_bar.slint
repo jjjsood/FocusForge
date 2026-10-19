@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The left icon bar: the notification bell with its unread count above
+// Settings, stacked up from the window's bottom edge.
+
+import { ShellGeometry } from "../geometry.slint";
+import { FFIconButton } from "../components/ff_icon_button.slint";
+import { FFNavRail } from "../components/ff_nav_rail.slint";
+
+export component FFIconBar inherits Rectangle {
+    in property <int> unread: 0;
+    // The bell is filled while the center is open.
+    in property <bool> center-open: false;
+    callback bell-activated();
+    callback settings-requested();
+
+    public function focus-bell() {
+        bell.focus();
+    }
+
+    width: ShellGeometry.icon-bar-width;
+
+    FFNavRail {
+        width: 100%;
+        height: 100%;
+        end-aligned: true;
+        raised: true;
+
+        bell := FFIconButton {
+            icon: root.center-open ? @image-url("../../../../assets/icons/bell-filled.svg")
+                : @image-url("../../../../assets/icons/bell.svg");
+            focusable: true;
+            filled: root.center-open;
+            badge: root.unread;
+            accessible-label: "Notifications";
+            triggered => { root.bell-activated(); }
+        }
+        settings := FFIconButton {
+            icon: @image-url("../../../../assets/icons/settings.svg");
+            focusable: true;
+            accessible-label: "Settings";
+            triggered => { root.settings-requested(); }
+        }
+    }
+}

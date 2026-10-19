@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# `fuse_algorithms.rs` and `laplacian_fusion.rs` each write a shared, fixed
+# `.scratch/fuse/<label>.tif` path per fixture label (`tiff-diff.py` compares
+# that exact path by hand), so nextest -- where every test is its own
+# process -- must run these two binaries one at a time rather than racing to
+# write the same file.
+[test-groups]
+fuse-fixture-writers = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(focusforge-core::fuse_algorithms) + binary_id(focusforge-core::laplacian_fusion)'
+test-group = 'fuse-fixture-writers'
+
+# The GPU parity suite: one test at a time (they share one device), a SLOW
+# line every minute so a long test is told apart from a hung one, and a
+# per-test kill so a hang ends as a named TIMEOUT instead of a silent wait.
+# The forced one-tile and probed budget stacks alone run well over an hour.
+[profile.gpu]
+test-threads = 1
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[profile.gpu.junit]
+path = "junit.xml"
+
+[[profile.gpu.overrides]]
+filter = 'binary(harness) & test(/_budget$/)'
+slow-timeout = { period = "60s", terminate-after = 120 }
+
+# The fast workspace run `tools/check-all.sh --quick` uses: everything except
+# the binaries that measure memory peaks, the hit cap and the reference cache
+# over real stacks. Each of those runs for minutes and sets the wall time of
+# the whole suite on its own; the full gate still runs them.
+[profile.quick]
+default-filter = '''
+not (
+  binary_id(focusforge-core::hit_cap_behaviour)
+  | binary_id(focusforge-core::align_parallel_memory)
+  | binary_id(focusforge-core::align_reference_cache)
+  | binary_id(focusforge-core::tile_scheduler_memory)
+  | binary_id(focusforge-core::checkpoint_render_memory)
+)
+'''

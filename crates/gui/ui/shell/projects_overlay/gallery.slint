@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The overlay's main area: a heading and count line over a scrolling grid
+// of project cards.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFProjectCard } from "../../components/ff_project_card.slint";
+import { FFScrollbar } from "../../components/ff_scrollbar.slint";
+
+// The plain twin of `crate::overlay::CardView`: one gallery card, already
+// positioned on the grid.
+export struct ProjectCardView {
+    kind: string,
+    opened: bool,
+    current: bool,
+    unsaved: bool,
+    fusing: bool,
+    fusing-fraction: float,
+    project-name: string,
+    meta-text: string,
+    headline: string,
+    stage: string,
+    reason: string,
+    action-label: string,
+    has-picture: bool,
+    picture: image,
+    x: length,
+    y: length,
+}
+
+export component FFProjectsGallery inherits Rectangle {
+    in property <string> heading: "Open projects";
+    in property <string> count-text: "";
+    in property <[ProjectCardView]> cards: [];
+    in property <length> content-height: 0px;
+    in property <length> scroll-y: 0px;
+    callback card-clicked(int);
+    callback card-action-clicked(int);
+    callback card-close-clicked(int);
+    callback scrolled(length);
+    callback scrollbar-pointer(int, length);
+    callback scrollbar-dragged(length);
+    callback viewport-height-changed(length);
+    out property <length> viewport-width: viewport.width;
+    changed viewport-width => { root.viewport-width-changed(self.viewport-width); }
+    callback viewport-width-changed(length);
+
+    background: transparent;
+
+    HorizontalLayout {
+        x: 32px;
+        y: 16px;
+        width: parent.width - 64px;
+        height: 26px;
+
+        Text {
+            text: root.heading;
+            color: Theme.text-primary;
+            font-size: Theme.text-emphasis.size;
+            font-weight: Theme.text-emphasis.weight;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.count-text;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+
+    if root.cards.length == 0: Text {
+        text: "No projects open";
+        x: 32px;
+        y: 52px;
+        width: parent.width - 64px;
+        height: parent.height - 52px;
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    viewport := Rectangle {
+        x: 32px;
+        y: 52px;
+        width: parent.width - 32px - ShellGeometry.scrollbar-width - Theme.space-2 - 32px;
+        height: parent.height - 52px;
+        clip: true;
+        changed height => { root.viewport-height-changed(self.height); }
+
+        hit-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            scroll-event(event) => {
+                root.scrolled(-event.delta-y);
+                accept
+            }
+        }
+
+        // 2 px of slack on every side: `FFProjectCard`'s `current` ring
+        // paints 2 px outside the card's own box, and a card flush against
+        // this viewport's own clip -- the grid's first row and column
+        // always are -- would have that ring cut off with nowhere to go.
+        cards-layer := Rectangle {
+            x: 2px;
+            y: 2px - root.scroll-y;
+            width: parent.width - 4px;
+            height: root.content-height;
+
+            for card[i] in root.cards: FFProjectCard {
+                x: card.x;
+                y: card.y;
+                kind: card.kind;
+                opened: card.opened;
+                current: card.current;
+                unsaved: card.unsaved;
+                fusing: card.fusing;
+                fusing-fraction: card.fusing-fraction;
+                project-name: card.project-name;
+                meta-text: card.meta-text;
+                has-picture: card.has-picture;
+                picture: card.picture;
+                glyph: card.kind == "failed" ? @image-url("../../../../../assets/icons/triangle-alert.svg")
+                    : card.kind == "sources-missing" ? @image-url("../../../../../assets/icons/circle-alert.svg")
+                    : card.kind == "cancelled" ? @image-url("../../../../../assets/icons/x.svg")
+                    : @image-url("../../../../../assets/icons/folder.svg");
+                headline: card.headline;
+                stage: card.stage;
+                reason: card.reason;
+                action-label: card.action-label;
+                clicked => { root.card-clicked(i); }
+                action-clicked => { root.card-action-clicked(i); }
+                close-clicked => { root.card-close-clicked(i); }
+            }
+        }
+    }
+
+    FFScrollbar {
+        x: parent.width - ShellGeometry.scrollbar-width - Theme.space-2;
+        y: viewport.y;
+        height: viewport.height;
+        content-height: root.content-height;
+        viewport-height: viewport.height;
+        offset: root.scroll-y;
+        pointer(kind, y) => { root.scrollbar-pointer(kind, y); }
+        dragged(y) => { root.scrollbar-dragged(y); }
+    }
+}

@@ -1,0 +1,237 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The dock: from the tab strip to the bottom bar. Composes the mode switch,
+// the checkpoint panel and the dock tab row with the dock's own chrome.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFModeSwitch } from "dock/mode_switch.slint";
+import { FFCheckpointPanel, CheckpointEntryView } from "dock/checkpoint_panel.slint";
+export { CheckpointEntryView }
+import { FFDockTabs } from "dock/dock_tabs.slint";
+import { FFSettingsPanel, SettingsRow, SectionHeadView } from "dock/settings_panel.slint";
+export { SettingsRow, SectionHeadView }
+import { FFImagesPanel, ImageRowView } from "dock/images_panel.slint";
+export { ImageRowView }
+
+export component FFDock inherits Rectangle {
+    callback mode-selected(string);
+    callback dock-tab-selected(string);
+    callback checkpoint-export-requested();
+    in property <bool> editor-enabled: false;
+    in property <string> mode: "stacking";
+    in property <string> dock-tab: "images";
+    // Whether the active tab holds a project. Without one the dock tab row
+    // has nothing to show, and draws the line `No project open.` in its
+    // place instead.
+    in property <bool> project-loaded: false;
+    // The checkpoints panel's own empty-state line, shown in place of the
+    // row list below while it is empty. Set from Rust in `src/bridge.rs`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
+    in property <bool> checkpoint-export-enabled: false;
+    // The checkpoints panel's own list, forwarded the same way as the
+    // `Images` panel's rows below.
+    in property <[CheckpointEntryView]> checkpoint-rows: [];
+    in property <length> checkpoint-scroll-y: 0px;
+    in property <length> checkpoint-content-height: 0px;
+    callback checkpoint-selected(int);
+    callback checkpoint-delete-requested(int);
+    callback checkpoint-scrolled(length);
+    callback checkpoint-scrollbar-pointer(int, length);
+    callback checkpoint-scrollbar-dragged(length);
+    callback checkpoint-viewport-height-changed(length);
+    out property <length> checkpoint-viewport-height: checkpoint-panel.viewport-height;
+
+    // The settings panel: generated entirely from the row list Rust hands
+    // it, forwarded one line into `FFSettingsPanel`.
+    in property <[SettingsRow]> settings-rows: [];
+    in property <SectionHeadView> settings-sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> settings-scroll-y: 0px;
+    in property <length> settings-content-height: 0px;
+    in property <bool> settings-enabled: true;
+    callback settings-param-changed(string, string, float);
+    callback settings-param-stepped(string, string, int);
+    callback settings-param-text-edited(string, string, string);
+    callback settings-algorithm-selected(string, string);
+    callback settings-reset-all();
+    callback settings-menu-toggled(string, string);
+    callback settings-more-toggled(string);
+    callback settings-scrolled(length);
+    callback settings-scrollbar-pointer(int, length);
+    callback settings-scrollbar-dragged(length);
+    callback settings-viewport-height-changed(length);
+
+    // The `Images` panel: forwarded the same way, one line into
+    // `FFImagesPanel`.
+    in property <[ImageRowView]> images-rows: [];
+    in property <string> images-header-text: "";
+    in property <string> images-presentation: "list";
+    in-out property <length> images-list-viewport-y: 0px;
+    in property <string> images-sort: "";
+    in property <bool> images-sort-menu-open: false;
+    in property <int> images-dragging-row: -1;
+    in property <length> images-drag-offset: 0px;
+    in property <bool> images-drag-capture-active: false;
+    in property <int> images-drag-target-row: -1;
+    in property <bool> images-enabled: true;
+    in property <length> tooltip-max-width: ShellGeometry.tooltip-width;
+    callback images-add-frames-requested();
+    callback images-sort-menu-toggled();
+    callback images-sort-selected(string);
+    callback images-frame-selected(int);
+    callback images-frame-keyboard-moved(int);
+    callback images-frame-excluded-toggled(int);
+    callback images-frame-remove-requested(int);
+    callback images-frame-drag-pointer(int, int, length);
+    callback images-viewport-scrolled(length);
+    callback images-frame-wheel(length);
+    callback images-scrollbar-pointer(int, length);
+    callback images-scrollbar-dragged(length);
+    callback images-viewport-height-changed(length);
+
+    // Where the settings/images panel content starts: right under the tab
+    // row in stacking mode, right under the checkpoint rule in editor mode
+    // -- the dock tab row is hidden there (below), and the legend it
+    // uncovers replaces it with no gap of its own.
+    property <length> content-top: root.mode == "stacking"
+        ? dock-tabs.y + dock-tabs.height + Theme.space-2
+        : dock-tabs.y;
+
+    background: Theme.surface-raised;
+
+    VerticalLayout {
+        padding-left: ShellGeometry.dock-content-inset;
+        padding-right: ShellGeometry.dock-content-inset;
+        padding-top: Theme.space-2;
+        spacing: Theme.space-2;
+        alignment: start;
+
+        mode-switch := FFModeSwitch {
+            editor-enabled: root.editor-enabled;
+            mode: root.mode;
+            mode-selected(m) => { root.mode-selected(m); }
+        }
+
+        checkpoint-panel := FFCheckpointPanel {
+            line: root.checkpoint-line;
+            export-enabled: root.checkpoint-export-enabled;
+            rows: root.checkpoint-rows;
+            scroll-y: root.checkpoint-scroll-y;
+            content-height: root.checkpoint-content-height;
+            checkpoint-export-requested => { root.checkpoint-export-requested(); }
+            checkpoint-selected(i) => { root.checkpoint-selected(i); }
+            checkpoint-delete-requested(i) => { root.checkpoint-delete-requested(i); }
+            checkpoint-scrolled(delta) => { root.checkpoint-scrolled(delta); }
+            checkpoint-scrollbar-pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
+            checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
+            checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
+        }
+
+        dock-tabs := FFDockTabs {
+            // Hidden in editor mode: the legend shows in their place.
+            visible: root.project-loaded && root.mode == "stacking";
+            active: root.dock-tab;
+            tab-selected(t) => { root.dock-tab-selected(t); }
+        }
+    }
+
+    settings-panel := FFSettingsPanel {
+        x: ShellGeometry.dock-content-inset;
+        y: root.content-top;
+        // The scrollbar sits flush on this panel's own right edge (see
+        // `ff_scrollbar.slint`'s `x: parent.width - self.width`), so this
+        // width is what puts that edge `dock-scrollbar-inset` from the
+        // dock's own right edge: the panel starts `dock-content-inset` in,
+        // and ends `dock-scrollbar-inset` short of the dock's far side.
+        width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
+        height: parent.height - self.y - ShellGeometry.dock-content-inset;
+        // The tabs are gone in editor mode, and with them the Settings
+        // panel -- the legend takes the whole dock body there instead.
+        visible: root.project-loaded && root.mode == "stacking" && root.dock-tab == "settings";
+        rows: root.settings-rows;
+        sticky: root.settings-sticky;
+        scroll-y: root.settings-scroll-y;
+        content-height: root.settings-content-height;
+        enabled: root.settings-enabled;
+        param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
+        param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+        algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+        reset-all => { root.settings-reset-all(); }
+        menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        more-toggled(section) => { root.settings-more-toggled(section); }
+        scrolled(delta) => { root.settings-scrolled(delta); }
+        scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+    }
+
+    images-panel := FFImagesPanel {
+        x: ShellGeometry.dock-content-inset;
+        y: root.content-top;
+        width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
+        height: parent.height - self.y - ShellGeometry.dock-content-inset;
+        // The legend always shows in editor mode, tabs or none.
+        visible: root.project-loaded && (root.mode == "editor" || root.dock-tab == "images");
+        rows: root.images-rows;
+        header-text: root.images-header-text;
+        presentation: root.images-presentation;
+        tooltip-max-width: root.tooltip-max-width;
+        list-viewport-y <=> root.images-list-viewport-y;
+        mutable: root.mode == "stacking";
+        enabled: root.images-enabled;
+        job-disabled: !root.images-enabled;
+        legend: root.mode == "editor";
+        sort: root.images-sort;
+        sort-menu-open: root.images-sort-menu-open;
+        dragging-row: root.images-dragging-row;
+        drag-offset: root.images-drag-offset;
+        drag-capture-active: root.images-drag-capture-active;
+        drag-target-row: root.images-drag-target-row;
+        add-frames-requested => { root.images-add-frames-requested(); }
+        sort-menu-toggled => { root.images-sort-menu-toggled(); }
+        sort-selected(picked) => { root.images-sort-selected(picked); }
+        frame-selected(i) => { root.images-frame-selected(i); }
+        frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
+        frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+        frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+        frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
+        viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
+        frame-wheel(delta) => { root.images-frame-wheel(delta); }
+        scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
+    }
+
+    no-project-note := Text {
+        x: ShellGeometry.dock-content-inset + Theme.space-1;
+        y: checkpoint-rule.y + checkpoint-rule.height + Theme.space-4;
+        height: Theme.text-body.size * Theme.text-body.line-height;
+        visible: !root.project-loaded;
+        text: "No project open.";
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        vertical-alignment: center;
+    }
+
+    // The rule under the checkpoint panel, full dock width -- 1 px of
+    // `border.default`.
+    checkpoint-rule := Rectangle {
+        x: 0px;
+        y: checkpoint-panel.y + checkpoint-panel.height;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+
+    // The 1 px rule at x 1180 that separates the dock from the toolbar and
+    // the canvas.
+    dock-edge := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        background: Theme.border-default;
+    }
+}

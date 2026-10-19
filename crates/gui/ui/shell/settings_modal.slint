@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The settings modal: reachable only through the bottom bar's gear. The
+// frame -- header, nav rail and content host -- over one tab per section.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFModalPanel } from "../components/ff_modal_panel.slint";
+import { FFHeading } from "../components/ff_heading.slint";
+import { FFDivider } from "../components/ff_divider.slint";
+import { FFIconButton } from "../components/ff_icon_button.slint";
+import { FFNavRail } from "../components/ff_nav_rail.slint";
+import { FFNavRailEntry } from "../components/ff_nav_rail_entry.slint";
+import { FFDiagnosticsPanel, FFManifestRow } from "settings_modal/diagnostics_panel.slint";
+import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
+import { FFPerformanceTab, PerformanceCap, PerformanceState } from "settings_modal/performance_tab.slint";
+import { FFStorageTab, StoragePathState, StorageState } from "settings_modal/storage_tab.slint";
+import { AboutState, FFAboutTab } from "settings_modal/about_tab.slint";
+import { FFAppearanceTab } from "settings_modal/appearance_tab.slint";
+export { AboutState, FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+
+export component FFSettingsModal inherits FFModalPanel {
+    in property <bool> settings-open: false;
+    in property <[InputRow]> input-rows: [];
+    in property <string> settings-section: "performance";
+    callback settings-close-requested();
+    callback settings-section-selected(string);
+
+    in property <PerformanceState> performance;
+    callback performance-gpu-toggled(bool);
+    callback performance-host-cap-edited(string);
+    callback performance-vram-cap-edited(string);
+    callback performance-host-cap-cursor-moved(length, length);
+    callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <string> appearance-presentation: "image-list";
+    in property <bool> appearance-menu-open: false;
+    in property <bool> appearance-menu-focused: false;
+    in property <bool> appearance-menu-disabled: false;
+    in property <string> appearance-save-error: "";
+    callback appearance-presentation-selected(string);
+    callback appearance-menu-toggled();
+
+    in property <StorageState> storage;
+    callback storage-clear-requested();
+
+    in property <AboutState> about;
+
+    in property <[FFManifestRow]> diagnostics-rows: [];
+    in property <string> diagnostics-note: "";
+    in property <bool> diagnostics-include-minidumps: false;
+    in property <string> diagnostics-destination: "";
+    in property <string> diagnostics-status: "idle";
+    in property <string> diagnostics-message: "";
+    in property <string> diagnostics-primary-label: "Create bundle";
+    in property <bool> diagnostics-busy: false;
+    in property <bool> diagnostics-loading: false;
+    in property <length> diagnostics-manifest-scroll-offset: 0px;
+    in property <length> diagnostics-manifest-content-height: 0px;
+    in property <length> diagnostics-destination-scroll-offset: 0px;
+    callback diagnostics-minidumps-toggled(bool);
+    callback diagnostics-destination-edited(string);
+    callback diagnostics-destination-cursor-moved(length, length);
+    callback diagnostics-primary-clicked();
+    callback diagnostics-manifest-scrollbar-pointer(int, length);
+    callback diagnostics-manifest-scrollbar-dragged(length);
+    callback diagnostics-manifest-viewport-height-changed(length);
+    callback diagnostics-manifest-scrolled(length);
+
+    changed settings-open => {
+        if root.settings-open {
+            content.focus();
+        }
+    }
+    changed settings-section => {
+        if root.settings-open {
+            content.focus();
+        }
+    }
+
+    modal-open: root.settings-open;
+    panel-width: 680px;
+    panel-height: 520px;
+    clip-panel: true;
+
+    rail := FFNavRail {
+        x: 0px;
+        y: 0px;
+        height: root.panel-height;
+        header-inset: ShellGeometry.settings-header-height;
+
+        FFNavRailEntry {
+            label: "Performance";
+            icon-source: @image-url("../../../../assets/icons/cpu.svg");
+            selected: root.settings-section == "performance";
+            clicked => { root.settings-section-selected("performance"); }
+        }
+        FFNavRailEntry {
+            label: "Appearance";
+            icon-source: @image-url("../../../../assets/icons/picture-in-picture-2.svg");
+            selected: root.settings-section == "appearance";
+            clicked => { root.settings-section-selected("appearance"); }
+        }
+        FFNavRailEntry {
+            label: "Storage";
+            icon-source: @image-url("../../../../assets/icons/hard-drive.svg");
+            selected: root.settings-section == "storage";
+            clicked => { root.settings-section-selected("storage"); }
+        }
+        FFNavRailEntry {
+            label: "Input map";
+            icon-source: @image-url("../../../../assets/icons/keyboard.svg");
+            selected: root.settings-section == "input-map";
+            clicked => { root.settings-section-selected("input-map"); }
+        }
+        FFNavRailEntry {
+            label: "Diagnostics";
+            icon-source: @image-url("../../../../assets/icons/triangle-alert.svg");
+            selected: root.settings-section == "diagnostics";
+            clicked => { root.settings-section-selected("diagnostics"); }
+        }
+        FFNavRailEntry {
+            label: "About";
+            icon-source: @image-url("../../../../assets/icons/info.svg");
+            selected: root.settings-section == "about";
+            clicked => { root.settings-section-selected("about"); }
+        }
+    }
+
+    FFHeading {
+        x: ShellGeometry.settings-header-inset-x;
+        y: 0px;
+        height: ShellGeometry.settings-header-height;
+        text: "Settings";
+    }
+
+    header-rule := FFDivider {
+        x: 0px;
+        y: ShellGeometry.settings-header-height - self.height;
+        width: root.panel-width;
+    }
+
+    close := FFIconButton {
+        x: root.panel-width - ShellGeometry.settings-header-inset-x - Theme.icon-md - self.pad;
+        y: (ShellGeometry.settings-header-height - self.height) / 2;
+        icon: @image-url("../../../../assets/icons/x.svg");
+        name: "Close settings";
+        triggered => { root.settings-close-requested(); }
+    }
+
+    // Takes focus when the modal opens or the section changes, so Escape
+    // reaches it from any tab; a text field inside keeps focus until then.
+    content := FocusScope {
+        x: rail.width;
+        y: ShellGeometry.settings-header-height;
+        width: root.panel-width - rail.width;
+        height: root.panel-height - ShellGeometry.settings-header-height;
+        focus-on-click: false;
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.settings-close-requested();
+                return accept;
+            }
+            return reject;
+        }
+
+        if root.settings-section == "diagnostics": FFDiagnosticsPanel {
+            width: 100%;
+            height: 100%;
+            rows: root.diagnostics-rows;
+            note: root.diagnostics-note;
+            include-minidumps: root.diagnostics-include-minidumps;
+            destination: root.diagnostics-destination;
+            status: root.diagnostics-status;
+            message: root.diagnostics-message;
+            primary-label: root.diagnostics-primary-label;
+            busy: root.diagnostics-busy;
+            loading: root.diagnostics-loading;
+            manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+            manifest-content-height: root.diagnostics-manifest-content-height;
+            destination-scroll-offset: root.diagnostics-destination-scroll-offset;
+
+            minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+            destination-edited(t) => { root.diagnostics-destination-edited(t); }
+            destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+            primary-clicked => { root.diagnostics-primary-clicked(); }
+            manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+            manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+            manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+            manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+        }
+
+        if root.settings-section == "performance": FFPerformanceTab {
+            width: 100%;
+            height: 100%;
+            performance: root.performance;
+
+            gpu-toggled(on) => { root.performance-gpu-toggled(on); }
+            host-cap-edited(t) => { root.performance-host-cap-edited(t); }
+            vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+            host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
+            vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        }
+
+        if root.settings-section == "appearance": FFAppearanceTab {
+            width: 100%;
+            height: 100%;
+            presentation: root.appearance-presentation;
+            menu-open: root.appearance-menu-open;
+            menu-focused: root.appearance-menu-focused;
+            menu-disabled: root.appearance-menu-disabled;
+            save-error: root.appearance-save-error;
+            presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+            menu-toggled => { root.appearance-menu-toggled(); }
+        }
+
+        if root.settings-section == "storage": FFStorageTab {
+            width: 100%;
+            height: 100%;
+            storage: root.storage;
+
+            clear-requested => { root.storage-clear-requested(); }
+        }
+
+        if root.settings-section == "input-map": FFInputMapTab {
+            input-rows: root.input-rows;
+        }
+
+        if root.settings-section == "about": FFAboutTab {
+            width: 100%;
+            height: 100%;
+            about: root.about;
+        }
+    }
+}

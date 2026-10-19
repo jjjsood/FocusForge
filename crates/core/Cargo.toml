@@ -1,0 +1,52 @@
+[package]
+name = "focusforge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+gpu = []
+test-algorithms = []
+
+# A dev-dependency on this very crate, the documented way to switch a
+# feature on for a package's own test targets: `crates/core/tests/grouping.rs`
+# builds its capture-time trees with `io::test_frames`, which lives behind
+# `test-algorithms` (see that module for why it cannot be `#[cfg(test)]`).
+# Without this line every `cargo test -p focusforge-core --test grouping`
+# would have to carry `--features test-algorithms` by hand.
+[dev-dependencies]
+focusforge-core = { path = ".", features = ["test-algorithms"] }
+# `tracing_spans.rs` installs a capturing layer of its own. Product code in
+# this crate raises events through the facade and never installs a
+# subscriber.
+tracing-subscriber = "0.3.23"
+tempfile = "3"
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+
+# `save_timing.rs` evicts files from the page cache with `posix_fadvise`.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[dependencies]
+akaze = { git = "https://github.com/rust-cv/cv", rev = "d271a9ac6a9d7b39c6f22573d26d63b5ce94f3cb" }
+blake3 = { version = "1.8.7", features = ["mmap", "rayon"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+flate2 = "1.1.10"
+inventory = "0.3.24"
+jpeg-encoder = "0.7.1"
+memmap2 = "0.9.11"
+png = { version = "0.18.1", default-features = false }
+rayon = "1.12"
+rawler = "=0.8.0"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+weezl = "0.1.12"
+serde = { version = "1", features = ["derive"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+serde_json = "1"
+zstd = { version = "0.14", features = ["zstdmt"] }

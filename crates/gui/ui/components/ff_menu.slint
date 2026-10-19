@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A labelled field that opens a list of choices, drawn in the panel's own
+// tree rather than a `PopupWindow` so its open state stays queryable.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFField } from "ff_field.slint";
+import { FFMenuList } from "ff_menu_list.slint";
+
+export component FFMenu inherits Rectangle {
+    in property <string> label: "";
+    in property <[string]> choices: [];
+    in property <[string]> choice-ids: [];
+    in property <bool> show-choice-ids: true;
+    in property <string> selected: "";
+    in property <bool> open: false;
+    in property <bool> focused: false;
+    in property <int> focused-index: -1;
+    in property <bool> disabled: false;
+    // The field's accessible name: the setting it picks.
+    in property <string> name: "";
+    // Sits on a tint as light as its own field: draws the base surface.
+    in property <bool> recessed: false;
+    // A caller that stacks several menus in a paint-ordered list (so a
+    // later sibling would otherwise be drawn over this one's open list)
+    // draws the list itself, over everything, and sets this so this
+    // instance draws none of its own.
+    in property <bool> external-list: false;
+    callback toggled();
+    callback option-selected(string);
+    callback previous-requested();
+    callback next-requested();
+    callback accepted();
+    callback dismissed();
+
+    // The closed row is the whole component's own height -- the open list
+    // draws over the content below rather than pushing it, so it is not
+    // counted in this element's own layout height.
+    height: ShellGeometry.field-height;
+    accessible-role: combobox;
+    accessible-label: root.name;
+    accessible-value: root.label;
+    accessible-enabled: !root.disabled;
+    accessible-expandable: true;
+    accessible-expanded: root.open;
+    accessible-action-default => { if !root.disabled { root.toggled(); } }
+
+    closed := FFField {
+        width: 100%;
+        height: ShellGeometry.field-height;
+        text: root.label;
+        focused: root.focused || root.open || focus.has-focus;
+        disabled: root.disabled;
+        recessed: root.recessed;
+    }
+
+    chevron := Text {
+        x: parent.width - Theme.space-4 - self.width;
+        y: (ShellGeometry.field-height - self.height) / 2;
+        text: "\u{2304}";
+        color: Theme.text-secondary;
+        font-size: Theme.text-value.size;
+    }
+
+    area := TouchArea {
+        width: 100%;
+        height: ShellGeometry.field-height;
+        enabled: !root.disabled;
+        clicked => { root.toggled(); }
+    }
+
+    focus := FocusScope {
+        enabled: !root.disabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if root.disabled { return reject; }
+            if event.text == Key.UpArrow {
+                root.previous-requested();
+                return accept;
+            } else if event.text == Key.DownArrow {
+                root.next-requested();
+                return accept;
+            } else if event.text == Key.Return || event.text == Key.Space {
+                root.accepted();
+                return accept;
+            } else if event.text == Key.Escape {
+                root.dismissed();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    if root.open && !root.external-list: FFMenuList {
+        x: 0px;
+        y: ShellGeometry.field-height;
+        width: parent.width;
+        choices: root.choices;
+        choice-ids: root.choice-ids;
+        selected: root.selected;
+        show-choice-ids: root.show-choice-ids;
+        focused-index: root.open ? max(root.focused-index, 0) : -1;
+        option-selected(picked) => { root.option-selected(picked); }
+    }
+}

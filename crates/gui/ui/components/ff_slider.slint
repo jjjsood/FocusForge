@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A value slider with a numeric readout. `scale: "logarithmic"` adds a
+// decade-tick line below the track and is 14 px taller than the default
+// linear scale. `compact` is the bar form: a track 2 px high (`track-width`
+// wide, 72 px by default), a 10 px thumb and the value as plain text
+// instead of a field.
+
+import { Theme } from "../theme.slint";
+import { FFField } from "ff_field.slint";
+
+export component FFSlider inherits Rectangle {
+    in property <string> scale: "linear"; // "linear" | "logarithmic"
+    in property <float> fraction: 0.0;
+    in property <string> value-text: "";
+    in property <bool> disabled: false;
+    in property <bool> invalid: false;
+    in property <bool> compact: false;
+    // Sits on a tint as light as its own track: draws the stronger border tone.
+    in property <bool> recessed: false;
+    // `compact`'s own track width; ignored outside `compact`.
+    in property <length> track-width: 72px;
+    callback fraction-changed(float);
+    // Left (-1) or Right (+1) while the slider has keyboard focus.
+    callback stepped(int);
+
+    height: root.scale == "logarithmic" ? 40px : 26px;
+
+    track-row := Rectangle {
+        y: 0px;
+        height: 26px;
+        width: parent.width;
+
+        track := Rectangle {
+            x: 0px;
+            y: parent.height / 2 - self.height / 2;
+            width: root.compact ? root.track-width : parent.width - 70px;
+            height: root.compact ? 2px : 4px;
+            border-radius: self.height / 2;
+            background: root.recessed ? Theme.border-strong : Theme.surface-overlay;
+
+            fill := Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width * root.fraction;
+                height: parent.height;
+                border-radius: parent.border-radius;
+                background: root.disabled ? Theme.text-disabled : root.invalid ? Theme.status-failure : Theme.accent-default;
+            }
+
+            thumb := Rectangle {
+                width: root.compact ? 10px : 12px;
+                height: self.width;
+                y: parent.height / 2 - self.height / 2;
+                x: parent.width * root.fraction - self.width / 2;
+                border-radius: self.height / 2;
+                background: root.disabled ? Theme.text-disabled : root.invalid ? Theme.status-failure : Theme.accent-default;
+            }
+
+            drag-area := TouchArea {
+                enabled: !root.disabled;
+                width: parent.width;
+                height: 20px;
+                y: -8px;
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down {
+                        key.focus();
+                    }
+                }
+                moved => {
+                    root.fraction-changed(self.pressed ? max(0.0, min(1.0, self.mouse-x / parent.width)) : root.fraction);
+                }
+                clicked => {
+                    root.fraction-changed(max(0.0, min(1.0, self.mouse-x / parent.width)));
+                }
+            }
+        }
+
+        if !root.compact: FFField {
+            x: parent.width - self.width;
+            y: 0px;
+            width: 60px;
+            height: 26px;
+            text: root.value-text;
+            disabled: root.disabled;
+            focused: key.has-focus && !root.disabled;
+            invalid: root.invalid;
+            recessed: root.recessed;
+            text-alignment: right;
+        }
+        if root.compact: Text {
+            x: track.width + Theme.space-2;
+            width: parent.width - self.x;
+            height: parent.height;
+            text: root.value-text;
+            color: root.disabled ? Theme.text-disabled : Theme.text-primary;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            vertical-alignment: center;
+        }
+    }
+
+    key := FocusScope {
+        enabled: !root.disabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if root.disabled { return reject; }
+            if event.text == Key.LeftArrow {
+                root.stepped(-1);
+                return accept;
+            } else if event.text == Key.RightArrow {
+                root.stepped(1);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // The decade scale line -- logarithmic only, each label placed
+    // explicitly rather than through a layout's own `alignment`: `1e-9`
+    // flush with the track's own left edge, `1` flush with its right edge
+    // (the readout field starts right after), the two between it centred
+    // on their own third of the track.
+    if root.scale == "logarithmic": Rectangle {
+        x: 0px;
+        y: 28px;
+        width: track.width;
+        height: Theme.text-section.size * Theme.text-section.line-height;
+
+        Text {
+            x: 0px;
+            text: "1e-9";
+            color: Theme.text-disabled;
+            font-size: Theme.text-section.size;
+        }
+        tick1 := Text {
+            x: parent.width / 3 - self.width / 2;
+            text: "1e-6";
+            color: Theme.text-disabled;
+            font-size: Theme.text-section.size;
+        }
+        tick2 := Text {
+            x: parent.width * 2 / 3 - self.width / 2;
+            text: "1e-3";
+            color: Theme.text-disabled;
+            font-size: Theme.text-section.size;
+        }
+        tick3 := Text {
+            x: parent.width - self.width;
+            text: "1";
+            color: Theme.text-disabled;
+            font-size: Theme.text-section.size;
+        }
+    }
+}

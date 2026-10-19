@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The editor-mode toolbar: brush size and softness, the pipette, undo/redo
+// and the checkpoint button.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFSlider } from "../components/ff_slider.slint";
+import { FFIconButton } from "../components/ff_icon_button.slint";
+import { FFButton } from "../components/ff_button.slint";
+import { FFRowText } from "../components/ff_row_text.slint";
+
+export component FFEditorToolbar inherits Rectangle {
+    in property <string> size-text: "";
+    in property <float> size-fraction: 0.0;
+    in property <int> size-ceiling: 1;
+    in property <string> soft-text: "";
+    in property <float> soft-fraction: 0.0;
+    in property <bool> picking: false;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    in property <bool> can-save-checkpoint: false;
+    callback brush-size-fraction-changed(float);
+    callback brush-softness-fraction-changed(float);
+    callback pipette-toggled();
+    callback undo-requested();
+    callback redo-requested();
+    callback save-checkpoint-requested();
+
+    height: ShellGeometry.toolbar-height;
+    background: Theme.surface-raised;
+
+    property <length> control-y: (root.height - ShellGeometry.toolbar-button-height) / 2;
+
+    FFRowText {
+        x: ShellGeometry.editor-toolbar-size-caption-x;
+        height: parent.height;
+        text: "Size";
+        muted: true;
+    }
+    FFSlider {
+        x: ShellGeometry.editor-toolbar-size-track-x;
+        y: (root.height - self.height) / 2;
+        compact: true;
+        fraction: root.size-fraction;
+        value-text: root.size-text;
+        fraction-changed(f) => { root.brush-size-fraction-changed(f); }
+    }
+    FFRowText {
+        x: ShellGeometry.editor-toolbar-soft-caption-x;
+        height: parent.height;
+        text: "Soft";
+        muted: true;
+    }
+    FFSlider {
+        x: ShellGeometry.editor-toolbar-soft-track-x;
+        y: (root.height - self.height) / 2;
+        compact: true;
+        fraction: root.soft-fraction;
+        value-text: root.soft-text;
+        fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
+    }
+    pipette := FFIconButton {
+        name: "Pipette";
+        x: ShellGeometry.editor-toolbar-pipette-x;
+        y: root.control-y;
+        width: ShellGeometry.editor-toolbar-icon-width;
+        height: ShellGeometry.toolbar-button-height;
+        icon: @image-url("../../../../assets/icons/pipette.svg");
+        filled: true;
+        selected: root.picking;
+        triggered => { root.pipette-toggled(); }
+    }
+    undo := FFIconButton {
+        name: "Undo";
+        x: ShellGeometry.editor-toolbar-undo-x;
+        y: root.control-y;
+        width: ShellGeometry.editor-toolbar-icon-width;
+        height: ShellGeometry.toolbar-button-height;
+        icon: @image-url("../../../../assets/icons/undo-2.svg");
+        filled: true;
+        enabled: root.can-undo;
+        triggered => { root.undo-requested(); }
+    }
+    redo := FFIconButton {
+        name: "Redo";
+        x: ShellGeometry.editor-toolbar-redo-x;
+        y: root.control-y;
+        width: ShellGeometry.editor-toolbar-icon-width;
+        height: ShellGeometry.toolbar-button-height;
+        icon: @image-url("../../../../assets/icons/redo-2.svg");
+        filled: true;
+        enabled: root.can-redo;
+        triggered => { root.redo-requested(); }
+    }
+    FFButton {
+        x: parent.width - ShellGeometry.editor-toolbar-save-checkpoint-right-inset - self.width;
+        y: root.control-y;
+        width: ShellGeometry.editor-toolbar-save-checkpoint-width;
+        compact: true;
+        text: "Save checkpoint";
+        enabled: root.can-save-checkpoint;
+        dim-label-only: true;
+        clicked => { root.save-checkpoint-requested(); }
+    }
+
+    // The 1 px rule along the toolbar's bottom edge, matching `FFToolbar`'s
+    // own, over the canvas width only.
+    Rectangle {
+        x: 0px;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+}

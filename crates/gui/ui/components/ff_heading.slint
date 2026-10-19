@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A dialog's own title-weight line: its header, or a status heading such as
+// a refusal's own.
+
+import { Theme } from "../theme.slint";
+
+export component FFHeading inherits Text {
+    // "primary" | "failure".
+    in property <string> tone: "primary";
+    // "title" (15px) | "body" (12px) -- either size still carries a
+    // title's own weight, so a "body"-sized heading reads as bolded body
+    // text, not a smaller title.
+    in property <string> size: "title";
+
+    color: root.tone == "failure" ? Theme.status-failure : Theme.text-primary;
+    font-size: root.size == "body" ? Theme.text-body.size : Theme.text-title.size;
+    font-weight: Theme.text-title.weight;
+    vertical-alignment: center;
+}

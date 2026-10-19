@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The open-choice list an `FFMenu` shows under its field: display name left,
+// grey id right, a check glyph on the selected row. Its own file so a caller
+// with several menus in one paint-ordered list (settings rows stacked one
+// under another) can draw the currently open one last, over whatever
+// follows it, instead of it being buried in that element's own place in the
+// tree.
+
+import { Theme } from "../theme.slint";
+
+export component FFMenuList inherits Rectangle {
+    in property <[string]> choices: [];
+    in property <[string]> choice-ids: [];
+    in property <string> selected: "";
+    in property <int> focused-index: -1;
+    // A caller whose ids carry no meaning of their own (a sort menu, whose
+    // entries are just "Name"/"Capture time") hides the grey id column
+    // rather than showing it as a second, meaningless label.
+    in property <bool> show-choice-ids: true;
+    callback option-selected(string);
+
+    height: root.choices.length * 24px;
+    background: Theme.surface-overlay;
+    border-width: 1px;
+    border-color: Theme.border-default;
+
+    VerticalLayout {
+        for choice-label[i] in root.choices: option-row := Rectangle {
+            height: 24px;
+            background: option-area.has-hover || i == root.focused-index ? Theme.surface-hover : transparent;
+            accessible-role: button;
+            accessible-label: choice-label;
+            accessible-checked: root.choice-ids[i] == root.selected;
+
+            HorizontalLayout {
+                padding-left: Theme.space-2;
+                padding-right: Theme.space-2;
+                spacing: Theme.space-2;
+
+                Text {
+                    text: choice-label;
+                    color: Theme.text-primary;
+                    font-size: Theme.text-value.size;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                if root.show-choice-ids: Text {
+                    text: root.choice-ids[i];
+                    color: Theme.text-disabled;
+                    font-size: Theme.text-section.size;
+                    vertical-alignment: center;
+                }
+                if root.choice-ids[i] == root.selected: Text {
+                    text: "\u{2713}";
+                    color: Theme.accent-default;
+                    vertical-alignment: center;
+                }
+            }
+
+            option-area := TouchArea {
+                clicked => { root.option-selected(root.choice-ids[i]); }
+            }
+        }
+    }
+}

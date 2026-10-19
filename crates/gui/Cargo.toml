@@ -1,0 +1,53 @@
+[package]
+name = "focusforge-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+trace = ["focusforge-diagnostics/trace"]
+# A timed trigger that destroys the graphics device mid-session, for the
+# lost-device response's own tests.
+gpu-tests = ["focusforge-gpu/gpu-tests"]
+# Development-only Slint UI inspection/control endpoint. The server is idle
+# unless its feature and `SLINT_MCP_PORT` are both set.
+mcp = ["slint/mcp"]
+
+[dependencies]
+slint = { version = "~1.17", default-features = false, features = [
+    "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-29",
+    "unstable-winit-030",
+] }
+clap = { version = "4", features = ["derive"] }
+png = "0.18"
+thiserror = "2.0.20"
+focusforge-core = { path = "../core" }
+focusforge-diagnostics = { path = "../diagnostics" }
+focusforge-gpu = { path = "../gpu", features = ["gpu"] }
+toml = "1"
+toml_edit = "0.25"
+serde = { version = "1", features = ["derive"] }
+directories = "6"
+rfd = "0.17.2"
+notify-rust = "4.18"
+tracing = "0.1.44"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[build-dependencies]
+slint-build = "~1.17"
+
+[dev-dependencies]
+focusforge-core = { path = "../core", features = ["test-algorithms"] }
+i-slint-backend-testing = "~1.17"
+serde_json = "1"
+tempfile = "3"
+# Reading a written bundle back, with the same pinned feature set the
+# writer uses.
+zip = { version = "9.0.4", default-features = false }
+# Corrupting a blob's compressed bytes without breaking its zstd framing.
+zstd = "0.14"

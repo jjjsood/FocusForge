@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The Input map section's content: the read-only three-column table.
+
+import { ShellGeometry } from "../../geometry.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFInputTableRow } from "../../components/ff_input_table_row.slint";
+
+export struct InputRow {
+    input: string,
+    stacking: string,
+    editor: string,
+}
+
+export component FFInputMapTab inherits Rectangle {
+    in property <[InputRow]> input-rows: [];
+
+    VerticalLayout {
+        padding-left: ShellGeometry.settings-content-inset-left;
+        padding-right: ShellGeometry.settings-content-inset-right;
+        padding-top: ShellGeometry.settings-content-inset-top;
+        padding-bottom: ShellGeometry.settings-content-inset-bottom;
+        alignment: start;
+
+        FFSettingsSection {
+            heading: "BINDINGS";
+
+            FFInputTableRow {
+                header: true;
+                input-label: "INPUT";
+                stacking-label: "STACKING";
+                editor-label: "EDITOR";
+            }
+
+            for row in root.input-rows: FFInputTableRow {
+                input-label: row.input;
+                stacking-label: row.stacking;
+                editor-label: row.editor;
+            }
+        }
+    }
+}

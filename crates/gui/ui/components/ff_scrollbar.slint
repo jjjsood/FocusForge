@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A 6 px vertical scroll track with a proportional thumb. Forwards the raw
+// pointer position; `AppController` decides thumb-drag vs. track-jump.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFScrollbar inherits Rectangle {
+    in property <length> content-height: 0px;
+    in property <length> viewport-height: 0px;
+    in property <length> offset: 0px;
+    // The `int` folds `PointerEventKind` the same way `canvas.slint`'s
+    // `canvas-pointer` does: 0 = Down, 1 = Up or Cancel, 2 = Move (ignored
+    // by the caller; `dragged` below is the real motion source).
+    callback pointer(int, length);
+    callback dragged(length);
+
+    width: ShellGeometry.scrollbar-width;
+    background: transparent;
+
+    thumb := Rectangle {
+        width: parent.width;
+        border-radius: self.width / 2;
+        background: Theme.border-strong;
+        visible: root.content-height > root.viewport-height;
+        height: root.content-height > 0px
+            ? max(16px, root.viewport-height * root.viewport-height / max(root.content-height, 1px))
+            : root.viewport-height;
+        y: root.content-height > 0px
+            ? root.offset * root.viewport-height / max(root.content-height, 1px)
+            : 0px;
+    }
+
+    track-area := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            root.pointer(event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1), self.mouse-y);
+        }
+        moved => { root.dragged(self.mouse-y); }
+    }
+}

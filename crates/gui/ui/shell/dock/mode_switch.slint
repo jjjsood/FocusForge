@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The dock's stacking/editor mode switch: a pill track with an accent pill
+// under the active half.
+
+import { Theme } from "../../theme.slint";
+
+export component FFModeSwitch inherits Rectangle {
+    callback mode-selected(string);
+    in property <bool> editor-enabled: false;
+    in property <string> mode: "stacking";
+
+    height: 28px;
+    background: Theme.surface-overlay;
+    border-radius: min(Theme.radius-full, self.height / 2);
+
+    HorizontalLayout {
+        stacking-half := Rectangle {
+            width: root.width / 2;
+            background: root.mode == "stacking" ? Theme.accent-default : transparent;
+            border-radius: min(Theme.radius-full, self.height / 2);
+            Text {
+                text: "STACKING";
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+                letter-spacing: Theme.text-section.letter-spacing;
+                color: root.mode == "stacking" ? Theme.text-on-accent : Theme.text-muted;
+            }
+            TouchArea {
+                clicked => { root.mode-selected("stacking"); }
+            }
+        }
+        editor-half := Rectangle {
+            width: root.width / 2;
+            background: root.mode == "editor" ? Theme.accent-default : transparent;
+            border-radius: min(Theme.radius-full, self.height / 2);
+            Text {
+                text: "EDITOR";
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+                letter-spacing: Theme.text-section.letter-spacing;
+                color: root.mode == "editor" ? Theme.text-on-accent
+                    : root.editor-enabled ? Theme.text-muted : Theme.text-disabled;
+            }
+            TouchArea {
+                enabled: root.editor-enabled;
+                clicked => { root.mode-selected("editor"); }
+            }
+        }
+    }
+}

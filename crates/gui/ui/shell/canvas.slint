@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The canvas region: two panes, a divider between them, each pane carrying
+// the wgpu-written image, a label and an undock control.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFEmptyState } from "empty_state.slint";
+import { FFPane } from "../components/ff_pane.slint";
+import { FFPanePlaceholder } from "../components/ff_pane_placeholder.slint";
+import { FFBrushCursor } from "../components/ff_brush_cursor.slint";
+
+export component FFCanvas inherits Rectangle {
+    in property <image> composite-source;
+    // The left pane's own source, label and refusal -- see
+    // `FFPane::message-lines`.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    in property <[string]> frame-message-lines: [];
+    // The right pane's refusal -- see `FFPane::message-lines`.
+    in property <[string]> composite-message-lines: [];
+    in property <bool> undock-enabled: true;
+    // "frame" or "composite" names the pane outside the main window; empty while both are docked.
+    in property <string> detached-pane: "";
+    // Forwarded to both panes' chrome -- see `FFPane::project-loaded`.
+    in property <bool> project-loaded: false;
+    // Whether the active tab has a composite -- governs the right pane's
+    // not-yet-fused placeholder.
+    in property <bool> composite-ready: false;
+    // The one shared viewport's placement -- forwarded identically to
+    // both panes below, which is what makes "one viewport
+    // over two panes" structural rather than a synchronisation. The right
+    // pane draws the sealed composite/Z-Map at this extent.
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
+    // The left pane's own placement, over the same extent as the right pane.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
+    // Each pane's low-detail backdrop -- see `FFPane::backdrop`.
+    in property <image> frame-backdrop;
+    in property <length> frame-backdrop-x;
+    in property <length> frame-backdrop-y;
+    in property <length> frame-backdrop-w;
+    in property <length> frame-backdrop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
+    in property <length> frame-crop-x;
+    in property <length> frame-crop-y;
+    in property <length> frame-crop-w;
+    in property <length> frame-crop-h;
+    in property <bool> pixelated;
+    // Whether editor mode is active -- the right pane's accent border and
+    // the brush cursor both show only then.
+    in property <bool> editor-mode: false;
+    // The brush cursor's own `Path` geometry, already scaled to on-screen
+    // px -- see `AppController::brush_cursor_view`.
+    in property <length> cursor-extent;
+    in property <string> cursor-ring-commands;
+    in property <string> cursor-core-commands;
+    in property <bool> cursor-picking: false;
+    in property <color> cursor-pick-color;
+    in property <bool> cursor-visible: false;
+    in property <length> cursor-frame-x;
+    in property <length> cursor-frame-y;
+    in property <length> cursor-composite-x;
+    in property <length> cursor-composite-y;
+    out property <bool> pane-hovered: hit-area.has-hover
+        && ((pane-left.visible && hit-area.mouse-x >= pane-left.x
+                && hit-area.mouse-x <= pane-left.x + pane-left.width
+                && hit-area.mouse-y >= pane-left.y
+                && hit-area.mouse-y <= pane-left.y + pane-left.height)
+            || (pane-right.visible && hit-area.mouse-x >= pane-right.x
+                && hit-area.mouse-x <= pane-right.x + pane-right.width
+                && hit-area.mouse-y >= pane-right.y
+                && hit-area.mouse-y <= pane-right.y + pane-right.height));
+    callback pane-hover-changed();
+    callback frame-undock-requested();
+    callback composite-undock-requested();
+    // The one input dispatch point's gesture forwards. No other `.slint`
+    // file in the crate declares `scroll-event`, `pointer-event` or
+    // `moved`. The two extra `length`s carry the wheel's own cursor
+    // position (`self.mouse-x`/`mouse-y` are written before `scroll-event`
+    // is invoked), since `moved` only fires while the pointer is pressed
+    // and cannot track a hovering cursor.
+    callback canvas-scrolled(length, length, length, length, bool, bool, bool);
+    // The `int` is `event.kind` folded to 0 = Down, 1 = Up or Cancel,
+    // 2 = Move -- `PointerEventKind` itself is not publicly nameable from
+    // `src/bridge.rs` (unlike `PointerEventButton`), so the fold happens
+    // here rather than forwarding an unnameable type. `Move` fires on every
+    // mouse movement over the area, before `moved`; the dispatch point
+    // (`AppController::pointer`, `PointerKind::Move`) is what ignores it.
+    callback canvas-pointer(PointerEventButton, int, length, length, bool, bool, bool);
+    callback canvas-dragged(length, length);
+    // Fires whenever this component's own size changes, so `src/bridge.rs`
+    // can re-read the five geometry properties below and re-fit/re-clamp
+    // the viewport. Nothing is passed: the bridge reads
+    // the `out` properties itself, which also covers the initial value a
+    // `changed` handler never fires for (`src/main.rs`'s own startup read).
+    callback canvas-resized();
+
+    // The empty state: `true` while no tab is open.
+    // Placed last (below) so it covers the canvas region without moving
+    // either pane -- `tests/shell.rs`'s pane-geometry tests keep finding
+    // `pane-left`/`pane-right` at their fixed rects regardless.
+    in property <bool> show-empty-state: true;
+    // A background load in flight: hides the empty state for that span, so
+    // its own text never bleeds around the loading indicator drawn over
+    // this same region.
+    in property <bool> load-active: false;
+    callback open-folder-requested();
+
+    // The pane geometry `AppController::set_pane_geometry` needs, read back
+    // as plain property reads -- no arithmetic, `pane-gutter`/`pane-divider`
+    // stay derived once, here. `pane-left`/`pane-right` share one `y`,
+    // `width` and `height` by construction (below), so only `pane-left`'s
+    // are exposed for those three.
+    out property <length> pane-left-x: pane-left.x;
+    out property <length> pane-right-x: pane-right.x;
+    out property <length> pane-left-y: pane-left.y;
+    out property <length> pane-left-width: pane-left.width;
+    out property <length> pane-left-height: pane-left.height;
+    out property <length> pane-right-y: pane-right.y;
+    out property <length> pane-right-width: pane-right.width;
+    out property <length> pane-right-height: pane-right.height;
+
+    changed width => { root.canvas-resized(); }
+    changed height => { root.canvas-resized(); }
+    changed pane-hovered => { root.pane-hover-changed(); }
+
+    background: Theme.surface-base;
+
+    // Whether the pointer sits over the right or left pane's own rect --
+    // both brush cursors' visibility and the hidden system cursor gate on
+    // hovering either, not just `has-hover` over the whole canvas.
+    property <bool> show-brush-cursor: root.editor-mode && root.cursor-visible;
+
+    // First child so it spans the whole canvas region while the
+    // later-declared panes and their `FFUndockControl` `TouchArea`s keep
+    // z-order above it.
+    hit-area := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: root.show-brush-cursor ? MouseCursor.none : MouseCursor.default;
+
+        scroll-event(event) => {
+            root.canvas-scrolled(event.delta-x, event.delta-y, self.mouse-x, self.mouse-y,
+                event.modifiers.control, event.modifiers.shift, event.modifiers.alt);
+            accept
+        }
+        pointer-event(event) => {
+            root.canvas-pointer(event.button,
+                event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1),
+                self.mouse-x, self.mouse-y, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+        }
+        moved => { root.canvas-dragged(self.mouse-x, self.mouse-y); }
+    }
+
+    pane-left := FFPane {
+        x: ShellGeometry.pane-gutter;
+        y: ShellGeometry.pane-gutter;
+        width: root.detached-pane == "composite" ? parent.width - 2 * ShellGeometry.pane-gutter
+            : root.detached-pane == "frame" ? 0px
+            : (parent.width - 3 * ShellGeometry.pane-gutter) / 2;
+        height: parent.height - 2 * ShellGeometry.pane-gutter;
+        visible: root.detached-pane != "frame";
+        source: root.frame-source;
+        label: root.frame-label;
+        message-lines: root.frame-message-lines;
+        undock-enabled: root.undock-enabled;
+        project-loaded: root.project-loaded;
+        image-x: root.frame-image-x;
+        image-y: root.frame-image-y;
+        image-w: root.frame-image-w;
+        image-h: root.frame-image-h;
+        backdrop: root.frame-backdrop;
+        backdrop-x: root.frame-backdrop-x;
+        backdrop-y: root.frame-backdrop-y;
+        backdrop-w: root.frame-backdrop-w;
+        backdrop-h: root.frame-backdrop-h;
+        crop-x: root.frame-crop-x;
+        crop-y: root.frame-crop-y;
+        crop-w: root.frame-crop-w;
+        crop-h: root.frame-crop-h;
+        pixelated: root.pixelated;
+        undock-requested => { root.frame-undock-requested(); }
+    }
+
+    // Centred inside the gutter between the panes, not added on top of it.
+    pane-divider := Rectangle {
+        x: pane-left.x + pane-left.width
+            + (ShellGeometry.pane-gutter - ShellGeometry.pane-divider) / 2;
+        y: ShellGeometry.pane-gutter;
+        width: ShellGeometry.pane-divider;
+        height: parent.height - 2 * ShellGeometry.pane-gutter;
+        background: Theme.border-default;
+        visible: root.detached-pane == "";
+    }
+
+    pane-right := FFPane {
+        x: root.detached-pane == "frame" ? ShellGeometry.pane-gutter
+            : root.detached-pane == "composite" ? parent.width
+            : parent.width - ShellGeometry.pane-gutter - pane-left.width;
+        y: ShellGeometry.pane-gutter;
+        width: root.detached-pane == "frame" ? parent.width - 2 * ShellGeometry.pane-gutter
+            : root.detached-pane == "composite" ? 0px
+            : pane-left.width;
+        height: pane-left.height;
+        visible: root.detached-pane != "composite";
+        source: root.composite-source;
+        label: "Composite";
+        message-lines: root.composite-message-lines;
+        undock-enabled: root.undock-enabled;
+        project-loaded: root.project-loaded;
+        image-x: root.image-x;
+        image-y: root.image-y;
+        image-w: root.image-w;
+        image-h: root.image-h;
+        backdrop: root.backdrop;
+        backdrop-x: root.backdrop-x;
+        backdrop-y: root.backdrop-y;
+        backdrop-w: root.backdrop-w;
+        backdrop-h: root.backdrop-h;
+        crop-x: root.crop-x;
+        crop-y: root.crop-y;
+        crop-w: root.crop-w;
+        crop-h: root.crop-h;
+        pixelated: root.pixelated;
+        undock-requested => { root.composite-undock-requested(); }
+    }
+
+    pane-placeholder := FFPanePlaceholder {
+        x: pane-right.x + (pane-right.width - self.width) / 2;
+        y: pane-right.y + (pane-right.height - self.height) / 2;
+        visible: root.project-loaded && !root.composite-ready && root.detached-pane != "composite";
+    }
+
+    brush-cursor-left-clip := Rectangle {
+        x: pane-left.x;
+        y: pane-left.y;
+        width: pane-left.width;
+        height: pane-left.height;
+        clip: true;
+
+        brush-cursor-left := FFBrushCursor {
+            x: root.cursor-frame-x - self.width / 2;
+            y: root.cursor-frame-y - self.height / 2;
+            visible: root.show-brush-cursor;
+            extent: root.cursor-extent;
+            ring-commands: root.cursor-ring-commands;
+            core-commands: root.cursor-core-commands;
+            picking: root.cursor-picking;
+            pick-color: root.cursor-pick-color;
+        }
+    }
+
+    brush-cursor-right-clip := Rectangle {
+        x: pane-right.x;
+        y: pane-right.y;
+        width: pane-right.width;
+        height: pane-right.height;
+        clip: true;
+
+        brush-cursor-right := FFBrushCursor {
+            x: root.cursor-composite-x - self.width / 2;
+            y: root.cursor-composite-y - self.height / 2;
+            visible: root.show-brush-cursor;
+            extent: root.cursor-extent;
+            ring-commands: root.cursor-ring-commands;
+            core-commands: root.cursor-core-commands;
+            picking: root.cursor-picking;
+            pick-color: root.cursor-pick-color;
+        }
+    }
+
+    empty-state := FFEmptyState {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        visible: root.show-empty-state && !root.load-active;
+        open-folder-requested => { root.open-folder-requested(); }
+    }
+}

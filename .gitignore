@@ -1,0 +1,10 @@
+/target
+/.scratch/
+/.logs/
+crates/*/.scratch/
+/spikes/*/target
+/spikes/*/__pycache__
+/tools/__pycache__
+/tools/lib/__pycache__
+*.code-workspace
+/.locks/

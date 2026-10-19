@@ -1,0 +1,1704 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Visual reference sheet for every design token and shared component,
+// rendered via `--theme-sheet`. Kept separate from `theme.slint`: a test
+// there forbids the substring `width` anywhere in that file, and a swatch
+// needs one.
+
+import { Theme, TypeRole } from "theme.slint";
+import { ShellGeometry } from "geometry.slint";
+import { FFIconButton } from "components/ff_icon_button.slint";
+import { FFSlider } from "components/ff_slider.slint";
+import { FFField } from "components/ff_field.slint";
+import { FFToggle } from "components/ff_toggle.slint";
+import { FFMenu } from "components/ff_menu.slint";
+import { FFMenuList } from "components/ff_menu_list.slint";
+import { FFSectionHeading } from "components/ff_section_heading.slint";
+import { FFErrorRow } from "components/ff_error_row.slint";
+import { FFScrollbar } from "components/ff_scrollbar.slint";
+import { FFResetAll } from "components/ff_reset_all.slint";
+import { FFMoreToggle } from "components/ff_more_toggle.slint";
+import { FFRowLabel } from "components/ff_row_label.slint";
+import { FFRowText } from "components/ff_row_text.slint";
+import { FFButton } from "components/ff_button.slint";
+import { FFProgressBar } from "components/ff_progress_bar.slint";
+import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
+import { FFSpinner } from "components/ff_spinner.slint";
+import { FFLoadingPanel } from "components/ff_loading_panel.slint";
+import { FFImageRow } from "components/ff_image_row.slint";
+import { FFTooltip } from "components/ff_tooltip.slint";
+import { FFDragLandingMarker } from "components/ff_drag_landing_marker.slint";
+import { FFCheckpointRow } from "components/ff_checkpoint_row.slint";
+import { FFDialog } from "components/ff_dialog.slint";
+import { FFDialogFooter } from "components/ff_dialog_footer.slint";
+import { FFChip } from "components/ff_chip.slint";
+import { FFProjectCard } from "components/ff_project_card.slint";
+import { FFManifestList } from "components/ff_manifest_list.slint";
+import { FFBrushCursor } from "components/ff_brush_cursor.slint";
+import { FFStatusGlyph } from "components/ff_status_glyph.slint";
+import { FFHeading } from "components/ff_heading.slint";
+import { FFDivider } from "components/ff_divider.slint";
+import { FFSegmented } from "components/ff_segmented.slint";
+import { FFPane } from "components/ff_pane.slint";
+import { FFPaneLabel } from "components/ff_pane_label.slint";
+import { FFUndockControl } from "components/ff_undock_control.slint";
+import { FFWindowBar } from "components/ff_window_bar.slint";
+import { FFCheckpointDelete } from "shell/dialogs.slint";
+import { FFNotificationGlyph } from "components/ff_notification_glyph.slint";
+import { FFToast } from "components/ff_toast.slint";
+import { FFNotificationRow } from "components/ff_notification_row.slint";
+import { FFModalPanel } from "components/ff_modal_panel.slint";
+import { FFTextField } from "components/ff_text_field.slint";
+import { FFNavRail } from "components/ff_nav_rail.slint";
+import { FFNavRailEntry } from "components/ff_nav_rail_entry.slint";
+import { FFSettingsSection } from "components/ff_settings_section.slint";
+import { FFSettingsRow } from "components/ff_settings_row.slint";
+import { FFSettingsPathRow } from "components/ff_settings_path_row.slint";
+import { FFSettingsActionRow } from "components/ff_settings_action_row.slint";
+import { FFStatusText } from "components/ff_status_text.slint";
+import { FFInputTableRow } from "components/ff_input_table_row.slint";
+
+// The settings modal's own ground, content width plus its padding.
+component SettingsGround inherits Rectangle {
+    width: ShellGeometry.settings-content-width + 2 * Theme.space-4;
+    height: lay.preferred-height;
+    background: Theme.surface-raised;
+
+    lay := VerticalLayout {
+        padding: Theme.space-4;
+        alignment: start;
+        @children
+    }
+}
+
+// The notification center's own ground: its width over the raised fill,
+// rows stacked from the top.
+component CenterGround inherits Rectangle {
+    width: ShellGeometry.notification-center-width;
+    background: Theme.surface-raised;
+    clip: true;
+
+    VerticalLayout {
+        padding-left: Theme.space-4;
+        padding-right: Theme.space-4;
+        alignment: start;
+        @children
+    }
+}
+
+// A text field in a settings row's value slot. The slot keeps the field's
+// unemphasised size, so its focus growth stays centred.
+component CapFieldSlot inherits Rectangle {
+    in property <string> text: "";
+    in property <string> placeholder: "";
+    in property <string> tone: "neutral";
+    in property <bool> enabled: true;
+    width: ShellGeometry.settings-field-width;
+    height: ShellGeometry.field-height;
+
+    FFTextField {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        placeholder: root.placeholder;
+        tone: root.tone;
+        enabled: root.enabled;
+        field-width: parent.width;
+    }
+}
+
+component ColourSwatch inherits Rectangle {
+    in property <color> swatch;
+    in property <string> label;
+    width: 210px;
+    height: 32px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            background: root.swatch;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: Theme.border-default;
+        }
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component GroupHeading inherits Text {
+    color: Theme.text-secondary;
+    font-weight: 600;
+}
+
+component TypeSample inherits Rectangle {
+    in property <TypeRole> role;
+    in property <string> label;
+    height: 24px;
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: root.role.size;
+        font-weight: root.role.weight;
+        letter-spacing: root.role.letter-spacing;
+    }
+}
+
+component SpacingSample inherits Rectangle {
+    in property <length> step;
+    in property <string> label;
+    height: 24px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: root.step;
+            height: 16px;
+            background: Theme.accent-default;
+        }
+        Text { text: root.label; color: Theme.text-primary; vertical-alignment: center; }
+    }
+}
+
+component RadiusSample inherits Rectangle {
+    in property <length> corner;
+    in property <string> label;
+    height: 24px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: 32px;
+            height: 24px;
+            background: Theme.surface-overlay;
+            border-radius: root.corner;
+        }
+        Text { text: root.label; color: Theme.text-primary; vertical-alignment: center; }
+    }
+}
+
+component IconSizeSample inherits Rectangle {
+    in property <length> icon-size;
+    in property <string> label;
+    height: 24px;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            width: root.icon-size;
+            height: root.icon-size;
+            background: Theme.text-primary;
+        }
+        Text { text: root.label; color: Theme.text-primary; vertical-alignment: center; }
+    }
+}
+
+export component ThemeSheet inherits Window {
+    title: "FocusForge -- token sheet";
+    preferred-width: 1100px;
+    preferred-height: 1000px;
+    background: Theme.surface-base;
+    default-font-family: Theme.font-family;
+
+    Flickable {
+        width: root.width;
+        height: root.height;
+
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+        alignment: start;
+
+        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "info"; title: "Some images were skipped"; }
+                FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; }
+                FFToast { toast-open: true; kind: "failure"; title: "Could not save project"; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "crash"; title: "Previous session stopped"; }
+                FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; hovered: true; }
+                FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; focused: true; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFNotificationGlyph { kind: "info"; }
+                FFNotificationGlyph { kind: "warning"; }
+                FFNotificationGlyph { kind: "failure"; }
+                FFNotificationGlyph { kind: "crash"; }
+            }
+        }
+
+        GroupHeading { text: "Icon button: badge 0, 3, 12, 128; focus"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 3; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 12; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 128; }
+            FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 3; focused: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; focused: true; }
+        }
+
+        GroupHeading { text: "Icon bar and raised nav rail"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFNavRail {
+                width: ShellGeometry.icon-bar-width;
+                height: 160px;
+                end-aligned: true;
+                raised: true;
+                FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; badge: 3; }
+                FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; }
+            }
+            FFNavRail {
+                width: ShellGeometry.icon-bar-width;
+                height: 160px;
+                end-aligned: true;
+                raised: true;
+                FFIconButton { icon: @image-url("../../../assets/icons/bell.svg"); focusable: true; filled: true; }
+                FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; }
+            }
+            FFNavRail {
+                width: 120px;
+                height: 160px;
+                raised: true;
+                FFNavRailEntry {
+                    label: "Storage";
+                    icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                    selected: true;
+                }
+                FFNavRailEntry {
+                    label: "About";
+                    icon-source: @image-url("../../../assets/icons/info.svg");
+                }
+            }
+        }
+
+        GroupHeading { text: "FFNotificationRow: summaries, selected + focus, 40-line message"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            CenterGround {
+                height: 520px;
+                FFNotificationRow { kind: "info"; title: "Some images were skipped"; context: "Import · Mantis · 16:42"; }
+                FFNotificationRow {
+                    kind: "warning";
+                    title: "Brightness target limited";
+                    context: "Mantis · IMG_9823.tif · 16:41";
+                    message: "Requested gain 1.67; maximum 1.25 applied. This source did not reach the target.\n\nThe original source file is unchanged.";
+                    selected: true;
+                    expanded: true;
+                    focused: true;
+                }
+                FFNotificationRow { kind: "failure"; title: "Could not save project"; context: "Save · Mantis · mantis.ffp · 16:39"; }
+                FFNotificationRow { kind: "crash"; title: "Previous session stopped"; context: "Startup · 1 crash report · 16:40"; }
+            }
+            CenterGround {
+                height: 520px;
+                FFNotificationRow {
+                    kind: "info";
+                    title: "Some images were skipped";
+                    context: "Import · Mantis · 16:42";
+                    message: "Skipped source files:\n~/Pictures/Mantis/session-2026-10-11/IMG_9824-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9825-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9826-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9827-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9828-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9829-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9830-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9831-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9832-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9833-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9834-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9835-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9836-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9837-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9838-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9839-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9840-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9841-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9842-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9843-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9844-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9845-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9846-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9847-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9848-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9849-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9850-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9851-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9852-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9853-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9854-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9855-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9856-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9857-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9858-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9859-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9860-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9861-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9862-source-original.tif\n~/Pictures/Mantis/session-2026-10-11/IMG_9863-source-original.tif";
+                    selected: true;
+                    expanded: true;
+                }
+            }
+        }
+
+        GroupHeading { text: "FFNotificationRow crash: unacknowledged, failed, unavailable, acknowledged"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-4;
+                alignment: start;
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "A previous session stopped unexpectedly. One crash report was detected at startup.\n\nReading or closing this notice does not acknowledge the report.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "unacknowledged";
+                    }
+                }
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "A previous session stopped unexpectedly. One crash report was detected at startup.\n\nReading or closing this notice does not acknowledge the report.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "failed";
+                        crash-error: "Permission denied (os error 13)";
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-4;
+                alignment: start;
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "A previous session stopped unexpectedly. One crash report was detected at startup.\n\nReading or closing this notice does not acknowledge the report.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "unavailable";
+                    }
+                }
+                CenterGround {
+                    height: 420px;
+                    FFNotificationRow {
+                        kind: "crash";
+                        title: "Previous session stopped";
+                        context: "Startup · 1 crash report · 16:40";
+                        message: "This crash report was acknowledged. Its original notification remains available for this session.";
+                        selected: true;
+                        expanded: true;
+                        crash-state: "acknowledged";
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Source presentations: List, Image list and Large previews"; }
+        Rectangle {
+            width: 3 * ShellGeometry.image-row-band-width + 2 * Theme.space-4;
+            height: ShellGeometry.image-header-height + 2 * ShellGeometry.large-preview-row-height;
+
+            GroupHeading { x: 0px; y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "LIST"; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "16:42:09"; selected: true; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height + ShellGeometry.image-row-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-success; name: "IMG_9820.tif"; time-text: ""; excluded: true; hovered: true; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height + 2 * ShellGeometry.image-row-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-warning; name: "IMG_9823.tif"; time-text: ""; unresolved: true; focused: true; }
+            FFImageRow { x: 0px; y: ShellGeometry.image-header-height + 3 * ShellGeometry.image-row-height; width: ShellGeometry.image-row-band-width; chip: Theme.accent-default; name: "IMG_9819-long-filename.tif"; time-text: "16:42:09"; dragging: true; }
+            FFDragLandingMarker { x: 0px; y: ShellGeometry.image-header-height + 4 * ShellGeometry.image-row-height; }
+
+            GroupHeading { x: ShellGeometry.image-row-band-width + Theme.space-4; y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "IMAGE LIST"; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "11.10.26 16:42"; selected: true; hovered: true; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; chip: Theme.status-success; name: "IMG_9821.tif"; time-text: ""; preview-state: "loading"; focused: true; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + 2 * ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; chip: Theme.status-failure; name: "IMG_9823.tif"; time-text: ""; preview-state: "missing"; unresolved: true; }
+
+            GroupHeading { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "LARGE PREVIEWS"; }
+            FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; presentation: "large"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "16:42:09"; selected: true; hovered: true; }
+            FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height + ShellGeometry.large-preview-row-height; width: ShellGeometry.image-row-band-width; presentation: "large"; chip: Theme.status-success; name: "IMG_9821.tif"; time-text: ""; preview-state: "unavailable"; job-disabled: true; focused: true; }
+        }
+
+        GroupHeading { text: "Source presentations: empty, tooltip, presentation menu and save error"; }
+        Rectangle {
+            width: 860px;
+            height: 220px;
+            FFPanePlaceholder { x: 0px; y: 0px; title: "No source images"; body: "Add images to begin."; action-label: "Add images"; }
+            FFMenu { x: 240px; y: 0px; width: ShellGeometry.settings-field-width; label: "Image list"; choices: ["List", "Image list", "Large previews"]; choice-ids: ["list", "image-list", "large"]; show-choice-ids: false; selected: "image-list"; open: true; focused: true; }
+            FFErrorRow { x: 400px; y: 0px; width: ShellGeometry.settings-content-width; message: "Could not save settings. Selected view remains active."; show-icon: true; }
+            FFTooltip { x: 400px; y: 48px; tooltip-max-width: parent.width - self.x; text: "IMG_9819-long-filename.tif"; }
+            FFTooltip { x: 400px; y: 120px; tooltip-max-width: parent.width - self.x; text: "IMG_9819.tif"; }
+        }
+
+        GroupHeading { text: "Settings: nav rail, entry default / hover / focus / selected"; }
+        FFNavRail {
+            height: ShellGeometry.settings-rail-top-inset + 4 * ShellGeometry.settings-rail-entry-height;
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+            }
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                hovered: true;
+            }
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                focused: true;
+            }
+            FFNavRailEntry {
+                label: "Storage";
+                icon-source: @image-url("../../../assets/icons/hard-drive.svg");
+                selected: true;
+            }
+        }
+
+        GroupHeading { text: "Settings: nav rail, the live entries"; }
+        FFNavRail {
+            height: ShellGeometry.settings-rail-top-inset + 2 * ShellGeometry.settings-rail-entry-height;
+            FFNavRailEntry {
+                label: "Input map";
+                icon-source: @image-url("../../../assets/icons/keyboard.svg");
+                selected: true;
+            }
+            FFNavRailEntry {
+                label: "Diagnostics";
+                icon-source: @image-url("../../../assets/icons/triangle-alert.svg");
+            }
+        }
+
+        GroupHeading { text: "Settings: section, path rows (present, present, missing, present)"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LOCATIONS";
+                FFSettingsPathRow {
+                    label: "Settings file";
+                    path: "~/.config/focusforge/settings.toml";
+                }
+                FFSettingsPathRow { label: "Logs"; path: "~/.local/share/focusforge/logs"; }
+                FFSettingsPathRow {
+                    label: "Crash reports";
+                    path: "~/.local/share/focusforge/crashes";
+                    missing: true;
+                }
+                FFSettingsPathRow {
+                    label: "Scratch";
+                    path: "~/.local/share/focusforge/scratch";
+                    divider: false;
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: path rows, long path elided, long path and missing (suffix whole), unavailable"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LOCATIONS";
+                FFSettingsPathRow {
+                    label: "Scratch";
+                    path: "/mnt/photography/2026/mantis-series/session-three/focusforge/scratch";
+                }
+                FFSettingsPathRow {
+                    label: "Scratch";
+                    path: "/mnt/photography/2026/mantis-series/session-three/focusforge/scratch";
+                    missing: true;
+                }
+                FFSettingsPathRow { label: "Settings file"; available: false; }
+                FFSettingsPathRow { label: "Logs"; available: false; divider: false; }
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, default (toggle on, backend, empty caps showing the placeholder, budgets, note)"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: ShellGeometry.settings-section-gap;
+
+                FFSettingsSection {
+                    heading: "PROCESSING";
+                    FFSettingsRow {
+                        label: "GPU processing";
+                        align-end: true;
+                        FFToggle { on: true; }
+                    }
+                    FFSettingsRow {
+                        label: "Backend";
+                        FFRowText { text: "gpu — NVIDIA GeForce RTX 5070 Ti"; overflow: elide; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: Theme.space-4;
+
+                    FFSettingsSection {
+                        heading: "LIMITS";
+                        FFSettingsRow {
+                            label: "Host memory cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "No cap"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "No cap"; }
+                        }
+                        FFSettingsRow {
+                            label: "Host budget";
+                            FFRowText { text: "48.0 GiB"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM budget";
+                            FFRowText { text: "15.4 GiB"; }
+                        }
+                    }
+                    FFStatusText {
+                        height: ShellGeometry.settings-status-height;
+                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, states (toggle off, long backend elided, cap typed, cap failure tone, budget not probed yet)"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: ShellGeometry.settings-section-gap;
+
+                FFSettingsSection {
+                    heading: "PROCESSING";
+                    FFSettingsRow {
+                        label: "GPU processing";
+                        align-end: true;
+                        FFToggle { }
+                    }
+                    FFSettingsRow {
+                        label: "Backend";
+                        FFRowText {
+                            text: "cpu — no usable GPU adapter: no suitable adapter was found; continuing on the CPU path";
+                            overflow: elide;
+                        }
+                    }
+                }
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory cap";
+                        align-end: true;
+                        CapFieldSlot { placeholder: "No cap"; text: "2GiB"; }
+                    }
+                    FFSettingsRow {
+                        label: "VRAM cap";
+                        align-end: true;
+                        CapFieldSlot { placeholder: "No cap"; text: "8G"; tone: "failure"; }
+                    }
+                    FFSettingsRow {
+                        label: "Host budget";
+                        FFRowText { text: "48.0 GiB"; }
+                    }
+                    FFSettingsRow {
+                        label: "VRAM budget";
+                        FFRowText { text: "Not probed yet"; muted: true; }
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, no adapter (toggle on and disabled, cpu backend, VRAM cap disabled with Unavailable, budget Unavailable, note)"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: ShellGeometry.settings-section-gap;
+
+                FFSettingsSection {
+                    heading: "PROCESSING";
+                    FFSettingsRow {
+                        label: "GPU processing";
+                        align-end: true;
+                        FFToggle { on: true; disabled: true; }
+                    }
+                    FFSettingsRow {
+                        label: "Backend";
+                        FFRowText { text: "cpu — no GPU adapter found"; }
+                    }
+                }
+                VerticalLayout {
+                    spacing: Theme.space-4;
+
+                    FFSettingsSection {
+                        heading: "LIMITS";
+                        FFSettingsRow {
+                            label: "Host memory cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "No cap"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM cap";
+                            align-end: true;
+                            CapFieldSlot { placeholder: "Unavailable"; enabled: false; }
+                        }
+                        FFSettingsRow {
+                            label: "Host budget";
+                            FFRowText { text: "48.0 GiB"; }
+                        }
+                        FFSettingsRow {
+                            label: "VRAM budget";
+                            FFRowText { text: "Unavailable"; muted: true; }
+                        }
+                    }
+                    FFStatusText {
+                        height: ShellGeometry.settings-status-height;
+                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: toggle, on / off / on and disabled"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFToggle { on: true; }
+            FFToggle { }
+            FFToggle { on: true; disabled: true; }
+        }
+
+        GroupHeading { text: "Settings: action row, idle / busy / refused / succeeded / failed"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "CACHE";
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Deletes cached fuse stages.";
+                    button-text: "Clear cache";
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Deletes cached fuse stages.";
+                    button-text: "Clearing…";
+                    enabled: false;
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Deletes cached fuse stages.";
+                    button-text: "Clear cache";
+                    enabled: false;
+                    status-text: "A run is active.";
+                    status-tone: "warning";
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    helper: "Deletes cached fuse stages.";
+                    button-text: "Clear cache";
+                    status-text: "Cleared 12 stage entries.";
+                    status-tone: "success";
+                }
+                FFSettingsActionRow {
+                    label: "Stage cache";
+                    button-text: "Clear cache";
+                    status-text: "Could not clear the cache: Permission denied.";
+                    status-tone: "failure";
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: status text, none / success / warning / failure, elided, wrapped"; }
+        SettingsGround {
+            VerticalLayout {
+                spacing: Theme.space-2;
+
+                FFStatusText { text: "Nothing to report."; }
+                FFStatusText { text: "Bundle created successfully."; tone: "success"; }
+                FFStatusText {
+                    text: "This file already exists. Creating the bundle will overwrite it.";
+                    tone: "warning";
+                }
+                FFStatusText { text: "Could not write the bundle. Nothing was written."; tone: "failure"; }
+                FFStatusText {
+                    text: "Could not write the bundle: the destination folder is read-only, the disk is full, or the path no longer exists, so nothing was written.";
+                    tone: "failure";
+                    overflow: elide;
+                }
+                FFStatusText {
+                    text: "Not redacted — binary memory contents. Marked in the list above. Share the bundle only with people who may see this machine's memory.";
+                    tone: "warning";
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: row text, plain / muted / accent"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "ROW TEXT";
+                FFSettingsRow {
+                    label: "Plain";
+                    FFRowText { text: "12 files"; }
+                }
+                FFSettingsRow {
+                    label: "Muted";
+                    FFRowText { text: "Unavailable"; muted: true; }
+                }
+                FFSettingsRow {
+                    label: "Accent";
+                    divider: false;
+                    FFRowText { text: "example.org/project"; accent: true; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: wrapped paragraphs 6 px apart, then a Source row with an accent value and no rule"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "NOTICE";
+
+                VerticalLayout {
+                    spacing: ShellGeometry.settings-paragraph-gap;
+
+                    FFRowText { text: "Copyright © 2026 Johannes Sood"; wrap: word-wrap; }
+                    FFRowText {
+                        text: "FocusForge is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License.";
+                        wrap: word-wrap;
+                    }
+                    FFRowText {
+                        text: "This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full license text.";
+                        wrap: word-wrap;
+                    }
+                    FFSettingsRow {
+                        label: "Source";
+                        divider: false;
+                        FFRowText { text: "example.org/project"; accent: true; }
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Input table: header, one-line row, wrapped row, last row without rule"; }
+        SettingsGround {
+            FFInputTableRow {
+                header: true;
+                input-label: "INPUT";
+                stacking-label: "STACKING";
+                editor-label: "EDITOR";
+            }
+            FFInputTableRow {
+                input-label: "wheel";
+                stacking-label: "zoom-at-cursor";
+                editor-label: "zoom-at-cursor";
+            }
+            FFInputTableRow {
+                input-label: "alt+left-click";
+                stacking-label: "pick-source-under-pointer";
+                editor-label: "pick-source-under-pointer";
+            }
+            FFInputTableRow {
+                divider: false;
+                input-label: "ctrl+z / ctrl+shift+z";
+                stacking-label: "—";
+                editor-label: "undo / redo";
+            }
+        }
+
+        GroupHeading { text: "Text field: neutral, warning, failure, disabled, empty with placeholder"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; }
+            FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; tone: "warning"; }
+            FFTextField { field-width: 300px; text: "/nonexistent/focusforge-diagnostics.zip"; tone: "failure"; }
+            FFTextField { field-width: 300px; text: "~/Pictures/focusforge-diagnostics.zip"; enabled: false; }
+            FFTextField { field-width: 300px; placeholder: "No destination chosen"; }
+        }
+
+        GroupHeading { text: "Modal panel: plain, warning rule, caution rule"; }
+        for tone in ["none", "warning", "caution"]: Rectangle {
+            width: 500px;
+            height: 220px;
+            clip: true;
+            FFModalPanel {
+                modal-open: true;
+                tone-rule: tone;
+                panel-width: 440px;
+                panel-height: 180px;
+                FFHeading {
+                    x: Theme.space-4;
+                    y: Theme.space-4;
+                    text: "Panel, tone rule: " + tone;
+                }
+            }
+        }
+
+        GroupHeading { text: "Pane chrome: default, hover, disabled"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFPaneLabel { label: "Composite"; }
+            FFUndockControl { }
+            FFUndockControl { hovered: true; }
+            FFUndockControl { enabled: false; }
+            FFUndockControl { dock-back: true; }
+            FFPane {
+                width: 220px;
+                height: 72px;
+                label: "Selected frame";
+                project-loaded: true;
+                undock-enabled: false;
+            }
+        }
+
+        GroupHeading { text: "Comparison window bar: default, hover, maximized, disabled"; }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+        }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+            hovered-control: "close";
+        }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+            maximized: true;
+        }
+        FFWindowBar {
+            width: 820px;
+            title: "Selected frame";
+            controls-enabled: false;
+        }
+
+        GroupHeading { text: "Export dialog: format settings"; }
+        FFSegmented { width: 252px; segments: ["TIFF", "PNG", "JPEG"]; selected: "PNG"; }
+        Rectangle {
+            width: 528px;
+            height: 150px;
+
+            FFRowText { x: 0px; y: 0px; width: 120px; height: 28px; text: "Quality"; }
+            FFSlider { x: 128px; y: 1px; width: 210px; fraction: 0.94; value-text: "95"; }
+
+            FFRowText { x: 0px; y: 36px; width: 120px; height: 28px; text: "Chroma subsampling"; }
+            FFSegmented { x: 128px; y: 36px; width: 168px; segments: ["4:4:4", "4:2:0"]; selected: "4:2:0"; }
+
+            FFRowText { x: 0px; y: 72px; width: 120px; height: 28px; text: "Compression"; }
+            FFMenu {
+                x: 128px;
+                y: 72px;
+                width: 110px;
+                label: "None";
+                external-list: true;
+                open: true;
+            }
+
+            FFSectionHeading {
+                x: 0px;
+                y: 108px;
+                width: 528px;
+                compact: true;
+                opaque: false;
+                provenance: "explicit";
+                label: "METADATA";
+            }
+            FFRowText { x: 0px; y: 122px; width: 120px; height: 24px; text: "Metadata"; }
+
+            FFMenuList {
+                x: 128px;
+                y: 100px;
+                width: 110px;
+                choices: ["None", "LZW", "Deflate"];
+                choice-ids: ["none", "lzw", "deflate"];
+                show-choice-ids: false;
+                selected: "none";
+            }
+        }
+        FFDialogFooter {
+            width: 528px;
+            cancel-label: "Close";
+            confirm-label: "";
+        }
+
+        GroupHeading { text: "Surfaces / Borders"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.surface-canvas; label: "surface.canvas"; }
+            ColourSwatch { swatch: Theme.surface-base; label: "surface.base"; }
+            ColourSwatch { swatch: Theme.surface-raised; label: "surface.raised"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.surface-overlay; label: "surface.overlay"; }
+            ColourSwatch { swatch: Theme.surface-hover; label: "surface.hover"; }
+            ColourSwatch { swatch: Theme.surface-disabled; label: "surface.disabled"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.border-default; label: "border.default"; }
+            ColourSwatch { swatch: Theme.border-strong; label: "border.strong"; }
+        }
+
+        GroupHeading { text: "Text"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.text-primary; label: "text.primary"; }
+            ColourSwatch { swatch: Theme.text-secondary; label: "text.secondary"; }
+            ColourSwatch { swatch: Theme.text-muted; label: "text.muted"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.text-disabled; label: "text.disabled"; }
+            ColourSwatch { swatch: Theme.text-on-accent; label: "text.onAccent"; }
+            ColourSwatch { swatch: Theme.cursor-ink; label: "cursor.ink"; }
+        }
+
+        GroupHeading { text: "Accent / Status"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.accent-default; label: "accent.default"; }
+            ColourSwatch { swatch: Theme.accent-hover; label: "accent.hover"; }
+            ColourSwatch { swatch: Theme.accent-pressed; label: "accent.pressed"; }
+            ColourSwatch { swatch: Theme.accent-subtle; label: "accent.subtle"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            ColourSwatch { swatch: Theme.status-failure; label: "status.failure"; }
+            ColourSwatch { swatch: Theme.status-warning; label: "status.warning"; }
+            ColourSwatch { swatch: Theme.status-success; label: "status.success"; }
+        }
+
+        GroupHeading { text: "Type"; }
+        TypeSample { role: Theme.text-section; label: "text.section"; }
+        TypeSample { role: Theme.text-body; label: "text.body"; }
+        TypeSample { role: Theme.text-value; label: "text.value"; }
+        TypeSample { role: Theme.text-emphasis; label: "text.emphasis"; }
+        TypeSample { role: Theme.text-title; label: "text.title"; }
+        TypeSample { role: Theme.text-display; label: "text.display"; }
+
+        GroupHeading { text: "Spacing"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            SpacingSample { step: Theme.space-1; label: "space-1"; }
+            SpacingSample { step: Theme.space-2; label: "space-2"; }
+            SpacingSample { step: Theme.space-3; label: "space-3"; }
+            SpacingSample { step: Theme.space-4; label: "space-4"; }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            SpacingSample { step: Theme.space-6; label: "space-6"; }
+            SpacingSample { step: Theme.space-8; label: "space-8"; }
+            SpacingSample { step: Theme.space-12; label: "space-12"; }
+        }
+
+        GroupHeading { text: "Radius"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            RadiusSample { corner: Theme.radius-sm; label: "radius-sm"; }
+            RadiusSample { corner: Theme.radius-md; label: "radius-md"; }
+            RadiusSample { corner: Theme.radius-lg; label: "radius-lg"; }
+            RadiusSample { corner: Theme.radius-full; label: "radius-full"; }
+        }
+
+        GroupHeading { text: "Icon sizes"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            IconSizeSample { icon-size: Theme.icon-lg; label: "icon-lg"; }
+            IconSizeSample { icon-size: Theme.icon-md; label: "icon-md"; }
+            IconSizeSample { icon-size: Theme.icon-sm; label: "icon-sm"; }
+        }
+
+        GroupHeading { text: "Icon button"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFIconButton { icon: @image-url("../../../assets/icons/zoom-out.svg"); }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/arrow-up-down.svg");
+                glyph-size: Theme.icon-sm;
+                pad: Theme.space-1;
+            }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/x.svg");
+                width: ShellGeometry.strip-box-width;
+                height: ShellGeometry.strip-box-height;
+                recolor-on-hover: false;
+            }
+            FFIconButton {
+                icon: @image-url("../../../assets/icons/zoom-out.svg");
+                enabled: false;
+            }
+        }
+
+        GroupHeading { text: "Editor toolbar: sliders, filled and selected icon buttons, inert button"; }
+        Rectangle {
+            height: ShellGeometry.toolbar-height;
+            background: Theme.surface-raised;
+
+            HorizontalLayout {
+                padding-left: Theme.space-3;
+                padding-right: Theme.space-3;
+                spacing: Theme.space-3;
+                alignment: start;
+
+                FFRowText { text: "Size"; width: 32px; muted: true; }
+                FFSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 120px;
+                    compact: true;
+                    fraction: 0.61;
+                    value-text: "64";
+                }
+                FFRowText { text: "Soft"; width: 32px; muted: true; }
+                FFSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 120px;
+                    compact: true;
+                    fraction: 0.3;
+                    value-text: "30%";
+                }
+                FFSlider {
+                    y: (parent.height - self.height) / 2;
+                    width: 120px;
+                    compact: true;
+                    fraction: 0.3;
+                    value-text: "30%";
+                    disabled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/pipette.svg");
+                    filled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/pipette.svg");
+                    filled: true;
+                    selected: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/rotate-ccw.svg");
+                    filled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/rotate-cw.svg");
+                    filled: true;
+                    enabled: false;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/undo-2.svg");
+                    filled: true;
+                }
+                FFIconButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 28px;
+                    height: ShellGeometry.toolbar-button-height;
+                    icon: @image-url("../../../assets/icons/redo-2.svg");
+                    filled: true;
+                    enabled: false;
+                }
+                FFButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 164px;
+                    compact: true;
+                    text: "Save checkpoint";
+                    enabled: false;
+                }
+                FFButton {
+                    y: (parent.height - self.height) / 2;
+                    width: 164px;
+                    compact: true;
+                    text: "Save checkpoint";
+                    enabled: false;
+                    dim-label-only: true;
+                }
+            }
+        }
+
+        GroupHeading { text: "Brush cursor: hard / soft 55 % at radius 64 and 22, picking"; }
+        Rectangle {
+            height: 170px;
+            background: Theme.text-muted;
+
+            HorizontalLayout {
+                padding: Theme.space-4;
+                spacing: Theme.space-6;
+                alignment: start;
+
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 130px;
+                    core-commands: "M 1 65 A 64 64 0 1 1 129 65 A 64 64 0 1 1 1 65";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 130px;
+                    ring-commands: "M 65.00 1.00 A 64 64 0 0 1 76.11 1.97 M 86.89 4.86 A 64 64 0 0 1 97.00 9.57 M 106.14 15.97 A 64 64 0 0 1 114.03 23.86 M 120.43 33.00 A 64 64 0 0 1 125.14 43.11 M 128.03 53.89 A 64 64 0 0 1 129.00 65.00 M 128.03 76.11 A 64 64 0 0 1 125.14 86.89 M 120.43 97.00 A 64 64 0 0 1 114.03 106.14 M 106.14 114.03 A 64 64 0 0 1 97.00 120.43 M 86.89 125.14 A 64 64 0 0 1 76.11 128.03 M 65.00 129.00 A 64 64 0 0 1 53.89 128.03 M 43.11 125.14 A 64 64 0 0 1 33.00 120.43 M 23.86 114.03 A 64 64 0 0 1 15.97 106.14 M 9.57 97.00 A 64 64 0 0 1 4.86 86.89 M 1.97 76.11 A 64 64 0 0 1 1.00 65.00 M 1.97 53.89 A 64 64 0 0 1 4.86 43.11 M 9.57 33.00 A 64 64 0 0 1 15.97 23.86 M 23.86 15.97 A 64 64 0 0 1 33.00 9.57 M 43.11 4.86 A 64 64 0 0 1 53.89 1.97";
+                    core-commands: "M 36.2 65 A 28.8 28.8 0 1 1 93.8 65 A 28.8 28.8 0 1 1 36.2 65";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 46px;
+                    core-commands: "M 1 23 A 22 22 0 1 1 45 23 A 22 22 0 1 1 1 23";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 46px;
+                    ring-commands: "M 23.00 1.00 A 22 22 0 0 1 34.00 3.95 M 42.05 12.00 A 22 22 0 0 1 45.00 23.00 M 42.05 34.00 A 22 22 0 0 1 34.00 42.05 M 23.00 45.00 A 22 22 0 0 1 12.00 42.05 M 3.95 34.00 A 22 22 0 0 1 1.00 23.00 M 3.95 12.00 A 22 22 0 0 1 12.00 3.95";
+                    core-commands: "M 13.1 23 A 9.9 9.9 0 1 1 32.9 23 A 9.9 9.9 0 1 1 13.1 23";
+                }
+                FFBrushCursor {
+                    y: (parent.height - self.height) / 2;
+                    extent: 46px;
+                    picking: true;
+                    pick-color: Theme.status-warning;
+                }
+            }
+        }
+
+        GroupHeading { text: "FFManifestList"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFManifestList {
+                height: 170px;
+                rows: [
+                    { name: "diagnostics.log", value: "412 KB", not-redacted: false },
+                    { name: "diagnostics.log.1", value: "1.0 MB", not-redacted: false },
+                    { name: "panic-2026-09-15T10-22-01.json", value: "8 KB", not-redacted: false },
+                    { name: "system-summary.txt", value: "2 KB", not-redacted: false },
+                    {
+                        name: "crash-2026-09-18T09-03-12.dmp",
+                        value: "8.2 MB · not redacted",
+                        not-redacted: true,
+                    },
+                    {
+                        name: "crashes/crash-2026-09-18T09-03-12-focusforge-gui-pid-48213-thread-main.dmp",
+                        value: "2.4 MB · not redacted",
+                        not-redacted: true,
+                    },
+                ];
+            }
+            FFManifestList {
+                note: "No logs or crash evidence were found.";
+            }
+        }
+
+        GroupHeading { text: "Settings panel: section heading"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFSectionHeading { width: 160px; label: "PREPARE"; provenance: "pending"; }
+            FFSectionHeading { width: 160px; label: "FUSE"; provenance: "default"; }
+            FFSectionHeading { width: 160px; label: "ALIGN"; provenance: "explicit"; }
+            FFSectionHeading { width: 160px; label: "FINISH"; provenance: "pending"; }
+        }
+
+        GroupHeading { text: "Settings panel: slider"; }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Score Radius";
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Score Radius (disabled)";
+            disabled: true;
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; disabled: true; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Epsilon (px)";
+            FFSlider { scale: "logarithmic"; fraction: 0.5556; value-text: "0.0001"; }
+        }
+
+        GroupHeading { text: "Settings panel: slider, signed readout"; }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops)";
+            FFSlider { scale: "linear"; fraction: 0.0; value-text: "\u{2212}0.5"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops)";
+            FFSlider { scale: "linear"; fraction: 0.5; value-text: "0.0"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops)";
+            FFSlider { scale: "linear"; fraction: 1.0; value-text: "+0.5"; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Target (stops, disabled)";
+            disabled: true;
+            FFSlider { scale: "linear"; fraction: 0.3; value-text: "\u{2212}0.2"; disabled: true; }
+        }
+
+        GroupHeading { text: "Settings panel: field states"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFField { width: 90px; text: "4"; }
+            FFField { width: 90px; text: "4"; hovered: true; }
+            FFField { width: 90px; text: "4"; focused: true; }
+            FFField { width: 90px; text: "4"; disabled: true; }
+            FFField { width: 90px; text: "4"; invalid: true; }
+        }
+
+        GroupHeading { text: "Settings panel: toggle"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFToggle { on: true; }
+            FFToggle { on: false; }
+            FFToggle { on: true; disabled: true; }
+        }
+
+        GroupHeading { text: "Settings panel: picker (closed)"; }
+        FFMenu {
+            width: 220px;
+            label: "Option A";
+            choices: ["Option A", "Option B"];
+            choice-ids: ["option-a", "option-b"];
+            selected: "option-a";
+        }
+
+        GroupHeading { text: "Settings panel: picker (open)"; }
+        Rectangle {
+            width: 220px;
+            height: 120px;
+            FFMenu {
+                width: 220px;
+                label: "Option A";
+                choices: ["Option A", "Option B"];
+                choice-ids: ["option-a", "option-b"];
+                selected: "option-a";
+                open: true;
+            }
+        }
+
+        GroupHeading { text: "Settings panel: bool row + error row"; }
+        HorizontalLayout {
+            width: 320px;
+            alignment: space-between;
+            FFRowText { text: "Auto-crop"; }
+            FFToggle { on: true; }
+        }
+        FFErrorRow { width: 320px; message: "epsilon-px: out of range"; }
+
+        GroupHeading { text: "Settings panel: more fold-out"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            for state in ["default", "hover", "focus", "disabled"]: VerticalLayout {
+                width: 260px;
+                spacing: Theme.space-3;
+                FFMoreToggle {
+                    height: ShellGeometry.more-height;
+                    hovered: state == "hover";
+                    focused: state == "focus";
+                    disabled: state == "disabled";
+                }
+                FFMoreToggle {
+                    open: true;
+                    height: ShellGeometry.more-height + ShellGeometry.more-gap + ShellGeometry.param-label-height + ShellGeometry.param-row-linear;
+                    hovered: state == "hover";
+                    focused: state == "focus";
+                    disabled: state == "disabled";
+                    FFRowLabel {
+                        x: ShellGeometry.dock-content-inset;
+                        y: ShellGeometry.more-height + ShellGeometry.more-gap;
+                        width: ShellGeometry.panel-content-width;
+                        label-text: "Levels";
+                        FFSlider {
+                            scale: "linear";
+                            fraction: 0.4;
+                            value-text: "5";
+                            recessed: true;
+                            disabled: state == "disabled";
+                        }
+                    }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings panel: scrollbar + reset-all"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFScrollbar { height: 80px; content-height: 400px; viewport-height: 80px; offset: 40px; }
+            FFResetAll { width: 220px; enabled: true; }
+            FFResetAll { width: 220px; enabled: false; }
+        }
+
+        GroupHeading { text: "Toolbar: transport button"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "▶"; text: "Fuse stack"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "⏸"; text: "Pause"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "▶"; text: "Resume"; }
+            FFButton { width: 116px; compact: true; kind: "default"; glyph: "☐"; text: "Cancel"; }
+            FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
+            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
+            FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
+            FFButton {
+                width: 140px;
+                kind: "primary";
+                has-icon: true;
+                icon-source: @image-url("../../../assets/icons/download.svg");
+                text: "Create bundle";
+            }
+        }
+
+        GroupHeading { text: "Bottom bar: progress track"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFProgressBar { width: 400px; tone: "running"; fraction: 0.62; }
+            FFProgressBar { width: 400px; tone: "held"; fraction: 0.62; }
+            FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
+            FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
+            FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
+        }
+
+        GroupHeading { text: "Loading indicator"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFSpinner {}
+            FFLoadingPanel { caption: "Loading…"; }
+        }
+
+        GroupHeading { text: "Canvas: pane placeholder"; }
+        FFPanePlaceholder { }
+
+        GroupHeading { text: "Checkpoints list: row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFSectionHeading {
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: "TODAY";
+                compact: true;
+                opaque: false;
+            }
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "16:42:08";
+                selected: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:58:30";
+                deletable: true;
+                hovered: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:12:44";
+                deletable: true;
+            }
+            FFSectionHeading {
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: "YESTERDAY";
+                compact: true;
+                opaque: false;
+            }
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "21:08:12";
+            }
+        }
+
+        GroupHeading { text: "Checkpoints list: fresh row, tint at its peak"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFCheckpointRow {
+                algorithm: "Laplacian Pyramid";
+                time-text: "16:43:01";
+                selected: true;
+                flash-held: true;
+            }
+            FFCheckpointRow {
+                algorithm: "dwt-wavelet";
+                time-text: "15:58:30";
+                deletable: true;
+            }
+        }
+
+        GroupHeading { text: "Checkpoints list: last row, hovered"; }
+        FFCheckpointRow {
+            algorithm: "Laplacian Pyramid";
+            time-text: "16:42:08";
+            selected: true;
+            hovered: true;
+            deletable: false;
+        }
+
+        GroupHeading { text: "Images list: legend row"; }
+        VerticalLayout {
+            spacing: 0px;
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-failure;
+                name: "IMG_9811";
+                time-text: "1";
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-warning;
+                name: "IMG_9812";
+                time-text: "2";
+                hovered: true;
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.accent-default;
+                name: "IMG_9815";
+                time-text: "";
+                unresolved: true;
+            }
+            FFImageRow {
+                width: 248px;
+                legend: true;
+                mutable: false;
+                chip: Theme.status-success;
+                name: "IMG_9816";
+                time-text: "6";
+                selected: true;
+            }
+        }
+
+        Rectangle {
+            width: 200px;
+            height: 48px;
+            FFMenuList {
+                width: 200px;
+                choices: ["Name", "Capture time"];
+                choice-ids: ["name", "capture-time"];
+                show-choice-ids: false;
+                selected: "name";
+            }
+        }
+
+        GroupHeading { text: "Dialog footer"; }
+        FFDialogFooter {
+            width: 480px;
+            secondary-label: "New project instead";
+            confirm-label: "Add and re-fuse";
+        }
+
+        GroupHeading { text: "Dialog footer: renamed cancel button"; }
+        FFDialogFooter {
+            width: 480px;
+            cancel-label: "Discard";
+            confirm-label: "Keep";
+        }
+
+        GroupHeading { text: "Dialog: warning, with a secondary button"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                title: "Add 3 frames and fuse again?";
+                body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
+                info: "Or start a new project with the same settings instead.";
+                secondary-label: "New project instead";
+                confirm-label: "Add and re-fuse";
+            }
+        }
+
+        GroupHeading { text: "Dialog: warning, Remove's own footer"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                title: "Remove and fuse again?";
+                body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
+                info: "You can also start a new project with the same settings instead.";
+                secondary-label: "Exclude instead";
+                confirm-label: "Remove and re-fuse";
+            }
+        }
+
+        GroupHeading { text: "Dialog: caution"; }
+        Rectangle {
+            width: 560px;
+            height: 350px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "caution";
+                panel-width: 540px;
+                panel-height: 330px;
+                title: "The frames are no longer there";
+                context: "demo.ffp";
+                body: "A project remembers its frames by path. 2 of 3 cannot be found in this location.\n\nHistory and Z-Map are complete. Fused results still show; edited checkpoints and re-fusing need the frames.";
+                info: "The Projects overlay shows the same condition as a \"Sources missing\" card.";
+                cancel-label: "Close";
+                confirm-label: "Locate frames…";
+                confirm-kind: "default";
+            }
+        }
+
+        GroupHeading { text: "Dialog: warning, danger confirm (600×362)"; }
+        Rectangle {
+            width: 620px;
+            height: 382px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                panel-width: 600px;
+                panel-height: 362px;
+                title: "The source frames are not the same";
+                context: "demo.ffp";
+                body: "The project was made over 3 frames. The frames in this location give a different fingerprint.\n\nThe Z-Map records, for every pixel, which frame it came from — by that frame's place in the row. If the row is wrong, every retouch points at the wrong frame.";
+                info: "Finding the original frames again opens the project unchanged.";
+                secondary-label: "Locate frames…";
+                confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: delete a checkpoint"; }
+        Rectangle {
+            width: 580px;
+            height: 336px;
+            clip: true;
+            FFCheckpointDelete {
+                width: 100%;
+                height: 100%;
+                open: true;
+                context: "Laplacian Pyramid · 15:47:02";
+                body: "The other 3 checkpoints are untouched, and the stack is not fused again.";
+            }
+        }
+
+        GroupHeading { text: "Dialog: save, with a context line"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "save";
+                title: "Save this state first?";
+                context: "Closing IMG_9801-9861";
+                body: "2 checkpoints have been fused since the last save. They belong to no saved project.\n\nClosing without saving loses them.";
+                info: "Saving adds them to IMG_9801-9861.ffp.";
+                secondary-label: "Save and close";
+                confirm-label: "Close without saving";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: header status glyph"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFStatusGlyph { kind: "swatch"; }
+            FFStatusGlyph { kind: "circle"; }
+        }
+
+        GroupHeading { text: "Dialog: heading"; }
+        VerticalLayout {
+            spacing: Theme.space-2;
+            FFHeading { text: "Export image"; }
+            FFHeading { text: "Can't export this position"; tone: "failure"; size: "body"; }
+        }
+
+        GroupHeading { text: "Dialog: divider"; }
+        FFDivider { width: 300px; }
+
+        GroupHeading { text: "Dialog: segmented selector"; }
+        FFSegmented { width: 168px; segments: ["TIFF", "JPEG"]; selected: "TIFF"; }
+
+        GroupHeading { text: "Projects overlay: chip"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFChip { text: "UNSAVED"; tone: "accent"; }
+            FFChip { text: "CURRENT"; tone: "accent"; }
+            FFChip { text: "MUTED"; tone: "muted"; }
+        }
+
+        GroupHeading { text: "Projects overlay: outlined button"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFButton { width: 130px; height: 30px; kind: "outlined"; text: "Run again"; }
+            FFButton { width: 130px; height: 30px; kind: "outlined"; text: "Locate frames…"; }
+        }
+
+        GroupHeading { text: "Projects overlay: card, every kind"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFProjectCard {
+                kind: "open";
+                opened: true;
+                current: true;
+                unsaved: true;
+                project-name: "IMG_9801-9861";
+                meta-text: "61 frames · 4 checkpoints";
+            }
+            FFProjectCard {
+                kind: "open";
+                opened: true;
+                fusing: true;
+                fusing-fraction: 0.42;
+                project-name: "IMG_9941-9977";
+                meta-text: "37 frames · aligning, 15 of 37";
+            }
+            FFProjectCard {
+                kind: "failed";
+                opened: true;
+                current: true;
+                glyph: @image-url("../../../assets/icons/triangle-alert.svg");
+                headline: "Did not stack";
+                stage: "FAILED WHILE ALIGNING";
+                reason: "Frames 12 and 13 share no overlap. Alignment stopped there.";
+                action-label: "Run again";
+                project-name: "IMG_9862-9903";
+                meta-text: "42 frames · 1 checkpoint";
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            FFProjectCard {
+                kind: "sources-missing";
+                opened: true;
+                unsaved: true;
+                glyph: @image-url("../../../assets/icons/circle-alert.svg");
+                headline: "Sources missing";
+                stage: "NOTHING TO SHOW";
+                reason: "The project points at frames that are not where it left them.";
+                action-label: "Locate frames…";
+                project-name: "IMG_9978-9994";
+                meta-text: "17 frames · 3 checkpoints";
+            }
+            FFProjectCard {
+                kind: "cancelled";
+                opened: true;
+                glyph: @image-url("../../../assets/icons/x.svg");
+                headline: "Cancelled";
+                stage: "STOPPED WHILE FUSING";
+                reason: "You stopped this one. Nothing was written.";
+                action-label: "Run again";
+                project-name: "IMG_10062-10090";
+                meta-text: "29 frames · 2 checkpoints";
+            }
+            FFProjectCard {
+                kind: "not-a-project";
+                glyph: @image-url("../../../assets/icons/folder.svg");
+                headline: "Not a project";
+                stage: "LEFT ALONE";
+                reason: "This folder holds something else. Nothing was read and nothing was changed.";
+                action-label: "";
+                project-name: "contact-sheets";
+                meta-text: "not read · not changed";
+            }
+        }
+    }
+    }
+}

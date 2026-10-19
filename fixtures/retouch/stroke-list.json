@@ -1,0 +1,26 @@
+[
+  {
+    "brush-stroke": {
+      "source_id": 2,
+      "path": [{ "x": 120, "y": 256 }, { "x": 380, "y": 256 }],
+      "radius": 18.0,
+      "softness": 0.3
+    }
+  },
+  {
+    "brush-stroke": {
+      "source_id": 5,
+      "path": [{ "x": 470, "y": 100 }, { "x": 540, "y": 130 }],
+      "radius": 24.0,
+      "softness": 0.4
+    }
+  },
+  {
+    "brush-stroke": {
+      "source_id": 6,
+      "path": [{ "x": 150, "y": 256 }, { "x": 300, "y": 256 }],
+      "radius": 12.0,
+      "softness": 0.2
+    }
+  }
+]

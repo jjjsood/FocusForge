@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFDragLandingMarker inherits Rectangle {
+    width: ShellGeometry.image-row-band-width;
+    height: ShellGeometry.pane-divider;
+    background: Theme.accent-default;
+}

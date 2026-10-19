@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The checkpoint panel: a `CHECKPOINTS` heading row with `Export image`,
+// then the empty-state line or a fixed four-row scrolling list.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFButton } from "../../components/ff_button.slint";
+import { FFCheckpointRow } from "../../components/ff_checkpoint_row.slint";
+import { FFSectionHeading } from "../../components/ff_section_heading.slint";
+import { FFScrollbar } from "../../components/ff_scrollbar.slint";
+
+/// One entry of the panel's flat list -- the `.slint` twin of
+/// `crate::checkpoints::CheckpointEntry`. `kind` is `"separator"` or
+/// `"row"`; `label` is the separator's own day text, meaningless off a
+/// `"separator"` entry.
+export struct CheckpointEntryView {
+    kind: string,
+    label: string,
+    algorithm: string,
+    time-text: string,
+    top: length,
+    selected: bool,
+    // Plays the row's one-shot flash.
+    flash: bool,
+    // Whether the row offers its delete control.
+    deletable: bool,
+    // A separator's own next separator's `top`; a very large value with no
+    // next one, so it never pushes -- meaningless on a `"row"` entry.
+    next-separator-top: length,
+}
+
+export component FFCheckpointPanel inherits Rectangle {
+    callback checkpoint-export-requested();
+    callback checkpoint-selected(int);
+    callback checkpoint-delete-requested(int);
+    callback checkpoint-scrolled(length);
+    callback checkpoint-scrollbar-pointer(int, length);
+    callback checkpoint-scrollbar-dragged(length);
+    callback checkpoint-viewport-height-changed(length);
+    // The list's viewport height, read once at install: a fixed height never
+    // fires `checkpoint-viewport-height-changed`.
+    out property <length> viewport-height: list-wrap.height;
+    // The empty-state line, shown only while `rows` is empty.
+    in property <string> line: "None yet — fuse a stack";
+    in property <bool> export-enabled: false;
+    in property <[CheckpointEntryView]> rows: [];
+    // The list's own scroll offset and total row height -- both computed in
+    // Rust, the `FFImagesPanel` `scroll-y`/`content-height` twins.
+    in property <length> scroll-y: 0px;
+    in property <length> content-height: 0px;
+    // The list's top: below the heading row and a `space-2` gap.
+    property <length> content-top: Theme.space-3 + ShellGeometry.checkpoint-heading-height + Theme.space-2;
+    height: root.content-top
+        + (root.rows.length > 0 ? 4 * ShellGeometry.checkpoint-row-height : Theme.text-body.size * Theme.text-body.line-height)
+        + (root.rows.length > 0 ? Theme.space-3 : Theme.space-8);
+
+    VerticalLayout {
+        padding-left: Theme.space-1;
+        padding-right: Theme.space-1;
+        padding-top: Theme.space-3;
+        padding-bottom: Theme.space-8;
+
+        heading-row := HorizontalLayout {
+            height: ShellGeometry.checkpoint-heading-height;
+            alignment: space-between;
+
+            Text {
+                text: "CHECKPOINTS";
+                color: Theme.text-secondary;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+                letter-spacing: Theme.text-section.letter-spacing;
+                vertical-alignment: center;
+            }
+
+            VerticalLayout {
+                alignment: center;
+
+                checkpoint-export := FFButton {
+                    kind: "default";
+                    compact: true;
+                    has-icon: true;
+                    icon-source: @image-url("../../../../../assets/icons/download.svg");
+                    text: "Export image";
+                    enabled: root.export-enabled;
+                    clicked => { root.checkpoint-export-requested(); }
+                }
+            }
+        }
+
+        if root.rows.length == 0: empty-note := Text {
+            text: root.line;
+            min-height: Theme.text-body.size * Theme.text-body.line-height;
+            vertical-alignment: center;
+            color: Theme.text-disabled;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            wrap: word-wrap;
+        }
+    }
+
+    // Positioned outside the header's own padded layout: a row's fixed
+    // band width reaches `dock-band-inset` from the dock's edge, 2 px
+    // (`dock-content-inset - dock-band-inset`) further out than the
+    // header's own content column, so the list sits that far further left.
+    list-wrap := Rectangle {
+        visible: root.rows.length > 0;
+        clip: true;
+        x: -(ShellGeometry.dock-content-inset - ShellGeometry.dock-band-inset);
+        y: root.content-top;
+        width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-band-inset;
+        height: 4 * ShellGeometry.checkpoint-row-height;
+
+        changed height => { root.checkpoint-viewport-height-changed(self.height); }
+
+        hit-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            scroll-event(event) => {
+                root.checkpoint-scrolled(-event.delta-y);
+                accept
+            }
+        }
+
+        content := Rectangle {
+            x: 0px;
+            y: -root.scroll-y;
+            width: parent.width;
+            height: root.content-height;
+
+            for row[i] in root.rows: Rectangle {
+                y: row.top;
+                width: parent.width;
+                height: row.kind == "separator" ? ShellGeometry.day-separator-height : ShellGeometry.checkpoint-row-height;
+
+                if row.kind == "separator": FFSectionHeading {
+                    width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                    label: row.label;
+                    compact: true;
+                    opaque: false;
+                }
+                if row.kind == "row": FFCheckpointRow {
+                    algorithm: row.algorithm;
+                    time-text: row.time-text;
+                    selected: row.selected;
+                    flash: row.flash;
+                    deletable: row.deletable;
+                    clicked => { root.checkpoint-selected(i); }
+                    delete-requested => { root.checkpoint-delete-requested(i); }
+                }
+            }
+        }
+
+        // The sticky day header: a separator stays pinned at the list's top
+        // from its own `top` until the next separator's `top` reaches it,
+        // then slides out as that one slides in.
+        for row[i] in root.rows: Rectangle {
+            if row.kind == "separator": FFSectionHeading {
+                x: 0px;
+                width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset;
+                label: row.label;
+                compact: true;
+                visible: row.top <= root.scroll-y && root.scroll-y < row.next-separator-top;
+                y: min(0px, row.next-separator-top - root.scroll-y - ShellGeometry.day-separator-height);
+            }
+        }
+
+        scrollbar := FFScrollbar {
+            x: parent.width - self.width;
+            y: 0px;
+            height: parent.height;
+            content-height: root.content-height;
+            viewport-height: parent.height;
+            offset: root.scroll-y;
+            pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
+            dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
+        }
+    }
+}

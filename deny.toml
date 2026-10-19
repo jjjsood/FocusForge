@@ -1,0 +1,86 @@
+# GPLv3-compatible license allowlist, current SPDX spelling.
+#
+# Slint's own license expression -- `GPL-3.0-only OR
+# LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0` (same
+# for every `i-slint-*` crate) -- is satisfied by the `GPL-3.0-only` arm
+# alone, already allowed below.
+
+# Optional dependencies are resolved too, so a crate that only an
+# off-by-default feature pulls in still has to pass the licence check.
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "GPL-3.0-or-later",
+    "GPL-3.0-only",
+    "LGPL-2.1-or-later",
+    "LGPL-2.1-only",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",       # foldhash, slotmap (wgpu-hal tree)
+    "ISC",        # libloading (wgpu-hal tree)
+    "CC0-1.0",    # hexf-parse (naga, via wgpu)
+]
+
+# BSL-1.0, via `copypasta` <- `i-slint-backend-winit`'s clipboard support;
+# Boost Software License 1.0 is on the FSF's GPL-compatible free-license list.
+[[licenses.exceptions]]
+name = "clipboard-win"
+allow = ["BSL-1.0"]
+
+# BSL-1.0, via the same clipboard-win path.
+[[licenses.exceptions]]
+name = "error-code"
+allow = ["BSL-1.0"]
+
+# MIT/Apache-2.0/NCSA, via `rav1e` <- `ravif` <- `image` <-
+# `i-slint-compiler`/`i-slint-core`, a fuzzing-only dependency never linked
+# into this workspace's own code; NCSA is on the FSF's GPL-compatible list.
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+allow = ["MIT", "Apache-2.0", "NCSA"]
+
+[[licenses.exceptions]]
+name = "rawler"
+allow = ["LGPL-2.1"]
+
+# JPEG export encoder; its Independent JPEG Group derivative clause sits
+# alongside its dual MIT/Apache-2.0 grant.
+[[licenses.exceptions]]
+name = "jpeg-encoder"
+allow = ["IJG"]
+
+# Reached only through Slint; no fixed version exists. Revisit on a Slint bump.
+[advisories]
+ignore = [
+    # paste v1.0.15, via paste -> pulp -> exr -> image ->
+    # (i-slint-compiler, i-slint-core, slint) -> focusforge-gui
+    { id = "RUSTSEC-2024-0436", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # rustybuzz v0.20.1, via rustybuzz -> usvg -> resvg ->
+    # (i-slint-common, i-slint-compiler, i-slint-core) -> focusforge-gui
+    { id = "RUSTSEC-2026-0206", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # ttf-parser v0.25.1, via ttf-parser -> fontdb -> usvg -> resvg ->
+    # (i-slint-common, i-slint-compiler, i-slint-core) -> focusforge-gui
+    { id = "RUSTSEC-2026-0192", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # zvariant, zbus_names and zvariant_derive (the zbus family), via zbus ->
+    # (i-slint-backend-winit -> slint, notify-rust) -> focusforge-gui
+    { id = "RUSTSEC-2026-0370", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or notify-rust version bump" },
+    { id = "RUSTSEC-2026-0371", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or notify-rust version bump" },
+    { id = "RUSTSEC-2026-0372", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or notify-rust version bump" },
+]
+
+# `akaze` is taken from the one git revision that carries the detector fixes
+# its last crates.io release lacks (crates/core/Cargo.toml).
+[sources]
+allow-git = ["https://github.com/rust-cv/cv"]
+
+# wgpu is pinned to one major version by Slint's `unstable-wgpu-29` feature
+# (crates/gpu/src/lib.rs); this bans a second wgpu major by name.
+[[bans.deny]]
+name = "wgpu"
+deny-multiple-versions = true

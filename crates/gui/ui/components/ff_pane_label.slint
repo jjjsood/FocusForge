@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFPaneLabel inherits Rectangle {
+    in property <string> label: "";
+
+    width: ShellGeometry.pane-label-width;
+    height: ShellGeometry.pane-label-height;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}

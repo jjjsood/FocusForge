@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The Performance section's content: GPU processing, the two budget caps
+// and the budgets they lower.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFToggle } from "../../components/ff_toggle.slint";
+import { FFTextField } from "../../components/ff_text_field.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFSettingsRow } from "../../components/ff_settings_row.slint";
+import { FFRowText } from "../../components/ff_row_text.slint";
+import { FFStatusText } from "../../components/ff_status_text.slint";
+
+export struct PerformanceCap {
+    text: string,
+    placeholder: string,
+    invalid: bool,
+    enabled: bool,
+    scroll-offset: length,
+}
+
+export struct PerformanceState {
+    gpu: bool,
+    gpu-enabled: bool,
+    backend: string,
+    host-cap: PerformanceCap,
+    vram-cap: PerformanceCap,
+    host-budget: string,
+    vram-budget: string,
+    vram-budget-known: bool,
+    note: string,
+}
+
+export component FFPerformanceTab inherits Rectangle {
+    in property <PerformanceState> performance;
+    callback gpu-toggled(bool);
+    callback host-cap-edited(string);
+    callback vram-cap-edited(string);
+    callback host-cap-cursor-moved(length, length);
+    callback vram-cap-cursor-moved(length, length);
+
+    VerticalLayout {
+        padding-left: ShellGeometry.settings-content-inset-left;
+        padding-right: ShellGeometry.settings-content-inset-right;
+        padding-top: ShellGeometry.settings-content-inset-top;
+        padding-bottom: ShellGeometry.settings-content-inset-bottom;
+        spacing: ShellGeometry.settings-section-gap;
+        alignment: start;
+
+        FFSettingsSection {
+            heading: "PROCESSING";
+
+            FFSettingsRow {
+                label: "GPU processing";
+                align-end: true;
+
+                FFToggle {
+                    name: "GPU processing";
+                    on: root.performance.gpu;
+                    disabled: !root.performance.gpu-enabled;
+                    toggled => { root.gpu-toggled(!root.performance.gpu); }
+                }
+            }
+
+            FFSettingsRow {
+                label: "Backend";
+
+                FFRowText {
+                    text: root.performance.backend;
+                    overflow: elide;
+                }
+            }
+        }
+
+        VerticalLayout {
+            spacing: Theme.space-4;
+
+            FFSettingsSection {
+                heading: "LIMITS";
+
+                FFSettingsRow {
+                    label: "Host memory cap";
+                    align-end: true;
+
+                    // The field grows by 2 px on every edge when emphasised;
+                    // its slot keeps the unemphasised size.
+                    Rectangle {
+                        width: ShellGeometry.settings-field-width;
+                        height: ShellGeometry.field-height;
+
+                        FFTextField {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            text: root.performance.host-cap.text;
+                            placeholder: root.performance.host-cap.placeholder;
+                            tone: root.performance.host-cap.invalid ? "failure" : "neutral";
+                            enabled: root.performance.host-cap.enabled;
+                            field-width: parent.width;
+                            scroll-offset: root.performance.host-cap.scroll-offset;
+                            edited(text) => { root.host-cap-edited(text); }
+                            cursor-moved(x, w) => { root.host-cap-cursor-moved(x, w); }
+                        }
+                    }
+                }
+
+                FFSettingsRow {
+                    label: "VRAM cap";
+                    align-end: true;
+
+                    Rectangle {
+                        width: ShellGeometry.settings-field-width;
+                        height: ShellGeometry.field-height;
+
+                        FFTextField {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            text: root.performance.vram-cap.text;
+                            placeholder: root.performance.vram-cap.placeholder;
+                            tone: root.performance.vram-cap.invalid ? "failure" : "neutral";
+                            enabled: root.performance.vram-cap.enabled;
+                            field-width: parent.width;
+                            scroll-offset: root.performance.vram-cap.scroll-offset;
+                            edited(text) => { root.vram-cap-edited(text); }
+                            cursor-moved(x, w) => { root.vram-cap-cursor-moved(x, w); }
+                        }
+                    }
+                }
+
+                FFSettingsRow {
+                    label: "Host budget";
+
+                    FFRowText { text: root.performance.host-budget; }
+                }
+
+                FFSettingsRow {
+                    label: "VRAM budget";
+
+                    FFRowText {
+                        text: root.performance.vram-budget;
+                        muted: !root.performance.vram-budget-known;
+                    }
+                }
+            }
+
+            FFStatusText {
+                height: ShellGeometry.settings-status-height;
+                text: root.performance.note;
+            }
+        }
+    }
+}

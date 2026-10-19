@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The bottom bar's zoom cluster: the control, the readout and `Fit`,
+// governing both panes, so it lives here rather than in either pane.
+
+import { Theme } from "../../theme.slint";
+import { FFIconButton } from "../../components/ff_icon_button.slint";
+
+// The zoom button box is 32px square (`Theme.icon-md` plus a full
+// `Theme.space-2` pad on every side), so the cluster's own height follows
+// that token rather than a pinned value, and everything else in the cluster
+// matches it for one shared baseline. At the bar's right end, mirroring the
+// gear's `Theme.space-3` inset at the left: `zoom-group 120 (32+56+32, one
+// shared surface) | 16 | Fit 80` -- 120+16+80 = 216. Zoom-out, the readout
+// and zoom-in share one rounded surface -- the same track-plus-segments
+// idiom `FFModeSwitch` uses -- so they read as one control rather than
+// three floating pieces, with `Fit` kept visually separate by a full
+// `Theme.space-4` gap as its own action.
+export component FFZoomCluster inherits Rectangle {
+    in property <string> readout: "";
+    // Whether a project is open, so the readout, the zoom buttons and `Fit`
+    // grey out together instead of only the readout going blank -- there is
+    // nothing to zoom or fit before a project is loaded.
+    in property <bool> project-loaded: false;
+    callback zoom-in-requested();
+    callback zoom-out-requested();
+    callback zoom-fit-requested();
+
+    width: 216px;
+    height: zoom-group.height;
+
+    // The shared "track": one rounded surface behind zoom-out, the readout
+    // and zoom-in, with no gap between them -- this is what makes the three
+    // read as one element. Anonymous (not its own `component`), so
+    // `zoom-out`/`zoom-in` keep the qualified ids `FFZoomCluster::zoom-out`
+    // / `zoom-in`. Its height follows the icon buttons' own token-derived
+    // height, never a repeated literal.
+    zoom-group := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 120px;
+        height: zoom-out.height;
+        background: Theme.surface-overlay;
+        border-radius: Theme.radius-sm;
+
+        zoom-out := FFIconButton {
+            name: "Zoom out";
+            x: 0px;
+            y: 0px;
+            enabled: root.project-loaded;
+            icon: @image-url("../../../../../assets/icons/zoom-out.svg");
+            triggered => { root.zoom-out-requested(); }
+        }
+
+        zoom-readout := Text {
+            x: zoom-out.x + zoom-out.width;
+            y: 0px;
+            width: 56px;
+            height: zoom-group.height;
+            // Dimmed the same way the zoom buttons are.
+            opacity: root.project-loaded ? 1.0 : 0.5;
+            // A project-less window has nothing to report a percentage
+            // for -- an em dash rather than a blank space, matching the
+            // app's own "no binding here" convention
+            // (`crate::input_map::Binding`'s `None` column).
+            text: root.readout == "" ? "—" : root.readout;
+            color: Theme.text-secondary;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        zoom-in := FFIconButton {
+            name: "Zoom in";
+            x: zoom-readout.x + zoom-readout.width;
+            y: 0px;
+            enabled: root.project-loaded;
+            icon: @image-url("../../../../../assets/icons/zoom-in.svg");
+            triggered => { root.zoom-in-requested(); }
+        }
+    }
+
+    zoom-fit := Rectangle {
+        // A full step of breathing room ahead of `Fit` (`Theme.space-4`),
+        // separating it from the zoom group above.
+        x: zoom-group.x + zoom-group.width + Theme.space-4;
+        y: 0px;
+        width: 80px;
+        height: zoom-group.height;
+        background: fit-area.has-hover && root.project-loaded ? Theme.surface-hover : Theme.surface-overlay;
+        border-radius: Theme.radius-sm;
+        opacity: root.project-loaded ? 1.0 : 0.5;
+        accessible-role: button;
+        accessible-enabled: root.project-loaded;
+
+        fit-area := TouchArea {
+            enabled: root.project-loaded;
+            clicked => { root.zoom-fit-requested(); }
+        }
+        Text {
+            text: "Fit";
+            color: Theme.text-primary;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}

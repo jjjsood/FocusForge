@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The tab strip doubles as the title bar. Holds project tabs, the drag
+// region, and the three window-control glyphs.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFChip } from "../components/ff_chip.slint";
+import { FFIconButton } from "../components/ff_icon_button.slint";
+
+// One open project's tab -- the plain twin of `crate::controller::ProjectTabView`.
+export struct ProjectTabView {
+    title: string,
+    unsaved: bool,
+    selected: bool,
+    // "" idle, "play" running/paused/cancelling, "ellipsis" waiting.
+    run-mark-icon: string,
+}
+
+// The one box every element of the tab strip is drawn in -- projects
+// button, scroll arrows, each tab and "+". Shared so their top edge, height
+// and frame cannot drift apart: a 1px `Theme.border-default` frame on the
+// left, right and top, no bottom (the box connects down into the toolbar),
+// `surface-base` fill, `surface-hover` under the pointer, and when active
+// (the selected tab, or "+" while it is selected) `surface-raised` plus a
+// 2 px `accent-default` top-edge marker: active tab `Theme.surface-raised`,
+// inactive boxes `Theme.surface-base` on a `Theme.surface-canvas` strip.
+component FFStripBox inherits Rectangle {
+    in property <bool> active: false;
+    in property <bool> hovered: false;
+
+    y: ShellGeometry.strip-box-top;
+    width: ShellGeometry.strip-box-width;
+    height: ShellGeometry.strip-box-height;
+    background: root.active ? Theme.surface-raised : (root.hovered ? Theme.surface-hover : Theme.surface-base);
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        background: Theme.border-default;
+    }
+    Rectangle {
+        x: parent.width - 1px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        background: Theme.border-default;
+    }
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+
+    // The 2 px top-edge marker on the active box, drawn over the frame --
+    // collapsed rather than transparent when inactive, so a headless test
+    // can read its presence from its size.
+    marker := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: root.active ? 2px : 0px;
+        background: Theme.accent-default;
+    }
+
+    @children
+}
+
+component FFTab inherits FFStripBox {
+    in property <ProjectTabView> view;
+    in property <int> index;
+    callback selected(int);
+    callback closed(int);
+
+    width: ShellGeometry.tab-width;
+    active: root.view.selected;
+    hovered: area.has-hover;
+    // Carries the loop index back out for a headless test to key on --
+    // every `FFTab` instance shares the same element id, so position alone
+    // cannot tell two tabs apart once some have scrolled out of the clip.
+    accessible-role: tab;
+    accessible-label: "tab-" + root.index;
+
+    area := TouchArea {
+        clicked => { root.selected(root.index); }
+    }
+
+    // Anchored to the tab's full bounds so every child is centred in the
+    // full 30px height. Padding: title at +12, the close glyph 12 in
+    // from the right edge, UNSAVED 12 left of it.
+    HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        padding-left: Theme.space-3;
+        padding-right: Theme.space-3;
+        spacing: Theme.space-3;
+
+        Text {
+            text: root.view.title;
+            color: root.view.selected ? Theme.text-primary : Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            // The selected tab's title reads bold against its inactive
+            // neighbours' regular weight.
+            font-weight: root.view.selected ? 600 : Theme.text-body.weight;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        // The run mark takes the unsaved chip's own slot while a tab is
+        // fusing or queued; `UNSAVED` returns once the run settles.
+        if root.view.run-mark-icon != "": Rectangle {
+            width: Theme.icon-md;
+            Image {
+                source: root.view.run-mark-icon == "play"
+                    ? @image-url("../../../../assets/icons/play.svg")
+                    : @image-url("../../../../assets/icons/ellipsis.svg");
+                colorize: Theme.text-secondary;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                width: Theme.icon-md;
+                height: Theme.icon-md;
+            }
+        }
+        if root.view.run-mark-icon == "" && root.view.unsaved: FFChip {
+            text: "UNSAVED";
+        }
+
+        // The touch area takes the layout's full height; the glyph is
+        // placed at its vertical centre explicitly, since a fixed-size child
+        // is otherwise anchored to the top of its layout cell.
+        close-area := TouchArea {
+            width: Theme.icon-md;
+            clicked => { root.closed(root.index); }
+            Image {
+                source: @image-url("../../../../assets/icons/x.svg");
+                colorize: Theme.text-secondary;
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                width: Theme.icon-md;
+                height: Theme.icon-md;
+            }
+        }
+    }
+}
+
+// A square strip box carrying one centred glyph -- the projects button,
+// the scroll arrows and "+". Same `FFStripBox` as every tab.
+component FFTabStripIconButton inherits FFStripBox {
+    in property <image> glyph;
+    in property <angle> glyph-rotation: 0deg;
+    in property <bool> enabled: true;
+    callback triggered();
+
+    hovered: area.has-hover && root.enabled;
+    // Disabled reads half opacity with no hover and no clicks -- an icon
+    // button has no other disabled treatment.
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.triggered(); }
+    }
+    Image {
+        source: root.glyph;
+        colorize: Theme.text-secondary;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: Theme.icon-md;
+        height: Theme.icon-md;
+        transform-rotation: root.glyph-rotation;
+    }
+}
+
+// A window-control glyph button: fixed to the strip box band, no
+// hover-recolour -- the three window buttons share this box, only their
+// `x`, `icon` and `accessible-label` differ.
+component WindowIconButton inherits FFIconButton {
+    y: ShellGeometry.strip-box-top;
+    width: ShellGeometry.strip-box-width;
+    height: ShellGeometry.strip-box-height;
+    recolor-on-hover: false;
+}
+
+export component FFTabStrip inherits Rectangle {
+    // Forwarded straight to the AppController via AppWindow.
+    callback window-drag-requested();
+    callback window-minimize-requested();
+    callback window-maximize-toggled();
+    callback window-close-requested();
+
+    // Set from `AppWindow::window-maximized`, itself set from
+    // `AppController::maximized()` via the bridge. Drives the maximize
+    // glyph below -- maximised must look different from not-maximised.
+    in property <bool> maximized: false;
+
+    // Project tabs: the plain list plus the scroll state `AppController`
+    // computes (`tab_scroll_x`, `tabs_overflow`,
+    // `can_scroll_left/right`) -- this file reads them, it computes nothing
+    // of its own.
+    in property <[ProjectTabView]> tabs: [];
+    in property <length> tab-scroll-x: 0px;
+    in property <bool> tabs-overflow: false;
+    in property <bool> can-scroll-left: false;
+    in property <bool> can-scroll-right: false;
+    callback tab-selected(int);
+    callback tab-closed(int);
+    callback scroll-left();
+    callback scroll-right();
+    // "+" is a selectable pseudo-tab: clicking it selects it, and while
+    // selected no project is active.
+    in property <bool> plus-selected: true;
+    callback plus-clicked();
+    // The tabs-region's width, from which `AppController` decides overflow
+    // and derives the scrolling viewport -- read once at install, forwarded
+    // on change.
+    out property <length> tabs-region-width: tabs-region.width;
+    changed tabs-region-width => { root.tabs-region-width-changed(self.tabs-region-width); }
+    callback tabs-region-width-changed(length);
+
+    height: ShellGeometry.strip-height;
+    // The strip itself is the darkest chrome surface; its boxes stand on
+    // it (`Theme.surface-canvas`).
+    background: Theme.surface-canvas;
+
+    // The drag region: the whole strip behind the window-control cluster.
+    // `changed pressed` is a single-statement handler; it fires on both
+    // press and release, and a refused or redundant compositor move is a
+    // documented no-op.
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        changed pressed => { root.window-drag-requested(); }
+    }
+
+    // The four-square Projects-overlay button: lit while the overlay is
+    // open, the same 2 px top-edge marker every active strip box carries.
+    in property <bool> projects-overlay-open: false;
+    callback projects-toggled();
+
+    projects-button := FFTabStripIconButton {
+        x: ShellGeometry.projects-button-inset;
+        glyph: @image-url("../../../../assets/icons/layout-grid.svg");
+        active: root.projects-overlay-open;
+        accessible-role: button;
+        accessible-label: "Projects";
+        triggered => { root.projects-toggled(); }
+    }
+
+    // Everything between the projects slot and the window glyphs, less the
+    // clear `strip-cluster-gap` before them. Without overflow: the tabs, then
+    // "+" one tab-pitch after the last. On overflow:
+    // [left arrow][scrolling tabs viewport][right arrow][+], the arrows
+    // greyed at the ends of the list, "+" pinned.
+    tabs-region := Rectangle {
+        x: ShellGeometry.projects-button-slot;
+        y: 0px;
+        width: parent.width - ShellGeometry.projects-button-slot - (ShellGeometry.base-width - ShellGeometry.glyph-first-x) - ShellGeometry.strip-cluster-gap;
+        height: parent.height;
+
+        left-arrow := FFTabStripIconButton {
+            x: 0px;
+            visible: root.tabs-overflow;
+            enabled: root.can-scroll-left;
+            glyph: @image-url("../../../../assets/icons/chevron-down.svg");
+            glyph-rotation: 90deg;
+            triggered => { root.scroll-left(); }
+        }
+
+        tabs-viewport := Rectangle {
+            x: root.tabs-overflow ? ShellGeometry.strip-box-width + ShellGeometry.strip-box-gap : 0px;
+            y: 0px;
+            width: root.tabs-overflow ? parent.width - 3 * (ShellGeometry.strip-box-width + ShellGeometry.strip-box-gap) : parent.width;
+            height: parent.height;
+            clip: true;
+
+            tabs-row := Rectangle {
+                x: 0px - root.tab-scroll-x;
+                // Only the scroll offset animates: arrow clicks,
+                // scroll-into-view and resize re-clamps all land here.
+                animate x { duration: Theme.motion-fast; easing: ease-out; }
+                y: 0px;
+                width: root.tabs.length * ShellGeometry.tab-pitch;
+                height: parent.height;
+
+                for tab[i] in root.tabs: tab-instance := FFTab {
+                    x: i * ShellGeometry.tab-pitch;
+                    view: tab;
+                    index: i;
+                    selected(idx) => { root.tab-selected(idx); }
+                    closed(idx) => { root.tab-closed(idx); }
+                }
+            }
+        }
+
+        right-arrow := FFTabStripIconButton {
+            x: parent.width - 2 * self.width - ShellGeometry.strip-box-gap;
+            visible: root.tabs-overflow;
+            enabled: root.can-scroll-right;
+            glyph: @image-url("../../../../assets/icons/chevron-down.svg");
+            glyph-rotation: -90deg;
+            triggered => { root.scroll-right(); }
+        }
+
+        // Pinned at the region's right end on overflow; otherwise one
+        // tab-pitch after the last tab, the same 4 px gap as between tabs
+        // (the viewport starts at x 0 and never scrolls without overflow).
+        plus-button := FFTabStripIconButton {
+            x: root.tabs-overflow ? parent.width - self.width : root.tabs.length * ShellGeometry.tab-pitch;
+            glyph: @image-url("../../../../assets/icons/plus.svg");
+            active: root.plus-selected;
+            triggered => { root.plus-clicked(); }
+        }
+    }
+
+    // Right-anchored: `glyph-first-x` is the first box's left edge at
+    // `base-width`, so the cluster keeps its right inset at any window
+    // width.
+    window-glyphs := Rectangle {
+        x: parent.width - (ShellGeometry.base-width - ShellGeometry.glyph-first-x);
+        y: 0px;
+        width: ShellGeometry.base-width - ShellGeometry.glyph-first-x;
+        height: parent.height;
+
+        window-minimize := WindowIconButton {
+            x: 0px;
+            icon: @image-url("../../../../assets/icons/minus.svg");
+            accessible-label: "Minimize";
+            triggered => { root.window-minimize-requested(); }
+        }
+        window-maximize := WindowIconButton {
+            x: ShellGeometry.glyph-pitch;
+            // Maximised looks different from not-maximised: the plain
+            // square swaps for the two-overlapping-squares restore glyph,
+            // same convention every other window on the desktop uses.
+            icon: root.maximized
+                ? @image-url("../../../../assets/icons/copy.svg")
+                : @image-url("../../../../assets/icons/square.svg");
+            accessible-label: root.maximized ? "Restore" : "Maximize";
+            triggered => { root.window-maximize-toggled(); }
+        }
+        window-close := WindowIconButton {
+            x: 2 * ShellGeometry.glyph-pitch;
+            icon: @image-url("../../../../assets/icons/x.svg");
+            accessible-label: "Close";
+            triggered => { root.window-close-requested(); }
+        }
+    }
+}

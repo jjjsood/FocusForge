@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The shell's geometry, as a single exported global: every number here is
+// transcribed once, so the `.slint` shell files and the geometry tests read one source.
+
+import { Theme } from "theme.slint";
+
+export global ShellGeometry {
+    // The window itself.
+    out property <length> base-width: 1440px;
+    out property <length> base-height: 900px;
+    out property <length> min-width: 1200px;
+    out property <length> min-height: 760px;
+
+    // The three horizontal bands.
+    out property <length> strip-height: 36px;
+    out property <length> toolbar-height: 40px;
+    out property <length> bottom-bar-height: 44px;
+    out property <length> dock-width: 260px;
+
+    // The canvas region's two panes. The divider sits
+    // centred *inside* the gutter, never added on top of it:
+    // 1132 - 3*16 = 1084, /2 = 542 (base); 892 - 3*16 = 844, /2 = 422 (min).
+    out property <length> pane-gutter: 16px;
+    out property <length> pane-divider: 2px;
+    out property <length> pane-placeholder-width: 220px;
+    out property <length> pane-chrome-inset: 10px;
+    out property <length> pane-label-width: 120px;
+    out property <length> pane-label-height: 22px;
+    out property <length> undock-control-width: 26px;
+    out property <length> undock-control-height: 22px;
+
+    // The comparison window's thin native-like frame.
+    out property <length> comparison-window-bar-height: 28px;
+    out property <length> comparison-window-control-width: 28px;
+    out property <length> comparison-window-title-inset: 10px;
+
+    // The dock's three insets, drawn separately, not collapsed to one.
+    out property <length> dock-band-inset: 6px;
+    out property <length> dock-content-inset: 8px;
+    out property <length> dock-scrollbar-inset: 4px;
+
+    // The tab strip's window glyphs.
+    out property <length> glyph-pitch: 36px;
+    out property <length> glyph-first-x: 1335px; // 1342 - 7
+
+    // Every box on the tab strip -- the projects button, the scroll arrows,
+    // each tab and "+" -- shares one top edge and one height: boxes span
+    // strip y 6..36, so they sit flush on the strip's bottom edge and
+    // connect into the toolbar.
+    out property <length> strip-box-height: 30px;
+    out property <length> strip-box-top: 6px;
+    // The square boxes (projects button, scroll arrows, "+") -- 30 wide.
+    out property <length> strip-box-width: 30px;
+
+    // The four-square Projects-overlay button at the tab strip's far left,
+    // centred over the icon bar's column below it (button x 9..39). The slot
+    // is everything left of the tabs: the first tab's left frame sits on the
+    // icon bar's 1 px right rule (first tab x 47).
+    out property <length> projects-button-inset: (icon-bar-width - strip-box-width) / 2;
+    out property <length> projects-button-slot: icon-bar-width - 1px;
+
+    // The gap between neighbouring strip boxes: a tab and the next, a scroll
+    // arrow and the tabs viewport, the right arrow and the pinned "+".
+    out property <length> strip-box-gap: Theme.space-1;
+    // The clear gap between the strip's right-hand group (the last tab and
+    // "+", or the right arrow and the pinned "+" on overflow) and the window
+    // glyphs -- roughly one "+" width.
+    out property <length> strip-cluster-gap: Theme.space-8;
+
+    // Dock rows.
+    // The checkpoint panel's heading row: `CHECKPOINTS` and `Export image`.
+    out property <length> checkpoint-heading-height: 28px;
+    out property <length> checkpoint-row-height: 40px;
+    // A day separator's own row: an uppercase label over a hairline rule.
+    out property <length> day-separator-height: 16px;
+    out property <length> tab-width: 224px;
+    out property <length> tab-pitch: 228px;
+
+    // Source presentation variants.
+    out property <length> image-row-height: 26px;
+    out property <length> image-row-band-width: 248px;
+    out property <length> image-row-content-width: 232px;
+    out property <length> image-row-content-inset: 8px;
+    out property <length> image-chip-size: 14px;
+    out property <length> image-header-height: 24px;
+    out property <length> image-list-row-height: 120px;
+    out property <length> large-preview-row-height: 200px;
+    out property <length> image-preview-inset: 8px;
+    out property <length> image-list-preview-width: 136px;
+    out property <length> image-list-preview-height: 90px;
+    out property <length> image-list-details-x: 152px;
+    out property <length> image-list-details-width: 88px;
+    out property <length> image-list-name-y: 32px;
+    out property <length> image-list-name-height: 20px;
+    out property <length> image-list-time-height: 36px;
+    out property <length> image-list-color-height: 16px;
+    out property <length> large-preview-width: 224px;
+    out property <length> large-preview-height: 149px;
+    out property <length> large-preview-y: Theme.space-3;
+    out property <length> image-row-marker-width: 4px;
+    out property <length> image-row-action-gap: 4px;
+    out property <length> image-row-action-inset: Theme.space-4;
+    out property <length> image-row-action-pad: 0px;
+    out property <length> tooltip-width: 248px;
+
+    // The settings panel. Mirrored one-for-one as `pub const`s in
+    // `crates/gui/src/settings_panel.rs`, exactly as `tab-pitch` above is
+    // mirrored on the Rust side. There is no separate inter-row gap
+    // property: the breathing room a row needs before the next row's label
+    // is part of the row's own height, so a control this short does not
+    // draw as tall as its slot -- the rest of the slot is the gap.
+    out property <length> param-label-height: 17px;
+    out property <length> param-row-linear: 43px;
+    out property <length> param-row-log: 60px;
+    out property <length> param-row-field: 45px;
+    out property <length> param-row-bool: 20px;
+    // The space under a toggle row, one grid step below the toggle.
+    out property <length> param-row-bool-gap: 12px;
+    out property <length> param-row-enum: 43px;
+    out property <length> param-error-height: 16px;
+    out property <length> section-heading-height: 41px;
+    // Trailing empty space after a heading's own text/badge, before its
+    // section's first field -- one grid step: without it the sticky
+    // overlay's own rule sits flush against whatever comes next.
+    out property <length> section-heading-bottom-gap: 8px;
+    out property <length> panel-content-width: 228px;
+    // The panel's own bottom-of-list reset control -- two grid steps above
+    // it, clear of FINISH's own last field, its own height below.
+    out property <length> reset-all-top-gap: 32px;
+    out property <length> reset-all-height: 32px;
+    // A section's `More...` header band, and the space under it, under an
+    // open fold-out's last row and above the next section.
+    out property <length> more-height: 32px;
+    out property <length> more-gap: 12px;
+
+    // The settings modal's flat rows and nav rail: a row is 34 px over a 1 px
+    // rule, its label column 140 px, its content 446 px wide.
+    out property <length> settings-content-width: 446px;
+    out property <length> settings-rail-width: 190px;
+    out property <length> settings-rail-entry-height: 32px;
+    out property <length> settings-rail-top-inset: 12px;
+    out property <length> settings-rail-icon-x: 16px;
+    out property <length> settings-rail-label-x: 40px;
+    // The notification center and the left icon bar beside it.
+    out property <length> notification-center-width: 380px;
+    out property <length> icon-bar-width: 48px;
+    out property <length> settings-row-height: 34px;
+    out property <length> settings-label-width: 140px;
+    // A section heading's own height, down to the top of its first row.
+    out property <length> settings-heading-height: 26px;
+    out property <length> settings-section-gap: 22px;
+    out property <length> settings-field-width: 136px;
+    out property <length> settings-action-button-width: 112px;
+    // The status line under an action row: the gap above it, then one line.
+    out property <length> settings-status-gap: 6px;
+    out property <length> settings-status-height: 15px;
+    // The gap between stacked paragraphs inside a settings section.
+    out property <length> settings-paragraph-gap: 6px;
+    // The table header: the column titles' top down to the rule under them,
+    // then the gap above the first row.
+    out property <length> settings-table-header-height: 18px;
+    out property <length> settings-table-header-gap: 3px;
+    // The modal's header band, and the insets of the content under it: with
+    // `settings-content-width` they fill the content host's width.
+    out property <length> settings-header-height: 60px;
+    out property <length> settings-header-inset-x: 20px;
+    out property <length> settings-content-inset-left: 20px;
+    out property <length> settings-content-inset-right: 24px;
+    out property <length> settings-content-inset-top: 16px;
+    out property <length> settings-content-inset-bottom: 16px;
+
+    // Two primitive sizes shared wherever something else needs to lay out
+    // against them, rather than assuming the primitive's own literal.
+    out property <length> scrollbar-width: 6px; // `FFScrollbar`'s own width.
+    out property <length> field-height: 28px; // `FFField`'s own height.
+
+    // The toolbar's transport buttons and the bottom bar's progress track,
+    // measured at 1440px width.
+    out property <length> toolbar-button-height: 26px;
+    out property <length> toolbar-button-width: 116px;
+    out property <length> toolbar-button-gap: 10px;
+    out property <length> progress-step-x: 118px;
+    out property <length> progress-bar-x: 202px;
+    out property <length> progress-bar-height: 4px;
+    // The ETA's slot, right-bounded by the overlay cluster below; the track
+    // ends before it, and a longer readout is elided.
+    out property <length> eta-width: 80px;
+
+    // The bottom bar's overlay cluster, right of the progress track and left
+    // of the zoom cluster. Its left edge sits at this inset from the bar's
+    // right edge; everything else in the cluster is an offset from that edge:
+    // toggle 60 | 12 | track
+    // (`overlay-track-width` wide) with the readout after it, then a 1 px
+    // rule 266 past the cluster's left edge, 21 px before the zoom cluster.
+    out property <length> overlay-cluster-inset: 516px;
+    out property <length> overlay-toggle-offset: 60px;
+    out property <length> overlay-track-offset: 108px;
+    out property <length> overlay-track-width: 100px;
+    out property <length> overlay-rule-offset: 266px;
+
+    // The editor toolbar's own row -- every control shares
+    // `toolbar-button-height`/`toolbar-height` above.
+    out property <length> editor-toolbar-size-caption-x: 12px;
+    out property <length> editor-toolbar-size-track-x: 56px;
+    out property <length> editor-toolbar-soft-caption-x: 188px;
+    out property <length> editor-toolbar-soft-track-x: 236px;
+    out property <length> editor-toolbar-pipette-x: 376px;
+    out property <length> editor-toolbar-undo-x: 436px;
+    out property <length> editor-toolbar-redo-x: 468px;
+    out property <length> editor-toolbar-icon-width: 27px;
+    out property <length> editor-toolbar-save-checkpoint-right-inset: 13px;
+    out property <length> editor-toolbar-save-checkpoint-width: 163px;
+}

@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A modal's own scrim and centered panel -- every dialog's shared shell,
+// its content placed as this component's children.
+
+import { Theme } from "../theme.slint";
+
+export component FFModalPanel inherits Rectangle {
+    in property <bool> modal-open: false;
+    in property <length> panel-width: 480px;
+    in property <length> panel-height: 300px;
+    // "none" | "warning" (a red top rule) | "caution" (an amber top rule).
+    in property <string> tone-rule: "none";
+    in property <bool> clip-panel: false;
+
+    visible: root.modal-open;
+    width: 100%;
+    height: 100%;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.surface-canvas.with-alpha(0.6);
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            scroll-event(e) => { accept }
+        }
+    }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: root.panel-width;
+        height: root.panel-height;
+        background: Theme.surface-raised;
+        border-radius: Theme.radius-lg;
+        clip: root.clip-panel;
+        // Lifts the panel off the scrim -- the same recipe `FFLoadingPanel`
+        // and `FFImageRow`'s floating state use.
+        drop-shadow-color: Theme.surface-canvas.with-alpha(0.5);
+        drop-shadow-offset-y: Theme.space-1;
+        drop-shadow-blur: Theme.space-2;
+
+        if root.tone-rule == "warning": Rectangle {
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 2px;
+            background: Theme.status-failure;
+        }
+        if root.tone-rule == "caution": Rectangle {
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 2px;
+            background: Theme.status-warning;
+        }
+
+        @children
+    }
+}

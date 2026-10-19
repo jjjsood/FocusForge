@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A labelled button with an optional leading glyph or icon, in two heights
+// and six tones.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFButton inherits Rectangle {
+    // "primary" | "default" | "quiet" | "danger" | "outlined" | "secondary" (the
+    // default fill, label in `Theme.text-secondary`, dimmed to 40 % when disabled).
+    in property <string> kind: "default";
+    // The bar height (`ShellGeometry.toolbar-button-height`); the taller,
+    // 34 px default otherwise.
+    in property <bool> compact: false;
+    in property <string> text;
+    // A single leading glyph, 16 px wide; no glyph column when empty.
+    in property <string> glyph: "";
+    // A leading icon image, 16 px, shown instead of `glyph` when set.
+    in property <image> icon-source;
+    in property <bool> has-icon: false;
+    in property <bool> enabled: true;
+    // While true, a disabled button keeps its normal fill at full opacity
+    // and dims only the label to `Theme.text-disabled`, instead of halving
+    // the whole button's opacity.
+    in property <bool> dim-label-only: false;
+    callback clicked();
+
+    property <color> label-color: !root.enabled && root.dim-label-only
+        ? Theme.text-disabled
+        : (root.kind == "primary" || root.kind == "danger")
+        ? Theme.text-on-accent
+        : root.kind == "quiet" ? Theme.text-muted
+        : root.kind == "secondary" ? Theme.text-secondary : Theme.text-primary;
+
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-label: root.text;
+
+    height: root.compact ? ShellGeometry.toolbar-button-height : 34px;
+    border-radius: Theme.radius-sm;
+    background: root.kind == "primary" ? Theme.accent-default
+        : root.kind == "danger" ? Theme.status-failure
+        : root.kind == "quiet" ? transparent
+        : root.kind == "outlined" ? Theme.surface-raised
+        : Theme.surface-overlay;
+    border-width: root.kind == "outlined" ? 1px : 0px;
+    border-color: Theme.border-strong;
+    opacity: root.dim-label-only ? 1.0 : (root.enabled ? 1.0 : root.kind == "secondary" ? 0.4 : 0.5);
+
+    area := TouchArea {
+        enabled: root.enabled;
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        height: 100%;
+        padding-left: Theme.space-3;
+        padding-right: Theme.space-3;
+        alignment: center;
+        spacing: Theme.space-1;
+
+        if root.has-icon: Image {
+            source: root.icon-source;
+            colorize: root.label-color;
+            width: Theme.icon-md;
+            height: Theme.icon-md;
+            y: (parent.height - self.height) / 2;
+        }
+        if !root.has-icon && root.glyph != "": Text {
+            text: root.glyph;
+            width: 16px;
+            color: root.label-color;
+            font-size: Theme.text-body.size;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.text;
+            color: root.label-color;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+}

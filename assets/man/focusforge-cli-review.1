@@ -1,0 +1,27 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-review 1  "review 0.1.0" 
+.SH NAME
+focusforge\-cli\-review \- Report one record per result found under a directory of projects, or a batch run\*(Aqs output directory: identity, outcome, sharpness ratio and Z\-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non\-recursive listing of `*.ffp` files; never groups frames itself and writes nothing
+.SH SYNOPSIS
+\fBfocusforge\-cli review\fR [\fB\-\-json\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+.SH DESCRIPTION
+Report one record per result found under a directory of projects, or a batch run\*(Aqs output directory: identity, outcome, sharpness ratio and Z\-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non\-recursive listing of `*.ffp` files; never groups frames itself and writes nothing
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Emit one wrapped JSON document instead of a human\-readable table
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIDIR\fR>
+Directory to review: a run\*(Aqs `\-o` output, or a plain directory of `*.ffp` projects
+.SH VERSION
+v0.1.0

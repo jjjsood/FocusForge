@@ -1,0 +1,1079 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The entry point compiled by `build.rs`. Slint exposes to Rust only what
+// this file exports.
+
+import { Theme, TypeRole, ThemeProbe } from "theme.slint";
+// Re-exported so Rust can reach them through this file; `Primitives` stays
+// unreachable outside `theme.slint`.
+export { Theme, TypeRole, ThemeProbe }
+
+import { ThemeSheet } from "theme_sheet.slint";
+export { ThemeSheet }
+
+import { ShellGeometry } from "geometry.slint";
+import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
+export { ProjectTabView }
+import { FFToolbar } from "shell/toolbar.slint";
+import { FFEditorToolbar } from "shell/editor_toolbar.slint";
+import { FFCanvas } from "shell/canvas.slint";
+import { ComparisonWindow } from "comparison_window.slint";
+export { ComparisonWindow }
+import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
+export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
+import { FFBottomBar } from "shell/bottom_bar.slint";
+import { FFIconBar } from "shell/icon_bar.slint";
+import { FFNotificationCenter, NotificationRowView } from "shell/notification_center.slint";
+import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing } from "shell/dialogs.slint";
+import { FFToast } from "components/ff_toast.slint";
+import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
+import { FFLoadingIndicator } from "shell/loading.slint";
+export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView }
+
+export component AppWindow inherits Window {
+    // Every callback forwards one-for-one into `AppController` via
+    // `src/bridge.rs`.
+    callback window-drag-requested();
+    callback window-minimize-requested();
+    callback window-maximize-toggled();
+    callback window-close-requested();
+    callback mode-selected(string);
+    callback dock-tab-selected(string);
+    callback checkpoint-export-requested();
+    // The run's own transport, forwarded one-for-one from `FFToolbar` below.
+    callback fuse-requested();
+    callback pause-or-resume-requested();
+    callback cancel-requested();
+    callback retry-requested();
+    // The editor toolbar, forwarded one-for-one from `FFEditorToolbar` below.
+    callback brush-size-fraction-changed(float);
+    callback brush-softness-fraction-changed(float);
+    callback pipette-toggled();
+    callback undo-requested();
+    callback redo-requested();
+    callback save-checkpoint-requested();
+
+    // Every piece of state the shell shows is an `in` property set from
+    // Rust, never computed here.
+    in property <bool> editor-enabled: false;
+    in property <string> mode: "stacking";
+    in property <string> dock-tab: "images";
+    // Named `window-maximized`, not `maximized`: `Window` already declares
+    // an in-out `maximized` (`i-slint-compiler` 1.17.1's `Window` builtin,
+    // `//-shadowable`), which is native window state reached only through
+    // the runtime `Window` API (`src/bridge.rs`), never as a generated root
+    // accessor. This property is the separate, plain chrome state the tab
+    // strip's maximize glyph draws from.
+    in property <bool> window-maximized: false;
+    // The editor toolbar's own state, pushed from `AppController::brush_toolbar_view`
+    // (`src/bridge.rs`) on every `ShellEvent::EditorChanged`.
+    in property <string> brush-size-text: "";
+    in property <float> brush-size-fraction: 0.0;
+    in property <int> brush-size-ceiling: 1;
+    in property <string> brush-soft-text: "";
+    in property <float> brush-soft-fraction: 0.0;
+    in property <bool> brush-picking: false;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    in property <bool> can-save-checkpoint: false;
+    // The brush cursor's own `Path` geometry, pushed alongside the toolbar
+    // state above on every repaint (it also depends on the viewport's
+    // current zoom, which the toolbar state does not).
+    in property <length> cursor-extent;
+    in property <string> cursor-ring-commands;
+    in property <string> cursor-core-commands;
+    in property <bool> cursor-picking: false;
+    in property <color> cursor-pick-color;
+    in property <bool> cursor-visible: false;
+    in property <length> cursor-frame-x;
+    in property <length> cursor-frame-y;
+    in property <length> cursor-composite-x;
+    in property <length> cursor-composite-y;
+
+    no-frame: true;
+    resize-border-width: 8px;
+    min-width: ShellGeometry.min-width;
+    min-height: ShellGeometry.min-height;
+    preferred-width: ShellGeometry.base-width;
+    preferred-height: ShellGeometry.base-height;
+    background: Theme.surface-base;
+    default-font-family: Theme.font-family;
+    title: "FocusForge";
+    // Gives `canvas-ground` (the input dispatch point's `FocusScope`,
+    // declared below) keyboard focus on window activation -- without this,
+    // nothing in the shell ever takes focus, so `key-pressed`/`key-released`
+    // never fire and every key-chord row (`ctrl+z`, `ctrl+shift+z`,
+    // `space+left-drag`) is dead code in the real window. `forward-focus` is
+    // the compiler-recognised `Window` property for exactly this
+    // (`i-slint-compiler` 1.17.1's `forward-focus` builtin), not a second
+    // handler.
+    forward-focus: canvas-ground;
+
+    // The entry path: the tab strip's own project list, scroll state, and
+    // the "+" forward. `open-folder-requested` is the empty state's button
+    // (the picker); the strip's "+" raises `plus-clicked`, which selects
+    // "+" itself.
+    in property <[ProjectTabView]> project-tabs: [];
+    in property <length> tab-scroll-x: 0px;
+    in property <bool> tabs-overflow: false;
+    in property <bool> can-scroll-left: false;
+    in property <bool> can-scroll-right: false;
+    in property <bool> show-empty-state: true;
+    in property <bool> plus-selected: true;
+    callback open-folder-requested();
+    callback plus-clicked();
+    callback tab-selected(int);
+    callback tab-closed(int);
+    callback tab-scroll-left();
+    callback tab-scroll-right();
+    callback tab-region-width-changed(length);
+    out property <length> tab-region-width: tab-strip.tabs-region-width;
+
+    // The projects overlay's own toggle: the tab strip's four-square button
+    // lights while it is open, and the same press or `Esc` closes it.
+    in property <bool> projects-overlay-open: false;
+    callback projects-overlay-toggled();
+
+    tab-strip := FFTabStrip {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: ShellGeometry.strip-height;
+        maximized: root.window-maximized;
+        tabs: root.project-tabs;
+        plus-selected: root.plus-selected;
+        tab-scroll-x: root.tab-scroll-x;
+        tabs-overflow: root.tabs-overflow;
+        can-scroll-left: root.can-scroll-left;
+        can-scroll-right: root.can-scroll-right;
+        projects-overlay-open: root.projects-overlay-open;
+
+        window-drag-requested => { root.window-drag-requested(); }
+        window-minimize-requested => { root.window-minimize-requested(); }
+        window-maximize-toggled => { root.window-maximize-toggled(); }
+        window-close-requested => { root.window-close-requested(); }
+        plus-clicked => { root.plus-clicked(); }
+        tab-selected(i) => { root.tab-selected(i); }
+        tab-closed(i) => { root.tab-closed(i); }
+        scroll-left => { root.tab-scroll-left(); }
+        scroll-right => { root.tab-scroll-right(); }
+        tabs-region-width-changed(w) => { root.tab-region-width-changed(w); }
+        projects-toggled => { root.projects-overlay-toggled(); }
+    }
+
+    // The transport's current run state: "idle" | "running" | "paused" |
+    // "cancelling" | "failed".
+    in property <string> toolbar-run-state: "idle";
+    // `false` until Rust sets it: matches `fuse_enabled()`'s own default (no
+    // tab means nothing to fuse), so the toolbar reads disabled from the
+    // window's very first frame, before any project has ever opened.
+    in property <bool> fuse-enabled: false;
+    // Another tab's run is live and this one holds no place in it -- the
+    // next `Fuse stack` press here would enqueue rather than start.
+    in property <bool> toolbar-would-queue: false;
+
+    // Always occupies its row, so a tab mounting never shifts the canvas
+    // below it -- with no project open (or "+" selected over background
+    // tabs) `fuse-enabled` and `toolbar-run-state` already resolve to their
+    // inert values, so the row renders itself disabled without a separate
+    // hidden state.
+    if root.mode != "editor": toolbar := FFToolbar {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
+        height: ShellGeometry.toolbar-height;
+        run-state: root.toolbar-run-state;
+        fuse-enabled: root.fuse-enabled;
+        would-queue: root.toolbar-would-queue;
+
+        fuse-requested => { root.fuse-requested(); }
+        pause-or-resume-requested => { root.pause-or-resume-requested(); }
+        cancel-requested => { root.cancel-requested(); }
+        retry-requested => { root.retry-requested(); }
+    }
+
+    if root.mode == "editor": editor-toolbar := FFEditorToolbar {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
+        height: ShellGeometry.toolbar-height;
+        size-text: root.brush-size-text;
+        size-fraction: root.brush-size-fraction;
+        size-ceiling: root.brush-size-ceiling;
+        soft-text: root.brush-soft-text;
+        soft-fraction: root.brush-soft-fraction;
+        picking: root.brush-picking;
+        can-undo: root.can-undo;
+        can-redo: root.can-redo;
+        can-save-checkpoint: root.can-save-checkpoint;
+
+        brush-size-fraction-changed(f) => { root.brush-size-fraction-changed(f); }
+        brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
+        pipette-toggled => { root.pipette-toggled(); }
+        undo-requested => { root.undo-requested(); }
+        redo-requested => { root.redo-requested(); }
+        save-checkpoint-requested => { root.save-checkpoint-requested(); }
+    }
+
+    // The images are `in` properties set from Rust
+    // (`crates/gui/src/gpu_canvas.rs`) once a project is loaded -- the wgpu
+    // texture is never computed here.
+    in property <image> composite-source;
+    // The selected source frame (`src/gpu_canvas.rs::redraw_frame`) -- the
+    // left pane's own image, label and refusal text, independent of the
+    // composite above.
+    in property <image> frame-source;
+    in property <string> frame-label: "";
+    // Each pane's refusal, one entry per line: the selected frame's on the
+    // left, the current checkpoint's on the right.
+    in property <[string]> frame-message-lines: [];
+    in property <[string]> composite-message-lines: [];
+    in property <bool> canvas-undock-enabled: true;
+    in property <string> detached-pane: "";
+    // Whether a project is open -- governs the pane chrome (label, undock)
+    // and the bottom bar's zoom cluster together, so nothing offers an
+    // action there is nothing yet to act on. Set from Rust alongside
+    // `zoom-readout` in `src/bridge.rs::repaint`, `false` until then.
+    in property <bool> project-loaded: false;
+    // Whether the active tab has a composite to show -- governs the right
+    // pane's not-yet-fused placeholder. Set from Rust alongside
+    // `project-loaded` in `src/bridge.rs::push_projects`.
+    in property <bool> composite-ready: false;
+    // The checkpoints panel's own line -- the active tab's checkpoint
+    // count, or the empty-state wording. Set from Rust alongside
+    // `composite-ready` in `src/bridge.rs::push_projects`.
+    in property <string> checkpoint-line: "None yet — fuse a stack";
+    in property <bool> checkpoint-export-enabled: false;
+    // The `Checkpoints` panel: pushed from `AppController::checkpoints_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::CheckpointsChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[CheckpointEntryView]> checkpoint-rows: [];
+    in property <length> checkpoint-scroll-y: 0px;
+    in property <length> checkpoint-content-height: 0px;
+    callback checkpoint-selected(int);
+    callback checkpoint-delete-requested(int);
+    callback checkpoint-scrolled(length);
+    callback checkpoint-scrollbar-pointer(int, length);
+    callback checkpoint-scrollbar-dragged(length);
+    callback checkpoint-viewport-height-changed(length);
+    out property <length> checkpoint-viewport-height: dock.checkpoint-viewport-height;
+    callback frame-undock-requested();
+    callback composite-undock-requested();
+    // Forwarded from `FFCanvas`'s own callbacks of the same shape -- the
+    // matching one-line-forward style as the two above.
+    callback canvas-scrolled(length, length, length, length, bool, bool, bool);
+    // `int`: `event.kind` folded to 0 = Down, 1 = Up or Cancel, 2 = Move --
+    // see `ui/shell/canvas.slint`'s `canvas-pointer` declaration.
+    callback canvas-pointer(PointerEventButton, int, length, length, bool, bool, bool);
+    callback canvas-dragged(length, length);
+    // The `FocusScope`'s own callbacks -- `text` carries the
+    // pressed/released key's unicode, the three bools its modifiers.
+    callback canvas-key-pressed(string, bool, bool, bool);
+    callback canvas-key-released(string, bool, bool, bool);
+    callback canvas-focus-changed();
+    callback canvas-hover-changed();
+    // The one shared viewport's placement: `in`
+    // properties set from Rust on every gesture repaint, bound to **both**
+    // `FFPane`s below -- "one viewport over two panes" is structural, not a
+    // synchronisation. `canvas-resized` forwards `FFCanvas`'s own callback
+    // of the same shape; the five `out` properties mirror its geometry so
+    // `src/bridge.rs` can read them (`app.get_canvas_pane_left_x()` and
+    // friends).
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
+    // The left pane's own placement, drawn against the selected frame's
+    // extent rather than the composite/Z-Map's -- the two panes share one
+    // viewport's scale but not one image size.
+    in property <length> frame-image-x;
+    in property <length> frame-image-y;
+    in property <length> frame-image-w;
+    in property <length> frame-image-h;
+    // Each pane's low-detail whole-image backdrop and its placement, set
+    // from Rust like the sources above.
+    in property <image> frame-backdrop;
+    in property <length> frame-backdrop-x;
+    in property <length> frame-backdrop-y;
+    in property <length> frame-backdrop-w;
+    in property <length> frame-backdrop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
+    in property <length> frame-crop-x;
+    in property <length> frame-crop-y;
+    in property <length> frame-crop-w;
+    in property <length> frame-crop-h;
+    in property <bool> pixelated;
+    callback canvas-resized();
+    out property <length> canvas-pane-left-x: canvas.pane-left-x;
+    out property <length> canvas-pane-right-x: canvas.pane-right-x;
+    out property <length> canvas-pane-left-y: canvas.pane-left-y;
+    out property <length> canvas-pane-left-width: canvas.pane-left-width;
+    out property <length> canvas-pane-left-height: canvas.pane-left-height;
+    out property <length> canvas-pane-right-y: canvas.pane-right-y;
+    out property <length> canvas-pane-right-width: canvas.pane-right-width;
+    out property <length> canvas-pane-right-height: canvas.pane-right-height;
+    out property <bool> canvas-pane-hovered: canvas.pane-hovered;
+
+    canvas-ground := FocusScope {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
+            - ShellGeometry.bottom-bar-height;
+
+        // `reject` so the chrome accelerators still reach the parent;
+        // `key-pressed` auto-repeats while a key is held, which
+        // `AppController::set_space_held`'s idempotence absorbs.
+        key-pressed(event) => {
+            root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+            reject
+        }
+        key-released(event) => {
+            root.canvas-key-released(event.text, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+            reject
+        }
+        focus-changed-event(reason) => { root.canvas-focus-changed(); }
+
+        canvas := FFCanvas {
+            width: 100%;
+            height: 100%;
+            composite-source: root.composite-source;
+            frame-source: root.frame-source;
+            frame-label: root.frame-label;
+            frame-message-lines: root.frame-message-lines;
+            composite-message-lines: root.composite-message-lines;
+            undock-enabled: root.canvas-undock-enabled;
+            detached-pane: root.detached-pane;
+            project-loaded: root.project-loaded;
+            composite-ready: root.composite-ready;
+            image-x: root.image-x;
+            image-y: root.image-y;
+            image-w: root.image-w;
+            image-h: root.image-h;
+            crop-x: root.crop-x;
+            crop-y: root.crop-y;
+            crop-w: root.crop-w;
+            crop-h: root.crop-h;
+            frame-image-x: root.frame-image-x;
+            frame-image-y: root.frame-image-y;
+            frame-image-w: root.frame-image-w;
+            frame-image-h: root.frame-image-h;
+            frame-backdrop: root.frame-backdrop;
+            frame-backdrop-x: root.frame-backdrop-x;
+            frame-backdrop-y: root.frame-backdrop-y;
+            frame-backdrop-w: root.frame-backdrop-w;
+            frame-backdrop-h: root.frame-backdrop-h;
+            backdrop: root.backdrop;
+            backdrop-x: root.backdrop-x;
+            backdrop-y: root.backdrop-y;
+            backdrop-w: root.backdrop-w;
+            backdrop-h: root.backdrop-h;
+            frame-crop-x: root.frame-crop-x;
+            frame-crop-y: root.frame-crop-y;
+            frame-crop-w: root.frame-crop-w;
+            frame-crop-h: root.frame-crop-h;
+            pixelated: root.pixelated;
+            show-empty-state: root.show-empty-state;
+            load-active: root.load-active;
+            editor-mode: root.mode == "editor";
+            cursor-extent: root.cursor-extent;
+            cursor-ring-commands: root.cursor-ring-commands;
+            cursor-core-commands: root.cursor-core-commands;
+            cursor-picking: root.cursor-picking;
+            cursor-pick-color: root.cursor-pick-color;
+        cursor-visible: root.cursor-visible;
+        cursor-frame-x: root.cursor-frame-x;
+        cursor-frame-y: root.cursor-frame-y;
+        cursor-composite-x: root.cursor-composite-x;
+        cursor-composite-y: root.cursor-composite-y;
+
+            frame-undock-requested => { root.frame-undock-requested(); }
+            composite-undock-requested => { root.composite-undock-requested(); }
+            open-folder-requested => { root.open-folder-requested(); }
+            canvas-scrolled(dx, dy, x, y, ctrl, shift, alt) => {
+                root.canvas-scrolled(dx, dy, x, y, ctrl, shift, alt);
+            }
+            canvas-pointer(button, kind, x, y, ctrl, shift, alt) => {
+                root.canvas-pointer(button, kind, x, y, ctrl, shift, alt);
+            }
+            canvas-dragged(x, y) => { root.canvas-dragged(x, y); }
+            canvas-resized => { root.canvas-resized(); }
+            pane-hover-changed => { root.canvas-hover-changed(); }
+        }
+    }
+
+    // The settings panel: pushed from `AppController::settings_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::SettingsChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[SettingsRow]> settings-rows: [];
+    in property <SectionHeadView> settings-sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> settings-scroll-y: 0px;
+    in property <length> settings-content-height: 0px;
+    in property <bool> settings-enabled: true;
+    callback settings-param-changed(string, string, float);
+    callback settings-param-stepped(string, string, int);
+    callback settings-param-text-edited(string, string, string);
+    callback settings-algorithm-selected(string, string);
+    callback settings-reset-all();
+    callback settings-menu-toggled(string, string);
+    callback settings-more-toggled(string);
+    callback settings-scrolled(length);
+    callback settings-scrollbar-pointer(int, length);
+    callback settings-scrollbar-dragged(length);
+    callback settings-viewport-height-changed(length);
+
+    // The `Images` panel: pushed from `AppController::images_panel`
+    // (`src/bridge.rs`) on every `ShellEvent::ImagesChanged`, forwarded
+    // one line into `FFDock`.
+    in property <[ImageRowView]> images-rows: [];
+    in property <string> images-header-text: "";
+    in property <string> images-presentation: "list";
+    in-out property <length> images-list-viewport-y: 0px;
+    in property <string> images-sort: "";
+    in property <bool> images-sort-menu-open: false;
+    in property <int> images-dragging-row: -1;
+    in property <length> images-drag-offset: 0px;
+    in property <bool> images-drag-capture-active: false;
+    in property <int> images-drag-target-row: -1;
+    // Whether the mutating controls (row actions, add, sort, drag) are
+    // reachable at all -- `false` while this tab's own job is running.
+    in property <bool> images-enabled: true;
+    // Inspection rows are independent from live controller publication.
+    in property <bool> list-preview-active: false;
+    in property <string> list-preview-mode: "stacking";
+    in property <[ImageRowView]> list-preview-rows: [];
+    in property <string> list-preview-header-text: "";
+    in property <string> list-preview-presentation: "list";
+    in property <int> list-preview-dragging-row: -1;
+    in property <length> list-preview-drag-offset: 0px;
+    in property <int> list-preview-drag-target-row: -1;
+    callback images-add-frames-requested();
+    callback images-sort-menu-toggled();
+    callback images-sort-selected(string);
+    callback images-frame-selected(int);
+    callback images-frame-keyboard-moved(int);
+    callback images-frame-excluded-toggled(int);
+    callback images-frame-remove-requested(int);
+    callback images-frame-drag-pointer(int, int, length);
+    callback images-viewport-scrolled(length);
+    callback images-frame-wheel(length);
+    callback images-scrollbar-pointer(int, length);
+    callback images-scrollbar-dragged(length);
+    callback images-viewport-height-changed(length);
+
+    dock := FFDock {
+        x: root.width - ShellGeometry.dock-width;
+        y: ShellGeometry.strip-height;
+        width: ShellGeometry.dock-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.bottom-bar-height;
+        editor-enabled: root.editor-enabled;
+        mode: root.list-preview-active ? root.list-preview-mode : root.mode;
+        dock-tab: root.list-preview-active ? "images" : root.dock-tab;
+        project-loaded: root.project-loaded || root.list-preview-active;
+        checkpoint-line: root.checkpoint-line;
+        checkpoint-export-enabled: root.checkpoint-export-enabled;
+        checkpoint-rows: root.checkpoint-rows;
+        checkpoint-scroll-y: root.checkpoint-scroll-y;
+        checkpoint-content-height: root.checkpoint-content-height;
+        settings-rows: root.settings-rows;
+        settings-sticky: root.settings-sticky;
+        settings-scroll-y: root.settings-scroll-y;
+        settings-content-height: root.settings-content-height;
+        settings-enabled: root.settings-enabled;
+        images-rows: root.list-preview-active ? root.list-preview-rows : root.images-rows;
+        images-header-text: root.list-preview-active ? root.list-preview-header-text : root.images-header-text;
+        images-presentation: root.list-preview-active ? root.list-preview-presentation : root.images-presentation;
+        tooltip-max-width: root.width;
+        images-list-viewport-y <=> root.images-list-viewport-y;
+        images-sort: root.images-sort;
+        images-sort-menu-open: root.images-sort-menu-open;
+        images-dragging-row: root.list-preview-active ? root.list-preview-dragging-row : root.images-dragging-row;
+        images-drag-offset: root.list-preview-active ? root.list-preview-drag-offset : root.images-drag-offset;
+        images-drag-capture-active: root.list-preview-active ? false : root.images-drag-capture-active;
+        images-drag-target-row: root.list-preview-active ? root.list-preview-drag-target-row : root.images-drag-target-row;
+        images-enabled: root.list-preview-active ? true : root.images-enabled;
+
+        mode-selected(m) => { root.mode-selected(m); }
+        dock-tab-selected(t) => { root.dock-tab-selected(t); }
+        checkpoint-export-requested => { root.checkpoint-export-requested(); }
+        checkpoint-selected(i) => { root.checkpoint-selected(i); }
+        checkpoint-delete-requested(i) => { root.checkpoint-delete-requested(i); }
+        checkpoint-scrolled(delta) => { root.checkpoint-scrolled(delta); }
+        checkpoint-scrollbar-pointer(kind, y) => { root.checkpoint-scrollbar-pointer(kind, y); }
+        checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
+        checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
+        settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        settings-param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
+        settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+        settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+        settings-reset-all => { root.settings-reset-all(); }
+        settings-menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+        settings-more-toggled(section) => { root.settings-more-toggled(section); }
+        settings-scrolled(delta) => { root.settings-scrolled(delta); }
+        settings-scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+        settings-scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+        settings-viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+        images-add-frames-requested => { root.images-add-frames-requested(); }
+        images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
+        images-sort-selected(picked) => { root.images-sort-selected(picked); }
+        images-frame-selected(i) => { root.images-frame-selected(i); }
+        images-frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
+        images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+        images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+        images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
+        images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
+        images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
+        images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+        images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+        images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
+    }
+
+    // Settings modal state -- pushed from Rust once at startup
+    // (`src/main.rs`, `--settings-section`) and toggled through
+    // `AppController::open_settings`/`close_settings`.
+    in property <bool> settings-open: false;
+    in property <[InputRow]> input-rows: [];
+    in property <string> settings-section: "performance";
+    callback settings-open-requested();
+    // The unread count on the bell, and whether the notification center is
+    // open (the bell is filled while it is).
+    in property <int> notifications-unread: 0;
+    in property <bool> notification-center-open: false;
+    callback bell-activated();
+    in property <[NotificationRowView]> notification-rows: [];
+    in property <string> notification-count-text: "";
+    callback notification-row-clicked(int);
+    callback notification-acknowledge-requested(int);
+    callback notification-diagnostics-requested(int);
+    callback notification-selection-moved(int);
+    callback notification-expansion-toggled();
+    callback notification-center-close-requested();
+    callback settings-close-requested();
+    callback settings-section-selected(string);
+
+    in property <PerformanceState> performance;
+    callback performance-gpu-toggled(bool);
+    callback performance-host-cap-edited(string);
+    callback performance-vram-cap-edited(string);
+    callback performance-host-cap-cursor-moved(length, length);
+    callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <string> appearance-presentation: "image-list";
+    in property <bool> appearance-menu-open: false;
+    in property <bool> appearance-menu-focused: false;
+    in property <bool> appearance-menu-disabled: false;
+    in property <string> appearance-save-error: "";
+    callback appearance-presentation-selected(string);
+    callback appearance-menu-toggled();
+
+    in property <StorageState> storage;
+    callback storage-clear-requested();
+
+    in property <AboutState> about;
+
+    in property <[FFManifestRow]> diagnostics-rows: [];
+    in property <string> diagnostics-note: "";
+    in property <bool> diagnostics-include-minidumps: false;
+    in property <string> diagnostics-destination: "";
+    in property <string> diagnostics-status: "idle";
+    in property <string> diagnostics-message: "";
+    in property <string> diagnostics-primary-label: "Create bundle";
+    in property <bool> diagnostics-busy: false;
+    in property <bool> diagnostics-loading: false;
+    in property <length> diagnostics-manifest-scroll-offset: 0px;
+    in property <length> diagnostics-manifest-content-height: 0px;
+    in property <length> diagnostics-destination-scroll-offset: 0px;
+    callback diagnostics-minidumps-toggled(bool);
+    callback diagnostics-destination-edited(string);
+    callback diagnostics-destination-cursor-moved(length, length);
+    callback diagnostics-primary-clicked();
+    callback diagnostics-manifest-scrollbar-pointer(int, length);
+    callback diagnostics-manifest-scrollbar-dragged(length);
+    callback diagnostics-manifest-viewport-height-changed(length);
+    callback diagnostics-manifest-scrolled(length);
+
+    // The bottom bar's zoom cluster -- governs both panes, which is why it
+    // lives at the root rather than inside `FFPane`.
+    // Greys out together with the rest of the chrome via the single
+    // `project-loaded` property declared above.
+    in property <string> zoom-readout: "";
+    callback zoom-in-requested();
+    callback zoom-out-requested();
+    callback zoom-fit-requested();
+
+    // The run's own words for the bottom bar's progress track -- pushed from
+    // Rust alongside the toolbar's `toolbar-run-state`, never computed here.
+    in property <string> stage-word: "";
+    in property <string> step-text: "";
+    in property <float> bar-fraction: 0.0;
+    in property <string> bar-tone: "running";
+    in property <string> eta-text: "";
+
+    // The bottom bar's overlay controls; disabled without a finished fuse.
+    in property <bool> overlay-available: false;
+    in property <bool> overlay-on: false;
+    in property <float> overlay-fraction: 0.0;
+    in property <string> overlay-text: "";
+    callback overlay-toggled(bool);
+    callback overlay-fraction-changed(float);
+
+    // Whether a background stack load is in flight
+    // (`AppController::open_paths`), pushed on every `LoadStarted`/`LoadReady`.
+    in property <bool> load-active: false;
+    // The loading indicator's wording: "Loading…" for a load, "Saving…" for a save.
+    in property <string> load-caption: "Loading…";
+    // Whether the loading indicator's own show threshold has let it become
+    // visible -- read by a headless test, with no running window.
+    out property <bool> load-indicator-visible: loading-indicator.load-visible;
+
+    icon-bar := FFIconBar {
+        x: 0px;
+        y: ShellGeometry.strip-height;
+        height: root.height - ShellGeometry.strip-height;
+        unread: root.notifications-unread;
+        center-open: root.notification-center-open;
+
+        bell-activated => {
+            root.bell-activated();
+            if root.notification-center-open {
+                notification-center.focus-center();
+            }
+        }
+        settings-requested => { root.settings-open-requested(); }
+    }
+
+    bottom-bar := FFBottomBar {
+        x: ShellGeometry.icon-bar-width;
+        y: root.height - ShellGeometry.bottom-bar-height;
+        width: root.width - ShellGeometry.icon-bar-width;
+        height: ShellGeometry.bottom-bar-height;
+        zoom-readout: root.zoom-readout;
+        project-loaded: root.project-loaded;
+        stage-word: root.stage-word;
+        step-text: root.step-text;
+        bar-fraction: root.bar-fraction;
+        bar-tone: root.bar-tone;
+        eta-text: root.eta-text;
+        overlay-available: root.overlay-available;
+        overlay-on: root.overlay-on;
+        overlay-fraction: root.overlay-fraction;
+        overlay-text: root.overlay-text;
+
+        zoom-in-requested => { root.zoom-in-requested(); }
+        zoom-out-requested => { root.zoom-out-requested(); }
+        zoom-fit-requested => { root.zoom-fit-requested(); }
+        overlay-toggled(on) => { root.overlay-toggled(on); }
+        overlay-fraction-changed(f) => { root.overlay-fraction-changed(f); }
+    }
+
+    // The projects overlay's gallery: pushed from `AppController::project_cards`
+    // on every `ShellEvent::OverlayChanged`.
+    in property <string> gallery-heading: "Open projects";
+    in property <string> gallery-count-text: "";
+    in property <[ProjectCardView]> project-cards: [];
+    in property <length> gallery-content-height: 0px;
+    in property <length> gallery-scroll-y: 0px;
+    callback projects-card-clicked(int);
+    callback projects-card-action-clicked(int);
+    callback projects-card-close-clicked(int);
+    callback gallery-scrolled(length);
+    callback gallery-scrollbar-pointer(int, length);
+    callback gallery-scrollbar-dragged(length);
+    callback gallery-viewport-height-changed(length);
+    callback gallery-width-changed(length);
+    in property <[RecentRowView]> recent-rows: [];
+    callback projects-new-project-requested();
+    callback projects-open-project-requested();
+    callback projects-close-project-requested();
+    in property <bool> projects-save-enabled: false;
+    callback projects-save-project-requested();
+    callback projects-recent-clicked(int);
+    out property <length> gallery-width: projects-overlay.gallery-width;
+
+    projects-overlay := FFProjectsOverlay {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height;
+        width: root.width - ShellGeometry.icon-bar-width;
+        height: root.height - ShellGeometry.strip-height;
+        overlay-open: root.projects-overlay-open;
+        gallery-heading: root.gallery-heading;
+        gallery-count-text: root.gallery-count-text;
+        cards: root.project-cards;
+        gallery-content-height: root.gallery-content-height;
+        gallery-scroll-y: root.gallery-scroll-y;
+        recent-rows: root.recent-rows;
+        save-enabled: root.projects-save-enabled;
+
+        card-clicked(i) => { root.projects-card-clicked(i); }
+        card-action-clicked(i) => { root.projects-card-action-clicked(i); }
+        card-close-clicked(i) => { root.projects-card-close-clicked(i); }
+        gallery-scrolled(delta) => { root.gallery-scrolled(delta); }
+        gallery-scrollbar-pointer(kind, y) => { root.gallery-scrollbar-pointer(kind, y); }
+        gallery-scrollbar-dragged(y) => { root.gallery-scrollbar-dragged(y); }
+        gallery-viewport-height-changed(h) => { root.gallery-viewport-height-changed(h); }
+        gallery-width-changed(w) => { root.gallery-width-changed(w); }
+        new-project-requested => { root.projects-new-project-requested(); }
+        open-project-requested => { root.projects-open-project-requested(); }
+        close-project-requested => { root.projects-close-project-requested(); }
+        save-project-requested => { root.projects-save-project-requested(); }
+        recent-clicked(i) => { root.projects-recent-clicked(i); }
+    }
+
+    notification-center := FFNotificationCenter {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.bottom-bar-height;
+        center-open: root.notification-center-open;
+        count-text: root.notification-count-text;
+        rows: root.notification-rows;
+
+        row-clicked(id) => { root.notification-row-clicked(id); }
+        acknowledge-requested(id) => { root.notification-acknowledge-requested(id); }
+        diagnostics-requested(id) => { root.notification-diagnostics-requested(id); }
+        selection-moved(delta) => { root.notification-selection-moved(delta); }
+        expansion-toggled => { root.notification-expansion-toggled(); }
+        close-requested => {
+            root.notification-center-close-requested();
+            icon-bar.focus-bell();
+        }
+    }
+
+    settings-modal := FFSettingsModal {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        settings-open: root.settings-open;
+        input-rows: root.input-rows;
+        settings-section: root.settings-section;
+        performance: root.performance;
+        appearance-presentation: root.appearance-presentation;
+        appearance-menu-open: root.appearance-menu-open;
+        appearance-menu-focused: root.appearance-menu-focused;
+        appearance-menu-disabled: root.appearance-menu-disabled;
+        appearance-save-error: root.appearance-save-error;
+        appearance-presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+        appearance-menu-toggled => { root.appearance-menu-toggled(); }
+        storage: root.storage;
+        about: root.about;
+        diagnostics-rows: root.diagnostics-rows;
+        diagnostics-note: root.diagnostics-note;
+        diagnostics-include-minidumps: root.diagnostics-include-minidumps;
+        diagnostics-destination: root.diagnostics-destination;
+        diagnostics-status: root.diagnostics-status;
+        diagnostics-message: root.diagnostics-message;
+        diagnostics-primary-label: root.diagnostics-primary-label;
+        diagnostics-busy: root.diagnostics-busy;
+        diagnostics-loading: root.diagnostics-loading;
+        diagnostics-manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+        diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
+        diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;
+
+        settings-close-requested => {
+            root.settings-close-requested();
+            canvas-ground.focus();
+        }
+        settings-section-selected(s) => { root.settings-section-selected(s); }
+        performance-gpu-toggled(on) => { root.performance-gpu-toggled(on); }
+        performance-host-cap-edited(t) => { root.performance-host-cap-edited(t); }
+        performance-vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+        performance-host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
+        performance-vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        storage-clear-requested => { root.storage-clear-requested(); }
+        diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+        diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
+        diagnostics-destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+        diagnostics-primary-clicked => { root.diagnostics-primary-clicked(); }
+        diagnostics-manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+        diagnostics-manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+        diagnostics-manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+        diagnostics-manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+    }
+
+    // The one grouping question and the two refusals the entry path can
+    // produce.
+    in property <bool> question-open: false;
+    in property <int> question-frame-count: 0;
+    in property <int> question-project-count: 0;
+    callback question-open-as-one();
+    callback question-open-as-many();
+    callback question-cancelled();
+    in property <bool> refusal-open: false;
+    in property <string> refusal-title: "No frames here";
+    in property <string> refusal-body: "";
+    in property <string> refusal-button-label: "Pick another folder…";
+    callback refusal-pick-another-folder();
+
+    // A saved project's source content disagrees with its recorded
+    // fingerprint; the project stays unopened until a choice is made.
+    in property <bool> mismatch-open: false;
+    in property <string> mismatch-context: "";
+    in property <string> mismatch-body: "";
+    callback mismatch-open-anyway();
+    callback mismatch-locate-frames();
+    callback mismatch-cancelled();
+
+    // An opened project's sources cannot all be resolved from here.
+    in property <bool> sources-missing-open: false;
+    in property <string> sources-missing-context: "";
+    in property <string> sources-missing-body: "";
+    callback sources-missing-locate-frames();
+    callback sources-missing-closed();
+
+    // The checkpoint panel's `Export image` modal.
+    in property <bool> export-open: false;
+    in property <string> export-context: "";
+    in property <string> export-what: "";
+    in property <string> export-stage: "ready";
+    in property <string> export-writing-file-name: "";
+    in property <[string]> export-refusal-lines: [];
+    in property <[string]> export-format-segments: [];
+    in property <string> export-format-selected: "";
+    in property <string> export-settings-heading: "";
+    in property <[ExportRowView]> export-rows: [];
+    in property <bool> export-slider-group: false;
+    in property <bool> export-metadata-on: true;
+    in property <bool> export-can-locate: true;
+    callback export-confirmed();
+    callback export-cancelled();
+    callback export-format-chosen(string);
+    callback export-menu-toggled(string);
+    callback export-option-chosen(string, string);
+    callback export-quality-changed(float);
+    callback export-chroma-chosen(string, string);
+    callback export-metadata-toggled();
+
+    // The visible toast; `toast-id` is its record's stable id.
+    in property <bool> toast-open: false;
+    in property <int> toast-id: 0;
+    // "info" | "warning" | "failure" | "crash".
+    in property <string> toast-kind: "info";
+    in property <string> toast-title: "";
+    callback toast-dismissed();
+    callback toast-activated(int);
+    // The pointer or the keyboard is on the toast.
+    callback toast-hold-changed(bool);
+
+    // The one warning a frame-set change (add/reorder/remove) raises once
+    // its project already carries a checkpoint.
+    in property <bool> frame-warning-open: false;
+    in property <string> frame-warning-title: "";
+    in property <string> frame-warning-body: "";
+    in property <string> frame-warning-info: "";
+    in property <string> frame-warning-confirm-label: "Confirm";
+    in property <string> frame-warning-secondary-label: "";
+    callback frame-warning-cancelled();
+    callback frame-warning-secondary-pressed();
+    callback frame-warning-confirmed();
+
+    // Keep or discard a run whose alignment left some frames unregistered.
+    in property <bool> divergence-open: false;
+    in property <string> divergence-body: "";
+    callback divergence-discarded();
+    callback divergence-kept();
+    in property <bool> close-guard-open: false;
+    in property <string> close-guard-title: "Save this state first?";
+    in property <string> close-guard-context: "";
+    in property <string> close-guard-body: "";
+    in property <string> close-guard-info: "";
+    in property <string> close-guard-secondary-label: "Save and close";
+    in property <string> close-guard-confirm-label: "Close without saving";
+    callback close-guard-cancelled();
+    callback close-guard-secondary-pressed();
+    callback close-guard-confirmed();
+    in property <bool> checkpoint-delete-open: false;
+    in property <string> checkpoint-delete-context: "";
+    in property <string> checkpoint-delete-body: "";
+    callback checkpoint-delete-cancelled();
+    callback checkpoint-delete-confirmed();
+
+    grouping-question := FFGroupingQuestion {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        question-open: root.question-open;
+        frame-count: root.question-frame-count;
+        project-count: root.question-project-count;
+        open-as-one => { root.question-open-as-one(); }
+        open-as-many => { root.question-open-as-many(); }
+        cancelled => { root.question-cancelled(); }
+    }
+
+    mismatch-dialog := FFFingerprintMismatch {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.mismatch-open;
+        context: root.mismatch-context;
+        body: root.mismatch-body;
+        confirmed => { root.mismatch-open-anyway(); }
+        secondary-pressed => { root.mismatch-locate-frames(); }
+        cancelled => { root.mismatch-cancelled(); }
+    }
+
+    sources-missing-dialog := FFSourcesMissing {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.sources-missing-open;
+        context: root.sources-missing-context;
+        body: root.sources-missing-body;
+        confirmed => { root.sources-missing-locate-frames(); }
+        cancelled => { root.sources-missing-closed(); }
+    }
+
+    export-dialog := FFExportDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        export-open: root.export-open;
+        context: root.export-context;
+        what: root.export-what;
+        stage: root.export-stage;
+        writing-file-name: root.export-writing-file-name;
+        refusal-lines: root.export-refusal-lines;
+        format-segments: root.export-format-segments;
+        format-selected: root.export-format-selected;
+        settings-heading: root.export-settings-heading;
+        rows: root.export-rows;
+        slider-group: root.export-slider-group;
+        metadata-on: root.export-metadata-on;
+        can-locate: root.export-can-locate;
+        confirmed => { root.export-confirmed(); }
+        cancelled => { root.export-cancelled(); }
+        format-chosen(label) => { root.export-format-chosen(label); }
+        menu-toggled(id) => { root.export-menu-toggled(id); }
+        option-chosen(id, variant) => { root.export-option-chosen(id, variant); }
+        quality-changed(fraction) => { root.export-quality-changed(fraction); }
+        chroma-chosen(id, label) => { root.export-chroma-chosen(id, label); }
+        metadata-toggled => { root.export-metadata-toggled(); }
+    }
+
+    // Declared after the mismatch and sources-missing dialogs so a refusal
+    // raised by a failed `Locate frames…` (either one's own trigger) always
+    // paints on top of whichever dialog is still open underneath it, rather
+    // than being fully occluded by it.
+    refusal-dialog := FFRefusalDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        refusal-open: root.refusal-open;
+        title: root.refusal-title;
+        body: root.refusal-body;
+        button-label: root.refusal-button-label;
+        pick-another-folder => { root.refusal-pick-another-folder(); }
+    }
+
+    toast := FFToast {
+        x: ShellGeometry.icon-bar-width + Theme.space-4;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + Theme.space-4;
+        toast-open: root.toast-open;
+        title: root.toast-title;
+        kind: root.toast-kind;
+        dismissed => { root.toast-dismissed(); }
+        link-activated => {
+            root.toast-activated(root.toast-id);
+            if root.notification-center-open {
+                notification-center.focus-center();
+            }
+        }
+        changed held => { root.toast-hold-changed(self.held); }
+    }
+
+    frame-warning := FFFrameSetWarning {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.frame-warning-open;
+        title: root.frame-warning-title;
+        body: root.frame-warning-body;
+        info: root.frame-warning-info;
+        confirm-label: root.frame-warning-confirm-label;
+        secondary-label: root.frame-warning-secondary-label;
+        cancelled => { root.frame-warning-cancelled(); }
+        secondary-pressed => { root.frame-warning-secondary-pressed(); }
+        confirmed => { root.frame-warning-confirmed(); }
+    }
+
+    divergence-warning := FFDivergenceWarning {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.divergence-open;
+        body: root.divergence-body;
+        cancelled => { root.divergence-discarded(); }
+        confirmed => { root.divergence-kept(); }
+    }
+
+    close-guard := FFCloseGuard {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.close-guard-open;
+        title: root.close-guard-title;
+        context: root.close-guard-context;
+        body: root.close-guard-body;
+        info: root.close-guard-info;
+        secondary-label: root.close-guard-secondary-label;
+        confirm-label: root.close-guard-confirm-label;
+        cancelled => { root.close-guard-cancelled(); }
+        secondary-pressed => { root.close-guard-secondary-pressed(); }
+        confirmed => { root.close-guard-confirmed(); }
+    }
+
+    checkpoint-delete := FFCheckpointDelete {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        open: root.checkpoint-delete-open;
+        context: root.checkpoint-delete-context;
+        body: root.checkpoint-delete-body;
+        cancelled => { root.checkpoint-delete-cancelled(); }
+        confirmed => { root.checkpoint-delete-confirmed(); }
+    }
+
+    loading-indicator := FFLoadingIndicator {
+        x: canvas-ground.x;
+        y: canvas-ground.y;
+        width: canvas-ground.width;
+        height: canvas-ground.height;
+        load-active: root.load-active;
+        caption: root.load-caption;
+    }
+
+    // `no-frame: true` above means the compositor draws no OS chrome, so
+    // without this the window has no visible boundary against a dark
+    // desktop. Painted last (last child = topmost), non-interactive (no
+    // `TouchArea`) so it never steals a click meant for the chrome beneath
+    // it.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: transparent;
+        border-width: 1px;
+        border-color: Theme.border-default;
+    }
+}

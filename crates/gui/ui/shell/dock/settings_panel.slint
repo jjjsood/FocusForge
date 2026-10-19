@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The settings panel: one row per parameter, generated entirely from the
+// flat list Rust hands it.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFSlider } from "../../components/ff_slider.slint";
+import { FFToggle } from "../../components/ff_toggle.slint";
+import { FFMenu } from "../../components/ff_menu.slint";
+import { FFMenuList } from "../../components/ff_menu_list.slint";
+import { FFSectionHeading } from "../../components/ff_section_heading.slint";
+import { FFErrorRow } from "../../components/ff_error_row.slint";
+import { FFScrollbar } from "../../components/ff_scrollbar.slint";
+import { FFResetAll } from "../../components/ff_reset_all.slint";
+import { FFMoreToggle } from "../../components/ff_more_toggle.slint";
+import { FFRowLabel } from "../../components/ff_row_label.slint";
+import { FFRowText } from "../../components/ff_row_text.slint";
+
+/// One row of the panel's flat list -- the `.slint` twin of
+/// `crate::settings_panel::SettingsRow`. `kind` is one of `"heading"`,
+/// `"picker"`, `"linear-float"`, `"log-float"`, `"int"`, `"bool"`,
+/// `"enum"`, `"error"`, `"reset-all"`, `"more"` or `"more-end"`; `heading-state` is one of
+/// `"default"`, `"explicit"` or `"pending"`, meaningless off a `"heading"`
+/// row. `"reset-all"` carries its own enabled state in `selected`
+/// (`"true"`/`"false"`), the same convention a `"bool"` row's value uses; a
+/// `"more"` row carries its open state the same way and, in `extent`, the
+/// height of its band including the rows it holds, which are `nested`.
+export struct SettingsRow {
+    kind: string,
+    section: string,
+    id: string,
+    label: string,
+    value-text: string,
+    fraction: float,
+    choices: [string],
+    choice-ids: [string],
+    selected: string,
+    menu-open: bool,
+    heading-state: string,
+    top: length,
+    disabled: bool,
+    nested: bool,
+    extent: length,
+}
+
+/// The section heading currently stuck to the panel's own top edge, drawn
+/// once more over the scrolling content below it. `visible` is false while
+/// no heading has scrolled past yet.
+export struct SectionHeadView {
+    visible: bool,
+    section: string,
+    label: string,
+    provenance: string,
+    // How far the next heading has already pushed this one up and off the
+    // viewport's own top edge, `0` until the next heading is closer than
+    // one heading-band away.
+    push: length,
+}
+
+export component FFSettingsPanel inherits Rectangle {
+    in property <[SettingsRow]> rows: [];
+    in property <SectionHeadView> sticky: { visible: false, section: "", label: "", provenance: "default", push: 0px };
+    in property <length> scroll-y: 0px;
+    in property <length> content-height: 0px;
+    in property <bool> enabled: true;
+
+    callback param-changed(string, string, float);
+    callback param-stepped(string, string, int);
+    callback param-text-edited(string, string, string);
+    callback algorithm-selected(string, string);
+    callback reset-all();
+    callback menu-toggled(string, string);
+    callback more-toggled(string);
+    callback scrolled(length);
+    callback scrollbar-pointer(int, length);
+    callback scrollbar-dragged(length);
+    callback viewport-height-changed(length);
+
+    opacity: root.enabled ? 1.0 : 0.5;
+
+    clip-area := Rectangle {
+        x: -ShellGeometry.dock-content-inset;
+        y: 0px;
+        width: ShellGeometry.dock-width;
+        height: parent.height;
+        clip: true;
+
+        changed height => { root.viewport-height-changed(self.height); }
+
+        hit-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            enabled: root.enabled;
+            scroll-event(event) => {
+                root.scrolled(-event.delta-y);
+                accept
+            }
+        }
+
+        content := Rectangle {
+            x: ShellGeometry.dock-content-inset;
+            y: -root.scroll-y;
+            width: ShellGeometry.panel-content-width;
+            height: root.content-height;
+
+            for row[i] in root.rows: row-area := Rectangle {
+                x: 0px;
+                y: row.top;
+                width: 100%;
+                height: row.kind == "heading"
+                    ? ShellGeometry.section-heading-height
+                    : row.kind == "error" ? ShellGeometry.param-error-height
+                    : row.kind == "bool" ? ShellGeometry.param-row-bool + ShellGeometry.param-row-bool-gap
+                    : row.kind == "picker" ? ShellGeometry.param-label-height + ShellGeometry.param-row-field
+                    : row.kind == "enum" ? ShellGeometry.param-label-height + ShellGeometry.param-row-enum
+                    : row.kind == "log-float" ? ShellGeometry.param-label-height + ShellGeometry.param-row-log
+                    : row.kind == "reset-all" ? ShellGeometry.reset-all-top-gap + ShellGeometry.reset-all-height
+                    : row.kind == "more" ? ShellGeometry.more-height + ShellGeometry.more-gap
+                    : row.kind == "more-end" ? ShellGeometry.more-gap
+                    : ShellGeometry.param-label-height + ShellGeometry.param-row-linear;
+
+                if row.kind == "heading": FFSectionHeading {
+                    width: 100%;
+                    height: 100%;
+                    label: row.label;
+                    provenance: row.heading-state;
+                }
+
+                if row.kind == "picker": FFRowLabel {
+                    width: 100%;
+                    height: 100%;
+                    label-text: row.label;
+                    disabled: row.disabled;
+                    FFMenu {
+                        name: row.label;
+                        label: row.value-text;
+                        choices: row.choices;
+                        choice-ids: row.choice-ids;
+                        selected: row.selected;
+                        open: row.menu-open;
+                        disabled: !root.enabled || row.disabled;
+                        external-list: true;
+                        toggled => { root.menu-toggled(row.section, row.id); }
+                        option-selected(picked) => { root.algorithm-selected(row.section, picked); }
+                    }
+                }
+
+                if row.kind == "enum": FFRowLabel {
+                    width: 100%;
+                    height: 100%;
+                    label-text: row.label;
+                    disabled: row.disabled;
+                    FFMenu {
+                        name: row.label;
+                        label: row.value-text;
+                        choices: row.choices;
+                        choice-ids: row.choice-ids;
+                        selected: row.selected;
+                        open: row.menu-open;
+                        disabled: !root.enabled || row.disabled;
+                        recessed: row.nested;
+                        external-list: true;
+                        toggled => { root.menu-toggled(row.section, row.id); }
+                        option-selected(picked) => { root.param-text-edited(row.section, row.id, picked); }
+                    }
+                }
+
+                if row.kind == "linear-float" || row.kind == "int": FFRowLabel {
+                    width: 100%;
+                    height: 100%;
+                    label-text: row.label;
+                    disabled: row.disabled;
+                    FFSlider {
+                        scale: "linear";
+                        fraction: row.fraction;
+                        value-text: row.value-text;
+                        disabled: !root.enabled || row.disabled;
+                        recessed: row.nested;
+                        fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
+                        stepped(direction) => { root.param-stepped(row.section, row.id, direction); }
+                    }
+                }
+
+                if row.kind == "log-float": FFRowLabel {
+                    width: 100%;
+                    height: 100%;
+                    label-text: row.label;
+                    disabled: row.disabled;
+                    FFSlider {
+                        scale: "logarithmic";
+                        fraction: row.fraction;
+                        value-text: row.value-text;
+                        disabled: !root.enabled || row.disabled;
+                        recessed: row.nested;
+                        fraction-changed(f) => { root.param-changed(row.section, row.id, f); }
+                    }
+                }
+
+                if row.kind == "bool": HorizontalLayout {
+                    width: 100%;
+                    height: ShellGeometry.param-row-bool;
+                    alignment: space-between;
+                    FFRowText {
+                        text: row.label;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        FFToggle {
+                            name: row.label;
+                            on: row.selected == "true";
+                            disabled: !root.enabled || row.disabled;
+                            recessed: row.nested;
+                            toggled => {
+                                root.param-text-edited(row.section, row.id, row.selected == "true" ? "false" : "true");
+                            }
+                        }
+                    }
+                }
+
+                if row.kind == "error": FFErrorRow {
+                    width: 100%;
+                    height: 100%;
+                    message: row.value-text;
+                }
+
+                if row.kind == "reset-all": FFResetAll {
+                    x: 0px;
+                    y: ShellGeometry.reset-all-top-gap;
+                    width: 100%;
+                    height: ShellGeometry.reset-all-height;
+                    enabled: row.selected == "true";
+                    clicked => { root.reset-all(); }
+                }
+
+                if row.kind == "more": FFMoreToggle {
+                    x: -ShellGeometry.dock-content-inset;
+                    y: 0px;
+                    width: ShellGeometry.dock-width;
+                    height: row.extent;
+                    open: row.selected == "true";
+                    disabled: !root.enabled || row.disabled;
+                    toggled => { root.more-toggled(row.section); }
+                }
+            }
+
+            // A picker/enum row's open list drawn again, in its own pass
+            // after every row -- document order alone would put whichever
+            // row comes next on top of an open list that reaches past this
+            // row's own bottom edge. `FFMenu` draws none of its own in this
+            // panel (`external-list: true` above); this is the only copy.
+            for row[i] in root.rows: Rectangle {
+                x: 0px;
+                y: row.top;
+                width: 100%;
+                visible: row.menu-open;
+
+                if row.kind == "picker": FFMenuList {
+                    x: 0px;
+                    y: ShellGeometry.param-label-height + ShellGeometry.field-height;
+                    width: ShellGeometry.panel-content-width;
+                    choices: row.choices;
+                    choice-ids: row.choice-ids;
+                    selected: row.selected;
+                    option-selected(picked) => { root.algorithm-selected(row.section, picked); }
+                }
+
+                if row.kind == "enum": FFMenuList {
+                    x: 0px;
+                    y: ShellGeometry.param-label-height + ShellGeometry.field-height;
+                    width: ShellGeometry.panel-content-width;
+                    choices: row.choices;
+                    choice-ids: row.choice-ids;
+                    selected: row.selected;
+                    option-selected(picked) => { root.param-text-edited(row.section, row.id, picked); }
+                }
+            }
+        }
+
+        // Drawn last, inside `clip-area` but outside `content` -- unmoved
+        // by its own `-scroll-y` binding, and clipped at the panel's own
+        // top edge when `sticky.push` slides it upward off-screen.
+        if root.sticky.visible: FFSectionHeading {
+            x: 0px;
+            y: -root.sticky.push;
+            width: parent.width;
+            inset: ShellGeometry.dock-content-inset;
+            inset-end: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.panel-content-width;
+            label: root.sticky.label;
+            provenance: root.sticky.provenance;
+        }
+    }
+
+    scrollbar := FFScrollbar {
+        x: parent.width - self.width;
+        y: 0px;
+        height: parent.height;
+        content-height: root.content-height;
+        viewport-height: clip-area.height;
+        offset: root.scroll-y;
+        pointer(kind, y) => { root.scrollbar-pointer(kind, y); }
+        dragged(y) => { root.scrollbar-dragged(y); }
+    }
+}

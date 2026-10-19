@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One checkpoint list row: algorithm over timestamp; selected adds a raised
+// background and a left accent bar; a hovered deletable row shows a trash
+// control at its right edge; a fresh row appears under one short accent tint
+// that holds, then fades on its own.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFCheckpointRow inherits Rectangle {
+    in property <string> algorithm;
+    in property <string> time-text;
+    in property <bool> selected: false;
+    // Whether the row offers a delete control while hovered.
+    in property <bool> deletable: false;
+    // Draws the hover look without a pointer.
+    in property <bool> hovered: false;
+    // Plays the tint once when set; clearing it never cuts a running tint short.
+    in property <bool> flash: false;
+    // Draws the tint's peak without fading, as `hovered` does for the hover look.
+    in property <bool> flash-held: false;
+
+    callback clicked();
+    callback delete-requested();
+
+    width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-band-inset;
+    height: ShellGeometry.checkpoint-row-height;
+    background: root.selected || root.hovered || area.has-hover ? Theme.surface-hover : transparent;
+
+    // Set in `init`, so a fresh row's first frame is already at the peak; only
+    // the fall animates.
+    property <bool> flashing: false;
+
+    init => {
+        if root.flash {
+            root.flashing = true;
+        }
+    }
+    changed flash => {
+        if root.flash {
+            root.flashing = true;
+        }
+    }
+
+    // First child: under the trash, the accent bar and the text.
+    flash-tint := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.accent-default.with-alpha(0.15);
+        opacity: (root.flashing || root.flash-held) ? 1 : 0;
+        animate opacity { duration: Theme.motion-fast; easing: ease-out; }
+
+        Timer {
+            interval: Theme.motion-fast;
+            running: root.flashing;
+            triggered => { root.flashing = false; }
+        }
+    }
+
+    // Nested rather than a sibling: Slint delivers a pointer move to exactly
+    // one item, so a sibling TouchArea would occlude `area.has-hover` once the
+    // pointer reaches the trash.
+    area := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+
+        // Clear of the list's scrollbar track, which sits flush on the row's
+        // right edge.
+        if root.deletable && (root.hovered || area.has-hover): trash := TouchArea {
+            accessible-role: button;
+            accessible-enabled: true;
+            accessible-label: "Delete checkpoint";
+            width: Theme.icon-sm;
+            height: Theme.icon-sm;
+            x: parent.width - self.width - Theme.space-1 - ShellGeometry.scrollbar-width;
+            y: (parent.height - self.height) / 2;
+            clicked => { root.delete-requested(); }
+            Image {
+                source: @image-url("../../../../assets/icons/trash.svg");
+                colorize: Theme.status-failure;
+                width: 100%;
+                height: 100%;
+            }
+        }
+    }
+
+    // The bar's own width is the gap between the band's inset and the
+    // content column's -- it sits exactly where the row's shared content
+    // edge already is.
+    property <length> bar-width: ShellGeometry.dock-content-inset - ShellGeometry.dock-band-inset;
+
+    if root.selected: Rectangle {
+        x: 0;
+        width: root.bar-width;
+        height: 100%;
+        background: Theme.accent-default;
+    }
+
+    VerticalLayout {
+        // Clear of the accent bar, whether or not this row draws one.
+        x: root.bar-width + Theme.space-3;
+        width: ShellGeometry.dock-width - 2 * ShellGeometry.dock-content-inset - Theme.space-3;
+        height: 100%;
+        alignment: center;
+
+        Text {
+            text: root.algorithm;
+            color: Theme.text-primary;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            overflow: elide;
+        }
+        Text {
+            text: root.time-text;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            overflow: elide;
+        }
+    }
+}

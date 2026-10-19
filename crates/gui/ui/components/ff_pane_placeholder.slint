@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A raised card telling the viewer a canvas pane has nothing to show yet.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFButton } from "ff_button.slint";
+
+export component FFPanePlaceholder inherits Rectangle {
+    in property <string> title: "Not fused yet";
+    in property <string> body: "Fuse stack builds the composite here.";
+    in property <string> action-label: "";
+    in property <length> content-inset: Theme.space-4;
+    in property <length> corner-radius: Theme.radius-lg;
+    callback action-requested();
+
+    width: ShellGeometry.pane-placeholder-width;
+    height: layout.preferred-height;
+    background: Theme.surface-raised;
+    border-radius: root.corner-radius;
+
+    layout := VerticalLayout {
+        padding: root.content-inset;
+        spacing: Theme.space-2;
+
+        Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: Theme.text-title.size;
+            font-weight: Theme.text-title.weight;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.body;
+            color: Theme.text-muted;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        if root.action-label != "": Rectangle {
+            height: ShellGeometry.toolbar-button-height;
+
+            FFButton {
+                x: (parent.width - self.width) / 2;
+                width: self.preferred-width;
+                kind: "default";
+                compact: true;
+                text: root.action-label;
+                clicked => { root.action-requested(); }
+            }
+        }
+    }
+}

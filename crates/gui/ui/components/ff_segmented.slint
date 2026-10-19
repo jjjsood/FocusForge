@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A track of equal-width segments with one highlighted -- a format or mode
+// switch drawn as one control rather than separate buttons. The selected
+// segment is tinted and set in the accent colour.
+
+import { Theme } from "../theme.slint";
+
+export component FFSegmented inherits Rectangle {
+    in property <[string]> segments: [];
+    in property <string> selected: "";
+    callback segment-selected(string);
+
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    background: Theme.surface-overlay;
+    clip: true;
+
+    HorizontalLayout {
+        for label[i] in root.segments: Rectangle {
+            border-radius: Theme.radius-sm;
+            background: label == root.selected ? Theme.accent-subtle : transparent;
+
+            Text {
+                text: label;
+                color: label == root.selected ? Theme.accent-default : Theme.text-muted;
+                font-size: Theme.text-body.size;
+                font-weight: label == root.selected ? Theme.text-section.weight : Theme.text-body.weight;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+            }
+            segment := TouchArea {
+                accessible-role: button;
+                accessible-enabled: true;
+                accessible-label: label;
+                accessible-checkable: true;
+                accessible-checked: label == root.selected;
+                clicked => { root.segment-selected(label); }
+            }
+        }
+    }
+}

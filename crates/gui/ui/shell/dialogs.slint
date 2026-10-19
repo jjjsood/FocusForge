@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The one grouping question and the two refusals the entry path can
+// produce. Modelled on `ui/shell/settings_modal.slint`.
+// No string in this file, or anywhere else under `ui/`, contains `group` --
+// "stacks" and "projects" carry the same meaning without inventing
+// vocabulary the CLI has no counterpart for.
+
+import { Theme } from "../theme.slint";
+import { FFDialog } from "../components/ff_dialog.slint";
+import { FFDialogFooter } from "../components/ff_dialog_footer.slint";
+import { FFRowText } from "../components/ff_row_text.slint";
+import { FFSectionHeading } from "../components/ff_section_heading.slint";
+import { FFMenu } from "../components/ff_menu.slint";
+import { FFMenuList } from "../components/ff_menu_list.slint";
+import { FFSlider } from "../components/ff_slider.slint";
+import { FFToggle } from "../components/ff_toggle.slint";
+import { FFSpinner } from "../components/ff_spinner.slint";
+import { FFProgressBar } from "../components/ff_progress_bar.slint";
+import { FFErrorRow } from "../components/ff_error_row.slint";
+import { FFModalPanel } from "../components/ff_modal_panel.slint";
+import { FFStatusGlyph } from "../components/ff_status_glyph.slint";
+import { FFDivider } from "../components/ff_divider.slint";
+import { FFHeading } from "../components/ff_heading.slint";
+import { FFSegmented } from "../components/ff_segmented.slint";
+
+export component FFGroupingQuestion inherits FFModalPanel {
+    in property <bool> question-open: false;
+    in property <int> frame-count: 0;
+    in property <int> project-count: 0;
+    callback open-as-one();
+    callback open-as-many();
+    callback cancelled();
+
+    modal-open: root.question-open;
+    panel-width: 480px;
+    panel-height: 200px;
+
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+
+        body := Text {
+            text: "This folder reads as " + root.project-count + " stacks of "
+                + root.frame-count + " frames.";
+            color: Theme.text-primary;
+            font-size: Theme.text-body.size;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: Theme.space-2;
+
+            one-button := Rectangle {
+                height: 36px;
+                background: Theme.accent-default;
+                border-radius: Theme.radius-sm;
+                TouchArea { clicked => { root.open-as-one(); } }
+                Text {
+                    text: "Open as one project";
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+            many-button := Rectangle {
+                height: 36px;
+                background: Theme.surface-hover;
+                border-radius: Theme.radius-sm;
+                TouchArea { clicked => { root.open-as-many(); } }
+                Text {
+                    text: "Open as " + root.project-count + " projects";
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
+
+        cancel-area := TouchArea {
+            height: 24px;
+            clicked => { root.cancelled(); }
+            Text {
+                text: "Cancel";
+                color: Theme.text-muted;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
+
+export component FFRefusalDialog inherits FFModalPanel {
+    in property <bool> refusal-open: false;
+    in property <string> title: "No frames here";
+    in property <string> body: "";
+    in property <string> button-label: "Pick another folder…";
+    callback pick-another-folder();
+
+    modal-open: root.refusal-open;
+    panel-width: 420px;
+    panel-height: 180px;
+
+    VerticalLayout {
+        padding: Theme.space-4;
+        spacing: Theme.space-3;
+
+        Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: Theme.text-title.size;
+            font-weight: Theme.text-title.weight;
+        }
+        Text {
+            text: root.body;
+            color: Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            wrap: word-wrap;
+        }
+        pick-area := Rectangle {
+            height: 36px;
+            background: Theme.accent-default;
+            border-radius: Theme.radius-sm;
+            TouchArea { clicked => { root.pick-another-folder(); } }
+            Text {
+                text: root.button-label;
+                color: Theme.text-primary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+            }
+        }
+    }
+}
+
+// The one warning a frame-set change (add/reorder/remove) shows once its
+// project already carries a checkpoint -- `AppController::pending_frame_change`
+// supplies every string and flag below, already rendered.
+export component FFFrameSetWarning inherits FFDialog {
+    tone: "warning";
+    confirm-kind: "primary";
+}
+
+// Asked after a run whose alignment left some frames unregistered, before
+// its checkpoint is committed; the body names those frames.
+export component FFDivergenceWarning inherits FFDialog {
+    tone: "warning";
+    title: "Keep this fused result?";
+    cancel-label: "Discard";
+    confirm-label: "Keep";
+    confirm-kind: "primary";
+}
+
+// Asked before closing a tab, or the window, with checkpoints no project
+// file contains; `AppController::pending_close` supplies the close-a-tab
+// title, context, body and info, `pending_quit_copy` the quit-the-window
+// ones, whichever is pending.
+export component FFCloseGuard inherits FFDialog {
+    tone: "save";
+    confirm-kind: "danger";
+}
+
+// Asked before a checkpoint is deleted; `AppController` supplies the
+// context (`algorithm · HH:MM:SS`) and the body with the other-checkpoint
+// count.
+export component FFCheckpointDelete inherits FFDialog {
+    tone: "plain";
+    divider: false;
+    panel-width: 560px;
+    panel-height: 316px;
+    title: "Delete this checkpoint?";
+    confirm-label: "Delete";
+    confirm-kind: "danger";
+}
+
+// A saved project's source content no longer matches the fingerprint it
+// was recorded with, blocking the open until a choice is made;
+// `AppController::mismatch_copy` supplies the context and body. `Open
+// anyway` is a `status.failure`-styled (`confirm-kind: "danger"`) confirm,
+// as `FFCloseGuard`'s own is.
+export component FFFingerprintMismatch inherits FFDialog {
+    tone: "warning";
+    panel-width: 600px;
+    panel-height: 362px;
+    title: "The source frames are not the same";
+    info: "Finding the original frames again opens the project unchanged.";
+    secondary-label: "Locate frames…";
+    confirm-label: "Open anyway";
+    confirm-kind: "danger";
+}
+
+// An opened project's sources cannot all be resolved from here;
+// `AppController::sources_notice` supplies the context and body. The
+// project is already open, so its dismiss is `Close`, not `Cancel`.
+export component FFSourcesMissing inherits FFDialog {
+    tone: "caution";
+    panel-width: 540px;
+    panel-height: 330px;
+    title: "The frames are no longer there";
+    info: "The Projects overlay shows the same condition as a \"Sources missing\" card.";
+    cancel-label: "Close";
+    confirm-label: "Locate frames…";
+    confirm-kind: "default";
+}
+
+/// One descriptor row of the export modal's settings group, from
+/// `crate::export_settings::ExportView`.
+export struct ExportRowView {
+    id: string,
+    label: string,
+    value-text: string,
+    fraction: float,
+    choices: [string],
+    choice-ids: [string],
+    selected: string,
+    open: bool,
+}
+
+// The checkpoint panel's `Export image` modal: the tab's current position
+// as a TIFF, PNG or JPEG image, no destination field of its own --
+// confirming opens the OS save dialog directly. Its content is richer than
+// `FFDialog`'s one string body, so it composes `FFModalPanel` directly
+// rather than `FFDialog`. The three states share one fixed-height content
+// slot, so the panel never resizes across them.
+export component FFExportDialog inherits FFModalPanel {
+    in property <bool> export-open: false;
+    in property <string> context: "";
+    in property <string> what: "";
+    // "ready" | "writing" | "refused".
+    in property <string> stage: "ready";
+    // The chosen destination's own file name, named only while writing.
+    in property <string> writing-file-name: "";
+    in property <[string]> refusal-lines: [];
+    in property <[string]> format-segments: [];
+    in property <string> format-selected: "";
+    in property <string> settings-heading: "";
+    in property <[ExportRowView]> rows: [];
+    // The group is a slider row then a segmented row, not menus.
+    in property <bool> slider-group: false;
+    in property <bool> metadata-on: true;
+    // Whether the refused state offers `Locate frames…`; without it `Close` stands alone.
+    in property <bool> can-locate: true;
+    callback cancelled();
+    callback confirmed();
+    callback format-chosen(string);
+    callback menu-toggled(string);
+    callback option-chosen(string, string);
+    callback quality-changed(float);
+    callback chroma-chosen(string, string);
+    callback metadata-toggled();
+
+    modal-open: root.export-open;
+    panel-width: 560px;
+    panel-height: 365px;
+    clip-panel: true;
+    tone-rule: root.stage == "refused" ? "warning" : "none";
+
+    FFStatusGlyph {
+        x: Theme.space-4;
+        y: Theme.space-4;
+        kind: root.stage == "refused" ? "circle" : "swatch";
+    }
+
+    title-text := FFHeading {
+        x: 44px;
+        y: Theme.space-4;
+        width: 500px;
+        height: 22px;
+        text: "Export image";
+    }
+
+    context-text := FFRowText {
+        x: Theme.space-4;
+        y: title-text.y + title-text.height + Theme.space-3;
+        width: 528px;
+        height: 16px;
+        muted: true;
+        text: root.context;
+        overflow: elide;
+    }
+    what-text := FFRowText {
+        x: Theme.space-4;
+        y: context-text.y + context-text.height + Theme.space-2;
+        width: 528px;
+        height: 32px;
+        text: root.what;
+        wrap: word-wrap;
+    }
+
+    top-divider := FFDivider {
+        x: Theme.space-4;
+        y: what-text.y + what-text.height + Theme.space-3;
+        width: 528px;
+    }
+
+    // Zero-size anchor: every stage's content slot starts here, a fixed
+    // `Theme.space-3` below the divider, and the footer starts a fixed
+    // 184px past it regardless of which slot is showing -- the one span
+    // that never resizes across ready/writing/refused.
+    content-top := Rectangle {
+        x: 0px;
+        y: top-divider.y + top-divider.height + Theme.space-3;
+        width: 0px;
+        height: 0px;
+    }
+
+    if root.stage == "ready": Rectangle {
+        x: Theme.space-4;
+        y: content-top.y;
+        width: 528px;
+        height: 184px;
+
+        format-label := FFRowText {
+            x: 0px;
+            y: 0px;
+            width: 120px;
+            height: 28px;
+            text: "Format";
+        }
+        FFSegmented {
+            x: 128px;
+            y: 0px;
+            width: 252px;
+            segments: root.format-segments;
+            selected: root.format-selected;
+            segment-selected(label) => { root.format-chosen(label); }
+        }
+
+        settings-heading := FFSectionHeading {
+            x: 0px;
+            y: format-label.y + format-label.height + Theme.space-2;
+            width: 528px;
+            compact: true;
+            opaque: false;
+            provenance: "explicit";
+            label: root.settings-heading;
+        }
+
+        // 2px: `FFSectionHeading`'s own compact height leaves no
+        // token-sized gap to the row below it.
+        rows-top := Rectangle {
+            x: 0px;
+            y: settings-heading.y + settings-heading.height + 2px;
+            width: 0px;
+            height: 0px;
+        }
+
+        if !root.slider-group: Rectangle {
+            for row[i] in root.rows: Rectangle {
+                x: 0px;
+                y: rows-top.y + i * (28px + Theme.space-2);
+                width: 528px;
+                height: 28px;
+
+                FFRowText {
+                    x: 0px;
+                    width: 120px;
+                    height: 28px;
+                    text: row.label;
+                }
+                FFMenu {
+                    name: row.label;
+                    x: 128px;
+                    width: 110px;
+                    label: row.value-text;
+                    choices: row.choices;
+                    choice-ids: row.choice-ids;
+                    selected: row.selected;
+                    open: row.open;
+                    external-list: true;
+                    toggled => { root.menu-toggled(row.id); }
+                }
+            }
+        }
+
+        if root.slider-group: Rectangle {
+            FFRowText {
+                x: 0px;
+                y: rows-top.y;
+                width: 120px;
+                height: 28px;
+                text: root.rows[0].label;
+            }
+            FFSlider {
+                x: 128px;
+                y: rows-top.y + 1px;
+                width: 210px;
+                fraction: root.rows[0].fraction;
+                value-text: root.rows[0].value-text;
+                fraction-changed(fraction) => { root.quality-changed(fraction); }
+            }
+            FFRowText {
+                x: 0px;
+                y: rows-top.y + 28px + Theme.space-2;
+                width: 120px;
+                height: 28px;
+                text: root.rows[1].label;
+            }
+            FFSegmented {
+                x: 128px;
+                y: rows-top.y + 28px + Theme.space-2;
+                width: 168px;
+                segments: root.rows[1].choices;
+                selected: root.rows[1].value-text;
+                segment-selected(label) => { root.chroma-chosen(root.rows[1].id, label); }
+            }
+        }
+
+        metadata-heading := FFSectionHeading {
+            x: 0px;
+            y: rows-top.y + 2 * (28px + Theme.space-2) - Theme.space-2 + Theme.space-3;
+            width: 528px;
+            compact: true;
+            opaque: false;
+            provenance: "explicit";
+            label: "METADATA";
+        }
+
+        // 2px, the same leftover as `settings-heading`'s own.
+        metadata-label := FFRowText {
+            x: 44px;
+            y: metadata-heading.y + metadata-heading.height + 2px;
+            width: 484px;
+            height: 24px;
+            text: "Metadata";
+        }
+        FFToggle {
+            name: "Metadata";
+            x: 0px;
+            // 2px above the label's own top: a toggle's knob sits taller
+            // than a text row's cap-height, so this aligns their centers.
+            y: metadata-label.y - 2px;
+            on: root.metadata-on;
+            toggled => { root.metadata-toggled(); }
+        }
+
+        // Drawn last so an open list paints over the rows and heading
+        // below its menu.
+        if !root.slider-group: Rectangle {
+            for row[i] in root.rows: Rectangle {
+                if row.open: FFMenuList {
+                    x: 128px;
+                    y: rows-top.y + i * (28px + Theme.space-2) + 28px;
+                    width: 110px;
+                    choices: row.choices;
+                    choice-ids: row.choice-ids;
+                    show-choice-ids: false;
+                    selected: row.selected;
+                    option-selected(variant) => { root.option-chosen(row.id, variant); }
+                }
+            }
+        }
+    }
+
+    if root.stage == "writing": Rectangle {
+        x: Theme.space-4;
+        y: content-top.y;
+        width: 528px;
+        height: 184px;
+
+        spinner := FFSpinner {
+            x: 0px;
+            y: 0px;
+            width: 20px;
+            height: 20px;
+        }
+        writing-heading := FFHeading {
+            x: 28px;
+            y: 0px;
+            width: 500px;
+            height: 22px;
+            text: "Writing image…";
+        }
+        progress := FFProgressBar {
+            x: 0px;
+            y: writing-heading.y + writing-heading.height + Theme.space-2;
+            width: 528px;
+            indeterminate: true;
+        }
+        FFRowText {
+            x: 0px;
+            y: progress.y + progress.height + Theme.space-2;
+            width: 528px;
+            height: 32px;
+            muted: true;
+            text: "Writing " + root.writing-file-name + " — this can take a few minutes for a large stack.";
+            wrap: word-wrap;
+        }
+    }
+
+    if root.stage == "refused": Rectangle {
+        x: Theme.space-4;
+        y: content-top.y;
+        width: 528px;
+        height: 184px;
+
+        refused-heading := FFHeading {
+            x: 0px;
+            y: 0px;
+            width: 528px;
+            height: 18px;
+            tone: "failure";
+            size: "body";
+            text: "Can't export this position";
+        }
+        for line[i] in root.refusal-lines: FFErrorRow {
+            x: 0px;
+            y: refused-heading.y + refused-heading.height + Theme.space-2 + i * Theme.space-4;
+            width: 528px;
+            message: "• " + line;
+        }
+    }
+
+    FFDialogFooter {
+        x: Theme.space-4;
+        y: content-top.y + 184px;
+        width: 528px;
+        dimmed: root.stage == "writing";
+        cancel-label: root.stage == "refused" ? "Close" : "Cancel";
+        confirm-label: root.stage == "refused" ? (root.can-locate ? "Locate frames…" : "") : "Export";
+        confirm-kind: root.stage == "refused" ? "default" : "primary";
+        cancelled => { root.cancelled(); }
+        confirmed => { root.confirmed(); }
+    }
+}

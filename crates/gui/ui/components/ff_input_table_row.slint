@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A read-only three-column table row, split 42 / 29 / 29 %, over a 1 px rule;
+// with `header` it carries the column titles. Cells wrap, and the row grows to
+// fit the tallest one.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFDivider } from "ff_divider.slint";
+
+export component FFInputTableRow inherits VerticalLayout {
+    in property <string> input-label: "";
+    in property <string> stacking-label: "";
+    in property <string> editor-label: "";
+    in property <bool> header: false;
+    // The rule under the row; a header always carries one.
+    in property <bool> divider: true;
+
+    spacing: 0px;
+    padding-bottom: root.header ? ShellGeometry.settings-table-header-gap : 0px;
+
+    HorizontalLayout {
+        min-height: root.header ? ShellGeometry.settings-table-header-height : ShellGeometry.settings-row-height;
+        padding-top: root.header ? 0px : Theme.space-1;
+        padding-bottom: root.header ? 0px : Theme.space-1;
+
+        HorizontalLayout {
+            width: 42%;
+            padding-right: Theme.space-2;
+            input-cell := Text {
+                text: root.input-label;
+                color: root.header ? Theme.text-muted : Theme.text-primary;
+                font-size: root.header ? Theme.text-section.size : Theme.text-value.size;
+                font-weight: root.header ? Theme.text-section.weight : Theme.text-value.weight;
+                letter-spacing: root.header ? Theme.text-section.letter-spacing : 0px;
+                wrap: word-wrap;
+                vertical-alignment: root.header ? top : center;
+            }
+        }
+        HorizontalLayout {
+            width: 29%;
+            padding-right: Theme.space-2;
+            stacking-cell := Text {
+                text: root.stacking-label;
+                color: root.header ? Theme.text-muted : Theme.text-primary;
+                font-size: root.header ? Theme.text-section.size : Theme.text-value.size;
+                font-weight: root.header ? Theme.text-section.weight : Theme.text-value.weight;
+                letter-spacing: root.header ? Theme.text-section.letter-spacing : 0px;
+                wrap: word-wrap;
+                vertical-alignment: root.header ? top : center;
+            }
+        }
+        HorizontalLayout {
+            width: 29%;
+            padding-right: Theme.space-2;
+            editor-cell := Text {
+                text: root.editor-label;
+                color: root.header ? Theme.text-muted : Theme.text-primary;
+                font-size: root.header ? Theme.text-section.size : Theme.text-value.size;
+                font-weight: root.header ? Theme.text-section.weight : Theme.text-value.weight;
+                letter-spacing: root.header ? Theme.text-section.letter-spacing : 0px;
+                wrap: word-wrap;
+                vertical-alignment: root.header ? top : center;
+            }
+        }
+    }
+
+    if root.divider || root.header: FFDivider { }
+}

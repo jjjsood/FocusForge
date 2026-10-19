@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One tile of the projects gallery: an opened project's picture and counts,
+// or -- for a stack that never opened -- a headline, a stage and a reason in
+// the picture's place.
+
+import { Theme } from "../theme.slint";
+import { FFChip } from "ff_chip.slint";
+import { FFButton } from "ff_button.slint";
+import { FFProgressBar } from "ff_progress_bar.slint";
+
+export component FFProjectCard inherits Rectangle {
+    // "open" | "failed" | "cancelled" | "sources-missing" | "not-a-project".
+    in property <string> kind: "open";
+    // Has an open project behind it, independent of `kind`: a failed or
+    // cancelled run's card stays opened once merged onto its project.
+    in property <bool> opened: false;
+    // The tab in front of the shell right now.
+    in property <bool> current: false;
+    // An `open` project with nothing sealed to disk yet.
+    in property <bool> unsaved: false;
+    // The one project a stack job is currently running against.
+    in property <bool> fusing: false;
+    // 0.0..1.0 of the running job, meaningful only while `fusing`.
+    in property <float> fusing-fraction: 0.0;
+    in property <image> picture;
+    in property <bool> has-picture: false;
+    in property <string> project-name;
+    // The second meta-band line: frame and checkpoint counts, or a
+    // not-opened project's own state in the same words.
+    in property <string> meta-text;
+    // A not-opened card's own content -- unused when `kind == "open"`.
+    in property <image> glyph;
+    in property <string> headline;
+    in property <string> stage;
+    in property <string> reason;
+    // Empty hides the button; a not-opened card carries at most one.
+    in property <string> action-label;
+    callback clicked();
+    callback action-clicked();
+    callback close-clicked();
+
+    width: 330px;
+    height: 252px;
+    background: transparent;
+
+    property <color> tone-color: root.kind == "failed" ? Theme.status-failure
+        : root.kind == "sources-missing" ? Theme.status-warning
+        : root.kind == "open" ? transparent
+        : Theme.text-muted;
+
+    // The 2 px highlight `current` carries beyond its chip: a solid fill
+    // behind the card, its own outer 2 px showing as a ring once the
+    // (opaque, same-position) card paints over it -- a border here would
+    // fillet visibly at this radius/width ratio instead of ringing cleanly.
+    if root.current: Rectangle {
+        x: -2px;
+        y: -2px;
+        width: parent.width + 4px;
+        height: parent.height + 4px;
+        border-radius: Theme.radius-lg + 2px;
+        background: Theme.accent-default;
+    }
+
+    // The visible, rounded card.
+    body := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        clip: true;
+        border-radius: Theme.radius-lg;
+        background: Theme.surface-raised;
+
+        // Wraps the whole card's visible content below so the close
+        // button's own touch area can nest inside it: a sibling TouchArea
+        // would steal dispatch the moment the pointer reaches it, which
+        // flips `has-hover` false and hides the very button the pointer is
+        // over (`ui/components/ff_image_row.slint`'s grip/eye/bin fix is the
+        // same shape).
+        card-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.clicked(); }
+
+            if root.opened && card-area.has-hover: close := TouchArea {
+                accessible-role: button;
+                accessible-enabled: true;
+                accessible-label: "Close";
+                x: 296px;
+                y: 10px;
+                width: 24px;
+                height: 24px;
+                clicked => { root.close-clicked(); }
+            }
+        }
+
+        // The upper 186 px: a picture on an opened card, or a not-opened
+        // card's own headline, stage, reason and action.
+        upper := Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 186px;
+            background: root.kind == "open" ? Theme.surface-raised : Theme.surface-overlay;
+
+            if root.kind == "open" && root.has-picture: Image {
+                source: root.picture;
+                width: 100%;
+                height: 100%;
+                image-fit: cover;
+            }
+
+            if root.kind == "open" && root.fusing: FFProgressBar {
+                x: 0px;
+                y: parent.height - self.height;
+                width: parent.width;
+                height: 3px;
+                fraction: root.fusing-fraction;
+                tone: "running";
+            }
+
+            // Purely visual: the close button's own touch area is nested
+            // inside `card-area` above, so its hover survives reaching it.
+            if root.opened && card-area.has-hover: Rectangle {
+                x: 296px;
+                y: 10px;
+                width: 24px;
+                height: 24px;
+                background: Theme.surface-overlay;
+                border-radius: Theme.radius-sm;
+
+                Image {
+                    source: @image-url("../../../../assets/icons/x.svg");
+                    colorize: Theme.text-secondary;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: Theme.icon-md;
+                    height: Theme.icon-md;
+                }
+            }
+
+            if root.kind != "open": Image {
+                source: root.glyph;
+                colorize: root.tone-color;
+                x: 20px;
+                y: 26px;
+                width: Theme.icon-lg;
+                height: Theme.icon-lg;
+            }
+            if root.kind != "open": Text {
+                text: root.headline;
+                color: root.tone-color;
+                font-size: Theme.text-emphasis.size;
+                font-weight: Theme.text-emphasis.weight;
+                x: 74px;
+                y: 22px;
+                width: 260px;
+                height: 26px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.kind != "open": Text {
+                text: root.stage;
+                color: Theme.text-muted;
+                font-size: Theme.text-section.size;
+                font-weight: Theme.text-section.weight;
+                letter-spacing: Theme.text-section.letter-spacing;
+                x: 20px;
+                y: 58px;
+                width: 290px;
+                height: 22px;
+                vertical-alignment: center;
+            }
+            if root.kind != "open": Text {
+                text: root.reason;
+                color: Theme.text-secondary;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                x: 20px;
+                y: 82px;
+                width: 290px;
+                height: 56px;
+                wrap: word-wrap;
+            }
+            if root.kind != "open" && root.action-label != "": FFButton {
+                kind: "outlined";
+                text: root.action-label;
+                x: 20px;
+                y: 141px;
+                width: 130px;
+                height: 30px;
+                clicked => { root.action-clicked(); }
+            }
+        }
+
+        // The scan signal: transparent on an opened card, so every card is
+        // the same height regardless of what its upper region holds.
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: 3px;
+            background: root.tone-color;
+        }
+
+        // The meta band: title plus chips on the first line, the meta text
+        // plus `current` on the second.
+        VerticalLayout {
+            x: Theme.space-3;
+            y: 186px + Theme.space-2;
+            width: parent.width - 2 * Theme.space-3;
+            spacing: 0px;
+
+            HorizontalLayout {
+                height: 22px;
+                Text {
+                    text: root.project-name;
+                    color: root.opened ? Theme.text-primary : Theme.text-secondary;
+                    font-size: Theme.text-emphasis.size;
+                    font-weight: Theme.text-emphasis.weight;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if root.opened && root.unsaved: FFChip {
+                    text: "UNSAVED";
+                    vertical-alignment: center;
+                }
+            }
+            HorizontalLayout {
+                height: 20px;
+                Text {
+                    text: root.meta-text;
+                    color: Theme.text-muted;
+                    font-size: Theme.text-body.size;
+                    font-weight: Theme.text-body.weight;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if root.opened && root.current: FFChip {
+                    text: "CURRENT";
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

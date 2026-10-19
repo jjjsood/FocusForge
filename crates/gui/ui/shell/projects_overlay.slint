@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The projects overlay: everything below the tab strip while it is open --
+// a header band, the file-level rail and the gallery of cards.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFProjectsGallery, ProjectCardView } from "projects_overlay/gallery.slint";
+import { FFProjectsRail, RecentRowView } from "projects_overlay/rail.slint";
+export { ProjectCardView, RecentRowView }
+
+export component FFProjectsOverlay inherits Rectangle {
+    in property <bool> overlay-open: false;
+    in property <string> gallery-heading: "Open projects";
+    in property <string> gallery-count-text: "";
+    in property <[ProjectCardView]> cards: [];
+    in property <length> gallery-content-height: 0px;
+    in property <length> gallery-scroll-y: 0px;
+    in property <[RecentRowView]> recent-rows: [];
+    in property <bool> save-enabled: false;
+    callback card-clicked(int);
+    callback card-action-clicked(int);
+    callback card-close-clicked(int);
+    callback gallery-scrolled(length);
+    callback gallery-scrollbar-pointer(int, length);
+    callback gallery-scrollbar-dragged(length);
+    callback gallery-viewport-height-changed(length);
+    callback gallery-width-changed(length);
+    callback new-project-requested();
+    callback open-project-requested();
+    callback close-project-requested();
+    callback save-project-requested();
+    callback recent-clicked(int);
+    out property <length> gallery-width: gallery.viewport-width;
+    out property <length> gallery-x: gallery.x;
+    out property <length> gallery-y: gallery.y;
+
+    visible: root.overlay-open;
+    background: Theme.surface-base;
+
+    // Swallows a click or scroll over any background left exposed by the
+    // header, rail and gallery below -- `rail`/`gallery` sit above this in
+    // the tree and keep their own hits.
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        scroll-event(e) => { accept }
+    }
+
+    header := Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 60px;
+
+        Text {
+            text: "Projects";
+            x: 24px;
+            y: (parent.height - self.height) / 2;
+            color: Theme.text-primary;
+            font-size: Theme.text-title.size;
+            font-weight: Theme.text-title.weight;
+        }
+        Text {
+            text: "The same button closes it again; Esc does too.";
+            x: parent.width - self.width - 24px;
+            y: (parent.height - self.height) / 2;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+        }
+        Rectangle {
+            x: 0px;
+            y: parent.height - 1px;
+            width: parent.width;
+            height: 1px;
+            background: Theme.border-default;
+        }
+    }
+
+    rail := FFProjectsRail {
+        x: 0px;
+        y: 60px;
+        width: 300px;
+        height: parent.height - 60px;
+        recent: root.recent-rows;
+        save-enabled: root.save-enabled;
+
+        new-project-requested => { root.new-project-requested(); }
+        open-project-requested => { root.open-project-requested(); }
+        close-project-requested => { root.close-project-requested(); }
+        save-project-requested => { root.save-project-requested(); }
+        recent-clicked(i) => { root.recent-clicked(i); }
+    }
+
+    Rectangle {
+        x: rail.x + rail.width - 1px;
+        y: rail.y;
+        width: 1px;
+        height: rail.height;
+        background: Theme.border-default;
+    }
+
+    gallery := FFProjectsGallery {
+        x: 300px;
+        y: 60px;
+        width: parent.width - 300px;
+        height: parent.height - 60px;
+        heading: root.gallery-heading;
+        count-text: root.gallery-count-text;
+        cards: root.cards;
+        content-height: root.gallery-content-height;
+        scroll-y: root.gallery-scroll-y;
+
+        card-clicked(i) => { root.card-clicked(i); }
+        card-action-clicked(i) => { root.card-action-clicked(i); }
+        card-close-clicked(i) => { root.card-close-clicked(i); }
+        scrolled(delta) => { root.gallery-scrolled(delta); }
+        scrollbar-pointer(kind, y) => { root.gallery-scrollbar-pointer(kind, y); }
+        scrollbar-dragged(y) => { root.gallery-scrollbar-dragged(y); }
+        viewport-height-changed(h) => { root.gallery-viewport-height-changed(h); }
+        viewport-width-changed(w) => { root.gallery-width-changed(w); }
+    }
+}

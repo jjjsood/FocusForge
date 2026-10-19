@@ -1,0 +1,1592 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Offline mutation checks for release packaging and publication policy."""
+from __future__ import annotations
+
+import ast
+import copy
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import struct
+import types
+import tomllib
+import urllib.error
+import xml.etree.ElementTree as ET
+import plistlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PACKAGE = ROOT / "tools/package-linux.sh"
+CHECKER = ROOT / "tools/check-package-linux.sh"
+NATIVE_COLLECTOR = ROOT / "tools/collect-native-artifacts.py"
+SYMBOL_PACKAGER = ROOT / "tools/package-symbols.py"
+SYMBOL_TOOLS = ROOT / "packaging/symbol-tools.toml"
+NATIVE_WORKFLOW = ROOT / ".github/workflows/package-native.yml"
+spec = importlib.util.spec_from_file_location("release_gate", ROOT / "tools/check-release-gate.py")
+gate = importlib.util.module_from_spec(spec)
+assert spec and spec.loader
+spec.loader.exec_module(gate)
+collector_spec = importlib.util.spec_from_file_location("native_collector", NATIVE_COLLECTOR)
+collector = importlib.util.module_from_spec(collector_spec)
+assert collector_spec and collector_spec.loader
+collector_spec.loader.exec_module(collector)
+
+
+def call(args: list[str], success: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(args, text=True, capture_output=True)
+    assert result.returncode == 0 if success else result.returncode != 0, (args, result.stdout, result.stderr)
+    return result
+
+
+def shell(script: str, *args: str, success: bool = True) -> None:
+    call(["bash", "-c", script, "selftest", *args], success)
+
+
+def release_run(sha: str, conclusion: object = "success", status: str = "completed", attempt: int = 2) -> dict[str, object]:
+    return {"id": 7, "path": ".github/workflows/check.yml", "event": "push", "head_sha": sha, "created_at": f"2026-10-10T00:0{attempt}:00Z", "run_attempt": attempt, "status": status, "conclusion": conclusion}
+
+
+def release_jobs(sha: str, attempt: int = 2) -> dict[str, object]:
+    return {"workflow_run_id": 7, "head_sha": sha, "run_attempt": attempt, "total_count": 3, "pages": [{"jobs": [{"name": name, "run_id": 7, "head_sha": sha, "run_attempt": attempt, "status": "completed", "conclusion": "success"} for name in ("ubuntu-24.04", "macos-15", "windows-2022")]}]}
+
+
+def producer() -> None:
+    pins = ROOT / "packaging/linux-tools.toml"
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        shell('FOCUSFORGE_PACKAGE_OUT="$2"; source "$1"; test "$out" = "$root/.scratch/package-linux"', str(PACKAGE), str(directory / "unrequested-output"))
+        def selected_values(path: Path) -> list[str]:
+            return call(["bash", "-c", 'source "$1"; read_pin_values "$2"', "selftest", str(PACKAGE), str(path)]).stdout.splitlines()
+
+        def expected_values(path: Path) -> list[str]:
+            parsed = tomllib.loads(path.read_text())
+            return [parsed[section][key] for section, key in (("linux", "container"), ("cargo_dist", "url"), ("cargo_dist", "sha256"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256"))]
+
+        assert selected_values(pins) == expected_values(pins)
+        parts = pins.read_text().split("[[type2_runtime.legal_inputs]]")
+        varied = directory / "varied-legal-inputs.toml"
+        varied.write_text(parts[0] + "".join("[[type2_runtime.legal_inputs]]" + part for part in reversed(parts[1:])))
+        assert selected_values(varied) == expected_values(varied)
+        values = tomllib.loads(pins.read_text())
+        nested_first = directory / "nested-legal-before-pins.toml"
+        nested_first.write_text(
+            "[legal]\n[[legal.inputs]]\nname = \"alternate\"\nurl = \"https://example.invalid/alternate-license\"\nsha256 = \"" + "f" * 64 + "\"\n\n"
+            + "\n\n".join(
+                f"[{section}]\n" + "\n".join(f"{key} = {json.dumps(value)}" for key, value in values[section].items() if isinstance(value, str))
+                for section in ("linux", "cargo_dist", "appimagetool", "type2_runtime")
+            )
+            + "\n"
+        )
+        assert selected_values(nested_first) == expected_values(nested_first)
+        commented = directory / "commented-headers.toml"
+        legal_rows = []
+        for index in range(11):
+            legal_rows.append(
+                "[[type2_runtime.legal_inputs]] # legal input\n"
+                + f'name = "legal-{index}"\n'
+                + f'url = "https://example.invalid/legal/{index}#fragment=a=b"\n'
+                + f'sha256 = "{hashlib.sha256(f"legal-{index}".encode()).hexdigest()}"\n'
+            )
+        commented.write_text(
+            "[linux] # selected container\n"
+            + f'container = {json.dumps(values["linux"]["container"])}\n\n'
+            + "[cargo_dist] # selected tool\n"
+            + 'url = "https://example.invalid/dist#fragment=a=b"\n'
+            + f'sha256 = "{hashlib.sha256(b"dist-commented").hexdigest()}"\n\n'
+            + "[type2_runtime] # selected runtime\n"
+            + 'url = "https://example.invalid/runtime#fragment=a=b"\n'
+            + f'sha256 = "{hashlib.sha256(b"runtime-commented").hexdigest()}"\n\n'
+            + "\n".join(legal_rows)
+            + "\n[appimagetool] # selected after legal arrays\n"
+            + 'url = "https://example.invalid/app#fragment=a=b"\n'
+            + f'sha256 = "{hashlib.sha256(b"app-commented").hexdigest()}"\n'
+        )
+        assert selected_values(commented) == expected_values(commented)
+        whitespace_headers = directory / "whitespace-headers.toml"
+        whitespace_headers.write_text(
+            commented.read_text()
+            .replace("[linux] #", "[ linux ] #")
+            .replace("[cargo_dist] #", "[ cargo_dist ] #")
+            .replace("[type2_runtime] #", "[ type2_runtime ] #")
+            .replace("[[type2_runtime.legal_inputs]] #", "[[ type2_runtime.legal_inputs ]] #")
+            .replace("[appimagetool] #", "[ appimagetool ] #")
+        )
+        assert selected_values(whitespace_headers) == expected_values(whitespace_headers)
+        legal = directory / "legal.tsv"
+        call([str(PACKAGE), "--write-legal-inputs", str(legal)])
+        assert len(legal.read_text().splitlines()) == 11
+        call([str(PACKAGE), "--write-legal-inputs", str(legal), str(varied)])
+        assert len(legal.read_text().splitlines()) == 11
+        call([str(PACKAGE), "--write-legal-inputs", str(legal), str(commented)])
+        parsed_commented = tomllib.loads(commented.read_text())
+        assert legal.read_text().splitlines() == [f'{item["name"]}\t{item["url"]}\t{item["sha256"]}' for item in parsed_commented["type2_runtime"]["legal_inputs"]]
+        unsupported = directory / "unsupported-header.toml"
+        unsupported.write_text(commented.read_text().replace("[appimagetool] # selected after legal arrays", "[appimagetool unsupported] # selected after legal arrays"))
+        result = subprocess.run(["bash", "-c", 'source "$1"; read_pin_values "$2"', "selftest", str(PACKAGE), str(unsupported)], text=True, capture_output=True)
+        assert result.returncode != 0 and result.stderr.strip() == "unsupported pin table header"
+        legal.write_text("kept\n")
+        call([str(PACKAGE), "--write-legal-inputs", str(legal), str(unsupported)], False)
+        assert legal.read_text() == "kept\n"
+        legal.write_text("kept\n")
+        corrupt = directory / "corrupt.toml"
+        corrupt.write_text(pins.read_text().replace('sha256 = "4b3f0a5f0ebbdb798f6db649d01b32ba1518376b6f7a0502b7d92b75cc2c8293"', 'sha256 = "z"'))
+        call([str(PACKAGE), "--write-legal-inputs", str(legal), str(corrupt)], False)
+        assert legal.read_text() == "kept\n"
+        payload = directory / "payload"; payload.write_bytes(b"pinned")
+        call([str(PACKAGE), "--verify-sha256", str(payload), hashlib.sha256(payload.read_bytes()).hexdigest()])
+        call([str(PACKAGE), "--verify-sha256", str(payload), "0" * 64], False)
+        setup = r'''
+source "$1"
+out="$2"; version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1); revision=$(git -C "$root" rev-parse HEAD)
+image=$(python3 - "$root/packaging/linux-tools.toml" <<'PY'
+import sys, tomllib
+print(tomllib.load(open(sys.argv[1], "rb"))["linux"]["container"])
+PY
+)
+mkdir -p "$out"; printf app > "$out/FocusForge-$version-x86_64.AppImage"; printf deb > "$out/focusforge_${version}_amd64.deb"
+(cd "$out" && sha256sum "FocusForge-$version-x86_64.AppImage" "focusforge_${version}_amd64.deb" > artifacts.sha256)
+mkdir -p "$out/symbols"
+python3 -c 'import hashlib,json,tarfile,sys,shutil,importlib.util; root=__import__("pathlib").Path(sys.argv[1]); version=sys.argv[2]; spec=importlib.util.spec_from_file_location("package_symbols","tools/package-symbols.py"); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); entries=[]
+for name,ident in (("focusforge-cli","73DB7F2DB3A643B9DFD8FF6C4DFF41940"),("focusforge-gui","05CE7935D101B8E6E397B49D6F6716080")):
+ native=root/"native"/(name+".debug"); native.parent.mkdir(exist_ok=True); shutil.copyfile("/bin/true",native); ident=module.elf_module_id(native); sym=root/"store"/name/ident/(name+".sym"); sym.parent.mkdir(parents=True); sym.write_text(f"MODULE Linux x86_64 {ident} {name}\nFILE 0 crates/{name}/src/main.rs\nFUNC 1000 10 0 {name.replace(chr(45),chr(95))}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n"); h=lambda p:hashlib.sha256(p.read_bytes()).hexdigest(); entries.append({"name":name,"native":str(native.relative_to(root)),"native_sha256":h(native),"native_id":ident,"native_build_id":module.elf_build_id(native),"native_source_inspection":{"schema":module.SOURCE_INSPECTION_SCHEMA,"format":"elf-dwarf","native_inspection_sha256":h(native),"coverage":{"compile_units":1,"line_tables":1,"source_less_compile_units":0,"no_line_compile_units":0},"source_paths":[f"/work/crates/{name.split(chr(45),1)[1]}/src/main.rs"]},"symbols":[{"path":str(sym.relative_to(root)),"sha256":h(sym),"module_id":ident,"module_name":name}]})
+(root/"symbol-inventory.json").write_text(json.dumps({"platform":"x86_64-unknown-linux-gnu","version":version,"entries":entries})); archive=root/f"FocusForge-{version}-x86_64-unknown-linux-gnu-symbols.tar.gz"; source=tarfile.open(archive,"w:gz"); [source.add(p,arcname=p.relative_to(root)) for p in [root/"symbol-inventory.json",*sorted((root/"native").rglob("*")),*sorted((root/"store").rglob("*"))] if p.is_file()]; source.close(); print(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}")' "$out/symbols" "$version" > "$out/symbols/symbols.sha256"
+input_manifest="$out/current-inputs.sha256"; write_input_manifest "$input_manifest"; cp "$input_manifest" "$out/package-inputs.sha256"; printf 'source_revision=%s\nimage=%s\n' "$revision" "$image" > "$out/inventory.txt"; verify_reuse
+'''
+        out = directory / "out"
+        shell(setup, str(PACKAGE), str(out))
+        shell(setup + '\nprintf stale >> "$out/FocusForge-$version-x86_64.AppImage"; verify_reuse\n', str(PACKAGE), str(out), success=False)
+        shell(setup + '\nrm "$out/package-inputs.sha256"; verify_reuse\n', str(PACKAGE), str(out), success=False)
+        shell(setup + '\nprintf stale > "$out/stale.deb"; verify_reuse\n', str(PACKAGE), str(out), success=False)
+
+
+def producer_foreign_owned_output_cleanup() -> None:
+    image = tomllib.loads((ROOT / "packaging/linux-tools.toml").read_text())["linux"]["container"]
+    with tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / "out"
+        output.mkdir()
+        call([
+            "docker", "run", "--rm", "-v", f"{output}:/out", image,
+            "bash", "-c", "mkdir -p /out/check/symbolicate/stackwalk && printf old >/out/check/symbolicate/stackwalk/minidump-stackwalk && chown -R 1001:1001 /out/check",
+        ])
+        try:
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1"; image="$2"; owner_uid=$(id -u); owner_gid=$(id -g); clean_package_output "$3"',
+                    "selftest", str(PACKAGE), image, str(output),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert not output.exists()
+        finally:
+            if output.exists():
+                call([
+                    "docker", "run", "--rm", "-v", f"{output}:/out", image,
+                    "bash", "-c", "find /out -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
+                ])
+
+
+def producer_cleanup_mock() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        output = directory / "out"
+        output.mkdir()
+        (output / "check").mkdir()
+        (output / "check/old-output").write_text("old")
+        mock = directory / "mock"
+        mock.mkdir()
+        log = directory / "docker.log"
+        docker = mock / "docker"
+        docker.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$MOCK_DOCKER_LOG\"\n")
+        docker.chmod(0o755)
+        result = subprocess.run(
+            [
+                "bash", "-c",
+                'source "$1"; PATH="$4:$PATH"; image=mock-image; owner_uid=$(id -u); owner_gid=$(id -g); printf "%s:%s\\n" "$owner_uid" "$owner_gid"; clean_package_output "$3"',
+                "selftest", str(PACKAGE), "unused", str(output), str(mock),
+            ],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "MOCK_DOCKER_LOG": str(log)},
+        )
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert not output.exists()
+        expected_owner = result.stdout.strip()
+        assert f"chown -R {expected_owner} /out" in log.read_text()
+
+
+def cli_asset_helper_cases() -> None:
+    helper_path = ROOT / "tools/package-cli-assets.py"
+    helper_spec = importlib.util.spec_from_file_location("cli_assets", helper_path)
+    helper = importlib.util.module_from_spec(helper_spec)
+    assert helper_spec and helper_spec.loader
+    helper_spec.loader.exec_module(helper)
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        source = directory / "product"
+        shutil.copytree(ROOT / "assets/man", source / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", source / "assets/completions")
+        expected = helper.sources(source)
+        assert len(expected) == 19
+        staged = []
+        for destination in (
+            directory / "appimage/usr",
+            directory / "bundle/FocusForge.app/Contents/Resources",
+            directory / "windows/FocusForge",
+        ):
+            helper.stage(source, destination)
+            for relative in (
+                Path("share/man/man1/system.1.gz"),
+                Path("share/bash-completion/completions/apt"),
+                Path("share/zsh/vendor-completions/_system"),
+                Path("share/fish/vendor_completions.d/system.fish"),
+                Path("share/powershell/completions/_system.ps1"),
+            ):
+                (destination / relative).write_bytes(b"unrelated")
+            helper.verify(source, destination)
+            staged.append(destination)
+        assert {
+            relative: (staged[0] / relative).read_bytes() for relative in expected
+        } == {
+            relative: (staged[1] / relative).read_bytes() for relative in expected
+        }
+        assert all(
+            (destination / relative).read_bytes() == b"unrelated"
+            for destination in staged
+            for relative in (
+                Path("share/man/man1/system.1.gz"),
+                Path("share/bash-completion/completions/apt"),
+                Path("share/zsh/vendor-completions/_system"),
+                Path("share/fish/vendor_completions.d/system.fish"),
+                Path("share/powershell/completions/_system.ps1"),
+            )
+        )
+        for name in helper.MANUALS:
+            data = (staged[0] / "share/man/man1" / f"{name}.gz").read_bytes()
+            assert data[3] == 0 and data[4:8] == b"\0\0\0\0" and data[9] == 255
+            assert gzip.decompress(data) == (source / "assets/man" / name).read_bytes()
+        cases = (
+            (Path("share/man/man1/focusforge-cli.1.gz"), "manual", ("focusforge-cli-extra.1.gz", "focusforge-cli-extra.txt")),
+            (Path("share/bash-completion/completions/focusforge-cli"), "completion", ("focusforge-cli-extra", "focusforge-cli-extra.bak")),
+        )
+        for destination in staged:
+            for relative, resource_class, orphans in cases:
+                target = destination / relative
+                original = target.read_bytes()
+                target.unlink()
+                try:
+                    helper.verify(source, destination)
+                except ValueError as error:
+                    assert str(relative) in str(error), (resource_class, error)
+                else:
+                    raise AssertionError(f"missing {resource_class} passed verification")
+                target.write_bytes(original + b"corrupt")
+                try:
+                    helper.verify(source, destination)
+                except ValueError as error:
+                    assert str(relative) in str(error), (resource_class, error)
+                else:
+                    raise AssertionError(f"corrupt {resource_class} passed verification")
+                target.write_bytes(original)
+                for name in orphans:
+                    orphan = target.parent / name
+                    orphan.write_bytes(b"orphan")
+                    try:
+                        helper.verify(source, destination)
+                    except ValueError as error:
+                        assert str(orphan.relative_to(destination)) in str(error), (resource_class, error)
+                    else:
+                        raise AssertionError(f"orphan {resource_class} passed verification")
+                    orphan.unlink()
+                helper.verify(source, destination)
+
+
+def fake_appimage(directory: Path) -> tuple[Path, Path, Path]:
+    expected, app = directory / "expected", directory / "appimage"
+    (expected / "frames").mkdir(parents=True)
+    for frame in ("00.tif", "01.tif", "02.tif"): (expected / "frames" / frame).write_bytes(b"")
+    for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, expected / name)
+    shutil.copy(ROOT / "assets/focusforge.desktop", expected / "focusforge.desktop")
+    shutil.copytree(ROOT / "assets/build/hicolor", expected / "hicolor"); (expected / "VERSION").write_text("focusforge-cli 0.1.0\n")
+    tree = app / "usr"
+    for path in (tree / "bin", tree / "lib", tree / "share/applications", tree / "share/icons", tree / "share/doc/focusforge/native-licenses", tree / "share/doc/focusforge/type2-runtime/notices"): path.mkdir(parents=True, exist_ok=True)
+    call(["/usr/bin/python3", str(ROOT / "tools/package-cli-assets.py"), "stage", str(ROOT), str(tree)])
+    shutil.copytree(expected / "hicolor", tree / "share/icons/hicolor"); shutil.copy(expected / "focusforge.desktop", tree / "share/applications/focusforge.desktop")
+    for name in ("LICENSE", "NOTICE"): shutil.copy(expected / name, tree / f"share/doc/focusforge/{name}")
+    (tree / "share/doc/focusforge/native-notices.txt").write_text("libfontconfig\n")
+    licenses = tree / "share/doc/focusforge/native-licenses"
+    (licenses / "fake.copyright").write_text("/usr/share/common-licenses/GPL. and /usr/share/common-licenses/LGPL.\n")
+    (licenses / "GPL").write_text("GPL\n"); (licenses / "LGPL").write_text("LGPL\n")
+    (tree / "share/doc/focusforge/type2-runtime/RELINKING.md").write_text("dd6cebedcbddde9c82f89b011e8e1d40b6e43868\nlibfuse 3.15.0\n")
+    notice = tree / "share/doc/focusforge/type2-runtime/notices/license"; notice.write_text("legal\n")
+    legal = expected / "legal.sha256"; legal.write_text(f"{hashlib.sha256(notice.read_bytes()).hexdigest()}  notices/license\n")
+    true = Path(shutil.which("true") or "/bin/true"); shutil.copy(true, tree / "lib/libfontconfig.so.1")
+    cli = tree / "bin/focusforge-cli"
+    cli.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'focusforge-cli 0.1.0'; elif [ \"$1\" = --help ]; then echo help; elif [ \"$1\" = info ] && [ \"$2\" = --json ]; then printf '{\"frame_count\":3,\"unreadable_count\":0,\"files\":[{\"name\":\"00.tif\",\"width\":64,\"height\":64,\"samples_per_pixel\":3,\"bits_per_sample\":[16,16,16]},{\"name\":\"01.tif\",\"width\":64,\"height\":64,\"samples_per_pixel\":3,\"bits_per_sample\":[16,16,16]},{\"name\":\"02.tif\",\"width\":64,\"height\":64,\"samples_per_pixel\":3,\"bits_per_sample\":[16,16,16]}]}\\n'; else for n in 00 01 02; do echo \"$2/$n.tif 64x64 3ch 16-bit\"; done; fi\n")
+    gui = tree / "bin/focusforge-gui"; gui.write_text("#!/bin/sh\nexit 0\n")
+    app.joinpath("AppRun").write_text("#!/bin/sh\nexec \"$(dirname \"$0\")/usr/bin/focusforge-gui\" \"$@\"\n")
+    app.joinpath("focusforge.desktop").symlink_to("usr/share/applications/focusforge.desktop")
+    app.joinpath("focusforge.png").symlink_to("usr/share/icons/hicolor/256x256/apps/focusforge.png")
+    for path in (cli, gui, app / "AppRun"): path.chmod(0o755)
+    return app, expected, legal
+
+
+def checker() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        app, expected, legal = fake_appimage(Path(temp))
+        args = ["bash", str(CHECKER), "--validate-appimage", str(app), str(expected), str(legal)]
+        call(args)
+        desktop = app / "focusforge.desktop"
+        desktop.unlink()
+        desktop.write_bytes((expected / "focusforge.desktop").read_bytes() + b"X-AppImage-Version=0.1.0\n")
+        call(args)
+        desktop.write_bytes((expected / "focusforge.desktop").read_bytes() + b"X-AppImage-Version=9.9.9\n"); call(args, False)
+        desktop.write_bytes((expected / "focusforge.desktop").read_bytes() + b"X-AppImage-Version=0.1.0\nextra\n"); call(args, False)
+        desktop.unlink(); desktop.symlink_to("usr/share/applications/focusforge.desktop")
+        app.joinpath("usr/share/doc/focusforge/LICENSE").unlink(); call(args, False)
+        shutil.copy(expected / "LICENSE", app / "usr/share/doc/focusforge/LICENSE")
+        app.joinpath("focusforge.png").unlink(); app.joinpath("focusforge.png").symlink_to("missing.png"); call(args, False)
+        app.joinpath("focusforge.png").unlink(); app.joinpath("focusforge.png").symlink_to("usr/share/icons/hicolor/256x256/apps/focusforge.png")
+        icon = app / "usr/share/icons/hicolor/256x256/apps/focusforge.png"; icon.write_bytes(b"wrong"); call(args, False); shutil.copy(expected / "hicolor/256x256/apps/focusforge.png", icon)
+        app.joinpath("usr/lib/libfontconfig.so.1").unlink(); call(args, False)
+        shutil.copy(Path(shutil.which("true") or "/bin/true"), app / "usr/lib/libfontconfig.so.1")
+        cli = app / "usr/bin/focusforge-cli"; cli.write_text(cli.read_text().replace("focusforge-cli 0.1.0", "focusforge-cli 9.9.9")); call(args, False)
+        cli.write_text(cli.read_text().replace("focusforge-cli 9.9.9", "focusforge-cli 0.1.0"))
+        binary = app / "usr/lib/libfontconfig.so.1"; data = binary.read_bytes(); marker = next(item.encode() for item in ("GLIBC_2.34", "GLIBC_2.35", "GLIBC_2.36") if item.encode() in data)
+        binary.write_bytes(data.replace(marker, b"GLIBC_9.99", 1)); call(args, False)
+
+
+def gate_checks() -> None:
+    sha = "a" * 40; good_runs = {"pages": [{"workflow_runs": [release_run(sha)]}]}; good_jobs = release_jobs(sha)
+    assert gate.approved(good_runs, good_jobs, sha)
+    for conclusion in ("failure", "cancelled", "skipped", "neutral", None): assert not gate.approved({"pages": [{"workflow_runs": [release_run(sha, conclusion)]}]}, good_jobs, sha)
+    assert not gate.approved({"pages": [{"workflow_runs": []}]}, good_jobs, sha)
+    assert not gate.approved({"pages": [{"workflow_runs": [release_run("b" * 40)]}]}, good_jobs, sha)
+    assert not gate.approved({"pages": [{"workflow_runs": [release_run(sha, status="in_progress")]}]}, good_jobs, sha)
+    assert not gate.approved({"pages": [{"workflow_runs": [release_run(sha, attempt=1), release_run(sha, "failure", attempt=2)]}]}, good_jobs, sha)
+    assert gate.approved({"total_count": 1, "pages": [{"workflow_runs": []}, {"workflow_runs": [release_run(sha)]}]}, good_jobs, sha)
+    bad = release_jobs(sha); bad["pages"][0]["jobs"][0]["conclusion"] = "skipped"; assert not gate.approved(good_runs, bad, sha)
+    for field, value in (("head_sha", "b" * 40), ("run_id", 8), ("run_attempt", 3)):
+        mutated = json.loads(json.dumps(good_jobs)); mutated["pages"][0]["jobs"][0][field] = value; assert not gate.approved(good_runs, mutated, sha)
+    for field, value in (("head_sha", "b" * 40), ("workflow_run_id", 8), ("run_attempt", 3)):
+        mutated = json.loads(json.dumps(good_jobs)); mutated[field] = value; assert not gate.approved(good_runs, mutated, sha)
+    for conclusion in ("failure", "cancelled", "neutral"):
+        mutated = json.loads(json.dumps(good_jobs)); mutated["pages"][0]["jobs"][0]["conclusion"] = conclusion; assert not gate.approved(good_runs, mutated, sha)
+    missing = json.loads(json.dumps(good_jobs)); missing["pages"][0]["jobs"].pop(); missing["total_count"] = 2; assert not gate.approved(good_runs, missing, sha)
+    duplicate = json.loads(json.dumps(good_jobs)); duplicate["pages"][0]["jobs"].append(duplicate["pages"][0]["jobs"][0]); duplicate["total_count"] = 4; assert not gate.approved(good_runs, duplicate, sha)
+    with tempfile.TemporaryDirectory() as temp:
+        runs, jobs = Path(temp) / "runs", Path(temp) / "jobs"; runs.write_text(json.dumps(good_runs)); jobs.write_text(json.dumps(good_jobs))
+        call([str(ROOT / "tools/check-release-gate.py"), "--sha", sha, "--runs", str(runs), "--jobs", str(jobs)])
+        runs.write_text("["); call([str(ROOT / "tools/check-release-gate.py"), "--sha", sha, "--runs", str(runs), "--jobs", str(jobs)], False)
+    class Response(io.BytesIO):
+        def __init__(self, body: dict[str, object], link: str = "") -> None: super().__init__(json.dumps(body).encode()); self.headers = {"Link": link}
+        def __enter__(self) -> "Response": return self
+        def __exit__(self, *args: object) -> None: self.close()
+    original = gate.urllib.request.urlopen
+    def fake(request: object, timeout: float) -> Response:
+        return Response({"total_count": 1, "workflow_runs": [release_run(sha)]}) if request.full_url.endswith("page=2") else Response({"total_count": 1, "workflow_runs": []}, '<https://api.github.com/page=2>; rel="next"')
+    gate.urllib.request.urlopen = fake
+    try:
+        assert gate.request_pages("https://api.github.com/runs", 1e20, False)["pages"][1]["workflow_runs"]
+        gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(urllib.error.URLError("offline"))
+        try: gate.request_pages("https://api.github.com/runs", 1e20, False)
+        except urllib.error.URLError: pass
+        else: raise AssertionError("API failure accepted")
+        try: gate.request_pages("https://api.github.com/runs", 0, False)
+        except ValueError: pass
+        else: raise AssertionError("pending timeout accepted")
+    finally: gate.urllib.request.urlopen = original
+    original_pages, original_clock, original_sleep, original_remote = gate.request_pages, gate.time.monotonic, gate.time.sleep, gate.remote
+    ticks = iter((0.0, 0.1, 0.2, 2.0)); sleeps: list[float] = []
+    def pending(url: str, deadline: float, use_token: bool) -> dict:
+        return {"pages": [{"workflow_runs": [release_run(sha, status="in_progress")]}]} if "/workflows/" in url else {"pages": [{"jobs": []}]}
+    gate.request_pages = pending; gate.time.monotonic = lambda: next(ticks); gate.time.sleep = sleeps.append
+    try:
+        runs, pending_jobs = gate.remote("owner/repo", sha, 1, False); assert sleeps and not gate.approved(runs, pending_jobs, sha)
+        gate.remote = lambda *args: (_ for _ in ()).throw(urllib.error.URLError("offline")); assert gate.main(["--sha", sha, "--repository", "owner/repo"]) == 2
+    finally:
+        gate.request_pages, gate.time.monotonic, gate.time.sleep, gate.remote = original_pages, original_clock, original_sleep, original_remote
+    clock = [0.0]; pauses: list[float] = []; requests: list[str] = []
+    original_pages, original_clock, original_sleep = gate.request_pages, gate.time.monotonic, gate.time.sleep
+    def delayed_success(url: str, deadline: float, use_token: bool) -> dict:
+        requests.append(url)
+        if "/workflows/" in url:
+            return good_runs if clock[0] >= 180 else {"pages": [{"workflow_runs": [release_run(sha, status="in_progress")]}]}
+        return json.loads(json.dumps(good_jobs))
+    def advance(seconds: float) -> None:
+        pauses.append(seconds); clock[0] += seconds
+    gate.request_pages = delayed_success; gate.time.monotonic = lambda: clock[0]; gate.time.sleep = advance
+    try:
+        runs, jobs = gate.remote("owner/repo", sha, 3600, False)
+        assert gate.approved(runs, jobs, sha) and pauses == [90, 90] and len(requests) == 4
+    finally:
+        gate.request_pages, gate.time.monotonic, gate.time.sleep = original_pages, original_clock, original_sleep
+    calls: list[tuple[str, str, int, bool]] = []
+    original_remote = gate.remote
+    gate.remote = lambda repository, commit, wait, token: (calls.append((repository, commit, wait, token)) or (good_runs, good_jobs))
+    try:
+        assert gate.main(["--sha", sha, "--repository", "owner/repo"]) == 0
+        assert calls == [("owner/repo", sha, 3600, True)]
+    finally:
+        gate.remote = original_remote
+
+
+def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
+    try:
+        dist = tomllib.loads(config)
+        targets = dist["dist"]["targets"]
+        packages = dist["workspace"]["packages"]
+        extras = dist["dist"]["extra-artifacts"]
+    except (KeyError, TypeError, tomllib.TOMLDecodeError):
+        return False
+    if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
+        return False
+    if dist["dist"].get("local-artifacts-jobs") != ["./package-native"] or dist["dist"].get("pr-run-mode") != "upload": return False
+    linux = next((item for item in extras if item.get("build") == ["tools/package-linux.sh"]), None)
+    native_extra = next((item for item in extras if item.get("build") == ["python3", "tools/collect-native-artifacts.py"]), None)
+    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 7: return False
+    checker = "python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
+    step = setup[setup.find("- name: Require exact check run"):setup.find("- name: Require locked release Cargo profile")]
+    if checker not in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
+    if "plan-gate" in release: return False
+    local, global_build, host = release.find("build-local-artifacts:"), release.find("build-global-artifacts:"), release.find("\n  host:")
+    local_part = release[local:global_build]; global_part = release[global_build:host]; host_part = release[host:release.find("\n  announce:", host)]
+    matrix = "matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}"
+    pinned_actions = [action for action in re.findall(r"uses:\s*['\"]?([^\s'\"]+)", release) if "@" in action]
+    condition = "if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null &&"
+    generated_step = local_part[local_part.find("Require exact check run"):local_part.find("Require locked release Cargo profile")]
+    run_line = next((line.strip().split(": ", 1)[1] for line in generated_step.splitlines() if line.strip().startswith("run: ")), "")
+    try: generated_command = json.loads(run_line)
+    except json.JSONDecodeError: return False
+    native_actions = re.findall(r"uses:\s*['\"]?([^\s'\"]+)", native)
+    def native_job(name: str) -> str | None:
+        match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", native, re.MULTILINE | re.DOTALL)
+        return match.group(1) if match else None
+    native_jobs = {name: native_job(name) for name in ("macos", "windows")}
+    producer = {"macos": r"tools/package-macos\.sh(?:\s+--output\s+target/distrib/native/macos)?", "windows": r"tools/package-windows\.ps1(?:\s+-OutputDirectory\s+target/distrib/native/windows)?"}
+    def guarded_job(job: str, command: str) -> bool:
+        guard = re.search(r"- name: Require exact check run\n\s+if: github\.event_name != 'pull_request'\n\s+shell: \w+\n\s+run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate\.py --anonymous --sha \"\$GITHUB_SHA\" --repository \"\$GITHUB_REPOSITORY\"", job)
+        header = job[:job.find("    steps:")]
+        runs = list(re.finditer(rf"^\s+run:\s*{command}\s*$", job, re.MULTILINE))
+        if "if:" in header or "needs:" in header or guard is None or len(runs) != 1 or guard.start() > runs[0].start(): return False
+        step_start = job.rfind("      - name:", 0, runs[0].start())
+        next_step = job.find("      - name:", runs[0].end())
+        producer_step = job[step_start:None if next_step < 0 else next_step]
+        return "if:" not in producer_step and "continue-on-error" not in producer_step and "|| true" not in producer_step
+    guarded = all(native_jobs[name] is not None and guarded_job(native_jobs[name] or "", producer[name]) for name in producer)
+    return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == "GH_TOKEN= GITHUB_TOKEN= " + checker and re.search(r"if: ['\"]github\.event_name != 'pull_request'['\"]", generated_step) is not None and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- custom-package-native" in global_part and "- build-local-artifacts" in host_part and "- custom-package-native" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and "needs.custom-package-native.result == 'success'" in host_part and "needs.custom-package-native.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and "uses: ./.github/workflows/package-native.yml" in release and len(native_jobs) == 2 and guarded and native.count("if: github.event_name != 'pull_request'") == 2 and native.count("GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\"") == 2 and "continue-on-error" not in native and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions + native_actions)
+
+
+def graph() -> None:
+    config = (ROOT / "dist-workspace.toml").read_text(); setup = (ROOT / ".github/build-setup.yml").read_text()
+    release = (ROOT / ".github/workflows/release.yml").read_text(); native = NATIVE_WORKFLOW.read_text(); assert valid_graph(config, setup, release, native)
+    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
+    assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release, native)
+    assert not valid_graph(config, setup.replace("if: github.event_name != 'pull_request'", "if: false", 1), release, native)
+    assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release, native)
+    assert not valid_graph(config, setup.replace(checker := 'python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"', checker + ' || true'), release, native)
+    assert not valid_graph(config, setup, release.replace('Require exact check run', 'masked check run', 1), native)
+    assert not valid_graph(config, setup, release.replace('- name: "Require exact check run"', '- name: "Require exact check run"\n        continue-on-error: true', 1), native)
+    generated_run = next(line for line in release.splitlines() if 'tools/check-release-gate.py' in line)
+    assert not valid_graph(config, setup, release.replace(generated_run, generated_run[:-1] + ' || true"', 1), native)
+    assert not valid_graph(config, setup, release.replace("needs.build-local-artifacts.result == 'success'", "needs.build-local-artifacts.result == 'failure'", 1), native)
+    assert not valid_graph(config, setup, release.replace("needs.custom-package-native.result == 'success'", "needs.custom-package-native.result == 'failure'", 1), native)
+    assert not valid_graph(config, setup, release.replace("build-local-artifacts:", "plan-gate:\n  build-local-artifacts:", 1), native)
+    assert not valid_graph(config, setup, release.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1), native)
+    assert not valid_graph(config, setup, release, native.replace("if: github.event_name != 'pull_request'", "if: false", 1))
+    assert not valid_graph(config, setup, release, native.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1))
+    assert not valid_graph(config, setup, release.replace("      - custom-package-native\n", "", 1), native)
+    for job, command in (("macos", "tools/package-macos.sh --output target/distrib/native/macos"), ("macos", "tools/package-macos.sh"), ("windows", "tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows"), ("windows", "tools/package-windows.ps1")):
+        start = native.index(f"  {job}:\n")
+        insertion = native.index("      - name: Check native plan", start)
+        injected = native[:insertion] + f"      - name: any name\n        shell: bash\n        run: {command}\n" + native[insertion:]
+        assert not valid_graph(config, setup, release, injected)
+    assert not valid_graph(config, setup, release, native.replace("      - name: Build native package", "      - name: Build native package\n        if: true", 1))
+    assert not valid_graph(config, setup, release, native.replace("    runs-on: macos-14", "    if: false\n    runs-on: macos-14").replace("    runs-on: windows-2022", "    if: false\n    runs-on: windows-2022"))
+    matrix = "matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}"
+    assert not valid_graph(config, setup, release.replace(matrix, "matrix: { include: [] }", 1), native)
+    def workflow_job(name: str) -> str:
+        match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", release, re.MULTILINE | re.DOTALL)
+        assert match
+        return match.group(1)
+    def needs(job: str) -> list[str]:
+        match = re.search(r"^    needs:\n((?:      - [A-Za-z0-9_-]+\n)+)", job, re.MULTILINE)
+        return re.findall(r"- ([A-Za-z0-9_-]+)", match.group(1)) if match else []
+    local, custom, global_job, host, announce = (workflow_job(name) for name in ("build-local-artifacts", "custom-package-native", "build-global-artifacts", "host", "announce"))
+    assert needs(local) == ["plan"] and needs(custom) == ["plan"] and needs(global_job) == ["plan", "build-local-artifacts", "custom-package-native"] and needs(host) == ["plan", "build-local-artifacts", "custom-package-native", "build-global-artifacts"] and needs(announce) == ["plan", "host"]
+    local_condition = next(line.strip()[4:] for line in local.splitlines() if line.strip().startswith("if: "))
+    custom_condition = next(line.strip()[4:] for line in custom.splitlines() if line.strip().startswith("if: "))
+    host_condition = next(line.strip()[4:] for line in host.splitlines() if line.strip().startswith("if: "))
+    announce_condition = next(line.strip()[4:] for line in announce.splitlines() if line.strip().startswith("if: "))
+
+    def condition(expression: str, values: dict[str, object]) -> bool:
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+        for name, value in sorted(values.items(), key=lambda pair: len(pair[0]), reverse=True):
+            expression = expression.replace(name, repr(value))
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        tree = ast.parse(expression, mode="eval")
+        assert all(isinstance(node, (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.NotEq, ast.Constant)) for node in ast.walk(tree))
+        return bool(eval(compile(tree, "<workflow condition>", "eval"), {"__builtins__": {}}, {}))
+
+    values = {
+        "always()": True,
+        "fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": bool(tomllib.loads(config)["dist"]["targets"]),
+        "fromJson(needs.plan.outputs.val).ci.github.pr_run_mode": "skip",
+        "needs.plan.outputs.publishing": "true",
+        "needs.plan.result": "success",
+        "needs.build-local-artifacts.result": "success",
+        "needs.custom-package-native.result": "success",
+        "needs.build-global-artifacts.result": "success",
+    }
+    assert condition(local_condition, values) and condition(host_condition, values)
+    for refused in ("failure", "cancelled"):
+        assert not condition(host_condition, values | {"needs.build-local-artifacts.result": refused})
+        assert not condition(host_condition, values | {"needs.build-global-artifacts.result": refused})
+        assert not condition(host_condition, values | {"needs.plan.result": refused, "needs.build-local-artifacts.result": "skipped"})
+    assert condition(host_condition, values | {"needs.build-local-artifacts.result": "skipped"})
+    assert not condition(local_condition, values | {"fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": False})
+    assert not condition(host_condition, values | {"needs.plan.outputs.publishing": "false"})
+    assert "- host" in announce and "if: ${{ always() && needs.host.result == 'success' }}" in announce
+    assert "if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}" in custom
+    def states(publishing: bool, pr_mode: str, native_result: str = "success", collector_result: str = "success") -> tuple[str, str, str, str]:
+        values = {"always()": True, "fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": True, "fromJson(needs.plan.outputs.val).ci.github.pr_run_mode": pr_mode, "needs.plan.outputs.publishing": "true" if publishing else "false", "needs.plan.result": "success"}
+        local_result = "success" if condition(local_condition, values) else "skipped"
+        custom_result = native_result if condition(custom_condition, values) else "skipped"
+        results = {"plan": "success", "build-local-artifacts": local_result, "custom-package-native": custom_result}
+        global_result = collector_result if all(results[name] == "success" for name in needs(global_job)) else "skipped"
+        results["build-global-artifacts"] = global_result
+        values |= {f"needs.{name}.result": result for name, result in results.items()}
+        host_result = "success" if condition(host_condition, values) else "skipped"
+        values["needs.host.result"] = host_result
+        return custom_result, global_result, host_result, "success" if condition(announce_condition, values) else "skipped"
+    assert states(False, "upload") == ("success", "success", "skipped", "skipped")
+    assert states(True, "skip") == ("success", "success", "success", "success")
+    assert states(True, "skip", "failure") == ("failure", "skipped", "skipped", "skipped")
+    assert states(True, "skip", "cancelled") == ("cancelled", "skipped", "skipped", "skipped")
+    assert states(True, "skip", "success", "failure") == ("success", "failure", "skipped", "skipped")
+
+
+def native_identity() -> str:
+    match = re.search(r'const APP_ID: &str = "([^"]+)";', (ROOT / "crates/gui/src/native_notify.rs").read_text())
+    assert match, "APP_ID not found in the notification adapter"
+    return match.group(1)
+
+
+def assert_native_identity(plist: dict, wix: ET.Element) -> None:
+    identity = native_identity()
+    assert plist.get("CFBundleIdentifier") == identity, "bundle identifier differs from the notification identity"
+    shortcut = next(item for item in wix.iter() if item.tag.endswith("Shortcut"))
+    properties = [item.attrib for item in shortcut if item.tag.endswith("ShortcutProperty")]
+    assert len(properties) == 1 and properties[0]["Key"] == "System.AppUserModel.ID" and properties[0].get("Value") == identity, "shortcut AppUserModelID differs from the notification identity"
+
+
+def native_identity_cases(plist: dict, wix: ET.Element) -> None:
+    assert_native_identity(plist, wix)
+    def plist_with(**changes: str) -> dict:
+        mutated = copy.deepcopy(plist); mutated.update(changes); return mutated
+    def wix_with(mutate: object) -> ET.Element:
+        mutated = copy.deepcopy(wix); mutate(next(item for item in mutated.iter() if item.tag.endswith("Shortcut"))); return mutated
+    def drop(shortcut: ET.Element) -> None:
+        for item in list(shortcut): shortcut.remove(item)
+    def attribute(name: str, value: str) -> object:
+        return lambda shortcut: next(item for item in shortcut).set(name, value)
+    missing_plist = copy.deepcopy(plist); del missing_plist["CFBundleIdentifier"]
+    rejected = [
+        (missing_plist, wix), (plist_with(CFBundleIdentifier="org.focusforge.app"), wix), (plist_with(CFBundleIdentifier="org.focusforge.focusforge"), wix),
+        (plist, wix_with(drop)), (plist, wix_with(attribute("Value", "org.focusforge.app"))), (plist, wix_with(attribute("Key", "System.AppUserModel.RelaunchCommand"))),
+        (plist, wix_with(lambda shortcut: shortcut.append(copy.deepcopy(next(item for item in shortcut))))),
+    ]
+    for bad_plist, bad_wix in rejected:
+        try: assert_native_identity(bad_plist, bad_wix)
+        except AssertionError: pass
+        else: raise AssertionError("native identity mismatch accepted")
+
+
+def native_boundaries() -> None:
+    plist = plistlib.loads((ROOT / "packaging/macos/Info.plist").read_bytes())
+    assert {key: plist[key] for key in ("CFBundleExecutable", "CFBundleIconFile", "CFBundleShortVersionString", "CFBundleVersion")} == {"CFBundleExecutable": "focusforge-gui", "CFBundleIconFile": "focusforge", "CFBundleShortVersionString": "__VERSION__", "CFBundleVersion": "__VERSION__"}
+    wix = ET.parse(ROOT / "packaging/windows/focusforge.wxs").getroot()
+    package = next(item for item in wix if item.tag.endswith("Package"))
+    files = [item for item in wix.iter() if item.tag.endswith("File")]
+    root_files = {(item.attrib["Name"], item.attrib["Source"], item.attrib.get("KeyPath")) for item in files if "Name" in item.attrib}
+    asset_sources = {item.attrib["Source"] for item in files if item.attrib["Source"].startswith("$(var.CliAssets)")}
+    asset_components = [
+        component for component in wix.iter() if component.tag.endswith("Component")
+        and any(file.attrib.get("Source", "").startswith("$(var.CliAssets)") for file in component if file.tag.endswith("File"))
+    ]
+    assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and root_files == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
+    assert len(asset_sources) == 19 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
+    assert len(asset_components) == 19 and all(
+        len([file for file in component if file.tag.endswith("File")]) == 1
+        and next(file for file in component if file.tag.endswith("File")).attrib.get("KeyPath") == "yes"
+        for component in asset_components
+    )
+    shortcut = next(item for item in wix.iter() if item.tag.endswith("Shortcut")); icon = next(item for item in wix.iter() if item.tag.endswith("Icon"))
+    assert shortcut.attrib["Target"] == "[INSTALLFOLDER]focusforge-gui.exe" and shortcut.attrib["Icon"] == "FocusForgeIcon" and icon.attrib == {"Id": "FocusForgeIcon", "SourceFile": "$(var.Icon)"}
+    native_identity_cases(plist, wix)
+    call(["bash", "-n", str(ROOT / "tools/package-macos.sh"), str(ROOT / "tools/check-package-macos.sh")])
+    call(["bash", str(ROOT / "tools/package-macos.sh"), "--output", "/tmp/outside-native-packages"], False)
+    call(["python3", "-c", "import pathlib; compile(pathlib.Path(__import__('sys').argv[1]).read_text(), __import__('sys').argv[1], 'exec')", str(NATIVE_COLLECTOR)])
+    old_plan = os.environ.get("DIST_PLAN")
+    required = [f"FocusForge-{collector.version()}-x86_64-unknown-linux-gnu-symbols.tar.gz", f"FocusForge-{collector.version()}-universal.dmg", f"FocusForge-{collector.version()}-x86_64.msi", f"FocusForge-{collector.version()}-x86_64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-aarch64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-x86_64-pc-windows-msvc-symbols.tar.gz", "native-artifacts.sha256", "native-artifacts.json"]
+    plan = {"releases": [{"app_name": name, "app_version": collector.version(), "artifacts": [*(f"{name}-{target}.zip" for target in collector.TARGETS), *required]} for name in sorted(collector.PACKAGES)]}
+    os.environ["DIST_PLAN"] = json.dumps(plan)
+    try:
+        collector.check_plan()
+        plan["releases"][0]["artifacts"].append(f"{plan['releases'][0]['app_name']}-aarch64-pc-windows-msvc.zip")
+        os.environ["DIST_PLAN"] = json.dumps(plan)
+        try: collector.check_plan()
+        except ValueError: pass
+        else: raise AssertionError("additional target accepted")
+    finally:
+        if old_plan is None: os.environ.pop("DIST_PLAN", None)
+        else: os.environ["DIST_PLAN"] = old_plan
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp)
+        native, output = directory / "native", directory / "output"
+        old_native, old_output = collector.NATIVE, collector.OUTPUT
+        collector.NATIVE, collector.OUTPUT = native, output
+        try:
+            revision = collector.revision()
+            def restore() -> None:
+                shutil.rmtree(native, ignore_errors=True)
+                symbol_spec = importlib.util.spec_from_file_location("symbol_packager_for_collector", SYMBOL_PACKAGER)
+                symbol_module = importlib.util.module_from_spec(symbol_spec)
+                assert symbol_spec and symbol_spec.loader
+                symbol_spec.loader.exec_module(symbol_module)
+                def native_fixture(path: Path, target_name: str, identifier: str, logical: str) -> None:
+                    if target_name.endswith("windows-msvc"):
+                        guid = __import__("uuid").UUID(hex=identifier[:32]).bytes_le; age = int(identifier[32:], 16)
+                        path.write_bytes(msf_pdb(guid, age)); return
+                    raw = bytes.fromhex(identifier[:32]); slices = []
+                    for cpu in (0x1000007, 0x100000C): slices.append(struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + raw)
+                    data = bytearray(12288); struct.pack_into(">II", data, 0, 0xCAFEBABE, 2)
+                    for index, (cpu, payload) in enumerate(zip((0x1000007, 0x100000C), slices)): offset = 4096 * (index + 1); struct.pack_into(">IIIII", data, 8 + index * 20, cpu, 3, offset, len(payload), 12); data[offset:offset + len(payload)] = payload
+                    dwarf = path / "Contents/Resources/DWARF" / logical; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(data)
+                for platform, kind, suffix in (("macos", "dmg", "universal.dmg"), ("windows", "msi", "x86_64.msi")):
+                    target = native / platform; target.mkdir(parents=True)
+                    artifact = target / f"FocusForge-{collector.version()}-{suffix}"; artifact.write_bytes(platform.encode())
+                    receipt = {"kind": kind, "version": collector.version(), "revision": revision, "artifact": artifact.name, "sha256": collector.sha256(artifact)}
+                    (target / "native-receipt.json").write_text(json.dumps(receipt))
+                    for symbol_target in {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]:
+                        symbols = target / "symbols" / symbol_target
+                        native_inputs = {}; symbols_by_name = {}
+                        module_os, module_cpu, suffix = {"x86_64-apple-darwin": ("Mac", "x86_64", ".dSYM"), "aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"), "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb")}[symbol_target]
+                        for name, identifier in (("focusforge-cli", "73DB7F2DB3A643B9DFD8FF6C4DFF41940"), ("focusforge-gui", "05CE7935D101B8E6E397B49D6F6716080")):
+                            debug_name = f"{name}{suffix}" if suffix != ".pdb" else f"actual-{name}.pdb"
+                            debug = symbols / "native" / debug_name; debug.parent.mkdir(parents=True, exist_ok=True)
+                            native_fixture(debug, symbol_target, identifier, name)
+                            native_inputs[name] = debug
+                            module_name = debug_name if suffix == ".pdb" else name
+                            store = symbols / f"store/{module_name}/{identifier}"; store.mkdir(parents=True); symbol = store / f"{module_name}.sym"; symbol.write_text(f"MODULE {module_os} {module_cpu} {identifier} {module_name}\nFILE 0 crates/{name}/src/main.rs\nFUNC 1000 10 0 {name.replace('-', '_')}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n"); symbols_by_name[name] = [symbol]
+                        manifest = symbol_module.write_inventory(symbols, symbol_target, collector.version(), native_inputs, symbols_by_name, fixture_inspections(symbol_module, symbol_target, native_inputs))
+                        archive = symbols / f"FocusForge-{collector.version()}-{symbol_target}-symbols.tar.gz"
+                        with tarfile.open(archive, "w:gz") as output:
+                            for path in sorted([*(symbols / "native").rglob("*"), *(symbols / "store").rglob("*"), manifest]):
+                                if path.is_file(): output.add(path, arcname=path.relative_to(symbols))
+                        (symbols / "symbols.sha256").write_text(f"{symbol_module.digest(archive)}  {archive.name}\n")
+            restore(); collector.collect()
+            baseline = {path.name: path.read_bytes() for path in output.iterdir()}
+            def reject(mutate: object) -> None:
+                restore(); mutate()
+                try: collector.collect()
+                except (TypeError, ValueError, subprocess.CalledProcessError): pass
+                else: raise AssertionError("collector accepted malformed native input")
+                assert baseline == {path.name: path.read_bytes() for path in output.iterdir()}
+            receipt = native / "macos/native-receipt.json"
+            def receipt_field(field: str, value: object) -> object:
+                def mutate() -> None:
+                    body = json.loads(receipt.read_text()); body[field] = value; receipt.write_text(json.dumps(body))
+                return mutate
+            for field, value in (("revision", "0" * 40), ("version", "9.9.9"), ("artifact", "wrong.dmg"), ("kind", "msi"), ("sha256", "0" * 64)):
+                reject(receipt_field(field, value))
+            reject(lambda: receipt.write_text("{"))
+            reject(lambda: (native / "macos/FocusForge-0.1.0-universal.dmg").unlink())
+            reject(lambda: shutil.rmtree(native / "macos/symbols/aarch64-apple-darwin"))
+            def wrong_target() -> None:
+                path = native / "windows/symbols/x86_64-pc-windows-msvc/symbol-inventory.json"
+                body = json.loads(path.read_text()); body["platform"] = "x86_64-apple-darwin"; path.write_text(json.dumps(body))
+            reject(wrong_target)
+            reject(lambda: (native / "windows/symbols/x86_64-pc-windows-msvc/FocusForge-0.1.0-x86_64-pc-windows-msvc-symbols.tar.gz").write_bytes(b"corrupt"))
+            reject(lambda: (native / "macos/symbols/x86_64-apple-darwin/stale").write_text("stale"))
+            def duplicate() -> None:
+                nested = native / "native/macos"; nested.mkdir(parents=True)
+                shutil.copytree(native / "macos", nested, dirs_exist_ok=True)
+            reject(duplicate)
+            reject(lambda: receipt.unlink())
+        finally:
+            collector.NATIVE, collector.OUTPUT = old_native, old_output
+
+
+def symbol_tool_cases() -> None:
+    """Pinned tool metadata and symbol stores reject stale or mismatched IDs."""
+    assert SYMBOL_PACKAGER.is_file(), "symbol packager is missing"
+    assert SYMBOL_TOOLS.is_file(), "symbol tool pins are missing"
+    spec = importlib.util.spec_from_file_location("symbol_packager", SYMBOL_PACKAGER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    symbolicate_spec = importlib.util.spec_from_file_location("symbolicate", ROOT / "tools/symbolicate.py")
+    symbolicate = importlib.util.module_from_spec(symbolicate_spec)
+    assert symbolicate_spec and symbolicate_spec.loader
+    symbolicate_spec.loader.exec_module(symbolicate)
+    module.check_config(SYMBOL_TOOLS)
+    try:
+        module.build(types.SimpleNamespace(output=ROOT, output_root=ROOT))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("symbol packager accepted repository output root")
+    with tempfile.TemporaryDirectory() as temporary:
+        cache = Path(temporary)
+        payload = cache / "tool.tar.xz"
+        with tarfile.open(payload, "w:xz") as archive:
+            body = cache / "minidump-stackwalk"; body.write_bytes(b"tool"); archive.add(body, arcname="minidump-stackwalk")
+        manifest = {"artifacts": {payload.name: {"checksums": {"sha256": module.digest(payload)}, "target_triples": ["x86_64-unknown-linux-gnu"]}}}
+        (cache / "stackwalk-0.0-manifest.json").write_text(json.dumps(manifest))
+        pins = {"stackwalk": {"version": "0.0", "manifest_sha256": module.digest(cache / "stackwalk-0.0-manifest.json"), "artifact": [{"target": "x86_64-unknown-linux-gnu", "url": f"https://example.invalid/{payload.name}", "sha256": module.digest(payload), "executable": "minidump-stackwalk"}]}}
+        original = module.urllib.request.urlopen
+        module.urllib.request.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cached tool attempted network"))
+        try:
+            assert module.install(pins, "stackwalk", "x86_64-unknown-linux-gnu", cache).is_file()
+            payload.write_bytes(b"corrupt")
+            try: module.install(pins, "stackwalk", "x86_64-unknown-linux-gnu", cache)
+            except AssertionError: pass
+            else: raise AssertionError("corrupt cached archive accepted without a verified replacement")
+        finally:
+            module.urllib.request.urlopen = original
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "native").mkdir()
+        native = root / "native/focusforge-cli.debug"; shutil.copyfile("/bin/true", native)
+        gui_native = root / "native/focusforge-gui.debug"; shutil.copyfile("/bin/true", gui_native)
+        cli_id, gui_id = module.elf_module_id(native), module.elf_module_id(gui_native)
+        store = root / f"store/focusforge-cli/{cli_id}"
+        store.mkdir(parents=True)
+        symbol = store / "focusforge-cli.sym"
+        symbol.write_text(f"MODULE Linux x86_64 {cli_id} focusforge-cli\nFILE 0 crates/cli/src/main.rs\nFUNC 1000 10 0 focusforge_cli::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        gui_store = root / f"store/focusforge-gui/{gui_id}"; gui_store.mkdir(parents=True)
+        (gui_store / "focusforge-gui.sym").write_text(f"MODULE Linux x86_64 {gui_id} focusforge-gui\nFILE 0 crates/gui/src/main.rs\nFUNC 1000 10 0 focusforge_gui::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        fixture_native = {"focusforge-cli": native, "focusforge-gui": gui_native}
+        manifest = module.write_inventory(root, "x86_64-unknown-linux-gnu", "0.1.0", fixture_native, inspections=fixture_inspections(module, "x86_64-unknown-linux-gnu", fixture_native))
+        module.verify_inventory(root, manifest)
+        symbol.write_text("MODULE Linux x86_64 00000000000000000000000000000000 focusforge-cli\nFILE 0 crates/cli/src/main.rs\nFUNC 1000 10 0 focusforge_cli::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        try:
+            module.verify_inventory(root, manifest)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("mismatched Breakpad module ID accepted")
+        symbol.write_text(f"MODULE Linux x86_64 {cli_id} focusforge-cli\nFILE 0 crates/cli/src/main.rs\nFUNC 1000 10 0 focusforge_cli::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        report = {"modules": [{"filename": "focusforge-cli", "debug_file": "focusforge-cli", "debug_id": cli_id, "loaded_symbols": True}], "crashing_thread": {"frames": [{"function": "focusforge_cli::main", "module": "focusforge-cli", "file": r"C:\work\crates\cli\src\main.rs", "line": 522}]}}
+        symbolicate.verify_report(report, module.verify_inventory(root, manifest))
+        bad = json.loads(json.dumps(report)); bad["modules"][0]["debug_id"] = "0" * 33
+        try: symbolicate.verify_report(bad, module.verify_inventory(root, manifest))
+        except ValueError: pass
+        else: raise AssertionError("symbolicate accepted a mismatched loaded module")
+        bad = json.loads(json.dumps(report)); bad["crashing_thread"]["frames"][0]["line"] = 0
+        try: symbolicate.verify_report(bad, module.verify_inventory(root, manifest))
+        except ValueError: pass
+        else: raise AssertionError("symbolicate accepted a missing application line")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary); native = {}; binary = {}
+        for name in ("focusforge-cli", "focusforge-gui"):
+            source = root / "crates" / name.removeprefix("focusforge-") / "src/main.rs"; source.parent.mkdir(parents=True); source.write_text("fn main() {}\n")
+            path = root / f"{name}.debug"
+            result = subprocess.run(["rustc", "--edition=2021", "--crate-name", name.replace("-", "_"), "-g", "--remap-path-prefix=/home=/rustc", f"--remap-path-prefix={root}=/work", str(source), "-o", str(path)], cwd=root, text=True, capture_output=True)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            native[name] = path; binary[name] = path
+        identifiers = {name: module.elf_module_id(path) for name, path in native.items()}
+        dump_syms = root / "dump_syms"
+        dump_syms.write_text("#!/bin/sh\nset -eu\nstore= binary=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --store ]; then store=$2; shift 2; else binary=$1; shift; fi; done\nname=$(basename \"$binary\" .debug)\ncrate=$(printf '%s' \"$name\" | tr '-' '_')\nid=$(printf '%s\\n' \"$MODULE_IDS\" | tr ',' '\\n' | sed -n \"s/^$name=//p\")\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Linux x86_64 %s %s\\nFILE 0 /root/.cargo/registry/src/index.crates.io/dependency/src/lib.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$id\" \"$name\" \"$crate\" > \"$store/$name/$id/$name.sym\"\n")
+        dump_syms.chmod(0o755)
+        original = os.environ.get("MODULE_IDS"); os.environ["MODULE_IDS"] = ",".join(f"{name}={identifier}" for name, identifier in identifiers.items())
+        try:
+            output = root / "output"
+            module.build(types.SimpleNamespace(platform="x86_64-unknown-linux-gnu", version="0.1.0", dump_syms=str(dump_syms), output=output, output_root=root, native=[f"{name}={path}" for name, path in native.items()], binary=[f"{name}={path}" for name, path in binary.items()], arch=None, symbols_per_native=1))
+        finally:
+            if original is None: os.environ.pop("MODULE_IDS", None)
+            else: os.environ["MODULE_IDS"] = original
+        for name in native:
+            symbol = output / "store" / name / identifiers[name] / f"{name}.sym"
+            assert "FILE 0 dependency/lib.rs" in symbol.read_text()
+
+
+def linux_known_main_cases(sealed_container: bool = False) -> None:
+    module = symbol_module()
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary); tree, symbols, mock = root / "tree", root / "symbols", root / "mock"; (tree / "bin").mkdir(parents=True); mock.mkdir()
+        native: dict[str, Path] = {}; symbol_files: dict[str, list[Path]] = {}
+        for name in ("focusforge-cli", "focusforge-gui"):
+            crate = name.replace("-", "_"); source = root / f"crates/{name.removeprefix('focusforge-')}/src/main.rs"; source.parent.mkdir(parents=True); source.write_text("fn main() { println!(\"fixture\"); }\n")
+            debug = symbols / "native" / f"{name}.debug"; debug.parent.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(["rustc", "--edition=2021", "--crate-name", crate, "-g", "--remap-path-prefix=/home=/rustc", f"--remap-path-prefix={root}=/work", str(source), "-o", str(debug)], cwd=root, text=True, capture_output=True)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            shipping = tree / "bin" / name; shutil.copyfile(debug, shipping); call(["objcopy", "--strip-debug", str(shipping)]); call(["objcopy", f"--add-gnu-debuglink={debug}", str(shipping)])
+            identifier = module.elf_module_id(debug); symbol = symbols / "store" / name / identifier / f"{name}.sym"; symbol.parent.mkdir(parents=True); symbol.write_text(f"MODULE Linux x86_64 {identifier} {name}\nFILE 0 crates/{name.removeprefix('focusforge-')}/src/main.rs\nFUNC 1000 10 0 {crate}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+            native[name], symbol_files[name] = debug, [symbol]
+        module.write_inventory(symbols, "x86_64-unknown-linux-gnu", "0.1.0", native, symbol_files, {name: module.inspect_native("x86_64-unknown-linux-gnu", path, name) for name, path in native.items()})
+        def validate_main(extra: dict[str, str] | None = None, success: bool = True) -> None:
+            env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_PRIVATE_SOURCE": str(root / "private/crates/cli/src/main.rs"), **(extra or {})}
+            result = subprocess.run(["bash", "-c", 'source "$1"; validate_main_address focusforge-cli "$2/bin/focusforge-cli" "$3/native/focusforge-cli.debug"; validate_main_address focusforge-gui "$2/bin/focusforge-gui" "$3/native/focusforge-gui.debug"', "selftest", str(CHECKER), str(tree), str(symbols)], text=True, capture_output=True, env=env)
+            assert (result.returncode == 0) == success, (result.stdout, result.stderr)
+        nm = mock / "nm"; nm.write_text("#!/bin/sh\n/usr/bin/nm \"$@\" | awk 'BEGIN { no=ENVIRON[\"MOCK_NO_MAIN\"]; bad=ENVIRON[\"MOCK_BAD_ADDRESS\"] && ARGV[0] !~ /native/; zero=ENVIRON[\"MOCK_ZERO_ADDRESS\"] } no && $NF ~ /^focusforge_(cli|gui)::main$/ { next } bad && $NF == \"focusforge_cli::main\" { $1=\"deadbeef\" } zero && $NF ~ /^focusforge_(cli|gui)::main$/ { $1=\"0000000000000000\" } { print }'\n"); nm.chmod(0o755)
+        addr2line = mock / "addr2line"; addr2line.write_text("#!/bin/sh\ncase \"$*\" in *focusforge-cli.debug*) export MOCK_CLI=1;; esac\n/usr/bin/addr2line \"$@\" | awk 'NR == 2 && ENVIRON[\"MOCK_BAD_SOURCE\"] { print \"wrong.rs\" \":1\"; next } NR == 2 && ENVIRON[\"MOCK_RELATIVE_SOURCE\"] && ENVIRON[\"MOCK_CLI\"] { print \"crates/cli/src/main.rs\" \":1\"; next } NR == 2 && ENVIRON[\"MOCK_PRIVATE_CRATES\"] { print ENVIRON[\"MOCK_PRIVATE_SOURCE\"] \":1\"; next } NR == 2 && ENVIRON[\"MOCK_NON_MAIN_SOURCE\"] { print \"crates/cli/src/lib.rs\" \":1\"; next } NR == 2 && ENVIRON[\"MOCK_TRAVERSAL_SOURCE\"] { print \"crates/cli/../gui/src/main.rs\" \":1\"; next } { print }'\n"); addr2line.chmod(0o755)
+        validate_main()
+        validate_main({"MOCK_NO_MAIN": "1"}, False)
+        validate_main({"MOCK_BAD_ADDRESS": "1"}, False)
+        validate_main({"MOCK_BAD_SOURCE": "1"}, False)
+        validate_main({"MOCK_ZERO_ADDRESS": "1"}, False)
+        validate_main({"MOCK_RELATIVE_SOURCE": "1"})
+        validate_main({"MOCK_PRIVATE_CRATES": "1"}, False)
+        validate_main({"MOCK_NON_MAIN_SOURCE": "1"}, False)
+        validate_main({"MOCK_TRAVERSAL_SOURCE": "1"}, False)
+        if not sealed_container:
+            return
+        image = subprocess.run(["docker", "build", "-q", "-"], input="FROM ubuntu@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401\nRUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq binutils file python3\n", text=True, capture_output=True)
+        assert image.returncode == 0, (image.stdout, image.stderr)
+        image_name = image.stdout.strip()
+        version = subprocess.run(["docker", "run", "--rm", "--network=none", image_name, "python3", "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"], text=True, capture_output=True)
+        assert version.returncode == 0 and version.stdout.strip() == "3.10", (version.stdout, version.stderr)
+        def validate_container(caller: str, extra: dict[str, str] | None = None, success: bool = True, missing_config: bool = False) -> None:
+            args = ["docker", "run", "--rm", "--network=none", "-v", f"{ROOT}:/product:ro", "-v", f"{CHECKER}:/checks/checker.sh:ro", "-v", f"{tree}:/tree:ro", "-v", f"{symbols}:/symbols:ro", "-v", f"{mock}:/mock:ro", "-e", "PATH=/mock:/usr/bin:/bin"]
+            if missing_config:
+                overlay = root / "missing-config/packaging"; overlay.mkdir(parents=True, exist_ok=True)
+                args.extend(("-v", f"{overlay}:/product/packaging:ro"))
+            for key, value in (extra or {}).items(): args.extend(("-e", f"{key}={value}"))
+            command = 'source /checks/checker.sh; validate_symbols /tree /symbols' if missing_config else 'test -f /product/packaging/symbol-tools.toml; source /checks/checker.sh; validate_symbols /tree /symbols'
+            result = subprocess.run([*args, image_name, "bash", "-c", command], text=True, capture_output=True)
+            if missing_config:
+                assert result.returncode != 0 and "FileNotFoundError" in result.stderr and "'/product/packaging/symbol-tools.toml'" in result.stderr, (caller, result.stdout, result.stderr)
+                return
+            assert (result.returncode == 0) == success, (caller, result.stdout, result.stderr)
+        validate_container("appimage")
+        validate_container("debian")
+        validate_container("missing config", missing_config=True)
+        original = (tree / "bin/focusforge-cli").read_bytes(); bad = root / "other/focusforge-cli.debug"; bad.parent.mkdir(); bad.write_bytes(native["focusforge-cli"].read_bytes() + b"bad")
+        call(["objcopy", "--remove-section", ".gnu_debuglink", str(tree / "bin/focusforge-cli")]); call(["objcopy", f"--add-gnu-debuglink={bad}", str(tree / "bin/focusforge-cli")])
+        validate_container("debuglink crc", success=False)
+        (tree / "bin/focusforge-cli").write_bytes(original)
+        inventory = symbols / "symbol-inventory.json"; original_inventory = inventory.read_bytes()
+        native["focusforge-cli"].write_bytes(native["focusforge-cli"].read_bytes() + b"changed")
+        validate_container("changed native", success=False)
+        native["focusforge-cli"].write_bytes(native["focusforge-cli"].read_bytes()[:-7])
+        inventory.write_text('{}')
+        validate_container("inventory", success=False)
+        inventory.write_bytes(original_inventory)
+
+
+def sealed_linux_checker_container_cases() -> None:
+    linux_known_main_cases(sealed_container=True)
+
+
+def linux_crash_roundtrip_cases() -> None:
+    source = CHECKER.read_text()
+    bodies = re.findall(r"^force_crash\(\) \{\n(.*?)^\}", source, re.MULTILINE | re.DOTALL)
+    assert len(bodies) == 2
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for body_index, original_body in enumerate(bodies):
+            for artifact in ("missing_dump", "missing_metadata", "missing_both", "complete"):
+                crash = root / f"{body_index}-{artifact}"
+                symbols = crash / "artifacts/symbols"; symbols.mkdir(parents=True)
+                (symbols / "FocusForge-0.1.0-x86_64-unknown-linux-gnu-symbols.tar.gz").write_bytes(b"symbols")
+                symbolicate = crash / "symbolicate.py"; symbolicate.write_text("raise SystemExit(0)\n")
+                body = original_body.replace("/checks/crashes", str(crash / "crashes")).replace("/artifacts/symbols", str(symbols)).replace("/product/tools/symbolicate.py", str(symbolicate))
+                for name, arguments in (("focusforge-cli", "algorithms"), ("focusforge-gui", "")):
+                    binary = crash / name
+                    binary.write_text(f"#!/bin/sh\nname=$(basename \"$0\")\ncase \"$name\" in focusforge-cli) [ \"${{1:-}}\" = algorithms ] || {{ echo parser >&2; exit 64; }};; focusforge-gui) [ \"$#\" -eq 0 ] || {{ echo parser >&2; exit 65; }};; esac\nmkdir -p \"$FOCUSFORGE_DATA_DIR/focusforge/crashes\"\ncase {artifact} in missing_metadata|complete) printf MDMP > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp\";; esac\ncase {artifact} in missing_dump|complete) printf '{{\"binary\":\"%s\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"0.1.0\",\"timestamp\":\"%s\"}}' \"$name\" \"$$\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json\";; esac\nexit 1\n")
+                    binary.chmod(0o755)
+                    command = f"set -euo pipefail; version=0.1.0; force_crash() {{\n{body}\n}}\nforce_crash {name} {binary} {arguments}"
+                    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+                    if artifact == "complete":
+                        assert result.returncode == 0, (result.stdout, result.stderr)
+                    else:
+                        missing = "dump" if artifact == "missing_both" else artifact.removeprefix("missing_")
+                        assert result.returncode != 0 and f"missing crash artifact: {missing}" in result.stderr and "Traceback" not in result.stderr, (result.stdout, result.stderr)
+
+
+def source_privacy_cases() -> None:
+    module = symbol_module()
+    assert module.normalized_source("/rust/deps/hashbrown-0.16.1/src/raw/mod.rs") == "dependency/mod.rs"
+    for source, expected in (
+        ("/root/.cargo/git/checkouts/cv-9d8edb0abe48fcfc/d271a9a/akaze/src/lib.rs", "dependency/lib.rs"),
+        ("/out/target/release/build/focusforge-gui/out/app.rs", "dependency/app.rs"),
+        ("/usr/include/x86_64-linux-gnu/bits/string_fortified.h", "dependency/string_fortified.h"),
+        ("/usr/lib/gcc/x86_64-linux-gnu/11/include/emmintrin.h", "dependency/emmintrin.h"),
+    ):
+        assert module.normalized_source(source) == expected
+    for source in ("/root/.cargo/git/checkouts/../../private/main.rs", "/out/target/../../private/main.rs", "/usr/include-private/secret.h", "/usr/lib/gcc/x86_64-linux-gnu/11/private/secret.h"):
+        try: module.normalized_source(source)
+        except ValueError: pass
+        else: raise AssertionError(f"private dependency source accepted: {source}")
+    assert module.safe_source_less_cu("crates/cli/src/main.rs/@/focusforge_cli.fixture")
+    assert module.safe_source_less_cu("/root/.cargo/registry/src/index.crates.io/example/src/lib.rs/@/example.fixture")
+    for value in ("../private/checkout/@/fixture", "private checkout/src/main.rs/@/fixture", "/private/checkout/src/main.rs/@/fixture", "crates/cli/src/main.rs"):
+        assert not module.safe_source_less_cu(value)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        clean_source = root / "crates/cli/src/main.rs"; clean_source.parent.mkdir(parents=True); clean_source.write_text("fn main() { println!(\"fixture\"); }\n")
+        clean = root / "clean.debug"
+        result = subprocess.run(["rustc", "--edition=2021", "--crate-name", "focusforge_cli", "-g", "--remap-path-prefix=/home=/rustc", f"--remap-path-prefix={root}=/work", str(clean_source), "-o", str(clean)], cwd=root, text=True, capture_output=True)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        inspection = module.inspect_native("x86_64-unknown-linux-gnu", clean, "focusforge-cli")
+        assert inspection["format"] == "elf-dwarf" and inspection["coverage"]["line_tables"] > 0 and any(path.endswith("crates/cli/src/main.rs") for path in inspection["source_paths"])
+        collision = root / "collision.debug"; shutil.copyfile(clean, collision); collision.write_bytes(collision.read_bytes() + b"\0\0/a\0\0")
+        assert module.inspect_native("x86_64-unknown-linux-gnu", collision, "focusforge-cli")["source_paths"] == inspection["source_paths"]
+        records = root / "records"; records.mkdir(); reader = records / "readelf"
+        reader.write_text("#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nprint(Path(os.environ['SOURCE_PRIVACY_INFO'] if '--debug-dump=info' in sys.argv else os.environ['SOURCE_PRIVACY_LINE']).read_text(), end='')\n")
+        reader.chmod(0o755)
+        info = """ <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+ DW_AT_name : crates/cli/src/main.rs
+ DW_AT_comp_dir : /work
+ DW_AT_stmt_list : 0
+ <0><b0>: Abbrev Number: 1 (DW_TAG_compile_unit)
+ DW_AT_name : crates/cli/src/main.rs/@/focusforge_cli.fixture
+ DW_AT_comp_dir : /work
+ DW_AT_stmt_list : 64
+"""
+        main_table = """ Offset: 0
+ The Directory Table:
+ 1 /work/crates/cli/src
+
+ The File Name Table:
+ 1 1 0 0 main.rs
+
+"""
+        (records / "info").write_text(info)
+        old = dict(os.environ)
+        def inspect_records(rawline: str) -> dict:
+            (records / "line").write_text(rawline)
+            os.environ.update(PATH=f"{records}:{old['PATH']}", SOURCE_PRIVACY_INFO=str(records / "info"), SOURCE_PRIVACY_LINE=str(records / "line"))
+            return module.inspect_native("x86_64-unknown-linux-gnu", clean, "focusforge-cli")
+        def rejects(label: str, rawline: str, message: str) -> None:
+            try: inspect_records(rawline)
+            except ValueError as error: assert str(error) == message, (label, error)
+            else: raise AssertionError(f"{label} accepted")
+        try:
+            empty_clean = main_table + """ Offset: 64
+ The Directory Table:
+ 1 /work/crates/cli/src/empty-directory-metadata
+
+ The File Name Table:
+
+"""
+            assert "/work/crates/cli/src/empty-directory-metadata" in inspect_records(empty_clean)["source_paths"]
+            rejects("private empty codegen directory", empty_clean.replace("/work/crates/cli/src/empty-directory-metadata", "/private checkout.Åsa"), "private source path in native symbols")
+            unbound_clean = main_table + """ Offset: 64
+ The Directory Table:
+ 1 /work/crates/cli/src
+
+ The File Name Table:
+
+ Offset: 128
+ The Directory Table:
+ 1 /work/crates/cli/src/unbound-directory-metadata
+
+ The File Name Table:
+ 1 1 0 0 orphan.rs
+
+"""
+            unbound = inspect_records(unbound_clean)["source_paths"]
+            assert "/work/crates/cli/src/unbound-directory-metadata" in unbound and "/work/crates/cli/src/unbound-directory-metadata/orphan.rs" in unbound
+            rejects("private unbound directory", unbound_clean.replace("/work/crates/cli/src/unbound-directory-metadata", "/private checkout.Åsa"), "private source path in native symbols")
+            rejects("unresolved relative unbound directory", unbound_clean.replace("/work/crates/cli/src/unbound-directory-metadata", "relative-source-basis"), "unresolved DWARF line table basis")
+        finally:
+            os.environ.clear(); os.environ.update(old)
+        for suffix in ("private checkout.Åsa", 'private "quoted" checkout.Åsa'):
+            private_root = root / suffix; private_root.mkdir(); private_source = private_root / "main.rs"; private_source.write_text("fn main() {}\n")
+            private = root / f"{len(suffix)}.debug"; result = subprocess.run(["rustc", "--edition=2021", "--crate-name", "focusforge_cli", "-g", "main.rs", "-o", str(private)], cwd=private_root, text=True, capture_output=True)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            try: module.inspect_native("x86_64-unknown-linux-gnu", private, "focusforge-cli")
+            except ValueError: pass
+            else: raise AssertionError("private DWARF compilation directory accepted")
+        symbols = root / "symbols"; native = {"focusforge-cli": clean, "focusforge-gui": collision}
+        for name, path in native.items():
+            identifier = module.elf_module_id(path); symbol = symbols / "store" / name / identifier / f"{name}.sym"; symbol.parent.mkdir(parents=True); symbol.write_text(f"MODULE Linux x86_64 {identifier} {name}\nFILE 0 crates/{name.removeprefix('focusforge-')}/src/main.rs\nFUNC 1000 10 0 {name.replace('-', '_')}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        copied = {}
+        for name, source in native.items():
+            destination = symbols / "native" / f"{name}.debug"; destination.parent.mkdir(exist_ok=True); shutil.copyfile(source, destination); copied[name] = destination
+        inspections = {name: module.inspect_native("x86_64-unknown-linux-gnu", path, name) for name, path in copied.items()}
+        manifest = module.write_inventory(symbols, "x86_64-unknown-linux-gnu", "0.1.0", copied, inspections=inspections)
+        module.verify_inventory(symbols, manifest)
+        inventory = json.loads(manifest.read_text())
+        for label, mutate in (("stale", lambda record: record.__setitem__("native_inspection_sha256", "0" * 64)), ("missing coverage", lambda record: record.pop("coverage")), ("private record", lambda record: record.__setitem__("source_paths", ["/private/checkout/main.rs"]))):
+            changed = json.loads(json.dumps(inventory)); mutate(changed["entries"][0]["native_source_inspection"]); manifest.write_text(json.dumps(changed))
+            try: module.verify_inventory(symbols, manifest)
+            except ValueError: pass
+            else: raise AssertionError(f"{label} native source inspection accepted")
+        manifest.write_text(json.dumps(inventory))
+        changed_native = copied["focusforge-cli"]; changed_native.write_bytes(changed_native.read_bytes() + b"changed"); rehashed = json.loads(json.dumps(inventory)); rehashed["entries"][0]["native_sha256"] = module.digest(changed_native); manifest.write_text(json.dumps(rehashed))
+        try: module.verify_inventory(symbols, manifest)
+        except ValueError: pass
+        else: raise AssertionError("rehash with stale native source inspection accepted")
+        shutil.copyfile(clean, changed_native); manifest.write_text(json.dumps(inventory))
+        pdb = root / "source.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs"))
+        pdb_inspection = module.inspect_windows_native(pdb)
+        assert pdb_inspection["source_paths"] == ["/work", "/work/crates/cli/src/main.rs"] and pdb_inspection["coverage"]["module_c13_records"] == 1 and pdb_inspection["coverage"]["environment_records"] == 2
+        trusted_pdb = root / "trusted-source.pdb"; trusted_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "C:/work/crates/cli/src/nested space/main.rs"))
+        assert "C:/work/crates/cli/src/nested space/main.rs" in module.inspect_windows_native(trusted_pdb)["source_paths"]
+        for index, private_source in enumerate(("/private checkout.Åsa/main.rs", "E:/private 用户/main.rs", "//server/private/checkout/main.rs")):
+            private_pdb = root / f"private-source-{index}.pdb"; private_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, private_source))
+            try: module.inspect_windows_native(private_pdb)
+            except ValueError: pass
+            else: raise AssertionError("private PDB FileInfo source accepted")
+        fpm = bytearray(pdb.read_bytes()); marker_offset = 512 + 64; fpm[marker_offset:marker_offset + 6] = b"/a\0\0\0\0"; fpm_path = root / "fpm-marker.pdb"; fpm_path.write_bytes(fpm)
+        assert module.pdb_info(fpm_path) == (bytes(range(16)), 0x20)
+        malformed = bytearray(pdb.read_bytes()); end = malformed.find(b"/work/crates/cli/src/main.rs\0\0", 7 * 512); assert end >= 0; malformed[end + len(b"/work/crates/cli/src/main.rs\0")] = ord("x"); malformed_path = root / "malformed-env.pdb"; malformed_path.write_bytes(malformed)
+        try: module.inspect_windows_native(malformed_path)
+        except ValueError: pass
+        else: raise AssertionError("odd CodeView environment fields accepted")
+        for platform in ("x86_64-apple-darwin", "x86_64-pc-windows-msvc"):
+            portable = root / platform
+            if platform.endswith("apple-darwin"):
+                archive = write_macos_symbols(portable, platform)
+            else:
+                shipping = root / "shipping-windows"; shipping.mkdir(); archive = write_windows_symbols(portable, shipping)
+            module.verify_archive(portable, archive)
+            inventory_path = portable / "symbol-inventory.json"; portable_inventory = json.loads(inventory_path.read_text())
+            record = portable_inventory["entries"][0]["native_source_inspection"]
+            if platform.endswith("apple-darwin"): record["coverage"]["slices"] = ["x86_64"]
+            else: record["native_inspection_sha256"] = "0" * 64
+            inventory_path.write_text(json.dumps(portable_inventory))
+            try: module.verify_inventory(portable)
+            except ValueError: pass
+            else: raise AssertionError(f"portable {platform} inspection mutation accepted")
+
+
+def macos_source_cases() -> None:
+    module = symbol_module()
+    grouped = """0x00000000: DW_TAG_compile_unit
+ DW_AT_name ("crates/cli/src/one.rs")
+ DW_AT_comp_dir ("/work")
+ DW_AT_stmt_list (0x00000000)
+0x00000020: DW_TAG_compile_unit
+ DW_AT_name ("crates/cli/src/two.rs")
+ DW_AT_comp_dir ("/work")
+ DW_AT_stmt_list (0x00000040)
+.debug_line[0x00000000]
+include_directories[1] = "/work/crates/cli/src"
+file_names[1] = {
+ name: "one.rs"
+ dir_index: 1
+}
+.debug_line[0x00000040]
+include_directories[1] = "/work/crates/cli/src"
+file_names[1] = {
+ name: "two.rs"
+ dir_index: 1
+}
+"""
+    def inspect(output: str, auxiliary: dict | None = None) -> dict:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); bundle = root / "focusforge-cli.dSYM"; dwarf = bundle / "Contents/Resources/DWARF/focusforge-cli"; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(universal_macho())
+            (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "focusforge-cli"}))
+            if auxiliary is not None:
+                resource = bundle / "Contents/Resources/00000000000000000000000000000001.plist"
+                resource.write_bytes(plistlib.dumps(auxiliary))
+            mock = root / "mock"; mock.mkdir(); dumper = mock / "dwarfdump"
+            dumper.write_text("#!/bin/sh\ncat <<'EOF'\n" + output + "EOF\n"); dumper.chmod(0o755)
+            old = os.environ["PATH"]; os.environ["PATH"] = str(mock) + ":" + old
+            try: return module.inspect_macos_native(bundle, "focusforge-cli")
+            finally: os.environ["PATH"] = old
+    record = inspect(grouped)
+    assert record["coverage"]["slices"] == ["arm64", "x86_64"] and "/work/crates/cli/src/two.rs" in record["source_paths"]
+    no_line = grouped.replace(".debug_line", """0x00000060: DW_TAG_compile_unit
+ DW_AT_name ("crates/cli/src/no-line.rs")
+ DW_AT_comp_dir ("/work")
+.debug_line""", 1)
+    assert "/work/crates/cli/src/no-line.rs" in inspect(no_line)["source_paths"]
+    private_no_line = no_line.replace('DW_AT_name ("crates/cli/src/no-line.rs")\n DW_AT_comp_dir ("/work")', 'DW_AT_name ("crates/cli/src/no-line.rs")\n DW_AT_comp_dir ("/private/checkout")')
+    unused_clean = grouped.replace('include_directories[1] = "/work/crates/cli/src"', 'include_directories[1] = "/work/crates/cli/src"\ninclude_directories[2] = "/work/crates/unused"', 1)
+    assert "/work/crates/unused" in inspect(unused_clean)["source_paths"]
+    unused_private = unused_clean.replace('include_directories[2] = "/work/crates/unused"', 'include_directories[2] = "/private/checkout"')
+    missing_table = grouped.replace(".debug_line[0x00000040]", ".debug_line[0x00000041]")
+    for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for x86_64")):
+        try: inspect(output)
+        except ValueError as error: assert str(error) == message
+        else: raise AssertionError(f"{label} accepted")
+    assert inspect(grouped, {"DBGBuildSourcePath": "/work", "DBGSourcePath": "/work/crates/cli/src"})["coverage"]["auxiliary_source_records"] == 1
+    assert inspect(grouped, {"DBGSourcePathRemapping": {"/work": "/work/crates/cli/src"}})["coverage"]["auxiliary_source_records"] == 1
+    for label, auxiliary in (("private plist", {"DBGBuildSourcePath": "/private/checkout", "DBGSourcePath": "/private/checkout"}), ("malformed plist", {"DBGBuildSourcePath": "/work"}), ("private remap", {"DBGSourcePathRemapping": {"/work": "/private/checkout"}})):
+        try: inspect(grouped, auxiliary)
+        except ValueError: pass
+        else: raise AssertionError(f"{label} accepted")
+
+def msf_pdb(guid: bytes, age: int) -> bytearray:
+    page_size, page_count = 512, 6
+    pdb = bytearray(page_size * page_count)
+    pdb[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
+    struct.pack_into("<IIIIII", pdb, 32, page_size, 1, page_count, 16, 0, 5)
+    struct.pack_into("<I", pdb, 5 * page_size, 3)
+    struct.pack_into("<IIII", pdb, 3 * page_size, 2, 0xFFFFFFFF, 28, 4)
+    struct.pack_into("<I", pdb, 4 * page_size + 8, age)
+    pdb[4 * page_size + 12:4 * page_size + 28] = guid
+    return pdb
+
+
+def msf_pdb_with_source(guid: bytes, age: int, source: str) -> bytearray:
+    page_size, page_count = 512, 8
+    pdb = bytearray(page_size * page_count)
+    pdb[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
+    source_bytes = source.encode() + b"\0"; c13 = struct.pack("<II", 0xF3, len(source_bytes)) + source_bytes + b"\0" * ((-len(source_bytes)) % 4) + struct.pack("<IIIBB", 0xF4, 8, 0, 0, 0) + b"\0\0"
+    environment = b"\0cwd\0/work\0src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
+    module = bytearray(len(symbols) + len(c13)); module[:len(symbols)] = symbols; module[len(symbols):] = c13
+    record = bytearray(64); struct.pack_into("<HIII", record, 34, 4, len(symbols), 0, len(c13)); record += b"module\0object\0"; record += b"\0" * ((-len(record)) % 4)
+    file_info = struct.pack("<HHHHI", 1, 1, 0, 1, 0) + source_bytes
+    dbi_size = 64 + len(record) + len(file_info)
+    directory = struct.pack("<IIIIIIIII", 5, 0xFFFFFFFF, 28, 0xFFFFFFFF, dbi_size, len(module), 4, 6, 7)
+    struct.pack_into("<IIIIII", pdb, 32, page_size, 1, page_count, len(directory), 0, 5)
+    struct.pack_into("<I", pdb, 5 * page_size, 3); pdb[3 * page_size:3 * page_size + len(directory)] = directory
+    struct.pack_into("<IIII", pdb, 4 * page_size, 2, 0xFFFFFFFF, 28, 4); struct.pack_into("<I", pdb, 4 * page_size + 8, age); pdb[4 * page_size + 12:4 * page_size + 28] = guid
+    dbi = memoryview(pdb)[6 * page_size:7 * page_size]; struct.pack_into("<iII", dbi, 0, -1, 19990903, age); struct.pack_into("<II", dbi, 24, len(record), 0); struct.pack_into("<II", dbi, 32, 0, len(file_info)); dbi[64:64 + len(record)] = record; dbi[64 + len(record):64 + len(record) + len(file_info)] = file_info; pdb[7 * page_size:7 * page_size + len(module)] = module
+    return pdb
+
+
+def windows_identity_cases() -> None:
+    spec = importlib.util.spec_from_file_location("symbol_packager_windows", SYMBOL_PACKAGER)
+    module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
+    def fixtures(root: Path, guid: bytes, age: int, pdb_guid: bytes | None = None, pdb_age: int | None = None) -> tuple[Path, Path]:
+        pe = bytearray(0x700); pe[:2] = b"MZ"; struct.pack_into("<I", pe, 0x3C, 0x80); pe[0x80:0x84] = b"PE\0\0"; struct.pack_into("<H", pe, 0x84, 0x8664); struct.pack_into("<H", pe, 0x86, 1); struct.pack_into("<H", pe, 0x94, 240); struct.pack_into("<H", pe, 0x98, 0x20B); struct.pack_into("<I", pe, 0x98 + 108, 16); struct.pack_into("<II", pe, 0x98 + 112 + 48, 0x1000, 28); struct.pack_into("<IIII", pe, 0x188 + 8, 0x200, 0x1000, 0x200, 0x200); struct.pack_into("<II", pe, 0x200 + 12, 2, 32); struct.pack_into("<I", pe, 0x200 + 24, 0x240); pe[0x240:0x244] = b"RSDS"; pe[0x244:0x254] = guid; struct.pack_into("<I", pe, 0x254, age); pe[0x258:0x260] = b"real.pdb\0"
+        pdb = msf_pdb(pdb_guid if pdb_guid is not None else guid, pdb_age if pdb_age is not None else age)
+        pe_path, pdb_path = root / "app.exe", root / "app.pdb"; pe_path.write_bytes(pe); pdb_path.write_bytes(pdb); return pe_path, pdb_path
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary); guid = bytes(range(16)); pe, pdb = fixtures(root, guid, 0x20)
+        module.verify_windows([f"focusforge-cli={pe},{pdb}"])
+        assert module.pe_rsds_record(pe)[2].endswith("real.pdb")
+        for changed_guid, changed_age in ((bytes(range(1, 17)), None), (None, 0x21)):
+            pe, pdb = fixtures(root, guid, 0x20, changed_guid, changed_age)
+            try: module.verify_windows([f"focusforge-cli={pe},{pdb}"])
+            except ValueError: pass
+            else: raise AssertionError("PE/PDB GUID or age mismatch accepted")
+        for name, mutate in (
+            ("block-map-fpm1", lambda data: struct.pack_into("<I", data, 52, 1)),
+            ("block-map-fpm2", lambda data: struct.pack_into("<I", data, 52, 2)),
+            ("directory-fpm1", lambda data: struct.pack_into("<I", data, 5 * 512, 1)),
+            ("directory-fpm2", lambda data: struct.pack_into("<I", data, 5 * 512, 2)),
+            ("info-fpm1", lambda data: struct.pack_into("<I", data, 3 * 512 + 12, 1)),
+            ("info-fpm2", lambda data: struct.pack_into("<I", data, 3 * 512 + 12, 2)),
+            ("duplicate-stream", lambda data: (struct.pack_into("<I", data, 44, 24), struct.pack_into("<IIIIII", data, 3 * 512, 3, 0xFFFFFFFF, 28, 28, 4, 4))),
+        ):
+            invalid = root / f"{name}.pdb"; invalid.write_bytes(msf_pdb(guid, 0x20))
+            data = bytearray(invalid.read_bytes()); mutate(data); invalid.write_bytes(data)
+            try: module.pdb_info(invalid)
+            except ValueError: pass
+            else: raise AssertionError(f"PDB allocation accepted: {name}")
+
+
+def wix_version_cases() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "PowerShell 7+ is required for WiX version cases"
+    source = (ROOT / "tools/package-windows.ps1").read_text()
+    match = re.search(r"(\$wixVersion = @\(& dotnet \$wix --version\)\nif \(\$LASTEXITCODE.*?\{ throw 'WiX 4\.0\.5 cannot run on this runner' \})", source)
+    assert match, "current WiX version check not found"
+    with tempfile.TemporaryDirectory() as temp:
+        runner = Path(temp) / "wix-version.ps1"
+        runner.write_text("param([string]$Case)\n$ErrorActionPreference='Stop'\nfunction dotnet { switch ($Case) { 'good' { '4.0.5+b9b2f1b4' }; 'wrong' { '4.0.6' }; 'empty' { }; 'multiple' { '4.0.5+b9b2f1b4'; 'unexpected' }; 'badexit' { '4.0.5+b9b2f1b4' } }; $global:LASTEXITCODE=if ($Case -eq 'badexit') {1} else {0} }\n$wix='mock.dll'\n" + match.group(1))
+        for case, success in (("good", True), ("wrong", False), ("empty", False), ("multiple", False), ("badexit", False)):
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(runner), case], text=True, capture_output=True)
+            assert (result.returncode == 0) == success, (case, result.stderr)
+
+
+def symbol_module() -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location("symbol_packager_fixture", SYMBOL_PACKAGER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def fixture_inspections(module: types.ModuleType, platform: str, native: dict[str, Path]) -> dict[str, dict]:
+    coverage = {"compile_units": 1, "line_tables": 1, "source_less_compile_units": 0, "no_line_compile_units": 0} if platform == "x86_64-unknown-linux-gnu" else {"slices": ["arm64", "x86_64"], "auxiliary_source_records": 0} if platform.endswith("apple-darwin") else {"dbi_stream": 3, "file_records": 1, "module_c13_records": 0, "environment_records": 0}
+    kind = {"x86_64-unknown-linux-gnu": "elf-dwarf", "x86_64-apple-darwin": "macho-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
+    return {name: {"schema": module.SOURCE_INSPECTION_SCHEMA, "format": kind, "native_inspection_sha256": module.digest(path), "coverage": coverage, "source_paths": [f"/work/crates/{name.removeprefix('focusforge-')}/src/main.rs"]} for name, path in native.items()}
+
+
+def universal_macho() -> bytes:
+    uuids = (bytes.fromhex("00000000000000000000000000000001"), bytes.fromhex("11111111111111111111111111111111"))
+    slices = [struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + identifier for cpu, identifier in zip((0x1000007, 0x100000C), uuids)]
+    data = bytearray(12288)
+    struct.pack_into(">II", data, 0, 0xCAFEBABE, 2)
+    for index, (cpu, payload) in enumerate(zip((0x1000007, 0x100000C), slices)):
+        offset = 4096 * (index + 1)
+        struct.pack_into(">IIIII", data, 8 + index * 20, cpu, 3, offset, len(payload), 12)
+        data[offset:offset + len(payload)] = payload
+    return bytes(data)
+
+
+def write_dsym(path: Path, name: str) -> None:
+    dwarf = path / "Contents/Resources/DWARF" / name
+    dwarf.parent.mkdir(parents=True, exist_ok=True)
+    dwarf.write_bytes(universal_macho())
+    (path / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": name}))
+
+
+def write_macos_symbols(root: Path, target: str) -> Path:
+    module = symbol_module()
+    native: dict[str, Path] = {}
+    symbols: dict[str, list[Path]] = {}
+    os_name, cpu, _ = module.platform_header(target)
+    for name in ("focusforge-cli", "focusforge-gui"):
+        debug = root / "native" / f"{name}.dSYM"
+        write_dsym(debug, name)
+        identifier = module.native_module_id(target, debug, name)
+        symbol = root / "store" / name / identifier / f"{name}.sym"
+        symbol.parent.mkdir(parents=True, exist_ok=True)
+        symbol.write_text(f"MODULE {os_name} {cpu} {identifier} {name}\nFILE 0 crates/{name.removeprefix('focusforge-')}/src/main.rs\nFUNC 1000 10 0 {name.replace('-', '_')}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        native[name], symbols[name] = debug, [symbol]
+    manifest = module.write_inventory(root, target, "0.1.0", native, symbols, fixture_inspections(module, target, native))
+    archive = root / f"FocusForge-0.1.0-{target}-symbols.tar.gz"
+    with tarfile.open(archive, "w:gz") as output:
+        for path in sorted([*(root / "native").rglob("*"), *(root / "store").rglob("*"), manifest]):
+            if path.is_file(): output.add(path, arcname=path.relative_to(root))
+    module.verify_archive(root, archive)
+    (root / "symbols.sha256").write_text(f"{module.digest(archive)}  {archive.name}\n")
+    return archive
+
+
+def write_windows_native(root: Path, name: str, guid: bytes, age: int) -> tuple[Path, Path]:
+    pe = bytearray(0x700); pe[:2] = b"MZ"; struct.pack_into("<I", pe, 0x3C, 0x80); pe[0x80:0x84] = b"PE\0\0"; struct.pack_into("<H", pe, 0x84, 0x8664); struct.pack_into("<H", pe, 0x86, 1); struct.pack_into("<H", pe, 0x94, 240); struct.pack_into("<H", pe, 0x98, 0x20B); struct.pack_into("<I", pe, 0x98 + 108, 16); struct.pack_into("<II", pe, 0x98 + 112 + 48, 0x1000, 28); struct.pack_into("<IIII", pe, 0x188 + 8, 0x200, 0x1000, 0x200, 0x200); struct.pack_into("<II", pe, 0x200 + 12, 2, 32); struct.pack_into("<I", pe, 0x200 + 24, 0x240); pe[0x240:0x244] = b"RSDS"; pe[0x244:0x254] = guid; struct.pack_into("<I", pe, 0x254, age); pe[0x258:0x260] = f"{name}.pdb\0".encode()
+    pdb = msf_pdb(guid, age)
+    exe, debug = root / f"{name}.exe", root / f"{name}.pdb"; exe.write_bytes(pe); debug.write_bytes(pdb)
+    return exe, debug
+
+
+def write_windows_symbols(root: Path, shipping: Path) -> Path:
+    module = symbol_module()
+    native: dict[str, Path] = {}
+    symbols: dict[str, list[Path]] = {}
+    for offset, name in enumerate(("focusforge-cli", "focusforge-gui")):
+        exe, pdb = write_windows_native(shipping, name, bytes(range(offset * 16, offset * 16 + 16)), 0x20 + offset)
+        debug = root / "native" / f"{name}.pdb"; debug.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(pdb, debug)
+        identifier = module.native_module_id("x86_64-pc-windows-msvc", debug, name)
+        symbol = root / "store" / debug.name / identifier / f"{debug.name}.sym"
+        symbol.parent.mkdir(parents=True, exist_ok=True)
+        symbol.write_text(f"MODULE Windows x86_64 {identifier} {debug.name}\nFILE 0 crates/{name.removeprefix('focusforge-')}/src/main.rs\nFUNC 1000 10 0 {name.replace('-', '_')}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
+        native[name], symbols[name] = debug, [symbol]
+        assert module.pe_rsds(exe) == module.pdb_info(debug)
+    manifest = module.write_inventory(root, "x86_64-pc-windows-msvc", "0.1.0", native, symbols, fixture_inspections(module, "x86_64-pc-windows-msvc", native))
+    archive = root / "FocusForge-0.1.0-x86_64-pc-windows-msvc-symbols.tar.gz"
+    with tarfile.open(archive, "w:gz") as output:
+        for path in sorted([*(root / "native").rglob("*"), *(root / "store").rglob("*"), manifest]):
+            if path.is_file(): output.add(path, arcname=path.relative_to(root))
+    module.verify_archive(root, archive)
+    (root / "symbols.sha256").write_text(f"{module.digest(archive)}  {archive.name}\n")
+    return archive
+
+
+def macos_checker_mock() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        directory = Path(temp); mount = directory / "mount"; app = mount / "FocusForge.app/Contents"; binary = app / "MacOS"; resources = app / "Resources"; mock = directory / "mock"; log = directory / "hdiutil.log"
+        binary.mkdir(parents=True); resources.mkdir(); mock.mkdir(); (directory / "tools").mkdir()
+        shutil.copy(ROOT / "Cargo.toml", directory / "Cargo.toml")
+        shutil.copy(ROOT / "LICENSE", directory / "LICENSE"); shutil.copy(ROOT / "NOTICE", directory / "NOTICE")
+        shutil.copytree(ROOT / "assets/build", directory / "assets/build")
+        shutil.copytree(ROOT / "assets/man", directory / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", directory / "assets/completions")
+        shutil.copytree(ROOT / "fixtures/mantis-64", directory / "fixtures/mantis-64")
+        shutil.copy(ROOT / "tools/package-symbols.py", directory / "tools/package-symbols.py")
+        shutil.copy(ROOT / "tools/package-cli-assets.py", directory / "tools/package-cli-assets.py")
+        shutil.copy(ROOT / "tools/symbolicate.py", directory / "tools/symbolicate.py")
+        smoke = directory / "tools/smoke-release.sh"
+        smoke.write_text("#!/bin/sh\n[ -z \"${MOCK_SMOKE_FAIL:-}\" ] || exit 73\n[ -x \"$1\" ] && [ ! -e \"$2\" ] || exit 74\nmkdir -p \"$2\"\n")
+        smoke.chmod(0o755)
+        shutil.copytree(ROOT / "packaging", directory / "packaging")
+        for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, resources / name)
+        shutil.copy(ROOT / "assets/build/focusforge.icns", resources / "focusforge.icns")
+        call(["/usr/bin/python3", str(directory / "tools/package-cli-assets.py"), "stage", str(directory), str(resources)])
+        version_file, info_file = directory / "version", directory / "info.json"
+        version_file.write_text("0.1.0\n")
+        info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
+        for name in ("focusforge-cli", "focusforge-gui"):
+            path = binary / name; path.write_text(f"#!/bin/sh\nif [ -n \"$FF_FORCE_CRASH\" ]; then case {name} in focusforge-cli) [ \"${{1:-}}\" = algorithms ] || exit 64;; focusforge-gui) [ \"$#\" -eq 0 ] || exit 65;; esac; mkdir -p \"$FOCUSFORGE_DATA_DIR/focusforge/crashes\"; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_metadata|complete) printf MDMP > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp\";; esac; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_dump|complete) printf '{{\"binary\":\"{name}\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"0.1.0\",\"timestamp\":\"%s\"}}' \"$$\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json\";; esac; exit 1; elif [ \"$1\" = --version ]; then echo \"focusforge-cli $(cat {version_file})\"; elif [ \"$1\" = info ]; then cat {info_file}; fi\n"); path.chmod(0o755)
+        gui = binary / "focusforge-gui"
+        gui.write_text(gui.read_text() + "if [ \"$1\" = --exit-after ]; then while [ $# -gt 0 ]; do if [ \"$1\" = --screenshot ]; then printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\000\\001\\000\\000\\000\\001' > \"$2\"; exit 0; fi; shift; done; exit 64; fi\n")
+        symbols = directory / "symbols"
+        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
+            write_macos_symbols(symbols / target, target)
+        (app / "Info.plist").write_text("stub")
+        template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
+        stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
+        bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
+        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-x86_64 arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O universal binary with 2 architectures: [x86_64] [arm64]'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
+        for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
+        info_file.write_text(info)
+        checker_copy = directory / "tools/check-package-macos.sh"
+        original = (ROOT / "tools/check-package-macos.sh").read_text()
+        assert original.count("/usr/libexec/PlistBuddy") == 5
+        checker_copy.write_text(original.replace("/usr/libexec/PlistBuddy", str(mock / "PlistBuddy")))
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_STACKWALK": str(stackwalk)}
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_SMOKE_FAIL": "1"})
+        assert result.returncode != 0
+        for missing in ("missing_dump", "missing_metadata", "missing_both"):
+            templates = list((template / "FocusForge.app/Contents/MacOS").iterdir())
+            original_binaries = {path: path.read_text() for path in templates}
+            for path, text in original_binaries.items(): path.write_text(text.replace("${MOCK_CRASH_ARTIFACT:-complete}", missing))
+            result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+            for path, text in original_binaries.items(): path.write_text(text)
+            expected = "dump" if missing == "missing_both" else missing.removeprefix("missing_")
+            assert result.returncode != 0 and f"missing crash artifact: {expected}" in result.stderr and "Traceback" not in result.stderr, (result.stdout, result.stderr)
+        env["MOCK_ARCHES"] = "x86_64"
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        env.pop("MOCK_ARCHES")
+        for wrong in ("org.focusforge.app", ""):
+            result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_BUNDLE_ID": wrong})
+            assert result.returncode != 0 and f"invalid bundle identifier: {wrong}" in result.stderr, (result.stdout, result.stderr)
+        version_file.write_text("0.1.1\n")
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        version_file.write_text("0.1.0\n")
+        template_resources = template / "FocusForge.app/Contents/Resources"
+        (template_resources / "focusforge.icns").unlink()
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        shutil.copy(ROOT / "assets/build/focusforge.icns", template_resources / "focusforge.icns")
+        (template_resources / "LICENSE").unlink()
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        shutil.copy(ROOT / "LICENSE", template_resources / "LICENSE")
+        (symbols / "x86_64-apple-darwin/native/focusforge-cli.dSYM/Contents/Resources/DWARF/focusforge-cli").write_bytes(b"wrong")
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0
+        write_macos_symbols(symbols / "x86_64-apple-darwin", "x86_64-apple-darwin")
+        info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and log.read_text().count("detach") == 13
+
+
+def macos_producer_mock() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp); tools, mock = root / "tools", root / "mock"; tools.mkdir(); mock.mkdir()
+        shutil.copy(ROOT / "Cargo.toml", root / "Cargo.toml")
+        for name in ("LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)
+        shutil.copytree(ROOT / "assets/build", root / "assets/build")
+        shutil.copytree(ROOT / "assets/man", root / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", root / "assets/completions")
+        shutil.copytree(ROOT / "packaging", root / "packaging")
+        shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
+        shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
+        producer_copy = tools / "package-macos.sh"; producer_copy.write_text((ROOT / "tools/package-macos.sh").read_text())
+        macho = root / "macho"; macho.write_bytes(universal_macho())
+        dump_syms = mock / "dump_syms"; dump_syms.write_text("#!/usr/bin/env bash\nset -euo pipefail\nbinary=${!#}; store= arch=\nwhile (($#)); do case $1 in --store|--arch) [[ $1 == --store ]] && store=$2 || arch=$2; shift 2;; *) shift;; esac; done\nname=$(basename \"$binary\")\ncase $arch in x86_64) id=000000000000000000000000000000010;; arm64) id=111111111111111111111111111111110;; *) exit 2;; esac\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Mac %s %s %s\\nFILE 0 crates/%s/src/main.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$arch\" \"$id\" \"$name\" \"${name#focusforge-}\" \"${name//-/_}\" > \"$store/$name/$id/$name.sym\"\n"); dump_syms.chmod(0o755)
+        commands = {
+            "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
+            "lipo": "#!/usr/bin/env bash\nif [[ $1 == -archs ]]; then echo \"${MOCK_ARCHES:-x86_64 arm64}\"; else while (($#)); do if [[ $1 == -output ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done; fi\n",
+            "hdiutil": "#!/usr/bin/env bash\n[[ -z ${MOCK_HDIUTIL_FAIL:-} ]] || exit 77; touch \"${!#}\"\n",
+            "plutil": "#!/usr/bin/env bash\nexit 0\n",
+            "shasum": "#!/usr/bin/env bash\nsha256sum \"${!#}\"\n",
+            "git": "#!/usr/bin/env bash\necho 0123456789abcdef0123456789abcdef01234567\n",
+            "dsymutil": "#!/usr/bin/env bash\nsource=$1; while (($#)); do if [[ $1 == -o ]]; then mkdir -p \"$2/Contents/Resources/DWARF\"; cp \"$MOCK_MACHO\" \"$2/Contents/Resources/DWARF/$(basename \"$source\")\"; printf '<plist version=\"1.0\"><dict/></plist>\\n' > \"$2/Contents/Info.plist\"; exit 0; fi; shift; done\n",
+            "strip": "#!/usr/bin/env bash\nwhile (($#)); do if [[ $1 == -o ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done\n",
+            "dwarfdump": "#!/usr/bin/env bash\ncase \" $* \" in *' --debug-info '*) root=${MOCK_DWARF_ROOT:-/work}; cat <<EOF\n0x00000000: DW_TAG_compile_unit\n              DW_AT_name (\"$root/crates/cli/src/main.rs\")\n              DW_AT_comp_dir (\"$root\")\n              DW_AT_stmt_list (0x00000000)\n.debug_line[0x00000000]\ninclude_directories[1] = \"$root/crates/cli/src\"\nfile_names[1] = {\n  name: \"main.rs\"\n  dir_index: 1\n}\nEOF\n;; *) printf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\";; esac\n",
+            "python3": f"#!/usr/bin/env bash\nif [[ $2 == install ]]; then echo '{dump_syms}'; exit 0; fi\nexec /usr/bin/python3 \"$@\"\n",
+            "mv": "#!/usr/bin/env bash\nif [[ ${MOCK_MV_PROMOTION_FAIL:-} && $1 == *.next && $2 == */macos ]]; then exit 77; fi; exec /bin/mv \"$@\"\n",
+        }
+        for name, body in commands.items():
+            path = mock / name; path.write_text(body); path.chmod(0o755)
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_MACHO": str(macho)}
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 0, result.stderr
+        output = root / "target/distrib/native/macos"
+        artifact = output / "FocusForge-0.1.0-universal.dmg"; receipt = output / "native-receipt.json"
+        assert artifact.exists() and receipt.exists()
+        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
+            call(["/usr/bin/python3", str(tools / "package-symbols.py"), "verify", str(output / "symbols" / target)])
+        original = artifact.read_bytes(), receipt.read_bytes()
+        env["MOCK_DWARF_ROOT"] = "/private checkout.Åsa"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_DWARF_ROOT")
+        env["MOCK_ARCHES"] = "x86_64"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_ARCHES")
+        env["MOCK_HDIUTIL_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_HDIUTIL_FAIL")
+        env["MOCK_MV_PROMOTION_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+
+
+def windows_checker_mock() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "PowerShell is required for the Windows checker mock"
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp) / "space root"; root.mkdir(); tools = root / "tools"; tools.mkdir()
+        checker_copy = tools / "check-package-windows.ps1"; checker_copy.write_text((ROOT / "tools/check-package-windows.ps1").read_text())
+        shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
+        shutil.copy(ROOT / "tools/symbolicate.py", tools / "symbolicate.py")
+        shutil.copytree(ROOT / "packaging", root / "packaging")
+        for name in ("Cargo.toml", "LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)
+        shutil.copytree(ROOT / "assets/build", root / "assets/build")
+        shutil.copytree(ROOT / "assets/man", root / "assets/man")
+        shutil.copytree(ROOT / "assets/completions", root / "assets/completions")
+        shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
+        smoke = tools / "smoke-release.sh"
+        smoke.write_text("#!/bin/sh\n[ -z \"${MOCK_SMOKE_FAIL:-}\" ] || exit 73\n[ -x \"$1\" ] && [ ! -e \"$2\" ] || exit 74\nmkdir -p \"$2\"\n")
+        smoke.chmod(0o755)
+        shutil.copytree(ROOT / "fixtures/mantis-64", root / "fixtures/mantis-64")
+        mock = root / "mock"; mock.mkdir()
+        cygpath = mock / "cygpath"; cygpath.write_text("#!/bin/sh\nshift\nprintf '%s\\n' \"$1\"\n"); cygpath.chmod(0o755)
+        shipping, template = root / "shipping", root / "symbols-template"; shipping.mkdir()
+        write_windows_symbols(template, shipping)
+        stackwalk = root / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
+        bridge = root / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys, uuid\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nidentifier = uuid.UUID(bytes_le=bytes(range(16))).hex.upper() + '20'\nreport = {'modules': [{'filename': 'focusforge-cli.pdb', 'debug_file': 'focusforge-cli.pdb', 'debug_id': identifier, 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli.pdb', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
+        runner = root / "runner.ps1"
+        runner.write_text(r'''param([string]$Script, [string]$Msi)
+$ErrorActionPreference = 'Stop'
+function global:python {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+  $tool = if ($Arguments.Count) { [IO.Path]::GetFileName($Arguments[0]) } else { '' }
+  if ($tool -eq 'package-symbols.py' -and $Arguments.Count -gt 1 -and $Arguments[1] -eq 'install') { Write-Output (Join-Path $PSScriptRoot 'stackwalk'); $global:LASTEXITCODE = 0; return }
+  if ($tool -eq 'package-symbols.py' -and $Arguments.Count -gt 1 -and $Arguments[1] -eq 'verify-windows') {
+    $mapped = @($Arguments[0], $Arguments[1])
+    foreach ($argument in ($Arguments[2..($Arguments.Count - 1)] -join ' ' -split '(?=--identity=)' | Where-Object { $_ })) {
+      if ($argument -notlike '--identity=*') { $mapped += $argument; continue }
+      $name = $argument.Substring(11).Split('=')[0]
+      $mapped += "--identity=$name=$(Join-Path $PSScriptRoot ('shipping/' + $name + '.exe')),$(Join-Path $PSScriptRoot ('symbols/native/' + $name + '.pdb'))"
+    }
+    & /usr/bin/python3 @mapped; $global:LASTEXITCODE = $LASTEXITCODE; return
+  }
+  if ($tool -eq 'symbolicate.py') { & /usr/bin/python3 (Join-Path $PSScriptRoot 'symbolicate-bridge.py') @($Arguments[1..($Arguments.Count - 1)]); $global:LASTEXITCODE = $LASTEXITCODE; return }
+  & /usr/bin/python3 @Arguments; $global:LASTEXITCODE = $LASTEXITCODE
+}
+function global:msiexec.exe {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+  $product = Join-Path $env:ProgramFiles 'FocusForge'
+  $shortcut = Join-Path $env:ProgramData 'Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk'
+  if ($Arguments[0] -eq '/i') {
+    New-Item -ItemType Directory -Force -Path $product, (Split-Path $shortcut) | Out-Null
+    @('#!/usr/bin/env bash', 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"0.1.0\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli 0.1.0; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
+    & chmod +x (Join-Path $product 'focusforge-cli.exe')
+    Copy-Item (Join-Path $product 'focusforge-cli.exe') (Join-Path $product 'focusforge-gui.exe')
+    & chmod +x (Join-Path $product 'focusforge-gui.exe')
+    @('if [[ $1 == --exit-after ]]; then while (($#)); do if [[ $1 == --screenshot ]]; then printf "\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001" > "$2"; exit 0; fi; shift; done; exit 64; fi') | Add-Content (Join-Path $product 'focusforge-gui.exe')
+    Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $product
+    Copy-Item (Join-Path $PSScriptRoot 'NOTICE') $product
+    Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') $product
+    Copy-Item (Join-Path $PSScriptRoot 'assets/build/focusforge.ico') (Join-Path $env:ProgramData 'cache.ico')
+    & /usr/bin/python3 (Join-Path $PSScriptRoot 'tools/package-cli-assets.py') stage $PSScriptRoot $product
+    if ($LASTEXITCODE -ne 0) { throw 'mock CLI asset staging failed' }
+    Set-Content $shortcut shortcut
+  } elseif ($Arguments[0] -eq '/x') { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $product, $shortcut }
+  $global:LASTEXITCODE = 0
+}
+function global:New-Object {
+  param([string]$ComObject)
+  if ($ComObject -eq 'Shell.Application') {
+    $application = [pscustomobject]@{}
+    $application | Add-Member -MemberType ScriptMethod -Name NameSpace -Value {
+      param($Directory)
+      $folder = [pscustomobject]@{}
+      $folder | Add-Member -MemberType ScriptMethod -Name ParseName -Value {
+        param($Name)
+        $item = [pscustomobject]@{ Name = $Name }
+        $item | Add-Member -MemberType ScriptMethod -Name ExtendedProperty -Value {
+          param($Key)
+          if ($Key -ne 'System.AppUserModel.ID' -or $this.Name -ne 'FocusForge.lnk') { return '' }
+          if ($env:MOCK_AUMID -eq 'absent') { return '' }
+          if ($env:MOCK_AUMID) { return $env:MOCK_AUMID }
+          'org.focusforge.FocusForge'
+        }
+        $item
+      }
+      $folder
+    }
+    return $application
+  }
+  if ($ComObject -ne 'WScript.Shell') { throw "unexpected COM object: $ComObject" }
+  $shell = [pscustomobject]@{}
+  $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
+    param($Path)
+    $index = if ($env:MOCK_ICON_INDEX) { $env:MOCK_ICON_INDEX } else { '0' }
+    [pscustomobject]@{ TargetPath = (Join-Path $env:ProgramFiles 'FocusForge/focusforge-gui.exe'); IconLocation = ((Join-Path $env:ProgramData 'cache.ico') + ',' + $index) }
+  }
+  $shell
+}
+if ($env:MOCK_BAD_PDB) { $path = Join-Path $PSScriptRoot 'symbols/native/focusforge-cli.pdb'; $bytes = [IO.File]::ReadAllBytes($path); $bytes[1544] = $bytes[1544] + 1; [IO.File]::WriteAllBytes($path, $bytes) }
+if ($env:MOCK_BAD_ID) { $path = Join-Path $PSScriptRoot 'symbols/symbol-inventory.json'; $inventory = Get-Content $path -Raw | ConvertFrom-Json; $inventory.entries[0].native_id = '0' * 33; $inventory | ConvertTo-Json -Depth 8 | Set-Content $path }
+if ($env:MOCK_MISSING_PAYLOAD) { Remove-Item (Join-Path $PSScriptRoot 'symbols/native/focusforge-cli.pdb') }
+if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot 'symbols') -Filter '*.tar.gz' | Select-Object -First 1) 'wrong' }
+& $Script -Msi $Msi -Symbols (Join-Path $PSScriptRoot 'symbols')
+''')
+        info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
+        invocations = root / "invocations"
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
+        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False)):
+            shutil.rmtree(root / "symbols", ignore_errors=True)
+            shutil.copytree(template, root / "symbols")
+            case_env = env | mutation
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(runner), str(checker_copy), "mock.msi"], text=True, capture_output=True, env=case_env)
+            assert (result.returncode == 0) == success, result.stderr
+            if "MOCK_CRASH_ARTIFACT" in mutation:
+                missing = "dump" if mutation["MOCK_CRASH_ARTIFACT"] == "missing_both" else mutation["MOCK_CRASH_ARTIFACT"].removeprefix("missing_")
+                assert f"crash is missing {missing}" in result.stderr, result.stderr
+            if "MOCK_AUMID" in mutation:
+                assert "invalid Start-menu shortcut AppUserModelID:" in result.stderr, result.stderr
+            assert not (root / "program-files/FocusForge").exists()
+            assert not (root / "program-data/Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk").exists()
+        assert invocations.read_text().splitlines()[:2] == ["focusforge-cli.exe:1:algorithms", "focusforge-gui.exe:0:"]
+
+
+def smoke_callers() -> None:
+    linux = (ROOT / "tools/check-package-linux.sh").read_text()
+    macos = (ROOT / "tools/check-package-macos.sh").read_text()
+    windows = (ROOT / "tools/check-package-windows.ps1").read_text()
+    native = NATIVE_WORKFLOW.read_text()
+    release = (ROOT / ".github/workflows/release.yml").read_text()
+    assert linux.count("tools/smoke-release.sh") == 2
+    assert '"$tree/bin/focusforge-cli"' in linux and '"/usr/bin/focusforge-cli"' in linux
+    assert 'tools/smoke-release.sh" "$app/Contents/MacOS/focusforge-cli"' in macos
+    assert "cygpath -u \"$1\"" in windows and "cygpath -u \"$2\"" in windows and "cygpath -u \"$3\"" in windows
+    assert "if ($LASTEXITCODE -ne 0) { throw 'installed CLI smoke failed' }" in windows
+    assert native.count("- name: Check native package") == 2
+    assert "uses: ./.github/workflows/package-native.yml" in release
+    build = release.index("- name: Build artifacts")
+    post_build = release.index("- id: cargo-dist", build)
+    linux_check = release.index("- name: Check Linux package", build)
+    check_step = release[linux_check:post_build]
+    assert build < linux_check < post_build
+    assert "if: \"runner.os == 'Linux'\"" in check_step
+    assert "tools/check-package-linux.sh .scratch/package-linux" in check_step
+    assert "|| true" not in check_step
+    upload = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+    receipt_specs = (
+        (native, "tools/check-package-macos.sh", "- name: Upload native artifacts", "package-smoke-receipts-macos", (".scratch/check-package-macos.*/smoke",), True),
+        (native, "tools/check-package-windows.ps1", "- name: Upload native artifacts", "package-smoke-receipts-windows", (".scratch/check-package-windows/*/smoke",), True),
+        (release, "tools/check-package-linux.sh .scratch/package-linux", "- id: cargo-dist", "package-smoke-receipts-linux-${{ join(matrix.targets, '_') }}", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
+    )
+    for source, checker, handoff, name, roots, launch in receipt_specs:
+        checked = source.index(checker)
+        step = source.index("- name: Upload package smoke receipts", checked)
+        end = source.index(handoff, step)
+        block = source[step:end]
+        assert checked < step < end and f"name: {name}" in block and upload in block
+        assert "always()" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
+        assert "continue-on-error" not in block and "|| true" not in block
+        suffixes = ("commands.log", "exit-status", "installed-cli.sha256", "source-os", "logs/*.stdout", "logs/*.stderr", "logs/*.exit")
+        paths = {line.strip() for line in block.split("path: |\n", 1)[1].split("          include-hidden-files: true", 1)[0].splitlines() if line.strip()}
+        expected_paths = {f"{root}/{suffix}" for root in roots for suffix in suffixes}
+        if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
+        assert paths == expected_paths
+        assert "artifacts-" not in name
+
+
+if __name__ == "__main__":
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")

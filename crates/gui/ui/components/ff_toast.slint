@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The one in-app notice: a 300 x 84 card over the canvas with a kind stripe,
+// icon, title, an `Open notification` link and a close control. A closed
+// toast is not visible and takes no input.
+
+import { Theme } from "../theme.slint";
+import { FFHeading } from "ff_heading.slint";
+import { FFIconButton } from "ff_icon_button.slint";
+import { FFNotificationGlyph } from "ff_notification_glyph.slint";
+import { FFRowText } from "ff_row_text.slint";
+
+export component FFToast inherits Rectangle {
+    in property <bool> toast-open: false;
+    // "info" | "warning" | "failure" | "crash".
+    in property <string> kind: "info";
+    in property <string> title: "";
+    // Drawn without the pointer or the keyboard being there, as `FFField`'s
+    // own `hovered` and `focused` are.
+    in property <bool> hovered: false;
+    in property <bool> focused: false;
+    out property <bool> has-hover: card.has-hover || close.has-hover;
+    out property <bool> has-focus: key.has-focus;
+    // The pointer or the keyboard is on the toast.
+    out property <bool> held: root.has-hover || root.has-focus;
+    callback dismissed();
+    callback link-activated();
+
+    property <bool> ringed: root.focused || key.has-focus;
+
+    visible: root.toast-open;
+    width: 300px;
+    height: 84px;
+    background: root.hovered || root.has-hover ? Theme.surface-overlay : Theme.surface-raised;
+    accessible-role: button;
+    accessible-label: root.title;
+    accessible-action-default => { root.link-activated(); }
+
+    key := FocusScope {
+        enabled: root.toast-open;
+        focus-on-click: false;
+        KeyBinding {
+            keys: @keys(Return);
+            activated => { root.link-activated(); }
+        }
+    }
+
+    card := TouchArea {
+        clicked => { root.link-activated(); }
+    }
+
+    Rectangle {
+        x: root.ringed ? 1px : 0px;
+        y: root.ringed ? 1px : 0px;
+        width: 3px;
+        height: parent.height - 2 * self.y;
+        background: glyph.tone;
+    }
+
+    glyph := FFNotificationGlyph {
+        x: Theme.space-3;
+        y: Theme.space-3;
+        kind: root.kind;
+    }
+
+    FFHeading {
+        x: 38px;
+        y: Theme.space-2;
+        width: close.x - self.x - Theme.space-2;
+        height: 20px;
+        size: "body";
+        text: root.title;
+        overflow: elide;
+    }
+
+    FFRowText {
+        x: 38px;
+        y: 34px;
+        height: 20px;
+        text: "Open notification";
+        accent: true;
+    }
+
+    close := FFIconButton {
+        x: parent.width - self.width - Theme.space-2;
+        y: Theme.space-1 + 2px;
+        icon: @image-url("../../../../assets/icons/x.svg");
+        pad: Theme.space-1;
+        quiet: true;
+        accessible-label: "Dismiss notification";
+        triggered => { root.dismissed(); }
+    }
+
+    if root.ringed: Rectangle {
+        width: 100%;
+        height: 100%;
+        border-width: 1px;
+        border-color: Theme.accent-default;
+    }
+}

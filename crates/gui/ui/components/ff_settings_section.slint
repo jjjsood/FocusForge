@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A settings section: a flat uppercase heading over a stack of rows.
+
+import { FFSectionHeading } from "ff_section_heading.slint";
+
+export component FFSettingsSection inherits VerticalLayout {
+    in property <string> heading: "";
+    spacing: 0px;
+
+    FFSectionHeading {
+        flat: true;
+        label: root.heading;
+    }
+
+    @children
+}

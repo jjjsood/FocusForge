@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// An uppercase list heading over a 1 px rule: a settings section with its
+// `DEFAULT` badge, or (`compact`) a day boundary in the checkpoint list.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFSectionHeading inherits Rectangle {
+    in property <string> label: "";
+    // "default" | "explicit" | "pending"; a compact heading shows no badge.
+    in property <string> provenance: "default";
+    // A day boundary: `day-separator-height` tall, label on the top edge,
+    // no trailing gap.
+    in property <bool> compact: false;
+    // A copy drawn over scrolled rows needs the opaque dock ground to cover
+    // them; an in-flow day boundary is transparent.
+    in property <bool> opaque: true;
+    // Space kept clear of the label and badge on both sides.
+    in property <length> inset: 0px;
+    // Space kept clear of the badge on the trailing side; the label side
+    // keeps `inset`.
+    in property <length> inset-end: root.inset;
+    // A settings section's heading: the bare label on a transparent ground,
+    // no badge and no rule, `settings-heading-height` tall.
+    in property <bool> flat: false;
+
+    background: root.opaque && !root.flat ? Theme.surface-raised : transparent;
+    // The label/badge band's own height -- every child below positions
+    // against this, never against `height`, which also carries the
+    // trailing gap to the section's first field. One fixed height for
+    // every state: the badge is the only thing that ever changes, and it
+    // never changes this row's own size.
+    property <length> head-height: root.compact ? ShellGeometry.day-separator-height : ShellGeometry.section-heading-height;
+    height: root.flat ? ShellGeometry.settings-heading-height
+        : root.head-height + (root.compact ? 0px : ShellGeometry.section-heading-bottom-gap);
+
+    Text {
+        x: root.inset;
+        // Centered the same way the badge below centers its own text: by the
+        // glyph's own natural height against `head-height`, not by handing a
+        // tall box to `vertical-alignment: center`, which centers the font's
+        // full ascent-plus-descent metric box rather than the glyphs actually
+        // drawn -- the two land at different pixels for all-caps text, since
+        // the descender space that metric reserves is never actually used.
+        y: root.compact || root.flat ? 0px : (root.head-height - self.height) / 2;
+        text: root.label;
+        color: Theme.text-muted;
+        font-size: Theme.text-section.size;
+        font-weight: Theme.text-section.weight;
+        letter-spacing: Theme.text-section.letter-spacing;
+    }
+
+    if !root.compact && !root.flat && root.provenance == "default": badge := Rectangle {
+        x: parent.width - self.width - root.inset-end;
+        y: (root.head-height - self.height) / 2;
+        width: badge-text.width + 2 * Theme.space-2;
+        height: 14px;
+        border-radius: self.height / 2;
+        background: Theme.accent-subtle;
+
+        badge-text := Text {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            text: "DEFAULT";
+            color: Theme.accent-default;
+            font-size: Theme.text-section.size;
+            font-weight: Theme.text-section.weight;
+            letter-spacing: Theme.text-section.letter-spacing;
+        }
+    }
+
+    if !root.flat: Rectangle {
+        x: 0px;
+        y: root.head-height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+}

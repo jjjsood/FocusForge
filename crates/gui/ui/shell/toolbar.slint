@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The stacking-mode toolbar: the run's transport at the left, two dim,
+// inert labels at the right end.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFButton } from "../components/ff_button.slint";
+
+export component FFToolbar inherits Rectangle {
+    // "idle" | "running" | "paused" | "cancelling" | "failed" | "queued".
+    // Any other value renders as "idle".
+    in property <string> run-state: "idle";
+    // Enabled at two or more frames; disabled below that on an unfused and
+    // a fused tab alike.
+    in property <bool> fuse-enabled: true;
+    // Another tab is running and this one holds no place in it -- the next
+    // `Fuse stack` press would enqueue rather than start. Relabels the same
+    // button; the press still enqueues once made.
+    in property <bool> would-queue: false;
+    callback fuse-requested();
+    callback pause-or-resume-requested();
+    callback cancel-requested();
+    callback retry-requested();
+
+    height: ShellGeometry.toolbar-height;
+    background: Theme.surface-raised;
+
+    property <length> button-y: (root.height - ShellGeometry.toolbar-button-height) / 2;
+    property <length> second-button-x: Theme.space-3 + ShellGeometry.toolbar-button-width
+        + ShellGeometry.toolbar-button-gap;
+    property <bool> is-idle: root.run-state != "running" && root.run-state != "paused"
+        && root.run-state != "cancelling" && root.run-state != "failed"
+        && root.run-state != "queued";
+
+    if root.run-state == "running": pause-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        glyph: "⏸";
+        text: "Pause";
+        clicked => { root.pause-or-resume-requested(); }
+    }
+    if root.run-state == "paused": resume-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        glyph: "▶";
+        text: "Resume";
+        clicked => { root.pause-or-resume-requested(); }
+    }
+    // A queued tab has no pause/resume button, so `Cancel` takes the first
+    // slot -- the one button a queued row needs, in the place `Fuse stack`
+    // would otherwise sit.
+    if root.run-state == "running" || root.run-state == "paused" || root.run-state == "queued": cancel-button := FFButton {
+        x: root.run-state == "queued" ? Theme.space-3 : root.second-button-x;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        glyph: "☐";
+        text: "Cancel";
+        clicked => { root.cancel-requested(); }
+    }
+    if root.run-state == "cancelling": cancelling-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        kind: "quiet";
+        glyph: "☐";
+        text: "Cancelling…";
+        enabled: false;
+    }
+    if root.run-state == "failed": retry-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        kind: "primary";
+        glyph: "↻";
+        text: root.would-queue ? "Queued" : "Retry";
+        clicked => { root.retry-requested(); }
+    }
+    if root.is-idle: fuse-button := FFButton {
+        x: Theme.space-3;
+        y: root.button-y;
+        width: ShellGeometry.toolbar-button-width;
+        compact: true;
+        kind: "primary";
+        glyph: "▶";
+        text: root.would-queue ? "Queued" : "Fuse stack";
+        enabled: root.fuse-enabled;
+        clicked => { root.fuse-requested(); }
+    }
+
+    // Right-aligned, muted, and reached by no `TouchArea` -- neither label
+    // does anything yet.
+    right-end := Text {
+        x: parent.width - Theme.space-3 - self.width;
+        y: 0px;
+        height: parent.height;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        text: root.is-idle ? "Save checkpoint" : "Fuse stack · Save checkpoint";
+        color: Theme.text-disabled;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+    }
+
+    // The 1 px rule along the toolbar's bottom edge, over the canvas width
+    // only.
+    bottom-rule := Rectangle {
+        x: 0px;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border-default;
+    }
+}

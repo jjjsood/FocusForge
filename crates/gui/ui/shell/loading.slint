@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A background load's own progress indicator, centred over the canvas.
+
+import { Theme } from "../theme.slint";
+import { FFLoadingPanel } from "../components/ff_loading_panel.slint";
+
+export component FFLoadingIndicator inherits Rectangle {
+    in property <bool> load-active: false;
+    in property <string> caption: "Loading…";
+    // Mirrored so a headless test can read whether the threshold has
+    // let the indicator become visible, with no running window.
+    out property <bool> load-visible: gate.shown;
+
+    // Resets the gate the moment a load ends, so the next one starts its
+    // own delay from scratch rather than showing immediately.
+    changed load-active => {
+        if !root.load-active {
+            gate.shown = false;
+        }
+    }
+
+    // Gates the indicator behind a delay, so a load that finishes inside
+    // the delay never shows it at all.
+    gate := Rectangle {
+        property <bool> shown: false;
+
+        width: 0px;
+        height: 0px;
+
+        threshold-timer := Timer {
+            interval: 500ms;
+            running: root.load-active && !gate.shown;
+            triggered => { gate.shown = true; }
+        }
+    }
+
+    // Centred over the whole canvas region (both panes).
+    panel := FFLoadingPanel {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        caption: root.caption;
+        opacity: (root.load-active && gate.shown) ? 1.0 : 0.0;
+        animate opacity { duration: Theme.motion-slow; easing: ease-in-out; }
+    }
+}

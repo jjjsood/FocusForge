@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import { Theme } from "theme.slint";
+import { ShellGeometry } from "geometry.slint";
+import { FFPane } from "components/ff_pane.slint";
+import { FFWindowBar } from "components/ff_window_bar.slint";
+import { FFBrushCursor } from "components/ff_brush_cursor.slint";
+
+export component ComparisonWindow inherits Window {
+    preferred-width: 820px;
+    preferred-height: 600px;
+    no-frame: true;
+    title: "FocusForge comparison";
+    background: Theme.surface-base;
+    default-font-family: Theme.font-family;
+    forward-focus: pane-focus;
+
+    in property <image> source;
+    in property <string> pane-label: "";
+    in property <string> bar-title: "FocusForge — Frame";
+    in property <[string]> message-lines: [];
+    in property <bool> project-loaded: false;
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <length> crop-x;
+    in property <length> crop-y;
+    in property <length> crop-w;
+    in property <length> crop-h;
+    in property <image> backdrop;
+    in property <length> backdrop-x;
+    in property <length> backdrop-y;
+    in property <length> backdrop-w;
+    in property <length> backdrop-h;
+    in property <bool> pixelated: false;
+    in property <bool> editor-mode: false;
+    in property <length> cursor-extent;
+    in property <string> cursor-ring-commands;
+    in property <string> cursor-core-commands;
+    in property <bool> cursor-picking: false;
+    in property <color> cursor-pick-color;
+    in property <bool> cursor-visible: false;
+    in property <length> cursor-x;
+    in property <length> cursor-y;
+    in property <bool> window-maximized: false;
+
+    callback window-drag-requested();
+    callback window-minimize-requested();
+    callback window-maximize-toggled();
+    callback window-close-requested();
+    callback dock-requested();
+    callback pane-scrolled(length, length, length, length, bool, bool, bool);
+    callback pane-pointer(PointerEventButton, int, length, length, bool, bool, bool);
+    callback pane-dragged(length, length);
+    callback pane-resized();
+    callback pane-hover-changed();
+    callback pane-key-pressed(string, bool, bool, bool);
+    callback pane-key-released(string, bool, bool, bool);
+    callback pane-focus-changed();
+
+    out property <length> pane-x: pane.x;
+    out property <length> pane-y: pane.y;
+    out property <length> pane-width: pane.width;
+    out property <length> pane-height: pane.height;
+    out property <bool> pane-hovered: input.has-hover;
+    out property <bool> crop-clips: pane.crop-clips;
+
+    changed width => { root.pane-resized(); }
+    changed height => { root.pane-resized(); }
+    changed pane-hovered => { root.pane-hover-changed(); }
+
+    pane-focus := FocusScope {
+        x: pane.x;
+        y: pane.y;
+        width: pane.width;
+        height: pane.height;
+        key-pressed(event) => {
+            root.pane-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+            reject
+        }
+        key-released(event) => {
+            root.pane-key-released(event.text, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+            reject
+        }
+        focus-changed-event(reason) => { root.pane-focus-changed(); }
+    }
+
+    input := TouchArea {
+        x: pane.x;
+        y: pane.y;
+        width: pane.width;
+        height: pane.height;
+        mouse-cursor: root.editor-mode && root.cursor-visible ? MouseCursor.none : MouseCursor.default;
+        scroll-event(event) => {
+            root.pane-scrolled(event.delta-x, event.delta-y, self.mouse-x, self.mouse-y,
+                event.modifiers.control, event.modifiers.shift, event.modifiers.alt);
+            accept
+        }
+        pointer-event(event) => {
+            root.pane-pointer(event.button,
+                event.kind == PointerEventKind.down ? 0
+                    : event.kind == PointerEventKind.move ? 2 : 1,
+                self.mouse-x, self.mouse-y, event.modifiers.control, event.modifiers.shift,
+                event.modifiers.alt);
+        }
+        moved => { root.pane-dragged(self.mouse-x, self.mouse-y); }
+    }
+
+    bar := FFWindowBar {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        title: root.bar-title;
+        maximized: root.window-maximized;
+        drag-requested => { root.window-drag-requested(); }
+        minimize-requested => { root.window-minimize-requested(); }
+        maximize-toggled => { root.window-maximize-toggled(); }
+        close-requested => { root.window-close-requested(); }
+    }
+
+    pane := FFPane {
+        x: 1px;
+        y: ShellGeometry.comparison-window-bar-height + 1px;
+        width: parent.width - 2px;
+        height: parent.height - ShellGeometry.comparison-window-bar-height - 2px;
+        source: root.source;
+        label: root.pane-label;
+        message-lines: root.message-lines;
+        project-loaded: root.project-loaded;
+        image-x: root.image-x;
+        image-y: root.image-y;
+        image-w: root.image-w;
+        image-h: root.image-h;
+        crop-x: root.crop-x;
+        crop-y: root.crop-y;
+        crop-w: root.crop-w;
+        crop-h: root.crop-h;
+        backdrop: root.backdrop;
+        backdrop-x: root.backdrop-x;
+        backdrop-y: root.backdrop-y;
+        backdrop-w: root.backdrop-w;
+        backdrop-h: root.backdrop-h;
+        pixelated: root.pixelated;
+        undock-requested => { root.dock-requested(); }
+        dock-back: true;
+    }
+
+    cursor-clip := Rectangle {
+        x: pane.x;
+        y: pane.y;
+        width: pane.width;
+        height: pane.height;
+        clip: true;
+        visible: root.editor-mode && root.cursor-visible;
+        FFBrushCursor {
+            x: root.cursor-x - self.width / 2;
+            y: root.cursor-y - self.height / 2;
+            extent: root.cursor-extent;
+            ring-commands: root.cursor-ring-commands;
+            core-commands: root.cursor-core-commands;
+            picking: root.cursor-picking;
+            pick-color: root.cursor-pick-color;
+        }
+    }
+}

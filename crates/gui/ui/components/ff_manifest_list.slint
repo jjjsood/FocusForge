@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A bordered, fixed-size list of name/value rows that scrolls internally
+// rather than growing with the row count, with an optional muted note row
+// when empty. Scrollbar and wheel forward raw input; the caller owns
+// scroll offset, content height, and telling a thumb-drag from a track-jump.
+
+import { Theme } from "../theme.slint";
+
+export struct FFManifestRow {
+    name: string,
+    value: string,
+    not-redacted: bool,
+}
+
+export component FFManifestList inherits Rectangle {
+    in property <[FFManifestRow]> rows: [];
+    in property <string> note: "";
+    in property <length> content-height: 0px;
+    in property <length> scroll-offset: 0px;
+    // The `int` folds `PointerEventKind` the same way the canvas's own
+    // pointer forwarding does: 0 = Down, 1 = Up or Cancel, 2 = Move.
+    callback pointer(int, length);
+    callback dragged(length);
+    callback viewport-height-changed(length);
+    callback scrolled(length);
+
+    width: 446px;
+    height: 118px;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    clip: true;
+
+    clip-area := Rectangle {
+        x: Theme.space-3;
+        y: Theme.space-3;
+        width: parent.width - 3 * Theme.space-3;
+        height: parent.height - 2 * Theme.space-3;
+        clip: true;
+
+        // `height` above is a fixed formula over the list's own constant
+        // `height` and `Theme.space-3` -- it never changes after this
+        // element is built, so `init` (fired exactly once, unlike
+        // `changed`, which only fires on a value change after construction)
+        // is what reliably seeds the caller's viewport height.
+        init => { root.viewport-height-changed(self.height); }
+
+        wheel-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            scroll-event(event) => {
+                root.scrolled(-event.delta-y);
+                accept
+            }
+        }
+
+        // An explicit height, not the implicit fill-parent a `Rectangle`
+        // child gets by default: content taller than the clip area is the
+        // entire reason a scroll offset exists, so this must be free to
+        // size past `clip-area.height` rather than being squashed to it.
+        content := VerticalLayout {
+            height: root.content-height;
+            y: -root.scroll-offset;
+            spacing: Theme.space-2;
+
+            for row[i] in root.rows: HorizontalLayout {
+                height: 18px;
+                name-text := Text {
+                    text: row.name;
+                    color: Theme.text-secondary;
+                    font-size: Theme.text-body.size;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                value-text := Text {
+                    text: row.value;
+                    color: row.not-redacted ? Theme.status-warning : Theme.text-muted;
+                    font-size: Theme.text-body.size;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    horizontal-stretch: 0;
+                }
+            }
+
+            if root.note != "": Text {
+                text: root.note;
+                color: Theme.text-muted;
+                font-size: Theme.text-body.size;
+                height: 18px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // Spans exactly the content viewport, not some independent inset of
+    // its own: the thumb's own geometry below scales by `parent.height`,
+    // which must therefore be the same viewport height the controller
+    // clamps and converts against, or the two fall out of step.
+    scrollbar := Rectangle {
+        x: parent.width - Theme.space-3 - self.width;
+        y: clip-area.y;
+        width: 4px;
+        height: clip-area.height;
+        // Half the bar's own width, not `radius-full`: a radius this far
+        // past half the thickness renders as a lens on a bar this thin.
+        border-radius: self.width / 2;
+        background: Theme.surface-raised;
+        visible: root.content-height > clip-area.height;
+
+        thumb := Rectangle {
+            width: parent.width;
+            height: root.content-height > 0px
+                ? max(12px, parent.height * parent.height / root.content-height)
+                : parent.height;
+            y: root.content-height > 0px
+                ? max(0px, min(parent.height - self.height,
+                    parent.height * (root.scroll-offset / root.content-height)))
+                : 0px;
+            border-radius: self.width / 2;
+            background: track-area.pressed ? Theme.text-secondary : Theme.text-disabled;
+        }
+
+        // The whole track, not just the thumb, takes the press: the
+        // caller tells a thumb-grab from a track-jump by where it landed.
+        track-area := TouchArea {
+            width: 100%;
+            height: 100%;
+            pointer-event(event) => {
+                root.pointer(event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1), self.mouse-y);
+            }
+            moved => { root.dragged(self.mouse-y); }
+        }
+    }
+}

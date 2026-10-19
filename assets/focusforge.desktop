@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=FocusForge
+GenericName=Focus Stacker
+Comment=Stack and retouch focus bracketed photographs
+Exec=focusforge-gui %F
+TryExec=focusforge-gui
+Icon=focusforge
+Terminal=false
+Categories=Graphics;Photography;2DGraphics;
+MimeType=image/tiff;
+Keywords=focus;stacking;macro;photography;depth;
+StartupNotify=true
+StartupWMClass=focusforge-gui

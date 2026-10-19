@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The About section's content: the build's version, the licence, the licence
+// notice and the source location.
+
+import { ShellGeometry } from "../../geometry.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFSettingsRow } from "../../components/ff_settings_row.slint";
+import { FFRowText } from "../../components/ff_row_text.slint";
+
+export struct AboutState {
+    version: string,
+    source: string,
+}
+
+export component FFAboutTab inherits Rectangle {
+    in property <AboutState> about;
+
+    VerticalLayout {
+        padding-left: ShellGeometry.settings-content-inset-left;
+        padding-right: ShellGeometry.settings-content-inset-right;
+        padding-top: ShellGeometry.settings-content-inset-top;
+        padding-bottom: ShellGeometry.settings-content-inset-bottom;
+        spacing: ShellGeometry.settings-section-gap;
+        alignment: start;
+
+        FFSettingsSection {
+            heading: "FOCUSFORGE";
+
+            FFSettingsRow {
+                label: "Version";
+                FFRowText { text: root.about.version; }
+            }
+            FFSettingsRow {
+                label: "License";
+                FFRowText { text: "GPL-3.0"; }
+            }
+        }
+
+        FFSettingsSection {
+            heading: "NOTICE";
+
+            VerticalLayout {
+                spacing: ShellGeometry.settings-paragraph-gap;
+
+                FFRowText { text: "Copyright © 2026 Johannes Sood"; wrap: word-wrap; }
+                FFRowText {
+                    text: "FocusForge is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3 of the License.";
+                    wrap: word-wrap;
+                }
+                FFRowText {
+                    text: "This program comes with ABSOLUTELY NO WARRANTY. See the LICENSE file for the full license text.";
+                    wrap: word-wrap;
+                }
+                FFSettingsRow {
+                    label: "Source";
+                    divider: false;
+                    FFRowText { text: root.about.source; accent: true; }
+                }
+            }
+        }
+    }
+}

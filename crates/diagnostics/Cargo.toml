@@ -1,0 +1,42 @@
+[package]
+name = "focusforge-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+trace = ["dep:tracing-chrome", "dep:tracing-tracy"]
+
+[dependencies]
+crash-handler = "0.8.0"
+directories = "6"
+focusforge-core = { path = "../core" }
+minidumper = "0.11.0"
+rayon = "1.12"
+sadness-generator = "0.7.0"
+serde_json = "1"
+thiserror = "2.0.20"
+tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
+tracing-chrome = { version = "0.7.2", optional = true }
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.23", features = ["json"] }
+# Without the crate's own defaults: no signal handler in front of this
+# crate's crash hooks, no LAN announcement of a running process, no source
+# or assembly transfer to whoever connects. `only-localhost` keeps the
+# client's listening socket off every other interface.
+tracing-tracy = { version = "0.12.0", default-features = false, features = [
+    "enable",
+    "ondemand",
+    "only-localhost",
+], optional = true }
+# `default-features = false` drops every compression backend and the clock
+# feature, matching the project container's pinned feature set: a bundle is
+# stored, not compressed, and needs no new dependency to be readable.
+zip = { version = "9.0.4", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

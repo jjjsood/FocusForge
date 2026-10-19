@@ -1,0 +1,60 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-align 1  "align 0.1.0" 
+.SH NAME
+focusforge\-cli\-align \- Compute and report the per\-frame transforms for a stack: readable text by default, a `\-\-json` document on request, and an optional per\-frame warped\-TIFF dump for a visual check
+.SH SYNOPSIS
+\fBfocusforge\-cli align\fR [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-strict\fR] [\fB\-\-write\-warped\fR] [\fB\-\-set\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-\-max\-vram\fR] [\fB\-\-no\-progress\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-v \fR]... [\fB\-\-cpu\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+.SH DESCRIPTION
+Compute and report the per\-frame transforms for a stack: readable text by default, a `\-\-json` document on request, and an optional per\-frame warped\-TIFF dump for a visual check
+.SH OPTIONS
+.TP
+\fB\-\-algorithm\fR \fI<ALGO>\fR
+Registered alignment algorithm id. Optional: defaults to the sole registered alignment algorithm
+.TP
+\fB\-\-json\fR
+Emit the JSON report instead of human\-readable text
+.TP
+\fB\-\-strict\fR
+Refuse the run when an alignment fails
+.TP
+\fB\-\-write\-warped\fR \fI<DIR>\fR
+Write one warped TIFF per frame into this directory, at source dimensions, uncropped
+.TP
+\fB\-\-set\fR \fI<KEY=VALUE>\fR
+Set a parameter: `\-\-set key=value`, repeatable. A repeated key is last\-wins
+.TP
+\fB\-\-max\-host\-memory\fR \fI<SIZE>\fR
+A **ceiling only** on the adaptive host\-memory budget the alignment workers are sized from: it can lower the budget the host\-derived estimate resolved to, and can never raise it. Omit it entirely and the budget is derived from the host. Accepts suffixed sizes (`8GiB`, `512MiB`, `4096`)
+.TP
+\fB\-\-max\-vram\fR \fI<SIZE>\fR
+A **ceiling only** on the adaptive device (VRAM) budget, for the alignment\*(Aqs GPU levels and the `\-\-write\-warped` fuse backend: it can lower the budget the startup probe settled on, and can never raise it. Accepts the same suffixed sizes as `\-\-max\-host\-memory`. Only present when the `gpu` feature is compiled in
+.TP
+\fB\-\-no\-progress\fR
+Print no progress at all. `align` has no fuse\-tile units to count: this suppresses only the one stage line `align` otherwise prints
+.TP
+\fB\-\-preset\fR \fI<PATH>\fR
+Read parameter values from a TOML preset. `align` uses only `align\-algo` and the `[align]` table; a non\-empty `[stack]` table or `algo` key is unused here and says so on stderr, so one preset file serves both subcommands
+.TP
+\fB\-\-write\-preset\fR \fI<PATH>\fR
+Write the preset that reproduces this run to this path: `align\-algo` plus the `[align]` values you actually chose
+.TP
+\fB\-\-status\fR \fI<PATH>\fR
+Append one NDJSON status record for this run to this path
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-\-cpu\fR
+Force the CPU path even when a usable GPU adapter is available: the alignment\*(Aqs large levels and the `\-\-write\-warped` fuse backend both stay on the CPU. Only present when the `gpu` feature is compiled in
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIDIR\fR>
+Directory of TIFF frames to align (non\-recursive, descending into `<dir>/frames` when that subdirectory exists)
+.SH VERSION
+v0.1.0

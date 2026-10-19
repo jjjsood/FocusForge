@@ -1,0 +1,46 @@
+[package]
+name = "focusforge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "focusforge-cli"
+path = "src/main.rs"
+
+[features]
+default = ["gpu"]
+gpu = ["dep:focusforge-gpu", "focusforge-gpu/gpu"]
+gpu-tests = ["gpu", "focusforge-gpu/gpu-tests"]
+trace = ["focusforge-diagnostics/trace"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+focusforge-core = { path = "../core" }
+focusforge-diagnostics = { path = "../diagnostics" }
+focusforge-gpu = { path = "../gpu", optional = true }
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = { version = "0.4.4", default-features = false }
+toml = "1"
+tracing = "0.1.44"
+
+[dev-dependencies]
+clap_complete = "=4.6.11"
+clap_mangen = "=0.3.3"
+focusforge-core = { path = "../core", features = ["test-algorithms"] }
+tempfile = "3"
+# An independent TIFF reader for `export_formats.rs`'s 8-bit round trip:
+# `core`'s own segment decoder refuses anything but 16 bits per sample.
+tiff = { version = "0.11.3", default-features = false, features = ["lzw", "deflate"] }
+# An independent JPEG decoder for `export_formats.rs`'s quality/subsampling
+# round trip.
+zune-jpeg = "0.5.15"
+# Reading a written bundle back, with the same pinned feature set the
+# writer uses.
+zip = { version = "9.0.4", default-features = false }

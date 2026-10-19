@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The settings panel's own bottom-of-list control: resets every section at
+// once, enabled only once any section carries an explicit value.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFResetAll inherits Rectangle {
+    in property <bool> enabled: false;
+    callback clicked();
+
+    height: ShellGeometry.reset-all-height;
+    background: Theme.surface-overlay;
+    border-radius: Theme.radius-md;
+
+    area := TouchArea {
+        enabled: root.enabled;
+        accessible-role: button;
+        accessible-label: "Reset All to Default";
+        accessible-enabled: root.enabled;
+        width: 100%;
+        height: 100%;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        spacing: Theme.space-1;
+        Text {
+            text: "\u{27F2}"; // ⟲
+            color: root.enabled ? Theme.accent-default : Theme.text-disabled;
+            font-size: Theme.text-section.size;
+            vertical-alignment: center;
+        }
+        Text {
+            text: "Reset All to Default";
+            color: root.enabled ? Theme.accent-default : Theme.text-disabled;
+            font-size: Theme.text-section.size;
+            font-weight: Theme.text-section.weight;
+            letter-spacing: Theme.text-section.letter-spacing;
+            vertical-alignment: center;
+        }
+    }
+}
