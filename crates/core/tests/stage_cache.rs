@@ -54,7 +54,7 @@ fn sample_fingerprint(n: usize) -> StackFingerprint {
 fn sample_identity(algorithm: &str, policy: FailurePolicy) -> AlignIdentity {
     let mut params = ParamValues::new();
     params.insert("max-iterations".to_string(), ParamValue::Int(50));
-    AlignIdentity::new(algorithm, params, policy)
+    AlignIdentity::new(algorithm, params, policy, Vec::new())
 }
 
 fn sample_alignment(n: usize) -> StackAlignment {
@@ -193,7 +193,7 @@ fn every_parameter_the_align_stage_reads_is_in_its_key() {
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &ctx)
         .expect("resolve must succeed with no explicit overrides");
     let values = params::resolved_values(&resolved);
-    let identity = AlignIdentity::new(algo.id(), values, FailurePolicy::Strict);
+    let identity = AlignIdentity::new(algo.id(), values, FailurePolicy::Strict, Vec::new());
     let fingerprint = sample_fingerprint(2);
     let key = StageKey::align(&fingerprint, &identity);
     let bytes = key.canonical_bytes();
@@ -211,7 +211,10 @@ fn every_parameter_the_align_stage_reads_is_in_its_key() {
 
 #[test]
 fn the_align_key_is_params_plus_the_named_driver_fields() {
-    assert_eq!(DRIVER_POLICY_FIELDS, ["failure_policy", "solver_version"]);
+    assert_eq!(
+        DRIVER_POLICY_FIELDS,
+        ["failure_policy", "solver_version", "gains"]
+    );
 
     let src = include_str!("../src/job/record.rs");
     let start = src
@@ -228,9 +231,9 @@ fn the_align_key_is_params_plus_the_named_driver_fields() {
         .filter(|line| line.trim_start().starts_with("pub "))
         .count();
     assert_eq!(
-        pub_fields, 4,
-        "AlignIdentity must carry exactly 4 `pub` fields (algorithm, params, \
-         failure_policy, solver_version) -- a field added without updating this \
+        pub_fields, 5,
+        "AlignIdentity must carry exactly 5 `pub` fields (algorithm, params, \
+         failure_policy, solver_version, gains) -- a field added without updating this \
          test or DRIVER_POLICY_FIELDS silently widens the cache key:\n{block}"
     );
 }
@@ -243,7 +246,13 @@ fn the_key_bytes_carry_every_identity_field() {
     );
     let json: serde_json::Value =
         serde_json::from_slice(&key.canonical_bytes()).expect("canonical bytes are JSON");
-    for field in ["algorithm", "params", "failure_policy", "solver_version"] {
+    for field in [
+        "algorithm",
+        "params",
+        "failure_policy",
+        "solver_version",
+        "gains",
+    ] {
         assert!(
             json.get(field).is_some(),
             "the canonical key bytes must carry `{field}`: {json}"
@@ -273,6 +282,38 @@ fn the_key_bytes_carry_every_identity_field() {
                 .all(|frame| frame["raw_identity"] == serde_json::Value::Null)
         );
     }
+}
+
+#[test]
+fn changed_gains_change_the_align_digest() {
+    let fingerprint = sample_fingerprint(2);
+    let digest = |gains: Vec<u32>| {
+        let mut identity = sample_identity("ecc", FailurePolicy::Strict);
+        identity.gains = gains;
+        StageKey::align(&fingerprint, &identity).digest()
+    };
+    let unprepared = digest(Vec::new());
+    let unit = digest(vec![65_536, 65_536]);
+    let shifted = digest(vec![65_536, 65_537]);
+    assert_ne!(unprepared, unit, "preparation on or off");
+    assert_ne!(unit, shifted, "one gain moved by one Q16 step");
+    assert_eq!(shifted, digest(vec![65_536, 65_537]), "the same gains hit");
+
+    let scratch = tmp_dir("prepared-gains");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    let mut identity = sample_identity("ecc", FailurePolicy::Strict);
+    identity.gains = vec![65_536, 65_537];
+    let key = StageKey::align(&fingerprint, &identity);
+    cache
+        .put_alignment(&key, &[], &sample_alignment(2))
+        .unwrap();
+    assert!(cache.get_alignment(&key).is_some());
+    identity.gains = vec![65_536, 65_536];
+    assert!(
+        cache
+            .get_alignment(&StageKey::align(&fingerprint, &identity))
+            .is_none()
+    );
 }
 
 #[test]

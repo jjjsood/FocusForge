@@ -19,9 +19,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::canvas::{FrameView, OverlayDraw, PaneSource};
 use crate::checkpoints;
@@ -36,11 +38,15 @@ use crate::input_map::{
     Action, ActionEvent, Button, InputRowView, InputTable, Modifiers, PointerKind, Trigger,
 };
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
+use crate::notifications::{Banner, CrashEvidence, Kind, Notification, Notifications, Source};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
 use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
 use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
+};
+use crate::source_previews::{
+    MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
 };
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 use focusforge_gpu::blend::Blender;
@@ -78,6 +84,7 @@ pub enum DockTab {
 pub enum SettingsSection {
     #[default]
     Performance,
+    Appearance,
     Storage,
     InputMap,
     Diagnostics,
@@ -86,8 +93,9 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Every section, in nav-rail order.
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Performance,
+        SettingsSection::Appearance,
         SettingsSection::Storage,
         SettingsSection::InputMap,
         SettingsSection::Diagnostics,
@@ -98,6 +106,7 @@ impl SettingsSection {
     pub fn slug(self) -> &'static str {
         match self {
             SettingsSection::Performance => "performance",
+            SettingsSection::Appearance => "appearance",
             SettingsSection::Storage => "storage",
             SettingsSection::InputMap => "input-map",
             SettingsSection::Diagnostics => "diagnostics",
@@ -500,11 +509,6 @@ struct DiagnosticsState {
     /// [`AppController::diagnostics_destination_cursor_moved`] whenever the
     /// cursor would otherwise land outside the field's visible width.
     destination_scroll_x: f32,
-    /// The crash notice's own snapshot: the unreported crash ids found at
-    /// start and whether the notice is currently shown for them. Taken once
-    /// by [`AppController::scan_crash_notice`]; nothing re-scans mid-session.
-    crash_notice_ids: Vec<String>,
-    crash_notice_visible: bool,
     /// Bumped by every [`AppController::start_manifest_scan`] call, so a
     /// report from a superseded scan can be told apart from the current one.
     scan_generation: u64,
@@ -750,18 +754,20 @@ struct ExportDialog {
     open_menu: Option<String>,
 }
 
-/// Which position an export modal names -- the three kinds its own
+/// Which position an export modal names -- the four kinds its own
 /// context/what copy tells apart.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExportKind {
     Saved,
     Held,
+    /// A held retouch checkpoint with no unsealed edits after it.
+    HeldRetouch,
     Live,
 }
 
-/// The export modal's own context/what copy for `kind`: a saved or live
-/// row names its algorithm and local time, a held row does not -- it has
-/// neither yet, only its own "just fused" state.
+/// The export modal's own context/what copy for `kind`: a saved, retouch or
+/// live row names its algorithm and local time, a held fuse result does not
+/// -- it has neither yet, only its own "just fused" state.
 fn export_copy_for(
     kind: ExportKind,
     project_file: &str,
@@ -776,6 +782,10 @@ fn export_copy_for(
         ExportKind::Held => (
             format!("{project_file} · unsaved fuse result, held in this tab"),
             "Exporting the unsaved fuse result held in this tab.".to_string(),
+        ),
+        ExportKind::HeldRetouch => (
+            format!("{project_file} · retouch checkpoint on {algorithm} · {timestamp}"),
+            "Exporting the unsaved retouch checkpoint held in this tab.".to_string(),
         ),
         ExportKind::Live => (
             format!("{project_file} · unsaved edits on {algorithm} · {timestamp}"),
@@ -1258,6 +1268,8 @@ pub enum ChromeKey {
     None,
     /// Already performed; nothing left for the bridge to do.
     Consumed,
+    /// An open refusal was closed; the bridge repaints and opens no picker.
+    RefusalDismissed,
     NewProject,
     OpenProject,
     /// Save the active tab's held checkpoints.
@@ -1331,9 +1343,6 @@ struct ShellState {
     /// [`AppController::cancel_mismatch`] -- no tab exists for it while
     /// this is `Some`.
     pending_mismatch: Option<PendingOpen>,
-    /// The info notice: the most recent open's skipped-subfolder line or the
-    /// most recent finished run's notices, if any.
-    notice: Option<String>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
     /// The most recent refusal's own title, `Some` only for a project or
@@ -1395,13 +1404,16 @@ struct ShellState {
     /// Whether the `Images` panel's sort menu is open -- the same
     /// externally-driven convention `tab.menu_open` uses for a settings row.
     images_sort_menu_open: bool,
-    /// A live grip drag, if any: which row it started on and the raw
-    /// row-local `y` the grip reported at press time -- later `y` values
+    /// A live filename/image drag, if any: which row it started on and the raw
+    /// row-local `y` it reported at press time -- later `y` values
     /// minus this one, in whole [`images::ROW_HEIGHT`] steps, is how far
     /// the row has moved.
     drag_row: Option<DragRow>,
     /// Whether the projects overlay is open.
     overlay_open: bool,
+    /// The overlay was opened while a load ran, so that load's arrival
+    /// leaves it open. Cleared whenever the overlay closes.
+    overlay_survives_load: bool,
     /// The tab, by id, whose close waits on the "save first?" answer --
     /// raised by [`AppController::request_close`] only when closing that tab
     /// loses something ([`ProjectTab::loses_on_close`]).
@@ -1601,6 +1613,9 @@ struct DragRow {
     /// The grip's own `mouse_y` as of the most recent `Move` -- `press_y`
     /// until the first one arrives.
     current_y: f32,
+    /// Remains true after the first movement so capture survives an origin
+    /// return until the gesture releases.
+    capture_active: bool,
 }
 
 /// An import's resolved shape, staged for [`AppController::apply_add_frames`]:
@@ -1756,15 +1771,9 @@ pub struct AppController {
     /// Test-only override for the resident display tiles' edge, applied to
     /// every edit session opened afterwards.
     resident_tile_size_for_test: Option<u32>,
-    /// The most recent run or save failure, taken exactly once by
-    /// [`Self::take_settled_failure`] -- what lets the failure toast
-    /// announce the run that actually failed without reopening itself on
-    /// every later poll.
-    settled_failure: Option<job::Notification>,
-    /// Every run and save failure since the window opened, oldest first --
-    /// append-only, so a later failure replacing the toast's own slot, a
-    /// retry or a tab switch never drops what an earlier one recorded.
-    notifications: Vec<job::Notification>,
+    /// Every user-facing event since the window opened, with the toast queue
+    /// and read state.
+    notifications: Notifications,
     /// The last id handed to a [`ProjectTab`] -- incremented before each
     /// use, so ids start at 1 and no two tabs ever share one.
     next_tab_id: u64,
@@ -1772,11 +1781,34 @@ pub struct AppController {
     checkpoint_generation: u64,
     /// The newest generation [`Self::take_checkpoint_flash`] handed out.
     checkpoint_flash_played: u64,
+    /// The run (counted from 1 over this controller's lifetime) held in its
+    /// fuse stage for the given running time.
+    slow_run: Option<(usize, Duration)>,
+    /// Runs started so far, counted after the budget refusal.
+    runs_started: usize,
+    /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
+    /// returns in place of the active run's, until the next run starts.
+    toolbar_preview: Option<JobView>,
+    /// How long every folder or project load waits before it reads anything.
+    open_hold: Duration,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
     /// the loaded value ([`Self::install_performance`]).
     performance: PerformanceSettings,
+    appearance: AppearanceSettings,
+    appearance_save_error: Option<String>,
+    /// Owns the persistent source decoder. It is created with the controller
+    /// and never runs on the window thread.
+    previews: Option<PreviewWorker>,
+    preview_generation: u64,
+    preview_requests: Vec<PreviewRequest>,
+    preview_budget_bytes: u64,
+    preview_cache: HashMap<PreviewRequest, Arc<PreviewPixels>>,
+    preview_cache_bytes: u64,
+    preview_failures: HashMap<PreviewRequest, String>,
+    published_preview_bytes: AtomicU64,
+    peak_published_preview_bytes: AtomicU64,
     /// Cap field text that did not parse, shown until the next edit; the
     /// cap in `performance` stays as it was.
     rejected_caps: RejectedCaps,
@@ -1796,6 +1828,26 @@ pub struct AppController {
     blender: Option<Blender>,
 }
 
+/// Bounded source-preview state for diagnostics and deterministic tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourcePreviewSnapshot {
+    pub configured_cap: u64,
+    pub admission_bytes: u64,
+    pub scheduled: usize,
+    pub active_workers: u64,
+    pub peak_workers: u64,
+    pub cache_entries: usize,
+    pub cache_bytes: u64,
+    pub resident_bytes: u64,
+    pub conversion_bytes: u64,
+    pub native_bytes: u64,
+    pub peak_native_bytes: u64,
+    pub host_remaining: u64,
+    pub outcome_bytes: u64,
+    pub peak_outcome_bytes: u64,
+    pub owned_bytes: u64,
+}
+
 /// The single live worker, if any: the control/observer pair a background
 /// thread was handed, the tab it runs against, and the join handle
 /// [`AppController::settle_job`] polls, plus the tabs waiting their turn. A
@@ -1804,6 +1856,9 @@ pub struct AppController {
 struct JobSlot {
     control: Option<Arc<job::JobControl>>,
     observer: Option<Arc<job::GuiObserver>>,
+    /// The live run's request frames, the list a frame notice's index points
+    /// into.
+    frames: Vec<PathBuf>,
     tab_id: Option<u64>,
     handle: Option<std::thread::JoinHandle<Result<job::FuseOutcome, job::PipelineError>>>,
     /// Tab ids waiting for the live run to settle, in press order. The live
@@ -1838,6 +1893,7 @@ impl AppController {
     pub fn new() -> Self {
         let mut controller = Self::default();
         controller.performance.gpu = false;
+        controller.previews = Some(PreviewWorker::new());
         controller.state.tab_region_width = Self::BASE_TAB_REGION_WIDTH;
         controller
     }
@@ -1968,7 +2024,11 @@ impl AppController {
         if mode != ShellMode::Editor {
             self.discard_live_stroke();
         }
+        if self.state.mode != mode {
+            self.cancel_frame_drag();
+        }
         self.state.mode = mode;
+        self.refresh_source_previews();
         self.emit(ShellEvent::ModeChanged(mode));
         true
     }
@@ -3042,6 +3102,7 @@ impl AppController {
     /// mode.
     pub fn images_list_wheel(&mut self, steps: f32) {
         self.step_source_frame(steps);
+        self.keep_selected_image_visible();
     }
 
     /// The active tab's fused image's shorter side -- `Size`'s ceiling.
@@ -4006,7 +4067,9 @@ impl AppController {
 
         let sink = self.sink.clone();
         let outcome_slot = Arc::clone(&self.state.load.outcome);
+        let hold = self.open_hold;
         Some(std::thread::spawn(move || {
+            std::thread::sleep(hold);
             let mut last_tick: Option<Instant> = None;
             let mut outcome = entry::open(target, |frames_read, frame_total| {
                 let done = frame_total > 0 && frames_read == frame_total;
@@ -4117,24 +4180,6 @@ impl AppController {
         self.state.pending.as_ref().map(|(question, _)| question)
     }
 
-    /// The info notice the window shows, if any: the skipped-subfolder line
-    /// of the most recent open, or the notices of the most recent finished
-    /// run (a clamped equalization frame among them).
-    pub fn notice(&self) -> Option<&str> {
-        self.state.notice.as_deref()
-    }
-
-    /// Clears the info notice. Manual dismiss only -- unlike
-    /// the run-failure toast, this one names something already finished,
-    /// not a live status to time out on its own, so it waits for its own
-    /// `x`. Clearing `self.state.notice` here, not only the Slint-side
-    /// property, is what stops a later, unrelated push from resurrecting
-    /// the old text.
-    pub fn dismiss_notice(&mut self) {
-        self.state.notice = None;
-        self.emit(ShellEvent::ProjectsChanged);
-    }
-
     /// The most recent refusal's already-rendered message, if any.
     pub fn last_refusal(&self) -> Option<&str> {
         self.state.last_refusal.as_deref()
@@ -4149,7 +4194,7 @@ impl AppController {
     }
 
     /// Closes the refusal dialog -- its own "Pick another folder…" button,
-    /// or `Close` for every other refusal.
+    /// or `Close` for every other refusal; `Esc` closes either.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -4263,14 +4308,16 @@ impl AppController {
     /// failure on its own tab; a path that opens successfully clears any
     /// `Not a project` card already held for it.
     fn accept(&mut self, opened: Opened, thumbnails: Vec<Preloaded>) {
-        self.state.notice = notice_line(&opened.skipped);
+        self.publish_skipped(&opened.skipped);
         self.state.last_refusal = None;
         for skipped in &opened.skipped {
             self.record_failure(not_a_project_card(skipped.clone()));
         }
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
-            self.close_projects_overlay();
+            if !self.state.overlay_survives_load {
+                self.close_projects_overlay();
+            }
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
                 self.clear_failure(&project_identity_path(&project));
@@ -4319,6 +4366,7 @@ impl AppController {
         self.settle_tab_scroll();
         self.state.settings_scroll_y = 0.0;
         self.settle_settings_scroll();
+        self.invalidate_source_previews();
         // `ProjectsChanged` alone: its own push already rebuilds the panel
         // for the newly active tab (`push_projects`, `src/bridge.rs`) --
         // a second `SettingsChanged` here would schedule a second, redundant
@@ -4395,10 +4443,13 @@ impl AppController {
     fn set_active_tab(&mut self, active: Option<usize>) {
         if self.state.active != active {
             self.discard_live_stroke();
+            self.cancel_frame_drag();
             self.state.pending_frame_change = None;
         }
         self.state.active = active;
         self.leave_editor_if_unfit();
+        self.keep_selected_image_visible();
+        self.refresh_source_previews();
     }
 
     /// "+": selects the pseudo-tab, leaving every project tab open and the
@@ -4492,6 +4543,7 @@ impl AppController {
     /// Closes tab `index`, re-selecting its neighbour -- "+" when the last
     /// tab closes, and "+" stays selected if it already was.
     fn remove_tab(&mut self, index: usize, now: Instant) {
+        self.cancel_frame_drag();
         self.state.last_close = Some(now);
         let closed = self.state.projects.remove(index);
         if self.state.pending_close == Some(closed.id) {
@@ -4558,6 +4610,10 @@ impl AppController {
                 .push(std::thread::spawn(move || job::compact_quietly(&path)));
         }
         self.leave_editor_if_unfit();
+        if closed_was_active {
+            self.keep_selected_image_visible();
+            self.refresh_source_previews();
+        }
         // A close renumbers every later tab down by one, so an index-shaped
         // owner marker can end up comparing equal to a *different* tab --
         // force a reload rather than trust the comparison.
@@ -4579,6 +4635,21 @@ impl AppController {
     pub fn install_recent(&mut self, entries: Vec<recent::RecentEntry>, config_dir: PathBuf) {
         self.state.recent = entries;
         self.state.config_dir = Some(config_dir);
+    }
+
+    /// Holds the `run`th fuse run started after this call (counted from 1)
+    /// in its fuse stage until it has been running for `floor`. Pause,
+    /// resume and cancel act on it as on any run, and its output is
+    /// unchanged.
+    pub fn set_slow_run(&mut self, run: usize, floor: Duration) {
+        self.slow_run = Some((run, floor));
+        self.runs_started = 0;
+    }
+
+    /// Makes every folder or project load wait `hold` before it reads
+    /// anything, keeping [`Self::load_in_flight`] true meanwhile.
+    pub fn set_open_hold(&mut self, hold: Duration) {
+        self.open_hold = hold;
     }
 
     /// The rail's own `Recent` rows, dates rendered against `now_unix` --
@@ -4669,6 +4740,9 @@ impl AppController {
     /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
+        self.state.overlay_survives_load = self.state.overlay_open && self.load_in_flight();
+        self.notifications
+            .set_projects_open(self.state.overlay_open);
         self.set_gallery_scroll(self.state.gallery_scroll_y);
         self.emit(ShellEvent::OverlayChanged);
     }
@@ -4677,6 +4751,8 @@ impl AppController {
     pub fn close_projects_overlay(&mut self) {
         if self.state.overlay_open {
             self.state.overlay_open = false;
+            self.state.overlay_survives_load = false;
+            self.notifications.set_projects_open(false);
             self.emit(ShellEvent::OverlayChanged);
         }
     }
@@ -4686,13 +4762,18 @@ impl AppController {
     /// none of the five can be shadowed by a user's rebind. The four
     /// Ctrl-chords apply anywhere in the window, whether or not the overlay
     /// is open; none of them acts while [`Self::modal_open`] holds. `Esc`
-    /// only closes an open overlay. Every other key press reads
+    /// closes an open refusal first (it paints above the overlay), else an
+    /// open overlay. Every other key press reads
     /// [`ChromeKey::None`] and falls through unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
         };
         if key == '\u{1b}' {
+            if self.state.refusal_open {
+                self.dismiss_refusal();
+                return ChromeKey::RefusalDismissed;
+            }
             if self.state.overlay_open {
                 self.close_projects_overlay();
                 return ChromeKey::Consumed;
@@ -5019,6 +5100,7 @@ impl AppController {
                         if matches!(&self.state.sources_notice, Some(n) if n.tab_id == id) {
                             self.state.sources_notice = None;
                         }
+                        self.invalidate_source_previews();
                         self.emit(ShellEvent::OverlayChanged);
                     }
                     if matches!(&self.state.export_dialog, Some(d) if d.tab_id == id && matches!(d.stage, ExportStage::Refused { .. }))
@@ -5355,6 +5437,26 @@ impl AppController {
         self.set_param_value(section, id, value);
     }
 
+    /// One Left (`direction < 0`) or Right (`> 0`) key press on a slider:
+    /// stores the value one step on, clamped. A no-op when no tab is
+    /// active, the descriptor cannot be found or its slider ignores keys.
+    pub fn step_param(&mut self, section: &str, id: &str, direction: i32) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let Some(desc) = settings_panel::find_desc(section, &tab.fuse_id, &tab.align_id, id) else {
+            return;
+        };
+        let current = tab_values_mut(tab, section)
+            .and_then(|values| values.get(id))
+            .unwrap_or(&desc.default)
+            .as_f64()
+            .unwrap_or_default();
+        if let Some(value) = settings_panel::stepped_value(current, direction, &desc.kind) {
+            self.set_param_value(section, id, value);
+        }
+    }
+
     /// Scrolls the settings panel by `delta_px`, clamped to its current
     /// content/viewport. Pushes only when it moved.
     pub fn scroll_settings_panel(&mut self, delta_px: f32) {
@@ -5466,10 +5568,307 @@ impl AppController {
         )
     }
 
+    /// Queues only the active virtual window. The worker owns all source I/O
+    /// and admission; this controller path only replaces immutable identities.
+    pub fn refresh_source_previews(&mut self) {
+        if self.any_job_running() {
+            self.preview_requests.clear();
+            self.preview_budget_bytes = 0;
+            if let Some(worker) = &self.previews {
+                worker.set_visible(Vec::new(), job::HostBudget::explicit(0));
+            }
+            return;
+        }
+        let requests = if self.mode() == ShellMode::Editor
+            || self.source_presentation() == SourcePresentation::List
+        {
+            Vec::new()
+        } else if let Some(tab) = self.state.active() {
+            let height = self.image_row_height();
+            if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+                Vec::new()
+            } else {
+                let scroll_y = self.images_scroll_y();
+                let first = (scroll_y / height).floor().max(0.0) as usize;
+                let visible_end = ((scroll_y + self.state.images_viewport_height) / height)
+                    .ceil()
+                    .max(1.0) as usize;
+                let start = first.saturating_sub(2);
+                let end = visible_end.saturating_add(2).min(tab.frames.len());
+                tab.frames[start..end]
+                    .iter()
+                    .filter(|path| tab.meta.get(*path).is_some_and(|meta| !meta.unresolved))
+                    .map(|path| PreviewRequest {
+                        tab_id: tab.id,
+                        generation: self.preview_generation,
+                        path: path.clone(),
+                    })
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        self.preview_cache
+            .retain(|request, _| requests.contains(request));
+        self.preview_failures
+            .retain(|request, _| requests.contains(request));
+        self.preview_cache_bytes = self
+            .preview_cache
+            .values()
+            .map(|pixels| pixels.rgba.len() as u64 * 2)
+            .sum();
+        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
+        let remaining = host_budget
+            .bytes()
+            .saturating_sub(self.preview_cache_bytes)
+            .saturating_sub(self.published_preview_bytes.load(Ordering::Acquire));
+        let budget = job::HostBudget::explicit(remaining);
+        let pending: Vec<_> = if remaining == 0 {
+            Vec::new()
+        } else {
+            requests
+                .iter()
+                .filter(|request| {
+                    !self.preview_cache.contains_key(*request)
+                        && !self.preview_failures.contains_key(*request)
+                })
+                .cloned()
+                .collect()
+        };
+        if pending == self.preview_requests && remaining == self.preview_budget_bytes {
+            return;
+        }
+        self.preview_requests = pending;
+        self.preview_budget_bytes = remaining;
+        if let Some(worker) = &self.previews {
+            worker.set_visible(self.preview_requests.clone(), budget);
+        }
+    }
+
+    /// Publishes settled worker outcomes only when their immutable identity
+    /// still belongs to the active virtual window.
+    pub fn poll_source_previews(&mut self) -> bool {
+        let outcomes = self
+            .previews
+            .as_ref()
+            .map(PreviewWorker::drain)
+            .unwrap_or_default();
+        let mut changed = false;
+        for outcome in outcomes {
+            if !self.preview_requests.contains(&outcome.request) {
+                continue;
+            }
+            match outcome.result {
+                Ok(pixels) => {
+                    let bytes = pixels.rgba.len() as u64 * 2;
+                    if bytes > MAX_CACHE_BYTES {
+                        self.preview_failures
+                            .insert(outcome.request, "preview exceeds cache limit".to_string());
+                    } else {
+                        let native = self.published_preview_bytes.load(Ordering::Acquire);
+                        while self
+                            .preview_cache_bytes
+                            .saturating_add(native)
+                            .saturating_add(bytes)
+                            > MAX_CACHE_BYTES
+                        {
+                            let Some(key) = self.preview_cache.keys().next().cloned() else {
+                                break;
+                            };
+                            if let Some(removed) = self.preview_cache.remove(&key) {
+                                self.preview_cache_bytes = self
+                                    .preview_cache_bytes
+                                    .saturating_sub(removed.rgba.len() as u64 * 2);
+                            }
+                        }
+                        if self
+                            .preview_cache_bytes
+                            .saturating_add(native)
+                            .saturating_add(bytes)
+                            > MAX_CACHE_BYTES
+                        {
+                            self.preview_failures
+                                .insert(outcome.request, "preview exceeds cache limit".to_string());
+                        } else {
+                            self.preview_cache_bytes =
+                                self.preview_cache_bytes.saturating_add(bytes);
+                            self.preview_cache.insert(outcome.request, pixels);
+                        }
+                    }
+                    changed = true;
+                }
+                Err(PreviewError::Cancelled) => {}
+                Err(error) => {
+                    self.preview_failures
+                        .insert(outcome.request, error.to_string());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.refresh_source_previews();
+        }
+        changed
+    }
+
+    pub fn source_preview(&self, path: &Path) -> Option<&Arc<PreviewPixels>> {
+        let tab_id = self.state.active()?.id;
+        self.preview_cache.get(&PreviewRequest {
+            tab_id,
+            generation: self.preview_generation,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Whether this model row intersects the current source-list viewport.
+    /// Prefetched pixels remain Rust-side only until their row becomes visible.
+    pub fn source_preview_row_visible(&self, index: usize) -> bool {
+        let height = self.image_row_height();
+        if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+            return false;
+        }
+        let first = (self.state.images_scroll_y / height).floor().max(0.0) as usize;
+        let end = ((self.state.images_scroll_y + self.state.images_viewport_height) / height)
+            .ceil()
+            .max(1.0) as usize;
+        index >= first && index < end
+    }
+
+    pub fn source_preview_state(&self, path: &Path, unresolved: bool) -> &'static str {
+        if unresolved {
+            return "missing";
+        }
+        if self.source_preview(path).is_some() {
+            return "ready";
+        }
+        let active = self.state.active().map(|tab| tab.id);
+        if self.preview_failures.keys().any(|request| {
+            Some(request.tab_id) == active
+                && request.generation == self.preview_generation
+                && request.path == path
+        }) {
+            return "unavailable";
+        }
+        "loading"
+    }
+
+    pub fn source_preview_snapshot(&self) -> SourcePreviewSnapshot {
+        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
+        let metrics = self
+            .previews
+            .as_ref()
+            .map(PreviewWorker::metrics)
+            .unwrap_or(crate::source_previews::PreviewMetrics {
+                active_workers: 0,
+                peak_workers: 0,
+                outcome_bytes: 0,
+                peak_outcome_bytes: 0,
+            });
+        let snapshot = SourcePreviewSnapshot {
+            configured_cap: host_budget.bytes(),
+            admission_bytes: self.preview_budget_bytes,
+            scheduled: self.preview_requests.len(),
+            active_workers: metrics.active_workers,
+            peak_workers: metrics.peak_workers,
+            cache_entries: self.preview_cache.len(),
+            cache_bytes: self.preview_cache_bytes,
+            resident_bytes: self.preview_cache_bytes / 2,
+            conversion_bytes: self.preview_cache_bytes / 2,
+            native_bytes: self.published_preview_bytes.load(Ordering::Acquire),
+            peak_native_bytes: self.peak_published_preview_bytes.load(Ordering::Acquire),
+            host_remaining: host_budget
+                .bytes()
+                .saturating_sub(self.preview_cache_bytes)
+                .saturating_sub(self.published_preview_bytes.load(Ordering::Acquire)),
+            outcome_bytes: metrics.outcome_bytes,
+            peak_outcome_bytes: metrics.peak_outcome_bytes,
+            owned_bytes: self
+                .preview_cache_bytes
+                .saturating_add(self.published_preview_bytes.load(Ordering::Acquire))
+                .saturating_add(metrics.outcome_bytes),
+        };
+        tracing::debug!(
+            configured_cap = snapshot.configured_cap,
+            admission_bytes = snapshot.admission_bytes,
+            scheduled = snapshot.scheduled,
+            active_workers = snapshot.active_workers,
+            peak_workers = snapshot.peak_workers,
+            cache_entries = snapshot.cache_entries,
+            cache_bytes = snapshot.cache_bytes,
+            resident_bytes = snapshot.resident_bytes,
+            conversion_bytes = snapshot.conversion_bytes,
+            native_bytes = snapshot.native_bytes,
+            peak_native_bytes = snapshot.peak_native_bytes,
+            host_remaining = snapshot.host_remaining,
+            outcome_bytes = snapshot.outcome_bytes,
+            peak_outcome_bytes = snapshot.peak_outcome_bytes,
+            owned_bytes = snapshot.owned_bytes,
+            "source preview resources"
+        );
+        snapshot
+    }
+
+    /// Replaces the Slint-owned preview allocation after a whole model push.
+    /// The value stays charged until the next model replacement or retirement.
+    pub fn set_published_preview_bytes(&self, bytes: u64) {
+        self.published_preview_bytes.store(bytes, Ordering::Release);
+        self.peak_published_preview_bytes
+            .fetch_max(bytes, Ordering::AcqRel);
+    }
+
+    fn invalidate_source_previews(&mut self) {
+        self.cancel_frame_drag();
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.preview_cache.clear();
+        self.preview_cache_bytes = 0;
+        self.preview_failures.clear();
+        self.keep_selected_image_visible();
+        self.refresh_source_previews();
+    }
+
     fn images_content_height(&self) -> f32 {
         self.state
             .active()
-            .map_or(0.0, |tab| tab.frames.len() as f32 * images::ROW_HEIGHT)
+            .map_or(0.0, |tab| tab.frames.len() as f32 * self.image_row_height())
+    }
+
+    fn keep_selected_image_visible(&mut self) {
+        let Some(selected) = self.state.active().map(|tab| tab.selected) else {
+            return;
+        };
+        self.keep_image_visible(selected);
+    }
+
+    /// Scrolls a valid source row into the source-list viewport without
+    /// changing which source is selected.
+    fn keep_image_visible(&mut self, index: usize) {
+        let Some(frame_count) = self.state.active().map(|tab| tab.frames.len()) else {
+            return;
+        };
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 || index >= frame_count {
+            return;
+        }
+        let row_height = self.image_row_height();
+        let top = index as f32 * row_height;
+        let bottom = top + row_height;
+        let current = self.state.images_scroll_y;
+        let target = if top < current {
+            top
+        } else if bottom > current + viewport {
+            bottom - viewport
+        } else {
+            current
+        };
+        self.set_images_scroll(target);
+    }
+
+    fn image_row_height(&self) -> f32 {
+        match self.source_presentation() {
+            SourcePresentation::List => images::ROW_HEIGHT,
+            SourcePresentation::ImageList => 120.0,
+            SourcePresentation::Large => 200.0,
+        }
     }
 
     /// The active tab's checkpoint count, `0` with none active -- what every
@@ -5509,6 +5908,40 @@ impl AppController {
         }
         tab.selected = index;
         self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Selects the next resolved source in `direction`, retaining the current
+    /// source when the selection is already at that edge.
+    pub fn select_adjacent_resolved_frame(&mut self, direction: i32) {
+        let step = direction.signum() as isize;
+        let next = {
+            let Some(tab) = self.state.active() else {
+                return;
+            };
+            if step == 0 {
+                None
+            } else {
+                let mut index = tab.selected as isize;
+                loop {
+                    index += step;
+                    if index < 0 || index >= tab.frames.len() as isize {
+                        break None;
+                    }
+                    let index = index as usize;
+                    if tab
+                        .meta
+                        .get(&tab.frames[index])
+                        .is_some_and(|meta| !meta.unresolved)
+                    {
+                        break Some(index);
+                    }
+                }
+            }
+        };
+        if let Some(next) = next {
+            self.select_frame(next);
+        }
+        self.keep_selected_image_visible();
     }
 
     /// The selected frame's path -- `None` with no tab active or an empty
@@ -5551,6 +5984,21 @@ impl AppController {
     /// [`Self::settle_import`] applies the scan. An [`ImportRefused`] leaves
     /// the tab untouched.
     pub fn add_frames(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
+        let result = self.try_add_frames(paths);
+        if let Err(refused) = &result {
+            let message = refused.to_string();
+            let mut record =
+                Notification::new(Kind::Failure, Source::Import, message.clone(), message);
+            self.fill_active_project(&mut record);
+            self.publish_notification(record);
+        }
+        result
+    }
+
+    fn try_add_frames(
         &mut self,
         paths: &[PathBuf],
     ) -> Result<Option<std::thread::JoinHandle<()>>, ImportRefused> {
@@ -5671,6 +6119,7 @@ impl AppController {
             .extend(std::iter::repeat_n(false, plan.add.len()));
         tab.frame_sort = None;
         tab.read_missing_meta();
+        self.invalidate_source_previews();
     }
 
     /// Removes the frame at `index` -- immediately, before the first
@@ -5711,6 +6160,7 @@ impl AppController {
         } else {
             tab.selected.min(tab.frames.len().saturating_sub(1))
         };
+        self.invalidate_source_previews();
     }
 
     /// Drags the frame at `from` to `to` -- the manual order, which clears
@@ -5742,6 +6192,8 @@ impl AppController {
         let order = images::move_order(tab.frames.len(), from, to);
         tab.reorder(&order);
         tab.frame_sort = None;
+        self.refresh_source_previews();
+        self.keep_image_visible(to);
     }
 
     /// Sorts the active tab's frame list by `sort` -- one code path for "the
@@ -5783,6 +6235,12 @@ impl AppController {
         self.state.drag_row.map(|drag| drag.from)
     }
 
+    /// A moved drag keeps its panel-wide capture through a zero offset. A
+    /// stationary source press remains uncaptured for ordinary row actions.
+    pub fn drag_capture_active(&self) -> bool {
+        self.state.drag_row.is_some_and(|drag| drag.capture_active)
+    }
+
     /// The live pixel offset a drag has moved by since the press, clamped so
     /// the dragged row's floating copy never leaves the list's own content
     /// band. `0.0` with no drag in progress.
@@ -5793,9 +6251,10 @@ impl AppController {
         let Some(tab) = self.state.active() else {
             return 0.0;
         };
-        let top = drag.from as f32 * images::ROW_HEIGHT;
-        let content_height = tab.frames.len() as f32 * images::ROW_HEIGHT;
-        let max = (content_height - images::ROW_HEIGHT - top).max(0.0);
+        let row_height = self.image_row_height();
+        let top = drag.from as f32 * row_height;
+        let content_height = tab.frames.len() as f32 * row_height;
+        let max = (content_height - row_height - top).max(0.0);
         (drag.current_y - drag.press_y).clamp(-top, max)
     }
 
@@ -5808,7 +6267,7 @@ impl AppController {
         Some(self.drag_target(&drag, drag.current_y))
     }
 
-    /// The grip's raw pointer stream for the row at `index`: `Down` starts a
+    /// The filename/image raw pointer stream for the row at `index`: `Down` starts a
     /// drag there; `Up` commits it, moving the row by however many whole
     /// [`images::ROW_HEIGHT`] steps `mouse_y` has travelled from the press;
     /// `Move` updates [`Self::drag_offset`], the floating copy's live
@@ -5834,6 +6293,7 @@ impl AppController {
                     from: index,
                     press_y: mouse_y,
                     current_y: mouse_y,
+                    capture_active: false,
                 });
                 self.emit(ShellEvent::ImagesChanged);
             }
@@ -5842,6 +6302,7 @@ impl AppController {
                     return;
                 };
                 drag.current_y = mouse_y;
+                drag.capture_active |= mouse_y != drag.press_y;
                 self.emit(ShellEvent::ImagesChanged);
             }
             PointerKind::Up => {
@@ -5858,12 +6319,54 @@ impl AppController {
         }
     }
 
+    /// Advances a moved source drag while its physical pointer remains in the
+    /// viewport's top or bottom row band. The bridge's existing preview timer
+    /// calls this every 30 ms; a stationary press never reaches this path.
+    pub fn advance_frame_drag_autoscroll(&mut self) -> bool {
+        if self.mode() != ShellMode::Stacking || self.job_running() {
+            return false;
+        }
+        let Some(drag) = self.state.drag_row else {
+            return false;
+        };
+        if !drag.capture_active {
+            return false;
+        }
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 {
+            return false;
+        }
+        let row_height = self.image_row_height();
+        let edge = (row_height / 2.0).min(viewport / 2.0);
+        let physical_y = drag.current_y - self.state.images_scroll_y;
+        let direction = if physical_y <= edge {
+            -1.0
+        } else if physical_y >= viewport - edge {
+            1.0
+        } else {
+            return false;
+        };
+        let before = self.state.images_scroll_y;
+        if !self.images_viewport_scrolled(before + direction * row_height / 4.0) {
+            return false;
+        }
+        let moved = self.state.images_scroll_y - before;
+        if let Some(drag) = self.state.drag_row.as_mut() {
+            drag.current_y += moved;
+        }
+        true
+    }
+
+    fn cancel_frame_drag(&mut self) {
+        self.state.drag_row = None;
+    }
+
     fn drag_target(&self, drag: &DragRow, mouse_y: f32) -> usize {
         let Some(tab) = self.state.active() else {
             return drag.from;
         };
         let last = tab.frames.len().saturating_sub(1);
-        let steps = ((mouse_y - drag.press_y) / images::ROW_HEIGHT).round() as isize;
+        let steps = ((mouse_y - drag.press_y) / self.image_row_height()).round() as isize;
         (drag.from as isize + steps).clamp(0, last as isize) as usize
     }
 
@@ -5874,6 +6377,7 @@ impl AppController {
         let order = images::sort_order(&tab.frames, sort, &tab.meta);
         tab.reorder(&order);
         tab.frame_sort = Some(sort);
+        self.refresh_source_previews();
     }
 
     /// The sort menu's own selection -- `None` while the order came from a
@@ -6394,6 +6898,9 @@ impl AppController {
         );
         let moved = offset != self.state.images_scroll_y;
         self.state.images_scroll_y = offset;
+        if moved {
+            self.refresh_source_previews();
+        }
         moved
     }
 
@@ -6448,6 +6955,7 @@ impl AppController {
     pub fn set_images_viewport_height(&mut self, height: f32) {
         self.state.images_viewport_height = height.max(0.0);
         self.images_viewport_scrolled(self.state.images_scroll_y);
+        self.refresh_source_previews();
         self.emit(ShellEvent::ImagesScrolled);
     }
 
@@ -6643,7 +7151,7 @@ impl AppController {
             align_values: tab.align_values.clone(),
             align_lax: true,
             crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
-            equalize: settings_panel::equalization_bound(&tab.fuse_id, &tab.project_values),
+            equalize: settings_panel::equalization_settings(&tab.fuse_id, &tab.project_values),
             gpu: self.performance.gpu,
             max_host_memory: self.performance.max_host_memory_bytes(),
             max_vram: self.performance.max_vram_bytes(),
@@ -6667,6 +7175,7 @@ impl AppController {
                 self.performance.max_host_memory = cap;
                 self.rejected_caps.host_memory = None;
                 self.save_performance();
+                self.refresh_source_previews();
             }
             Err(_) => self.rejected_caps.host_memory = Some(text.to_string()),
         }
@@ -6705,6 +7214,40 @@ impl AppController {
     /// Installs the settings loaded at startup.
     pub fn install_performance(&mut self, settings: PerformanceSettings) {
         self.performance = settings;
+    }
+
+    pub fn install_appearance(&mut self, settings: AppearanceSettings) {
+        self.appearance = settings;
+        self.appearance_save_error = None;
+    }
+
+    pub fn source_presentation(&self) -> SourcePresentation {
+        if self.mode() == ShellMode::Editor {
+            SourcePresentation::List
+        } else {
+            self.appearance.presentation
+        }
+    }
+
+    pub fn appearance_save_error(&self) -> Option<&str> {
+        self.appearance_save_error.as_deref()
+    }
+
+    pub fn set_source_presentation(&mut self, presentation: SourcePresentation) {
+        self.appearance.presentation = presentation;
+        // A row's pixel geometry changes with its presentation.  A drag is
+        // only meaningful in the geometry in which it began.
+        self.cancel_frame_drag();
+        self.set_images_scroll(self.state.images_scroll_y);
+        self.keep_selected_image_visible();
+        self.appearance_save_error = self
+            .state
+            .config_dir
+            .as_deref()
+            .and_then(|dir| appearance_settings::save(dir, self.appearance).err())
+            .map(|error| error.to_string());
+        self.refresh_source_previews();
+        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// Saves `performance` when a config directory is installed; a failed
@@ -6849,6 +7392,7 @@ impl AppController {
             return Some(false);
         }
         self.job.queue.push_back(id);
+        self.cancel_frame_drag();
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
         self.leave_editor_if_unfit();
@@ -7009,10 +7553,29 @@ impl AppController {
                 return false;
             }
         };
+        let retained_preview_bytes = self
+            .preview_cache_bytes
+            .saturating_add(self.published_preview_bytes.load(Ordering::Acquire));
+        let processing_budget = job::host_budget()
+            .capped_to(request.max_host_memory)
+            .bytes()
+            .saturating_sub(retained_preview_bytes);
+        if processing_budget == 0 {
+            self.refuse_message("Source previews use the available host memory. Close or change the source view before starting processing.".to_string());
+            return false;
+        }
+        self.cancel_frame_drag();
         let control = job::JobControl::new();
+        self.runs_started += 1;
+        if let Some((run, floor)) = self.slow_run
+            && run == self.runs_started
+        {
+            control.set_min_running(floor);
+        }
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
+        self.job.frames = request.frames.clone();
         self.job.tab_id = self.state.projects.get(tab_index).map(|tab| tab.id);
         if let Some(tab) = self.state.projects.get_mut(tab_index) {
             // The new run holds into the same directory the parked one uses.
@@ -7020,7 +7583,21 @@ impl AppController {
                 remove_held(std::slice::from_ref(&parked.held));
             }
         }
-        self.job.handle = Some(job::spawn(request.clone(), algorithms, control, observer));
+        let mut worker_request = request.clone();
+        worker_request.max_host_memory = Some(processing_budget);
+        self.toolbar_preview = None;
+        let preview_barrier = self.previews.as_ref().map(PreviewWorker::quiesce);
+        self.job.handle = Some(job::spawn_after(
+            worker_request,
+            algorithms,
+            control,
+            observer,
+            move || {
+                if let Some(barrier) = preview_barrier {
+                    barrier.wait();
+                }
+            },
+        ));
         if let Some(tab) = self.state.projects.get_mut(tab_index) {
             tab.run = job::RunState::Running;
             tab.request = Some(request);
@@ -7039,24 +7616,169 @@ impl AppController {
         }
     }
 
-    /// The most recent run or save failure, taken exactly once -- `None`
-    /// once already read, or with no failure to announce. What the failure
-    /// toast names, so it fires only for the run that actually failed and
-    /// never re-opens on a later poll.
-    pub fn take_settled_failure(&mut self) -> Option<job::Notification> {
-        self.settled_failure.take()
+    /// Every retained notification since the window opened, oldest first,
+    /// kept after its toast has closed.
+    pub fn notifications(&self) -> &[Notification] {
+        self.notifications.records()
     }
 
-    /// Every run and save failure since the window opened, oldest first,
-    /// kept after its toast has been dismissed.
-    pub fn notifications(&self) -> &[job::Notification] {
-        &self.notifications
+    /// How many retained notifications are unread.
+    pub fn unread_notifications(&self) -> usize {
+        self.notifications.unread()
+    }
+
+    /// The toast on screen, if any.
+    pub fn visible_toast(&self) -> Option<&Notification> {
+        self.notifications.visible()
+    }
+
+    /// When the visible toast closes; `None` with no toast or while paused.
+    pub fn toast_deadline(&self) -> Option<Instant> {
+        self.notifications.deadline()
+    }
+
+    /// Closes the visible toast once its own deadline has passed.
+    pub fn expire_toast(&mut self, now: Instant) {
+        self.notifications.expire_due(now);
+    }
+
+    /// Freezes the visible toast's countdown while `held`, restarts it with
+    /// the time it had left once released.
+    pub fn hold_toast(&mut self, held: bool) {
+        let Some(id) = self.notifications.visible().map(|n| n.id) else {
+            return;
+        };
+        let now = Instant::now();
+        if held {
+            self.notifications.pause(id, now);
+        } else {
+            self.notifications.resume(id, now);
+        }
+    }
+
+    /// Closes the visible toast ahead of its deadline.
+    pub fn dismiss_visible_toast(&mut self) {
+        if let Some(id) = self.notifications.visible().map(|n| n.id) {
+            self.notifications.dismiss(id, Instant::now());
+        }
+    }
+
+    pub fn notification_center_open(&self) -> bool {
+        self.notifications.center_open()
+    }
+
+    /// Opens the notification center, closing the Projects overview in the
+    /// same call, and marks every record read.
+    pub fn open_center(&mut self) {
+        self.close_projects_overlay();
+        self.notifications.open_center();
+    }
+
+    pub fn close_center(&mut self) {
+        self.notifications.close_center();
+    }
+
+    /// Opens the center on record `id`, selected and expanded, closing the
+    /// Projects overview as [`open_center`](Self::open_center) does.
+    pub fn open_center_at(&mut self, id: u64) {
+        self.close_projects_overlay();
+        self.notifications.open_center_at(id);
+    }
+
+    /// Selects record `id` and shows its full message.
+    pub fn select_notification(&mut self, id: u64) {
+        if self.notifications.get(id).is_some() {
+            self.notifications.select(id);
+            self.notifications.toggle_expanded();
+        }
+    }
+
+    /// Moves the center's selection `delta` rows down the list, newest first.
+    pub fn move_notification_selection(&mut self, delta: isize) {
+        self.notifications.move_selection(delta);
+    }
+
+    pub fn toggle_notification_expanded(&mut self) {
+        self.notifications.toggle_expanded();
+    }
+
+    /// The center's selected record and whether it shows its full message.
+    pub fn notification_selection(&self) -> (Option<u64>, bool) {
+        (self.notifications.selected(), self.notifications.expanded())
+    }
+
+    /// Closes the center when it is open, opens it (as
+    /// [`open_center`](Self::open_center) does) otherwise.
+    pub fn toggle_center(&mut self) {
+        if self.notifications.center_open() {
+            self.close_center();
+        } else {
+            self.open_center();
+        }
+    }
+
+    /// Records whether the app window `window` has focus.
+    pub fn set_window_focused(&mut self, window: u64, focused: bool) {
+        self.notifications.set_window_focused(window, focused);
+    }
+
+    /// The native banners due since the last call, each record once.
+    pub fn take_native_notifications(&mut self) -> Vec<Banner> {
+        self.notifications.take_native()
+    }
+
+    /// Stamps `record` with the local time and appends it, returning its id.
+    fn publish_notification(&mut self, mut record: Notification) -> u64 {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        record.at = checkpoints::local_hhmm(unix);
+        self.notifications.publish(record, Instant::now())
+    }
+
+    /// Names the project of tab `index` on `record`.
+    fn fill_project(&self, record: &mut Notification, index: Option<usize>) {
+        if let Some(tab) = index.and_then(|i| self.state.projects.get(i)) {
+            record.project_title = Some(tab.title.clone());
+            record.project_path = Some(project_identity_path(&tab.project));
+        }
+    }
+
+    fn fill_active_project(&self, record: &mut Notification) {
+        self.fill_project(record, self.state.active);
+    }
+
+    /// One info record for an open that skipped subfolders; its message
+    /// lists every full path.
+    fn publish_skipped(&mut self, skipped: &[PathBuf]) {
+        if skipped.is_empty() {
+            return;
+        }
+        let count = format!(
+            "{} subfolder{} skipped",
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" }
+        );
+        let paths: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+        let message = format!("{count}:\n{}", paths.join("\n"));
+        self.publish_notification(Notification::new(
+            Kind::Info,
+            Source::Import,
+            "Some images were skipped",
+            message,
+        ));
     }
 
     /// The toolbar/bottom-bar surfaces' current view of the active tab's
     /// run, empty rather than another tab's numbers with no active tab or
     /// with the active tab not the one actually running.
     pub fn job_view(&self) -> JobView {
+        if let Some(preview) = &self.toolbar_preview {
+            return JobView {
+                fuse_enabled: self.fuse_enabled(),
+                ..preview.clone()
+            };
+        }
         let run = self
             .state
             .active()
@@ -7077,6 +7799,52 @@ impl AppController {
             fuse_enabled: self.fuse_enabled(),
             state: run,
         }
+    }
+
+    /// Holds a literal transport view -- `state` is one of `idle`, `running`,
+    /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
+    /// until the next run starts; `fuse_enabled` still follows the active
+    /// tab. An unknown `state` gets the idle numbers and labels but keeps
+    /// its own string as `toolbar_run_state`, so callers validate first.
+    pub fn set_toolbar_preview(&mut self, state: &str) {
+        let (run, stage_word, step_text, fraction, tone, eta) = match state {
+            "running" => (
+                job::RunState::Running,
+                "Aligning",
+                "42 of 61",
+                0.62,
+                "running",
+                "ETA 1:12",
+            ),
+            "paused" => (job::RunState::Paused, "Paused", "", 0.62, "held", "ETA —"),
+            "cancelling" => (
+                job::RunState::Cancelling,
+                "Cancelling",
+                "",
+                0.0,
+                "held",
+                "ETA —",
+            ),
+            "failed" => (
+                job::RunState::Failed(String::new()),
+                "Failed",
+                "",
+                0.28,
+                "failed",
+                "ETA —",
+            ),
+            _ => (job::RunState::Idle, "", "", 0.0, "held", ""),
+        };
+        self.toolbar_preview = Some(JobView {
+            state: run,
+            toolbar_run_state: state.to_string(),
+            stage_word: stage_word.to_string(),
+            step_text: step_text.to_string(),
+            eta_text: eta.to_string(),
+            bar_tone: tone.to_string(),
+            fraction,
+            fuse_enabled: self.fuse_enabled(),
+        });
     }
 
     /// Whether the active tab's fuse control is enabled: a real project tab
@@ -7154,24 +7922,37 @@ impl AppController {
             // checkpoint just changed.
             self.state.canvas_dirty = true;
         }
-        let tab_info = tab_index
-            .and_then(|i| self.state.projects.get(i))
-            .map(|tab| (project_identity_path(&tab.project), tab.title.clone()));
+        let run_frames = std::mem::take(&mut self.job.frames);
+        // Preparation finishes before any later failure, so every notice is
+        // published, ahead of the failure itself.
+        for (frame, text) in run_notices {
+            let frame = frame
+                .and_then(|i| run_frames.get(i))
+                .map(|p| images::file_name(p));
+            let title = if frame.is_some() {
+                "Brightness target limited"
+            } else {
+                "Processing notice"
+            };
+            let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
+            record.frame = frame;
+            self.fill_project(&mut record, tab_index);
+            self.publish_notification(record);
+        }
 
         match &settled.state {
             job::RunState::Failed(message) => {
                 let operation = settled
                     .operation
                     .expect("settle() sets operation exactly when state is Failed");
-                let notification = job::Notification {
-                    operation,
-                    message: message.clone(),
-                    project_title: tab_info.as_ref().map(|(_, title)| title.clone()),
-                    project_path: tab_info.as_ref().map(|(path, _)| path.clone()),
-                    target: None,
-                };
-                self.notifications.push(notification.clone());
-                self.settled_failure = Some(notification);
+                let mut record = Notification::new(
+                    Kind::Failure,
+                    Source::Run,
+                    operation.summary(),
+                    message.clone(),
+                );
+                self.fill_project(&mut record, tab_index);
+                self.publish_notification(record);
                 if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
@@ -7193,12 +7974,6 @@ impl AppController {
         }
 
         let owner = tab_index.filter(|&i| i < self.state.projects.len());
-        if settled.held.is_some()
-            && let Some(line) = run_notice_line(&run_notices)
-        {
-            self.state.notice = Some(line);
-            self.emit(ShellEvent::ProjectsChanged);
-        }
         let planes = match (settled.held, owner) {
             (None, _) => None,
             (Some(held), None) => {
@@ -7244,6 +8019,7 @@ impl AppController {
                 break;
             }
         }
+        self.refresh_source_previews();
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
         planes
@@ -7332,19 +8108,16 @@ impl AppController {
         Some(parked.diverged.as_slice())
     }
 
+    /// Whether any tab, active or not, holds a parked run waiting for
+    /// Keep or Discard.
+    pub fn parked_run_waiting(&self) -> bool {
+        self.state.projects.iter().any(|tab| tab.parked.is_some())
+    }
+
     /// What the active tab's last completed run's alignment did: its source,
     /// backend and per-status counts.
     pub fn last_alignment(&self) -> Option<&job::AlignSummary> {
         self.state.active()?.alignment.as_ref()
-    }
-
-    /// The toast a kept run with unregistered frames raises, read after
-    /// [`AppController::keep_fused`]; `None` when every frame registered.
-    pub fn unaligned_notice(&self) -> Option<String> {
-        match &self.state.active()?.run {
-            job::RunState::Fused { unaligned, .. } => job::unaligned_notice(*unaligned),
-            _ => None,
-        }
     }
 
     /// `Keep` on the active tab's parked run: commits it exactly as a run
@@ -7361,6 +8134,12 @@ impl AppController {
         let planes = self.commit_held(index, parked.held);
         self.state.projects[index].run = job::RunState::Fused { at, unaligned };
         self.state.canvas_dirty = true;
+        if let Some(title) = job::unaligned_notice(unaligned) {
+            let message = format!("Kept the fused result with {title}.");
+            let mut record = Notification::new(Kind::Warning, Source::Run, title, message);
+            self.fill_project(&mut record, Some(index));
+            self.publish_notification(record);
+        }
         self.emit(ShellEvent::JobChanged);
         Some(planes)
     }
@@ -7678,8 +8457,9 @@ impl AppController {
     }
 
     /// Answers the delete question: queues the row's deletion and frees what
-    /// nothing needs any more. The canvas, the edit session and the render
-    /// are left alone.
+    /// nothing needs any more. While live holds ops the canvas, the edit
+    /// session and the render are left alone; otherwise deleting the current
+    /// row makes the newest remaining row current.
     pub fn confirm_checkpoint_delete(&mut self) {
         let Some((tab_id, key)) = self.state.pending_checkpoint_delete.take() else {
             return;
@@ -7698,6 +8478,16 @@ impl AppController {
         tab.free_unneeded_held();
         if checkpoints::held_index(&key).is_none() {
             tab.remove_cached_planes(&scratch_root, &key);
+        }
+        if tab.selected_checkpoint.as_deref() == Some(key.as_str())
+            && !tab.live_modified()
+            && let Some(newest) = self
+                .checkpoints_panel()
+                .entries
+                .into_iter()
+                .find_map(|entry| entry.id)
+        {
+            self.restore_row(newest);
         }
     }
 
@@ -7990,19 +8780,17 @@ impl AppController {
         Some(self.advance_saves())
     }
 
-    /// Records a failed save of tab `index` to `target` as a notification
-    /// and the settled failure.
+    /// Records a failed save of tab `index` to `target` as a notification.
     fn report_failed_save(&mut self, index: usize, target: &Path, cause: String) {
-        let tab = &self.state.projects[index];
-        let notification = job::Notification {
-            operation: job::FailedOperation::Save,
-            message: format!("Could not save {}: {cause}", target.display()),
-            project_title: Some(tab.title.clone()),
-            project_path: Some(project_identity_path(&tab.project)),
-            target: Some(target.to_path_buf()),
-        };
-        self.notifications.push(notification.clone());
-        self.settled_failure = Some(notification);
+        let mut record = Notification::new(
+            Kind::Failure,
+            Source::Save,
+            job::FailedOperation::Save.summary(),
+            format!("Could not save {}: {cause}", target.display()),
+        );
+        self.fill_project(&mut record, Some(index));
+        record.target = Some(target.to_path_buf());
+        self.publish_notification(record);
     }
 
     /// What the open renderer cell should do for the frame about to draw,
@@ -8063,11 +8851,11 @@ impl AppController {
     // [`tab_scroll_into_view`]); `.slint` only reads the results. --
 
     /// `tabs-region`'s width at `ShellGeometry.base-width`: 1440 minus the
-    /// 46 px projects slot, the 105 px window-glyph cluster (`base-width -
+    /// 47 px projects slot, the 105 px window-glyph cluster (`base-width -
     /// glyph-first-x`) and the 32 px
     /// `strip-cluster-gap` -- see [`AppController::new`] for why the region
     /// starts here rather than at zero.
-    const BASE_TAB_REGION_WIDTH: f32 = 1257.0;
+    const BASE_TAB_REGION_WIDTH: f32 = 1256.0;
 
     /// The tabs-region's measured width, pushed from `FFTabStrip`'s
     /// `tabs-region-width` (at install, and on every change). Re-clamps the
@@ -8319,8 +9107,13 @@ impl AppController {
         // A bundle written from the window already marks the crashes it
         // packaged; dropping the notice's own snapshot means a user who
         // only ever bundles never sees it return for that evidence.
-        self.state.diagnostics.crash_notice_ids.clear();
-        self.state.diagnostics.crash_notice_visible = false;
+        for record in self.notifications.records_mut() {
+            if let Some(crash) = record.crash.as_mut() {
+                crash.ids.clear();
+                crash.acknowledged = true;
+                crash.error = None;
+            }
+        }
     }
 
     /// Stores a background scan's outcome, called once
@@ -8335,70 +9128,99 @@ impl AppController {
         self.diagnostics_view();
     }
 
-    /// Snapshots `data_dir`'s unreported crash evidence and shows the notice
-    /// exactly when that snapshot is non-empty. No data directory and an
-    /// unreadable crash directory both yield an empty snapshot and a hidden
-    /// notice -- neither ever fails the window's start-up. Called once at
-    /// start; nothing re-scans mid-session.
+    /// Publishes one crash record for the unreported crash evidence in
+    /// `data_dir`, or for crash reports that cannot be located or read (no
+    /// data directory, or an unreadable crash directory); nothing for a clean
+    /// start. Never fails the window's start-up. Called once at start;
+    /// nothing re-scans mid-session.
     pub fn scan_crash_notice(&mut self) {
-        let ids = match &self.state.diagnostics.data_dir {
-            Some(dir) => focusforge_diagnostics::crash_notice::unreported(dir),
-            None => Vec::new(),
+        let (ids, unavailable) = match &self.state.diagnostics.data_dir {
+            Some(dir) => {
+                let unreadable = focusforge_diagnostics::crash_dir(dir)
+                    .read_dir()
+                    .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+                (
+                    focusforge_diagnostics::crash_notice::unreported(dir),
+                    unreadable,
+                )
+            }
+            None => (Vec::new(), true),
         };
-        self.state.diagnostics.crash_notice_visible = !ids.is_empty();
-        self.state.diagnostics.crash_notice_ids = ids;
-    }
-
-    pub fn crash_notice_visible(&self) -> bool {
-        self.state.diagnostics.crash_notice_visible
-    }
-
-    pub fn crash_notice_count(&self) -> usize {
-        self.state.diagnostics.crash_notice_ids.len()
-    }
-
-    /// "1 crash found" / "N crashes found", worded for the toast's title.
-    pub fn crash_notice_text(&self) -> String {
-        match self.crash_notice_count() {
-            1 => "1 crash found".to_string(),
-            n => format!("{n} crashes found"),
-        }
-    }
-
-    /// Marks the snapshot's crash ids reported, best-effort: a write
-    /// failure is logged and never surfaced, mirroring the CLI's own
-    /// precedent. Takes the snapshot, so a second call marks nothing.
-    fn mark_crash_notice_reported(&mut self) {
-        self.state.diagnostics.crash_notice_visible = false;
-        let ids = std::mem::take(&mut self.state.diagnostics.crash_notice_ids);
-        if ids.is_empty() {
+        let mut record = if unavailable {
+            Notification::new(
+                Kind::Crash,
+                Source::Startup,
+                "Crash reports unavailable",
+                "The crash reports of earlier sessions could not be read. Diagnostics can still \
+                 write a bundle.",
+            )
+        } else if ids.is_empty() {
             return;
-        }
-        let Some(data_dir) = self.state.diagnostics.data_dir.clone() else {
-            return;
+        } else {
+            let detected = match ids.len() {
+                1 => "One crash report was".to_string(),
+                n => format!("{n} crash reports were"),
+            };
+            Notification::new(
+                Kind::Crash,
+                Source::Startup,
+                "Previous session stopped",
+                format!(
+                    "A previous session stopped unexpectedly. {detected} detected at startup.\n\n\
+                     Reading or closing this notice does not acknowledge the report."
+                ),
+            )
         };
-        if let Err(e) = focusforge_diagnostics::crash_notice::mark_reported(&data_dir, &ids) {
-            tracing::warn!(error = %e, "the crash notice's evidence could not be marked as reported");
+        record.crash = Some(CrashEvidence {
+            reports: ids.len(),
+            ids,
+            unavailable,
+            ..CrashEvidence::default()
+        });
+        self.publish_notification(record);
+    }
+
+    /// Marks the crash evidence of record `id` reported. A failed write
+    /// keeps the evidence unreported and stores its error on the record.
+    /// Viewing or timing out a record never calls this.
+    pub fn acknowledge_crash(&mut self, id: u64) -> Result<(), String> {
+        let data_dir = self.state.diagnostics.data_dir.clone();
+        let Some(crash) = self
+            .notifications
+            .get_mut(id)
+            .and_then(|record| record.crash.as_mut())
+        else {
+            return Ok(());
+        };
+        if crash.acknowledged || crash.ids.is_empty() {
+            return Ok(());
+        }
+        let outcome = match data_dir {
+            Some(dir) => focusforge_diagnostics::crash_notice::mark_reported(&dir, &crash.ids)
+                .map_err(|e| e.to_string()),
+            None => Err("no data directory is available".to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                crash.ids.clear();
+                crash.acknowledged = true;
+                crash.error = None;
+                Ok(())
+            }
+            Err(error) => {
+                crash.error = Some(error.clone());
+                Err(error)
+            }
         }
     }
 
-    /// Hides the notice without writing anything: the evidence stays
-    /// unreported, so it returns on the next start.
-    pub fn crash_notice_timed_out(&mut self) {
-        self.state.diagnostics.crash_notice_visible = false;
-    }
-
-    /// Hides the notice and marks its evidence reported.
-    pub fn dismiss_crash_notice(&mut self) {
-        self.mark_crash_notice_reported();
-    }
-
-    /// Marks the notice's evidence reported the same way [`Self::dismiss_crash_notice`]
-    /// does, then opens the settings modal on the diagnostics section.
-    /// Returns the settings-open state the way [`Self::open_settings`] does,
-    /// so a caller pushes it without a second lock.
-    pub fn review_crashes(&mut self) -> bool {
-        self.mark_crash_notice_reported();
+    /// Acknowledges record `id` the way [`Self::acknowledge_crash`] does, then
+    /// opens the settings modal on the diagnostics section, whether or not
+    /// the mark succeeded. Returns the settings-open state the way
+    /// [`Self::open_settings`] does, so a caller pushes it without a second
+    /// lock.
+    pub fn crash_diagnostics(&mut self, id: u64) -> bool {
+        let _ = self.acknowledge_crash(id);
         let open = self.open_settings();
         self.select_settings_section(SettingsSection::Diagnostics);
         open
@@ -8805,8 +9627,10 @@ fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
 fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
     let editing = tab.edit.as_ref().is_some_and(|edit| edit.op_count() > 0);
     let info = row_export_info(tab)?;
-    let kind = if editing || info.live {
+    let kind = if editing {
         ExportKind::Live
+    } else if info.live {
+        ExportKind::HeldRetouch
     } else if info.held {
         ExportKind::Held
     } else {
@@ -8964,34 +9788,135 @@ fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>
     )
 }
 
-/// The info notice's text for a finished run: the first pipeline notice,
-/// plus ` (and N more)` when it raised several; `None` when it raised none.
-fn run_notice_line(notices: &[String]) -> Option<String> {
-    let (first, rest) = notices.split_first()?;
-    Some(match rest.len() {
-        0 => first.clone(),
-        more => format!("{first} (and {more} more)"),
-    })
-}
-
-/// The info notice's text for a skipped-subfolder open, `None` when nothing
-/// was skipped -- not an error, its toast's own copy (`ui/shell/dialogs.slint`'s
-/// `FFToast`, `tone: "info"`). Short enough to stay on the toast's one
-/// line regardless of how many subfolders it names.
-fn notice_line(skipped: &[PathBuf]) -> Option<String> {
-    if skipped.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{} subfolder{} skipped",
-        skipped.len(),
-        if skipped.len() == 1 { "" } else { "s" }
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::plain_cause;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    use focusforge_core::io::test_frames::write_frame_with_capture_time;
+
+    use super::{AppController, OpenOutcome, plain_cause};
+    use crate::appearance_settings::{AppearanceSettings, SourcePresentation};
+    use crate::source_previews::{PreviewError, PreviewPixels, PreviewReservation, PreviewWorker};
+
+    fn install_blocked_preview_worker(
+        controller: &mut AppController,
+        blocked_path: PathBuf,
+    ) -> (
+        mpsc::Receiver<PathBuf>,
+        mpsc::Sender<()>,
+        mpsc::Receiver<PathBuf>,
+    ) {
+        controller.preview_requests.clear();
+        controller.preview_budget_bytes = 0;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (completed_tx, completed_rx) = mpsc::channel();
+        controller.previews = Some(PreviewWorker::new_with_renderer(Arc::new(
+            move |path, _, _| {
+                if path != blocked_path {
+                    return Err(PreviewError::Cancelled);
+                }
+                started_tx.send(path.to_path_buf()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                completed_tx.send(path.to_path_buf()).unwrap();
+                Ok((
+                    PreviewPixels {
+                        width: 1,
+                        height: 1,
+                        rgba: vec![0, 0, 0, 255],
+                    },
+                    PreviewReservation {
+                        decoder_cache: 0,
+                        read_scratch: 0,
+                        band: 0,
+                        accumulator: 0,
+                        reduced_samples: 0,
+                        result: 4,
+                        resident_and_conversion: 8,
+                        total: 12,
+                        band_rows: 1,
+                    },
+                ))
+            },
+        )));
+        (started_rx, release_tx, completed_rx)
+    }
+
+    fn wait_for_preview_quiescence(controller: &mut AppController) {
+        while controller
+            .previews
+            .as_ref()
+            .expect("controlled preview worker remains installed")
+            .metrics()
+            .active_workers
+            != 0
+        {
+            controller.poll_source_previews();
+            std::thread::yield_now();
+        }
+        controller.poll_source_previews();
+    }
+
+    fn cache_has_source(controller: &AppController, source: &Path) -> bool {
+        controller
+            .preview_cache
+            .keys()
+            .any(|request| request.path == source)
+    }
+
+    fn seal_project_with_sources(dir: &Path, sources: &[PathBuf]) -> PathBuf {
+        use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+        use focusforge_core::params::ParamValues;
+        use focusforge_core::project::{Metrics, SealRequest, seal};
+        use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let composite = dir.join("composite.tif");
+        let zmap = dir.join("zmap.tif");
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let mut writer = TiffWriter::create(
+            &composite,
+            TiffSpec {
+                width: 4,
+                height: 4,
+                samples_per_pixel: 3,
+                description: Some("staged".to_string()),
+            },
+        )
+        .unwrap();
+        writer.write_tile(full, &[0u16; 4 * 4 * 3]).unwrap();
+        writer.finish().unwrap();
+
+        let mut map =
+            ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, sources.len() as u32).unwrap()).unwrap();
+        map.write_tile(full, &[0u16; 4 * 4]).unwrap();
+        map.finish().unwrap();
+
+        let project_path = dir.join("test.ffp");
+        seal(SealRequest {
+            project_path: &project_path,
+            staged_composite: &composite,
+            staged_zmap: &zmap,
+            sources,
+            algorithm: "laplacian",
+            params: &ParamValues::new(),
+            align: None,
+            registration: focusforge_core::align::Registration::default(),
+            composite_description: "staged".to_string(),
+            label: None,
+            metrics: Metrics::default(),
+        })
+        .unwrap();
+        project_path
+    }
 
     #[test]
     fn plain_cause_drops_the_os_error_tail_and_a_closing_period() {
@@ -9013,5 +9938,263 @@ mod tests {
         );
         assert_eq!(plain_cause("odd (os error x)"), "odd (os error x)");
         assert_eq!(plain_cause("odd (os error )"), "odd (os error )");
+    }
+
+    #[test]
+    fn a_removed_source_drops_its_blocked_preview_before_it_can_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.tif");
+        write_frame_with_capture_time(&source, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&root))
+            .expect("the source opens")
+            .join()
+            .expect("the open worker does not panic");
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, source.clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            source,
+            "the controlled worker owns the old source identity"
+        );
+
+        controller.remove_frame(0);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            completed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the blocked renderer finishes before stale outcome polling"),
+            source
+        );
+        wait_for_preview_quiescence(&mut controller);
+        assert_eq!(controller.source_preview_snapshot().cache_entries, 0);
+        assert!(controller.source_preview(&source).is_none());
+        assert!(!cache_has_source(&controller, &source));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_tab_switch_drops_its_blocked_preview_before_it_can_publish() {
+        let first = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-tab-first-{}",
+            std::process::id()
+        ));
+        let second = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-tab-second-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let source = first.join("first.tif");
+        write_frame_with_capture_time(&source, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        write_frame_with_capture_time(
+            &second.join("second.tif"),
+            4,
+            4,
+            Some("2026:08:29 10:00:00"),
+        )
+        .unwrap();
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&first))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, source.clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            source
+        );
+
+        controller
+            .open_paths(std::slice::from_ref(&second))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.select_project(1);
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the switched-away renderer completes");
+        wait_for_preview_quiescence(&mut controller);
+
+        assert!(!cache_has_source(&controller, &source));
+        assert!(controller.source_preview(&source).is_none());
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn a_relink_drops_its_blocked_preview_before_it_can_publish() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-relink-{}",
+            std::process::id()
+        ));
+        let old_sources = root.join("old-sources");
+        let new_sources = root.join("new-sources");
+        let project_dir = root.join("project");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&old_sources).unwrap();
+        std::fs::create_dir_all(&new_sources).unwrap();
+        let old_source = old_sources.join("source.tif");
+        write_frame_with_capture_time(&old_source, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        let project = seal_project_with_sources(&project_dir, std::slice::from_ref(&old_source));
+        let new_source = new_sources.join("source.tif");
+        std::fs::copy(&old_source, &new_source).unwrap();
+
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&project))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, old_source.clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            old_source
+        );
+
+        std::fs::remove_dir_all(&old_sources).unwrap();
+        let tab_id = controller.tab_id_at(0).unwrap();
+        controller
+            .locate_frames(crate::entry::LocateTarget::Tab(tab_id), new_sources.clone())
+            .unwrap()
+            .join()
+            .unwrap();
+        controller.settle_locate();
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the relinked-away renderer completes");
+        wait_for_preview_quiescence(&mut controller);
+
+        assert!(!cache_has_source(&controller, &old_source));
+        assert!(controller.source_preview(&old_source).is_none());
+        assert_eq!(controller.images_panel().rows[0].path, new_source);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn retry_keeps_the_original_host_cap_after_preview_reservation() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-retry-host-cap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.tif");
+        let second = root.join("second.tif");
+        write_frame_with_capture_time(&first, 4, 4, Some("2026:08:29 10:00:00")).unwrap();
+        write_frame_with_capture_time(&second, 4, 4, Some("2026:08:29 10:00:01")).unwrap();
+        let mut controller = AppController::new();
+        controller.set_scratch_root_for_test(root.join("scratch"));
+        controller
+            .open_paths(std::slice::from_ref(&root))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.set_align_algorithm("dummy-align");
+        controller.set_host_memory_cap("1MiB");
+        controller.set_published_preview_bytes(512 * 1024);
+        std::fs::write(&second, b"not a tiff").unwrap();
+
+        assert!(controller.start_fuse());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while controller.job_running() {
+            controller.settle_job();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the intentionally unreadable source must fail"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            controller.job_view().state,
+            crate::job::RunState::Failed(_)
+        ));
+        assert_eq!(
+            controller
+                .state
+                .active()
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .max_host_memory,
+            Some(1024 * 1024),
+            "the failed tab keeps its user-selected cap, not the first reduced worker allowance"
+        );
+
+        assert!(
+            controller.retry_fuse(),
+            "the retry subtracts retained previews from the original cap exactly once"
+        );
+        assert_eq!(
+            controller
+                .state
+                .active()
+                .unwrap()
+                .request
+                .as_ref()
+                .unwrap()
+                .max_host_memory,
+            Some(1024 * 1024)
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while controller.job_running() {
+            controller.settle_job();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry must settle its same unreadable-source failure"
+            );
+            std::thread::yield_now();
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

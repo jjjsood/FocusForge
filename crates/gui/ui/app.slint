@@ -22,12 +22,15 @@ export { ComparisonWindow }
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
+import { FFIconBar } from "shell/icon_bar.slint";
+import { FFNotificationCenter, NotificationRowView } from "shell/notification_center.slint";
 import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
 export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
-import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing, FFToast } from "shell/dialogs.slint";
+import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing } from "shell/dialogs.slint";
+import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
-export { ProjectCardView, RecentRowView, ExportRowView }
+export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -177,9 +180,9 @@ export component AppWindow inherits Window {
     // inert values, so the row renders itself disabled without a separate
     // hidden state.
     if root.mode != "editor": toolbar := FFToolbar {
-        x: 0px;
+        x: ShellGeometry.icon-bar-width;
         y: ShellGeometry.strip-height;
-        width: root.width - ShellGeometry.dock-width;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
         height: ShellGeometry.toolbar-height;
         run-state: root.toolbar-run-state;
         fuse-enabled: root.fuse-enabled;
@@ -192,9 +195,9 @@ export component AppWindow inherits Window {
     }
 
     if root.mode == "editor": editor-toolbar := FFEditorToolbar {
-        x: 0px;
+        x: ShellGeometry.icon-bar-width;
         y: ShellGeometry.strip-height;
-        width: root.width - ShellGeometry.dock-width;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
         height: ShellGeometry.toolbar-height;
         size-text: root.brush-size-text;
         size-fraction: root.brush-size-fraction;
@@ -322,9 +325,9 @@ export component AppWindow inherits Window {
     out property <bool> canvas-pane-hovered: canvas.pane-hovered;
 
     canvas-ground := FocusScope {
-        x: 0px;
+        x: ShellGeometry.icon-bar-width;
         y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
-        width: root.width - ShellGeometry.dock-width;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
         height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
             - ShellGeometry.bottom-bar-height;
 
@@ -420,6 +423,7 @@ export component AppWindow inherits Window {
     in property <length> settings-content-height: 0px;
     in property <bool> settings-enabled: true;
     callback settings-param-changed(string, string, float);
+    callback settings-param-stepped(string, string, int);
     callback settings-param-text-edited(string, string, string);
     callback settings-algorithm-selected(string, string);
     callback settings-reset-all();
@@ -435,22 +439,34 @@ export component AppWindow inherits Window {
     // one line into `FFDock`.
     in property <[ImageRowView]> images-rows: [];
     in property <string> images-header-text: "";
+    in property <string> images-presentation: "list";
     in-out property <length> images-list-viewport-y: 0px;
     in property <string> images-sort: "";
     in property <bool> images-sort-menu-open: false;
     in property <int> images-dragging-row: -1;
     in property <length> images-drag-offset: 0px;
+    in property <bool> images-drag-capture-active: false;
     in property <int> images-drag-target-row: -1;
-    // Whether the mutating controls (row grip/eye/bin, add, sort, drag) are
+    // Whether the mutating controls (row actions, add, sort, drag) are
     // reachable at all -- `false` while this tab's own job is running.
     in property <bool> images-enabled: true;
+    // Inspection rows are independent from live controller publication.
+    in property <bool> list-preview-active: false;
+    in property <string> list-preview-mode: "stacking";
+    in property <[ImageRowView]> list-preview-rows: [];
+    in property <string> list-preview-header-text: "";
+    in property <string> list-preview-presentation: "list";
+    in property <int> list-preview-dragging-row: -1;
+    in property <length> list-preview-drag-offset: 0px;
+    in property <int> list-preview-drag-target-row: -1;
     callback images-add-frames-requested();
     callback images-sort-menu-toggled();
     callback images-sort-selected(string);
     callback images-frame-selected(int);
+    callback images-frame-keyboard-moved(int);
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
-    callback images-frame-grip-pointer(int, int, length);
+    callback images-frame-drag-pointer(int, int, length);
     callback images-viewport-scrolled(length);
     callback images-frame-wheel(length);
     callback images-scrollbar-pointer(int, length);
@@ -463,9 +479,9 @@ export component AppWindow inherits Window {
         width: ShellGeometry.dock-width;
         height: root.height - ShellGeometry.strip-height - ShellGeometry.bottom-bar-height;
         editor-enabled: root.editor-enabled;
-        mode: root.mode;
-        dock-tab: root.dock-tab;
-        project-loaded: root.project-loaded;
+        mode: root.list-preview-active ? root.list-preview-mode : root.mode;
+        dock-tab: root.list-preview-active ? "images" : root.dock-tab;
+        project-loaded: root.project-loaded || root.list-preview-active;
         checkpoint-line: root.checkpoint-line;
         checkpoint-export-enabled: root.checkpoint-export-enabled;
         checkpoint-rows: root.checkpoint-rows;
@@ -476,15 +492,18 @@ export component AppWindow inherits Window {
         settings-scroll-y: root.settings-scroll-y;
         settings-content-height: root.settings-content-height;
         settings-enabled: root.settings-enabled;
-        images-rows: root.images-rows;
-        images-header-text: root.images-header-text;
+        images-rows: root.list-preview-active ? root.list-preview-rows : root.images-rows;
+        images-header-text: root.list-preview-active ? root.list-preview-header-text : root.images-header-text;
+        images-presentation: root.list-preview-active ? root.list-preview-presentation : root.images-presentation;
+        tooltip-max-width: root.width;
         images-list-viewport-y <=> root.images-list-viewport-y;
         images-sort: root.images-sort;
         images-sort-menu-open: root.images-sort-menu-open;
-        images-dragging-row: root.images-dragging-row;
-        images-drag-offset: root.images-drag-offset;
-        images-drag-target-row: root.images-drag-target-row;
-        images-enabled: root.images-enabled;
+        images-dragging-row: root.list-preview-active ? root.list-preview-dragging-row : root.images-dragging-row;
+        images-drag-offset: root.list-preview-active ? root.list-preview-drag-offset : root.images-drag-offset;
+        images-drag-capture-active: root.list-preview-active ? false : root.images-drag-capture-active;
+        images-drag-target-row: root.list-preview-active ? root.list-preview-drag-target-row : root.images-drag-target-row;
+        images-enabled: root.list-preview-active ? true : root.images-enabled;
 
         mode-selected(m) => { root.mode-selected(m); }
         dock-tab-selected(t) => { root.dock-tab-selected(t); }
@@ -496,6 +515,7 @@ export component AppWindow inherits Window {
         checkpoint-scrollbar-dragged(y) => { root.checkpoint-scrollbar-dragged(y); }
         checkpoint-viewport-height-changed(h) => { root.checkpoint-viewport-height-changed(h); }
         settings-param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+        settings-param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
         settings-param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
         settings-algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
         settings-reset-all => { root.settings-reset-all(); }
@@ -509,25 +529,15 @@ export component AppWindow inherits Window {
         images-sort-menu-toggled => { root.images-sort-menu-toggled(); }
         images-sort-selected(picked) => { root.images-sort-selected(picked); }
         images-frame-selected(i) => { root.images-frame-selected(i); }
+        images-frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
-        images-frame-grip-pointer(i, kind, y) => { root.images-frame-grip-pointer(i, kind, y); }
+        images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
         images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
         images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
-    }
-
-    if root.crash-notice-visible : crash-notice := FFToast {
-        x: ShellGeometry.pane-gutter;
-        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + ShellGeometry.pane-gutter;
-        toast-open: true;
-        message: root.crash-notice-title;
-        link-label: "Review";
-
-        dismissed => { root.crash-notice-dismissed(); }
-        link-activated => { root.crash-notice-review-requested(); }
     }
 
     // Settings modal state -- pushed from Rust once at startup
@@ -537,6 +547,19 @@ export component AppWindow inherits Window {
     in property <[InputRow]> input-rows: [];
     in property <string> settings-section: "performance";
     callback settings-open-requested();
+    // The unread count on the bell, and whether the notification center is
+    // open (the bell is filled while it is).
+    in property <int> notifications-unread: 0;
+    in property <bool> notification-center-open: false;
+    callback bell-activated();
+    in property <[NotificationRowView]> notification-rows: [];
+    in property <string> notification-count-text: "";
+    callback notification-row-clicked(int);
+    callback notification-acknowledge-requested(int);
+    callback notification-diagnostics-requested(int);
+    callback notification-selection-moved(int);
+    callback notification-expansion-toggled();
+    callback notification-center-close-requested();
     callback settings-close-requested();
     callback settings-section-selected(string);
 
@@ -546,6 +569,14 @@ export component AppWindow inherits Window {
     callback performance-vram-cap-edited(string);
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+
+    in property <string> appearance-presentation: "image-list";
+    in property <bool> appearance-menu-open: false;
+    in property <bool> appearance-menu-focused: false;
+    in property <bool> appearance-menu-disabled: false;
+    in property <string> appearance-save-error: "";
+    callback appearance-presentation-selected(string);
+    callback appearance-menu-toggled();
 
     in property <StorageState> storage;
     callback storage-clear-requested();
@@ -572,11 +603,6 @@ export component AppWindow inherits Window {
     callback diagnostics-manifest-scrollbar-dragged(length);
     callback diagnostics-manifest-viewport-height-changed(length);
     callback diagnostics-manifest-scrolled(length);
-
-    in property <bool> crash-notice-visible: false;
-    in property <string> crash-notice-title: "";
-    callback crash-notice-dismissed();
-    callback crash-notice-review-requested();
 
     // The bottom bar's zoom cluster -- governs both panes, which is why it
     // lives at the root rather than inside `FFPane`.
@@ -612,10 +638,26 @@ export component AppWindow inherits Window {
     // visible -- read by a headless test, with no running window.
     out property <bool> load-indicator-visible: loading-indicator.load-visible;
 
-    bottom-bar := FFBottomBar {
+    icon-bar := FFIconBar {
         x: 0px;
+        y: ShellGeometry.strip-height;
+        height: root.height - ShellGeometry.strip-height;
+        unread: root.notifications-unread;
+        center-open: root.notification-center-open;
+
+        bell-activated => {
+            root.bell-activated();
+            if root.notification-center-open {
+                notification-center.focus-center();
+            }
+        }
+        settings-requested => { root.settings-open-requested(); }
+    }
+
+    bottom-bar := FFBottomBar {
+        x: ShellGeometry.icon-bar-width;
         y: root.height - ShellGeometry.bottom-bar-height;
-        width: root.width;
+        width: root.width - ShellGeometry.icon-bar-width;
         height: ShellGeometry.bottom-bar-height;
         zoom-readout: root.zoom-readout;
         project-loaded: root.project-loaded;
@@ -629,7 +671,6 @@ export component AppWindow inherits Window {
         overlay-fraction: root.overlay-fraction;
         overlay-text: root.overlay-text;
 
-        settings-requested => { root.settings-open-requested(); }
         zoom-in-requested => { root.zoom-in-requested(); }
         zoom-out-requested => { root.zoom-out-requested(); }
         zoom-fit-requested => { root.zoom-fit-requested(); }
@@ -662,9 +703,9 @@ export component AppWindow inherits Window {
     out property <length> gallery-width: projects-overlay.gallery-width;
 
     projects-overlay := FFProjectsOverlay {
-        x: 0px;
+        x: ShellGeometry.icon-bar-width;
         y: ShellGeometry.strip-height;
-        width: root.width;
+        width: root.width - ShellGeometry.icon-bar-width;
         height: root.height - ShellGeometry.strip-height;
         overlay-open: root.projects-overlay-open;
         gallery-heading: root.gallery-heading;
@@ -690,6 +731,25 @@ export component AppWindow inherits Window {
         recent-clicked(i) => { root.projects-recent-clicked(i); }
     }
 
+    notification-center := FFNotificationCenter {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.bottom-bar-height;
+        center-open: root.notification-center-open;
+        count-text: root.notification-count-text;
+        rows: root.notification-rows;
+
+        row-clicked(id) => { root.notification-row-clicked(id); }
+        acknowledge-requested(id) => { root.notification-acknowledge-requested(id); }
+        diagnostics-requested(id) => { root.notification-diagnostics-requested(id); }
+        selection-moved(delta) => { root.notification-selection-moved(delta); }
+        expansion-toggled => { root.notification-expansion-toggled(); }
+        close-requested => {
+            root.notification-center-close-requested();
+            icon-bar.focus-bell();
+        }
+    }
+
     settings-modal := FFSettingsModal {
         x: 0px;
         y: 0px;
@@ -699,6 +759,13 @@ export component AppWindow inherits Window {
         input-rows: root.input-rows;
         settings-section: root.settings-section;
         performance: root.performance;
+        appearance-presentation: root.appearance-presentation;
+        appearance-menu-open: root.appearance-menu-open;
+        appearance-menu-focused: root.appearance-menu-focused;
+        appearance-menu-disabled: root.appearance-menu-disabled;
+        appearance-save-error: root.appearance-save-error;
+        appearance-presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+        appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
         diagnostics-rows: root.diagnostics-rows;
@@ -714,7 +781,10 @@ export component AppWindow inherits Window {
         diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
         diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
-        settings-close-requested => { root.settings-close-requested(); }
+        settings-close-requested => {
+            root.settings-close-requested();
+            canvas-ground.focus();
+        }
         settings-section-selected(s) => { root.settings-section-selected(s); }
         performance-gpu-toggled(on) => { root.performance-gpu-toggled(on); }
         performance-host-cap-edited(t) => { root.performance-host-cap-edited(t); }
@@ -742,7 +812,7 @@ export component AppWindow inherits Window {
     callback question-cancelled();
     in property <bool> refusal-open: false;
     in property <string> refusal-title: "No frames here";
-    in property <string> refusal-body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> refusal-body: "";
     in property <string> refusal-button-label: "Pick another folder…";
     callback refusal-pick-another-folder();
 
@@ -761,8 +831,6 @@ export component AppWindow inherits Window {
     in property <string> sources-missing-body: "";
     callback sources-missing-locate-frames();
     callback sources-missing-closed();
-    in property <string> skipped-notice: "";
-    callback skipped-notice-dismissed();
 
     // The checkpoint panel's `Export image` modal.
     in property <bool> export-open: false;
@@ -787,15 +855,16 @@ export component AppWindow inherits Window {
     callback export-chroma-chosen(string, string);
     callback export-metadata-toggled();
 
-    // The failed run's own notice, over the canvas rather than in the
-    // bottom bar -- a job failure and a "some subfolders were skipped"
-    // notice are different messages and never share a slot. Opens on its
-    // own the moment a run fails; there is no button that reveals it.
-    in property <bool> job-toast-open: false;
-    in property <string> job-toast-message: "";
-    // "failure" | "info", `FFToast`'s own tone vocabulary.
-    in property <string> job-toast-tone: "failure";
-    callback job-toast-dismissed();
+    // The visible toast; `toast-id` is its record's stable id.
+    in property <bool> toast-open: false;
+    in property <int> toast-id: 0;
+    // "info" | "warning" | "failure" | "crash".
+    in property <string> toast-kind: "info";
+    in property <string> toast-title: "";
+    callback toast-dismissed();
+    callback toast-activated(int);
+    // The pointer or the keyboard is on the toast.
+    callback toast-hold-changed(bool);
 
     // The one warning a frame-set change (add/reorder/remove) raises once
     // its project already carries a checkpoint.
@@ -912,33 +981,20 @@ export component AppWindow inherits Window {
         pick-another-folder => { root.refusal-pick-another-folder(); }
     }
 
-    // The skipped-subfolders notice waits, still armed, until the overview
-    // closes -- it announces an import result, not a background failure, so
-    // losing it to the overview's own focus costs nothing.
-    skipped-toast := FFToast {
-        x: canvas-ground.x + Theme.space-3;
-        y: canvas-ground.y + Theme.space-3;
-        tone: "info";
-        toast-open: root.skipped-notice != "" && !root.projects-overlay-open;
-        message: root.skipped-notice;
-        dismissed => { root.skipped-notice-dismissed(); }
-    }
-
-    // The job toast shows over whichever surface is up: the gallery's own
-    // gutter while the Projects overview is open (declared after
-    // `projects-overlay` above so it paints on top), the pane gutter
-    // otherwise.
-    job-toast := FFToast {
-        x: root.projects-overlay-open
-            ? projects-overlay.x + projects-overlay.gallery-x + Theme.space-3
-            : canvas-ground.x + Theme.space-3;
-        y: root.projects-overlay-open
-            ? projects-overlay.y + projects-overlay.gallery-y + Theme.space-3
-            : canvas-ground.y + Theme.space-3;
-        toast-open: root.job-toast-open;
-        message: root.job-toast-message;
-        tone: root.job-toast-tone;
-        dismissed => { root.job-toast-dismissed(); }
+    toast := FFToast {
+        x: ShellGeometry.icon-bar-width + Theme.space-4;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height + Theme.space-4;
+        toast-open: root.toast-open;
+        title: root.toast-title;
+        kind: root.toast-kind;
+        dismissed => { root.toast-dismissed(); }
+        link-activated => {
+            root.toast-activated(root.toast-id);
+            if root.notification-center-open {
+                notification-center.focus-center();
+            }
+        }
+        changed held => { root.toast-hold-changed(self.held); }
     }
 
     frame-warning := FFFrameSetWarning {

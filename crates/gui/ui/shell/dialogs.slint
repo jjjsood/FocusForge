@@ -96,7 +96,7 @@ export component FFGroupingQuestion inherits FFModalPanel {
 export component FFRefusalDialog inherits FFModalPanel {
     in property <bool> refusal-open: false;
     in property <string> title: "No frames here";
-    in property <string> body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> body: "";
     in property <string> button-label: "Pick another folder…";
     callback pick-another-folder();
 
@@ -133,86 +133,6 @@ export component FFRefusalDialog inherits FFModalPanel {
                 width: 100%;
                 height: 100%;
             }
-        }
-    }
-}
-
-// A non-modal notice over the canvas: no scrim, self-timing (auto-dismisses
-// after six seconds) and also dismissed early by its own `x`. Either way,
-// dismissal carries no side effect beyond closing the notice -- there is
-// nothing here to mark reported.
-export component FFToast inherits Rectangle {
-    in property <bool> toast-open: false;
-    in property <string> message: "";
-    // "failure" (default): a run's own toast. "info": a plain notice, such
-    // as a folder open that skipped some of what it found.
-    in property <string> tone: "failure";
-    // A second, optional line below the message; hidden when empty.
-    in property <string> link-label: "";
-    callback dismissed();
-    callback link-activated();
-
-    width: 300px;
-    height: 84px;
-    background: Theme.surface-raised;
-    border-width: 1px;
-    border-color: Theme.border-default;
-    border-radius: Theme.radius-lg;
-    opacity: root.toast-open ? 1.0 : 0.0;
-    animate opacity { duration: Theme.motion-slow; easing: ease-out; }
-
-    icon := Image {
-        x: Theme.space-4;
-        y: Theme.space-4;
-        source: root.tone == "failure" ? @image-url("../../../../assets/icons/triangle-alert.svg")
-            : @image-url("../../../../assets/icons/info.svg");
-        colorize: root.tone == "failure" ? Theme.status-failure : Theme.text-secondary;
-        width: 18px;
-        height: 18px;
-    }
-
-    title := Text {
-        x: icon.x + icon.width + Theme.space-2;
-        y: icon.y;
-        width: parent.width - self.x - Theme.space-3;
-        height: 32px;
-        text: root.message;
-        color: Theme.text-primary;
-        font-size: Theme.text-title.size;
-        font-weight: Theme.text-title.weight;
-        wrap: word-wrap;
-        overflow: clip;
-    }
-
-    if root.link-label != "": link-area := TouchArea {
-        x: title.x;
-        y: title.y + title.height;
-        width: title.width;
-        height: parent.height - self.y - Theme.space-3;
-        accessible-role: button;
-        clicked => { root.link-activated(); }
-
-        link-text := Text {
-            width: 100%;
-            height: 100%;
-            text: root.link-label;
-            color: Theme.accent-default;
-            font-size: Theme.text-body.size;
-        }
-    }
-
-    dismiss-area := TouchArea {
-        x: parent.width - Theme.space-3 - 12px;
-        y: Theme.space-3;
-        width: 12px;
-        height: 12px;
-        enabled: root.toast-open;
-        clicked => { root.dismissed(); }
-        Image {
-            source: @image-url("../../../../assets/icons/x.svg");
-            colorize: Theme.text-secondary;
-            width: 12px;
-            height: 12px;
         }
     }
 }
@@ -443,6 +363,7 @@ export component FFExportDialog inherits FFModalPanel {
                     text: row.label;
                 }
                 FFMenu {
+                    name: row.label;
                     x: 128px;
                     width: 110px;
                     label: row.value-text;
@@ -508,6 +429,7 @@ export component FFExportDialog inherits FFModalPanel {
             text: "Metadata";
         }
         FFToggle {
+            name: "Metadata";
             x: 0px;
             // 2px above the label's own top: a toggle's knob sits taller
             // than a text row's cap-height, so this aligns their centers.

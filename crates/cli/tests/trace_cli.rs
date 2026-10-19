@@ -307,7 +307,7 @@ fn chrome_trace_nesting() {
         "cpu_submissions",
         "buffer_creations",
         "readback_bytes",
-        "fuse_equalize_ns",
+        "prepare_equalize_ns",
     ] {
         let _ = summary_u64(summary[0], field);
     }
@@ -329,8 +329,8 @@ fn chrome_trace_nesting() {
         );
     }
     assert!(
-        summary_u64(summary[0], "fuse_equalize_ns") > 0,
-        "the default brightness equalization is charged to fuse_equalize_ns: {summary:?}"
+        summary_u64(summary[0], "prepare_equalize_ns") > 0,
+        "the default brightness equalization is charged to prepare_equalize_ns: {summary:?}"
     );
     for capability in [
         "gpu_execution_available",

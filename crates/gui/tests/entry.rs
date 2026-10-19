@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use focusforge_gui::entry::ImportRefused;
+use focusforge_gui::job::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome, ShellMode};
 use slint::ComponentHandle;
@@ -173,22 +174,73 @@ fn drop_of_several_files_is_one_open() {
 // The two refusals, and the not-an-error skip.
 // ---------------------------------------------------------------------
 
+/// The refusal body for a folder holding nothing the open path reads: it
+/// names every accepted source family (checked against the extension
+/// constants the open path scans with), names no PNG/JPEG, and leaves the
+/// way out to the dialog's button.
+fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutcome) {
+    match outcome {
+        OpenOutcome::Refused(EntryError::NoReadableFrames { .. }) => {}
+        OpenOutcome::Refused(other) => panic!("expected NoReadableFrames, got {other}"),
+        _ => panic!("a folder without readable frames must be refused"),
+    }
+    let body = controller
+        .last_refusal()
+        .expect("a refusal message must be recorded");
+    for extension in TIFF_EXTENSIONS {
+        assert!(
+            body.contains(&format!(".{extension}")),
+            "the body must name .{extension}: {body}"
+        );
+    }
+    assert!(
+        body.contains("RAW"),
+        "the body must name camera RAW: {body}"
+    );
+    for extension in PNG_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
+        assert!(
+            !body.to_lowercase().contains(&format!(".{extension}")),
+            "the body must not name .{extension}: {body}"
+        );
+    }
+    assert!(!body.contains("PNG") && !body.contains("JPEG"), "{body}");
+    assert!(
+        !body.contains("Pick another folder"),
+        "the button carries the offer, not the body: {body}"
+    );
+}
+
 #[test]
 fn empty_folder_is_refused_with_a_fix() {
     let root = tree("entry_empty_folder");
     let mut controller = AppController::new();
-    match common::open_and_settle(&mut controller, &[root]) {
-        OpenOutcome::Refused(EntryError::NoReadableFrames { .. }) => {}
-        OpenOutcome::Refused(other) => panic!("expected NoReadableFrames, got {other}"),
-        _ => panic!("an empty folder must be refused"),
-    }
-    let refusal = controller
-        .last_refusal()
-        .expect("a refusal message must be recorded");
-    assert_eq!(
-        refusal,
-        "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none. \
-         Pick another folder…"
+    let outcome = common::open_and_settle(&mut controller, &[root]);
+    assert_no_readable_frames_body(&controller, outcome);
+}
+
+#[test]
+fn png_and_jpeg_only_folder_is_refused() {
+    let root = tree("entry_png_jpeg_folder");
+    std::fs::write(root.join("a.png"), b"not decoded").unwrap();
+    std::fs::write(root.join("b.jpg"), b"not decoded").unwrap();
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &[root]);
+    assert_no_readable_frames_body(&controller, outcome);
+}
+
+#[test]
+fn raw_only_folder_opens() {
+    let root = tree("entry_raw_folder");
+    std::fs::copy(
+        common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng"),
+        root.join("frame.dng"),
+    )
+    .unwrap();
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &[root]);
+    assert!(
+        matches!(outcome, OpenOutcome::Opened(_)),
+        "a folder holding only a camera RAW file must open"
     );
 }
 
@@ -251,15 +303,43 @@ fn skipped_subfolders_are_reported_not_failed() {
     let outcome = common::open_and_settle(&mut controller, &[root]);
     assert!(matches!(outcome, OpenOutcome::Opened(_)));
     assert_eq!(controller.project_tabs().len(), 1);
-    let notice = controller
-        .notice()
+    let record = controller
+        .notifications()
+        .first()
         .expect("the skipped subfolder must be reported");
-    assert!(notice.contains("1 subfolder"));
-    assert!(notice.contains("skipped"));
+    assert_eq!(record.title, "Some images were skipped");
+    assert!(record.message.contains("thumbs"), "{}", record.message);
+    assert!(record.message.starts_with("1 subfolder skipped"));
     assert!(
         controller.last_refusal().is_none(),
         "a skipped subfolder is not a failure"
     );
+}
+
+#[test]
+fn two_skipped_subfolders_make_one_record_naming_both_paths() {
+    let root = tree("entry_two_skipped");
+    copy_frame(&root.join("subject"), "00.tif", 0);
+    for name in ["thumbs", "notes"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("readme.txt"), b"not a frame").unwrap();
+    }
+
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(controller.notifications().len(), 1, "one open, one record");
+    let record = &controller.notifications()[0];
+    assert_eq!(record.title, "Some images were skipped");
+    assert!(record.message.starts_with("2 subfolders skipped"));
+    for name in ["thumbs", "notes"] {
+        let full = root.join(name).display().to_string();
+        assert!(
+            record.message.contains(&full),
+            "{full} in {}",
+            record.message
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

@@ -43,4 +43,4 @@ tiff = { version = "0.11.3", default-features = false, features = ["lzw", "defla
 zune-jpeg = "0.5.15"
 # Reading a written bundle back, with the same pinned feature set the
 # writer uses.
-zip = { version = "8.6.0", default-features = false }
+zip = { version = "9.0.4", default-features = false }

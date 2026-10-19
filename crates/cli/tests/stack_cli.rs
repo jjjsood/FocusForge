@@ -1583,22 +1583,41 @@ fn equalize_set_enables_it_and_reports_every_frames_gain() {
     );
     let eq = &report["equalization"];
     assert_eq!(eq["max_gain"], 1.25);
-    assert_eq!(eq["reference"], 3, "the middle frame of eight");
+    assert_eq!(eq["target_stops"], 0.0);
+    let (neutral, target) = (
+        eq["neutral"].as_f64().unwrap(),
+        eq["target"].as_f64().unwrap(),
+    );
+    assert!(neutral > 0.0 && (neutral - target).abs() < 1e-9, "{eq}");
     let frames = eq["frames"].as_array().expect("one entry per frame");
     assert_eq!(
         frames.len(),
         report["frame_count"].as_u64().unwrap() as usize
     );
     for frame in frames {
-        for key in ["estimated", "applied", "clamped", "thin", "samples"] {
+        for key in [
+            "mean",
+            "estimated",
+            "applied",
+            "gain",
+            "clamped",
+            "black",
+            "clipped_samples",
+            "output_mean",
+            "residual",
+        ] {
             assert!(frame.get(key).is_some(), "{key} in {frame}");
         }
         assert_eq!(frame["clamped"], false, "{frame}");
-        assert_eq!(frame["thin"], false, "{frame}");
+        assert_eq!(frame["black"], false, "{frame}");
         let applied = frame["applied"].as_f64().unwrap();
         assert!((0.9..1.1).contains(&applied), "{frame}");
+        let residual = frame["residual"].as_f64().unwrap();
+        assert!(
+            residual.abs() <= 1.0 || frame["clipped_samples"] != 0,
+            "{frame}"
+        );
     }
-    assert_eq!(frames[3]["applied"], 1.0, "the reference keeps unit gain");
 }
 
 #[test]
@@ -1714,6 +1733,23 @@ fn equalize_settings_out_of_range_or_of_the_wrong_kind_are_refused_before_any_fr
     for (setting, names) in [
         ("equalize-max-gain=3", ["equalize-max-gain", "3", "2"]),
         ("equalize=maybe", ["equalize", "maybe", "bool"]),
+        ("equalize-target=0.6", ["equalize-target", "0.6", "0.5"]),
+        (
+            "equalize-target=-0.51",
+            ["equalize-target", "-0.51", "-0.5"],
+        ),
+        (
+            "equalize-target=NaN",
+            ["equalize-target", "NaN", "equalize-target"],
+        ),
+        (
+            "equalize-target=inf",
+            ["equalize-target", "inf", "equalize-target"],
+        ),
+        (
+            "equalize-target=bright",
+            ["equalize-target", "bright", "equalize-target"],
+        ),
     ] {
         let out = run_cli_in(
             &cwd,

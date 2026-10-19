@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The source-presentation choice, with cancellable keyboard navigation.
+
+import { Theme } from "../../theme.slint";
+import { ShellGeometry } from "../../geometry.slint";
+import { FFErrorRow } from "../../components/ff_error_row.slint";
+import { FFMenu } from "../../components/ff_menu.slint";
+import { FFRowText } from "../../components/ff_row_text.slint";
+import { FFSettingsRow } from "../../components/ff_settings_row.slint";
+import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+
+export component FFAppearanceTab inherits Rectangle {
+    in property <string> presentation: "image-list";
+    in property <bool> menu-open: false;
+    in property <bool> menu-focused: false;
+    in property <bool> menu-disabled: false;
+    in property <string> save-error: "";
+    callback presentation-selected(string);
+    callback menu-toggled();
+
+    property <int> pending-index: root.presentation == "list" ? 0
+        : root.presentation == "large" ? 2 : 1;
+    changed menu-open => {
+        if root.menu-open {
+            root.pending-index = root.presentation == "list" ? 0
+                : root.presentation == "large" ? 2 : 1;
+        }
+    }
+
+    property <string> presentation-label: root.presentation == "list" ? "List"
+        : root.presentation == "large" ? "Large previews" : "Image list";
+
+    VerticalLayout {
+        padding-left: ShellGeometry.settings-content-inset-left;
+        padding-right: ShellGeometry.settings-content-inset-right;
+        padding-top: ShellGeometry.settings-content-inset-top;
+        padding-bottom: ShellGeometry.settings-content-inset-bottom;
+        spacing: Theme.space-2;
+        alignment: start;
+
+        FFSettingsSection {
+            heading: "SOURCE IMAGES";
+
+            FFSettingsRow {
+                label: "Presentation";
+                align-end: true;
+
+                FFMenu {
+                    name: "Presentation";
+                    width: ShellGeometry.settings-field-width;
+                    label: root.presentation-label;
+                    choices: ["List", "Image list", "Large previews"];
+                    choice-ids: ["list", "image-list", "large"];
+                    show-choice-ids: false;
+                    selected: root.presentation;
+                    open: root.menu-open;
+                    focused: root.menu-focused;
+                    focused-index: root.pending-index;
+                    disabled: root.menu-disabled;
+                    toggled => { root.menu-toggled(); }
+                    option-selected(choice) => { root.presentation-selected(choice); }
+                    previous-requested => {
+                        if root.menu-open { root.pending-index = max(0, root.pending-index - 1); }
+                        else { root.menu-toggled(); }
+                    }
+                    next-requested => {
+                        if root.menu-open { root.pending-index = min(2, root.pending-index + 1); }
+                        else { root.menu-toggled(); }
+                    }
+                    accepted => {
+                        if root.menu-open {
+                            root.presentation-selected(root.pending-index == 0 ? "list"
+                                : root.pending-index == 2 ? "large" : "image-list");
+                        } else { root.menu-toggled(); }
+                    }
+                    dismissed => { if root.menu-open { root.menu-toggled(); } }
+                }
+            }
+        }
+
+        FFRowText {
+            text: "Previews show original source images.";
+            vertical-alignment: top;
+        }
+        FFRowText {
+            text: "Editor source legend stays compact and read-only.";
+            vertical-alignment: top;
+        }
+
+        if root.save-error != "": VerticalLayout {
+            spacing: Theme.space-2;
+            padding-top: Theme.space-2;
+
+            FFErrorRow {
+                width: parent.width;
+                message: root.save-error;
+                show-icon: true;
+                wrap-message: true;
+            }
+            FFRowText {
+                text: "The selected view is active for this session.";
+                vertical-alignment: top;
+            }
+        }
+    }
+}

@@ -4,7 +4,7 @@
 //! can be observed without a person in front of it.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screenshot};
+use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, picker, screenshot};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
@@ -64,9 +64,25 @@ struct Args {
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Opens the settings modal on the named section at startup:
-    /// `performance`, `storage`, `input-map`, `diagnostics` or `about`.
+    /// `performance`, `appearance`, `storage`, `input-map`, `diagnostics` or `about`.
     #[arg(long)]
     settings_section: Option<String>,
+    /// Displays one Appearance design state at startup. This does not load,
+    /// apply or persist a source-presentation preference.
+    #[arg(long, value_enum)]
+    appearance_preview: Option<AppearancePreview>,
+    /// Displays a deterministic compact Images-panel state for native
+    /// inspection without reading source files.
+    #[arg(long, value_enum, conflicts_with = "open")]
+    list_preview: Option<ListPreview>,
+    /// Displays deterministic Image list states for native inspection without
+    /// reading source files.
+    #[arg(long, value_enum, conflicts_with_all = ["open", "list_preview"])]
+    image_list_preview: Option<ImageListPreview>,
+    /// Displays deterministic Large preview states for native inspection
+    /// without reading source files.
+    #[arg(long, value_enum, conflicts_with_all = ["open", "list_preview", "image_list_preview"])]
+    large_preview: Option<LargePreview>,
     /// Selects the dock's tab row at startup: `images` or `settings`.
     #[arg(long)]
     dock_tab: Option<String>,
@@ -87,7 +103,8 @@ struct Args {
     images_sort_menu_open: bool,
     /// Opens the projects overlay at startup, for inspecting every state of
     /// this surface with no click sequence. With `--fuse-tabs`, it opens once
-    /// the last run settles instead.
+    /// the last run settles instead. With `--open`, it stays open once the
+    /// load lands.
     #[arg(long)]
     projects_overlay: bool,
     /// Presses `Save project` once the last `--fuse-tabs` run settles,
@@ -129,16 +146,71 @@ struct Args {
     /// Selects these tab indices in turn and presses `Fuse stack` on each,
     /// right after `--open`, leaving the last one selected -- for
     /// inspecting a live run and the tabs queued behind it with no click
-    /// sequence. Comma-separated. An index repeated waits for every run to
-    /// settle before it is pressed again, so `0,0` fuses tab 0 twice.
+    /// sequence. Comma-separated. An index repeated waits until every earlier
+    /// run has settled and any Keep/Discard question has been answered in
+    /// the window, so `0,0` fuses tab 0 twice.
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
+    /// Holds the Nth fuse run started in this launch (counted from 1, a whole
+    /// number) in its fuse stage for `--slow-run-seconds`. Other runs keep
+    /// their speed.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_run: Option<String>,
+    /// Minimum fuse running time, in whole seconds, of the run `--slow-run`
+    /// selects. Defaults to 150.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_run_seconds: Option<String>,
+    /// Holds every folder or project load for this many whole seconds before
+    /// it reads anything.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_open: Option<String>,
+    /// Writes every project save and image export into this existing folder
+    /// under its proposed file name, with no save dialog.
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    save_folder: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum ScreenshotWindow {
     Main,
     Comparison,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AppearancePreview {
+    Default,
+    Focus,
+    Open,
+    Disabled,
+    SaveError,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ListPreview {
+    Complete,
+    Dragging,
+    Empty,
+    Editor,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ImageListPreview {
+    Complete,
+    States,
+    Tooltip,
+    Dragging,
+    Empty,
+    Editor,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LargePreview {
+    Complete,
+    States,
+    Tooltip,
+    Dragging,
+    Empty,
+    Editor,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -149,28 +221,9 @@ enum UndockPane {
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
 
-/// Sets the toolbar's and the bottom bar's transport preview together, from
-/// literal values with no controller or job behind them -- for inspecting a
-/// state no click sequence currently reaches.
-fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
-    app.set_toolbar_run_state(state.into());
-    let (stage_word, step_text, fraction, tone, eta) = match state {
-        "running" => ("Aligning", "42 of 61", 0.62, "running", "ETA 1:12"),
-        "paused" => ("Paused", "", 0.62, "held", "ETA —"),
-        "cancelling" => ("Cancelling", "", 0.0, "held", "ETA —"),
-        "failed" => ("Failed", "", 0.28, "failed", "ETA —"),
-        _ => ("", "", 0.0, "held", ""),
-    };
-    app.set_stage_word(stage_word.into());
-    app.set_step_text(step_text.into());
-    app.set_bar_fraction(fraction);
-    app.set_bar_tone(tone.into());
-    app.set_eta_text(eta.into());
-}
-
 /// Sets the export modal's own state directly, with no controller or
-/// worker behind it -- `apply_toolbar_state_preview`'s twin, for inspecting
-/// the writing/refused states no click sequence quickly reaches.
+/// worker behind it, for inspecting the writing/refused states no click
+/// sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
     // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
@@ -224,13 +277,12 @@ struct FuseTabsFollowUp {
     cancel_quit_after: Option<u64>,
 }
 
-/// Presses `Fuse stack` on each of `indices` in turn, the moment no
-/// background load (`--open`) is still in flight. A press fired while a
-/// load is still running targets a tab that does not exist yet and is
-/// silently dropped, since `--open`'s directory walk and thumbnail decode
-/// run off the event-loop thread and settle only once the window's own poll
-/// picks up their result. An index already pressed waits until no run is
-/// pending, since a press on a tab already running or queued is ignored.
+/// Presses `Fuse stack` on each of `indices` in turn, once every `--open`
+/// load has settled (`open_timer` is the load timer starting them): an
+/// earlier press for a tab not yet open lands on the tab before it and is
+/// ignored. An index already pressed waits until no run is pending and no
+/// tab holds a Keep/Discard question; a press on a parked tab would
+/// discard its result.
 /// Once every press is made and every run settled, `save` presses `Save
 /// project` on the proposed path, `overlay` opens the projects overlay, and
 /// `enter_editor` selects editor mode.
@@ -240,6 +292,7 @@ fn start_fuse_tabs_timer(
     slot: &Rc<RefCell<Option<slint::Timer>>>,
     indices: Vec<usize>,
     follow_up: FuseTabsFollowUp,
+    open_timer: &Rc<RefCell<Option<slint::Timer>>>,
 ) {
     let FuseTabsFollowUp {
         save,
@@ -250,6 +303,7 @@ fn start_fuse_tabs_timer(
         cancel_quit_after,
     } = follow_up;
     let timer_slot = slot.clone();
+    let open_timer = open_timer.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
     let mut pressed: Vec<usize> = Vec::new();
     let timer = slint::Timer::default();
@@ -257,11 +311,19 @@ fn start_fuse_tabs_timer(
         let Some(app) = app_weak.upgrade() else {
             return;
         };
-        if controller.lock().unwrap().load_in_flight() {
+        if controller.lock().unwrap().load_in_flight()
+            || open_timer
+                .borrow()
+                .as_ref()
+                .is_some_and(slint::Timer::running)
+        {
             return;
         }
         while let Some(&index) = pending.front() {
-            if pressed.contains(&index) && controller.lock().unwrap().work_pending() {
+            if pressed.contains(&index) && {
+                let controller = controller.lock().unwrap();
+                controller.work_pending() || controller.parked_run_waiting()
+            } {
                 return;
             }
             pending.pop_front();
@@ -284,7 +346,7 @@ fn start_fuse_tabs_timer(
             controller
                 .lock()
                 .unwrap()
-                .save_active_project(|proposed| Some(proposed.to_path_buf()));
+                .save_active_project(|proposed| Some(save_destination(proposed)));
         }
         if close {
             let mut controller = controller.lock().unwrap();
@@ -338,7 +400,7 @@ fn start_export_active_row_timer(
             }
             let mut controller = controller.lock().unwrap();
             controller.checkpoint_export_requested();
-            controller.export_confirmed(|proposed| Some(proposed.to_path_buf()));
+            controller.export_confirmed(|proposed| Some(save_destination(proposed)));
             started = controller.take_export_started();
             pressed = true;
             bridge::push_export_dialog(&app, &controller);
@@ -881,6 +943,586 @@ fn install_input_table(
     }
 }
 
+fn apply_appearance_preview(app: &AppWindow, preview: Option<AppearancePreview>) {
+    let (presentation, menu_open, menu_focused, menu_disabled, save_error) = match preview {
+        Some(AppearancePreview::Focus) => ("list", false, true, false, ""),
+        Some(AppearancePreview::Open) => ("image-list", true, false, false, ""),
+        Some(AppearancePreview::Disabled) => ("image-list", false, false, true, ""),
+        Some(AppearancePreview::SaveError) => (
+            "image-list",
+            false,
+            false,
+            false,
+            "Could not save settings. Previous saved view kept.",
+        ),
+        Some(AppearancePreview::Default) | None => ("image-list", false, false, false, ""),
+    };
+    app.set_appearance_presentation(presentation.into());
+    app.set_appearance_menu_open(menu_open);
+    app.set_appearance_menu_focused(menu_focused);
+    app.set_appearance_menu_disabled(menu_disabled);
+    app.set_appearance_save_error(save_error.into());
+}
+
+fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRowView {
+    focusforge_gui::ImageRowView {
+        chip: slint::Color::from_rgb_u8(chip[0], chip[1], chip[2]),
+        name: name.into(),
+        time_text: time.into(),
+        capture_stamp: "".into(),
+        excluded: false,
+        unresolved: false,
+        selected: false,
+        hovered: false,
+        focused: false,
+        job_disabled: false,
+        preview: preview_image(),
+        preview_state: "ready".into(),
+    }
+}
+
+fn preview_image() -> slint::Image {
+    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(2, 2);
+    pixels.make_mut_bytes().copy_from_slice(&[
+        220, 201, 55, 255, 112, 132, 48, 255, 160, 222, 58, 255, 180, 171, 53, 255,
+    ]);
+    slint::Image::from_rgba8(pixels)
+}
+
+fn image_list_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRowView {
+    let mut row = preview_row(chip, name, time);
+    row.capture_stamp = time.into();
+    row
+}
+
+/// Installs native-inspection data for the compact source-list surface.
+/// The normal source model continues to own all live rows and interactions.
+fn apply_list_preview(app: &AppWindow, preview: Option<ListPreview>) {
+    let Some(preview) = preview else {
+        return;
+    };
+
+    let (mode, header, rows, dragging, target, offset) = match preview {
+        ListPreview::Complete | ListPreview::Dragging => (
+            "stacking",
+            "6 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: true,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([220, 201, 55], "IMG_9819.tif", "16:42:09")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: true,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([180, 171, 53], "IMG_9820.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: true,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([112, 132, 48], "IMG_9823.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: true,
+                    job_disabled: true,
+                    ..preview_row([160, 222, 58], "IMG_9824.tif", "16:42:09")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([220, 201, 55], "IMG_9819-long-filename.tif", "16:42:09")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([220, 201, 55], "IMG_9825.tif", "16:44:11")
+                },
+            ],
+            if matches!(preview, ListPreview::Dragging) {
+                4
+            } else {
+                -1
+            },
+            if matches!(preview, ListPreview::Dragging) {
+                3
+            } else {
+                -1
+            },
+            if matches!(preview, ListPreview::Dragging) {
+                -26.0
+            } else {
+                0.0
+            },
+        ),
+        ListPreview::Empty => ("stacking", "0 images", Vec::new(), -1, -1, 0.0),
+        ListPreview::Editor => (
+            "editor",
+            "Source legend",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([220, 201, 55], "IMG_9819.tif", "10")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([180, 171, 53], "IMG_9820.tif", "11")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([160, 222, 58], "IMG_9821.tif", "12")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    ..preview_row([112, 132, 48], "IMG_9822.tif", "13")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+        ),
+    };
+
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode(mode.into());
+    app.set_list_preview_presentation("list".into());
+    app.set_list_preview_header_text(header.into());
+    app.set_list_preview_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    app.set_list_preview_drag_offset(offset);
+    app.set_list_preview_dragging_row(dragging);
+    app.set_list_preview_drag_target_row(target);
+}
+
+/// Installs bounded source-view examples for the Image list inspection path.
+/// It shares the static dock seam with List while leaving controller data intact.
+fn apply_image_list_preview(app: &AppWindow, preview: Option<ImageListPreview>) {
+    let Some(preview) = preview else {
+        return;
+    };
+
+    let (header, rows, dragging, target, offset, editor) = match preview {
+        ImageListPreview::Complete => (
+            "4 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: true,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9819.tif", "11.10.26\n16:42")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: true,
+                    unresolved: false,
+                    selected: false,
+                    hovered: true,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9820.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: true,
+                    job_disabled: true,
+                    preview_state: "ready".into(),
+                    ..image_list_row([112, 132, 48], "IMG_9823.tif", "11.10.26\n16:43")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([160, 222, 58], "IMG_9824.tif", "11.10.26\n16:44")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+            false,
+        ),
+        ImageListPreview::States => (
+            "3 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: true,
+                    job_disabled: false,
+                    preview_state: "loading".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9821.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: true,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "missing".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9822.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: true,
+                    focused: true,
+                    job_disabled: false,
+                    preview_state: "error".into(),
+                    ..image_list_row([160, 222, 58], "IMG_9824.tif", "11.10.26\n16:44")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+            false,
+        ),
+        ImageListPreview::Tooltip => (
+            "1 image",
+            vec![focusforge_gui::ImageRowView {
+                excluded: false,
+                unresolved: false,
+                selected: false,
+                hovered: false,
+                focused: false,
+                job_disabled: false,
+                preview_state: "ready".into(),
+                ..image_list_row(
+                    [220, 201, 55],
+                    "IMG_9819_composite-exposure-calibrated-master-source-frame.tif",
+                    "11.10.26\n16:42",
+                )
+            }],
+            -1,
+            -1,
+            0.0,
+            false,
+        ),
+        ImageListPreview::Dragging => (
+            "3 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9819.tif", "11.10.26\n16:42")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9820.tif", "11.10.26\n16:42")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([160, 222, 58], "IMG_9821.tif", "11.10.26\n16:42")
+                },
+            ],
+            1,
+            0,
+            -120.0,
+            false,
+        ),
+        ImageListPreview::Empty => ("0 images", Vec::new(), -1, -1, 0.0, false),
+        ImageListPreview::Editor => (
+            "Source legend",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9819.tif", "10")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9820.tif", "11")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+            true,
+        ),
+    };
+
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode(if editor { "editor" } else { "stacking" }.into());
+    app.set_list_preview_presentation("image-list".into());
+    app.set_list_preview_header_text(header.into());
+    app.set_list_preview_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    app.set_list_preview_dragging_row(dragging);
+    app.set_list_preview_drag_target_row(target);
+    app.set_list_preview_drag_offset(offset);
+}
+
+/// Installs bounded source-view examples for the Large preview inspection
+/// path. It shares Image list's preview-only seam and leaves controller data
+/// intact.
+fn apply_large_preview(app: &AppWindow, preview: Option<LargePreview>) {
+    let Some(preview) = preview else {
+        return;
+    };
+
+    let (header, rows, dragging, target, offset, editor) = match preview {
+        LargePreview::Complete => (
+            "3 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: true,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9819.tif", "16:42:09")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: true,
+                    unresolved: false,
+                    selected: false,
+                    hovered: true,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9820.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: true,
+                    job_disabled: true,
+                    preview_state: "ready".into(),
+                    ..image_list_row([112, 132, 48], "IMG_9823.tif", "16:43:11")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+            false,
+        ),
+        LargePreview::States => (
+            "3 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: true,
+                    job_disabled: false,
+                    preview_state: "loading".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9821.tif", "")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: true,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "missing".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9822.tif", "Unavailable")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: true,
+                    focused: true,
+                    job_disabled: false,
+                    preview_state: "error".into(),
+                    ..image_list_row([160, 222, 58], "IMG_9824.tif", "16:44:19")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+            false,
+        ),
+        LargePreview::Tooltip => (
+            "1 image",
+            vec![focusforge_gui::ImageRowView {
+                excluded: false,
+                unresolved: false,
+                selected: false,
+                hovered: false,
+                focused: false,
+                job_disabled: false,
+                preview_state: "ready".into(),
+                ..image_list_row(
+                    [220, 201, 55],
+                    "IMG_9819_composite-exposure-calibrated-master-source-frame.tif",
+                    "16:42:09",
+                )
+            }],
+            -1,
+            -1,
+            0.0,
+            false,
+        ),
+        LargePreview::Dragging => (
+            "3 images",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9819.tif", "16:42:09")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9820.tif", "16:42:37")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([160, 222, 58], "IMG_9821.tif", "16:43:02")
+                },
+            ],
+            1,
+            0,
+            -200.0,
+            false,
+        ),
+        LargePreview::Empty => ("0 images", Vec::new(), -1, -1, 0.0, false),
+        LargePreview::Editor => (
+            "Source legend",
+            vec![
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: true,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([220, 201, 55], "IMG_9819.tif", "10")
+                },
+                focusforge_gui::ImageRowView {
+                    excluded: false,
+                    unresolved: false,
+                    selected: false,
+                    hovered: false,
+                    focused: false,
+                    job_disabled: false,
+                    preview_state: "ready".into(),
+                    ..image_list_row([180, 171, 53], "IMG_9820.tif", "11")
+                },
+            ],
+            -1,
+            -1,
+            0.0,
+            true,
+        ),
+    };
+
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode(if editor { "editor" } else { "stacking" }.into());
+    app.set_list_preview_presentation("large".into());
+    app.set_list_preview_header_text(header.into());
+    app.set_list_preview_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    app.set_list_preview_dragging_row(dragging);
+    app.set_list_preview_drag_target_row(target);
+    app.set_list_preview_drag_offset(offset);
+}
+
 /// Sets the diagnostics directories, starts a scan for them on a background
 /// thread, and pushes the panel's first view -- which carries no rows yet,
 /// since nothing on this path reads either directory itself.
@@ -903,6 +1545,7 @@ fn install_diagnostics(
 /// for the session, never a reason the window fails to open.
 fn install_recent(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    app: &AppWindow,
     args: &Args,
 ) {
     let Some(config_dir) = resolve_config_dir(args) else {
@@ -914,10 +1557,79 @@ fn install_recent(
     let entries = focusforge_gui::recent::load(&config_dir);
     let choice = focusforge_gui::export_settings::load(&config_dir);
     let performance = focusforge_gui::performance_settings::load(&config_dir);
+    let appearance = focusforge_gui::appearance_settings::load(&config_dir);
     let mut controller = controller.lock().unwrap();
     controller.install_export_choice(choice);
     controller.install_performance(performance);
+    controller.install_appearance(appearance);
+    app.set_appearance_presentation(controller.source_presentation().slug().into());
     controller.install_recent(entries, config_dir);
+}
+
+/// Parses a whole number of at least 1; `None` for anything else, including
+/// a negative or non-numeric value.
+fn parse_positive(spec: &str) -> Option<u64> {
+    spec.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// Reads one slow-down option: logs the expected form and returns `None`
+/// for a value that does not parse, leaving that option off.
+fn slow_down_value(name: &str, spec: Option<&String>) -> Option<u64> {
+    let spec = spec?;
+    let parsed = parse_positive(spec);
+    if parsed.is_none() {
+        tracing::warn!("{name} expects a whole number of at least 1, got {spec:?}");
+    }
+    parsed
+}
+
+/// Installs `--slow-run`, `--slow-run-seconds` and `--slow-open` on the
+/// controller.
+fn install_slow_down(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    const DEFAULT_SLOW_RUN_SECONDS: u64 = 150;
+    let run = slow_down_value("--slow-run", args.slow_run.as_ref());
+    let seconds = slow_down_value("--slow-run-seconds", args.slow_run_seconds.as_ref());
+    let hold = slow_down_value("--slow-open", args.slow_open.as_ref());
+    let mut controller = controller.lock().unwrap();
+    if let Some(run) = run {
+        let floor = Duration::from_secs(seconds.unwrap_or(DEFAULT_SLOW_RUN_SECONDS));
+        controller.set_slow_run(run as usize, floor);
+    }
+    if let Some(hold) = hold {
+        controller.set_open_hold(Duration::from_secs(hold));
+    }
+}
+
+/// `proposed`, or its file name inside the save folder when one is set.
+fn save_destination(proposed: &Path) -> PathBuf {
+    picker::in_save_folder(proposed).unwrap_or_else(|| proposed.to_path_buf())
+}
+
+/// Hands `--save-folder` to the pickers. A folder that is missing, not a
+/// folder or not writable is logged and leaves the native save dialogs in
+/// place.
+fn install_save_folder(args: &Args) {
+    let Some(spec) = &args.save_folder else {
+        return;
+    };
+    let checked = std::fs::canonicalize(spec).and_then(|dir| {
+        if !dir.is_dir() {
+            return Err(std::io::Error::other("not a folder"));
+        }
+        let probe = dir.join(".focusforge-write-probe");
+        std::fs::File::create_new(&probe)?;
+        std::fs::remove_file(&probe)?;
+        Ok(dir)
+    });
+    match checked {
+        Ok(dir) => picker::set_save_folder(dir),
+        Err(cause) => tracing::warn!(
+            "--save-folder expects an existing folder you can write to, got {spec:?}: {cause}"
+        ),
+    }
 }
 
 fn main() -> ExitCode {
@@ -954,6 +1666,13 @@ fn run(args: &Args) -> ExitCode {
             .map(|s| format!("{:?}", s.slug()))
             .join(" or ");
         tracing::error!("--settings-section accepts {accepted}, got {section:?}");
+        return ExitCode::from(2);
+    }
+    if args.appearance_preview.is_some()
+        && args.settings_section.as_deref()
+            != Some(focusforge_gui::SettingsSection::Appearance.slug())
+    {
+        tracing::error!("--appearance-preview requires --settings-section appearance");
         return ExitCode::from(2);
     }
     if let Some(tab) = &args.dock_tab
@@ -999,20 +1718,27 @@ fn run(args: &Args) -> ExitCode {
             controller,
             job_timer,
             toast_timer,
+            preview_timer,
         } = bridge::install(&app, controller, canvas.clone(), toast_timer);
         let _ = &job_timer;
         let _ = &toast_timer;
+        let _ = &preview_timer;
 
         install_input_table(&controller, &app, args);
+        apply_appearance_preview(&app, args.appearance_preview);
         install_diagnostics(&controller, &app);
-        bridge::install_crash_notice(&controller, &app);
-        install_recent(&controller, args);
+        bridge::install_crash_notice(&controller, &app, &toast_timer);
+        install_recent(&controller, &app, args);
+        install_slow_down(&controller, args);
+        install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);
 
         if let Some(state) = &args.toolbar_state {
-            apply_toolbar_state_preview(&app, state.as_str());
+            let mut controller = controller.lock().unwrap();
+            controller.set_toolbar_preview(state.as_str());
+            bridge::push_job(&app, &controller.job_view());
         }
         if let Some(stage) = &args.export_dialog_preview {
             apply_export_dialog_preview(&app, stage.as_str());
@@ -1107,6 +1833,10 @@ fn run(args: &Args) -> ExitCode {
             controller.lock().unwrap().toggle_images_sort_menu();
         }
 
+        apply_list_preview(&app, args.list_preview);
+        apply_image_list_preview(&app, args.image_list_preview);
+        apply_large_preview(&app, args.large_preview);
+
         if args.projects_overlay && args.fuse_tabs.is_empty() {
             controller.lock().unwrap().toggle_projects_overlay();
         }
@@ -1140,6 +1870,7 @@ fn run(args: &Args) -> ExitCode {
                     enter_editor: args.enter_editor,
                     cancel_quit_after: args.cancel_quit_after,
                 },
+                &open_wait_timer,
             );
         }
 
@@ -1168,6 +1899,112 @@ mod tests {
         assert_ne!(old_setup, new_setup);
         assert!(!teardown_is_current(&generation, old_setup));
         assert!(teardown_is_current(&generation, new_setup));
+    }
+
+    /// With two `--open` folders, the second tab does not exist until the
+    /// load timer starts its load. A `--fuse-tabs` press for it must wait for
+    /// that tab instead of landing on the first one, which ignores it.
+    #[test]
+    fn fuse_tabs_press_for_a_later_open_waits_for_that_tab() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let dir = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            for index in 0..3 {
+                let frame = format!("{index:02}.tif");
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../fixtures/mantis-64/frames")
+                        .join(&frame),
+                    root.join(frame),
+                )
+                .unwrap();
+            }
+            root
+        };
+        let (first, second) = (folder("first"), folder("second"));
+        let mut state = AppController::new();
+        state.set_scratch_root_for_test(dir.path().join("scratch"));
+        let controller = Arc::new(Mutex::new(state));
+        let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+        let _installed = bridge::install(
+            &app,
+            controller.clone(),
+            canvas.clone(),
+            Rc::new(RefCell::new(None)),
+        );
+
+        // As `main` starts them: the first load settled, the rest left to
+        // the load timer, and the press timer created after it.
+        let load = controller
+            .lock()
+            .unwrap()
+            .open_paths(std::slice::from_ref(&first))
+            .expect("the first load starts");
+        load.join().unwrap();
+        controller.lock().unwrap().settle_open().unwrap();
+        let open_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        bridge::start_load_timer(
+            app.as_weak(),
+            controller.clone(),
+            canvas,
+            &open_slot,
+            vec![second],
+        );
+        let press_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        start_fuse_tabs_timer(
+            app.as_weak(),
+            controller.clone(),
+            &press_slot,
+            vec![0, 1],
+            FuseTabsFollowUp {
+                save: false,
+                close: false,
+                quit: false,
+                overlay: false,
+                enter_editor: false,
+                cancel_quit_after: None,
+            },
+            &open_slot,
+        );
+
+        let running = |slot: &Rc<RefCell<Option<slint::Timer>>>| {
+            slot.borrow().as_ref().is_some_and(slint::Timer::running)
+        };
+        let started = std::time::Instant::now();
+        loop {
+            i_slint_backend_testing::mock_elapsed_time(job::POLL);
+            // The load worker's completion event, which this backend has no
+            // event loop to deliver.
+            if controller.lock().unwrap().settle_open().is_some() {
+                bridge::push_projects(&app, &controller);
+            }
+            let idle = {
+                let controller = controller.lock().unwrap();
+                !controller.load_in_flight() && !controller.work_pending()
+            };
+            if idle && !running(&open_slot) && !running(&press_slot) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "runs never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(controller.project_tabs().len(), 2);
+        for tab in 0..2 {
+            controller.select_project(tab);
+            assert!(
+                controller.pending_divergence().is_some(),
+                "tab {tab} fused and parked at its own question"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

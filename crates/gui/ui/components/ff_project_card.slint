@@ -83,7 +83,10 @@ export component FFProjectCard inherits Rectangle {
             height: 100%;
             clicked => { root.clicked(); }
 
-            if root.opened && card-area.has-hover: TouchArea {
+            if root.opened && card-area.has-hover: close := TouchArea {
+                accessible-role: button;
+                accessible-enabled: true;
+                accessible-label: "Close";
                 x: 296px;
                 y: 10px;
                 width: 24px;

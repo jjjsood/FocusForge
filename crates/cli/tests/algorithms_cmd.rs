@@ -70,7 +70,6 @@ fn prints_a_full_schema() {
         "float",
         "0",
         "1",
-        "0.5",
         "mode",
         "enum",
         "fast",
@@ -93,9 +92,13 @@ fn reports_an_auto_hook_as_unevaluated() {
         "stdout: {stdout}"
     );
     assert!(stdout.contains("auto: none"), "stdout: {stdout}");
+    let threshold = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("threshold: "))
+        .expect("dummy-stack lists threshold");
     assert!(
-        stdout.contains("threshold: ") && stdout.contains("(Default)"),
-        "threshold's provenance with no --set must be Default, not Auto: {stdout}"
+        threshold.contains("default from the loaded frames") && !threshold.contains("value"),
+        "an auto parameter at its default reports a frame-derived default, not a value: {threshold}"
     );
     // A *stack* `auto` hook is still never evaluated here (no `(Auto)` ever
     // appears), but a host-derived default *is* evaluated -- `(Host)` is
@@ -108,6 +111,94 @@ fn reports_an_auto_hook_as_unevaluated() {
         stdout.contains("workers: ") && stdout.contains("(Host)"),
         "dummy-stack's host-derived `workers` parameter must report (Host): {stdout}"
     );
+}
+
+/// `stack --dry-run` on the `frames` of fixture `name`: the lines the
+/// resolved alignment values are printed on.
+fn dry_run_lines(fixture: &str) -> String {
+    let out_dir = common::tmp_dir(&format!("algorithms_cmd_dry_run_{fixture}"));
+    let frames = common::fixtures_dir().join(fixture).join("frames");
+    let output = bin()
+        .args(["-q", "stack"])
+        .arg(frames)
+        .arg("-o")
+        .arg(&*out_dir)
+        .args(["--algorithm", "laplacian", "--dry-run"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn pyramid_depth_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("pyramid-depth: "))
+        .expect("pyramidal-ecc lists pyramid-depth")
+}
+
+#[test]
+fn pyramid_depth_reports_size_derived_default() {
+    let output = bin()
+        .args(["algorithms", "pyramidal-ecc"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = pyramid_depth_line(&stdout);
+    assert!(line.contains("default from the loaded frames"), "{line}");
+    assert!(!line.contains("value 4 (Default)"), "{line}");
+    assert!(
+        stdout.contains("shorter side at 64 px or more"),
+        "the help names the 64 px rule: {stdout}"
+    );
+
+    let output = bin()
+        .args(["algorithms", "pyramidal-ecc", "--set", "pyramid-depth=2"])
+        .output()
+        .expect("failed to run binary");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        pyramid_depth_line(&stdout).contains("value 2 (Explicit)"),
+        "{stdout}"
+    );
+
+    assert!(
+        dry_run_lines("mantis-64").contains("pyramid-depth = 0 (Auto)"),
+        "a 64 px frame registers at full resolution only"
+    );
+    assert!(
+        dry_run_lines("mantis-512").contains("pyramid-depth = 3 (Auto)"),
+        "a 512 px frame gets three coarser levels"
+    );
+}
+
+#[test]
+fn pyramid_depth_out_of_range_is_rejected() {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let out_dir = common::tmp_dir("algorithms_cmd_depth_range");
+    let algorithms = bin()
+        .args(["algorithms", "pyramidal-ecc", "--set", "pyramid-depth=17"])
+        .output()
+        .expect("failed to run binary");
+    let stack = bin()
+        .args(["-q", "stack"])
+        .arg(frames)
+        .arg("-o")
+        .arg(&*out_dir)
+        .args(["--algorithm", "laplacian", "--dry-run"])
+        .args(["--align-set", "pyramid-depth=17"])
+        .output()
+        .expect("failed to run binary");
+    for output in [algorithms, stack] {
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("pyramid-depth: value 17 is outside the allowed range [0, 16]"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]
@@ -278,7 +369,16 @@ fn project_params_json_lists_every_project_descriptor() {
         .as_array()
         .expect("a project_params array");
     let ids: Vec<&str> = params.iter().map(|p| p["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["align", "auto-crop", "equalize", "equalize-max-gain"]);
+    assert_eq!(
+        ids,
+        [
+            "align",
+            "auto-crop",
+            "equalize",
+            "equalize-max-gain",
+            "equalize-target"
+        ]
+    );
     for (json, desc) in params
         .iter()
         .zip(focusforge_core::project::PROJECT_PARAMS.iter())
@@ -290,6 +390,19 @@ fn project_params_json_lists_every_project_descriptor() {
     let equalize = params.iter().find(|p| p["id"] == "equalize").unwrap();
     let help = equalize["help"].as_str().unwrap();
     assert!(help.contains("not a linear-light correction"), "{help}");
+    let target = params
+        .iter()
+        .find(|p| p["id"] == "equalize-target")
+        .unwrap();
+    assert_eq!(target["label"], "Target brightness (stops)");
+    assert_eq!(target["value"], 0.0);
+    assert!(
+        target["help"]
+            .as_str()
+            .unwrap()
+            .contains("0.0 keeps the mean encoded brightness of the stacked sources"),
+        "{target}"
+    );
 }
 
 /// Each fusion method's entry carries the project defaults a run with that
@@ -352,7 +465,7 @@ fn project_params_text_listing_names_them_after_the_algorithms() {
             entry.id()
         );
     }
-    for id in ["auto-crop", "equalize-max-gain"] {
+    for id in ["auto-crop", "equalize-max-gain", "equalize-target"] {
         assert!(stdout.contains(&format!("{id} - ")), "{id} in {stdout}");
     }
 }

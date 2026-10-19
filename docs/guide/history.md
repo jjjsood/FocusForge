@@ -21,7 +21,8 @@ the time it was made.
   briefly. The button is enabled while there are unsaved strokes.
 - **Delete** — hover a row and click its trash icon. The dialog names the
   checkpoint and says the others are untouched. The last remaining
-  checkpoint cannot be deleted.
+  checkpoint cannot be deleted. Deleting the checkpoint you are looking at
+  shows the newest remaining one, unless the tab holds unsaved strokes.
 - **Export image** — the panel header's button exports the checkpoint you
   are looking at; see [exporting](gui.md#exporting-an-image).
 

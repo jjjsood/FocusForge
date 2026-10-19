@@ -246,6 +246,7 @@ pub(super) fn full_blob<'a>(
 }
 
 use crate::algorithm::StackAlgorithm;
+use crate::equalize::EqualizeSettings;
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
 use crate::tile::Rect;
 
@@ -283,18 +284,18 @@ pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     }]
 });
 
-/// The project parameters that change the frames before fusing: the two
-/// brightness-equalization parameters. The settings panel's prepare section
-/// renders exactly this schema.
+/// The project parameters that change the frames before alignment and
+/// fusing: the brightness-equalization parameters. The settings panel's
+/// prepare section renders exactly this schema.
 pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
         ParamDesc {
             id: "equalize".to_string(),
             label: "Equalize brightness".to_string(),
             help: "Gives every frame one gain, the same on every channel, \
-                   matching the reference frame's (the alignment's, otherwise \
-                   the middle one) mid-tone brightness; scales encoded code \
-                   values as delivered and is not a linear-light correction."
+                   bringing its mean brightness to one target shared by all \
+                   frames before they are aligned; scales encoded code values \
+                   as delivered and is not a linear-light correction."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(true),
@@ -317,6 +318,27 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 logarithmic: false,
             },
             default: ParamValue::Float(1.25),
+            advanced: true,
+            auto: None,
+            host_default: None,
+        },
+        ParamDesc {
+            id: "equalize-target".to_string(),
+            label: "Target brightness (stops)".to_string(),
+            help: "Only used when brightness equalization is on; 0.0 keeps the \
+                   mean encoded brightness of the stacked sources and this \
+                   value scales that shared target in stops (one stop doubles \
+                   it), the same for every source; scales encoded code values \
+                   as delivered and is not a linear-light correction, and \
+                   source files stay unchanged."
+                .to_string(),
+            kind: ParamKind::Float {
+                min: -0.5,
+                max: 0.5,
+                step: 0.1,
+                logarithmic: false,
+            },
+            default: ParamValue::Float(0.0),
             advanced: true,
             auto: None,
             host_default: None,
@@ -370,10 +392,13 @@ pub fn params_for_group(group: &[ParamDesc], method: &dyn StackAlgorithm) -> Vec
         .collect()
 }
 
-/// The gain bound brightness equalization runs with, `None` when the
+/// The settings brightness equalization runs with, `None` when the
 /// `equalize` switch is off. An absent key reads as its default in `schema`,
 /// the schema [`params_for`] returns for the run's fusion method.
-pub fn equalization_bound(schema: &[ParamDesc], values: &ParamValues) -> Option<f64> {
+pub fn equalization_settings(
+    schema: &[ParamDesc],
+    values: &ParamValues,
+) -> Option<EqualizeSettings> {
     let read = |id: &str| {
         let desc = schema
             .iter()
@@ -381,10 +406,12 @@ pub fn equalization_bound(schema: &[ParamDesc], values: &ParamValues) -> Option<
             .expect("the project schema declares the equalization parameters");
         values.get(id).unwrap_or(&desc.default).clone()
     };
-    read("equalize")
-        .as_bool()
-        .filter(|&on| on)
-        .and_then(|_| read("equalize-max-gain").as_f64())
+    read("equalize").as_bool().filter(|&on| on).and_then(|_| {
+        Some(EqualizeSettings {
+            max_gain: read("equalize-max-gain").as_f64()?,
+            target_stops: read("equalize-target").as_f64()?,
+        })
+    })
 }
 
 /// The project file's extension.
@@ -897,11 +924,17 @@ mod tests {
     }
 
     #[test]
-    fn project_params_hold_align_auto_crop_and_the_two_equalization_descriptors() {
+    fn project_params_hold_align_auto_crop_and_the_equalization_descriptors() {
         let ids: Vec<&str> = PROJECT_PARAMS.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["align", "auto-crop", "equalize", "equalize-max-gain"]
+            vec![
+                "align",
+                "auto-crop",
+                "equalize",
+                "equalize-max-gain",
+                "equalize-target"
+            ]
         );
 
         let align = desc("align");
@@ -934,6 +967,19 @@ mod tests {
         );
         assert_eq!(bound.default, ParamValue::Float(1.25));
 
+        let target = desc("equalize-target");
+        assert_eq!(target.label, "Target brightness (stops)");
+        assert_eq!(
+            target.kind,
+            ParamKind::Float {
+                min: -0.5,
+                max: 0.5,
+                step: 0.1,
+                logarithmic: false
+            }
+        );
+        assert_eq!(target.default, ParamValue::Float(0.0));
+
         for d in PROJECT_PARAMS.iter() {
             assert!(d.auto.is_none() && d.host_default.is_none(), "{}", d.id);
         }
@@ -941,7 +987,9 @@ mod tests {
 
     #[test]
     fn the_equalization_descriptors_are_advanced_and_no_registered_id_collides() {
-        assert!(desc("equalize").advanced && desc("equalize-max-gain").advanced);
+        for id in ["equalize", "equalize-max-gain", "equalize-target"] {
+            assert!(desc(id).advanced, "{id}");
+        }
         for algorithm in crate::registry::stack_algorithms() {
             for p in algorithm.params() {
                 assert!(
@@ -956,7 +1004,7 @@ mod tests {
 
     #[test]
     fn the_equalization_help_states_what_it_is_and_is_not() {
-        for id in ["equalize", "equalize-max-gain"] {
+        for id in ["equalize", "equalize-max-gain", "equalize-target"] {
             let help = desc(id).help.to_lowercase();
             assert!(help.contains("encoded code values"), "{id}: {help}");
             assert!(
@@ -968,6 +1016,17 @@ mod tests {
         assert!(!switch.contains("depends on the fusion method"), "{switch}");
         let bound = &desc("equalize-max-gain").help;
         assert!(bound.contains("0.8") && bound.contains("1.25"), "{bound}");
+        let target = &desc("equalize-target").help;
+        assert!(
+            target.contains("0.0 keeps the mean encoded brightness of the stacked sources")
+                && target.contains("stops")
+                && target.contains("source files stay unchanged"),
+            "{target}"
+        );
+        assert!(
+            !switch.contains("reference") && !switch.contains("mid-tone"),
+            "{switch}"
+        );
     }
 
     fn schema_for(id: &str) -> Vec<ParamDesc> {
@@ -1002,11 +1061,20 @@ mod tests {
     #[test]
     fn align_prepare_and_finish_partition_the_project_params() {
         assert_eq!(ids(&ALIGN_PARAMS), ["align"]);
-        assert_eq!(ids(&PREPARE_PARAMS), ["equalize", "equalize-max-gain"]);
+        assert_eq!(
+            ids(&PREPARE_PARAMS),
+            ["equalize", "equalize-max-gain", "equalize-target"]
+        );
         assert_eq!(ids(&FINISH_PARAMS), ["auto-crop"]);
         assert_eq!(
             ids(&PROJECT_PARAMS),
-            ["align", "auto-crop", "equalize", "equalize-max-gain"]
+            [
+                "align",
+                "auto-crop",
+                "equalize",
+                "equalize-max-gain",
+                "equalize-target"
+            ]
         );
         for d in PROJECT_PARAMS.iter() {
             let groups = [&*ALIGN_PARAMS, &*PREPARE_PARAMS, &*FINISH_PARAMS]
@@ -1023,13 +1091,20 @@ mod tests {
         let focus_map = crate::registry::find_stack("depth-map").expect("a registered method");
         let prepare = params_for_group(&PREPARE_PARAMS, focus_map);
         let finish = params_for_group(&FINISH_PARAMS, focus_map);
-        assert_eq!(ids(&prepare), ["equalize", "equalize-max-gain"]);
+        assert_eq!(
+            ids(&prepare),
+            ["equalize", "equalize-max-gain", "equalize-target"]
+        );
         assert_eq!(ids(&finish), ["auto-crop"]);
         assert_eq!(default_of(&prepare, "equalize"), ParamValue::Bool(true));
         assert_eq!(default_of(&finish, "auto-crop"), ParamValue::Bool(true));
         assert_eq!(
             default_of(&prepare, "equalize-max-gain"),
             ParamValue::Float(1.25)
+        );
+        assert_eq!(
+            default_of(&prepare, "equalize-target"),
+            ParamValue::Float(0.0)
         );
     }
 
@@ -1051,18 +1126,29 @@ mod tests {
     }
 
     #[test]
-    fn equalization_bound_follows_the_default_and_an_explicit_value_wins() {
+    fn equalization_settings_follow_the_defaults_and_explicit_values_win() {
         let focus_map = schema_for("depth-map");
         let details = schema_for("laplacian");
+        let default = EqualizeSettings {
+            max_gain: 1.25,
+            target_stops: 0.0,
+        };
         let mut values = ParamValues::new();
-        assert_eq!(equalization_bound(&focus_map, &values), Some(1.25));
-        assert_eq!(equalization_bound(&details, &values), Some(1.25));
+        assert_eq!(equalization_settings(&focus_map, &values), Some(default));
+        assert_eq!(equalization_settings(&details, &values), Some(default));
 
         values.insert("equalize".into(), ParamValue::Bool(false));
-        assert_eq!(equalization_bound(&focus_map, &values), None);
-        assert_eq!(equalization_bound(&details, &values), None);
+        assert_eq!(equalization_settings(&focus_map, &values), None);
+        assert_eq!(equalization_settings(&details, &values), None);
         values.insert("equalize".into(), ParamValue::Bool(true));
         values.insert("equalize-max-gain".into(), ParamValue::Float(1.4));
-        assert_eq!(equalization_bound(&details, &values), Some(1.4));
+        values.insert("equalize-target".into(), ParamValue::Float(-0.3));
+        assert_eq!(
+            equalization_settings(&details, &values),
+            Some(EqualizeSettings {
+                max_gain: 1.4,
+                target_stops: -0.3
+            })
+        );
     }
 }

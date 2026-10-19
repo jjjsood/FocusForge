@@ -13,6 +13,7 @@ export component FFMenuList inherits Rectangle {
     in property <[string]> choices: [];
     in property <[string]> choice-ids: [];
     in property <string> selected: "";
+    in property <int> focused-index: -1;
     // A caller whose ids carry no meaning of their own (a sort menu, whose
     // entries are just "Name"/"Capture time") hides the grey id column
     // rather than showing it as a second, meaningless label.
@@ -27,7 +28,10 @@ export component FFMenuList inherits Rectangle {
     VerticalLayout {
         for choice-label[i] in root.choices: option-row := Rectangle {
             height: 24px;
-            background: option-area.has-hover ? Theme.surface-hover : transparent;
+            background: option-area.has-hover || i == root.focused-index ? Theme.surface-hover : transparent;
+            accessible-role: button;
+            accessible-label: choice-label;
+            accessible-checked: root.choice-ids[i] == root.selected;
 
             HorizontalLayout {
                 padding-left: Theme.space-2;

@@ -36,10 +36,20 @@ hint before doing anything else. The hint clears itself once you run
 `focusforge-cli diagnostics` — see
 below — which marks every crash it packages as reported.
 
-The GUI shows the same thing as a dismissible notice the next time you start
-it, naming how many crashes it found. Dismissing the notice or following it
-into Settings → Diagnostics and creating a bundle both mark that evidence
-reported, so it does not come back.
+The GUI records the same thing as a notification the next time you start it,
+naming how many crashes it found, and shows it as a toast and in the
+notification center (see [Notifications](gui.md#notifications)). Reading the
+notice, letting its toast expire or closing the center does not mark the
+evidence reported, and it stays in the center for the session. Two explicit
+actions on the selected crash notice do: **Acknowledge** marks every listed
+crash reported, and **Diagnostics** acknowledges them and opens
+Settings → Diagnostics. Creating a bundle there also marks that evidence
+reported, so it does not come back at the next start. If the mark cannot be
+written, the notice says so and the evidence stays unreported; if the crash
+folder itself cannot be read, the notice reads "Crash reports unavailable"
+and Diagnostics is still reachable. While the window is in the background the
+notice also arrives as an operating-system banner with the title and a short
+context only.
 
 ## Packaging a diagnostics bundle
 

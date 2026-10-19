@@ -7,12 +7,16 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
+use focusforge_core::tile::HostBudget;
+use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation};
 use focusforge_gui::images::{DefaultButton, FrameSort, ImageRow, ImagesModel, ROW_HEIGHT};
 use focusforge_gui::input_map::PointerKind;
 use focusforge_gui::job;
+use focusforge_gui::source_previews::{self, PreviewError};
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
 use common::{controller_with_frames, copy_frame, tree};
@@ -39,6 +43,286 @@ fn controller_with_timed_frames(name: &str, count: usize) -> AppController {
         OpenOutcome::Opened(_)
     ));
     controller
+}
+
+fn controller_with_list_frames(name: &str, count: usize) -> AppController {
+    let mut controller = controller_with_timed_frames(name, count);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::List,
+    });
+    controller
+}
+
+#[test]
+fn source_preview_renders_original_rgb_without_crop_and_honours_limits() {
+    let root = tree("source_preview_original_rgb");
+    let path = write_timed(&root, "edge.tif", Some("2026:08:29 10:00:00"));
+    let (preview, reservation) =
+        source_previews::render(&path, HostBudget::explicit(32 * 1024 * 1024))
+            .expect("a valid TIFF renders off the UI thread");
+    assert_eq!((preview.width, preview.height), (4, 4));
+    assert_eq!(preview.rgba.len(), 4 * 4 * 4);
+    assert!(reservation.total <= 32 * 1024 * 1024);
+    assert!(reservation.reduced_samples > 0);
+
+    assert!(matches!(
+        source_previews::render(&path, HostBudget::explicit(1)),
+        Err(PreviewError::OverBudget)
+    ));
+    assert!(matches!(
+        source_previews::render_cancellable(
+            &path,
+            HostBudget::explicit(32 * 1024 * 1024),
+            &AtomicBool::new(true)
+        ),
+        Err(PreviewError::Cancelled)
+    ));
+}
+
+#[test]
+fn image_list_queues_only_the_visible_window_plus_two_rows() {
+    let mut controller = controller_with_timed_frames("preview_visible_window", 8);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_images_viewport_height(120.0);
+    let snapshot = controller.source_preview_snapshot();
+    assert_eq!(snapshot.scheduled, 3);
+    assert!(controller.source_preview_row_visible(0));
+    assert!(!controller.source_preview_row_visible(1));
+    controller.images_viewport_scrolled(360.0);
+    assert_eq!(controller.source_preview_snapshot().scheduled, 5);
+    assert!(controller.source_preview_row_visible(3));
+    assert!(!controller.source_preview_row_visible(4));
+}
+
+#[test]
+fn image_list_keeps_a_fractional_thousand_row_viewport_to_the_two_row_margin() {
+    let mut controller = controller_with_timed_frames("preview_fractional_thousand", 1000);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+
+    controller.set_images_viewport_height(120.5);
+    assert_eq!(
+        controller.source_preview_snapshot().scheduled,
+        4,
+        "the two visible top rows retain two prefetched rows below"
+    );
+    assert!(controller.source_preview_row_visible(0));
+    assert!(controller.source_preview_row_visible(1));
+    assert!(!controller.source_preview_row_visible(2));
+
+    controller.images_viewport_scrolled(500.0 * 120.0 + 0.25);
+    assert_eq!(
+        controller.source_preview_snapshot().scheduled,
+        6,
+        "an interior fractional viewport schedules its two visible rows plus two on each side"
+    );
+    assert!(controller.source_preview_row_visible(500));
+    assert!(controller.source_preview_row_visible(501));
+    assert!(!controller.source_preview_row_visible(499));
+    assert!(!controller.source_preview_row_visible(502));
+}
+
+#[test]
+fn every_directed_source_presentation_transition_preserves_identity_and_tab_state() {
+    let mut controller = controller_with_timed_frames("presentation_transition_pairs", 5);
+    controller.set_images_viewport_height(120.0);
+    controller.select_frame(3);
+    controller.toggle_frame_excluded(1);
+    let expected = |controller: &AppController| {
+        controller
+            .images_panel()
+            .rows
+            .into_iter()
+            .map(|row| (row.path, row.excluded, row.selected))
+            .collect::<Vec<_>>()
+    };
+    let before = expected(&controller);
+    let selected = before
+        .iter()
+        .find(|(_, _, selected)| *selected)
+        .map(|(path, _, _)| path.clone())
+        .expect("one selected source");
+
+    let pairs = [
+        (SourcePresentation::List, SourcePresentation::ImageList),
+        (SourcePresentation::List, SourcePresentation::Large),
+        (SourcePresentation::ImageList, SourcePresentation::List),
+        (SourcePresentation::ImageList, SourcePresentation::Large),
+        (SourcePresentation::Large, SourcePresentation::List),
+        (SourcePresentation::Large, SourcePresentation::ImageList),
+    ];
+    for (from, to) in pairs {
+        controller.set_source_presentation(from);
+        controller.set_source_presentation(to);
+        assert_eq!(
+            expected(&controller),
+            before,
+            "{from:?} -> {to:?} keeps source identity state"
+        );
+        let selected_index = controller
+            .images_panel()
+            .rows
+            .iter()
+            .position(|row| row.path == selected)
+            .expect("selected identity remains listed");
+        assert!(
+            controller.source_preview_row_visible(selected_index),
+            "{from:?} -> {to:?} keeps the selected source visible"
+        );
+    }
+
+    let other = tree("presentation_transition_second_tab");
+    write_timed(&other, "other.tif", Some("2026:08:29 10:00:00"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[other]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.select_project(0);
+    assert_eq!(
+        expected(&controller),
+        before,
+        "a tab round trip keeps the first tab's source state"
+    );
+}
+
+#[test]
+fn source_preview_cap_change_replaces_an_unchanged_visible_set() {
+    let mut controller = controller_with_timed_frames("preview_cap_change", 8);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_images_viewport_height(120.0);
+    let before = controller.source_preview_snapshot();
+    assert_eq!(before.scheduled, 3);
+    assert!(before.admission_bytes > 1);
+
+    controller.set_host_memory_cap("1");
+    let after = controller.source_preview_snapshot();
+    assert_eq!(after.scheduled, 3, "the visible identities did not change");
+    assert_eq!(after.configured_cap, 1);
+    assert_eq!(
+        after.admission_bytes, 1,
+        "the worker must receive the new cap"
+    );
+}
+
+#[test]
+fn processing_refuses_when_retained_preview_bytes_consume_the_host_cap() {
+    let mut controller = controller_with_timed_frames("preview_processing_cap", 2);
+    controller.set_host_memory_cap("1");
+    controller.set_published_preview_bytes(1);
+
+    assert!(!controller.start_fuse());
+    assert!(!controller.any_job_running());
+    assert_eq!(
+        controller.last_refusal(),
+        Some(
+            "Source previews use the available host memory. Close or change the source view before starting processing."
+        )
+    );
+}
+
+#[test]
+fn live_processing_reserves_cached_native_preview_growth_during_resize() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    let mut controller = controller_with_timed_frames("preview_live_resize_reserve", 4);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_host_memory_cap("1MiB");
+    controller.set_images_viewport_height(120.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while controller.source_preview_snapshot().cache_entries < 3 {
+        controller.poll_source_previews();
+        assert!(
+            Instant::now() < deadline,
+            "the controlled visible cache did not settle"
+        );
+        std::thread::yield_now();
+    }
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+
+    let before = controller.lock().unwrap().source_preview_snapshot();
+    const PIXELS: u64 = 4 * 4 * 4;
+    assert_eq!(before.cache_entries, 3);
+    assert_eq!(before.resident_bytes, 3 * PIXELS);
+    assert_eq!(before.conversion_bytes, 3 * PIXELS);
+    assert_eq!(before.native_bytes, PIXELS);
+    let running_allowance = before.host_remaining;
+    assert!(controller.lock().unwrap().start_fuse());
+    assert!(controller.lock().unwrap().job_running());
+
+    controller.lock().unwrap().set_images_viewport_height(360.0);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    let after = controller.lock().unwrap().source_preview_snapshot();
+    assert_eq!(after.native_bytes, 3 * PIXELS);
+    assert_eq!(
+        after.host_remaining,
+        after
+            .configured_cap
+            .saturating_sub(after.cache_bytes)
+            .saturating_sub(after.native_bytes),
+        "the snapshot reports current free space; the already-started worker retains its start allowance"
+    );
+    assert!(
+        after
+            .resident_bytes
+            .saturating_add(after.native_bytes)
+            .saturating_add(running_allowance)
+            <= after.configured_cap,
+        "the live worker and every actual retained source/native buffer fit the configured cap"
+    );
+}
+
+#[test]
+fn an_idle_tab_cannot_schedule_source_previews_while_another_tab_processes() {
+    let mut controller = controller_with_timed_frames("preview_global_job_guard", 4);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.set_images_viewport_height(120.0);
+
+    let other = tree("preview_global_job_guard_second_tab");
+    for name in [
+        "other-00.tif",
+        "other-01.tif",
+        "other-02.tif",
+        "other-03.tif",
+    ] {
+        write_timed(&other, name, Some("2026:08:29 10:00:00"));
+    }
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[other]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.select_project(0);
+    assert!(controller.start_fuse());
+    assert!(controller.any_job_running());
+
+    controller.select_project(1);
+    controller.set_images_viewport_height(360.5);
+    controller.images_viewport_scrolled(120.25);
+    let snapshot = controller.source_preview_snapshot();
+    assert_eq!(snapshot.scheduled, 0);
+    assert_eq!(snapshot.admission_bytes, 0);
 }
 
 fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
@@ -219,6 +503,27 @@ fn absent_capture_time_is_shown_as_absent() {
 }
 
 #[test]
+fn rows_retain_the_recorded_capture_stamp_for_image_metadata() {
+    let root = tree("capture_stamp");
+    write_timed(&root, "00.tif", Some("2026:08:29 10:00:00"));
+    write_timed(&root, "01.tif", None);
+    let mut controller = AppController::new();
+    match common::open_and_settle(&mut controller, &[root]) {
+        OpenOutcome::Opened(_) => {}
+        OpenOutcome::Question(_, _) => {
+            common::answer_and_settle(&mut controller, OpenAs::OneProject);
+        }
+        OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
+        OpenOutcome::Refused(_) => panic!("opening two tiny synthetic frames must not be refused"),
+    }
+
+    let panel = controller.images_panel();
+    assert_eq!(panel.rows[0].trailing_text, "10:00:00");
+    assert_eq!(panel.rows[0].capture_stamp, "2026:08:29 10:00:00");
+    assert_eq!(panel.rows[1].capture_stamp, "");
+}
+
+#[test]
 fn rows_carry_no_index() {
     // `ImageRow` names every field it has -- there is no index field to
     // destructure past.
@@ -228,9 +533,11 @@ fn rows_carry_no_index() {
         // Exhaustive: if `ImageRow` ever grows an index field, this
         // destructure stops compiling.
         let ImageRow {
+            path: _,
             chip: _,
             name: _,
             trailing_text: _,
+            capture_stamp: _,
             excluded: _,
             unresolved: _,
             selected: _,
@@ -377,6 +684,33 @@ fn selection_survives_reorder_and_remove() {
         selected_name,
         "the same frame stays selected across removing a frame above it"
     );
+}
+
+#[test]
+fn confirming_a_reorder_keeps_the_selected_source_visible() {
+    let mut controller = controller_with_frames("confirmed_reorder_selection_visibility", 3);
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.set_images_viewport_height(10.0);
+    controller.select_frame(0);
+    controller.images_viewport_scrolled(0.0);
+
+    controller.move_frame(0, 2);
+    assert!(
+        controller.pending_frame_change().is_some(),
+        "a checkpoint still requires confirmation before reordering"
+    );
+    assert!(
+        controller.confirm_frame_change(),
+        "confirmation applies the deferred reorder and starts the replacement run"
+    );
+    assert_eq!(controller.frame_pane_label(), "00.tif");
+    assert!(
+        controller.source_preview_row_visible(2),
+        "confirmation keeps the moved selected source visible"
+    );
+    wait_for_settle(&mut controller, Duration::from_secs(120));
 }
 
 // ---------------------------------------------------------------------
@@ -1242,6 +1576,9 @@ fn metadata_follows_the_source_through_reorder_and_remove() {
         common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::List,
+    });
     std::fs::remove_dir_all(&root).unwrap();
 
     controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
@@ -1361,7 +1698,7 @@ fn a_source_deleted_after_load_is_refused_on_fuse_then_shown_unresolved() {
 }
 
 // ---------------------------------------------------------------------
-// The sort menu's own open/closed state and a grip drag.
+// The sort menu's own open/closed state and a source-row drag.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -1385,7 +1722,7 @@ fn selecting_a_sort_closes_the_menu() {
 
 #[test]
 fn dragging_reports_a_live_pixel_offset_clamped_to_the_list_bounds() {
-    let mut controller = controller_with_timed_frames("grip_drag_live_offset", 4);
+    let mut controller = controller_with_list_frames("source_drag_live_offset", 4);
     assert_eq!(controller.drag_offset(), 0.0, "no drag yet");
 
     controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
@@ -1413,7 +1750,7 @@ fn dragging_reports_a_live_pixel_offset_clamped_to_the_list_bounds() {
 
 #[test]
 fn dragging_reports_its_live_landing_row() {
-    let mut controller = controller_with_timed_frames("grip_drag_live_target", 4);
+    let mut controller = controller_with_list_frames("source_drag_live_target", 4);
     assert_eq!(controller.drag_target_row(), None, "no drag yet");
 
     controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
@@ -1423,7 +1760,7 @@ fn dragging_reports_its_live_landing_row() {
         "releasing now would land it back where it started"
     );
 
-    // The same halfway-point rounding `a_grip_drag_moves_the_row_by_whole_row_steps`
+    // The same halfway-point rounding `a_source_drag_moves_the_row_by_whole_row_steps`
     // proves against the release path.
     controller.frame_drag_pointer(0, PointerKind::Move, 10.0 + 1.6 * ROW_HEIGHT);
     assert_eq!(controller.drag_target_row(), Some(2));
@@ -1442,8 +1779,48 @@ fn dragging_reports_its_live_landing_row() {
 }
 
 #[test]
-fn a_grip_drag_moves_the_row_by_whole_row_steps() {
-    let mut controller = controller_with_timed_frames("grip_drag_moves_row", 4);
+fn presentation_switches_drag_and_scroll_geometry_without_reusing_list_height() {
+    let mut controller = controller_with_timed_frames("presentation_drag_geometry", 4);
+    controller.set_images_viewport_height(240.0);
+
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
+    controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
+    controller.frame_drag_pointer(0, PointerKind::Move, 190.0);
+    assert_eq!(controller.drag_target_row(), Some(2));
+    assert_eq!(controller.drag_offset(), 180.0);
+
+    controller.set_source_presentation(SourcePresentation::Large);
+    assert_eq!(
+        controller.dragging_row(),
+        None,
+        "a geometry change cancels a live drag"
+    );
+    assert!(
+        controller.images_viewport_scrolled(f32::MAX),
+        "the large layout has scrollable content"
+    );
+    assert_eq!(controller.images_scroll_y(), 560.0);
+
+    controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
+    controller.frame_drag_pointer(0, PointerKind::Move, 310.0);
+    assert_eq!(controller.drag_target_row(), Some(2));
+    assert_eq!(controller.drag_offset(), 300.0);
+
+    controller.frame_drag_pointer(0, PointerKind::Up, 310.0);
+    controller.select_frame(3);
+    controller.set_source_presentation(SourcePresentation::List);
+    assert_eq!(
+        controller.images_scroll_y(),
+        0.0,
+        "the selected final List row remains visible after shrinking geometry"
+    );
+}
+
+#[test]
+fn a_source_drag_moves_the_row_by_whole_row_steps() {
+    let mut controller = controller_with_list_frames("source_drag_moves_row", 4);
     let before: Vec<String> = controller
         .images_panel()
         .rows
@@ -1470,8 +1847,8 @@ fn a_grip_drag_moves_the_row_by_whole_row_steps() {
 }
 
 #[test]
-fn releasing_a_grip_drag_on_the_same_row_moves_nothing() {
-    let mut controller = controller_with_timed_frames("grip_drag_no_move", 3);
+fn releasing_a_source_drag_on_the_same_row_moves_nothing() {
+    let mut controller = controller_with_list_frames("source_drag_no_move", 3);
     controller.frame_drag_pointer(1, PointerKind::Down, 5.0);
     controller.frame_drag_pointer(1, PointerKind::Up, 5.0 + ROW_HEIGHT * 0.2);
     let names: Vec<String> = controller
@@ -1493,7 +1870,7 @@ fn sort_menu_and_drag_are_stacking_mode_only() {
 }
 
 // ---------------------------------------------------------------------
-// The grip's real Slint-to-Rust wiring, through an actual window -- a
+// The source row's real Slint-to-Rust wiring, through an actual window -- a
 // controller-level test of `frame_drag_pointer` alone cannot see the
 // pointer capture outlive the row it started on.
 // ---------------------------------------------------------------------
@@ -1516,17 +1893,576 @@ fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::Log
     slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
 }
 
-/// A point in the panel's grip gutter at window height `y`.
-fn grip_gutter_point(app: &focusforge_gui::AppWindow, y: f32) -> slint::LogicalPosition {
-    let overlay = i_slint_backend_testing::ElementQuery::from_root(app)
-        .match_id("FFImagesPanel::grip-overlay")
+/// A point inside the first row's source-name region at window height `y`.
+fn source_drag_point(app: &focusforge_gui::AppWindow, y: f32) -> slint::LogicalPosition {
+    let area = i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFImageRow::area")
         .find_first()
-        .expect("the grip gutter is always mounted");
-    slint::LogicalPosition::new(element_center(&overlay).x, y)
+        .expect("a source row is mounted");
+    slint::LogicalPosition::new(area.absolute_position().x + 40.0, y)
 }
 
 #[test]
-fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
+fn row_hover_survives_image_name_timestamp_and_action_surfaces_in_every_presentation() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::WindowEvent;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode("stacking".into());
+    app.set_list_preview_header_text("1 image".into());
+    app.set_list_preview_dragging_row(-1);
+    app.set_list_preview_drag_target_row(-1);
+    app.set_list_preview_drag_offset(0.0);
+
+    let row = focusforge_gui::ImageRowView {
+        chip: slint::Color::from_rgb_u8(220, 201, 55),
+        name: "IMG_9819-long-filename.tif".into(),
+        time_text: "16:42:09".into(),
+        capture_stamp: "2026:08:29 16:42:09".into(),
+        excluded: false,
+        unresolved: false,
+        selected: false,
+        hovered: false,
+        focused: false,
+        job_disabled: false,
+        preview: slint::Image::default(),
+        preview_state: "ready".into(),
+    };
+
+    let dispatch = |position| {
+        app.window()
+            .dispatch_event(WindowEvent::PointerMoved { position });
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+    };
+    let mounted = |id| {
+        ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .expect("the requested row surface is mounted")
+    };
+
+    for (presentation, name_slot, exclude_button, remove_button) in [
+        (
+            "list",
+            "FFImageRow::list-name-slot",
+            "FFImageRow::list-exclude-button",
+            "FFImageRow::list-remove-button",
+        ),
+        (
+            "image-list",
+            "FFImageRow::image-list-name-slot",
+            "FFImageRow::image-list-exclude-button",
+            "FFImageRow::image-list-remove-button",
+        ),
+        (
+            "large",
+            "FFImageRow::large-name-slot",
+            "FFImageRow::large-exclude-button",
+            "FFImageRow::large-remove-button",
+        ),
+    ] {
+        app.set_list_preview_presentation(presentation.into());
+        app.set_list_preview_rows(
+            std::rc::Rc::new(slint::VecModel::from(vec![row.clone()])).into(),
+        );
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+
+        let area = mounted("FFImageRow::area");
+        let row_center = element_center(&area);
+        let image = slint::LogicalPosition::new(area.absolute_position().x + 16.0, row_center.y);
+        let name_handle = mounted(name_slot);
+        let name = element_center(&name_handle);
+        let name_before = (name_handle.absolute_position(), name_handle.size());
+
+        for position in [image, name] {
+            dispatch(position);
+            assert!(
+                ElementQuery::from_root(&app)
+                    .match_id(exclude_button)
+                    .find_first()
+                    .is_some(),
+                "{presentation}: row actions remain visible over image and filename"
+            );
+        }
+
+        let name_after = mounted(name_slot);
+        assert_eq!(
+            (name_after.absolute_position(), name_after.size()),
+            name_before,
+            "{presentation}: filename width stays fixed while actions replace the timestamp"
+        );
+
+        let exclude = element_center(&mounted(exclude_button));
+        let remove = element_center(&mounted(remove_button));
+        let timestamp_lane = slint::LogicalPosition::new(exclude.x, exclude.y);
+        let gap = slint::LogicalPosition::new((exclude.x + remove.x) / 2.0, exclude.y);
+        for position in [timestamp_lane, exclude, gap, remove] {
+            dispatch(position);
+            assert!(
+                ElementQuery::from_root(&app)
+                    .match_id(exclude_button)
+                    .find_first()
+                    .is_some(),
+                "{presentation}: action hover keeps the row controls visible"
+            );
+        }
+
+        dispatch(slint::LogicalPosition::new(0.0, 0.0));
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id(exclude_button)
+                .find_first()
+                .is_none(),
+            "{presentation}: leaving the row hides its controls"
+        );
+    }
+}
+
+#[test]
+fn source_rows_take_keyboard_focus_and_select_the_next_resolved_source() {
+    use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller_with_list_frames(
+        "images_keyboard_selection",
+        100,
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    let settle = || {
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    };
+    settle();
+
+    let press = |key: slint::SharedString| {
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key });
+    };
+    let mut reached_sources = false;
+    for _ in 0..40 {
+        press(Key::Tab.into());
+        press(Key::DownArrow.into());
+        settle();
+        if controller.lock().unwrap().frame_pane_label() == "01.tif" {
+            reached_sources = true;
+            break;
+        }
+    }
+    assert!(
+        reached_sources,
+        "Tab navigation reaches the source keyboard scope before a pointer click"
+    );
+    press(Key::UpArrow.into());
+    settle();
+    assert_eq!(controller.lock().unwrap().frame_pane_label(), "00.tif");
+
+    let row = ElementQuery::from_root(&app)
+        .match_id("FFImageRow::area")
+        .find_first()
+        .expect("the first source row is mounted");
+    let position = element_center(&row);
+    app.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: PointerEventButton::Left,
+    });
+    app.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: PointerEventButton::Left,
+    });
+    settle();
+    assert_eq!(
+        controller.lock().unwrap().frame_pane_label(),
+        "00.tif",
+        "the clicked source is the keyboard-selection anchor"
+    );
+
+    press(Key::DownArrow.into());
+    settle();
+    assert_eq!(controller.lock().unwrap().frame_pane_label(), "01.tif");
+
+    let metadata_reads_before_keys = {
+        enable_trace_accounting();
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .metadata_reads
+    };
+    for presentation in [
+        SourcePresentation::List,
+        SourcePresentation::ImageList,
+        SourcePresentation::Large,
+    ] {
+        {
+            let mut controller = controller.lock().unwrap();
+            controller.set_source_presentation(presentation);
+            controller.select_frame(0);
+            controller.images_viewport_scrolled(0.0);
+        }
+        settle();
+        for _ in 0..50 {
+            press(Key::DownArrow.into());
+            settle();
+        }
+        assert_eq!(
+            controller.lock().unwrap().frame_pane_label(),
+            "50.tif",
+            "{presentation:?}: Down selects beyond the initial viewport"
+        );
+        assert!(
+            controller.lock().unwrap().images_scroll_y() > 0.0,
+            "{presentation:?}: Down keeps the selected row visible"
+        );
+        let name_slot = match presentation {
+            SourcePresentation::List => "FFImageRow::list-name-slot",
+            SourcePresentation::ImageList => "FFImageRow::image-list-name-slot",
+            SourcePresentation::Large => "FFImageRow::large-name-slot",
+        };
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id(name_slot)
+                .match_descendants()
+                .match_predicate(|element| {
+                    element
+                        .accessible_label()
+                        .is_some_and(|label| label == "50.tif")
+                })
+                .find_first()
+                .is_some(),
+            "{presentation:?}: the selected row's name is mounted inside the source list"
+        );
+
+        for _ in 0..50 {
+            press(Key::UpArrow.into());
+            settle();
+        }
+        assert_eq!(
+            controller.lock().unwrap().frame_pane_label(),
+            "00.tif",
+            "{presentation:?}: Up returns to the first source"
+        );
+        assert_eq!(
+            controller.lock().unwrap().images_scroll_y(),
+            0.0,
+            "{presentation:?}: Up restores the first row"
+        );
+    }
+    assert_eq!(
+        timing_snapshot()
+            .expect("trace accounting is enabled")
+            .metadata_reads,
+        metadata_reads_before_keys,
+        "keyboard visibility changes do not read metadata"
+    );
+}
+
+#[test]
+fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_editor() {
+    let mut controller = controller_with_timed_frames("keyboard_visible_selection", 3);
+    controller.set_images_viewport_height(10.0);
+    std::fs::remove_file(
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("keyboard_visible_selection_frames")
+            .join("01.tif"),
+    )
+    .expect("the middle source exists");
+    assert!(!controller.start_fuse(), "the missing source is refused");
+    assert!(controller.images_panel().rows[1].unresolved);
+
+    controller.select_frame(0);
+    controller.images_viewport_scrolled(0.0);
+    controller.select_adjacent_resolved_frame(1);
+    assert_eq!(
+        controller.frame_pane_label(),
+        "02.tif",
+        "keyboard selection skips an unresolved source"
+    );
+    assert!(
+        controller.source_preview_row_visible(2),
+        "the resolved target is visible after the keyboard step"
+    );
+
+    controller.images_viewport_scrolled(0.0);
+    controller.select_adjacent_resolved_frame(1);
+    assert!(
+        controller.source_preview_row_visible(2),
+        "a last-row key press reanchors a manually displaced viewport"
+    );
+    controller.select_frame(0);
+    controller.images_viewport_scrolled(f32::MAX);
+    controller.select_adjacent_resolved_frame(-1);
+    assert!(
+        controller.source_preview_row_visible(0),
+        "a first-row key press reanchors a manually displaced viewport"
+    );
+
+    let mut editor = controller_in_editor_mode("keyboard_visible_selection_editor");
+    editor.set_images_viewport_height(10.0);
+    editor.select_frame(0);
+    editor.select_adjacent_resolved_frame(1);
+    assert_eq!(editor.mode(), ShellMode::Editor);
+    assert_eq!(editor.source_presentation(), SourcePresentation::List);
+    assert!(
+        editor.source_preview_row_visible(1),
+        "the compact read-only editor list follows keyboard selection"
+    );
+}
+
+#[test]
+fn selecting_a_hovered_source_keeps_its_hover_actions_mounted() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller_with_list_frames(
+        "images_hover_selection_reuse",
+        3,
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    let settle = || {
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    };
+    settle();
+
+    let row = ElementQuery::from_root(&app)
+        .match_id("FFImageRow::area")
+        .find_all()
+        .into_iter()
+        .nth(1)
+        .expect("a second resolved source row is mounted");
+    let position = element_center(&row);
+    app.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImageRow::list-exclude-button")
+            .find_first()
+            .is_some(),
+        "hover exposes the second source actions"
+    );
+
+    for event in [
+        WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        },
+        WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        },
+    ] {
+        app.window().dispatch_event(event);
+    }
+    settle();
+
+    assert_eq!(
+        controller
+            .lock()
+            .unwrap()
+            .images_panel()
+            .rows
+            .iter()
+            .position(|row| row.selected),
+        Some(1)
+    );
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImageRow::list-exclude-button")
+            .find_first()
+            .is_some(),
+        "selection updates the marker without replacing the hovered row's input tree"
+    );
+
+    let toggle = || {
+        let button = ElementQuery::from_root(&app)
+            .match_id("FFImageRow::list-exclude-button")
+            .find_first()
+            .expect("the hovered source action remains mounted");
+        let position = element_center(&button);
+        for event in [
+            WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            },
+            WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            },
+        ] {
+            app.window().dispatch_event(event);
+        }
+        settle();
+    };
+    toggle();
+    assert!(controller.lock().unwrap().images_panel().rows[1].excluded);
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImageRow::list-exclude-button")
+            .find_first()
+            .is_some(),
+        "exclude keeps the stationary-pointer action mounted"
+    );
+    toggle();
+    assert!(!controller.lock().unwrap().images_panel().rows[1].excluded);
+}
+
+#[test]
+fn elided_filename_tooltip_uses_available_window_width_before_wrapping() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::WindowEvent;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(720, 480));
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode("stacking".into());
+    app.set_list_preview_presentation("list".into());
+    app.set_list_preview_header_text("1 image".into());
+    app.set_list_preview_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![focusforge_gui::ImageRowView {
+            chip: slint::Color::from_rgb_u8(220, 201, 55),
+            name: "IMG_9819_composite-exposure-calibrated-master-source-frame.tif".into(),
+            time_text: "16:42:09".into(),
+            capture_stamp: "2026:08:29 16:42:09".into(),
+            excluded: false,
+            unresolved: false,
+            selected: false,
+            hovered: false,
+            focused: false,
+            job_disabled: false,
+            preview: slint::Image::default(),
+            preview_state: "ready".into(),
+        }]))
+        .into(),
+    );
+
+    let name = ElementQuery::from_root(&app)
+        .match_id("FFImageRow::list-name-slot")
+        .find_first()
+        .expect("the clipped filename is mounted");
+    app.window().dispatch_event(WindowEvent::PointerMoved {
+        position: element_center(&name),
+    });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+
+    let tooltip = ElementQuery::from_root(&app)
+        .match_predicate(|element| element.type_name().as_deref() == Some("FFTooltip"))
+        .find_first()
+        .expect("the built-in Tooltip exposes its custom content after the hover delay");
+    assert!(
+        tooltip.size().width > 248.0,
+        "a filename that fits the app viewport must not inherit the old 248px row cap"
+    );
+    assert!(
+        tooltip.size().height < 40.0,
+        "a filename that fits the app viewport remains one readable line"
+    );
+    assert!(
+        tooltip.size().width <= app.window().size().width as f32,
+        "the native tooltip popup fits inside the actual app viewport"
+    );
+    let tooltip_position = tooltip.absolute_position();
+    assert!(
+        tooltip_position.x >= 0.0 && tooltip_position.y >= 0.0,
+        "custom tooltip content must stay within its popup host instead of overflowing at a negative local offset: {tooltip_position:?}"
+    );
+}
+
+#[test]
+fn constrained_filename_tooltip_balances_wrapped_lines_within_the_viewport() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::WindowEvent;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(360, 480));
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode("stacking".into());
+    app.set_list_preview_presentation("list".into());
+    app.set_list_preview_header_text("1 image".into());
+    app.set_list_preview_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![focusforge_gui::ImageRowView {
+            chip: slint::Color::from_rgb_u8(220, 201, 55),
+            name: "IMG_9819_calibrated-composite-exposure-source-frame-with-reference-metadata.tif"
+                .into(),
+            time_text: "16:42:09".into(),
+            capture_stamp: "2026:08:29 16:42:09".into(),
+            excluded: false,
+            unresolved: false,
+            selected: false,
+            hovered: false,
+            focused: false,
+            job_disabled: false,
+            preview: slint::Image::default(),
+            preview_state: "ready".into(),
+        }]))
+        .into(),
+    );
+
+    let name = ElementQuery::from_root(&app)
+        .match_id("FFImageRow::list-name-slot")
+        .find_first()
+        .expect("the clipped filename is mounted");
+    app.window().dispatch_event(WindowEvent::PointerMoved {
+        position: element_center(&name),
+    });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+
+    let tooltip = ElementQuery::from_root(&app)
+        .match_predicate(|element| element.type_name().as_deref() == Some("FFTooltip"))
+        .find_first()
+        .expect("the built-in Tooltip exposes its custom content after the hover delay");
+    let viewport_width = app.window().size().width as f32;
+    assert!(
+        tooltip.size().width <= viewport_width,
+        "the constrained tooltip stays inside the usable app width"
+    );
+    assert!(
+        tooltip.size().width > viewport_width / 2.0,
+        "wrapped tooltip lines use the available width instead of leaving a tiny final fragment"
+    );
+    assert!(
+        tooltip.size().height >= 40.0,
+        "a filename larger than the viewport wraps rather than clipping"
+    );
+}
+
+#[test]
+fn dragging_a_row_by_its_source_reorders_it_through_the_real_window() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
     use slint::platform::{PointerEventButton, WindowEvent};
@@ -1537,8 +2473,8 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let controller = Arc::new(Mutex::new(controller_with_timed_frames(
-        "images_grip_drag_wire",
+    let controller = Arc::new(Mutex::new(controller_with_list_frames(
+        "images_source_drag_wire",
         5,
     )));
     let _installed = focusforge_gui::bridge::install(
@@ -1573,7 +2509,7 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
     assert_eq!(rows.len(), 5, "all five rows must be on screen");
     let row0_center = element_center(&rows[0]);
 
-    let press_pos = grip_gutter_point(&app, row0_center.y);
+    let press_pos = source_drag_point(&app, row0_center.y);
 
     dispatch(WindowEvent::PointerMoved {
         position: press_pos,
@@ -1616,7 +2552,51 @@ fn dragging_a_row_by_its_grip_reorders_it_through_the_real_window() {
 }
 
 #[test]
-fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
+fn installed_drag_callback_publishes_capture_before_the_next_motion() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller_with_list_frames(
+        "installed_drag_callback_publication",
+        3,
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+
+    app.invoke_images_frame_drag_pointer(0, 0, 10.0);
+    assert_eq!(controller.lock().unwrap().dragging_row(), Some(0));
+    assert!(
+        !app.get_images_drag_capture_active(),
+        "a stationary press does not capture the whole list"
+    );
+
+    app.invoke_images_frame_drag_pointer(0, 2, 10.0 + ROW_HEIGHT);
+    assert!(controller.lock().unwrap().drag_capture_active());
+    assert!(
+        app.get_images_drag_capture_active(),
+        "the installed callback publishes capture before another event-loop turn"
+    );
+
+    app.invoke_images_frame_drag_pointer(0, 1, 10.0 + ROW_HEIGHT);
+    assert_eq!(controller.lock().unwrap().dragging_row(), None);
+    assert!(
+        !app.get_images_drag_capture_active(),
+        "release clears capture before another event-loop turn"
+    );
+}
+
+#[test]
+fn dragging_a_row_by_its_source_floats_a_copy_that_follows_the_cursor() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
     use slint::platform::{PointerEventButton, WindowEvent};
@@ -1627,8 +2607,8 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let controller = Arc::new(Mutex::new(controller_with_timed_frames(
-        "images_grip_drag_ghost",
+    let controller = Arc::new(Mutex::new(controller_with_list_frames(
+        "images_source_drag_ghost",
         5,
     )));
     let _installed = focusforge_gui::bridge::install(
@@ -1657,6 +2637,11 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
             .match_id("FFImagesPanel::landing-line")
             .find_first()
     };
+    let find_capture = || {
+        ElementQuery::from_root(&app)
+            .match_id("FFImagesPanel::drag-capture")
+            .find_first()
+    };
 
     assert!(
         find_ghost().is_none(),
@@ -1677,9 +2662,10 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
             .unwrap()
     });
     let row0_center = element_center(&rows[0]);
+    let row0_top = rows[0].absolute_position().y;
     let last_row_top = rows[4].absolute_position().y;
 
-    let press_pos = grip_gutter_point(&app, row0_center.y);
+    let press_pos = source_drag_point(&app, row0_center.y);
 
     dispatch(WindowEvent::PointerMoved {
         position: press_pos,
@@ -1688,10 +2674,14 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
         position: press_pos,
         button: PointerEventButton::Left,
     });
-    let at_press = find_ghost()
-        .expect("a floating copy of the grabbed row appears once the drag starts")
-        .absolute_position()
-        .y;
+    assert!(
+        find_ghost().is_none(),
+        "a stationary press keeps the row input surface mounted"
+    );
+    assert!(
+        find_capture().is_none(),
+        "a stationary press must not install the full-panel capture overlay"
+    );
     assert!(
         find_landing_line().is_none(),
         "releasing right after the press would move nothing, so no line is drawn yet"
@@ -1699,14 +2689,18 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
 
     let target = slint::LogicalPosition::new(press_pos.x, press_pos.y + 3.0 * ROW_HEIGHT);
     dispatch(WindowEvent::PointerMoved { position: target });
+    assert!(
+        find_capture().is_some(),
+        "moving the pointer installs capture for a drag that leaves its row"
+    );
     let at_target = find_ghost()
         .expect("the floating copy stays mounted while the drag continues")
         .absolute_position()
         .y;
     assert!(
-        (at_target - at_press - 3.0 * ROW_HEIGHT).abs() < 1.0,
+        (at_target - row0_top - 3.0 * ROW_HEIGHT).abs() < 1.0,
         "the floating copy must have moved down by the same pixels the cursor did: \
-         from {at_press} to {at_target}"
+         from {row0_top} to {at_target}"
     );
 
     // Row 0 dragged down past row 3 lands at index 3 in a 5-row list --
@@ -1721,18 +2715,456 @@ fn dragging_a_row_by_its_grip_floats_a_copy_that_follows_the_cursor() {
          line at {landing_y}, boundary at {last_row_top}"
     );
 
+    dispatch(WindowEvent::PointerMoved {
+        position: press_pos,
+    });
+    assert!(
+        find_ghost().is_none(),
+        "returning to the press position removes the floating copy"
+    );
+    assert!(
+        find_capture().is_some(),
+        "returning to the press position keeps capture for the active gesture"
+    );
+    assert!(
+        find_landing_line().is_none(),
+        "returning to the press position clears the landing line"
+    );
+
+    dispatch(WindowEvent::PointerMoved { position: target });
+    assert!(
+        find_ghost().is_some(),
+        "the same press resumes its floating copy after returning to origin"
+    );
+    assert!(
+        find_capture().is_some(),
+        "the same press resumes capture after returning to origin"
+    );
+    assert_eq!(controller.lock().unwrap().dragging_row(), Some(0));
+
     dispatch(WindowEvent::PointerReleased {
         position: target,
         button: PointerEventButton::Left,
     });
     assert!(
         find_ghost().is_none(),
-        "the floating copy disappears once the drag is released"
+        "the floating copy stays absent after release"
     );
     assert!(
         find_landing_line().is_none(),
-        "the landing line disappears once the drag is released"
+        "the landing line stays absent after release"
     );
+    assert!(
+        find_capture().is_none(),
+        "release removes the active drag capture"
+    );
+    assert_eq!(controller.lock().unwrap().dragging_row(), None);
+    let names: Vec<String> = controller
+        .lock()
+        .unwrap()
+        .images_panel()
+        .rows
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["01.tif", "02.tif", "03.tif", "00.tif", "04.tif"],
+        "a resumed drag reorders on its release without needing a second press"
+    );
+}
+
+#[test]
+fn dragging_at_images_viewport_edges_auto_scrolls_and_keeps_the_selected_source_visible() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    for (presentation, at_bottom) in [
+        (SourcePresentation::List, false),
+        (SourcePresentation::List, true),
+        (SourcePresentation::ImageList, false),
+        (SourcePresentation::ImageList, true),
+        (SourcePresentation::Large, false),
+        (SourcePresentation::Large, true),
+    ] {
+        let app = focusforge_gui::AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let mut loaded = controller_with_list_frames(
+            &format!("images_drag_edge_{presentation:?}_{at_bottom}"),
+            40,
+        );
+        loaded.set_source_presentation(presentation);
+        let row_height = match presentation {
+            SourcePresentation::List => ROW_HEIGHT,
+            SourcePresentation::ImageList => 120.0,
+            SourcePresentation::Large => 200.0,
+        };
+        let controller = Arc::new(Mutex::new(loaded));
+        let _installed = focusforge_gui::bridge::install(
+            &app,
+            controller.clone(),
+            common::empty_canvas(),
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
+        );
+        app.set_project_loaded(true);
+        app.set_dock_tab("images".into());
+        let settle = || {
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        };
+        let dispatch = |event: WindowEvent| {
+            app.window().dispatch_event(event);
+            settle();
+        };
+        settle();
+        if !at_bottom {
+            let mut controller = controller.lock().unwrap();
+            controller.select_frame(20);
+            controller.images_viewport_scrolled(20.0 * row_height);
+            drop(controller);
+            settle();
+        }
+
+        let list = mounted(&app, "FFImagesPanel::list");
+        let expected_dragged_name = {
+            let controller = controller.lock().unwrap();
+            let first_visible = (controller.images_scroll_y() / row_height).floor() as usize;
+            if !at_bottom {
+                assert!(
+                    controller.images_scroll_y() > 0.0,
+                    "{presentation:?}: the top-edge case starts away from the content bound"
+                );
+            }
+            controller.images_panel().rows[first_visible].name.clone()
+        };
+        let selected_name_before = controller
+            .lock()
+            .unwrap()
+            .images_panel()
+            .rows
+            .into_iter()
+            .find(|row| row.selected)
+            .expect("one selected source before drag")
+            .name;
+        let edge_y = if at_bottom {
+            list.absolute_position().y + list.size().height - 1.0
+        } else {
+            list.absolute_position().y + 1.0
+        };
+        let source = source_drag_point(
+            &app,
+            list.absolute_position().y + (row_height / 2.0).min(list.size().height / 2.0),
+        );
+        dispatch(WindowEvent::PointerMoved { position: source });
+        dispatch(WindowEvent::PointerPressed {
+            position: source,
+            button: PointerEventButton::Left,
+        });
+        let (dragged_name, order_before) = {
+            let controller = controller.lock().unwrap();
+            let dragged = controller
+                .dragging_row()
+                .expect("the source press starts a drag");
+            (
+                controller.images_panel().rows[dragged].name.clone(),
+                controller
+                    .images_panel()
+                    .rows
+                    .into_iter()
+                    .map(|row| row.name)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            dragged_name, expected_dragged_name,
+            "{presentation:?}: the visible source receives the drag press"
+        );
+        let edge = slint::LogicalPosition::new(source.x, edge_y);
+        dispatch(WindowEvent::PointerMoved { position: edge });
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFImagesPanel::drag-capture")
+                .find_first()
+                .is_some(),
+            "{presentation:?}: a moved source drag owns capture at the viewport edge"
+        );
+        let before = controller.lock().unwrap().images_scroll_y();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(90));
+        let after = controller.lock().unwrap().images_scroll_y();
+        assert!(
+            if at_bottom {
+                after > before
+            } else {
+                after < before
+            },
+            "{presentation:?}: a held edge drag scrolls without another pointer move"
+        );
+        for _ in 0..200 {
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(30));
+        }
+        let bounded = controller.lock().unwrap().images_scroll_y();
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(90));
+        assert_eq!(
+            controller.lock().unwrap().images_scroll_y(),
+            bounded,
+            "{presentation:?}: edge scrolling stops at the content bound"
+        );
+        let target = controller
+            .lock()
+            .unwrap()
+            .drag_target_row()
+            .expect("the held drag retains a live target");
+
+        dispatch(WindowEvent::PointerReleased {
+            position: edge,
+            button: PointerEventButton::Left,
+        });
+        let guard = controller.lock().unwrap();
+        assert_eq!(
+            guard.dragging_row(),
+            None,
+            "{presentation:?}: release clears drag"
+        );
+        let selected = guard
+            .images_panel()
+            .rows
+            .iter()
+            .position(|row| row.selected)
+            .expect("one selected source");
+        let rows = guard.images_panel().rows;
+        assert_ne!(
+            rows.iter().map(|row| &row.name).collect::<Vec<_>>(),
+            order_before.iter().collect::<Vec<_>>(),
+            "{presentation:?}: edge release reorders the dragged source"
+        );
+        assert_eq!(
+            rows[target].name, dragged_name,
+            "{presentation:?}: release places the dragged source at its live target"
+        );
+        assert_eq!(
+            rows[selected].name, selected_name_before,
+            "{presentation:?}: reordering preserves the previous selection identity"
+        );
+        let list = mounted(&app, "FFImagesPanel::list");
+        let list_top = list.absolute_position().y;
+        let list_bottom = list_top + list.size().height;
+        let moved_top = list_top + target as f32 * row_height + app.get_images_list_viewport_y();
+        let moved_bottom = moved_top + row_height;
+        if list.size().height >= row_height {
+            assert!(
+                moved_top >= list_top - 1.0 && moved_bottom <= list_bottom + 1.0,
+                "{presentation:?}: release fully keeps the moved source in view"
+            );
+        } else {
+            assert!(
+                moved_top < list_bottom && moved_bottom > list_top,
+                "{presentation:?}: a short viewport keeps the moved source at its bounded best fit"
+            );
+        }
+        let scroll_after_release = guard.images_scroll_y();
+        let order_after_release: Vec<_> = rows.into_iter().map(|row| row.name).collect();
+        drop(guard);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(90));
+        let controller = controller.lock().unwrap();
+        assert_eq!(
+            controller.images_scroll_y(),
+            scroll_after_release,
+            "{presentation:?}: release stops edge auto-scroll"
+        );
+        assert_eq!(
+            controller
+                .images_panel()
+                .rows
+                .into_iter()
+                .map(|row| row.name)
+                .collect::<Vec<_>>(),
+            order_after_release,
+            "{presentation:?}: release leaves order stable while the timer continues"
+        );
+    }
+}
+
+#[test]
+fn a_stationary_source_press_near_an_edge_does_not_auto_scroll_or_reorder() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let loaded = controller_with_list_frames("images_stationary_edge_press", 40);
+    let controller = Arc::new(Mutex::new(loaded));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("images".into());
+    let settle = || {
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    };
+    settle();
+    {
+        let mut controller = controller.lock().unwrap();
+        controller.select_frame(10);
+        controller.images_viewport_scrolled(10.0 * ROW_HEIGHT);
+    }
+    settle();
+    let expected_clicked_name = {
+        let controller = controller.lock().unwrap();
+        assert!(
+            controller.images_scroll_y() > 0.0,
+            "the stationary press starts away from the content bound"
+        );
+        let first_visible = (controller.images_scroll_y() / ROW_HEIGHT).floor() as usize;
+        controller.images_panel().rows[first_visible].name.clone()
+    };
+    let names_before: Vec<_> = controller
+        .lock()
+        .unwrap()
+        .images_panel()
+        .rows
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+    let list = mounted(&app, "FFImagesPanel::list");
+    let press = source_drag_point(&app, list.absolute_position().y + 1.0);
+    app.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: press });
+    app.window().dispatch_event(WindowEvent::PointerPressed {
+        position: press,
+        button: PointerEventButton::Left,
+    });
+    settle();
+    let scroll_before = controller.lock().unwrap().images_scroll_y();
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(90));
+    assert_eq!(
+        controller.lock().unwrap().images_scroll_y(),
+        scroll_before,
+        "a stationary press does not auto-scroll"
+    );
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImagesPanel::drag-ghost")
+            .find_first()
+            .is_none(),
+        "a stationary press does not mount a drag ghost"
+    );
+    app.window().dispatch_event(WindowEvent::PointerReleased {
+        position: press,
+        button: PointerEventButton::Left,
+    });
+    settle();
+    let controller = controller.lock().unwrap();
+    assert_eq!(controller.dragging_row(), None);
+    assert_eq!(
+        controller
+            .images_panel()
+            .rows
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>(),
+        names_before,
+        "a stationary press cannot reorder sources"
+    );
+    assert_eq!(
+        controller.frame_pane_label(),
+        expected_clicked_name,
+        "a stationary press still selects the visible source it clicks"
+    );
+}
+
+#[test]
+fn closing_a_dragged_tab_retires_its_edge_scroll_state() {
+    let mut controller = controller_with_list_frames("images_dragged_tab_close", 40);
+    controller.set_images_viewport_height(2.0 * ROW_HEIGHT);
+
+    let other = tree("images_dragged_tab_close_other");
+    write_timed(&other, "other.tif", Some("2026:08:29 10:00:00"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[other]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.select_project(0);
+    controller.images_viewport_scrolled(10.0 * ROW_HEIGHT);
+    let edge = 12.0 * ROW_HEIGHT - 1.0;
+    controller.frame_drag_pointer(10, PointerKind::Down, 10.0 * ROW_HEIGHT + 1.0);
+    controller.frame_drag_pointer(10, PointerKind::Move, edge);
+    assert!(controller.drag_capture_active());
+    assert!(controller.advance_frame_drag_autoscroll());
+
+    controller.close_project_at(0, Instant::now());
+
+    assert_eq!(
+        controller.dragging_row(),
+        None,
+        "closing a dragged tab clears its source gesture"
+    );
+    assert!(
+        !controller.advance_frame_drag_autoscroll(),
+        "the timer cannot scroll a replacement tab after the dragged one closed"
+    );
+}
+
+#[test]
+fn source_drag_retirement_paths_leave_no_stale_edge_scroll() {
+    let begin_drag = |controller: &mut AppController| {
+        controller.frame_drag_pointer(0, PointerKind::Down, 1.0);
+        controller.frame_drag_pointer(0, PointerKind::Move, ROW_HEIGHT + 1.0);
+        assert!(controller.drag_capture_active());
+    };
+    let assert_retired = |controller: &mut AppController, reason: &str| {
+        assert_eq!(controller.dragging_row(), None, "{reason}");
+        assert!(
+            !controller.advance_frame_drag_autoscroll(),
+            "{reason}: a retired drag cannot scroll"
+        );
+    };
+
+    let mut released = controller_with_list_frames("images_drag_release", 3);
+    begin_drag(&mut released);
+    released.frame_drag_pointer(0, PointerKind::Up, ROW_HEIGHT + 1.0);
+    assert_retired(&mut released, "release retires the drag");
+
+    let mut removed = controller_with_list_frames("images_drag_source_retirement", 3);
+    begin_drag(&mut removed);
+    removed.remove_frame(0);
+    assert_retired(&mut removed, "removing a source retires the drag");
+
+    let mut switched = controller_with_list_frames("images_drag_tab_switch", 3);
+    let other = tree("images_drag_tab_switch_other");
+    write_timed(&other, "other.tif", Some("2026:08:29 10:00:00"));
+    assert!(matches!(
+        common::open_and_settle(&mut switched, &[other]),
+        OpenOutcome::Opened(_)
+    ));
+    switched.select_project(0);
+    begin_drag(&mut switched);
+    switched.select_project(1);
+    assert_retired(&mut switched, "switching tabs retires the drag");
+
+    let mut mode_changed = controller_in_editor_mode("images_drag_mode_change");
+    assert!(mode_changed.set_mode(ShellMode::Stacking));
+    begin_drag(&mut mode_changed);
+    assert!(mode_changed.set_mode(ShellMode::Editor));
+    assert_retired(&mut mode_changed, "changing mode retires the drag");
+
+    let mut running = controller_with_list_frames("images_drag_job_start", 3);
+    begin_drag(&mut running);
+    running.set_align_algorithm("dummy-align");
+    assert!(running.start_fuse());
+    assert_retired(&mut running, "starting a job retires the drag");
+    wait_for_settle(&mut running, Duration::from_secs(120));
 }
 
 #[test]
@@ -1773,7 +3205,10 @@ fn images_panel_disable_is_whole_panel() {
     app.set_images_enabled(true);
     assert_eq!(panel_opacity(), 1.0, "re-enabling restores full opacity");
 
-    let controller = controller_with_frames("images_panel_disable_is_whole_panel", 4);
+    let mut controller = controller_with_frames("images_panel_disable_is_whole_panel", 4);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::List,
+    });
     focusforge_gui::bridge::push_images_panel(&app, &controller);
     assert!(
         !row_opacities().is_empty(),
@@ -1793,7 +3228,8 @@ fn images_panel_disable_is_whole_panel() {
     );
     assert!(
         row_opacities().iter().all(|&o| o == 0.5),
-        "every row inherits the panel's dim, not just the panel background"
+        "every row inherits the panel's dim: {:?}",
+        row_opacities()
     );
     app.set_images_enabled(true);
     assert_eq!(panel_opacity(), 1.0);
@@ -1854,10 +3290,11 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let controller = Arc::new(Mutex::new(controller_with_frames(
-        "job_disables_images_and_settings",
-        3,
-    )));
+    let mut loaded = controller_with_frames("job_disables_images_and_settings", 3);
+    loaded.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::List,
+    });
+    let controller = Arc::new(Mutex::new(loaded));
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
@@ -1881,16 +3318,16 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
             .partial_cmp(&b.absolute_position().y)
             .unwrap()
     });
-    let gutter = grip_gutter_point(&app, element_center(&rows[0]).y);
+    let gutter = source_drag_point(&app, element_center(&rows[0]).y);
     app.window()
         .dispatch_event(WindowEvent::PointerMoved { position: gutter });
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
     assert!(
         ElementQuery::from_root(&app)
-            .match_id("FFImageRow::exclude-area")
+            .match_id("FFImageRow::list-exclude-button")
             .find_first()
             .is_some(),
-        "hovering a row's grip gutter shows its controls before any job runs"
+        "hovering a row's source-name region shows its controls before any job runs"
     );
     assert!(
         ElementQuery::from_root(&app)
@@ -1911,10 +3348,10 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
     assert!(
         ElementQuery::from_root(&app)
-            .match_id("FFImageRow::exclude-area")
+            .match_id("FFImageRow::list-exclude-button")
             .find_first()
             .is_none(),
-        "no row's grip or controls may show while this tab's own job is running, even hovered"
+        "no row controls may show while this tab's own job is running, even hovered"
     );
     assert!(
         ElementQuery::from_root(&app)
@@ -2026,6 +3463,12 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         "images_scroll_accounting",
         100,
     )));
+    controller
+        .lock()
+        .unwrap()
+        .install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::List,
+        });
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
@@ -2061,12 +3504,6 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
     .unwrap();
     events.lock().unwrap().clear();
 
-    let list_center = element_center(&mounted(&app, "FFImagesPanel::list"));
-    dispatch(WindowEvent::PointerScrolled {
-        position: list_center,
-        delta_x: 0.0,
-        delta_y: -100_000.0,
-    });
     let selected = || {
         controller
             .lock()
@@ -2076,20 +3513,74 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
             .iter()
             .position(|r| r.selected)
     };
+    let metadata_reads_before_wheel = counters().0;
+    for presentation in [
+        SourcePresentation::List,
+        SourcePresentation::ImageList,
+        SourcePresentation::Large,
+    ] {
+        {
+            let mut controller = controller.lock().unwrap();
+            controller.set_source_presentation(presentation);
+            controller.select_frame(0);
+            controller.images_viewport_scrolled(0.0);
+        }
+        settle();
+        let list_center = element_center(&mounted(&app, "FFImagesPanel::list"));
+        dispatch(WindowEvent::PointerScrolled {
+            position: list_center,
+            delta_x: 0.0,
+            delta_y: -100_000.0,
+        });
+        assert_eq!(
+            selected(),
+            Some(99),
+            "{presentation:?}: wheel selects the last row"
+        );
+        assert!(
+            controller.lock().unwrap().images_scroll_y() > 0.0,
+            "{presentation:?}: wheel keeps its selected row visible"
+        );
+        let name_slot = match presentation {
+            SourcePresentation::List => "FFImageRow::list-name-slot",
+            SourcePresentation::ImageList => "FFImageRow::image-list-name-slot",
+            SourcePresentation::Large => "FFImageRow::large-name-slot",
+        };
+        assert!(
+            i_slint_backend_testing::ElementQuery::from_root(&app)
+                .match_id(name_slot)
+                .match_descendants()
+                .match_predicate(|element| {
+                    element
+                        .accessible_label()
+                        .is_some_and(|label| label == "99.tif")
+                })
+                .find_first()
+                .is_some(),
+            "{presentation:?}: the selected row's name is mounted inside the source list"
+        );
+
+        dispatch(WindowEvent::PointerScrolled {
+            position: element_center(&mounted(&app, "FFImagesPanel::list")),
+            delta_x: 0.0,
+            delta_y: 100_000.0,
+        });
+        assert_eq!(
+            selected(),
+            Some(0),
+            "{presentation:?}: wheel selects the first row"
+        );
+        assert_eq!(
+            controller.lock().unwrap().images_scroll_y(),
+            0.0,
+            "{presentation:?}: returning selection restores the first row"
+        );
+    }
     assert_eq!(
-        controller.lock().unwrap().images_scroll_y(),
-        0.0,
-        "the wheel over a row steps frames and leaves the list where it is"
+        counters().0,
+        metadata_reads_before_wheel,
+        "wheel selection visibility does not read metadata"
     );
-    assert_eq!(selected(), Some(99), "the wheel stepped to the last frame");
-    dispatch(WindowEvent::PointerScrolled {
-        position: list_center,
-        delta_x: 0.0,
-        delta_y: 100_000.0,
-    });
-    assert_eq!(controller.lock().unwrap().images_scroll_y(), 0.0);
-    assert_eq!(selected(), Some(0), "the opposite wheel stepped back");
-    assert!(labelled(&app, "01.tif") > 0 && labelled(&app, "99.tif") == 0);
     let before = counters();
     events.lock().unwrap().clear();
 
@@ -2136,10 +3627,10 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
     assert!(dragged < jumped, "the thumb drag moved the list back up");
     assert_eq!(-app.get_images_list_viewport_y(), dragged);
 
-    assert_eq!(
-        counters(),
-        before,
-        "scrolling reads no metadata and updates no row"
+    assert_eq!(counters().0, before.0, "scrolling reads no metadata");
+    assert!(
+        counters().1 >= before.1,
+        "scrolling republishes the visible model so cached previews become native images"
     );
     {
         let seen = events.lock().unwrap();
@@ -2171,11 +3662,22 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         app.get_images_rows().iter().collect::<Vec<_>>()
     };
     let old = shown();
+    let old_panel = controller.lock().unwrap().images_panel();
     let removed = row_updates(&|c| c.remove_frame(98));
     let new = shown();
+    let new_panel = controller.lock().unwrap().images_panel();
     assert_eq!(new.len(), old.len() - 1);
-    let changed = new.iter().zip(&old).filter(|(n, o)| n != o).count();
-    assert_eq!(removed, (changed + 1) as u64);
+    let changed = new_panel
+        .rows
+        .iter()
+        .zip(&old_panel.rows)
+        .filter(|(new, old)| new != old)
+        .count();
+    assert_eq!(
+        removed,
+        (changed + 1) as u64,
+        "the bridge updates each changed source row and trims the removed tail"
+    );
     assert_eq!(counters().0, before.0, "no edit re-read the disk");
 }
 
@@ -2297,7 +3799,8 @@ fn a_thousand_rows_instantiate_only_the_visible_window() {
 }
 
 #[test]
-fn a_grip_drag_survives_leaving_the_viewport_and_row_recycling() {
+fn a_source_drag_survives_leaving_the_viewport_and_row_recycling() {
+    use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
@@ -2305,8 +3808,8 @@ fn a_grip_drag_survives_leaving_the_viewport_and_row_recycling() {
     init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
-    let controller = Arc::new(Mutex::new(controller_with_timed_frames(
-        "images_grip_drag_recycling",
+    let controller = Arc::new(Mutex::new(controller_with_list_frames(
+        "images_source_drag_recycling",
         40,
     )));
     let _installed = focusforge_gui::bridge::install(
@@ -2330,7 +3833,7 @@ fn a_grip_drag_survives_leaving_the_viewport_and_row_recycling() {
 
     let list = mounted(&app, "FFImagesPanel::list");
     let (top, height) = (list.absolute_position().y, list.size().height);
-    let at = |y: f32| grip_gutter_point(&app, y);
+    let at = |y: f32| source_drag_point(&app, y);
     let press = at(top + 1.5 * ROW_HEIGHT);
     dispatch(WindowEvent::PointerMoved { position: press });
     dispatch(WindowEvent::PointerPressed {
@@ -2356,7 +3859,18 @@ fn a_grip_drag_survives_leaving_the_viewport_and_row_recycling() {
     );
     dispatch(WindowEvent::PointerMoved { position: press });
     assert_eq!(controller.lock().unwrap().drag_offset(), 0.0);
-    assert_eq!(labelled(&app, "01.tif"), 2, "the row and its floating copy");
+    assert_eq!(
+        labelled(&app, "01.tif"),
+        1,
+        "returning to origin removes the floating copy"
+    );
+    assert!(
+        ElementQuery::from_root(&app)
+            .match_id("FFImagesPanel::drag-capture")
+            .find_first()
+            .is_some(),
+        "a drag that already moved retains capture through a zero offset"
+    );
 
     {
         let mut c = controller.lock().unwrap();
@@ -2391,7 +3905,7 @@ fn a_grip_drag_survives_leaving_the_viewport_and_row_recycling() {
     assert_eq!(c.dragging_row(), None, "no drag starts past the end");
     std::fs::remove_file(
         PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("images_grip_drag_recycling_frames")
+            .join("images_source_drag_recycling_frames")
             .join("00.tif"),
     )
     .unwrap();
@@ -2642,4 +4156,63 @@ fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(controller.lock().unwrap().checkpoint_count(), Some(2));
+}
+
+#[test]
+fn source_row_actions_and_panel_header_buttons_carry_their_names() {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_list_preview_active(true);
+    app.set_list_preview_mode("stacking".into());
+    app.set_list_preview_dragging_row(-1);
+    app.set_list_preview_drag_target_row(-1);
+    let named = |id: &str| {
+        let handle = ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("{id} is mounted"));
+        assert_eq!(
+            handle.accessible_role(),
+            Some(AccessibleRole::Button),
+            "{id}"
+        );
+        handle.accessible_label().unwrap_or_default().to_string()
+    };
+
+    for presentation in ["list", "image-list", "large"] {
+        app.set_list_preview_presentation(presentation.into());
+        for (excluded, exclude_label) in [(false, "Exclude"), (true, "Include")] {
+            let row = focusforge_gui::ImageRowView {
+                chip: slint::Color::from_rgb_u8(220, 201, 55),
+                name: "IMG_9819.tif".into(),
+                time_text: "16:42:09".into(),
+                capture_stamp: "2026:08:29 16:42:09".into(),
+                excluded,
+                unresolved: false,
+                selected: false,
+                hovered: true,
+                focused: false,
+                job_disabled: false,
+                preview: slint::Image::default(),
+                preview_state: "ready".into(),
+            };
+            app.set_list_preview_rows(std::rc::Rc::new(slint::VecModel::from(vec![row])).into());
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            assert_eq!(
+                named(&format!("FFImageRow::{presentation}-exclude-button")),
+                exclude_label,
+                "{presentation}, excluded {excluded}"
+            );
+            assert_eq!(
+                named(&format!("FFImageRow::{presentation}-remove-button")),
+                "Remove"
+            );
+        }
+    }
+    assert_eq!(named("FFImagesPanel::add-button"), "Add images");
+    assert_eq!(named("FFImagesPanel::sort-button"), "Sort");
 }

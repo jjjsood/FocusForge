@@ -34,7 +34,10 @@ crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                decodes a thumbnail off the event-loop thread, and a
                keyboard/mouse binding table read from `settings.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
-fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the test suite
+fixtures/      small checked-in TIFF crops, a RAW DNG fixture, folders that open
+               or are refused, and `.ffp` projects (valid, corrupt, mismatched,
+               missing frames) used by the test suite and the UI journeys
+tests/ui/      end-to-end window journeys written as numbered steps
 ```
 
 ## Tech stack
@@ -62,7 +65,8 @@ fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the tes
   declares, and `unstable-winit-030`), `slint-build` (build dependency),
   `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
   folder/file picker), `toml`/`toml_edit`/`serde` (`settings.toml`'s
-  `[recent]`, `[input]` and `[export]` tables), `directories` (per-platform data/config
+  `[recent]`, `[appearance]`, `[input]` and `[export]` tables), `notify-rust`
+  (desktop banners while the window is in the background), `directories` (per-platform data/config
   paths), `png`
   (`--screenshot`), `tracing`. Inter ships bundled under `assets/fonts/`;
   the icon set is vendored from Lucide under `assets/icons/`.
@@ -127,6 +131,13 @@ report and flight recording, and the crash-notice bookkeeping and
 diagnostics bundle's redaction and manifest, each writing into its own
 temporary directory rather than a shared one.
 
+`tests/ui/` holds 18 journeys, each one whole path through the window as
+numbered clicks, keys and hovers with an `Expect:` line per step, plus
+`features/` files listing which journey covers which feature. They are run by
+hand or by a script against `focusforge-gui`; `tests/ui/README.md` gives the
+step format and how to launch one, including `--save-folder` so saves and
+exports skip the file chooser. They are not part of `cargo test`.
+
 `crates/gpu`'s WGSL fusion and warp kernels, and the pipeline in
 `focusforge-cli` that dispatches them, sit behind the `gpu` Cargo feature —
 on by default, so a plain `cargo build --workspace` or `cargo test
@@ -167,9 +178,9 @@ not a failed run.
 
 The trace ends in a `timing_summary` span whose fields are run totals:
 bytes uploaded, read back and copied, buffer and pipeline creations, and
-nanosecond counters. `fuse_equalize_ns` is the time spent estimating the
-per-frame brightness gains before any tile is fused. On the GPU tile path,
-nine `gpu_tile_*_ns` counters (`read`, `warp`, `upload`, `pyramid`, `select`,
+nanosecond counters. `prepare_equalize_ns` is the time spent measuring the
+sources and fixing the per-frame brightness gains before alignment. On the GPU
+tile path, nine `gpu_tile_*_ns` counters (`read`, `warp`, `upload`, `pyramid`, `select`,
 `reconstruct`, `readback`, `wait`, `other`) split each tile's time so the
 stages sum to the tile's time; they are thread-seconds summed over
 concurrent tiles and stay 0 on a CPU run. `upload_bytes` counts every

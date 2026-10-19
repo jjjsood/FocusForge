@@ -21,8 +21,10 @@
 #                     any fixture. Needs no reference stack, so it runs even when
 #                     the stack directory does not exist -- checked before the
 #                     SKIP below.
-#   --compressed-only write/check compressed mantis-64 variants from committed
-#                     fixtures without a reference stack.
+#   --compressed-only write/check the compressed mantis-64 variants and the
+#                     open-two-stacks, open-root-and-subfolder and open-rejected
+#                     folder sets from committed fixtures without a reference
+#                     stack.
 #   --source-fixtures DIR
 #                     fixture tree containing the uncompressed mantis-64 source.
 #

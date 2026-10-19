@@ -78,6 +78,9 @@ use crate::tile::{FramePreprocess, TileConsumer, TileError, TileScheduler};
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStage {
+    /// Brightness preparation of the sources, before alignment: reported,
+    /// never controlled.
+    Prepare,
     /// Per-frame alignment: reported, never controlled.
     Align,
     /// Fuse-tile units: the only stage [`Job::run`] itself drives.
@@ -89,6 +92,7 @@ impl JobStage {
         match self {
             JobStage::Align => 0,
             JobStage::Fuse => 1,
+            JobStage::Prepare => 2,
         }
     }
 
@@ -96,6 +100,7 @@ impl JobStage {
         match v {
             0 => JobStage::Align,
             1 => JobStage::Fuse,
+            2 => JobStage::Prepare,
             _ => unreachable!("JobStage is only ever written through JobControl::set_stage"),
         }
     }

@@ -335,6 +335,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: deranged 0.5.9
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: macOS arm64, macOS x86_64
 - Package: derive_more 2.1.1
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT
@@ -859,6 +863,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: mac-notification-sys 0.6.15
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT/Apache-2.0
+  Targets: macOS arm64, macOS x86_64
 - Package: mach2 0.6.0
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: BSD-2-Clause OR MIT OR Apache-2.0
@@ -927,9 +935,17 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: nix 0.31.3
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT
+  Targets: macOS arm64, macOS x86_64
 - Package: no_std_io2 0.9.4
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: Apache-2.0 OR MIT
+  Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: notify-rust 4.18.2
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
 - Package: nshare 0.10.0
   Source: registry+https://github.com/rust-lang/crates.io-index
@@ -955,6 +971,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: num-conv 0.2.2
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: macOS arm64, macOS x86_64
 - Package: num-integer 0.1.47
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
@@ -1151,6 +1171,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: Unicode-3.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: powerfmt 0.2.1
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: macOS arm64, macOS x86_64
 - Package: presser 0.3.1
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
@@ -1475,6 +1499,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: tauri-winrt-notification 0.8.1
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: Windows x86_64
 - Package: thiserror 1.0.69
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
@@ -1487,6 +1515,14 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
+- Package: time 0.3.55
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: macOS arm64, macOS x86_64
+- Package: time-core 0.1.9
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: macOS arm64, macOS x86_64
 - Package: tiny-skia 0.11.4
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: BSD-3-Clause
@@ -1783,6 +1819,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Windows x86_64
+- Package: windows-version 0.1.7
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: Windows x86_64
 - Package: windows_x86_64_msvc 0.52.6
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
@@ -1879,7 +1919,7 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: Unicode-3.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64
-- Package: zip 8.6.0
+- Package: zip 9.0.4
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT
   Targets: Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64

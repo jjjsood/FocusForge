@@ -68,9 +68,15 @@ fn check_icon(path: &Path) -> Result<(), String> {
         .find(|t| element_name(t) == "svg")
         .ok_or_else(|| format!("{}: no <svg> root element", path.display()))?;
 
+    // A solid-fill variant of a glyph carries `fill="currentColor"`.
+    let fill = if path.file_name().and_then(|n| n.to_str()) == Some("bell-filled.svg") {
+        "currentColor"
+    } else {
+        "none"
+    };
     for (name, expected) in [
         ("viewBox", "0 0 24 24"),
-        ("fill", "none"),
+        ("fill", fill),
         ("stroke", "currentColor"),
         ("stroke-width", "2"),
         ("stroke-linecap", "round"),

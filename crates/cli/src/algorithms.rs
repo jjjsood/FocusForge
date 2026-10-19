@@ -200,21 +200,34 @@ fn render_listing(algorithms: &[AlgorithmReport<'_>], project: &[ParamReport<'_>
 /// value/provenance pair, its help sentence on its own line, and whether an
 /// `auto` hook exists. `has_auto` is reported as `auto: present, not
 /// evaluated` or `auto: none` — never as a resolved value, since no `auto`
-/// hook is ever invoked here.
+/// hook is ever invoked here. A parameter with an `auto` hook reads `default
+/// from the loaded frames` and shows a value only once set explicitly.
 fn render_schema(algo: &AlgorithmReport<'_>) -> String {
     let mut lines = vec![format!(
         "{} - {} ({})",
         algo.id, algo.display_name, algo.family
     )];
     for p in &algo.params {
-        lines.push(format!(
-            "  {}: {} default {} value {} ({:?})",
+        // An `auto` hook decides from the loaded frames, which this command
+        // never loads, so the stored default is not the value in use.
+        let default = if p.has_auto {
+            "from the loaded frames".to_string()
+        } else {
+            serde_json::to_string(&p.desc.default).unwrap_or_else(|_| "?".to_string())
+        };
+        let mut line = format!(
+            "  {}: {} default {default}",
             p.desc.id,
             describe_kind(&p.desc.kind),
-            serde_json::to_string(&p.desc.default).unwrap_or_else(|_| "?".to_string()),
-            serde_json::to_string(&p.value).unwrap_or_else(|_| "?".to_string()),
-            p.provenance,
-        ));
+        );
+        if !(p.has_auto && p.provenance == Provenance::Default) {
+            line.push_str(&format!(
+                " value {} ({:?})",
+                serde_json::to_string(&p.value).unwrap_or_else(|_| "?".to_string()),
+                p.provenance,
+            ));
+        }
+        lines.push(line);
         lines.push(format!("    {}", p.desc.help));
         lines.push(format!(
             "    auto: {}",

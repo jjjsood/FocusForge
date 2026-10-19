@@ -44,6 +44,7 @@ export component FFZoomCluster inherits Rectangle {
         border-radius: Theme.radius-sm;
 
         zoom-out := FFIconButton {
+            name: "Zoom out";
             x: 0px;
             y: 0px;
             enabled: root.project-loaded;
@@ -71,6 +72,7 @@ export component FFZoomCluster inherits Rectangle {
         }
 
         zoom-in := FFIconButton {
+            name: "Zoom in";
             x: zoom-readout.x + zoom-readout.width;
             y: 0px;
             enabled: root.project-loaded;

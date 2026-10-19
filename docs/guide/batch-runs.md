@@ -84,7 +84,7 @@ to an `auto` closure remain live rather than being frozen. A flag on the
 command line always beats the file:
 `--set`/`--align-set` override the file's tables, `--algorithm`/`--align-algorithm`
 override its keys. The `[stack]` table also carries the project settings (`align`, `auto-crop`,
-`equalize`, `equalize-max-gain`); `align = false` in a preset fuses the frames
+`equalize`, `equalize-max-gain`, `equalize-target`); `align = false` in a preset fuses the frames
 as read. `focusforge-cli align` reads the same file, using only
 its `align-algo` key and `[align]` table.
 

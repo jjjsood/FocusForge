@@ -94,6 +94,7 @@ fn live_slugs() -> Vec<&'static str> {
         slugs,
         [
             "performance",
+            "appearance",
             "storage",
             "input-map",
             "diagnostics",
@@ -170,6 +171,28 @@ fn settings_section_argument_help_names_every_live_tab() {
     for slug in live_slugs() {
         assert!(section.contains(slug), "--help must name {slug}: {section}");
     }
+}
+
+#[test]
+fn fuse_tabs_help_names_the_decision_wait() {
+    let output = common::gui_bin("diagnostics_fuse_tabs_help")
+        .arg("--help")
+        .output()
+        .expect("failed to run focusforge-gui");
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    let section = help
+        .split("--fuse-tabs <")
+        .nth(1)
+        .and_then(|rest| rest.split("--slow-run <").next())
+        .expect("--help describes --fuse-tabs")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        section.contains("waits until every earlier run has settled and any Keep/Discard question has been answered in the window"),
+        "--fuse-tabs help must state the wait: {section}"
+    );
 }
 
 /// Windowed: every accepted value goes on to open a real window, unlike the
