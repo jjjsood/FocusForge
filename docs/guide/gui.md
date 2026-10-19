@@ -30,7 +30,7 @@ lists them all.
 
 | flag | effect |
 |---|---|
-| `--fuse-tabs 0,1` | selects those tabs in turn and presses **Fuse stack** on each once `--open` has loaded; an index repeated, as in `0,0`, waits until the earlier run has settled and its **Keep** or **Discard** question is answered |
+| `--fuse-tabs 0,1` | selects those tabs in turn and presses **Fuse stack** on each once `--open` has loaded, so give one `--open <folder>` per stack (a folder that reads as several stacks first asks how to group them, and until that is answered no tab exists for the flag to select); an index repeated, as in `0,0`, waits until the earlier run has settled and its **Keep** or **Discard** question is answered |
 | `--projects-overlay` | opens the projects overlay; with `--open` it stays open after the load lands, with `--fuse-tabs` it opens once the last run settles |
 | `--toolbar-state idle\|running\|paused\|cancelling\|failed` | shows that transport state until a real run starts |
 | `--save-folder <DIR>` | writes every project save and image export into this existing folder under its proposed name, with no save dialog |
