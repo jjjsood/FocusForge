@@ -24,7 +24,7 @@ jobs:
       - name: Install pinned Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: '3.12.15'
+          python-version: '3.12.10'
       - name: Check native plan
         shell: bash
         run: python3 tools/collect-native-artifacts.py --check-plan
@@ -86,7 +86,7 @@ jobs:
       - name: Install pinned Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: '3.12.15'
+          python-version: '3.12.10'
       - name: Check native plan
         shell: pwsh
         run: python tools/collect-native-artifacts.py --check-plan

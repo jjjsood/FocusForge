@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: '3.12.15'
+          python-version: '3.12.10'
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
@@ -47,7 +47,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes pkg-config libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal --component rustfmt clippy
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.95.0
           if [ "$RUNNER_OS" = macOS ] && [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
             brew install bash

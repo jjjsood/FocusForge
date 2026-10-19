@@ -7,7 +7,7 @@ from the reference stack, and the shared build/GPU lock.
 acceptance or merge; GitHub Actions runs the same command on Linux, macOS and
 Windows for additional native-platform evidence. CI does not replace the local
 gate. It needs Rust 1.95.0 with rustfmt and clippy, cargo-deny 0.20.2,
-cargo-nextest 0.9.144, Python 3.12.15 with NumPy 2.2.6, and Linux GUI link
+cargo-nextest 0.9.144, Python 3.12 with NumPy 2.2.6 (CI pins 3.12.10, the last 3.12 release with Windows and macOS builds), and Linux GUI link
 prerequisites when run on Linux.
 
 | script | what it does |
