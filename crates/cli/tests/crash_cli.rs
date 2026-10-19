@@ -351,7 +351,14 @@ fn native_segfault() {
 fn native_stack_overflow() {
     let mut cmd = common::cli_bin("crash_cli_native_stack_overflow");
     let (pid, signal) = crash_child(&mut cmd, "stack-overflow");
-    assert_eq!(signal, 11, "an overflowed stack dies from SIGSEGV");
+    // On macOS the capture answers the Mach exception and the faulting
+    // instruction runs again; the runtime's guard-page handler then aborts.
+    let (expected, name) = if cfg!(target_os = "macos") {
+        (6, "SIGABRT")
+    } else {
+        (11, "SIGSEGV")
+    };
+    assert_eq!(signal, expected, "an overflowed stack dies from {name}");
 
     let (dump, metadata) = native_crash_files(&crashes_dir(&cmd));
     assert_metadata(&metadata, pid, "SIGSEGV", &dump);
