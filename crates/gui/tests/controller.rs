@@ -322,6 +322,10 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "close-requested")
             | (Some("app.slint"), "link-activated")
+            | (Some("app.slint"), "settings-close-requested")
+            | (Some("settings_modal.slint"), "changed settings-open")
+            | (Some("settings_modal.slint"), "changed settings-section")
+            | (Some("settings_modal.slint"), "key-pressed(event)")
             | (Some("notification_center.slint"), "clicked")
             | (Some("notification_center.slint"), "changed selected")
             | (Some("notification_center.slint"), "key-pressed(event)")
@@ -385,6 +389,16 @@ fn controller_with_scratch(name: &str) -> AppController {
 /// Opens the first `count` `fixtures/mantis-64` frames, copied under a fresh
 /// directory, as a new active tab with no checkpoint. Returns that directory.
 fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    let root = open_mantis64_frames(controller, name, count);
+    // Editor entry is under test, not alignment quality; an algorithm that
+    // always converges keeps every run clean.
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// [`open_mantis64_tab`] on the default aligner, which parks these frames
+/// at its Keep/Discard question.
+fn open_mantis64_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
     let root = common::tree(&format!("{name}_frames"));
     for i in 0..count {
         fs::copy(
@@ -397,9 +411,6 @@ fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -
         common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
-    // Editor entry is under test, not alignment quality; an algorithm that
-    // always converges keeps every run clean.
-    controller.set_align_algorithm("dummy-align");
     root
 }
 
@@ -1028,6 +1039,42 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
     let target = common::tree("detached_save_all_quit_sync").join("saved.ffp");
     assert!(headless.save_all_and_quit(|_| Some(target.clone())));
     assert_close_tail(&events);
+}
+
+#[test]
+fn quit_asks_only_when_work_would_be_lost() {
+    for tabs in 0..=2 {
+        let name = format!("quit_asks_unfused_{tabs}");
+        let mut controller = controller_with_scratch(&name);
+        for tab in 0..tabs {
+            open_mantis64_tab(&mut controller, &format!("{name}_{tab}"), 3);
+        }
+        let events = record_events(&mut controller);
+        controller.window_close();
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [ShellEvent::WindowCloseRequested],
+            "{tabs} never-saved tabs with no fuse close at once"
+        );
+        assert!(controller.pending_quit_copy().is_none(), "{tabs} tabs");
+    }
+
+    let mut controller = controller_with_scratch("quit_asks_fused_added");
+    open_mantis64_tab(&mut controller, "quit_asks_fused_added_a", 3);
+    open_fused_tab(&mut controller, "quit_asks_fused_added_b", 3);
+    let events = record_events(&mut controller);
+    controller.window_close();
+    assert!(
+        controller.pending_quit_copy().is_some(),
+        "a fused, unsaved tab raises the question"
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .contains(&ShellEvent::WindowCloseRequested),
+        "the window stays until the question is answered"
+    );
 }
 
 #[test]
@@ -3309,6 +3356,185 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
     );
     assert_eq!(summary.unaligned, 4);
     assert_eq!(summary.rerun, None);
+}
+
+/// The run state of tab `index`, read by selecting it.
+fn tab_run(controller: &mut AppController, index: usize) -> job::RunState {
+    controller.select_project(index);
+    controller.job_view().state
+}
+
+/// Polls until some tab holds a parked run, within the budget a mantis-512
+/// fuse needs.
+fn settle_until_parked(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.parked_run_waiting() {
+        controller.settle_job();
+        assert!(
+            start.elapsed() < Duration::from_secs(300),
+            "no run parked within the budget"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+const MANTIS_512_UNALIGNED: [&str; 4] = ["00.tif", "01.tif", "06.tif", "07.tif"];
+const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
+
+/// Tab 0 (mantis-512) parks at its question; `tails` are the tabs queued
+/// behind it, each `true` for `dummy-align` and `false` for the default
+/// aligner. Checks the queue head runs while tab 0 waits and every tab
+/// settles to an outcome of its own, then answers each question.
+fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
+    let mut c = controller_on_mantis_512(name);
+    for (i, dummy) in tails.iter().enumerate() {
+        let tab = format!("{name}_{i}");
+        if *dummy {
+            open_mantis64_tab(&mut c, &tab, 3);
+        } else {
+            open_mantis64_frames(&mut c, &tab, 3);
+        }
+    }
+    c.set_slow_run(2, Duration::from_secs(3));
+    c.select_project(0);
+    assert!(c.start_fuse());
+    for i in 1..=tails.len() {
+        c.select_project(i);
+        assert!(c.start_fuse(), "tab {i} joins the queue");
+        assert_eq!(
+            c.job_view().state,
+            job::RunState::Queued { position: i + 1 }
+        );
+    }
+
+    settle_until_parked(&mut c);
+    assert_eq!(tab_run(&mut c, 1), job::RunState::Running, "the head runs");
+    assert!(c.parked_run_waiting(), "tab 0's park counts from tab 1");
+    for i in 2..=tails.len() {
+        assert_eq!(tab_run(&mut c, i), job::RunState::Queued { position: i });
+    }
+    c.select_project(0);
+    assert_eq!(
+        c.pending_divergence(),
+        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+    );
+    let answer_first = |c: &mut AppController| {
+        c.select_project(0);
+        if keep_first {
+            c.keep_fused().expect("tab 0's park keeps");
+            assert_eq!(c.checkpoint_count(), Some(1));
+        } else {
+            c.discard_fused();
+            assert_eq!(c.checkpoint_count(), Some(0));
+        }
+        assert_eq!(c.pending_divergence(), None);
+    };
+    if answer_while_live {
+        answer_first(&mut c);
+    }
+
+    settle_all(&mut c);
+    assert!(c.last_refusal().is_none());
+    for (i, dummy) in tails.iter().enumerate() {
+        c.select_project(i + 1);
+        if *dummy {
+            assert_eq!(c.checkpoint_count(), Some(1), "tab {} fused", i + 1);
+            assert_eq!(c.pending_divergence(), None);
+        } else {
+            assert_eq!(c.checkpoint_count(), Some(0));
+            assert_eq!(
+                c.pending_divergence(),
+                Some(&MANTIS_64_UNALIGNED.map(String::from)[..]),
+                "tab {} parks at its own question",
+                i + 1
+            );
+        }
+    }
+    if !answer_while_live {
+        assert!(c.parked_run_waiting(), "tab 0 is still waiting");
+        c.select_project(0);
+        assert_eq!(
+            c.pending_divergence(),
+            Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+        );
+        answer_first(&mut c);
+    }
+    for (i, dummy) in tails.iter().enumerate() {
+        if !dummy {
+            c.select_project(i + 1);
+            c.keep_fused().expect("the tail's own park keeps");
+            assert_eq!(c.checkpoint_count(), Some(1));
+        }
+    }
+    assert!(!c.parked_run_waiting(), "every question is answered");
+    assert!(!c.work_pending());
+}
+
+#[test]
+fn queued_tab_runs_past_a_keep_question() {
+    // Queue lengths 1 and 2, `dummy-align` and the default aligner on the
+    // promoted tabs, Keep and Discard on tab 0, answered during and after
+    // the promoted run.
+    queue_behind_a_park("queue_past_park_a", &[true], true, true);
+    queue_behind_a_park("queue_past_park_b", &[false], false, false);
+    queue_behind_a_park("queue_past_park_c", &[true, false], true, false);
+    queue_behind_a_park("queue_past_park_d", &[false, true], false, true);
+}
+
+/// Tab 0 parked, tab 1 running slowly, tabs 2 and 3 queued behind it.
+fn parked_tab_with_two_queued(name: &str) -> AppController {
+    let mut c = controller_on_mantis_512(name);
+    for i in 0..3 {
+        open_mantis64_tab(&mut c, &format!("{name}_{i}"), 3);
+    }
+    c.set_slow_run(2, Duration::from_secs(3));
+    c.select_project(0);
+    assert!(c.start_fuse());
+    for i in 1..=3 {
+        c.select_project(i);
+        assert!(c.start_fuse());
+    }
+    settle_until_parked(&mut c);
+    assert_eq!(tab_run(&mut c, 1), job::RunState::Running);
+    c
+}
+
+#[test]
+fn queue_survives_closing_a_parked_tab() {
+    let mut c = parked_tab_with_two_queued("queue_close_parked");
+    c.request_close(0);
+    assert!(!c.parked_run_waiting(), "closing drops the park");
+    assert_eq!(c.project_tabs().len(), 3);
+    assert_eq!(tab_run(&mut c, 0), job::RunState::Running);
+    assert_eq!(tab_run(&mut c, 1), job::RunState::Queued { position: 2 });
+    assert_eq!(tab_run(&mut c, 2), job::RunState::Queued { position: 3 });
+    settle_all(&mut c);
+    assert!(!c.work_pending());
+    for i in 0..3 {
+        c.select_project(i);
+        assert_eq!(c.checkpoint_count(), Some(1), "tab {i} ran exactly once");
+    }
+}
+
+#[test]
+fn queue_survives_cancelling_a_queued_tab() {
+    let mut c = parked_tab_with_two_queued("queue_cancel_queued");
+    c.select_project(2);
+    c.cancel_fuse();
+    assert_eq!(c.job_view().state, job::RunState::Idle);
+    assert_eq!(tab_run(&mut c, 3), job::RunState::Queued { position: 2 });
+    assert!(c.parked_run_waiting(), "tab 0 still waits");
+    settle_all(&mut c);
+    assert!(!c.work_pending());
+    for (i, runs) in [(1, 1), (2, 0), (3, 1)] {
+        c.select_project(i);
+        assert_eq!(c.checkpoint_count(), Some(runs), "tab {i}");
+    }
+    c.select_project(0);
+    assert_eq!(
+        c.pending_divergence(),
+        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+    );
 }
 
 #[test]
@@ -6919,6 +7145,43 @@ fn refusal_dialog_counts_as_modal() {
     assert!(!controller.canvas_blocked());
 }
 
+#[test]
+fn refusal_dismissed_without_picker() {
+    use focusforge_gui::ChromeKey;
+    use focusforge_gui::input_map::Modifiers;
+    let escape = |c: &mut AppController| c.chrome_key("\u{1b}", Modifiers::NONE);
+
+    let mut controller = AppController::new();
+    raise_refusal(&mut controller, "refusal_escape_folder_empty");
+    assert!(controller.modal_open());
+    assert_eq!(escape(&mut controller), ChromeKey::RefusalDismissed);
+    assert!(
+        !controller.modal_open(),
+        "Escape closes the folder-empty refusal"
+    );
+
+    let dir = fixture_copy("projects", "refusal_escape_titled");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("corrupt.ffp")]),
+        OpenOutcome::Refused(_)
+    ));
+    assert!(controller.refusal_title().is_some(), "a titled refusal");
+    assert!(controller.modal_open());
+    assert_eq!(escape(&mut controller), ChromeKey::RefusalDismissed);
+    assert!(!controller.modal_open(), "Escape closes a titled refusal");
+
+    controller.toggle_projects_overlay();
+    raise_refusal(&mut controller, "refusal_escape_over_overlay");
+    assert_eq!(escape(&mut controller), ChromeKey::RefusalDismissed);
+    assert!(!controller.modal_open());
+    assert!(
+        controller.projects_overlay_open(),
+        "the refusal closes first; the overlay stays open"
+    );
+    assert_eq!(escape(&mut controller), ChromeKey::Consumed);
+    assert!(!controller.projects_overlay_open());
+}
+
 // ---------------------------------------------------------------------
 // In-memory checkpoints and the project save.
 // ---------------------------------------------------------------------
@@ -8970,5 +9233,262 @@ mod native_delivery {
         assert_eq!(controller.notifications().len(), 2);
         assert_eq!(controller.unread_notifications(), 2);
         assert!(controller.take_native_notifications().is_empty());
+    }
+}
+
+#[test]
+fn an_open_hold_keeps_the_load_in_flight() {
+    let root = common::tree("open_hold_frames");
+    for i in 0..3 {
+        common::copy_frame(&root, &format!("{i:02}.tif"), i);
+    }
+    let mut controller = AppController::new();
+    controller.set_open_hold(std::time::Duration::from_millis(600));
+    let started = std::time::Instant::now();
+    let handle = controller
+        .open_paths(&[root])
+        .expect("the load starts on a folder of frames");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        controller.load_in_flight(),
+        "the hold keeps the load in flight"
+    );
+    handle.join().expect("the load worker did not panic");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(600),
+        "the load finished after {:?}",
+        started.elapsed()
+    );
+    controller
+        .settle_open()
+        .expect("the load parked an outcome");
+    assert!(!controller.load_in_flight());
+}
+
+// --- Checked-in folder and project fixtures: each opens to the result it
+// exists for. Every case works on a copy under `CARGO_TARGET_TMPDIR`. -----
+
+/// A copy of `fixtures/<set>` named `name` under `CARGO_TARGET_TMPDIR`.
+fn fixture_copy(set: &str, name: &str) -> PathBuf {
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let dest = tree(name);
+    copy_dir(&common::workspace_root().join("fixtures").join(set), &dest);
+    dest
+}
+
+#[test]
+fn fixture_two_stacks_ask_the_grouping_question() {
+    let root = fixture_copy("open-two-stacks", "fixture_two_stacks");
+    let mut controller = AppController::new();
+    match common::open_and_settle(&mut controller, &[root]) {
+        OpenOutcome::Question(question, _) => {
+            assert_eq!(question.frame_count, 6);
+            assert_eq!(question.project_count, 2);
+        }
+        _ => panic!("two stacks in one folder must raise the grouping question"),
+    }
+    assert!(controller.pending_question().is_some());
+    assert!(controller.project_tabs().is_empty());
+
+    common::answer_and_settle(&mut controller, OpenAs::NProjects);
+    assert_eq!(controller.project_tabs().len(), 2);
+}
+
+#[test]
+fn fixture_root_and_subfolder_reports_the_skipped_subfolder() {
+    let root = fixture_copy("open-root-and-subfolder", "fixture_root_and_subfolder");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(
+        controller.images_panel().header_text,
+        "3 frames \u{b7} 0 excluded"
+    );
+
+    let record = controller
+        .notifications()
+        .first()
+        .expect("the skipped subfolder must be reported");
+    assert_eq!(record.title, "Some images were skipped");
+    assert_eq!(
+        record.message,
+        format!("1 subfolder skipped:\n{}", root.join("notes").display())
+    );
+    let cards = controller.project_cards();
+    let skipped = cards
+        .iter()
+        .find(|card| card.kind == "not-a-project")
+        .expect("the skipped subfolder keeps a card");
+    assert_eq!(skipped.project_name, "notes");
+}
+
+#[test]
+fn fixture_rejected_stack_opens_then_fails_and_retries() {
+    let root = fixture_copy("open-rejected", "fixture_rejected");
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("fixture_rejected_scratch"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(
+        matches!(controller.job_view().state, job::RunState::Failed(_)),
+        "the cut frame must fail the run, got {:?}",
+        controller.job_view().state
+    );
+    let message = controller.job_failure_message().unwrap_or_default();
+    assert!(message.contains("02.tif"), "{message}");
+
+    assert!(controller.retry_fuse(), "a failed run must be retryable");
+    assert!(controller.job_running());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    assert!(matches!(
+        controller.job_view().state,
+        job::RunState::Failed(_)
+    ));
+}
+
+#[test]
+fn fixture_corrupt_project_is_refused() {
+    let dir = fixture_copy("projects", "fixture_corrupt_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("corrupt.ffp")]),
+        OpenOutcome::Refused(_)
+    ));
+    assert_eq!(
+        controller.last_refusal(),
+        Some("This file is not a FocusForge project.")
+    );
+    assert_eq!(
+        controller.refusal_title(),
+        Some("This project cannot be opened")
+    );
+    assert!(controller.project_tabs().is_empty());
+}
+
+#[test]
+fn fixture_mismatched_project_raises_the_mismatch_and_opens_anyway() {
+    let dir = fixture_copy("projects", "fixture_mismatched_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("mismatch.ffp")]),
+        OpenOutcome::Mismatch(_)
+    ));
+    assert!(controller.pending_mismatch().is_some());
+    assert!(controller.project_tabs().is_empty());
+
+    controller.open_anyway();
+    assert!(controller.pending_mismatch().is_none());
+    assert_eq!(controller.project_tabs().len(), 1);
+}
+
+#[test]
+fn fixture_project_without_its_frames_opens_as_sources_missing() {
+    let dir = fixture_copy("projects", "fixture_missing_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("missing.ffp")]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(controller.gallery_failure_kind(0), Some("sources-missing"));
+    let (title, _body, file_name) = controller
+        .sources_notice()
+        .expect("the missing frames raise the notice");
+    assert_eq!(title, "The frames are no longer there");
+    assert_eq!(file_name, "missing");
+}
+
+#[test]
+fn fixture_valid_project_opens_over_its_frames() {
+    let dir = fixture_copy("projects", "fixture_valid_project");
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[dir.join("valid.ffp")]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert!(controller.pending_mismatch().is_none());
+    assert!(controller.sources_notice().is_none());
+    assert_eq!(controller.gallery_failure_kind(0), None);
+    assert_eq!(
+        controller.images_panel().header_text,
+        "3 frames \u{b7} 0 excluded"
+    );
+}
+
+/// A stroke of the shape a driver synthesises -- one press, one move to a far
+/// point, one release -- a long drag flushed every few moves, and a drag in
+/// stacking mode each reach their settled render in under a second.
+#[test]
+fn stroke_of_the_journey_shape_lands_quickly() {
+    use std::time::{Duration, Instant};
+
+    const BUDGET: Duration = Duration::from_secs(1);
+    let (mut c, _root) = open_editor("stroke_of_the_journey_shape");
+    set_size(&mut c, 8.0);
+    let centre = at(MAP_WIDTH as f32 / 2.0, MAP_HEIGHT as f32 / 2.0);
+    let far = at(MAP_WIDTH as f32 - 1.0, MAP_HEIGHT as f32 - 1.0);
+
+    let started = Instant::now();
+    press(&mut c, centre);
+    c.pointer_moved(far.0, far.1);
+    c.flush_live_stroke();
+    release(&mut c, far);
+    common::settle_region_renders(&mut c);
+    let one_move = started.elapsed();
+    assert_eq!(ops(&c).len(), 1, "the one-move stroke is appended");
+
+    let started = Instant::now();
+    press(&mut c, centre);
+    for step in 0..200 {
+        let t = step as f32 / 199.0;
+        let x = 4.0 + (MAP_WIDTH as f32 - 8.0) * t;
+        let y = MAP_HEIGHT as f32 / 2.0 + 20.0 * (t * 12.0).sin();
+        let point = at(x, y);
+        c.pointer_moved(point.0, point.1);
+        if step % 7 == 6 {
+            c.flush_live_stroke();
+        }
+    }
+    release(&mut c, far);
+    common::settle_region_renders(&mut c);
+    let long_drag = started.elapsed();
+    assert_eq!(ops(&c).len(), 2, "the long drag is appended");
+
+    assert!(c.set_mode(ShellMode::Stacking));
+    let started = Instant::now();
+    drag_screen(&mut c, &[centre, far]);
+    let stacking = started.elapsed();
+    assert_eq!(ops(&c).len(), 2, "a stacking-mode drag appends no stroke");
+
+    println!("one-move stroke: {one_move:?}");
+    println!("200-move drag, flush every 7: {long_drag:?}");
+    println!("stacking-mode drag: {stacking:?}");
+    for (name, took) in [
+        ("one-move stroke", one_move),
+        ("200-move drag", long_drag),
+        ("stacking-mode drag", stacking),
+    ] {
+        assert!(took < BUDGET, "{name} took {took:?}, over {BUDGET:?}");
     }
 }

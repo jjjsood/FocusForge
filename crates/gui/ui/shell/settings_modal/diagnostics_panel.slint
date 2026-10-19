@@ -82,6 +82,7 @@ export component FFDiagnosticsPanel inherits Rectangle {
                     divider: false;
 
                     FFToggle {
+                        name: "Include minidumps";
                         on: root.include-minidumps;
                         disabled: root.busy;
                         toggled => { root.minidumps-toggled(!root.include-minidumps); }

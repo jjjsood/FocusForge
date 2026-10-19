@@ -195,17 +195,62 @@ fn the_enabled_switch_writes_only_the_project_values() {
 
     let panel = controller.settings_panel();
     assert_eq!(field_rows(&panel.rows, "align")[0].selected, "false");
-    assert_eq!(
-        heading(&panel.rows, "align").heading_state,
-        HeadingState::Default,
-        "the switch is not an align parameter"
-    );
     assert!(
-        !panel
+        panel
             .rows
             .iter()
-            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true")
+            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true"),
+        "the switch alone enables Reset All"
     );
+    assert_eq!(
+        heading(&panel.rows, "finish").heading_state,
+        HeadingState::Default,
+        "no other section reads the switch"
+    );
+}
+
+#[test]
+fn enabled_switches_drive_their_heading() {
+    // (section whose switch is written, the switch's section, its id)
+    for (heading_section, switch_section, id) in [
+        ("align", "align-switch", "align"),
+        ("prepare", "prepare", "equalize"),
+    ] {
+        let mut controller = AppController::new();
+        open_mantis_512(&mut controller);
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Default,
+            "{id}: untouched"
+        );
+        assert!(
+            !reset_all_enabled(&controller),
+            "{id}: nothing to reset yet"
+        );
+
+        controller.set_param_value(switch_section, id, ParamValue::Bool(false));
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Explicit,
+            "{id}: writing the switch makes the heading explicit"
+        );
+        assert!(reset_all_enabled(&controller), "{id}: Reset All follows");
+
+        controller.set_param_value(switch_section, id, ParamValue::Bool(true));
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Explicit,
+            "{id}: provenance is key presence, so writing the default back keeps it"
+        );
+
+        controller.reset_all_sections();
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Default,
+            "{id}: Reset All restores the badge"
+        );
+        assert!(!reset_all_enabled(&controller), "{id}: Reset All disarms");
+    }
 }
 
 #[test]
@@ -343,6 +388,33 @@ fn a_loaded_stack_resolves_its_auto_hooks() {
         depth_row.value_text, "4",
         "pyramid-depth must resolve against the loaded stack's own dimensions, not the descriptor default"
     );
+}
+
+/// The Pyramid Depth row reads what `stack --dry-run` prints for the same
+/// frames: 0 for a 64 px frame, 3 for a 512 px frame, neither an explicit
+/// choice.
+#[test]
+fn pyramid_depth_matches_dry_run() {
+    let mantis_64 = common::workspace_root().join("fixtures").join("mantis-64");
+    for (frames, expected) in [(mantis_64, "0"), (mantis_512(), "3")] {
+        let mut controller = AppController::new();
+        assert!(matches!(
+            common::open_and_settle(&mut controller, std::slice::from_ref(&frames)),
+            OpenOutcome::Opened(_)
+        ));
+        controller.toggle_section_more("align");
+        controller.set_align_algorithm("pyramidal-ecc");
+        let panel = controller.settings_panel();
+        let depth_row = field_rows(&panel.rows, "align")
+            .into_iter()
+            .find(|r| r.id == "pyramid-depth")
+            .expect("pyramid-depth row must be present");
+        assert_eq!(depth_row.value_text, expected, "{}", frames.display());
+        assert_ne!(
+            heading(&panel.rows, "align").heading_state,
+            HeadingState::Explicit
+        );
+    }
 }
 
 #[test]
@@ -528,6 +600,20 @@ fn reopened_uncropped_project_shows_auto_crop_off() {
         OpenOutcome::Opened(_)
     ));
     assert_eq!(auto_crop_selected(&controller), "false");
+}
+
+#[test]
+fn a_reopened_project_without_an_align_record_opens_with_align_explicit() {
+    let mut controller = AppController::new();
+    let project = seal_without_align("reopened_unaligned_heading", "laplacian");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(
+        heading(&controller.settings_panel().rows, "align").heading_state,
+        HeadingState::Explicit
+    );
 }
 
 #[test]
@@ -741,6 +827,38 @@ fn seeded_ids_are_never_test_only() {
 }
 
 #[test]
+fn pickers_hide_test_only() {
+    assert!(
+        registry::find_stack("dummy-stack").unwrap().test_only(),
+        "the test build registers the dummy stack method"
+    );
+    assert!(registry::find_align("dummy-align").unwrap().test_only());
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let rows = controller.settings_panel().rows;
+    for section in ["fuse", "align"] {
+        let ids = picker_ids(&rows, section);
+        assert!(!ids.is_empty(), "{section} picker lists something");
+        for id in ids {
+            let algorithm = registry::find(&id).unwrap();
+            assert!(!algorithm.test_only(), "{section} picker lists {id}");
+        }
+    }
+
+    // A tab that holds a test-only algorithm keeps its closed-row label but
+    // does not offer it.
+    controller.set_align_algorithm("dummy-align");
+    let rows = controller.settings_panel().rows;
+    let picker = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "align")
+        .expect("align picker row must exist");
+    assert_eq!(picker.value_text, "Dummy Align (test-only)");
+    assert!(!picker.choice_ids.contains(&"dummy-align".to_string()));
+}
+
+#[test]
 fn pickers_list_the_registry() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
@@ -748,8 +866,8 @@ fn pickers_list_the_registry() {
 
     assert_eq!(
         picker_ids(&panel.rows, "fuse"),
-        every_fuse_id(),
-        "the collapsed fuse picker lists every registered method, the default first"
+        listed_fuse_ids(),
+        "the collapsed fuse picker lists every non-test method, the default first"
     );
 
     let align_picker = panel
@@ -759,6 +877,7 @@ fn pickers_list_the_registry() {
         .expect("align picker row must exist");
     let mut expected_align: Vec<String> = registry::align_algorithms()
         .iter()
+        .filter(|a| !a.test_only())
         .map(|a| a.id().to_string())
         .collect();
     expected_align.sort();
@@ -1567,12 +1686,21 @@ fn picker_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
         .clone()
 }
 
-/// Every stack method's id, the default first and the advanced ones last --
-/// what the Fuse picker lists, `More...` open or not.
+/// Every registered stack method's id, test-only ones included, the default
+/// first and the advanced ones last.
 fn every_fuse_id() -> Vec<String> {
     let mut methods = registry::stack_algorithms();
     methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
     methods.iter().map(|a| a.id().to_string()).collect()
+}
+
+/// What the Fuse picker lists, `More...` open or not: [`every_fuse_id`]
+/// without the test-only methods.
+fn listed_fuse_ids() -> Vec<String> {
+    every_fuse_id()
+        .into_iter()
+        .filter(|id| !registry::find_stack(id).unwrap().test_only())
+        .collect()
 }
 
 fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow> {
@@ -1672,7 +1800,7 @@ fn sections_start_collapsed_with_one_adjustment_at_most() {
 
     controller.set_fuse_algorithm("laplacian");
     let fuse_picker = picker_ids(&controller.settings_panel().rows, "fuse");
-    assert_eq!(fuse_picker, every_fuse_id());
+    assert_eq!(fuse_picker, listed_fuse_ids());
     assert_eq!(fuse_picker[0], "laplacian", "the default comes first");
     assert!(fuse_picker.contains(&"weighted-average".to_string()));
     assert!(fuse_picker.contains(&"depth-map".to_string()));
@@ -1877,7 +2005,7 @@ fn fuse_picker_lists_every_method_in_both_more_states() {
     let collapsed = picker_ids(&controller.settings_panel().rows, "fuse");
     assert_eq!(
         collapsed,
-        every_fuse_id(),
+        listed_fuse_ids(),
         "More... closed lists every method"
     );
     assert_eq!(collapsed.last().map(String::as_str), Some("depth-map"));
@@ -2404,6 +2532,116 @@ fn more_strip_is_disabled_while_running() {
         panel.click_strip(section);
         assert!(panel.is_open(section), "{section} opens once enabled again");
     }
+}
+
+/// The panel's controls are found by role: Reset All carries its enabled
+/// state, each switch its row label and on state, each menu its row label and
+/// shown value, each fold-out header its label.
+#[test]
+fn reset_all_and_switches_report_their_state() {
+    use focusforge_gui::AppWindow;
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::{ComponentHandle, Model as _};
+
+    init_window_backend();
+    let app = AppWindow::new().unwrap();
+    // Tall enough that no row is clipped out of the panel's viewport, where
+    // an element query does not look.
+    app.window().set_size(slint::PhysicalSize::new(1440, 2400));
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
+    controller.toggle_section_more("fuse");
+    controller.set_align_algorithm("pyramidal-ecc");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+
+    let find = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::settings-panel")
+            .match_descendants()
+            .match_id(id)
+            .find_all()
+    };
+    let reset_enabled = || {
+        let reset = find("FFResetAll::area");
+        assert_eq!(reset.len(), 1, "one Reset All in the panel");
+        assert_eq!(reset[0].accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(
+            reset[0].accessible_label().as_deref(),
+            Some("Reset All to Default")
+        );
+        reset[0].accessible_enabled()
+    };
+    assert_eq!(reset_enabled(), Some(false), "disabled while at defaults");
+
+    controller.set_param_text("finish", "auto-crop", "false");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(reset_enabled(), Some(true), "enabled once a value is set");
+
+    let rows = app.get_settings_rows();
+    let of_kind = |kinds: &[&str]| {
+        (0..rows.row_count())
+            .map(|i| rows.row_data(i).unwrap())
+            .filter(|r| kinds.contains(&r.kind.as_str()))
+            .collect::<Vec<_>>()
+    };
+
+    let switches = find("FFToggle::area");
+    let bools = of_kind(&["bool"]);
+    assert!(!bools.is_empty(), "the registry has bool rows");
+    assert_eq!(switches.len(), bools.len());
+    for (switch, row) in switches.iter().zip(&bools) {
+        assert_eq!(switch.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(
+            switch.accessible_label().as_deref(),
+            Some(row.label.as_str())
+        );
+        assert_eq!(switch.accessible_checked(), Some(row.selected == "true"));
+    }
+    let crop = bools.iter().position(|r| r.id == "auto-crop").unwrap();
+    assert_eq!(switches[crop].accessible_checked(), Some(false));
+    controller.set_param_text("finish", "auto-crop", "true");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(
+        find("FFToggle::area")[crop].accessible_checked(),
+        Some(true),
+        "checked follows the value"
+    );
+
+    assert!(
+        find("FFMenu::area")
+            .iter()
+            .all(|area| area.accessible_role() == Some(AccessibleRole::None)),
+        "a menu is one accessible node, its root"
+    );
+    let menus = find("FFMenu::root");
+    let fields = of_kind(&["picker", "enum"]);
+    assert!(!fields.is_empty(), "the registry has picker and enum rows");
+    assert_eq!(menus.len(), fields.len());
+    for (menu, row) in menus.iter().zip(&fields) {
+        assert_eq!(menu.accessible_role(), Some(AccessibleRole::Combobox));
+        assert_eq!(menu.accessible_enabled(), Some(true));
+        assert_eq!(menu.accessible_label().as_deref(), Some(row.label.as_str()));
+        assert_eq!(
+            menu.accessible_value().as_deref(),
+            Some(row.value_text.as_str())
+        );
+    }
+
+    let mores = find("FFMoreToggle::header-area");
+    assert!(!of_kind(&["more"]).is_empty(), "the registry has fold-outs");
+    assert_eq!(mores.len(), of_kind(&["more"]).len());
+    for more in &mores {
+        assert_eq!(more.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(more.accessible_label().as_deref(), Some("More..."));
+    }
+
+    controller.reset_all_sections();
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(reset_enabled(), Some(false), "disabled again after a reset");
 }
 
 fn prepare_row(controller: &AppController, id: &str) -> SettingsRow {

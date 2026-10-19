@@ -7,7 +7,7 @@ A toast shows only while an app window holds keyboard focus; a record that arriv
 
 Equalize brightness is on by default. With the Target brightness (stops) slider at +0.5 and Max brightness gain at 1.25, every frame needs a gain of about 1.41, which the bound limits, so one run of `mantis-512` publishes 8 records titled "Brightness target limited", one per frame (00.tif to 07.tif). Keeping the unaligned result adds a ninth record, "4 frames unaligned". A repeated run reuses cached results and ends within about 15 s; the first run takes up to 60 s. Records stay for the session. In a focused window the toast queue shows one toast at a time, each for 6 seconds, oldest first, so the queue of 9 lasts about a minute; the toast shows "Open notification" and an X, at the top left of the canvas under the toolbar. Opening the center reads every record and clears the queue. Reopening the center keeps the row selected last.
 
-With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-area` instance 0 (Max brightness gain) and instance 1 (Target brightness). For a drag on a slider, read its track with `get_element_properties` immediately before: the left end is absolutePosition.x, the right end is absolutePosition.x + width, and the pointer height is absolutePosition.y + 10. Use these logical coordinates as they are, never multiplied by the window scale. A drop 40 px right of the right end sets the slider to its maximum, +0.5. The target readout is signed: zero is `0.0`, a positive value carries a plus. A row card is `FFNotificationRow::card`; its instances count the rows in the list from the top of the visible part of the list. The keyboard steps and the crash steps cannot be driven by clicks and start `(human only)`; the crash steps need a data folder that already holds a crash report.
+With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-area` instance 0 (Max brightness gain) and instance 1 (Target brightness). For a drag on a slider, read its track with `get_element_properties` immediately before: the left end is absolutePosition.x, the right end is absolutePosition.x + width, and the pointer height is absolutePosition.y + 10. Use these logical coordinates as they are, never multiplied by the window scale. A drop 40 px right of the right end sets the slider to its maximum, +0.5. The target readout is signed: zero is `0.0`, a positive value carries a plus. A row card is `FFNotificationRow::card`; its instances count the rows in the list from the top of the visible part of the list. A key step (`Press`) goes to the control holding the keyboard focus, which the click of the step before gave it. The crash steps need a data folder that already holds a crash report and start `(human only)`.
 
 ## Empty center
 1. Click **Notifications** (`FFIconBar::bell`).
@@ -34,13 +34,13 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
    Expect: the second row has an orange outline and shows its full message; the first row is collapsed and shows no message.
 
 ## Keyboard in the center
-10. (human only) Press Down once.
+10. Press Down.
     Expect: the orange outline moves to the next row down and that row shows no message.
-11. (human only) Press Enter.
+11. Press Return.
     Expect: the selected row shows its full message.
-12. (human only) Press Escape.
+12. Press Escape.
     Expect: the center closes, the Projects overview does not open, and the bell has an orange outline.
-13. (human only) Press Enter.
+13. Press Return.
     Expect: the center opens again.
 
 ## Close, then Projects hides the center

@@ -4,7 +4,7 @@
 //! can be observed without a person in front of it.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, screenshot};
+use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, picker, screenshot};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
@@ -103,7 +103,8 @@ struct Args {
     images_sort_menu_open: bool,
     /// Opens the projects overlay at startup, for inspecting every state of
     /// this surface with no click sequence. With `--fuse-tabs`, it opens once
-    /// the last run settles instead.
+    /// the last run settles instead. With `--open`, it stays open once the
+    /// load lands.
     #[arg(long)]
     projects_overlay: bool,
     /// Presses `Save project` once the last `--fuse-tabs` run settles,
@@ -145,10 +146,28 @@ struct Args {
     /// Selects these tab indices in turn and presses `Fuse stack` on each,
     /// right after `--open`, leaving the last one selected -- for
     /// inspecting a live run and the tabs queued behind it with no click
-    /// sequence. Comma-separated. An index repeated waits for every run to
-    /// settle before it is pressed again, so `0,0` fuses tab 0 twice.
+    /// sequence. Comma-separated. An index repeated waits until every earlier
+    /// run has settled and any Keep/Discard question has been answered in
+    /// the window, so `0,0` fuses tab 0 twice.
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
+    /// Holds the Nth fuse run started in this launch (counted from 1, a whole
+    /// number) in its fuse stage for `--slow-run-seconds`. Other runs keep
+    /// their speed.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_run: Option<String>,
+    /// Minimum fuse running time, in whole seconds, of the run `--slow-run`
+    /// selects. Defaults to 150.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_run_seconds: Option<String>,
+    /// Holds every folder or project load for this many whole seconds before
+    /// it reads anything.
+    #[arg(long, allow_hyphen_values = true)]
+    slow_open: Option<String>,
+    /// Writes every project save and image export into this existing folder
+    /// under its proposed file name, with no save dialog.
+    #[arg(long, value_name = "DIR", allow_hyphen_values = true)]
+    save_folder: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -202,28 +221,9 @@ enum UndockPane {
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
 
-/// Sets the toolbar's and the bottom bar's transport preview together, from
-/// literal values with no controller or job behind them -- for inspecting a
-/// state no click sequence currently reaches.
-fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
-    app.set_toolbar_run_state(state.into());
-    let (stage_word, step_text, fraction, tone, eta) = match state {
-        "running" => ("Aligning", "42 of 61", 0.62, "running", "ETA 1:12"),
-        "paused" => ("Paused", "", 0.62, "held", "ETA —"),
-        "cancelling" => ("Cancelling", "", 0.0, "held", "ETA —"),
-        "failed" => ("Failed", "", 0.28, "failed", "ETA —"),
-        _ => ("", "", 0.0, "held", ""),
-    };
-    app.set_stage_word(stage_word.into());
-    app.set_step_text(step_text.into());
-    app.set_bar_fraction(fraction);
-    app.set_bar_tone(tone.into());
-    app.set_eta_text(eta.into());
-}
-
 /// Sets the export modal's own state directly, with no controller or
-/// worker behind it -- `apply_toolbar_state_preview`'s twin, for inspecting
-/// the writing/refused states no click sequence quickly reaches.
+/// worker behind it, for inspecting the writing/refused states no click
+/// sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
     // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
@@ -277,13 +277,12 @@ struct FuseTabsFollowUp {
     cancel_quit_after: Option<u64>,
 }
 
-/// Presses `Fuse stack` on each of `indices` in turn, the moment no
-/// background load (`--open`) is still in flight. A press fired while a
-/// load is still running targets a tab that does not exist yet and is
-/// silently dropped, since `--open`'s directory walk and thumbnail decode
-/// run off the event-loop thread and settle only once the window's own poll
-/// picks up their result. An index already pressed waits until no run is
-/// pending, since a press on a tab already running or queued is ignored.
+/// Presses `Fuse stack` on each of `indices` in turn, once every `--open`
+/// load has settled (`open_timer` is the load timer starting them): an
+/// earlier press for a tab not yet open lands on the tab before it and is
+/// ignored. An index already pressed waits until no run is pending and no
+/// tab holds a Keep/Discard question; a press on a parked tab would
+/// discard its result.
 /// Once every press is made and every run settled, `save` presses `Save
 /// project` on the proposed path, `overlay` opens the projects overlay, and
 /// `enter_editor` selects editor mode.
@@ -293,6 +292,7 @@ fn start_fuse_tabs_timer(
     slot: &Rc<RefCell<Option<slint::Timer>>>,
     indices: Vec<usize>,
     follow_up: FuseTabsFollowUp,
+    open_timer: &Rc<RefCell<Option<slint::Timer>>>,
 ) {
     let FuseTabsFollowUp {
         save,
@@ -303,6 +303,7 @@ fn start_fuse_tabs_timer(
         cancel_quit_after,
     } = follow_up;
     let timer_slot = slot.clone();
+    let open_timer = open_timer.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
     let mut pressed: Vec<usize> = Vec::new();
     let timer = slint::Timer::default();
@@ -310,11 +311,19 @@ fn start_fuse_tabs_timer(
         let Some(app) = app_weak.upgrade() else {
             return;
         };
-        if controller.lock().unwrap().load_in_flight() {
+        if controller.lock().unwrap().load_in_flight()
+            || open_timer
+                .borrow()
+                .as_ref()
+                .is_some_and(slint::Timer::running)
+        {
             return;
         }
         while let Some(&index) = pending.front() {
-            if pressed.contains(&index) && controller.lock().unwrap().work_pending() {
+            if pressed.contains(&index) && {
+                let controller = controller.lock().unwrap();
+                controller.work_pending() || controller.parked_run_waiting()
+            } {
                 return;
             }
             pending.pop_front();
@@ -337,7 +346,7 @@ fn start_fuse_tabs_timer(
             controller
                 .lock()
                 .unwrap()
-                .save_active_project(|proposed| Some(proposed.to_path_buf()));
+                .save_active_project(|proposed| Some(save_destination(proposed)));
         }
         if close {
             let mut controller = controller.lock().unwrap();
@@ -391,7 +400,7 @@ fn start_export_active_row_timer(
             }
             let mut controller = controller.lock().unwrap();
             controller.checkpoint_export_requested();
-            controller.export_confirmed(|proposed| Some(proposed.to_path_buf()));
+            controller.export_confirmed(|proposed| Some(save_destination(proposed)));
             started = controller.take_export_started();
             pressed = true;
             bridge::push_export_dialog(&app, &controller);
@@ -1557,6 +1566,72 @@ fn install_recent(
     controller.install_recent(entries, config_dir);
 }
 
+/// Parses a whole number of at least 1; `None` for anything else, including
+/// a negative or non-numeric value.
+fn parse_positive(spec: &str) -> Option<u64> {
+    spec.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// Reads one slow-down option: logs the expected form and returns `None`
+/// for a value that does not parse, leaving that option off.
+fn slow_down_value(name: &str, spec: Option<&String>) -> Option<u64> {
+    let spec = spec?;
+    let parsed = parse_positive(spec);
+    if parsed.is_none() {
+        tracing::warn!("{name} expects a whole number of at least 1, got {spec:?}");
+    }
+    parsed
+}
+
+/// Installs `--slow-run`, `--slow-run-seconds` and `--slow-open` on the
+/// controller.
+fn install_slow_down(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    const DEFAULT_SLOW_RUN_SECONDS: u64 = 150;
+    let run = slow_down_value("--slow-run", args.slow_run.as_ref());
+    let seconds = slow_down_value("--slow-run-seconds", args.slow_run_seconds.as_ref());
+    let hold = slow_down_value("--slow-open", args.slow_open.as_ref());
+    let mut controller = controller.lock().unwrap();
+    if let Some(run) = run {
+        let floor = Duration::from_secs(seconds.unwrap_or(DEFAULT_SLOW_RUN_SECONDS));
+        controller.set_slow_run(run as usize, floor);
+    }
+    if let Some(hold) = hold {
+        controller.set_open_hold(Duration::from_secs(hold));
+    }
+}
+
+/// `proposed`, or its file name inside the save folder when one is set.
+fn save_destination(proposed: &Path) -> PathBuf {
+    picker::in_save_folder(proposed).unwrap_or_else(|| proposed.to_path_buf())
+}
+
+/// Hands `--save-folder` to the pickers. A folder that is missing, not a
+/// folder or not writable is logged and leaves the native save dialogs in
+/// place.
+fn install_save_folder(args: &Args) {
+    let Some(spec) = &args.save_folder else {
+        return;
+    };
+    let checked = std::fs::canonicalize(spec).and_then(|dir| {
+        if !dir.is_dir() {
+            return Err(std::io::Error::other("not a folder"));
+        }
+        let probe = dir.join(".focusforge-write-probe");
+        std::fs::File::create_new(&probe)?;
+        std::fs::remove_file(&probe)?;
+        Ok(dir)
+    });
+    match checked {
+        Ok(dir) => picker::set_save_folder(dir),
+        Err(cause) => tracing::warn!(
+            "--save-folder expects an existing folder you can write to, got {spec:?}: {cause}"
+        ),
+    }
+}
+
 fn main() -> ExitCode {
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
@@ -1654,12 +1729,16 @@ fn run(args: &Args) -> ExitCode {
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
         install_recent(&controller, &app, args);
+        install_slow_down(&controller, args);
+        install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);
 
         if let Some(state) = &args.toolbar_state {
-            apply_toolbar_state_preview(&app, state.as_str());
+            let mut controller = controller.lock().unwrap();
+            controller.set_toolbar_preview(state.as_str());
+            bridge::push_job(&app, &controller.job_view());
         }
         if let Some(stage) = &args.export_dialog_preview {
             apply_export_dialog_preview(&app, stage.as_str());
@@ -1791,6 +1870,7 @@ fn run(args: &Args) -> ExitCode {
                     enter_editor: args.enter_editor,
                     cancel_quit_after: args.cancel_quit_after,
                 },
+                &open_wait_timer,
             );
         }
 
@@ -1819,6 +1899,112 @@ mod tests {
         assert_ne!(old_setup, new_setup);
         assert!(!teardown_is_current(&generation, old_setup));
         assert!(teardown_is_current(&generation, new_setup));
+    }
+
+    /// With two `--open` folders, the second tab does not exist until the
+    /// load timer starts its load. A `--fuse-tabs` press for it must wait for
+    /// that tab instead of landing on the first one, which ignores it.
+    #[test]
+    fn fuse_tabs_press_for_a_later_open_waits_for_that_tab() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let dir = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            for index in 0..3 {
+                let frame = format!("{index:02}.tif");
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../fixtures/mantis-64/frames")
+                        .join(&frame),
+                    root.join(frame),
+                )
+                .unwrap();
+            }
+            root
+        };
+        let (first, second) = (folder("first"), folder("second"));
+        let mut state = AppController::new();
+        state.set_scratch_root_for_test(dir.path().join("scratch"));
+        let controller = Arc::new(Mutex::new(state));
+        let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+        let _installed = bridge::install(
+            &app,
+            controller.clone(),
+            canvas.clone(),
+            Rc::new(RefCell::new(None)),
+        );
+
+        // As `main` starts them: the first load settled, the rest left to
+        // the load timer, and the press timer created after it.
+        let load = controller
+            .lock()
+            .unwrap()
+            .open_paths(std::slice::from_ref(&first))
+            .expect("the first load starts");
+        load.join().unwrap();
+        controller.lock().unwrap().settle_open().unwrap();
+        let open_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        bridge::start_load_timer(
+            app.as_weak(),
+            controller.clone(),
+            canvas,
+            &open_slot,
+            vec![second],
+        );
+        let press_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        start_fuse_tabs_timer(
+            app.as_weak(),
+            controller.clone(),
+            &press_slot,
+            vec![0, 1],
+            FuseTabsFollowUp {
+                save: false,
+                close: false,
+                quit: false,
+                overlay: false,
+                enter_editor: false,
+                cancel_quit_after: None,
+            },
+            &open_slot,
+        );
+
+        let running = |slot: &Rc<RefCell<Option<slint::Timer>>>| {
+            slot.borrow().as_ref().is_some_and(slint::Timer::running)
+        };
+        let started = std::time::Instant::now();
+        loop {
+            i_slint_backend_testing::mock_elapsed_time(job::POLL);
+            // The load worker's completion event, which this backend has no
+            // event loop to deliver.
+            if controller.lock().unwrap().settle_open().is_some() {
+                bridge::push_projects(&app, &controller);
+            }
+            let idle = {
+                let controller = controller.lock().unwrap();
+                !controller.load_in_flight() && !controller.work_pending()
+            };
+            if idle && !running(&open_slot) && !running(&press_slot) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "runs never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(controller.project_tabs().len(), 2);
+        for tab in 0..2 {
+            controller.select_project(tab);
+            assert!(
+                controller.pending_divergence().is_some(),
+                "tab {tab} fused and parked at its own question"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

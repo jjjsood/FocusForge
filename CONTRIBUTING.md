@@ -34,7 +34,10 @@ crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                decodes a thumbnail off the event-loop thread, and a
                keyboard/mouse binding table read from `settings.toml`
 spikes/        standalone, workspace-excluded feasibility spikes
-fixtures/      small checked-in TIFF crops and a RAW DNG fixture used by the test suite
+fixtures/      small checked-in TIFF crops, a RAW DNG fixture, folders that open
+               or are refused, and `.ffp` projects (valid, corrupt, mismatched,
+               missing frames) used by the test suite and the UI journeys
+tests/ui/      end-to-end window journeys written as numbered steps
 ```
 
 ## Tech stack
@@ -121,6 +124,13 @@ filters, the rotating log file, the `log`-crate bridge, the panic hook's
 report and flight recording, and the crash-notice bookkeeping and
 diagnostics bundle's redaction and manifest, each writing into its own
 temporary directory rather than a shared one.
+
+`tests/ui/` holds 18 journeys, each one whole path through the window as
+numbered clicks, keys and hovers with an `Expect:` line per step, plus
+`features/` files listing which journey covers which feature. They are run by
+hand or by a script against `focusforge-gui`; `tests/ui/README.md` gives the
+step format and how to launch one, including `--save-folder` so saves and
+exports skip the file chooser. They are not part of `cargo test`.
 
 `crates/gpu`'s WGSL fusion and warp kernels, and the pipeline in
 `focusforge-cli` that dispatches them, sit behind the `gpu` Cargo feature —

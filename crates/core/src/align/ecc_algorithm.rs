@@ -283,10 +283,11 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             id: "pyramid-depth".to_string(),
             label: "Pyramid Depth".to_string(),
             help: "How many coarser pyramid levels to register through \
-                   before refining at full resolution. `auto` derives a \
-                   depth from the frame's own resolution, bounded by a \
-                   floor below which a level is too small to solve \
-                   meaningfully."
+                   before refining at full resolution. `auto` derives the \
+                   depth from the loaded frames: the deepest one whose \
+                   coarsest level keeps the shorter side at 64 px or more, \
+                   so frames shorter than 127 px register at full \
+                   resolution only (0) and a 512 px frame gets 3."
                 .to_string(),
             kind: ParamKind::Int {
                 min: 0,
@@ -1551,8 +1552,10 @@ mod tests {
 
     #[test]
     fn auto_depth_scales_with_resolution() {
-        let ctx_512 = StackContext::new(8, 512, 512, 3);
-        assert_eq!(auto_pyramid_depth(&ctx_512), ParamValue::Int(3));
+        for (size, depth) in [(64, 0), (126, 0), (127, 1), (512, 3)] {
+            let ctx = StackContext::new(8, size, size, 3);
+            assert_eq!(auto_pyramid_depth(&ctx), ParamValue::Int(depth), "{size}");
+        }
 
         let ctx_ref = StackContext::new(61, 8192, 5464, 3);
         assert_eq!(auto_pyramid_depth(&ctx_ref), ParamValue::Int(6));

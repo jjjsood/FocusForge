@@ -1201,6 +1201,77 @@ fn recent_row_opens_its_target() {
     );
 }
 
+/// A fresh directory of `count` copied fixture frames, not yet opened.
+fn frames_dir(name: &str, count: usize) -> PathBuf {
+    let root = tree(&format!("{name}_frames"));
+    for i in 0..count {
+        copy_frame(&root, &format!("{i:02}.tif"), i);
+    }
+    root
+}
+
+#[test]
+fn overlay_opened_during_a_load_survives_it() {
+    let mut controller = AppController::new();
+    let first = frames_dir("overlay_during_load_first", 2);
+    let second = frames_dir("overlay_during_load_second", 2);
+
+    let handle = controller
+        .open_paths(std::slice::from_ref(&first))
+        .expect("the first load starts");
+    assert!(controller.load_in_flight());
+    controller.toggle_projects_overlay();
+    handle.join().expect("the load worker did not panic");
+    assert!(matches!(
+        controller.settle_open(),
+        Some(OpenOutcome::Opened(_))
+    ));
+    assert!(
+        controller.projects_overlay_open(),
+        "an overlay opened while the load ran stays open when it lands"
+    );
+
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&second)),
+        OpenOutcome::Opened(_)
+    ));
+    assert!(
+        controller.projects_overlay_open(),
+        "a second load landing leaves it open too"
+    );
+
+    controller.select_project(0);
+    assert!(
+        !controller.projects_overlay_open(),
+        "a tab switch closes an overlay that survived a load"
+    );
+
+    let third = frames_dir("overlay_during_load_third", 2);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&third)),
+        OpenOutcome::Opened(_)
+    ));
+    assert!(
+        !controller.projects_overlay_open(),
+        "the overlay stays closed after a later load"
+    );
+}
+
+#[test]
+fn overlay_opened_before_a_load_still_closes_when_it_lands() {
+    let mut controller = AppController::new();
+    let first = frames_dir("overlay_before_load_first", 2);
+    controller.toggle_projects_overlay();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&first)),
+        OpenOutcome::Opened(_)
+    ));
+    assert!(
+        !controller.projects_overlay_open(),
+        "an overlay open before the load started closes on arrival"
+    );
+}
+
 #[test]
 fn recent_row_switches_to_an_open_tab() {
     let (mut controller, first_dir) = controller_with_frames_and_dir("recent_switch", 2);
@@ -1740,6 +1811,57 @@ fn a_hidden_overlay_publishes_nothing_until_reopened() {
         .collect();
     assert!(!want.is_empty(), "the seeded project is recent");
     assert_eq!(recent, want);
+}
+
+/// Every rail entry is found by its own id as a labelled button; Save
+/// follows `projects-save-enabled`, and Recent has one entry per row.
+#[test]
+fn rail_entries_are_labelled_buttons() {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::ComponentHandle;
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_projects_overlay_open(true);
+
+    let find = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id(format!("FFProjectsRail::{id}"))
+            .find_all()
+    };
+    let only = |id: &str, label: &str| {
+        let found = find(id);
+        assert_eq!(found.len(), 1, "one {id}");
+        assert_eq!(found[0].accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(found[0].accessible_label().as_deref(), Some(label));
+        found[0].accessible_enabled()
+    };
+
+    app.set_projects_save_enabled(false);
+    assert_eq!(only("new-project", "New project"), Some(true));
+    assert_eq!(only("open-project", "Open project…"), Some(true));
+    assert_eq!(only("save-project", "Save project"), Some(false));
+    assert_eq!(only("close-project", "Close project"), Some(true));
+    assert!(find("recent-row").is_empty(), "no Recent rows, no entries");
+
+    app.set_projects_save_enabled(true);
+    assert_eq!(only("save-project", "Save project"), Some(true));
+
+    let recent = |name: &str| focusforge_gui::RecentRowView {
+        name: name.into(),
+        ..Default::default()
+    };
+    app.set_recent_rows(
+        std::rc::Rc::new(slint::VecModel::from(vec![recent("alpha"), recent("beta")])).into(),
+    );
+    let rows = find("recent-row");
+    assert_eq!(rows.len(), 2);
+    for (row, name) in rows.iter().zip(["alpha", "beta"]) {
+        assert_eq!(row.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(row.accessible_label().as_deref(), Some(name));
+        assert_eq!(row.accessible_enabled(), Some(true), "{name}");
+    }
 }
 
 /// The bell stays reachable over the overview: a pointer press, or Tab to it

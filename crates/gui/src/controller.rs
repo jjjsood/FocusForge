@@ -754,18 +754,20 @@ struct ExportDialog {
     open_menu: Option<String>,
 }
 
-/// Which position an export modal names -- the three kinds its own
+/// Which position an export modal names -- the four kinds its own
 /// context/what copy tells apart.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExportKind {
     Saved,
     Held,
+    /// A held retouch checkpoint with no unsealed edits after it.
+    HeldRetouch,
     Live,
 }
 
-/// The export modal's own context/what copy for `kind`: a saved or live
-/// row names its algorithm and local time, a held row does not -- it has
-/// neither yet, only its own "just fused" state.
+/// The export modal's own context/what copy for `kind`: a saved, retouch or
+/// live row names its algorithm and local time, a held fuse result does not
+/// -- it has neither yet, only its own "just fused" state.
 fn export_copy_for(
     kind: ExportKind,
     project_file: &str,
@@ -780,6 +782,10 @@ fn export_copy_for(
         ExportKind::Held => (
             format!("{project_file} · unsaved fuse result, held in this tab"),
             "Exporting the unsaved fuse result held in this tab.".to_string(),
+        ),
+        ExportKind::HeldRetouch => (
+            format!("{project_file} · retouch checkpoint on {algorithm} · {timestamp}"),
+            "Exporting the unsaved retouch checkpoint held in this tab.".to_string(),
         ),
         ExportKind::Live => (
             format!("{project_file} · unsaved edits on {algorithm} · {timestamp}"),
@@ -1262,6 +1268,8 @@ pub enum ChromeKey {
     None,
     /// Already performed; nothing left for the bridge to do.
     Consumed,
+    /// An open refusal was closed; the bridge repaints and opens no picker.
+    RefusalDismissed,
     NewProject,
     OpenProject,
     /// Save the active tab's held checkpoints.
@@ -1403,6 +1411,9 @@ struct ShellState {
     drag_row: Option<DragRow>,
     /// Whether the projects overlay is open.
     overlay_open: bool,
+    /// The overlay was opened while a load ran, so that load's arrival
+    /// leaves it open. Cleared whenever the overlay closes.
+    overlay_survives_load: bool,
     /// The tab, by id, whose close waits on the "save first?" answer --
     /// raised by [`AppController::request_close`] only when closing that tab
     /// loses something ([`ProjectTab::loses_on_close`]).
@@ -1770,6 +1781,16 @@ pub struct AppController {
     checkpoint_generation: u64,
     /// The newest generation [`Self::take_checkpoint_flash`] handed out.
     checkpoint_flash_played: u64,
+    /// The run (counted from 1 over this controller's lifetime) held in its
+    /// fuse stage for the given running time.
+    slow_run: Option<(usize, Duration)>,
+    /// Runs started so far, counted after the budget refusal.
+    runs_started: usize,
+    /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
+    /// returns in place of the active run's, until the next run starts.
+    toolbar_preview: Option<JobView>,
+    /// How long every folder or project load waits before it reads anything.
+    open_hold: Duration,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
@@ -4046,7 +4067,9 @@ impl AppController {
 
         let sink = self.sink.clone();
         let outcome_slot = Arc::clone(&self.state.load.outcome);
+        let hold = self.open_hold;
         Some(std::thread::spawn(move || {
+            std::thread::sleep(hold);
             let mut last_tick: Option<Instant> = None;
             let mut outcome = entry::open(target, |frames_read, frame_total| {
                 let done = frame_total > 0 && frames_read == frame_total;
@@ -4171,7 +4194,7 @@ impl AppController {
     }
 
     /// Closes the refusal dialog -- its own "Pick another folder…" button,
-    /// or `Close` for every other refusal.
+    /// or `Close` for every other refusal; `Esc` closes either.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -4292,7 +4315,9 @@ impl AppController {
         }
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
-            self.close_projects_overlay();
+            if !self.state.overlay_survives_load {
+                self.close_projects_overlay();
+            }
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
                 self.clear_failure(&project_identity_path(&project));
@@ -4612,6 +4637,21 @@ impl AppController {
         self.state.config_dir = Some(config_dir);
     }
 
+    /// Holds the `run`th fuse run started after this call (counted from 1)
+    /// in its fuse stage until it has been running for `floor`. Pause,
+    /// resume and cancel act on it as on any run, and its output is
+    /// unchanged.
+    pub fn set_slow_run(&mut self, run: usize, floor: Duration) {
+        self.slow_run = Some((run, floor));
+        self.runs_started = 0;
+    }
+
+    /// Makes every folder or project load wait `hold` before it reads
+    /// anything, keeping [`Self::load_in_flight`] true meanwhile.
+    pub fn set_open_hold(&mut self, hold: Duration) {
+        self.open_hold = hold;
+    }
+
     /// The rail's own `Recent` rows, dates rendered against `now_unix` --
     /// a parameter rather than a live clock read, so a test controls it.
     pub fn recent_rows(&self, now_unix: i64) -> Vec<RecentRow> {
@@ -4700,6 +4740,7 @@ impl AppController {
     /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
+        self.state.overlay_survives_load = self.state.overlay_open && self.load_in_flight();
         self.notifications
             .set_projects_open(self.state.overlay_open);
         self.set_gallery_scroll(self.state.gallery_scroll_y);
@@ -4710,6 +4751,7 @@ impl AppController {
     pub fn close_projects_overlay(&mut self) {
         if self.state.overlay_open {
             self.state.overlay_open = false;
+            self.state.overlay_survives_load = false;
             self.notifications.set_projects_open(false);
             self.emit(ShellEvent::OverlayChanged);
         }
@@ -4720,13 +4762,18 @@ impl AppController {
     /// none of the five can be shadowed by a user's rebind. The four
     /// Ctrl-chords apply anywhere in the window, whether or not the overlay
     /// is open; none of them acts while [`Self::modal_open`] holds. `Esc`
-    /// only closes an open overlay. Every other key press reads
+    /// closes an open refusal first (it paints above the overlay), else an
+    /// open overlay. Every other key press reads
     /// [`ChromeKey::None`] and falls through unchanged.
     pub fn chrome_key(&mut self, text: &str, mods: Modifiers) -> ChromeKey {
         let Some(key) = text.chars().next() else {
             return ChromeKey::None;
         };
         if key == '\u{1b}' {
+            if self.state.refusal_open {
+                self.dismiss_refusal();
+                return ChromeKey::RefusalDismissed;
+            }
             if self.state.overlay_open {
                 self.close_projects_overlay();
                 return ChromeKey::Consumed;
@@ -7519,6 +7566,12 @@ impl AppController {
         }
         self.cancel_frame_drag();
         let control = job::JobControl::new();
+        self.runs_started += 1;
+        if let Some((run, floor)) = self.slow_run
+            && run == self.runs_started
+        {
+            control.set_min_running(floor);
+        }
         let observer = Arc::new(job::GuiObserver::new());
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
@@ -7532,6 +7585,7 @@ impl AppController {
         }
         let mut worker_request = request.clone();
         worker_request.max_host_memory = Some(processing_budget);
+        self.toolbar_preview = None;
         let preview_barrier = self.previews.as_ref().map(PreviewWorker::quiesce);
         self.job.handle = Some(job::spawn_after(
             worker_request,
@@ -7719,6 +7773,12 @@ impl AppController {
     /// run, empty rather than another tab's numbers with no active tab or
     /// with the active tab not the one actually running.
     pub fn job_view(&self) -> JobView {
+        if let Some(preview) = &self.toolbar_preview {
+            return JobView {
+                fuse_enabled: self.fuse_enabled(),
+                ..preview.clone()
+            };
+        }
         let run = self
             .state
             .active()
@@ -7739,6 +7799,52 @@ impl AppController {
             fuse_enabled: self.fuse_enabled(),
             state: run,
         }
+    }
+
+    /// Holds a literal transport view -- `state` is one of `idle`, `running`,
+    /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
+    /// until the next run starts; `fuse_enabled` still follows the active
+    /// tab. An unknown `state` gets the idle numbers and labels but keeps
+    /// its own string as `toolbar_run_state`, so callers validate first.
+    pub fn set_toolbar_preview(&mut self, state: &str) {
+        let (run, stage_word, step_text, fraction, tone, eta) = match state {
+            "running" => (
+                job::RunState::Running,
+                "Aligning",
+                "42 of 61",
+                0.62,
+                "running",
+                "ETA 1:12",
+            ),
+            "paused" => (job::RunState::Paused, "Paused", "", 0.62, "held", "ETA —"),
+            "cancelling" => (
+                job::RunState::Cancelling,
+                "Cancelling",
+                "",
+                0.0,
+                "held",
+                "ETA —",
+            ),
+            "failed" => (
+                job::RunState::Failed(String::new()),
+                "Failed",
+                "",
+                0.28,
+                "failed",
+                "ETA —",
+            ),
+            _ => (job::RunState::Idle, "", "", 0.0, "held", ""),
+        };
+        self.toolbar_preview = Some(JobView {
+            state: run,
+            toolbar_run_state: state.to_string(),
+            stage_word: stage_word.to_string(),
+            step_text: step_text.to_string(),
+            eta_text: eta.to_string(),
+            bar_tone: tone.to_string(),
+            fraction,
+            fuse_enabled: self.fuse_enabled(),
+        });
     }
 
     /// Whether the active tab's fuse control is enabled: a real project tab
@@ -8000,6 +8106,12 @@ impl AppController {
     pub fn pending_divergence(&self) -> Option<&[String]> {
         let parked = self.state.active()?.parked.as_ref()?;
         Some(parked.diverged.as_slice())
+    }
+
+    /// Whether any tab, active or not, holds a parked run waiting for
+    /// Keep or Discard.
+    pub fn parked_run_waiting(&self) -> bool {
+        self.state.projects.iter().any(|tab| tab.parked.is_some())
     }
 
     /// What the active tab's last completed run's alignment did: its source,
@@ -8345,8 +8457,9 @@ impl AppController {
     }
 
     /// Answers the delete question: queues the row's deletion and frees what
-    /// nothing needs any more. The canvas, the edit session and the render
-    /// are left alone.
+    /// nothing needs any more. While live holds ops the canvas, the edit
+    /// session and the render are left alone; otherwise deleting the current
+    /// row makes the newest remaining row current.
     pub fn confirm_checkpoint_delete(&mut self) {
         let Some((tab_id, key)) = self.state.pending_checkpoint_delete.take() else {
             return;
@@ -8365,6 +8478,16 @@ impl AppController {
         tab.free_unneeded_held();
         if checkpoints::held_index(&key).is_none() {
             tab.remove_cached_planes(&scratch_root, &key);
+        }
+        if tab.selected_checkpoint.as_deref() == Some(key.as_str())
+            && !tab.live_modified()
+            && let Some(newest) = self
+                .checkpoints_panel()
+                .entries
+                .into_iter()
+                .find_map(|entry| entry.id)
+        {
+            self.restore_row(newest);
         }
     }
 
@@ -9504,8 +9627,10 @@ fn saved_row_export_info(tab: &ProjectTab, id: &str) -> Option<RowExportInfo> {
 fn export_dialog_for(tab: &ProjectTab, choice: &ExportChoice) -> Option<ExportDialog> {
     let editing = tab.edit.as_ref().is_some_and(|edit| edit.op_count() > 0);
     let info = row_export_info(tab)?;
-    let kind = if editing || info.live {
+    let kind = if editing {
         ExportKind::Live
+    } else if info.live {
+        ExportKind::HeldRetouch
     } else if info.held {
         ExportKind::Held
     } else {

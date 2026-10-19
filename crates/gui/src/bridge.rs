@@ -865,6 +865,19 @@ fn record_images_input() {
     record_surface_input(InputSurface::Images);
 }
 
+/// Hides the refusal dialog once the controller has dismissed its refusal.
+fn close_refusal_dialog(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+) {
+    if let Some(app) = app_weak.upgrade() {
+        app.set_refusal_open(false);
+        direct_publication_scope(InputSurface::Gallery);
+        repaint(&app, controller, canvas);
+    }
+}
+
 fn record_gallery_input() {
     record_surface_input(InputSurface::Gallery);
 }
@@ -1728,7 +1741,7 @@ fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
 
 /// Pushes the run's current view onto the toolbar/bottom-bar properties --
 /// the one place `ShellEvent::JobChanged` and the poll timer both write.
-fn push_job(app: &AppWindow, view: &JobView) {
+pub fn push_job(app: &AppWindow, view: &JobView) {
     app.set_toolbar_run_state(view.toolbar_run_state.as_str().into());
     app.set_stage_word(view.stage_word.as_str().into());
     app.set_step_text(view.step_text.as_str().into());
@@ -3153,6 +3166,10 @@ pub fn install(
                     controller.key(true, text.as_str(), mods);
                 }),
                 ChromeKey::Consumed => record_gallery_input(),
+                ChromeKey::RefusalDismissed => {
+                    record_gallery_input();
+                    close_refusal_dialog(&app_weak, &controller, &canvas);
+                }
                 ChromeKey::NewProject => {
                     record_surface_input(InputSurface::Other);
                     open_from_picker(
@@ -3704,11 +3721,7 @@ pub fn install(
             // `dismiss_refusal` would clear it.
             let is_folder_empty = controller.lock().unwrap().refusal_title().is_none();
             controller.lock().unwrap().dismiss_refusal();
-            if let Some(app) = app_weak.upgrade() {
-                app.set_refusal_open(false);
-                direct_publication_scope(InputSurface::Gallery);
-                repaint(&app, &controller, &canvas);
-            }
+            close_refusal_dialog(&app_weak, &controller, &canvas);
             if is_folder_empty {
                 open_from_picker(
                     &controller,
@@ -4479,12 +4492,7 @@ fn push_project_dialogs(app: &AppWindow, controller: &AppController) {
             .unwrap_or("No frames here")
             .into(),
     );
-    app.set_refusal_body(
-        controller
-            .last_refusal()
-            .unwrap_or("FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.")
-            .into(),
-    );
+    app.set_refusal_body(controller.last_refusal().unwrap_or_default().into());
     app.set_refusal_button_label(
         if folder_empty_refusal {
             "Pick another folder…"

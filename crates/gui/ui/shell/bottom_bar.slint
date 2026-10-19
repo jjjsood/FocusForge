@@ -111,6 +111,7 @@ export component FFBottomBar inherits Rectangle {
         muted: true;
     }
     overlay-toggle := FFToggle {
+        name: "Overlay";
         x: parent.width - ShellGeometry.overlay-cluster-inset + ShellGeometry.overlay-toggle-offset;
         y: (parent.height - self.height) / 2;
         on: root.overlay-on;

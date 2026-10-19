@@ -1,0 +1,11 @@
+# Notifications
+Reach: the bell (`FFIconBar::bell`, label **Notifications**) at the bottom of the 48 px icon bar on the left edge, above **Settings** (`FFIconBar::settings`). A run that warns (`--open fixtures/mantis-512/frames` with Target brightness (stops) at +0.5) publishes records; a crash report in the data folder publishes one at launch.
+Sub-features: the unread number on the bell (records since the center was last opened); the notification center (`AppWindow::notification-center`), a 380 px panel beside the icon bar listing records newest first with a kind icon, title and context line, one selectable row showing its full message; **Close notifications**; the Projects overview hiding the center; toasts (one at a time, oldest first, **Open notification** opens the center on that record, **Dismiss notification** closes only the toast); the crash record "Previous session stopped" with **Acknowledge** and **Diagnostics**.
+Ids: `FFIconBar::bell`, `AppWindow::notification-center` (its close button and the crash record's buttons are clicked by label inside it), rows `FFNotificationRow::card` N counted from the top of the visible list, the toast `AppWindow::toast` with its body `FFToast::card` and close glyph `FFToast::close` (**Dismiss notification**), `FFTabStrip::projects-button`.
+Gotchas:
+- A toast shows only while the window holds keyboard focus; otherwise the record becomes a desktop banner. Every toast step is human only, and the other steps read the same records through the bell.
+- Opening the center reads every record and clears the toast queue; reopening it keeps the row selected last.
+- An info or warning toast stays 6 s, a crash toast 10 s; the pointer on a toast holds it.
+- One `mantis-512` run with the target at +0.5 and Max brightness gain 1.25 gives 8 records "Brightness target limited", one per frame; **Keep** adds "4 frames unaligned". Records last for the session.
+- The keyboard in the center (Down, Return, Escape, Return) is driven (15 steps 10-13): each `Press` goes to the control holding the keyboard focus, which the click on a row in step 9 gave it. The crash steps (a hand-made data folder through `FOCUSFORGE_DATA_DIR`) are human only, and so are the toast steps (15 steps 23-28 and 30-31): a toast needs the window to hold the system's keyboard focus, which no step grants.
+Guides: 15-notification-center.md

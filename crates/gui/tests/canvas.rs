@@ -3535,3 +3535,123 @@ fn compressed_frame_reads_the_same_samples_as_its_uncompressed_original() {
         );
     }
 }
+
+/// Real pointer events across the Composite pane paint a stroke that settles
+/// in under a second, and the click on Undo that follows is handled: the
+/// stroke's pointer grab does not outlive its release.
+#[test]
+fn a_stroke_does_not_swallow_the_next_click() {
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    const BUDGET: Duration = Duration::from_secs(1);
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("stroke_next_click_scratch"));
+    open_fixture_tab(&mut controller, "stroke_next_click", "mantis-64", 3);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the fixture must fuse");
+    common::enter_editor(&mut controller);
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        Rc::new(RefCell::new(None)),
+    );
+    slint::platform::update_timers_and_animations();
+    app.invoke_canvas_resized();
+
+    let rect = |id: &str| {
+        let handle = ElementQuery::from_root(&app)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id {id:?}"));
+        (handle.absolute_position(), handle.size())
+    };
+    let event = |event: WindowEvent| {
+        app.window().dispatch_event(event);
+        slint::platform::update_timers_and_animations();
+    };
+    let (pane, size) = rect("FFCanvas::pane-right");
+    let at = |fx: f32, fy: f32| {
+        slint::LogicalPosition::new(pane.x + size.width * fx, pane.y + size.height * fy)
+    };
+
+    let started = Instant::now();
+    let first = at(0.45, 0.5);
+    event(WindowEvent::PointerMoved { position: first });
+    event(WindowEvent::PointerPressed {
+        position: first,
+        button: PointerEventButton::Left,
+    });
+    for step in 1..=20 {
+        event(WindowEvent::PointerMoved {
+            position: at(0.45 + 0.01 * step as f32, 0.5),
+        });
+    }
+    let last = at(0.65, 0.5);
+    event(WindowEvent::PointerReleased {
+        position: last,
+        button: PointerEventButton::Left,
+    });
+    common::settle_region_renders(&mut controller.lock().unwrap());
+    let stroke = started.elapsed();
+    assert_eq!(
+        controller
+            .lock()
+            .unwrap()
+            .edit_session()
+            .unwrap()
+            .ops()
+            .count(),
+        1,
+        "the drag across the Composite appends one stroke"
+    );
+
+    focusforge_gui::bridge::push_editor_toolbar(&app, &controller.lock().unwrap());
+    assert!(app.get_can_undo(), "the stroke enables Undo");
+    let (undo, undo_size) = rect("FFEditorToolbar::undo");
+    let button = slint::LogicalPosition::new(
+        undo.x + undo_size.width / 2.0,
+        undo.y + undo_size.height / 2.0,
+    );
+    let started = Instant::now();
+    event(WindowEvent::PointerMoved { position: button });
+    event(WindowEvent::PointerPressed {
+        position: button,
+        button: PointerEventButton::Left,
+    });
+    event(WindowEvent::PointerReleased {
+        position: button,
+        button: PointerEventButton::Left,
+    });
+    common::settle_region_renders(&mut controller.lock().unwrap());
+    let click = started.elapsed();
+    {
+        let controller = controller.lock().unwrap();
+        let session = controller.edit_session().unwrap();
+        assert!(!session.can_undo(), "the click on Undo landed");
+        assert!(session.can_redo(), "the undone stroke can be redone");
+    }
+
+    println!("stroke across the Composite, press to settled render: {stroke:?}");
+    println!("click on Undo, press to settled render: {click:?}");
+    assert!(
+        stroke < BUDGET,
+        "the stroke took {stroke:?}, over {BUDGET:?}"
+    );
+    assert!(
+        click < BUDGET,
+        "the Undo click took {click:?}, over {BUDGET:?}"
+    );
+}

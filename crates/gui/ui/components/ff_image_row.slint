@@ -370,12 +370,14 @@ export component FFImageRow inherits Rectangle {
             spacing: ShellGeometry.image-row-action-gap;
 
             list-exclude-button := FFIconButton {
+                name: root.excluded ? "Include" : "Exclude";
                 glyph-size: Theme.icon-sm;
                 pad: ShellGeometry.image-row-action-pad;
                 icon: root.excluded ? @image-url("../../../../assets/icons/eye-off.svg") : @image-url("../../../../assets/icons/eye.svg");
                 triggered => { root.exclude-toggled(); }
             }
             list-remove-button := FFIconButton {
+                name: "Remove";
                 glyph-size: Theme.icon-sm;
                 pad: ShellGeometry.image-row-action-pad;
                 icon: @image-url("../../../../assets/icons/trash.svg");
@@ -394,12 +396,14 @@ export component FFImageRow inherits Rectangle {
             spacing: ShellGeometry.image-row-action-gap;
 
             image-list-exclude-button := FFIconButton {
+                name: root.excluded ? "Include" : "Exclude";
                 glyph-size: Theme.icon-sm;
                 pad: ShellGeometry.image-row-action-pad;
                 icon: root.excluded ? @image-url("../../../../assets/icons/eye-off.svg") : @image-url("../../../../assets/icons/eye.svg");
                 triggered => { root.exclude-toggled(); }
             }
             image-list-remove-button := FFIconButton {
+                name: "Remove";
                 glyph-size: Theme.icon-sm;
                 pad: ShellGeometry.image-row-action-pad;
                 icon: @image-url("../../../../assets/icons/trash.svg");
@@ -418,12 +422,14 @@ export component FFImageRow inherits Rectangle {
             spacing: ShellGeometry.image-row-action-gap;
 
             large-exclude-button := FFIconButton {
+                name: root.excluded ? "Include" : "Exclude";
                 glyph-size: Theme.icon-sm;
                 pad: ShellGeometry.image-row-action-pad;
                 icon: root.excluded ? @image-url("../../../../assets/icons/eye-off.svg") : @image-url("../../../../assets/icons/eye.svg");
                 triggered => { root.exclude-toggled(); }
             }
             large-remove-button := FFIconButton {
+                name: "Remove";
                 glyph-size: Theme.icon-sm;
                 pad: ShellGeometry.image-row-action-pad;
                 icon: @image-url("../../../../assets/icons/trash.svg");

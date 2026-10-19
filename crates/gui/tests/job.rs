@@ -470,6 +470,94 @@ fn settings_journey_pause_resume_and_cancel() {
     }
 }
 
+/// Waits until the bar reads "Fusing" after the preparation and alignment
+/// stages, which hold no pause. A freshly started run reads "Fusing" before
+/// its first stage report, so the wait first gives the worker a moment to
+/// leave that state.
+fn wait_until_fusing(controller: &AppController) {
+    let start = Instant::now();
+    let mut left_fusing = false;
+    loop {
+        let fusing = controller.job_view().stage_word == "Fusing";
+        left_fusing |= !fusing;
+        if fusing && (left_fusing || start.elapsed() > Duration::from_secs(1)) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the run never reached Fusing"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_slowed_run_holds_its_floor_and_matches_an_unslowed_run() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("slow_run_floor", 3);
+    controller.set_slow_run(2, Duration::from_secs(2));
+    let newest_composite = |c: &AppController| {
+        std::fs::read(&c.held_checkpoints().last().expect("a held run").composite)
+            .expect("the held composite reads")
+    };
+
+    assert!(controller.start_fuse(), "run 1 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    let unslowed = newest_composite(&controller);
+
+    let started = Instant::now();
+    assert!(controller.start_fuse(), "run 2 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the slowed run settled after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(controller.held_checkpoints().len(), 2);
+    assert_eq!(
+        newest_composite(&controller),
+        unslowed,
+        "a slowed run must produce the unslowed run's composite"
+    );
+}
+
+#[test]
+fn pause_and_cancel_act_inside_a_slowed_run_and_siblings_keep_their_speed() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("slow_run_control", 3);
+    controller.set_slow_run(2, Duration::from_secs(20));
+
+    assert!(controller.start_fuse(), "run 1 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    let held = controller.held_checkpoints().len();
+
+    assert!(controller.start_fuse(), "run 2 starts");
+    wait_until_fusing(&controller);
+    controller.pause_or_resume();
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        held,
+        "a run paused inside its hold must not complete"
+    );
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+
+    controller.pause_or_resume();
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, Duration::from_secs(2));
+    assert_eq!(controller.job_view().state, job::RunState::Idle);
+    assert_eq!(controller.held_checkpoints().len(), held);
+
+    assert!(controller.start_fuse(), "run 3 starts");
+    common::wait_for_settle(&mut controller, Duration::from_secs(20));
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        held + 1,
+        "the run after the slowed one is not slowed"
+    );
+}
+
 #[test]
 fn resume_does_not_reset_the_unit_total() {
     let request = no_align_request("resume_unit_total", 2);
@@ -1426,6 +1514,83 @@ fn fuse_is_enabled_from_two_frames_and_disabled_below() {
         two.fuse_enabled(),
         "a fused tab with its original frame count stays enabled"
     );
+}
+
+#[test]
+fn toolbar_preview_holds_until_a_run_starts() {
+    for (state, stage_word, eta) in [
+        ("idle", "", ""),
+        ("running", "Aligning", "ETA 1:12"),
+        ("paused", "Paused", "ETA —"),
+        ("cancelling", "Cancelling", "ETA —"),
+        ("failed", "Failed", "ETA —"),
+    ] {
+        let mut controller = controller_with_frames(&format!("preview_{state}"), 3);
+        controller.set_toolbar_preview(state);
+        let preview = controller.job_view();
+        assert_eq!(preview.toolbar_run_state, state);
+        assert_eq!(preview.stage_word, stage_word, "{state}");
+        assert_eq!(preview.eta_text, eta, "{state}");
+        assert!(preview.fuse_enabled, "{state}: a 3-frame tab can fuse");
+
+        // A completed open adds a 1-frame tab: the preview stays, only
+        // `fuse_enabled` follows the active tab.
+        let single = common::tree(&format!("preview_{state}_single_frames"));
+        copy_frame(&single, "00.tif", 0);
+        assert!(matches!(
+            common::open_and_settle(&mut controller, &[single]),
+            OpenOutcome::Opened(_)
+        ));
+        let view = controller.job_view();
+        assert!(!view.fuse_enabled, "{state}: a 1-frame tab cannot fuse");
+        assert_eq!(
+            JobViewHeld(&view),
+            JobViewHeld(&preview),
+            "{state}: held across a completed open"
+        );
+
+        controller.select_project(0);
+        let view = controller.job_view();
+        assert!(view.fuse_enabled, "{state}: back on the 3-frame tab");
+        assert_eq!(
+            JobViewHeld(&view),
+            JobViewHeld(&preview),
+            "{state}: held across a tab switch"
+        );
+
+        assert!(controller.start_fuse());
+        assert_ne!(
+            JobViewHeld(&controller.job_view()),
+            JobViewHeld(&preview),
+            "{state}: a started run replaces the preview"
+        );
+        controller.cancel_fuse();
+        common::wait_for_settle(&mut controller, Duration::from_secs(120));
+        // An idle preview legitimately equals the idle view a cancelled run
+        // leaves behind.
+        assert!(
+            state == "idle" || JobViewHeld(&controller.job_view()) != JobViewHeld(&preview),
+            "{state}: the preview does not return after the run"
+        );
+    }
+}
+
+/// A [`job::JobView`] compared without `fuse_enabled`, which follows the
+/// active tab rather than the held preview.
+#[derive(Debug)]
+struct JobViewHeld<'a>(&'a focusforge_gui::JobView);
+
+impl PartialEq for JobViewHeld<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (self.0, other.0);
+        a.state == b.state
+            && a.toolbar_run_state == b.toolbar_run_state
+            && a.stage_word == b.stage_word
+            && a.step_text == b.step_text
+            && a.eta_text == b.eta_text
+            && a.bar_tone == b.bar_tone
+            && a.fraction == b.fraction
+    }
 }
 
 #[test]
@@ -6330,6 +6495,41 @@ fn assert_recent_persisted(controller: &AppController, config: &Path, paths: &[&
     let mut fresh = AppController::new();
     fresh.install_recent(loaded, config.to_path_buf());
     assert_eq!(fresh.recent_rows(0), controller.recent_rows(0));
+}
+
+/// The only test in this binary that reaches the real save picker: the save
+/// folder is process-wide and set once.
+#[test]
+fn a_save_folder_receives_the_project_save_and_its_recent_row() {
+    let folder = common::tree("save_folder_out");
+    let config = common::tree("save_folder_config");
+    focusforge_gui::picker::set_save_folder(folder.clone());
+    let mut c = controller_with_two_tabs("save_folder");
+    c.install_recent(vec![], config);
+    fuse_and_settle(&mut c);
+    let current = |c: &AppController| c.project_cards().into_iter().find(|card| card.current);
+    assert!(current(&c).expect("a current card").unsaved);
+
+    let mut proposed = None;
+    assert!(common::save_and_settle(&mut c, |p| {
+        proposed = Some(p.to_path_buf());
+        focusforge_gui::picker::pick_save_project(p)
+    }));
+    let proposed = proposed.expect("a never-saved tab asks where to save");
+    let saved = folder.join(proposed.file_name().unwrap());
+    assert!(saved.is_file(), "{} must be written", saved.display());
+    assert_eq!(saved.extension().unwrap(), "ffp");
+    let frames = proposed.parent().unwrap();
+    assert!(
+        std::fs::read_dir(frames).unwrap().all(|e| e
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|x| x != "ffp")),
+        "nothing may be saved beside the frames"
+    );
+    assert_eq!(recent_pairs(&c), [saved_row(&saved)]);
+    assert!(!current(&c).expect("a current card").unsaved);
 }
 
 #[test]

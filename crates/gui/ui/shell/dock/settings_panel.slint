@@ -133,6 +133,7 @@ export component FFSettingsPanel inherits Rectangle {
                     label-text: row.label;
                     disabled: row.disabled;
                     FFMenu {
+                        name: row.label;
                         label: row.value-text;
                         choices: row.choices;
                         choice-ids: row.choice-ids;
@@ -151,6 +152,7 @@ export component FFSettingsPanel inherits Rectangle {
                     label-text: row.label;
                     disabled: row.disabled;
                     FFMenu {
+                        name: row.label;
                         label: row.value-text;
                         choices: row.choices;
                         choice-ids: row.choice-ids;
@@ -205,6 +207,7 @@ export component FFSettingsPanel inherits Rectangle {
                     VerticalLayout {
                         alignment: center;
                         FFToggle {
+                            name: row.label;
                             on: row.selected == "true";
                             disabled: !root.enabled || row.disabled;
                             recessed: row.nested;

@@ -14,12 +14,28 @@ opened in turn, the next one waiting for the one before it to finish rather
 than racing it. Leaving `--open` off starts with no project open — use
 **Open project…** (below) or drop a folder or a set of frames onto the
 window. A path that fails to open shows the same refusal dialog a failed
-drop or picker choice would, rather than closing the window.
+drop or picker choice would, rather than closing the window. A folder with
+no readable frames is refused naming the formats read, 16-bit TIFF and camera
+RAW; Escape closes the dialog.
 
 Opening a folder, a project or a picker/drop result reads its frame headers
 and decodes a thumbnail off the window's own thread, so the window keeps
 responding while a large folder is scanned; a loading indicator appears over
 the canvas once a load has been running for half a second.
+
+## Launch options
+
+Other `focusforge-gui` flags start the window in a chosen state; `--help`
+lists them all.
+
+| flag | effect |
+|---|---|
+| `--fuse-tabs 0,1` | selects those tabs in turn and presses **Fuse stack** on each once `--open` has loaded; an index repeated, as in `0,0`, waits until the earlier run has settled and its **Keep** or **Discard** question is answered |
+| `--projects-overlay` | opens the projects overlay; with `--open` it stays open after the load lands, with `--fuse-tabs` it opens once the last run settles |
+| `--toolbar-state idle\|running\|paused\|cancelling\|failed` | shows that transport state until a real run starts |
+| `--save-folder <DIR>` | writes every project save and image export into this existing folder under its proposed name, with no save dialog |
+| `--settings-section <TAB>` | opens the settings window on that tab (see below) |
+| `--config-dir <DIR>` | reads and writes `<DIR>/focusforge/settings.toml` (see below) |
 
 ## The window
 
@@ -101,7 +117,9 @@ The **Settings** tab is generated from the same parameter schema
 - **FINISH** — **Auto-crop**, which trims the result to the area every
   aligned frame covers.
 
-Rarely changed parameters sit behind a **More...** strip at the foot of a
+A section's heading carries a **DEFAULT** badge while nothing in it differs
+from the defaults; in **ALIGN** the **Enabled** switch counts, so switching
+alignment off or on removes the badge. Rarely changed parameters sit behind a **More...** strip at the foot of a
 section; click it to open the strip and click again to collapse it. Choosing a
 different method or editing a value changes what the next fuse on this tab
 runs with.
@@ -186,6 +204,8 @@ window, not only with the overlay open: Ctrl+N (**New project**), Ctrl+O
 (**Open project…**), Ctrl+S (**Save project**) and Ctrl+W (**Close
 project**). They are not part of the rebindable input map, and they do
 nothing while the settings panel or a close or quit question is open.
+Escape is fixed the same way: it closes a refusal dialog first, otherwise the
+projects overlay, and closes the settings window from any of its tabs.
 
 Closing a tab that holds unsaved checkpoints or strokes asks **Save this
 state first?** and offers **Save and close** or **Close anyway**. Quitting the

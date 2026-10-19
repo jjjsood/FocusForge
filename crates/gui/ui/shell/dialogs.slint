@@ -96,7 +96,7 @@ export component FFGroupingQuestion inherits FFModalPanel {
 export component FFRefusalDialog inherits FFModalPanel {
     in property <bool> refusal-open: false;
     in property <string> title: "No frames here";
-    in property <string> body: "FocusForge reads 16-bit TIFF (.tif, .tiff). This folder holds none.";
+    in property <string> body: "";
     in property <string> button-label: "Pick another folder…";
     callback pick-another-folder();
 
@@ -363,6 +363,7 @@ export component FFExportDialog inherits FFModalPanel {
                     text: row.label;
                 }
                 FFMenu {
+                    name: row.label;
                     x: 128px;
                     width: 110px;
                     label: row.value-text;
@@ -428,6 +429,7 @@ export component FFExportDialog inherits FFModalPanel {
             text: "Metadata";
         }
         FFToggle {
+            name: "Metadata";
             x: 0px;
             // 2px above the label's own top: a toggle's knob sits taller
             // than a text row's cap-height, so this aligns their centers.
