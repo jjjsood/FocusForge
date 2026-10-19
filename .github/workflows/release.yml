@@ -233,32 +233,6 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
-      - name: Check Linux package
-        if: "runner.os == 'Linux'"
-        shell: bash
-        run: tools/check-package-linux.sh .scratch/package-linux
-      - name: Upload package smoke receipts
-        if: "always() && runner.os == 'Linux'"
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: package-smoke-receipts-linux-${{ join(matrix.targets, '_') }}
-          path: |
-            .scratch/package-linux/check/result/appimage/smoke/commands.log
-            .scratch/package-linux/check/result/appimage/smoke/exit-status
-            .scratch/package-linux/check/result/appimage/smoke/installed-cli.sha256
-            .scratch/package-linux/check/result/appimage/smoke/source-os
-            .scratch/package-linux/check/result/appimage/smoke/logs/*.stdout
-            .scratch/package-linux/check/result/appimage/smoke/logs/*.stderr
-            .scratch/package-linux/check/result/appimage/smoke/logs/*.exit
-            .scratch/package-linux/check/result/deb-smoke/commands.log
-            .scratch/package-linux/check/result/deb-smoke/exit-status
-            .scratch/package-linux/check/result/deb-smoke/installed-cli.sha256
-            .scratch/package-linux/check/result/deb-smoke/source-os
-            .scratch/package-linux/check/result/deb-smoke/logs/*.stdout
-            .scratch/package-linux/check/result/deb-smoke/logs/*.stderr
-            .scratch/package-linux/check/result/deb-smoke/logs/*.exit
-          include-hidden-files: true
-          if-no-files-found: warn
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -304,6 +278,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Install pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.10'
       - name: Install cached dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -329,6 +307,31 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Check Linux package
+        shell: bash
+        run: tools/check-package-linux.sh .scratch/package-linux
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: package-smoke-receipts-linux-x86_64-unknown-linux-gnu
+          path: |
+            .scratch/package-linux/check/result/appimage/smoke/commands.log
+            .scratch/package-linux/check/result/appimage/smoke/exit-status
+            .scratch/package-linux/check/result/appimage/smoke/installed-cli.sha256
+            .scratch/package-linux/check/result/appimage/smoke/source-os
+            .scratch/package-linux/check/result/appimage/smoke/logs/*.stdout
+            .scratch/package-linux/check/result/appimage/smoke/logs/*.stderr
+            .scratch/package-linux/check/result/appimage/smoke/logs/*.exit
+            .scratch/package-linux/check/result/deb-smoke/commands.log
+            .scratch/package-linux/check/result/deb-smoke/exit-status
+            .scratch/package-linux/check/result/deb-smoke/installed-cli.sha256
+            .scratch/package-linux/check/result/deb-smoke/source-os
+            .scratch/package-linux/check/result/deb-smoke/logs/*.stdout
+            .scratch/package-linux/check/result/deb-smoke/logs/*.stderr
+            .scratch/package-linux/check/result/deb-smoke/logs/*.exit
+          include-hidden-files: true
+          if-no-files-found: warn
       - name: "Upload artifacts"
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
