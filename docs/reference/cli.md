@@ -692,7 +692,11 @@ Prints `<ID>`'s id, display name and family, then one block per declared
 parameter: its kind (a float or int range and step, a bool, or an enum's
 variant ids and labels), its default, the value that resolved for this
 invocation, where that value came from, and whether the parameter has an
-`auto` hook. Resolution here is explicit → `auto` (stack) → host-derived
+`auto` hook. A parameter with an `auto` hook prints `default from the loaded
+frames` in place of a default, and no value line until one is set with
+`--set`; `pyramid-depth`, for example, derives its depth from the frames, the
+deepest whose coarsest level keeps the shorter side at 64 px or more (0 for
+frames shorter than 127 px, 3 for 512 px). Resolution here is explicit → `auto` (stack) → host-derived
 default → plain default — but an `auto` hook needs a loaded stack to run
 against, and this subcommand loads no image, so a *stack* `auto` hook is
 always shown as present but not evaluated, never run. A parameter with a
