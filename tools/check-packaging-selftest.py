@@ -973,7 +973,7 @@ def source_privacy_cases() -> None:
             return module.inspect_native("x86_64-unknown-linux-gnu", clean, "focusforge-cli")
         def rejects(label: str, rawline: str, message: str) -> None:
             try: inspect_records(rawline)
-            except ValueError as error: assert str(error) == message, (label, error)
+            except ValueError as error: assert str(error).startswith(message), (label, error)
             else: raise AssertionError(f"{label} accepted")
         try:
             empty_clean = main_table + """ Offset: 64
@@ -1066,6 +1066,91 @@ def source_privacy_cases() -> None:
             else: raise AssertionError(f"portable {platform} inspection mutation accepted")
 
 
+def hosted_runner(module: types.ModuleType, root: str, hosted: bool = True):
+    """Pretend the checkout lives at `root`, on a hosted runner or not."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def scope():
+        saved_root, saved_env = module.ROOT, os.environ.get("GITHUB_ACTIONS")
+        module.ROOT = Path(root)
+        if hosted: os.environ["GITHUB_ACTIONS"] = "true"
+        else: os.environ.pop("GITHUB_ACTIONS", None)
+        try: yield
+        finally:
+            module.ROOT = saved_root
+            if saved_env is None: os.environ.pop("GITHUB_ACTIONS", None)
+            else: os.environ["GITHUB_ACTIONS"] = saved_env
+    return scope()
+
+
+def hosted_runner_path_cases() -> None:
+    module = symbol_module()
+    windows, macos = "D:/a/FocusForge/FocusForge", "/Users/runner/work/FocusForge/FocusForge"
+    accepted = (
+        (windows, r"D:\a\FocusForge\FocusForge\crates\gui\src\main.rs", "crates/gui/src/main.rs"),
+        (windows, r"d:\a\FocusForge\FocusForge\crates\gui\src\main.rs", "crates/gui/src/main.rs"),
+        (windows, r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
+        (windows, r"C:\Users\runneradmin\.cargo\git\checkouts\cv-9d8edb0abe48fcfc\d271a9a\akaze\src\lib.rs", "dependency/lib.rs"),
+        (windows, "/rustc/90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf\\library\\core\\src\\ops\\function.rs", "dependency/function.rs"),
+        (windows, r"D:\rustc\90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf\library\core\src\ptr\mod.rs", "dependency/mod.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\target\x86_64-pc-windows-msvc\release\build\focusforge-gui-1\out\app.rs", "dependency/app.rs"),
+        (windows, r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\vector", "dependency/vector"),
+        (windows, r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stdio.h", "dependency/stdio.h"),
+        (windows, r"D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_main.cpp", "dependency/exe_main.cpp"),
+        (macos, f"{macos}/crates/cli/src/main.rs", "crates/cli/src/main.rs"),
+        (macos, "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap-4.6.6/src/lib.rs", "dependency/lib.rs"),
+        (macos, "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/stdio.h", "dependency/stdio.h"),
+        (macos, "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/math.h", "dependency/math.h"),
+    )
+    rejected = (
+        (windows, r"C:\Users\runneradmin\private\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge-other\crates\cli\src\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\..\secret\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\private\main.rs"),
+        (windows, r"C:\Program Files\Microsoft Visual Studio\..\..\Users\runneradmin\secret.h"),
+        (macos, "/Users/runner/Documents/secret.rs"),
+        (macos, f"{macos}/../private/main.rs"),
+        (macos, "/Users/runner/.cargo/registry/src/../../../private/main.rs"),
+    )
+    for root, source, expected in accepted:
+        with hosted_runner(module, root):
+            assert module.normalized_source(source) == expected, (source, module.normalized_source(source))
+    for root, source in rejected:
+        with hosted_runner(module, root):
+            try: module.normalized_source(source)
+            except ValueError as error: assert source in str(error), (source, str(error))
+            else: raise AssertionError(f"private runner source accepted: {source}")
+    long_source = "D:/other/" + "x" * 400 + "/main.rs"
+    try: module.normalized_source(long_source)
+    except ValueError as error:
+        shown = str(error).split(": ", 1)[1]
+        assert 0 < len(shown) <= 200 and long_source.startswith(shown.removesuffix("...")), shown
+    else: raise AssertionError("private long source accepted")
+    with tempfile.TemporaryDirectory() as temporary:
+        symbol = Path(temporary) / "app.sym"
+        good = r"D:\a\FocusForge\FocusForge\crates\gui\src\main.rs"
+        symbol.write_text(f"MODULE windows x86_64 {'A' * 33} app.pdb\nFILE 0 {good}\nFILE 1 C:\\Users\\runneradmin\\private\\one.rs\nFILE 2 C:\\Users\\runneradmin\\private\\two.rs\nFUNC 1 1 0 f\n")
+        with hosted_runner(module, windows):
+            try: module.canonicalize_symbol_sources(symbol)
+            except ValueError as error: assert r"C:\Users\runneradmin\private\one.rs" in str(error) and r"C:\Users\runneradmin\private\two.rs" in str(error), str(error)
+            else: raise AssertionError("private FILE records accepted")
+            symbol.write_text(f"MODULE windows x86_64 {'A' * 33} app.pdb\nFILE 0 {good}\nFUNC 1 1 0 f\n")
+            module.canonicalize_symbol_sources(symbol)
+        assert "FILE 0 crates/gui/src/main.rs\n" in symbol.read_text()
+    pdb_source = r"D:\a\FocusForge\FocusForge\crates\cli\src\main.rs"
+    with tempfile.TemporaryDirectory() as temporary:
+        pdb = Path(temporary) / "runner.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, pdb_source))
+        with hosted_runner(module, windows):
+            assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(pdb)["source_paths"]
+        with hosted_runner(module, windows, hosted=False):
+            try: module.inspect_windows_native(pdb)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "D:/a/FocusForge/FocusForge/crates/cli/src/main.rs" in str(error), str(error)
+            else: raise AssertionError("builder checkout accepted outside a hosted runner")
+        backslash = Path(temporary) / "backslash.pdb"; backslash.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"C:\work\crates\cli\src\main.rs", ("/work", "/work/crates/cli")))
+        assert "C:/work/crates/cli/src/main.rs" in module.inspect_windows_native(backslash)["source_paths"]
+
+
 def macos_source_cases() -> None:
     module = symbol_module()
     grouped = """0x00000000: DW_TAG_compile_unit
@@ -1115,7 +1200,7 @@ file_names[1] = {
     missing_table = grouped.replace(".debug_line[0x00000040]", ".debug_line[0x00000041]")
     for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for x86_64")):
         try: inspect(output)
-        except ValueError as error: assert str(error) == message
+        except ValueError as error: assert str(error).startswith(message), (label, str(error))
         else: raise AssertionError(f"{label} accepted")
     assert inspect(grouped, {"DBGBuildSourcePath": "/work", "DBGSourcePath": "/work/crates/cli/src"})["coverage"]["auxiliary_source_records"] == 1
     assert inspect(grouped, {"DBGSourcePathRemapping": {"/work": "/work/crates/cli/src"}})["coverage"]["auxiliary_source_records"] == 1
@@ -1123,6 +1208,63 @@ file_names[1] = {
         try: inspect(grouped, auxiliary)
         except ValueError: pass
         else: raise AssertionError(f"{label} accepted")
+    runner = "/Users/runner/work/FocusForge/FocusForge"; registry = "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foo-1.0.0"
+    def real(version: int, directories: list[tuple[int, str]], files: list[tuple[int, str]]) -> str:
+        text = f"""0x00000000: Compile Unit: length = 0x00000046, format = DWARF32, version = 0x000{version}, abbr_offset = 0x0000, addr_size = 0x08 (next unit at 0x0000004a)
+
+0x0000000c: DW_TAG_compile_unit
+              DW_AT_producer\t("clang LLVM (rustc version 1.95.0)")
+              DW_AT_language\t(DW_LANG_Rust)
+              DW_AT_name\t("{registry}/src/lib.rs/@/foo.cgu.0")
+              DW_AT_stmt_list\t(0x00000000)
+              DW_AT_comp_dir\t("{runner}")
+
+0x0000002a:   DW_TAG_namespace
+                DW_AT_name\t("foo")
+
+0x00000050: Compile Unit: length = 0x00000020, format = DWARF32, version = 0x000{version}, abbr_offset = 0x0000, addr_size = 0x08 (next unit at 0x00000074)
+
+0x0000005c: DW_TAG_compile_unit
+              DW_AT_name\t("crates/cli/src/main.rs/@/focusforge_cli.cgu.0")
+              DW_AT_comp_dir\t("{runner}")
+
+.debug_line contents:
+debug_line[0x00000000]
+Line table prologue:
+    total_length: 0x0000004e
+          format: DWARF32
+         version: {version}
+ prologue_length: 0x00000030
+ min_inst_length: 1
+max_ops_per_inst: 1
+ default_is_stmt: 1
+       line_base: -5
+      line_range: 14
+     opcode_base: 13
+standard_opcode_lengths[DW_LNS_copy] = 0
+"""
+        text += "".join(f'include_directories[{index:3}] = "{value}"\n' for index, value in directories)
+        for index, (directory, name) in enumerate(files, 1 if version < 5 else 0):
+            text += f'file_names[{index:3}]:\n           name: "{name}"\n      dir_index: {directory}\n' + ("   md5_checksum: 00000000000000000000000000000000\n" if version >= 5 else "       mod_time: 0x00000000\n         length: 0x00000000\n")
+        return text + "\nAddress            Line   Column File   ISA Discriminator OpIndex Flags\n------------------ ------ ------ ------ --- ------------- ------- -------------\n0x0000000100001000      5      0      1   0             0       0  is_stmt\n"
+    core = "/rustc/90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf/library/core/src"
+    four = real(4, [(1, f"{registry}/src"), (2, core)], [(0, "crates/cli/src/extra.rs"), (1, "lib.rs"), (2, "mod.rs")])
+    five = real(5, [(0, runner), (1, f"{registry}/src")], [(0, "crates/cli/src/main.rs"), (1, "lib.rs")])
+    lib = "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foo-1.0.0/src/lib.rs"
+    for label, output, expected in (("DWARF 4 directory indexes from 1", four, {lib, f"{core}/mod.rs", "/work/crates/cli/src/extra.rs"}), ("DWARF 5 directory index 0", five, {lib, "/work/crates/cli/src/main.rs"})):
+        with hosted_runner(module, runner):
+            found = set(inspect(output)["source_paths"])
+        assert expected <= found and "/work" in found and all(not path.startswith("/Users/") for path in found), (label, sorted(found))
+        with hosted_runner(module, runner, hosted=False):
+            try: inspect(output)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "/Users/runner/" in str(error), (label, str(error))
+            else: raise AssertionError(f"{label}: builder checkout accepted outside a hosted runner")
+    for label, output in (("DWARF 4 directory past the table", four.replace("dir_index: 2", "dir_index: 7")), ("DWARF 5 directory past the table", five.replace("dir_index: 1", "dir_index: 7"))):
+        with hosted_runner(module, runner):
+            try: inspect(output)
+            except ValueError as error: assert "invalid dSYM line directory for x86_64: index 7, 2 directories" in str(error), (label, str(error))
+            else: raise AssertionError(f"{label} accepted")
+
 
 def msf_pdb(guid: bytes, age: int) -> bytearray:
     page_size, page_count = 512, 6
@@ -1136,12 +1278,12 @@ def msf_pdb(guid: bytes, age: int) -> bytearray:
     return pdb
 
 
-def msf_pdb_with_source(guid: bytes, age: int, source: str) -> bytearray:
+def msf_pdb_with_source(guid: bytes, age: int, source: str, cwds: tuple[str, ...] = ("/work",)) -> bytearray:
     page_size, page_count = 512, 8
     pdb = bytearray(page_size * page_count)
     pdb[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
     source_bytes = source.encode() + b"\0"; c13 = struct.pack("<II", 0xF3, len(source_bytes)) + source_bytes + b"\0" * ((-len(source_bytes)) % 4) + struct.pack("<IIIBB", 0xF4, 8, 0, 0, 0) + b"\0\0"
-    environment = b"\0cwd\0/work\0src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
+    environment = b"\0" + b"".join(b"cwd\0" + cwd.encode() + b"\0" for cwd in cwds) + b"src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
     module = bytearray(len(symbols) + len(c13)); module[:len(symbols)] = symbols; module[len(symbols):] = c13
     record = bytearray(64); struct.pack_into("<HIII", record, 34, 4, len(symbols), 0, len(c13)); record += b"module\0object\0"; record += b"\0" * ((-len(record)) % 4)
     file_info = struct.pack("<HHHHI", 1, 1, 0, 1, 0) + source_bytes
@@ -1558,19 +1700,23 @@ def smoke_callers() -> None:
     assert "if ($LASTEXITCODE -ne 0) { throw 'installed CLI smoke failed' }" in windows
     assert native.count("- name: Check native package") == 2
     assert "uses: ./.github/workflows/package-native.yml" in release
-    build = release.index("- name: Build artifacts")
-    post_build = release.index("- id: cargo-dist", build)
-    linux_check = release.index("- name: Check Linux package", build)
-    check_step = release[linux_check:post_build]
+    global_start = release.index("\n  build-global-artifacts:")
+    global_job = release[global_start:release.index("\n  host:", global_start)]
+    local_job = release[release.index("\n  build-local-artifacts:"):global_start]
+    assert "check-package-linux" not in local_job and "package-smoke-receipts-linux" not in local_job
+    build = global_job.index('"--artifacts=global"')
+    post_build = global_job.index("- name: \"Upload artifacts\"", build)
+    linux_check = global_job.index("- name: Check Linux package", build)
+    check_step = global_job[linux_check:post_build]
     assert build < linux_check < post_build
-    assert "if: \"runner.os == 'Linux'\"" in check_step
+    assert "if:" not in check_step.split("- name: Upload package smoke receipts")[0]
     assert "tools/check-package-linux.sh .scratch/package-linux" in check_step
-    assert "|| true" not in check_step
+    assert "|| true" not in check_step and "continue-on-error" not in check_step
     upload = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
     receipt_specs = (
         (native, "tools/check-package-macos.sh", "- name: Upload native artifacts", "package-smoke-receipts-macos", (".scratch/check-package-macos.*/smoke",), True),
         (native, "tools/check-package-windows.ps1", "- name: Upload native artifacts", "package-smoke-receipts-windows", (".scratch/check-package-windows/*/smoke",), True),
-        (release, "tools/check-package-linux.sh .scratch/package-linux", "- id: cargo-dist", "package-smoke-receipts-linux-${{ join(matrix.targets, '_') }}", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
+        (global_job, "tools/check-package-linux.sh .scratch/package-linux", "- name: \"Upload artifacts\"", "package-smoke-receipts-linux-x86_64-unknown-linux-gnu", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
     )
     for source, checker, handoff, name, roots, launch in receipt_specs:
         checked = source.index(checker)
@@ -1589,4 +1735,4 @@ def smoke_callers() -> None:
 
 
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")

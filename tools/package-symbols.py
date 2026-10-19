@@ -200,11 +200,73 @@ def platform_header(platform: str) -> tuple[str, str, str]:
         raise ValueError("unsupported symbol target") from error
 
 
+def clipped(value: str) -> str:
+    return value if len(value) <= 200 else value[:197] + "..."
+
+
+def under(path: str, root: str) -> str | None:
+    """The part of `path` below `root`, or None; Windows roots compare without case."""
+    fold = str.casefold if re.match(r"^[A-Za-z]:", root) else str
+    prefix = root.rstrip("/") + "/"
+    if fold(path) == fold(root.rstrip("/")):
+        return ""
+    return path[len(prefix):] if fold(path[:len(prefix)]) == fold(prefix) else None
+
+
+TOOLCHAIN_ROOTS = re.compile(
+    r"^(?:/Applications/Xcode[^/]*\.app/Contents/Developer|/Library/Developer/CommandLineTools"
+    r"|[A-Za-z]:/Program Files(?: \(x86\))?/(?:Microsoft Visual Studio|Windows Kits)"
+    r"|[A-Za-z]:/[A-Za-z0-9]+/_work/\d+/s)/(.+)$"
+)
+
+
+def builder_location(value: str) -> str:
+    """Map the build host's checkout, cargo home, toolchain and SDK onto the container layout."""
+    path = posixpath.normpath(value.replace("\\", "/"))
+    relative = under(path, ROOT.as_posix())
+    if relative is not None:
+        if relative.startswith("target/"):
+            return "/out/target/" + relative[len("target/"):]
+        return "/work/" + relative if relative else "/work"
+    cargo_home = os.environ.get("CARGO_HOME", "").replace("\\", "/")
+    relative = under(path, cargo_home) if cargo_home else None
+    if relative and relative.startswith(("registry/", "git/checkouts/")):
+        return "/root/.cargo/" + relative
+    for pattern, template in (
+        (r"/\.cargo/((?:registry/src|git/checkouts)/.+)$", "/root/.cargo/{}"),
+        (r"/lib/rustlib/(?:src|rustc-src)/rust/(library/.+)$", "/rustc/toolchain/{}"),
+        (r"^[A-Za-z]:(/rustc/.+)$", "{}"),
+    ):
+        match = re.search(pattern, path)
+        if match:
+            return template.format(match.group(1))
+    match = TOOLCHAIN_ROOTS.match(path)
+    return "/usr/include/" + match.group(1) if match else path
+
+
+def native_source(path: str) -> str:
+    """A path read from native symbols; builder locations are mapped only on a public hosted runner."""
+    path = path.replace("\\", "/")
+    return builder_location(path) if os.environ.get("GITHUB_ACTIONS") == "true" else path
+
+
+def reject_private_native(paths) -> None:
+    rejected = sorted({path.replace("\\", "/") for path in paths if not safe_native_source(path)})
+    if rejected:
+        raise ValueError(f"private source path in native symbols: {clipped(rejected[0])}" + (f" (+{len(rejected) - 1} more)" if len(rejected) > 1 else ""))
+
+
+def absolute_native(value: str) -> bool:
+    value = value.replace("\\", "/")
+    return value.startswith("/") or re.match(r"^[A-Za-z]:/", value) is not None
+
+
 def normalized_source(value: str) -> str:
     """Map product paths and allow standard dependency records without escapes."""
     source = value.replace("\\", "/")
     if ".." in Path(source).parts:
-        raise ValueError("source path escapes its root")
+        raise ValueError(f"source path escapes its root: {clipped(value)}")
+    source = builder_location(source)
     for prefix in ("crates/", "/work/crates/", "C:/work/crates/"):
         if source.startswith(prefix):
             return "crates/" + source.split("crates/", 1)[1]
@@ -212,18 +274,24 @@ def normalized_source(value: str) -> str:
         return source
     if source.startswith(("/rustc/", "/rust/deps/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/out/target/", "/usr/include/")) or re.match(r"^/usr/lib/gcc/[^/]+/[^/]+/include/.+", source):
         return "dependency/" + source.rsplit("/", 1)[-1]
-    raise ValueError("private or unsupported source path in symbols")
+    raise ValueError(f"private or unsupported source path in symbols: {clipped(value)}")
 
 
 def canonicalize_symbol_sources(path: Path) -> None:
     lines = []
+    rejected: list[str] = []
     for line in path.read_text(encoding="utf-8", errors="strict").splitlines(keepends=True):
         if line.startswith("FILE "):
             parts = line.rstrip("\n").split(" ", 2)
             if len(parts) != 3:
                 raise ValueError("invalid Breakpad FILE record")
-            line = f"{parts[0]} {parts[1]} {normalized_source(parts[2])}\n"
+            try:
+                line = f"{parts[0]} {parts[1]} {normalized_source(parts[2])}\n"
+            except ValueError:
+                if parts[2] not in rejected: rejected.append(parts[2])
         lines.append(line)
+    if rejected:
+        raise ValueError("private or unsupported source path in symbols: " + "; ".join(clipped(value) for value in rejected[:5]) + (f" (+{len(rejected) - 5} more)" if len(rejected) > 5 else ""))
     path.write_text("".join(lines), encoding="utf-8")
 
 
@@ -325,8 +393,7 @@ def readelf_source_records(path: Path) -> tuple[list[str], int, int, int, int]:
             else:
                 no_line_count += 1
         resolved = resolved_native_source(base, source)
-        if not safe_native_source(posixpath.normpath(base.replace("\\", "/"))) or not safe_native_source(resolved):
-            raise ValueError("private source path in native symbols")
+        reject_private_native((posixpath.normpath(base.replace("\\", "/")), resolved))
         paths.update((posixpath.normpath(base.replace("\\", "/")), resolved))
     if not units:
         raise ValueError("missing DWARF line tables")
@@ -400,8 +467,7 @@ def readelf_source_records(path: Path) -> tuple[list[str], int, int, int, int]:
 
 def _inspect_linux_native(path: Path) -> dict:
     paths, units, tables, source_less, no_line = readelf_source_records(path)
-    if any(not safe_native_source(item) for item in paths):
-        raise ValueError("private source path in native symbols")
+    reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "elf-dwarf", "native_inspection_sha256": digest(path), "coverage": {"compile_units": units, "line_tables": tables, "source_less_compile_units": source_less, "no_line_compile_units": no_line}, "source_paths": paths}
 
 
@@ -488,13 +554,13 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
             if statement and unit_active: statement_list = int(statement.group(1), 16)
             if table:
                 finish_table(); table_offset = int(table.group(1), 16)
-            directory_row = re.search(r"include_directories\[(\d+)\]\s*=\s*\"(.*)\"", line)
+            directory_row = re.search(r"include_directories\[\s*(\d+)\]\s*=\s*[\"'](.*)[\"']\s*$", line)
             if directory_row and table_offset is not None:
                 line_directories[int(directory_row.group(1))] = directory_row.group(2)
-            if table_offset is not None and re.search(r"file_names\[\d+\]", line): finish_file()
-            inline_file = re.search(r"file_names\[\d+\].*name:\s*\"(.*)\"", line)
+            if table_offset is not None and re.search(r"file_names\[\s*\d+\]", line): finish_file()
+            inline_file = re.search(r"file_names\[\s*\d+\].*name:\s*[\"'](.*)[\"']", line)
             if inline_file and table_offset is not None: file_name = inline_file.group(1)
-            name_row = re.search(r"\bname:\s*\"(.*)\"", line)
+            name_row = re.search(r"\bname:\s*[\"'](.*)[\"']", line)
             if name_row and not inline_file and table_offset is not None: file_name = name_row.group(1)
             index_row = re.search(r"dir_index:\s*(\d+)", line)
             if index_row and table_offset is not None: file_directory = int(index_row.group(1))
@@ -511,16 +577,15 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
             resolved_directories = {index: resolved_native_source(directory, value) for index, value in directories.items()}
             unit_paths.update(resolved_directories.values())
             for index, value in files:
-                if index and index not in resolved_directories: raise ValueError(f"invalid dSYM line directory for {arch}")
+                if index and index not in resolved_directories: raise ValueError(f"invalid dSYM line directory for {arch}: index {index}, {len(resolved_directories)} directories (indexes {sorted(resolved_directories)[:8]}), file {clipped(value)!r}")
                 unit_paths.add(resolved_native_source(resolved_directories.get(index, directory), value))
         if line_tables: raise ValueError(f"unbound dSYM line table for {arch}")
         if not unit_paths:
             raise ValueError(f"missing dSYM source records for {arch}")
         paths.update(unit_paths); slices.append(arch)
     auxiliary, auxiliary_records = macos_auxiliary_source_paths(path, {value.hex().upper() for value in macho_uuids(dwarf).values()})
-    paths.update(auxiliary)
-    if any(not safe_native_source(item) for item in paths):
-        raise ValueError("private source path in native symbols")
+    paths = {native_source(item) for item in paths | auxiliary}
+    reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "macho-dwarf", "native_inspection_sha256": digest(path), "coverage": {"slices": sorted(slices), "auxiliary_source_records": auxiliary_records}, "source_paths": sorted(paths)}
 
 
@@ -618,7 +683,7 @@ def _inspect_windows_native(path: Path) -> dict:
                             if key.lower() == b"cwd":
                                 compilation_directories.append(value)
                                 module_directories.append(value)
-                            else: paths.append(resolved_native_source(compilation_directories[-1], value) if not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value) and compilation_directories else value)
+                            else: paths.append(resolved_native_source(compilation_directories[-1], value) if not absolute_native(value) and compilation_directories else value)
                             environment_records += 1
                 record = end
             c13 = module[symbol_size:symbol_size + c13_size]; cursor13 = 0; strings = b""; offsets: list[int] = []
@@ -641,17 +706,18 @@ def _inspect_windows_native(path: Path) -> dict:
                     end = strings.find(b"\0", position)
                     if end < 0: raise ValueError("unterminated C13 source record")
                     value = strings[position:end].decode("utf-8", "strict")
-                    if not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value):
+                    if not absolute_native(value):
                         if len(set(module_directories)) != 1:
                             raise ValueError("unresolved relative C13 source path")
                         value = resolved_native_source(module_directories[0], value)
                     paths.append(value)
                 c13_records += len(offsets)
         cursor = next_cursor
-    if any(not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value) for value in file_paths) and len(set(compilation_directories)) != 1: raise ValueError("unresolved relative PDB source path")
+    if any(not absolute_native(value) for value in file_paths) and len(set(compilation_directories)) != 1: raise ValueError("unresolved relative PDB source path")
     paths.extend(compilation_directories)
-    paths.extend(resolved_native_source(compilation_directories[0], value) if not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value) else value for value in file_paths)
-    if any(not safe_native_source(item) for item in paths): raise ValueError("private source path in native symbols")
+    paths.extend(resolved_native_source(compilation_directories[0], value) if not absolute_native(value) else value for value in file_paths)
+    paths = [native_source(item) for item in paths]
+    reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "pdb-dbi", "native_inspection_sha256": digest(path), "coverage": {"dbi_stream": 3, "file_records": len(file_paths), "module_c13_records": c13_records, "environment_records": environment_records}, "source_paths": sorted(set(paths))}
 
 
