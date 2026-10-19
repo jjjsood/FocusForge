@@ -130,7 +130,7 @@ jobs:
       - name: "Install pinned Python for release gate"
         uses: "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
         with:
-          "python-version": "3.12.15"
+          "python-version": "3.12.10"
       - name: "Require exact check run"
         if: "github.event_name != 'pull_request'"
         run: "GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""

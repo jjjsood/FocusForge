@@ -18,7 +18,7 @@ def errors(text: str) -> list[str]:
                      "fail-fast: false", "contents: read", "tools/check-all.sh --log-dir .logs/gate/ci",
                      "if: always()", "include-hidden-files: true", "if-no-files-found: error",
                      "cargo fetch --locked", "CARGO_DENY_VERSION: 0.20.2", "NEXTEST_VERSION: 0.9.144",
-                     "numpy==2.2.6", "python-version: '3.12.15'", "checksum mismatch"):
+                     "numpy==2.2.6", "python-version: '3.12.10'", "checksum mismatch"):
         if required not in text:
             found.append(f"missing {required!r}")
     canonical = re.findall(r"^\s*run:\s*tools/check-all\.sh --log-dir \.logs/gate/ci\s*$", text, re.M)
