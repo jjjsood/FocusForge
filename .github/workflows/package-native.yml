@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: package-native
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    env:
+      DIST_PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.15'
+      - name: Check native plan
+        shell: bash
+        run: python3 tools/collect-native-artifacts.py --check-plan
+      - name: Select Xcode 16.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.2.app
+          xcodebuild -version | grep -Fx 'Xcode 16.2'
+      - name: Install Rust 1.95.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add --toolchain 1.95.0 x86_64-apple-darwin aarch64-apple-darwin
+          rustup default 1.95.0
+      - name: Require exact check run
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+      - name: Build native package
+        shell: bash
+        run: tools/package-macos.sh --output target/distrib/native/macos
+      - name: Check native package
+        shell: bash
+        run: tools/check-package-macos.sh target/distrib/native/macos/FocusForge-0.1.0-universal.dmg
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: package-smoke-receipts-macos
+          path: |
+            .scratch/check-package-macos.*/smoke/commands.log
+            .scratch/check-package-macos.*/smoke/exit-status
+            .scratch/check-package-macos.*/smoke/installed-cli.sha256
+            .scratch/check-package-macos.*/smoke/source-os
+            .scratch/check-package-macos.*/smoke/logs/*.stdout
+            .scratch/check-package-macos.*/smoke/logs/*.stderr
+            .scratch/check-package-macos.*/smoke/logs/*.exit
+            .scratch/check-package-macos.*/launch.png
+          include-hidden-files: true
+          if-no-files-found: warn
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: artifacts-native-macos
+          path: target/distrib/native
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    env:
+      DIST_PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install pinned Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.15'
+      - name: Check native plan
+        shell: pwsh
+        run: python tools/collect-native-artifacts.py --check-plan
+      - name: Install Rust 1.95.0
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.95.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Parse PowerShell packaging scripts
+        shell: pwsh
+        run: |
+          $allErrors = @()
+          foreach ($script in 'tools/package-windows.ps1', 'tools/check-package-windows.ps1') {
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+            $allErrors += $errors
+          }
+          if ($allErrors.Count -gt 0) { $allErrors | Format-List | Out-String | Write-Error; exit 1 }
+      - name: Require exact check run
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+      - name: Build native package
+        shell: pwsh
+        run: tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows
+      - name: Check native package
+        shell: pwsh
+        run: tools/check-package-windows.ps1 -Msi target/distrib/native/windows/FocusForge-0.1.0-x86_64.msi
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: package-smoke-receipts-windows
+          path: |
+            .scratch/check-package-windows/*/smoke/commands.log
+            .scratch/check-package-windows/*/smoke/exit-status
+            .scratch/check-package-windows/*/smoke/installed-cli.sha256
+            .scratch/check-package-windows/*/smoke/source-os
+            .scratch/check-package-windows/*/smoke/logs/*.stdout
+            .scratch/check-package-windows/*/smoke/logs/*.stderr
+            .scratch/check-package-windows/*/smoke/logs/*.exit
+            .scratch/check-package-windows/*/launch.png
+          include-hidden-files: true
+          if-no-files-found: warn
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: artifacts-native-windows
+          path: target/distrib/native
+          if-no-files-found: error

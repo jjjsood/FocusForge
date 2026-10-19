@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+- name: Install pinned Python for release gate
+  uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+  with:
+    python-version: '3.12.15'
+- name: Require exact check run
+  if: github.event_name != 'pull_request'
+  shell: bash
+  run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+- name: Require locked release Cargo profile
+  if: runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    wrapper="$RUNNER_TEMP/focusforge-native-cargo"
+    real_cargo="$(command -v cargo)"
+    cat > "$wrapper" <<'WRAPPER'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${1:-}" = build ]; then
+      exec "$FOCUSFORGE_REAL_CARGO" "$@" --locked --config 'profile.dist.inherits="release"'
+    fi
+    exec "$FOCUSFORGE_REAL_CARGO" "$@"
+    WRAPPER
+    chmod +x "$wrapper"
+    {
+      echo "FOCUSFORGE_REAL_CARGO=$real_cargo"
+      echo "CARGO=$wrapper"
+    } >> "$GITHUB_ENV"
+- name: Require locked release Cargo profile on Windows
+  if: runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $wrapper = Join-Path $env:RUNNER_TEMP 'focusforge-native-cargo.cmd'
+    $realCargo = (Get-Command cargo).Source
+    @'
+    @echo off
+    if /I "%~1"=="build" (
+      "%FOCUSFORGE_REAL_CARGO%" %* --locked --config "profile.dist.inherits=\"release\""
+    ) else (
+      "%FOCUSFORGE_REAL_CARGO%" %*
+    )
+    exit /b %ERRORLEVEL%
+    '@ | Set-Content -LiteralPath $wrapper -Encoding ascii
+    "FOCUSFORGE_REAL_CARGO=$realCargo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    "CARGO=$wrapper" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+- name: Pull pinned Linux build image
+  if: runner.os == 'Linux'
+  shell: bash
+  run: docker pull ubuntu@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401
+- name: Route Linux builds through Ubuntu 22.04
+  if: runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    wrapper="$RUNNER_TEMP/focusforge-linux-cargo"
+    cat > "$wrapper" <<'WRAPPER'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "${1:-}" != build ]; then
+      exec "$FOCUSFORGE_REAL_CARGO" "$@"
+    fi
+    target_dir="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
+    docker_args=(--rm -i -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$GITHUB_WORKSPACE" -e RUSTFLAGS -e CARGO_ENCODED_RUSTFLAGS -e CARGO_BUILD_TARGET -e "FOCUSFORGE_TARGET_DIR=$target_dir" -e "FOCUSFORGE_HOST_UID=$(id -u)" -e "FOCUSFORGE_HOST_GID=$(id -g)")
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+      case "$target_dir" in /*) ;; *) target_dir="$GITHUB_WORKSPACE/$target_dir" ;; esac
+      mkdir -p "$target_dir"
+      docker_args+=(-v "$target_dir:$target_dir" -e "CARGO_TARGET_DIR=$target_dir" -e "FOCUSFORGE_TARGET_DIR=$target_dir")
+    fi
+    docker run "${docker_args[@]}" \
+      ubuntu@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401 \
+      bash -s -- "$@" <<'INNER'
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >&2
+    apt-get install -y -qq ca-certificates curl build-essential pkg-config libfontconfig1-dev >&2
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0 --profile minimal >&2
+    unset CARGO
+    cargo_status=0
+    "$HOME/.cargo/bin/cargo" "$@" --locked --config 'profile.dist.inherits="release"' || cargo_status=$?
+    chown -R "$FOCUSFORGE_HOST_UID:$FOCUSFORGE_HOST_GID" "$FOCUSFORGE_TARGET_DIR" >&2
+    exit "$cargo_status"
+    INNER
+    WRAPPER
+    chmod +x "$wrapper"
+    echo "CARGO=$wrapper" >> "$GITHUB_ENV"

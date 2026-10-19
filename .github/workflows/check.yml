@@ -1,0 +1,131 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.15'
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}
+      - name: Select native Python
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            native_python="$(command -v python)" || { echo "Python is required" >&2; exit 2; }
+            shim_dir="$RUNNER_TEMP/focusforge-bin"
+            mkdir -p "$shim_dir"
+            printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$native_python" > "$shim_dir/python3"
+            chmod +x "$shim_dir/python3"
+            echo "$shim_dir" >> "$GITHUB_PATH"
+            PATH="$shim_dir:$PATH"
+          fi
+          python3 --version
+      - name: Install Linux GUI prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes pkg-config libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt clippy
+          rustup default 1.95.0
+          if [ "$RUNNER_OS" = macOS ] && [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+            brew install bash
+            bash4="$(brew --prefix bash)/bin/bash"
+            "$bash4" --version
+            echo "$(dirname "$bash4")" >> "$GITHUB_PATH"
+          else
+            [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "Bash 4+ is required" >&2; exit 2; }
+          fi
+          bash --version
+      - name: Install pinned gate tools
+        env:
+          CARGO_DENY_VERSION: 0.20.2
+          NEXTEST_VERSION: 0.9.144
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) deny_target=x86_64-unknown-linux-musl; nextest_target=x86_64-unknown-linux-gnu ;;
+            macOS)
+              case "$(uname -m)" in
+                arm64|aarch64) deny_target=aarch64-apple-darwin ;;
+                x86_64) deny_target=x86_64-apple-darwin ;;
+                *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 2 ;;
+              esac
+              nextest_target=universal-apple-darwin
+              ;;
+            Windows) deny_target=x86_64-pc-windows-msvc; nextest_target=x86_64-pc-windows-msvc ;;
+            *) echo "unsupported runner OS: $RUNNER_OS" >&2; exit 2 ;;
+          esac
+          tool_dir="$RUNNER_TEMP/focusforge-tools"
+          rm -rf "$tool_dir"
+          mkdir -p "$tool_dir/deny" "$tool_dir/nextest" "$HOME/.cargo/bin"
+          fetch_checked() {
+            local url="$1" checksum_url="$2" archive="$3" dir="$4"
+            curl --fail --location --retry 3 --output "$archive" "$url"
+            curl --fail --location --retry 3 --output "$archive.sha256" "$checksum_url"
+            python3 - "$archive" "$archive.sha256" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          archive, checksum = map(pathlib.Path, sys.argv[1:])
+          lines = [line.split() for line in checksum.read_text().splitlines() if line.split()]
+          bare = [fields[0] for fields in lines if len(fields) == 1 and len(fields[0]) == 64]
+          named = [fields[0] for fields in lines if len(fields) == 2
+                   and fields[1].lstrip('*') == archive.name]
+          if any(len(fields) not in (1, 2) for fields in lines) or len(bare) > 1 or len(named) > 1:
+              raise SystemExit(f"ambiguous checksum file for {archive.name}")
+          expected = (bare[0] if bare else named[0] if named else "").lower()
+          if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+              raise SystemExit(f"malformed checksum for {archive.name}")
+          actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+          if expected != actual:
+              raise SystemExit(f"checksum mismatch for {archive.name}")
+          PY
+            tar -xzf "$archive" -C "$dir"
+          }
+          deny_archive="$tool_dir/cargo-deny-${CARGO_DENY_VERSION}-${deny_target}.tar.gz"
+          deny_url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/$(basename "$deny_archive")"
+          fetch_checked "$deny_url" "$deny_url.sha256" "$deny_archive" "$tool_dir/deny"
+          nextest_archive="$tool_dir/cargo-nextest-${NEXTEST_VERSION}-${nextest_target}.tar.gz"
+          nextest_base="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}"
+          fetch_checked "$nextest_base/$(basename "$nextest_archive")" "$nextest_base/cargo-nextest-${NEXTEST_VERSION}-${nextest_target}.sha256" "$nextest_archive" "$tool_dir/nextest"
+          find "$tool_dir/deny" -type f -name 'cargo-deny*' -exec cp {} "$HOME/.cargo/bin/" \;
+          find "$tool_dir/nextest" -type f -name 'cargo-nextest*' -exec cp {} "$HOME/.cargo/bin/" \;
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          cargo-deny --version
+          cargo nextest --version
+      - name: Install pinned Python dependency
+        run: python3 -m pip install --disable-pip-version-check 'numpy==2.2.6'
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Run canonical gate
+        run: tools/check-all.sh --log-dir .logs/gate/ci
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: gate-logs-${{ matrix.os }}
+          path: .logs/gate/ci/
+          include-hidden-files: true
+          if-no-files-found: error
