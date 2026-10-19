@@ -222,7 +222,8 @@ TOOLCHAIN_ROOTS = re.compile(
 
 def builder_location(value: str) -> str:
     """Map the build host's checkout, cargo home, toolchain and SDK onto the container layout."""
-    path = posixpath.normpath(value.replace("\\", "/"))
+    # Windows canonical paths carry the extended-length prefix: "\\?\D:\a\..." is "D:\a\...".
+    path = posixpath.normpath(re.sub(r"^//\?/(?=[A-Za-z]:/)", "", value.replace("\\", "/")))
     relative = under(path, ROOT.as_posix())
     if relative is not None:
         if relative.startswith("target/"):
@@ -579,7 +580,10 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
             for index, value in files:
                 if index and index not in resolved_directories: raise ValueError(f"invalid dSYM line directory for {arch}: index {index}, {len(resolved_directories)} directories (indexes {sorted(resolved_directories)[:8]}), file {clipped(value)!r}")
                 unit_paths.add(resolved_native_source(resolved_directories.get(index, directory), value))
-        if line_tables: raise ValueError(f"unbound dSYM line table for {arch}")
+        if line_tables:
+            unbound = "; ".join(f"table 0x{offset:x} ({len(dirs)} dirs, {len(files)} files, first {clipped(files[0][1])!r})" if files else f"table 0x{offset:x} ({len(dirs)} dirs, no files)" for offset, (dirs, files) in sorted(line_tables.items())[:5])
+            referenced = sorted({statement_list for _, _, statement_list in units.values() if statement_list is not None})
+            raise ValueError(f"unbound dSYM line table for {arch}: {len(line_tables)} unreferenced ({unbound}); {len(units)} units, {len(referenced)} reference a table {[hex(offset) for offset in referenced[:8]]}")
         if not unit_paths:
             raise ValueError(f"missing dSYM source records for {arch}")
         paths.update(unit_paths); slices.append(arch)
