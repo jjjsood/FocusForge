@@ -5,7 +5,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCK_LIB="$REPO/tools/lib/lock.sh"
-TMP="$(mktemp -d)"
+# Physical path: the lock pool path is canonical, and mktemp may return a symlinked prefix (macOS /var).
+TMP="$(cd -P "$(mktemp -d)" && pwd)"
 trap 'rm -rf "$TMP"' EXIT
 
 FAIL=0

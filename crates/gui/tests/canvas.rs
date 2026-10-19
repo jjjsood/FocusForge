@@ -1062,7 +1062,6 @@ fn frame_steps_keep_one_handle() {
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!("resident-memory measurement needs /proc/self/statm; skipping");
-        return;
     }
     #[cfg(target_os = "linux")]
     {

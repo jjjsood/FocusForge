@@ -102,7 +102,8 @@ jobs:
           if expected != actual:
               raise SystemExit(f"checksum mismatch for {archive.name}")
           PY
-            tar -xzf "$archive" -C "$dir"
+            # GNU tar reads a drive letter ("D:\...") as a remote host, so extract by relative name.
+            (cd "$(dirname "$archive")" && tar -xzf "$(basename "$archive")" -C "$dir")
           }
           deny_archive="$tool_dir/cargo-deny-${CARGO_DENY_VERSION}-${deny_target}.tar.gz"
           deny_url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/$(basename "$deny_archive")"

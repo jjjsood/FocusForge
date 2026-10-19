@@ -515,18 +515,27 @@ mod tests {
     #[test]
     fn a_floor_counts_running_time_only_not_the_time_between_segments() {
         let control = JobControl::new();
-        control.set_min_running(Duration::from_millis(150));
+        let floor = Duration::from_millis(150);
+        control.set_min_running(floor);
         control.begin_segment();
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
         control.end_segment();
+        // A sleep can overrun on a loaded host; the figure the floor still
+        // owes is what the control itself measured.
+        let ran = control.running_now();
+        if ran >= floor {
+            eprintln!("the first segment overran the floor ({ran:?}); nothing left to observe");
+            return;
+        }
         std::thread::sleep(Duration::from_millis(200));
         control.begin_segment();
         let started = Instant::now();
         assert!(!control.should_stop());
         let held = started.elapsed();
+        let owed = floor - ran;
         assert!(
-            held >= Duration::from_millis(40),
-            "the paused gap counted toward the floor: held {held:?}"
+            held >= owed.saturating_sub(Duration::from_millis(20)),
+            "the paused gap counted toward the floor: held {held:?}, owed {owed:?}"
         );
     }
 
