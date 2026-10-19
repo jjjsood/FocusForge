@@ -385,6 +385,16 @@ fn controller_with_scratch(name: &str) -> AppController {
 /// Opens the first `count` `fixtures/mantis-64` frames, copied under a fresh
 /// directory, as a new active tab with no checkpoint. Returns that directory.
 fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    let root = open_mantis64_frames(controller, name, count);
+    // Editor entry is under test, not alignment quality; an algorithm that
+    // always converges keeps every run clean.
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// [`open_mantis64_tab`] on the default aligner, which parks these frames
+/// at its Keep/Discard question.
+fn open_mantis64_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
     let root = common::tree(&format!("{name}_frames"));
     for i in 0..count {
         fs::copy(
@@ -397,9 +407,6 @@ fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -
         common::open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
-    // Editor entry is under test, not alignment quality; an algorithm that
-    // always converges keeps every run clean.
-    controller.set_align_algorithm("dummy-align");
     root
 }
 
@@ -3309,6 +3316,185 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
     );
     assert_eq!(summary.unaligned, 4);
     assert_eq!(summary.rerun, None);
+}
+
+/// The run state of tab `index`, read by selecting it.
+fn tab_run(controller: &mut AppController, index: usize) -> job::RunState {
+    controller.select_project(index);
+    controller.job_view().state
+}
+
+/// Polls until some tab holds a parked run, within the budget a mantis-512
+/// fuse needs.
+fn settle_until_parked(controller: &mut AppController) {
+    let start = Instant::now();
+    while !controller.parked_run_waiting() {
+        controller.settle_job();
+        assert!(
+            start.elapsed() < Duration::from_secs(300),
+            "no run parked within the budget"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+const MANTIS_512_UNALIGNED: [&str; 4] = ["00.tif", "01.tif", "06.tif", "07.tif"];
+const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
+
+/// Tab 0 (mantis-512) parks at its question; `tails` are the tabs queued
+/// behind it, each `true` for `dummy-align` and `false` for the default
+/// aligner. Checks the queue head runs while tab 0 waits and every tab
+/// settles to an outcome of its own, then answers each question.
+fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
+    let mut c = controller_on_mantis_512(name);
+    for (i, dummy) in tails.iter().enumerate() {
+        let tab = format!("{name}_{i}");
+        if *dummy {
+            open_mantis64_tab(&mut c, &tab, 3);
+        } else {
+            open_mantis64_frames(&mut c, &tab, 3);
+        }
+    }
+    c.set_slow_run(2, Duration::from_secs(3));
+    c.select_project(0);
+    assert!(c.start_fuse());
+    for i in 1..=tails.len() {
+        c.select_project(i);
+        assert!(c.start_fuse(), "tab {i} joins the queue");
+        assert_eq!(
+            c.job_view().state,
+            job::RunState::Queued { position: i + 1 }
+        );
+    }
+
+    settle_until_parked(&mut c);
+    assert_eq!(tab_run(&mut c, 1), job::RunState::Running, "the head runs");
+    assert!(c.parked_run_waiting(), "tab 0's park counts from tab 1");
+    for i in 2..=tails.len() {
+        assert_eq!(tab_run(&mut c, i), job::RunState::Queued { position: i });
+    }
+    c.select_project(0);
+    assert_eq!(
+        c.pending_divergence(),
+        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+    );
+    let answer_first = |c: &mut AppController| {
+        c.select_project(0);
+        if keep_first {
+            c.keep_fused().expect("tab 0's park keeps");
+            assert_eq!(c.checkpoint_count(), Some(1));
+        } else {
+            c.discard_fused();
+            assert_eq!(c.checkpoint_count(), Some(0));
+        }
+        assert_eq!(c.pending_divergence(), None);
+    };
+    if answer_while_live {
+        answer_first(&mut c);
+    }
+
+    settle_all(&mut c);
+    assert!(c.last_refusal().is_none());
+    for (i, dummy) in tails.iter().enumerate() {
+        c.select_project(i + 1);
+        if *dummy {
+            assert_eq!(c.checkpoint_count(), Some(1), "tab {} fused", i + 1);
+            assert_eq!(c.pending_divergence(), None);
+        } else {
+            assert_eq!(c.checkpoint_count(), Some(0));
+            assert_eq!(
+                c.pending_divergence(),
+                Some(&MANTIS_64_UNALIGNED.map(String::from)[..]),
+                "tab {} parks at its own question",
+                i + 1
+            );
+        }
+    }
+    if !answer_while_live {
+        assert!(c.parked_run_waiting(), "tab 0 is still waiting");
+        c.select_project(0);
+        assert_eq!(
+            c.pending_divergence(),
+            Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+        );
+        answer_first(&mut c);
+    }
+    for (i, dummy) in tails.iter().enumerate() {
+        if !dummy {
+            c.select_project(i + 1);
+            c.keep_fused().expect("the tail's own park keeps");
+            assert_eq!(c.checkpoint_count(), Some(1));
+        }
+    }
+    assert!(!c.parked_run_waiting(), "every question is answered");
+    assert!(!c.work_pending());
+}
+
+#[test]
+fn queued_tab_runs_past_a_keep_question() {
+    // Queue lengths 1 and 2, `dummy-align` and the default aligner on the
+    // promoted tabs, Keep and Discard on tab 0, answered during and after
+    // the promoted run.
+    queue_behind_a_park("queue_past_park_a", &[true], true, true);
+    queue_behind_a_park("queue_past_park_b", &[false], false, false);
+    queue_behind_a_park("queue_past_park_c", &[true, false], true, false);
+    queue_behind_a_park("queue_past_park_d", &[false, true], false, true);
+}
+
+/// Tab 0 parked, tab 1 running slowly, tabs 2 and 3 queued behind it.
+fn parked_tab_with_two_queued(name: &str) -> AppController {
+    let mut c = controller_on_mantis_512(name);
+    for i in 0..3 {
+        open_mantis64_tab(&mut c, &format!("{name}_{i}"), 3);
+    }
+    c.set_slow_run(2, Duration::from_secs(3));
+    c.select_project(0);
+    assert!(c.start_fuse());
+    for i in 1..=3 {
+        c.select_project(i);
+        assert!(c.start_fuse());
+    }
+    settle_until_parked(&mut c);
+    assert_eq!(tab_run(&mut c, 1), job::RunState::Running);
+    c
+}
+
+#[test]
+fn queue_survives_closing_a_parked_tab() {
+    let mut c = parked_tab_with_two_queued("queue_close_parked");
+    c.request_close(0);
+    assert!(!c.parked_run_waiting(), "closing drops the park");
+    assert_eq!(c.project_tabs().len(), 3);
+    assert_eq!(tab_run(&mut c, 0), job::RunState::Running);
+    assert_eq!(tab_run(&mut c, 1), job::RunState::Queued { position: 2 });
+    assert_eq!(tab_run(&mut c, 2), job::RunState::Queued { position: 3 });
+    settle_all(&mut c);
+    assert!(!c.work_pending());
+    for i in 0..3 {
+        c.select_project(i);
+        assert_eq!(c.checkpoint_count(), Some(1), "tab {i} ran exactly once");
+    }
+}
+
+#[test]
+fn queue_survives_cancelling_a_queued_tab() {
+    let mut c = parked_tab_with_two_queued("queue_cancel_queued");
+    c.select_project(2);
+    c.cancel_fuse();
+    assert_eq!(c.job_view().state, job::RunState::Idle);
+    assert_eq!(tab_run(&mut c, 3), job::RunState::Queued { position: 2 });
+    assert!(c.parked_run_waiting(), "tab 0 still waits");
+    settle_all(&mut c);
+    assert!(!c.work_pending());
+    for (i, runs) in [(1, 1), (2, 0), (3, 1)] {
+        c.select_project(i);
+        assert_eq!(c.checkpoint_count(), Some(runs), "tab {i}");
+    }
+    c.select_project(0);
+    assert_eq!(
+        c.pending_divergence(),
+        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+    );
 }
 
 #[test]

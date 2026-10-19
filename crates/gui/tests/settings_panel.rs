@@ -345,6 +345,33 @@ fn a_loaded_stack_resolves_its_auto_hooks() {
     );
 }
 
+/// The Pyramid Depth row reads what `stack --dry-run` prints for the same
+/// frames: 0 for a 64 px frame, 3 for a 512 px frame, neither an explicit
+/// choice.
+#[test]
+fn pyramid_depth_matches_dry_run() {
+    let mantis_64 = common::workspace_root().join("fixtures").join("mantis-64");
+    for (frames, expected) in [(mantis_64, "0"), (mantis_512(), "3")] {
+        let mut controller = AppController::new();
+        assert!(matches!(
+            common::open_and_settle(&mut controller, std::slice::from_ref(&frames)),
+            OpenOutcome::Opened(_)
+        ));
+        controller.toggle_section_more("align");
+        controller.set_align_algorithm("pyramidal-ecc");
+        let panel = controller.settings_panel();
+        let depth_row = field_rows(&panel.rows, "align")
+            .into_iter()
+            .find(|r| r.id == "pyramid-depth")
+            .expect("pyramid-depth row must be present");
+        assert_eq!(depth_row.value_text, expected, "{}", frames.display());
+        assert_ne!(
+            heading(&panel.rows, "align").heading_state,
+            HeadingState::Explicit
+        );
+    }
+}
+
 #[test]
 fn several_violations_are_shown_at_once() {
     let mut controller = AppController::new();

@@ -145,8 +145,9 @@ struct Args {
     /// Selects these tab indices in turn and presses `Fuse stack` on each,
     /// right after `--open`, leaving the last one selected -- for
     /// inspecting a live run and the tabs queued behind it with no click
-    /// sequence. Comma-separated. An index repeated waits for every run to
-    /// settle before it is pressed again, so `0,0` fuses tab 0 twice.
+    /// sequence. Comma-separated. An index repeated waits until every earlier
+    /// run has settled and any Keep/Discard question has been answered in
+    /// the window, so `0,0` fuses tab 0 twice.
     #[arg(long, value_delimiter = ',')]
     fuse_tabs: Vec<usize>,
     /// Holds the Nth fuse run started in this launch (counted from 1, a whole
@@ -294,13 +295,12 @@ struct FuseTabsFollowUp {
     cancel_quit_after: Option<u64>,
 }
 
-/// Presses `Fuse stack` on each of `indices` in turn, the moment no
-/// background load (`--open`) is still in flight. A press fired while a
-/// load is still running targets a tab that does not exist yet and is
-/// silently dropped, since `--open`'s directory walk and thumbnail decode
-/// run off the event-loop thread and settle only once the window's own poll
-/// picks up their result. An index already pressed waits until no run is
-/// pending, since a press on a tab already running or queued is ignored.
+/// Presses `Fuse stack` on each of `indices` in turn, once every `--open`
+/// load has settled (`open_timer` is the load timer starting them): an
+/// earlier press for a tab not yet open lands on the tab before it and is
+/// ignored. An index already pressed waits until no run is pending and no
+/// tab holds a Keep/Discard question; a press on a parked tab would
+/// discard its result.
 /// Once every press is made and every run settled, `save` presses `Save
 /// project` on the proposed path, `overlay` opens the projects overlay, and
 /// `enter_editor` selects editor mode.
@@ -310,6 +310,7 @@ fn start_fuse_tabs_timer(
     slot: &Rc<RefCell<Option<slint::Timer>>>,
     indices: Vec<usize>,
     follow_up: FuseTabsFollowUp,
+    open_timer: &Rc<RefCell<Option<slint::Timer>>>,
 ) {
     let FuseTabsFollowUp {
         save,
@@ -320,6 +321,7 @@ fn start_fuse_tabs_timer(
         cancel_quit_after,
     } = follow_up;
     let timer_slot = slot.clone();
+    let open_timer = open_timer.clone();
     let mut pending: std::collections::VecDeque<usize> = indices.into();
     let mut pressed: Vec<usize> = Vec::new();
     let timer = slint::Timer::default();
@@ -327,11 +329,19 @@ fn start_fuse_tabs_timer(
         let Some(app) = app_weak.upgrade() else {
             return;
         };
-        if controller.lock().unwrap().load_in_flight() {
+        if controller.lock().unwrap().load_in_flight()
+            || open_timer
+                .borrow()
+                .as_ref()
+                .is_some_and(slint::Timer::running)
+        {
             return;
         }
         while let Some(&index) = pending.front() {
-            if pressed.contains(&index) && controller.lock().unwrap().work_pending() {
+            if pressed.contains(&index) && {
+                let controller = controller.lock().unwrap();
+                controller.work_pending() || controller.parked_run_waiting()
+            } {
                 return;
             }
             pending.pop_front();
@@ -1876,6 +1886,7 @@ fn run(args: &Args) -> ExitCode {
                     enter_editor: args.enter_editor,
                     cancel_quit_after: args.cancel_quit_after,
                 },
+                &open_wait_timer,
             );
         }
 
@@ -1904,6 +1915,112 @@ mod tests {
         assert_ne!(old_setup, new_setup);
         assert!(!teardown_is_current(&generation, old_setup));
         assert!(teardown_is_current(&generation, new_setup));
+    }
+
+    /// With two `--open` folders, the second tab does not exist until the
+    /// load timer starts its load. A `--fuse-tabs` press for it must wait for
+    /// that tab instead of landing on the first one, which ignores it.
+    #[test]
+    fn fuse_tabs_press_for_a_later_open_waits_for_that_tab() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let dir = tempfile::tempdir().unwrap();
+        let folder = |name: &str| {
+            let root = dir.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            for index in 0..3 {
+                let frame = format!("{index:02}.tif");
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../fixtures/mantis-64/frames")
+                        .join(&frame),
+                    root.join(frame),
+                )
+                .unwrap();
+            }
+            root
+        };
+        let (first, second) = (folder("first"), folder("second"));
+        let mut state = AppController::new();
+        state.set_scratch_root_for_test(dir.path().join("scratch"));
+        let controller = Arc::new(Mutex::new(state));
+        let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+        let _installed = bridge::install(
+            &app,
+            controller.clone(),
+            canvas.clone(),
+            Rc::new(RefCell::new(None)),
+        );
+
+        // As `main` starts them: the first load settled, the rest left to
+        // the load timer, and the press timer created after it.
+        let load = controller
+            .lock()
+            .unwrap()
+            .open_paths(std::slice::from_ref(&first))
+            .expect("the first load starts");
+        load.join().unwrap();
+        controller.lock().unwrap().settle_open().unwrap();
+        let open_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        bridge::start_load_timer(
+            app.as_weak(),
+            controller.clone(),
+            canvas,
+            &open_slot,
+            vec![second],
+        );
+        let press_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        start_fuse_tabs_timer(
+            app.as_weak(),
+            controller.clone(),
+            &press_slot,
+            vec![0, 1],
+            FuseTabsFollowUp {
+                save: false,
+                close: false,
+                quit: false,
+                overlay: false,
+                enter_editor: false,
+                cancel_quit_after: None,
+            },
+            &open_slot,
+        );
+
+        let running = |slot: &Rc<RefCell<Option<slint::Timer>>>| {
+            slot.borrow().as_ref().is_some_and(slint::Timer::running)
+        };
+        let started = std::time::Instant::now();
+        loop {
+            i_slint_backend_testing::mock_elapsed_time(job::POLL);
+            // The load worker's completion event, which this backend has no
+            // event loop to deliver.
+            if controller.lock().unwrap().settle_open().is_some() {
+                bridge::push_projects(&app, &controller);
+            }
+            let idle = {
+                let controller = controller.lock().unwrap();
+                !controller.load_in_flight() && !controller.work_pending()
+            };
+            if idle && !running(&open_slot) && !running(&press_slot) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "runs never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(controller.project_tabs().len(), 2);
+        for tab in 0..2 {
+            controller.select_project(tab);
+            assert!(
+                controller.pending_divergence().is_some(),
+                "tab {tab} fused and parked at its own question"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

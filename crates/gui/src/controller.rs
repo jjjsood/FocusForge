@@ -8045,6 +8045,12 @@ impl AppController {
         Some(parked.diverged.as_slice())
     }
 
+    /// Whether any tab, active or not, holds a parked run waiting for
+    /// Keep or Discard.
+    pub fn parked_run_waiting(&self) -> bool {
+        self.state.projects.iter().any(|tab| tab.parked.is_some())
+    }
+
     /// What the active tab's last completed run's alignment did: its source,
     /// backend and per-status counts.
     pub fn last_alignment(&self) -> Option<&job::AlignSummary> {
@@ -8388,8 +8394,9 @@ impl AppController {
     }
 
     /// Answers the delete question: queues the row's deletion and frees what
-    /// nothing needs any more. The canvas, the edit session and the render
-    /// are left alone.
+    /// nothing needs any more. While live holds ops the canvas, the edit
+    /// session and the render are left alone; otherwise deleting the current
+    /// row makes the newest remaining row current.
     pub fn confirm_checkpoint_delete(&mut self) {
         let Some((tab_id, key)) = self.state.pending_checkpoint_delete.take() else {
             return;
@@ -8408,6 +8415,16 @@ impl AppController {
         tab.free_unneeded_held();
         if checkpoints::held_index(&key).is_none() {
             tab.remove_cached_planes(&scratch_root, &key);
+        }
+        if tab.selected_checkpoint.as_deref() == Some(key.as_str())
+            && !tab.live_modified()
+            && let Some(newest) = self
+                .checkpoints_panel()
+                .entries
+                .into_iter()
+                .find_map(|entry| entry.id)
+        {
+            self.restore_row(newest);
         }
     }
 
