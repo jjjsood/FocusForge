@@ -222,7 +222,8 @@ enum UndockPane {
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
 
 /// Sets the export modal's own state directly, with no controller or
-/// worker behind it, for inspecting the writing/refused states no click sequence quickly reaches.
+/// worker behind it, for inspecting the writing/refused states no click
+/// sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
     // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
