@@ -12,7 +12,7 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [settings-window](settings-window.md) | 08 | Performance, Appearance, Storage, Input map, Diagnostics, About |
 | [stacking-parameters](stacking-parameters.md) | 09, 14 | the dock's Settings tab: sections, values, algorithm picker, Reset All, per-tab values, brightness target |
 | [images-panel](images-panel.md) | 10, 13 | frame list, exclude, remove, sort, reorder, add, List / Image list / Large previews |
-| [projects](projects.md) | 11 | projects overview, cards, cancelled run, close from card, rail |
+| [projects](projects.md) | 11, 16, 18 | projects overview, cards, cancelled run, close from card, rail, overview opened at launch, held paused transport |
 | [open-and-refusals](open-and-refusals.md) | 12, 16 | RAW folder, compressed TIFF variants, empty start, not-a-project, mismatch and missing-frames projects, grouping question, skipped subfolder, failed fuse |
 | [notifications](notifications.md) | 15 | bell and unread count, notification center, toasts, crash record |
 

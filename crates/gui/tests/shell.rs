@@ -3480,3 +3480,124 @@ mod notification {
         assert_eq!(row().crash_error, "");
     }
 }
+
+// --- Escape in the Settings modal -------------------------------------------
+
+mod settings_escape {
+    use super::*;
+    use focusforge_gui::SettingsSection;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    struct Rig {
+        app: AppWindow,
+        controller: SharedController,
+        _installed: focusforge_gui::bridge::Installed,
+    }
+
+    fn rig() -> Rig {
+        let controller: SharedController = Arc::new(Mutex::new(AppController::new()));
+        let app = app_at(1440, 900);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        let installed = focusforge_gui::bridge::install(
+            &app,
+            controller.clone(),
+            common::empty_canvas(),
+            Rc::new(RefCell::new(None)),
+        );
+        Rig {
+            app,
+            controller,
+            _installed: installed,
+        }
+    }
+
+    impl Rig {
+        fn event(&self, event: WindowEvent) {
+            self.app.window().dispatch_event(event);
+            slint::platform::update_timers_and_animations();
+        }
+
+        fn open_settings(&self, section: SettingsSection) {
+            self.app.invoke_settings_open_requested();
+            self.app
+                .invoke_settings_section_selected(section.slug().into());
+            slint::platform::update_timers_and_animations();
+            assert!(self.app.get_settings_open());
+        }
+
+        fn escape(&self) {
+            let text: slint::SharedString = Key::Escape.into();
+            self.event(WindowEvent::KeyPressed { text: text.clone() });
+            self.event(WindowEvent::KeyReleased { text });
+        }
+
+        fn click_element(&self, id: &str) {
+            let (x, y, w, h) = rect(&self.app, id);
+            let position = slint::LogicalPosition::new(x + w / 2.0, y + h / 2.0);
+            self.event(WindowEvent::PointerMoved { position });
+            self.event(WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            });
+            self.event(WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            });
+        }
+
+        fn overlay_open(&self) -> bool {
+            self.controller.lock().unwrap().projects_overlay_open()
+        }
+    }
+
+    #[test]
+    fn escape_closes_settings_from_each_section() {
+        let rig = rig();
+        for section in SettingsSection::ALL {
+            rig.open_settings(section);
+            rig.escape();
+            assert!(
+                !rig.app.get_settings_open(),
+                "Escape closes Settings from {}",
+                section.slug()
+            );
+        }
+    }
+
+    #[test]
+    fn escape_closes_settings_after_a_text_field_held_focus() {
+        let rig = rig();
+        rig.open_settings(SettingsSection::Diagnostics);
+        rig.click_element("FFDiagnosticsPanel::dest-field");
+        rig.app
+            .invoke_settings_section_selected(SettingsSection::About.slug().into());
+        slint::platform::update_timers_and_animations();
+        rig.escape();
+        assert!(
+            !rig.app.get_settings_open(),
+            "Escape closes Settings after the Save to field held focus and About was selected"
+        );
+    }
+
+    #[test]
+    fn escape_closes_settings_and_leaves_the_overlay_to_the_next_escape() {
+        let rig = rig();
+        rig.controller.lock().unwrap().toggle_projects_overlay();
+        rig.open_settings(SettingsSection::Performance);
+        rig.escape();
+        assert!(
+            !rig.app.get_settings_open(),
+            "the first Escape closes Settings"
+        );
+        assert!(
+            rig.overlay_open(),
+            "the projects overlay underneath stays open"
+        );
+        rig.escape();
+        assert!(!rig.overlay_open(), "the second Escape closes the overlay");
+    }
+}

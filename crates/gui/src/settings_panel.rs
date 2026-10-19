@@ -705,7 +705,7 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         // The on/off switch is the project-level `align` value, written to
         // the project map, and is the section's first row after its heading;
         // every row below it greys while the switch is off. The heading's
-        // provenance reads the algorithm's own values only.
+        // provenance reads the algorithm's own values and the switch.
         let align_on = project_flag(project_values, "align");
         for row in align_rows.iter_mut().skip(1) {
             row.disabled = !align_on;
@@ -716,6 +716,9 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             field_row(ALIGN_SWITCH_SECTION, desc, value, false)
         });
         align_rows.splice(1..1, switch_rows);
+        if project_values.contains_key("align") {
+            align_rows[0].heading_state = HeadingState::Explicit;
+        }
         rows.extend(align_rows);
     }
     rows.extend(section_rows(

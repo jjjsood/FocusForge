@@ -781,7 +781,10 @@ export component AppWindow inherits Window {
         diagnostics-manifest-content-height: root.diagnostics-manifest-content-height;
         diagnostics-destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
-        settings-close-requested => { root.settings-close-requested(); }
+        settings-close-requested => {
+            root.settings-close-requested();
+            canvas-ground.focus();
+        }
         settings-section-selected(s) => { root.settings-section-selected(s); }
         performance-gpu-toggled(on) => { root.performance-gpu-toggled(on); }
         performance-host-cap-edited(t) => { root.performance-host-cap-edited(t); }

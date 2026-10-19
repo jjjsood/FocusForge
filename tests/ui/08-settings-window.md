@@ -52,7 +52,7 @@ Start: --open fixtures/mantis-64/frames
 22. Click **About** (`FFNavRailEntry::area` 5).
     Expect: the heading "FOCUSFORGE" shows "Version" with a number of the form "0.1.0" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge".
 ## The backend line after a fuse with the GPU switch off
-23. Click **Close settings** (`FFSettingsModal::close`).
+23. Press Escape (step 21 focused the "Save to" field and step 22 switched to About).
     Expect: the "Settings" window and its rail are gone; the canvas panes are visible again.
 24. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: (within 60 s) a dialog titled "Keep this fused result?" shows two buttons, "Discard" and "Keep".

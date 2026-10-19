@@ -1517,6 +1517,83 @@ fn fuse_is_enabled_from_two_frames_and_disabled_below() {
 }
 
 #[test]
+fn toolbar_preview_holds_until_a_run_starts() {
+    for (state, stage_word, eta) in [
+        ("idle", "", ""),
+        ("running", "Aligning", "ETA 1:12"),
+        ("paused", "Paused", "ETA —"),
+        ("cancelling", "Cancelling", "ETA —"),
+        ("failed", "Failed", "ETA —"),
+    ] {
+        let mut controller = controller_with_frames(&format!("preview_{state}"), 3);
+        controller.set_toolbar_preview(state);
+        let preview = controller.job_view();
+        assert_eq!(preview.toolbar_run_state, state);
+        assert_eq!(preview.stage_word, stage_word, "{state}");
+        assert_eq!(preview.eta_text, eta, "{state}");
+        assert!(preview.fuse_enabled, "{state}: a 3-frame tab can fuse");
+
+        // A completed open adds a 1-frame tab: the preview stays, only
+        // `fuse_enabled` follows the active tab.
+        let single = common::tree(&format!("preview_{state}_single_frames"));
+        copy_frame(&single, "00.tif", 0);
+        assert!(matches!(
+            common::open_and_settle(&mut controller, &[single]),
+            OpenOutcome::Opened(_)
+        ));
+        let view = controller.job_view();
+        assert!(!view.fuse_enabled, "{state}: a 1-frame tab cannot fuse");
+        assert_eq!(
+            JobViewHeld(&view),
+            JobViewHeld(&preview),
+            "{state}: held across a completed open"
+        );
+
+        controller.select_project(0);
+        let view = controller.job_view();
+        assert!(view.fuse_enabled, "{state}: back on the 3-frame tab");
+        assert_eq!(
+            JobViewHeld(&view),
+            JobViewHeld(&preview),
+            "{state}: held across a tab switch"
+        );
+
+        assert!(controller.start_fuse());
+        assert_ne!(
+            JobViewHeld(&controller.job_view()),
+            JobViewHeld(&preview),
+            "{state}: a started run replaces the preview"
+        );
+        controller.cancel_fuse();
+        common::wait_for_settle(&mut controller, Duration::from_secs(120));
+        // An idle preview legitimately equals the idle view a cancelled run
+        // leaves behind.
+        assert!(
+            state == "idle" || JobViewHeld(&controller.job_view()) != JobViewHeld(&preview),
+            "{state}: the preview does not return after the run"
+        );
+    }
+}
+
+/// A [`job::JobView`] compared without `fuse_enabled`, which follows the
+/// active tab rather than the held preview.
+#[derive(Debug)]
+struct JobViewHeld<'a>(&'a focusforge_gui::JobView);
+
+impl PartialEq for JobViewHeld<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (self.0, other.0);
+        a.state == b.state
+            && a.toolbar_run_state == b.toolbar_run_state
+            && a.stage_word == b.stage_word
+            && a.step_text == b.step_text
+            && a.eta_text == b.eta_text
+            && a.bar_tone == b.bar_tone
+            && a.fraction == b.fraction
+    }
+}
+
+#[test]
 fn the_plus_tab_offers_no_fuse_control() {
     let controller = AppController::new();
     assert!(controller.plus_selected());

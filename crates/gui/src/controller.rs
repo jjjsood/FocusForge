@@ -1411,6 +1411,9 @@ struct ShellState {
     drag_row: Option<DragRow>,
     /// Whether the projects overlay is open.
     overlay_open: bool,
+    /// The overlay was opened while a load ran, so that load's arrival
+    /// leaves it open. Cleared whenever the overlay closes.
+    overlay_survives_load: bool,
     /// The tab, by id, whose close waits on the "save first?" answer --
     /// raised by [`AppController::request_close`] only when closing that tab
     /// loses something ([`ProjectTab::loses_on_close`]).
@@ -1783,6 +1786,9 @@ pub struct AppController {
     slow_run: Option<(usize, Duration)>,
     /// Runs started so far, counted after the budget refusal.
     runs_started: usize,
+    /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
+    /// returns in place of the active run's, until the next run starts.
+    toolbar_preview: Option<JobView>,
     /// How long every folder or project load waits before it reads anything.
     open_hold: Duration,
     /// The Performance tab's settings, read by every run this controller
@@ -4309,7 +4315,9 @@ impl AppController {
         }
         if !opened.projects.is_empty() {
             self.set_active_tab(Some(self.state.projects.len()));
-            self.close_projects_overlay();
+            if !self.state.overlay_survives_load {
+                self.close_projects_overlay();
+            }
             let mut thumbnails = thumbnails.into_iter();
             for project in opened.projects {
                 self.clear_failure(&project_identity_path(&project));
@@ -4732,6 +4740,7 @@ impl AppController {
     /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
+        self.state.overlay_survives_load = self.state.overlay_open && self.load_in_flight();
         self.notifications
             .set_projects_open(self.state.overlay_open);
         self.set_gallery_scroll(self.state.gallery_scroll_y);
@@ -4742,6 +4751,7 @@ impl AppController {
     pub fn close_projects_overlay(&mut self) {
         if self.state.overlay_open {
             self.state.overlay_open = false;
+            self.state.overlay_survives_load = false;
             self.notifications.set_projects_open(false);
             self.emit(ShellEvent::OverlayChanged);
         }
@@ -7575,6 +7585,7 @@ impl AppController {
         }
         let mut worker_request = request.clone();
         worker_request.max_host_memory = Some(processing_budget);
+        self.toolbar_preview = None;
         let preview_barrier = self.previews.as_ref().map(PreviewWorker::quiesce);
         self.job.handle = Some(job::spawn_after(
             worker_request,
@@ -7762,6 +7773,12 @@ impl AppController {
     /// run, empty rather than another tab's numbers with no active tab or
     /// with the active tab not the one actually running.
     pub fn job_view(&self) -> JobView {
+        if let Some(preview) = &self.toolbar_preview {
+            return JobView {
+                fuse_enabled: self.fuse_enabled(),
+                ..preview.clone()
+            };
+        }
         let run = self
             .state
             .active()
@@ -7782,6 +7799,52 @@ impl AppController {
             fuse_enabled: self.fuse_enabled(),
             state: run,
         }
+    }
+
+    /// Holds a literal transport view -- `state` is one of `idle`, `running`,
+    /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
+    /// until the next run starts; `fuse_enabled` still follows the active
+    /// tab. An unknown `state` gets the idle numbers and labels but keeps
+    /// its own string as `toolbar_run_state`, so callers validate first.
+    pub fn set_toolbar_preview(&mut self, state: &str) {
+        let (run, stage_word, step_text, fraction, tone, eta) = match state {
+            "running" => (
+                job::RunState::Running,
+                "Aligning",
+                "42 of 61",
+                0.62,
+                "running",
+                "ETA 1:12",
+            ),
+            "paused" => (job::RunState::Paused, "Paused", "", 0.62, "held", "ETA —"),
+            "cancelling" => (
+                job::RunState::Cancelling,
+                "Cancelling",
+                "",
+                0.0,
+                "held",
+                "ETA —",
+            ),
+            "failed" => (
+                job::RunState::Failed(String::new()),
+                "Failed",
+                "",
+                0.28,
+                "failed",
+                "ETA —",
+            ),
+            _ => (job::RunState::Idle, "", "", 0.0, "held", ""),
+        };
+        self.toolbar_preview = Some(JobView {
+            state: run,
+            toolbar_run_state: state.to_string(),
+            stage_word: stage_word.to_string(),
+            step_text: step_text.to_string(),
+            eta_text: eta.to_string(),
+            bar_tone: tone.to_string(),
+            fraction,
+            fuse_enabled: self.fuse_enabled(),
+        });
     }
 
     /// Whether the active tab's fuse control is enabled: a real project tab

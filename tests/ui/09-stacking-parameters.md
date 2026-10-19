@@ -50,7 +50,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
 22. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
    Expect: the switch is on; the ALIGN "Algorithm" label and field, the "More..." bar and the "Mode" label are no longer greyed out.
 23. Drag the Settings scrollbar (`FFScrollbar::track-area`) to the middle of its track (`$M drag FFScrollbar::track-area 0 1193 480`).
-   Expect: the ALIGN heading with its "DEFAULT" badge is at the top of the dock; the rows "Mode" (reading "Rotation + Scale") and "Max Iterations" (reading "400") are shown.
+   Expect: the ALIGN heading is at the top of the dock with no "DEFAULT" badge (writing the Enabled switch counts as a change, even back to on); the rows "Mode" (reading "Rotation + Scale") and "Max Iterations" (reading "400") are shown.
 24. Click the **Mode** field (`FFMenu::root` 1).
    Expect: a list opens under it with the entries "Translation only" and "Rotation + Scale", the grey ids "translation" and "rotation-scale" and a check mark beside "Rotation + Scale".
 25. Click **Translation only** (`FFMenuList::option-area` 0).

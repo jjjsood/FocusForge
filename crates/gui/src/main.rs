@@ -103,7 +103,8 @@ struct Args {
     images_sort_menu_open: bool,
     /// Opens the projects overlay at startup, for inspecting every state of
     /// this surface with no click sequence. With `--fuse-tabs`, it opens once
-    /// the last run settles instead.
+    /// the last run settles instead. With `--open`, it stays open once the
+    /// load lands.
     #[arg(long)]
     projects_overlay: bool,
     /// Presses `Save project` once the last `--fuse-tabs` run settles,
@@ -220,28 +221,8 @@ enum UndockPane {
 
 const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "failed"];
 
-/// Sets the toolbar's and the bottom bar's transport preview together, from
-/// literal values with no controller or job behind them -- for inspecting a
-/// state no click sequence currently reaches.
-fn apply_toolbar_state_preview(app: &AppWindow, state: &str) {
-    app.set_toolbar_run_state(state.into());
-    let (stage_word, step_text, fraction, tone, eta) = match state {
-        "running" => ("Aligning", "42 of 61", 0.62, "running", "ETA 1:12"),
-        "paused" => ("Paused", "", 0.62, "held", "ETA —"),
-        "cancelling" => ("Cancelling", "", 0.0, "held", "ETA —"),
-        "failed" => ("Failed", "", 0.28, "failed", "ETA —"),
-        _ => ("", "", 0.0, "held", ""),
-    };
-    app.set_stage_word(stage_word.into());
-    app.set_step_text(step_text.into());
-    app.set_bar_fraction(fraction);
-    app.set_bar_tone(tone.into());
-    app.set_eta_text(eta.into());
-}
-
 /// Sets the export modal's own state directly, with no controller or
-/// worker behind it -- `apply_toolbar_state_preview`'s twin, for inspecting
-/// the writing/refused states no click sequence quickly reaches.
+/// worker behind it, for inspecting the writing/refused states no click sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
     // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
@@ -1754,7 +1735,9 @@ fn run(args: &Args) -> ExitCode {
         bridge::push_about_view(&app);
 
         if let Some(state) = &args.toolbar_state {
-            apply_toolbar_state_preview(&app, state.as_str());
+            let mut controller = controller.lock().unwrap();
+            controller.set_toolbar_preview(state.as_str());
+            bridge::push_job(&app, &controller.job_view());
         }
         if let Some(stage) = &args.export_dialog_preview {
             apply_export_dialog_preview(&app, stage.as_str());

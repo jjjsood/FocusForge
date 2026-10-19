@@ -1741,7 +1741,7 @@ fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
 
 /// Pushes the run's current view onto the toolbar/bottom-bar properties --
 /// the one place `ShellEvent::JobChanged` and the poll timer both write.
-fn push_job(app: &AppWindow, view: &JobView) {
+pub fn push_job(app: &AppWindow, view: &JobView) {
     app.set_toolbar_run_state(view.toolbar_run_state.as_str().into());
     app.set_stage_word(view.stage_word.as_str().into());
     app.set_step_text(view.step_text.as_str().into());

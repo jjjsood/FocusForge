@@ -67,6 +67,17 @@ export component FFSettingsModal inherits FFModalPanel {
     callback diagnostics-manifest-viewport-height-changed(length);
     callback diagnostics-manifest-scrolled(length);
 
+    changed settings-open => {
+        if root.settings-open {
+            content.focus();
+        }
+    }
+    changed settings-section => {
+        if root.settings-open {
+            content.focus();
+        }
+    }
+
     modal-open: root.settings-open;
     panel-width: 680px;
     panel-height: 520px;
@@ -137,11 +148,22 @@ export component FFSettingsModal inherits FFModalPanel {
         triggered => { root.settings-close-requested(); }
     }
 
-    content := Rectangle {
+    // Takes focus when the modal opens or the section changes, so Escape
+    // reaches it from any tab; a text field inside keeps focus until then.
+    content := FocusScope {
         x: rail.width;
         y: ShellGeometry.settings-header-height;
         width: root.panel-width - rail.width;
         height: root.panel-height - ShellGeometry.settings-header-height;
+        focus-on-click: false;
+
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.settings-close-requested();
+                return accept;
+            }
+            return reject;
+        }
 
         if root.settings-section == "diagnostics": FFDiagnosticsPanel {
             width: 100%;

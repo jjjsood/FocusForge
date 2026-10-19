@@ -1201,6 +1201,77 @@ fn recent_row_opens_its_target() {
     );
 }
 
+/// A fresh directory of `count` copied fixture frames, not yet opened.
+fn frames_dir(name: &str, count: usize) -> PathBuf {
+    let root = tree(&format!("{name}_frames"));
+    for i in 0..count {
+        copy_frame(&root, &format!("{i:02}.tif"), i);
+    }
+    root
+}
+
+#[test]
+fn overlay_opened_during_a_load_survives_it() {
+    let mut controller = AppController::new();
+    let first = frames_dir("overlay_during_load_first", 2);
+    let second = frames_dir("overlay_during_load_second", 2);
+
+    let handle = controller
+        .open_paths(std::slice::from_ref(&first))
+        .expect("the first load starts");
+    assert!(controller.load_in_flight());
+    controller.toggle_projects_overlay();
+    handle.join().expect("the load worker did not panic");
+    assert!(matches!(
+        controller.settle_open(),
+        Some(OpenOutcome::Opened(_))
+    ));
+    assert!(
+        controller.projects_overlay_open(),
+        "an overlay opened while the load ran stays open when it lands"
+    );
+
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&second)),
+        OpenOutcome::Opened(_)
+    ));
+    assert!(
+        controller.projects_overlay_open(),
+        "a second load landing leaves it open too"
+    );
+
+    controller.select_project(0);
+    assert!(
+        !controller.projects_overlay_open(),
+        "a tab switch closes an overlay that survived a load"
+    );
+
+    let third = frames_dir("overlay_during_load_third", 2);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&third)),
+        OpenOutcome::Opened(_)
+    ));
+    assert!(
+        !controller.projects_overlay_open(),
+        "the overlay stays closed after a later load"
+    );
+}
+
+#[test]
+fn overlay_opened_before_a_load_still_closes_when_it_lands() {
+    let mut controller = AppController::new();
+    let first = frames_dir("overlay_before_load_first", 2);
+    controller.toggle_projects_overlay();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&first)),
+        OpenOutcome::Opened(_)
+    ));
+    assert!(
+        !controller.projects_overlay_open(),
+        "an overlay open before the load started closes on arrival"
+    );
+}
+
 #[test]
 fn recent_row_switches_to_an_open_tab() {
     let (mut controller, first_dir) = controller_with_frames_and_dir("recent_switch", 2);

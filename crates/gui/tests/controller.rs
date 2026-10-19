@@ -322,6 +322,10 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "close-requested")
             | (Some("app.slint"), "link-activated")
+            | (Some("app.slint"), "settings-close-requested")
+            | (Some("settings_modal.slint"), "changed settings-open")
+            | (Some("settings_modal.slint"), "changed settings-section")
+            | (Some("settings_modal.slint"), "key-pressed(event)")
             | (Some("notification_center.slint"), "clicked")
             | (Some("notification_center.slint"), "changed selected")
             | (Some("notification_center.slint"), "key-pressed(event)")
@@ -1035,6 +1039,42 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
     let target = common::tree("detached_save_all_quit_sync").join("saved.ffp");
     assert!(headless.save_all_and_quit(|_| Some(target.clone())));
     assert_close_tail(&events);
+}
+
+#[test]
+fn quit_asks_only_when_work_would_be_lost() {
+    for tabs in 0..=2 {
+        let name = format!("quit_asks_unfused_{tabs}");
+        let mut controller = controller_with_scratch(&name);
+        for tab in 0..tabs {
+            open_mantis64_tab(&mut controller, &format!("{name}_{tab}"), 3);
+        }
+        let events = record_events(&mut controller);
+        controller.window_close();
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [ShellEvent::WindowCloseRequested],
+            "{tabs} never-saved tabs with no fuse close at once"
+        );
+        assert!(controller.pending_quit_copy().is_none(), "{tabs} tabs");
+    }
+
+    let mut controller = controller_with_scratch("quit_asks_fused_added");
+    open_mantis64_tab(&mut controller, "quit_asks_fused_added_a", 3);
+    open_fused_tab(&mut controller, "quit_asks_fused_added_b", 3);
+    let events = record_events(&mut controller);
+    controller.window_close();
+    assert!(
+        controller.pending_quit_copy().is_some(),
+        "a fused, unsaved tab raises the question"
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .contains(&ShellEvent::WindowCloseRequested),
+        "the window stays until the question is answered"
+    );
 }
 
 #[test]
@@ -9394,4 +9434,61 @@ fn fixture_valid_project_opens_over_its_frames() {
         controller.images_panel().header_text,
         "3 frames \u{b7} 0 excluded"
     );
+}
+
+/// A stroke of the shape a driver synthesises -- one press, one move to a far
+/// point, one release -- a long drag flushed every few moves, and a drag in
+/// stacking mode each reach their settled render in under a second.
+#[test]
+fn stroke_of_the_journey_shape_lands_quickly() {
+    use std::time::{Duration, Instant};
+
+    const BUDGET: Duration = Duration::from_secs(1);
+    let (mut c, _root) = open_editor("stroke_of_the_journey_shape");
+    set_size(&mut c, 8.0);
+    let centre = at(MAP_WIDTH as f32 / 2.0, MAP_HEIGHT as f32 / 2.0);
+    let far = at(MAP_WIDTH as f32 - 1.0, MAP_HEIGHT as f32 - 1.0);
+
+    let started = Instant::now();
+    press(&mut c, centre);
+    c.pointer_moved(far.0, far.1);
+    c.flush_live_stroke();
+    release(&mut c, far);
+    common::settle_region_renders(&mut c);
+    let one_move = started.elapsed();
+    assert_eq!(ops(&c).len(), 1, "the one-move stroke is appended");
+
+    let started = Instant::now();
+    press(&mut c, centre);
+    for step in 0..200 {
+        let t = step as f32 / 199.0;
+        let x = 4.0 + (MAP_WIDTH as f32 - 8.0) * t;
+        let y = MAP_HEIGHT as f32 / 2.0 + 20.0 * (t * 12.0).sin();
+        let point = at(x, y);
+        c.pointer_moved(point.0, point.1);
+        if step % 7 == 6 {
+            c.flush_live_stroke();
+        }
+    }
+    release(&mut c, far);
+    common::settle_region_renders(&mut c);
+    let long_drag = started.elapsed();
+    assert_eq!(ops(&c).len(), 2, "the long drag is appended");
+
+    assert!(c.set_mode(ShellMode::Stacking));
+    let started = Instant::now();
+    drag_screen(&mut c, &[centre, far]);
+    let stacking = started.elapsed();
+    assert_eq!(ops(&c).len(), 2, "a stacking-mode drag appends no stroke");
+
+    println!("one-move stroke: {one_move:?}");
+    println!("200-move drag, flush every 7: {long_drag:?}");
+    println!("stacking-mode drag: {stacking:?}");
+    for (name, took) in [
+        ("one-move stroke", one_move),
+        ("200-move drag", long_drag),
+        ("stacking-mode drag", stacking),
+    ] {
+        assert!(took < BUDGET, "{name} took {took:?}, over {BUDGET:?}");
+    }
 }

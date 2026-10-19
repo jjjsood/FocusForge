@@ -195,17 +195,62 @@ fn the_enabled_switch_writes_only_the_project_values() {
 
     let panel = controller.settings_panel();
     assert_eq!(field_rows(&panel.rows, "align")[0].selected, "false");
-    assert_eq!(
-        heading(&panel.rows, "align").heading_state,
-        HeadingState::Default,
-        "the switch is not an align parameter"
-    );
     assert!(
-        !panel
+        panel
             .rows
             .iter()
-            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true")
+            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true"),
+        "the switch alone enables Reset All"
     );
+    assert_eq!(
+        heading(&panel.rows, "finish").heading_state,
+        HeadingState::Default,
+        "no other section reads the switch"
+    );
+}
+
+#[test]
+fn enabled_switches_drive_their_heading() {
+    // (section whose switch is written, the switch's section, its id)
+    for (heading_section, switch_section, id) in [
+        ("align", "align-switch", "align"),
+        ("prepare", "prepare", "equalize"),
+    ] {
+        let mut controller = AppController::new();
+        open_mantis_512(&mut controller);
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Default,
+            "{id}: untouched"
+        );
+        assert!(
+            !reset_all_enabled(&controller),
+            "{id}: nothing to reset yet"
+        );
+
+        controller.set_param_value(switch_section, id, ParamValue::Bool(false));
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Explicit,
+            "{id}: writing the switch makes the heading explicit"
+        );
+        assert!(reset_all_enabled(&controller), "{id}: Reset All follows");
+
+        controller.set_param_value(switch_section, id, ParamValue::Bool(true));
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Explicit,
+            "{id}: provenance is key presence, so writing the default back keeps it"
+        );
+
+        controller.reset_all_sections();
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Default,
+            "{id}: Reset All restores the badge"
+        );
+        assert!(!reset_all_enabled(&controller), "{id}: Reset All disarms");
+    }
 }
 
 #[test]
@@ -555,6 +600,20 @@ fn reopened_uncropped_project_shows_auto_crop_off() {
         OpenOutcome::Opened(_)
     ));
     assert_eq!(auto_crop_selected(&controller), "false");
+}
+
+#[test]
+fn a_reopened_project_without_an_align_record_opens_with_align_explicit() {
+    let mut controller = AppController::new();
+    let project = seal_without_align("reopened_unaligned_heading", "laplacian");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(
+        heading(&controller.settings_panel().rows, "align").heading_state,
+        HeadingState::Explicit
+    );
 }
 
 #[test]
