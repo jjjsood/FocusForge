@@ -231,6 +231,17 @@ macOS produces a universal DMG and Windows produces one combined MSI; their
 target runners validate the installed package before uploading it for the
 release checksum job.
 
+The macOS and Windows targets are type-checked natively: the macOS and Windows
+legs of the check workflow each run `tools/check-all.sh`, which builds the
+workspace on its own OS. A Linux cross check (`rustup target add
+aarch64-apple-darwin x86_64-pc-windows-msvc`, then `cargo check -p
+focusforge-gui --target …` or `cargo xwin check`) is unsupported: the `blake3`
+and `zstd-sys` build scripts need the target's C toolchain and SDK. Windows
+toasts are attributed through the AppUserModelID `org.focusforge.FocusForge`,
+which the installed Start-menu shortcut registers; a build run outside the MSI
+install may show no toast, or one under another application
+(https://github.com/hoodie/notify-rust/issues/219).
+
 ### Release smoke checklist
 
 Run `tools/check-package-linux.sh .scratch/package-linux` after producing the

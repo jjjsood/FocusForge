@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import gzip
 import hashlib
 import importlib.util
@@ -576,6 +577,42 @@ def graph() -> None:
     assert states(True, "skip", "success", "failure") == ("success", "failure", "skipped", "skipped")
 
 
+def native_identity() -> str:
+    match = re.search(r'const APP_ID: &str = "([^"]+)";', (ROOT / "crates/gui/src/native_notify.rs").read_text())
+    assert match, "APP_ID not found in the notification adapter"
+    return match.group(1)
+
+
+def assert_native_identity(plist: dict, wix: ET.Element) -> None:
+    identity = native_identity()
+    assert plist.get("CFBundleIdentifier") == identity, "bundle identifier differs from the notification identity"
+    shortcut = next(item for item in wix.iter() if item.tag.endswith("Shortcut"))
+    properties = [item.attrib for item in shortcut if item.tag.endswith("ShortcutProperty")]
+    assert len(properties) == 1 and properties[0]["Key"] == "System.AppUserModel.ID" and properties[0].get("Value") == identity, "shortcut AppUserModelID differs from the notification identity"
+
+
+def native_identity_cases(plist: dict, wix: ET.Element) -> None:
+    assert_native_identity(plist, wix)
+    def plist_with(**changes: str) -> dict:
+        mutated = copy.deepcopy(plist); mutated.update(changes); return mutated
+    def wix_with(mutate: object) -> ET.Element:
+        mutated = copy.deepcopy(wix); mutate(next(item for item in mutated.iter() if item.tag.endswith("Shortcut"))); return mutated
+    def drop(shortcut: ET.Element) -> None:
+        for item in list(shortcut): shortcut.remove(item)
+    def attribute(name: str, value: str) -> object:
+        return lambda shortcut: next(item for item in shortcut).set(name, value)
+    missing_plist = copy.deepcopy(plist); del missing_plist["CFBundleIdentifier"]
+    rejected = [
+        (missing_plist, wix), (plist_with(CFBundleIdentifier="org.focusforge.app"), wix), (plist_with(CFBundleIdentifier="org.focusforge.focusforge"), wix),
+        (plist, wix_with(drop)), (plist, wix_with(attribute("Value", "org.focusforge.app"))), (plist, wix_with(attribute("Key", "System.AppUserModel.RelaunchCommand"))),
+        (plist, wix_with(lambda shortcut: shortcut.append(copy.deepcopy(next(item for item in shortcut))))),
+    ]
+    for bad_plist, bad_wix in rejected:
+        try: assert_native_identity(bad_plist, bad_wix)
+        except AssertionError: pass
+        else: raise AssertionError("native identity mismatch accepted")
+
+
 def native_boundaries() -> None:
     plist = plistlib.loads((ROOT / "packaging/macos/Info.plist").read_bytes())
     assert {key: plist[key] for key in ("CFBundleExecutable", "CFBundleIconFile", "CFBundleShortVersionString", "CFBundleVersion")} == {"CFBundleExecutable": "focusforge-gui", "CFBundleIconFile": "focusforge", "CFBundleShortVersionString": "__VERSION__", "CFBundleVersion": "__VERSION__"}
@@ -597,6 +634,7 @@ def native_boundaries() -> None:
     )
     shortcut = next(item for item in wix.iter() if item.tag.endswith("Shortcut")); icon = next(item for item in wix.iter() if item.tag.endswith("Icon"))
     assert shortcut.attrib["Target"] == "[INSTALLFOLDER]focusforge-gui.exe" and shortcut.attrib["Icon"] == "FocusForgeIcon" and icon.attrib == {"Id": "FocusForgeIcon", "SourceFile": "$(var.Icon)"}
+    native_identity_cases(plist, wix)
     call(["bash", "-n", str(ROOT / "tools/package-macos.sh"), str(ROOT / "tools/check-package-macos.sh")])
     call(["bash", str(ROOT / "tools/package-macos.sh"), "--output", "/tmp/outside-native-packages"], False)
     call(["python3", "-c", "import pathlib; compile(pathlib.Path(__import__('sys').argv[1]).read_text(), __import__('sys').argv[1], 'exec')", str(NATIVE_COLLECTOR)])
@@ -1282,12 +1320,12 @@ def macos_checker_mock() -> None:
         template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
         stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
         bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
-        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-x86_64 arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O universal binary with 2 architectures: [x86_64] [arm64]'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; esac\n"}
+        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-x86_64 arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O universal binary with 2 architectures: [x86_64] [arm64]'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
         for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
         info_file.write_text(info)
         checker_copy = directory / "tools/check-package-macos.sh"
         original = (ROOT / "tools/check-package-macos.sh").read_text()
-        assert original.count("/usr/libexec/PlistBuddy") == 4
+        assert original.count("/usr/libexec/PlistBuddy") == 5
         checker_copy.write_text(original.replace("/usr/libexec/PlistBuddy", str(mock / "PlistBuddy")))
         env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_STACKWALK": str(stackwalk)}
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
@@ -1306,6 +1344,9 @@ def macos_checker_mock() -> None:
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0
         env.pop("MOCK_ARCHES")
+        for wrong in ("org.focusforge.app", ""):
+            result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_BUNDLE_ID": wrong})
+            assert result.returncode != 0 and f"invalid bundle identifier: {wrong}" in result.stderr, (result.stdout, result.stderr)
         version_file.write_text("0.1.1\n")
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0
@@ -1325,7 +1366,7 @@ def macos_checker_mock() -> None:
         write_macos_symbols(symbols / "x86_64-apple-darwin", "x86_64-apple-darwin")
         info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
-        assert result.returncode != 0 and log.read_text().count("detach") == 11
+        assert result.returncode != 0 and log.read_text().count("detach") == 13
 
 
 def macos_producer_mock() -> None:
@@ -1449,6 +1490,27 @@ function global:msiexec.exe {
 }
 function global:New-Object {
   param([string]$ComObject)
+  if ($ComObject -eq 'Shell.Application') {
+    $application = [pscustomobject]@{}
+    $application | Add-Member -MemberType ScriptMethod -Name NameSpace -Value {
+      param($Directory)
+      $folder = [pscustomobject]@{}
+      $folder | Add-Member -MemberType ScriptMethod -Name ParseName -Value {
+        param($Name)
+        $item = [pscustomobject]@{ Name = $Name }
+        $item | Add-Member -MemberType ScriptMethod -Name ExtendedProperty -Value {
+          param($Key)
+          if ($Key -ne 'System.AppUserModel.ID' -or $this.Name -ne 'FocusForge.lnk') { return '' }
+          if ($env:MOCK_AUMID -eq 'absent') { return '' }
+          if ($env:MOCK_AUMID) { return $env:MOCK_AUMID }
+          'org.focusforge.FocusForge'
+        }
+        $item
+      }
+      $folder
+    }
+    return $application
+  }
   if ($ComObject -ne 'WScript.Shell') { throw "unexpected COM object: $ComObject" }
   $shell = [pscustomobject]@{}
   $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
@@ -1467,7 +1529,7 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         invocations = root / "invocations"
         env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
-        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False)):
+        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False)):
             shutil.rmtree(root / "symbols", ignore_errors=True)
             shutil.copytree(template, root / "symbols")
             case_env = env | mutation
@@ -1476,6 +1538,8 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
             if "MOCK_CRASH_ARTIFACT" in mutation:
                 missing = "dump" if mutation["MOCK_CRASH_ARTIFACT"] == "missing_both" else mutation["MOCK_CRASH_ARTIFACT"].removeprefix("missing_")
                 assert f"crash is missing {missing}" in result.stderr, result.stderr
+            if "MOCK_AUMID" in mutation:
+                assert "invalid Start-menu shortcut AppUserModelID:" in result.stderr, result.stderr
             assert not (root / "program-files/FocusForge").exists()
             assert not (root / "program-data/Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk").exists()
         assert invocations.read_text().splitlines()[:2] == ["focusforge-cli.exe:1:algorithms", "focusforge-gui.exe:0:"]

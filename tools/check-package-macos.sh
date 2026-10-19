@@ -38,6 +38,9 @@ plist="$app/Contents/Info.plist"
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") == "$version" ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist") == "$version" ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$plist") == focusforge ]]
+identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+echo "CFBundleIdentifier: $identifier"
+[[ $identifier == org.focusforge.FocusForge ]] || { echo "invalid bundle identifier: $identifier" >&2; exit 1; }
 for file in LICENSE NOTICE; do cmp "$root/$file" "$app/Contents/Resources/$file"; done
 cmp "$root/assets/build/focusforge.icns" "$app/Contents/Resources/focusforge.icns"
 python3 "$root/tools/package-cli-assets.py" verify "$root" "$app/Contents/Resources"

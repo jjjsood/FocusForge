@@ -102,6 +102,9 @@ try {
   if ($link.TargetPath -ne (Join-Path $product 'focusforge-gui.exe')) { throw 'invalid Start-menu shortcut target' }
   $iconParts = $link.IconLocation -split ',', 2; $iconPath = $iconParts[0].Trim('"'); $iconIndex = if ($iconParts.Count -eq 2) { [int]$iconParts[1] } else { 0 }
   if ($iconIndex -ne 0 -or -not (Test-Path $iconPath) -or (Get-FileHash $iconPath).Hash -ne (Get-FileHash (Join-Path $root 'assets/build/focusforge.ico')).Hash) { throw 'invalid Start-menu shortcut icon' }
+  $appId = (New-Object -ComObject Shell.Application).NameSpace((Split-Path $shortcut)).ParseName((Split-Path -Leaf $shortcut)).ExtendedProperty('System.AppUserModel.ID')
+  Write-Output "AppUserModelID: $appId"
+  if ($appId -ne 'org.focusforge.FocusForge') { throw "invalid Start-menu shortcut AppUserModelID: $appId" }
   Assert-CrashRoundtrip 'focusforge-cli' $cli @('algorithms')
   Assert-CrashRoundtrip 'focusforge-gui' (Join-Path $product 'focusforge-gui.exe')
 }

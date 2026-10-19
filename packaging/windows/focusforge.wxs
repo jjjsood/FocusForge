@@ -30,7 +30,7 @@
       <Component Id="ZshCompletion" Directory="ZshCompletionsDirectory" Bitness="always64"><File Id="ZshCompletionFile" Source="$(var.CliAssets)\zsh\vendor-completions\_focusforge-cli" KeyPath="yes" /></Component>
       <Component Id="FishCompletion" Directory="FishCompletionsDirectory" Bitness="always64"><File Id="FishCompletionFile" Source="$(var.CliAssets)\fish\vendor_completions.d\focusforge-cli.fish" KeyPath="yes" /></Component>
       <Component Id="PowerShellCompletion" Directory="PowerShellCompletionsDirectory" Bitness="always64"><File Id="PowerShellCompletionFile" Source="$(var.CliAssets)\powershell\completions\_focusforge-cli.ps1" KeyPath="yes" /></Component>
-      <Component Directory="FocusForgeMenu" Bitness="always64"><Shortcut Id="FocusForgeShortcut" Name="FocusForge" Target="[INSTALLFOLDER]focusforge-gui.exe" Icon="FocusForgeIcon" /><RemoveFolder Id="RemoveFocusForgeMenu" On="uninstall" /><RegistryValue Root="HKCU" Key="Software\\FocusForge" Name="installed" Type="integer" Value="1" KeyPath="yes" /></Component>
+      <Component Directory="FocusForgeMenu" Bitness="always64"><Shortcut Id="FocusForgeShortcut" Name="FocusForge" Target="[INSTALLFOLDER]focusforge-gui.exe" Icon="FocusForgeIcon"><ShortcutProperty Key="System.AppUserModel.ID" Value="org.focusforge.FocusForge" /></Shortcut><RemoveFolder Id="RemoveFocusForgeMenu" On="uninstall" /><RegistryValue Root="HKCU" Key="Software\\FocusForge" Name="installed" Type="integer" Value="1" KeyPath="yes" /></Component>
     </Feature>
     <Icon Id="FocusForgeIcon" SourceFile="$(var.Icon)" />
   </Package>
