@@ -4,6 +4,8 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
+# The stub CLI prints paths that a native Python must open; MSYS-style /tmp paths are not.
+if command -v cygpath >/dev/null 2>&1; then work=$(cygpath -m "$work"); fi
 trap 'rm -rf "$work"' EXIT
 product="$work/product with spaces"
 mkdir -p "$product/tools"

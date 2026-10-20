@@ -21,6 +21,8 @@ jobs:
     env:
       # Incremental caches only grow the target directory of a one-shot CI build.
       CARGO_INCREMENTAL: '0'
+      # Makes `ln -s` in the shell selftests create real symlinks on Windows; unused elsewhere.
+      MSYS: winsymlinks:nativestrict
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Limit parallel builds on Linux

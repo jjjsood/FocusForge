@@ -3,6 +3,15 @@
 # Selftest for the NOTICE collector, renderer, and stale-record reporting.
 set -euo pipefail
 
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # The stub cargo is a script, which Windows cannot execute without a shebang loader; the
+    # collector logic under test is platform independent and runs on Linux and macOS.
+    echo "NOTICE selftest not run on Windows: the stub cargo cannot be executed there"
+    exit 0
+    ;;
+esac
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
