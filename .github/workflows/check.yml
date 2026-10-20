@@ -27,6 +27,18 @@ jobs:
       MSYS: winsymlinks:nativestrict
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Add swap and limit parallel builds on Linux
+        if: runner.os == 'Linux'
+        # One rustc of focusforge-gui peaks near 11 GB on the 16 GB hosted runner, and the runner is
+        # shut down when memory runs out. Swap absorbs the peak; two jobs keep a second one away.
+        run: |
+          free -m
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          free -m
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12.10'

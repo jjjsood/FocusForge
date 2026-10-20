@@ -645,6 +645,9 @@ fn frame_set_changes_change_the_fingerprint() {
     let bytes1 = std::fs::read(&path1).unwrap();
     std::fs::write(&path0, &bytes1).unwrap();
     std::fs::write(&path1, &bytes0).unwrap();
+    // Frames of equal size written within one clock tick keep equal times on NTFS.
+    bump_mtime(&path0);
+    bump_mtime(&path1);
 
     match Project::open_checked(&project_path).unwrap() {
         Opened::NeedsChoice(pending) => {
