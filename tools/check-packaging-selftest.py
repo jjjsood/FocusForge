@@ -1438,7 +1438,7 @@ def write_windows_symbols(root: Path, shipping: Path) -> Path:
         exe, pdb = write_windows_native(shipping, name, bytes(range(offset * 16, offset * 16 + 16)), 0x20 + offset)
         debug = root / "native" / f"{name}.pdb"; debug.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(pdb, debug)
         identifier = module.native_module_id("x86_64-pc-windows-msvc", debug, name)
-        symbol = root / "store" / debug.name / identifier / f"{debug.name}.sym"
+        symbol = root / "store" / debug.name / identifier / f"{debug.stem}.sym"
         symbol.parent.mkdir(parents=True, exist_ok=True)
         symbol.write_text(f"MODULE Windows x86_64 {identifier} {debug.name}\nFILE 0 crates/{name.removeprefix('focusforge-')}/src/main.rs\nFUNC 1000 10 0 {name.replace('-', '_')}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
         native[name], symbols[name] = debug, [symbol]

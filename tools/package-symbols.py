@@ -858,7 +858,9 @@ def write_inventory(root: Path, platform: str, version: str, native: dict[str, P
         symbols = []
         for match in matches:
             module_id, module_name = module(match)
-            if match.parent.name != module_id or match.name != f"{module_name}.sym" or match.parent.parent.name != module_name:
+            # dump_syms files a PDB's symbols as `<name>.pdb/<id>/<name>.sym`, the Breakpad convention.
+            file_names = {f"{module_name}.sym", f"{module_name[:-4]}.sym" if module_name.lower().endswith(".pdb") else ""}
+            if match.parent.name != module_id or match.name not in file_names or match.parent.parent.name != module_name:
                 raise ValueError(f"invalid store layout for {name}")
             symbols.append({"path": str(match.relative_to(root)), "sha256": digest(match), "module_id": module_id, "module_name": module_name})
         if len({item["module_id"] for item in symbols}) != len(symbols):
