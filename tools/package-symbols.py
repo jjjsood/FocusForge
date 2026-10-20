@@ -172,8 +172,10 @@ def module_header(path: Path) -> tuple[str, str, str, str]:
     if len(head) != 5 or head[0] != "MODULE" or len(head[3]) < 33 or not all(char in "0123456789ABCDEF" for char in head[3]):
         raise ValueError(f"invalid Breakpad MODULE: {path}")
     body = path.read_text(encoding="utf-8", errors="strict")
-    if not any(line.startswith("FILE ") for line in body.splitlines()) or not any(line.startswith("FUNC ") for line in body.splitlines()) or not any(line.startswith("STACK CFI ") for line in body.splitlines()):
-        raise ValueError(f"incomplete Breakpad symbols: {path}")
+    lines = body.splitlines()
+    missing = [record for record in ("FILE ", "FUNC ", "STACK CFI ") if not any(line.startswith(record) for line in lines)]
+    if missing:
+        raise ValueError(f"incomplete Breakpad symbols: {path} lacks {[record.strip() for record in missing]} in {len(lines)} lines")
     for line in body.splitlines():
         if line.startswith("FILE "):
             source = line.split(" ", 2)[-1]
@@ -707,7 +709,7 @@ def _inspect_windows_native(path: Path) -> dict:
                 cursor13 = (end + 3) & ~3
             if c13_size:
                 # A module may carry only line or inlinee subsections and no source files.
-                if bool(strings) != bool(offsets): raise ValueError("incomplete C13 source records")
+                if offsets and not strings: raise ValueError(f"C13 file checksums without a string table: {len(offsets)} records, c13 size {c13_size}")
                 for position in offsets:
                     if position >= len(strings): raise ValueError("invalid C13 source offset")
                     end = strings.find(b"\0", position)

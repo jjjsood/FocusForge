@@ -11,6 +11,9 @@ case "$output" in "$root"/target/distrib/native/*) ;; *) echo "output must stay 
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)
 [[ -n $version ]] || { echo "missing workspace version" >&2; exit 1; }
 for command in cargo lipo hdiutil plutil shasum dsymutil strip dwarfdump; do command -v "$command" >/dev/null || { echo "missing $command" >&2; exit 1; }; done
+# dsymutil below reads the debug map of the linked binary, which points at the object files; with the
+# profile's "off" rustc deletes those after linking and the dSYM loses the binaries' own line tables.
+export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=unpacked
 for target in x86_64-apple-darwin aarch64-apple-darwin; do
   cargo build --locked --release --target "$target" -p focusforge-cli --bin focusforge-cli
   cargo build --locked --release --target "$target" -p focusforge-gui --bin focusforge-gui
