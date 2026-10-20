@@ -238,6 +238,8 @@ def builder_location(value: str) -> str:
     for pattern, template in (
         (r"/\.cargo/((?:registry/src|git/checkouts)/.+)$", "/root/.cargo/{}"),
         (r"/lib/rustlib/(?:src|rustc-src)/rust/(library/.+)$", "/rustc/toolchain/{}"),
+        # The debugger visualizers a PDB lists beside its sources.
+        (r"/lib/rustlib/(etc/[^/]+\.natvis)$", "/rustc/toolchain/{}"),
         (r"^[A-Za-z]:(/rustc/.+)$", "{}"),
     ):
         match = re.search(pattern, path)

@@ -1106,6 +1106,7 @@ def hosted_runner_path_cases() -> None:
         (windows, r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\vector", "dependency/vector"),
         (windows, r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stdio.h", "dependency/stdio.h"),
         (windows, r"D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_main.cpp", "dependency/exe_main.cpp"),
+        (windows, r"C:\Users\runneradmin\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib\rustlib\etc\intrinsic.natvis", "dependency/intrinsic.natvis"),
         (windows, r"\\?\D:\a\FocusForge\FocusForge\crates\cli\src\main.rs", "crates/cli/src/main.rs"),
         (windows, r"\\?\C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
         (macos, f"{macos}/crates/cli/src/main.rs", "crates/cli/src/main.rs"),
