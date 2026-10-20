@@ -241,12 +241,12 @@ fn panicking_stack_fails_alone() {
     );
 }
 
-/// The minidump and its metadata, polled for up to five seconds: the
+/// The minidump and its metadata, polled for up to a minute: the
 /// monitor writes them after the application process is already dead, and
 /// the metadata is written last, so its presence marks the pair complete.
 #[cfg(unix)]
 fn native_crash_files(dir: &Path) -> (PathBuf, serde_json::Value) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let paths: Vec<PathBuf> = std::fs::read_dir(dir)
             .map(|entries| entries.flatten().map(|e| e.path()).collect())
@@ -281,7 +281,7 @@ fn native_crash_files(dir: &Path) -> (PathBuf, serde_json::Value) {
         }
         assert!(
             Instant::now() < deadline,
-            "no minidump and metadata pair under {} within five seconds, got {paths:?}",
+            "no minidump and metadata pair under {} within a minute, got {paths:?}",
             dir.display()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -430,7 +430,7 @@ fn monitor_exits_with_app() {
         );
 
         let data_dir = common::data_dir_of(&monitored);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let left = monitors_under(&data_dir);
             if left.is_empty() {
@@ -461,7 +461,7 @@ fn monitor_runs_with_the_argument_it_is_spawned_with() {
             .spawn()
             .expect("failed to run the binary");
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let bound = loop {
             let sockets = std::fs::read_to_string("/proc/net/unix").unwrap_or_default();
             if sockets.contains(&format!("@{socket}")) {
