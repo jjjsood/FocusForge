@@ -842,7 +842,7 @@ def assert_safe_tree(root: Path, allowed_files: set[str]) -> None:
             raise ValueError("symbol tree contains empty directory")
         actual.update((current / name).relative_to(root).as_posix() for name in files)
     if actual != allowed_files:
-        raise ValueError("symbol tree contains stale or missing files")
+        raise ValueError(f"symbol tree contains stale or missing files: stale {sorted(actual - allowed_files)}, missing {sorted(allowed_files - actual)}")
 
 
 def write_inventory(root: Path, platform: str, version: str, native: dict[str, Path], symbols_by_name: dict[str, list[Path]] | None = None, inspections: dict[str, dict] | None = None) -> Path:
@@ -862,10 +862,10 @@ def write_inventory(root: Path, platform: str, version: str, native: dict[str, P
             file_names = {f"{module_name}.sym", f"{module_name[:-4]}.sym" if module_name.lower().endswith(".pdb") else ""}
             if match.parent.name != module_id or match.name not in file_names or match.parent.parent.name != module_name:
                 raise ValueError(f"invalid store layout for {name}")
-            symbols.append({"path": str(match.relative_to(root)), "sha256": digest(match), "module_id": module_id, "module_name": module_name})
+            symbols.append({"path": match.relative_to(root).as_posix(), "sha256": digest(match), "module_id": module_id, "module_name": module_name})
         if len({item["module_id"] for item in symbols}) != len(symbols):
             raise ValueError(f"duplicate Breakpad module ID for {name}")
-        entry = {"name": name, "native": str(path.relative_to(root)), "native_sha256": digest(path), "native_id": native_module_id(platform, path, name), "native_source_inspection": inspection, "symbols": symbols}
+        entry = {"name": name, "native": path.relative_to(root).as_posix(), "native_sha256": digest(path), "native_id": native_module_id(platform, path, name), "native_source_inspection": inspection, "symbols": symbols}
         if platform == "x86_64-unknown-linux-gnu":
             entry["native_build_id"] = elf_build_id(path)
         if platform.endswith("apple-darwin"):
