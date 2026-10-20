@@ -113,6 +113,11 @@ fn peak_live_heap_tracks_the_worker_budget() {
     let mut cfg = resolved_defaults(&stack_ctx);
     // The shipped 400 costs seconds this memory-shape property does not need.
     cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
+    // Only the anchor arm runs more than one worker.
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
 
     let shared_reference = bytes_shared_reference(stack_ctx);
     let per_registration = bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE);

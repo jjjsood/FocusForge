@@ -7,12 +7,12 @@
 //!
 //! This is the **second** consumer of the one cheap header-only fingerprint
 //! [`super::fingerprint::StackFingerprint`] -- the resume ledger
-//! (`super::ledger`) is the first, and neither is
-//! [`crate::project::stack_fingerprint`]'s blake3 content hash: the two are
-//! **deliberately different values** -- this one finds a match in
-//! milliseconds with no pixel read, that one says years later exactly which
-//! bytes a project was computed from, already persisted into a user
-//! document.
+//! (`super::ledger`) is the first. It finds a candidate entry with no pixel
+//! read; equal headers do not mean equal pixels, so an entry also stores each
+//! frame's whole-file blake3 ([`crate::project::source_hash`]) and is reused
+//! only when every current hash equals the stored one. Moving, renaming or
+//! touching a frame keeps the hit; rewriting it, or a frame that cannot be
+//! hashed, misses.
 //!
 //! # The key
 //!
@@ -30,9 +30,11 @@
 //!
 //! # Every read failure is a miss
 //!
-//! Absent file, unparsable or truncated JSON, a `key_digest` that does not
-//! equal the requested key's, or a `frame_count` that disagrees with the key's
-//! frame list: every one of these is [`Option::None`] from
+//! Absent file, unparsable or truncated JSON (an entry written without
+//! content hashes included), a `key_digest` that does not equal the requested
+//! key's, a `frame_count` that disagrees with the key's frame list, or a
+//! frame whose content hash differs or cannot be computed: every one of
+//! these is [`Option::None`] from
 //! [`StageCache::get_alignment`], never an
 //! `Err`. A cache read that could not be trusted must behave exactly like a
 //! cache that never had the entry -- the caller falls back to recomputing,
@@ -186,7 +188,9 @@ struct KeyMirror<'a> {
 /// alignment of differently prepared sources miss.
 ///
 /// **Deliberately not in the key**, by name: `path` and `mtime` (a moved, renamed or touched
-/// input frame still hits); tile geometry (`tile_size`, `levels` -- the align stage reads
+/// input frame still hits); the frames' content hashes (the entry holds them and
+/// [`StageCache::get_alignment`] compares them, so equal headers over other pixels miss);
+/// tile geometry (`tile_size`, `levels` -- the align stage reads
 /// neither); `backend` (an alignment is one backend's whole-stage result, and the CPU and GPU
 /// solves agree within the geometric parity budget, so a hit survives switching the GPU on or
 /// off; unlike [`super::record::JobRecord::backend`], which guards already-written fuse tiles;
@@ -314,23 +318,32 @@ impl CachedFrameAlignment {
 /// itself is **not** stored -- only its digest: the projection carries
 /// `strip_offsets`/`strip_byte_counts` per frame, which at reference scale is
 /// megabytes of JSON. `paths` is stored for diagnostics only and is never
-/// compared.
+/// compared. `content` holds each frame's whole-file blake3 (hex, in frame
+/// order): the key finds this entry from the headers, and only frames with
+/// these same bytes may reuse it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedAlignment {
     pub key_digest: String,
     pub frame_count: usize,
     pub paths: Vec<PathBuf>,
+    pub content: Vec<String>,
     pub reference: usize,
     pub policy: ReferencePolicy,
     pub frames: Vec<CachedFrameAlignment>,
 }
 
 impl CachedAlignment {
-    fn new(key: &StageKey, paths: &[PathBuf], alignment: &StackAlignment) -> Self {
+    fn new(
+        key: &StageKey,
+        paths: &[PathBuf],
+        content: &[String],
+        alignment: &StackAlignment,
+    ) -> Self {
         CachedAlignment {
             key_digest: key.digest(),
             frame_count: key.frames.len(),
             paths: paths.to_vec(),
+            content: content.to_vec(),
             reference: alignment.reference,
             policy: alignment.policy,
             frames: alignment
@@ -386,15 +399,29 @@ impl StageCache {
     /// Looks up `key`'s cached alignment. Every failure to produce a
     /// trustworthy entry is `None` -- see this module's own docs, "Every
     /// read failure is a miss".
-    pub fn get_alignment(&self, key: &StageKey) -> Option<StackAlignment> {
+    ///
+    /// `content(i)` is frame `i`'s whole-file blake3 (hex), or `None` when it
+    /// cannot be hashed; it is asked for one frame at a time, only once the
+    /// entry's header key matches, and stops at the first frame that differs
+    /// from the stored hash. An entry is reused only when every frame agrees.
+    pub fn get_alignment(
+        &self,
+        key: &StageKey,
+        mut content: impl FnMut(usize) -> Option<String>,
+    ) -> Option<StackAlignment> {
         let path = self.entry_path(key);
         let text = fs::read_to_string(&path).ok()?;
         let cached: CachedAlignment = serde_json::from_str(&text).ok()?;
         if cached.key_digest != key.digest() {
             return None;
         }
-        if cached.frame_count != key.frames.len() {
+        if cached.frame_count != key.frames.len() || cached.content.len() != cached.frame_count {
             return None;
+        }
+        for (i, stored) in cached.content.iter().enumerate() {
+            if content(i).as_ref() != Some(stored) {
+                return None;
+            }
         }
         Some(cached.into_stack_alignment())
     }
@@ -402,7 +429,9 @@ impl StageCache {
     /// Writes `alignment` under `key`, atomically. `paths` is stored for
     /// diagnostics only (never compared on read) -- the frame paths this
     /// alignment was computed from, as the caller already has them; passed
-    /// separately because `key` is deliberately path-free. A write
+    /// separately because `key` is deliberately path-free. `content` is
+    /// each frame's whole-file blake3, which [`Self::get_alignment`]
+    /// compares before reusing the entry. A write
     /// failure is the caller's to decide how to handle -- the posture
     /// `crates/cli/src/stack.rs::write_manifest`'s own caller already takes
     /// is "warn, do not fail the run".
@@ -410,6 +439,7 @@ impl StageCache {
         &self,
         key: &StageKey,
         paths: &[PathBuf],
+        content: &[String],
         alignment: &StackAlignment,
     ) -> Result<(), StageCacheError> {
         let path = self.entry_path(key);
@@ -419,7 +449,7 @@ impl StageCache {
                 source,
             })?;
         }
-        let cached = CachedAlignment::new(key, paths, alignment);
+        let cached = CachedAlignment::new(key, paths, content, alignment);
         write_atomic(&path, &cached).map_err(StageCacheError::from)
     }
 

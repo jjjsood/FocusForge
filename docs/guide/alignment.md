@@ -13,7 +13,7 @@ focusforge-cli align path/to/frames/
 
 ```
 path/to/frames (8 frames)
-pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=lax failures=0)
+pyramidal-ecc - Pyramidal ECC (reference=3 policy=Chain failure_policy=lax failures=0)
 rho = ECC correlation in [-1, 1], not a pixel distance
 00.tif    tx=+12.41 ty=-3.07 scale=1.000842 rot=+0.0131deg  converged iters=12 rho=0.9814
 ...
@@ -51,6 +51,17 @@ Run `focusforge-cli algorithms pyramidal-ecc` for the full parameter list —
 iteration cap, convergence epsilon, pyramid depth, which frame is the
 reference, and whether every frame registers against one anchor or chains
 hop-by-hop through its neighbours.
+
+`reference-policy` defaults to `chain`: each frame registers against its
+neighbour on the way to the reference, which holds up when the first and last
+frames differ a lot. Chain solves frames one after another; a 61-frame
+44.8 MP stack aligns in about 40 s on the reference machine. `anchor`
+registers every frame against the reference directly and in parallel, about
+6 s on the same stack:
+
+```bash
+focusforge-cli align path/to/frames/ --set reference-policy=anchor
+```
 
 ## Frame status
 
@@ -102,8 +113,9 @@ that says so; `--no-crop` keeps the full frame extent instead.
 Some inputs still defeat the solver:
 
 - Heavy defocus and long series (on the order of 64 frames) can leave frames
-  `diverged` (`correlation-decreased`). A fit whose final correlation stays
-  below 0.2 is reported as `diverged` (`weak-match`), which catches the clear
+  `diverged` (`correlation-decreased`). The full-resolution level gets four
+  times the sample budget of the coarse levels. A fit whose final correlation
+  stays below 0.2 is reported as `diverged` (`weak-match`), which catches the clear
   wrong fits, but `converged` still does not prove correctness on such
   stacks. Check them with `--write-warped` and look at the result, or compare
   each frame's transform with its neighbours'.
@@ -120,7 +132,9 @@ already registered, or inspect the result with `--write-warped`.
 `stack` stores each computed alignment in the stage cache, keyed on the
 frames, the alignment parameters, the failure policy and the solver revision,
 so a repeated run, or a re-fuse in the window with only fusion settings
-changed, skips the solve. `--no-cache` forces a recompute.
+changed, skips the solve. Frames are identified by their content, and an
+alignment cached by an older solver revision is recomputed.
+`--no-cache` forces a recompute.
 
 Large pyramid levels run on the GPU when a usable adapter is present; the
 rest of the solve is on the CPU. `--cpu` keeps everything on the CPU and

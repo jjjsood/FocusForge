@@ -38,7 +38,7 @@ use crate::transfer::{create_storage_buffer, download_buffer, upload_storage, up
 /// Shape A: one storage buffer read, one storage buffer read/write, one
 /// uniform -- `plane_from_u16`, `plane_to_u16`, `reduce::{horizontal,
 /// vertical}`, `expand::{horizontal, vertical}`, `score::{rows, cols}`,
-/// `residual::accumulate`, `eligibility::{exclude, mean_by_count}`.
+/// `eligibility::exclude`.
 fn shape_a() -> Vec<wgpu::BindGroupLayoutEntry> {
     vec![
         storage_entry(0, true),
@@ -73,13 +73,14 @@ fn shape_c() -> Vec<wgpu::BindGroupLayoutEntry> {
     ]
 }
 
-/// Shape D: one storage buffer read/write, one uniform -- `residual::mean`
-/// alone, bindings 1 (`sum`) and 2 (`params`). Binding 0 is omitted, not
-/// aliased to `sum`: wgpu rejects one buffer bound both `read` and
-/// `read_write` in a dispatch ("conflicting usages"), even when the shader
-/// never touches the unused slot (Vulkan, RTX 5070 Ti, driver 595.84).
-fn shape_d() -> Vec<wgpu::BindGroupLayoutEntry> {
-    vec![storage_entry(1, false), uniform_entry(2)]
+/// Shape E: shape A plus one more storage buffer read/write (the
+/// compensation term) -- `residual::accumulate`,
+/// `eligibility::mean_by_count`. Three storage buffers, inside the four-buffer
+/// `downlevel_defaults()` limit.
+fn shape_e() -> Vec<wgpu::BindGroupLayoutEntry> {
+    let mut entries = shape_a();
+    entries.push(storage_entry(3, false));
+    entries
 }
 
 /// One `OnceLock<Pipeline>` per kernel entry point, built on first use.
@@ -97,7 +98,6 @@ pub struct FusionPipelines {
     score_cols: OnceLock<Pipeline>,
     select_main: OnceLock<Pipeline>,
     residual_accumulate: OnceLock<Pipeline>,
-    residual_mean: OnceLock<Pipeline>,
     eligibility_exclude: OnceLock<Pipeline>,
     eligibility_mean_by_count: OnceLock<Pipeline>,
 }
@@ -199,14 +199,7 @@ impl FusionPipelines {
         "residual.wgsl",
         "focusforge-gpu-fuse-residual-accumulate",
         "accumulate",
-        shape_a
-    );
-    pipeline_getter!(
-        residual_mean,
-        "residual.wgsl",
-        "focusforge-gpu-fuse-residual-mean",
-        "mean",
-        shape_d
+        shape_e
     );
     pipeline_getter!(
         eligibility_exclude,
@@ -220,7 +213,7 @@ impl FusionPipelines {
         "eligibility.wgsl",
         "focusforge-gpu-fuse-eligibility-mean-by-count",
         "mean_by_count",
-        shape_a
+        shape_e
     );
 }
 
@@ -477,12 +470,10 @@ pub(crate) fn fuse_planes_gpu(
     let mut batch = TileBatch::new(device, queue);
 
     let mut best_levels: Vec<Option<BestLevel>> = (0..levels).map(|_| None).collect();
-    let mut residual_sum: Option<wgpu::Buffer> = None;
+    let mut residual_sum: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
     let mut residual_dims = (0u32, 0u32);
-    // Frames contributing at each residual pixel; only read when a frame
-    // carried a coverage mask.
+    // Frames contributing at each residual pixel.
     let mut residual_counts: Vec<u32> = Vec::new();
-    let mut any_masked = false;
 
     for frame in 0..frame_count {
         let (base, covered) = source(frame)?;
@@ -494,7 +485,6 @@ pub(crate) fn fuse_planes_gpu(
             .filter(|masks| {
                 !masks.levels.iter().all(|m| all_true(m)) || !all_true(&masks.residual)
             });
-        any_masked |= masks.is_some();
         let gaussians = {
             let _stage = gpu_tile_stage(TimingCounter::GpuTilePyramidNs);
             gaussian_levels_gpu(&mut batch, pipelines, base, levels)
@@ -590,11 +580,11 @@ pub(crate) fn fuse_planes_gpu(
         };
         residual_dims = (residual_width, residual_height);
         let residual_len = residual_width * residual_height * residual_spp;
-        let sum = residual_sum.get_or_insert_with(|| {
-            create_storage_buffer(
-                device,
-                u64::from(residual_len) * 4,
-                "focusforge-gpu-fuse-residual-sum",
+        let (hi, lo) = residual_sum.get_or_insert_with(|| {
+            let plane = |label| create_storage_buffer(device, u64::from(residual_len) * 4, label);
+            (
+                plane("focusforge-gpu-fuse-residual-sum-hi"),
+                plane("focusforge-gpu-fuse-residual-sum-lo"),
             )
         });
         if residual_counts.is_empty() {
@@ -618,33 +608,24 @@ pub(crate) fn fuse_planes_gpu(
             }
             None => residual_counts.iter_mut().for_each(|count| *count += 1),
         }
-        select::accumulate(&mut batch, pipelines, sum, residual_buffer, residual_len);
+        select::accumulate(&mut batch, pipelines, hi, lo, residual_buffer, residual_len);
         batch.submit();
     }
 
     let reconstruct = gpu_tile_stage(TimingCounter::GpuTileReconstructNs);
-    let sum_buffer =
+    let (sum_buffer, lo_buffer) =
         residual_sum.expect("frame_count >= 1 guarantees at least one residual accumulated");
     let residual_len = residual_dims.0 * residual_dims.1 * spp;
-    if any_masked {
-        let counts = batch.retain(upload_u32(device, queue, &residual_counts));
-        select::mean_by_count(
-            &mut batch,
-            pipelines,
-            &sum_buffer,
-            &counts,
-            residual_len,
-            spp,
-        );
-    } else {
-        select::mean(
-            &mut batch,
-            pipelines,
-            &sum_buffer,
-            residual_len,
-            frame_count as f32,
-        );
-    }
+    let counts = batch.retain(upload_u32(device, queue, &residual_counts));
+    select::mean_by_count(
+        &mut batch,
+        pipelines,
+        &sum_buffer,
+        &lo_buffer,
+        &counts,
+        residual_len,
+        spp,
+    );
 
     // Collapse: coarsest to finest, `A_k = L_k + expand(A_{k+1})`.
     let mut current_buffer = sum_buffer;

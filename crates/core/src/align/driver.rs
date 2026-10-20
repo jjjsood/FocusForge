@@ -1045,23 +1045,23 @@ mod tests {
     }
 
     #[test]
-    fn the_split_sums_to_369_mb_at_the_reference_scale() {
-        // Shared: the reference's coarse pyramid, the retained level
-        // templates, the patch templates and the feature set. Per registration: the frame's
-        // coarse pyramid plus the solve scratch and windows (55.3 MB), which
-        // just outweigh the streaming band (55.1 MB).
+    fn the_split_sums_to_625_mb_at_the_reference_scale() {
+        // Shared: the reference's coarse pyramid, the retained level templates,
+        // the patch templates and the feature set. Per registration: the
+        // frame's coarse pyramid (59.7 MB) plus the solve scratch and windows
+        // (173.1 MB), which outweigh the streaming band (55.1 MB).
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        assert_eq!(shared, 59_681_450 + 161_361_640 + 33_030_144 + 2000 * 72);
+        assert_eq!(shared, 59_681_450 + 299_706_264 + 33_030_144 + 2000 * 72);
         assert_eq!(
             per_registration,
-            59_681_450 + 24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10
+            59_681_450 + 24 * 2507 * 1672 + 3031 * 2196 * 10 + 772 * 772 * 10
         );
-        let ratio = (shared + per_registration) as f64 / 369_000_000f64;
+        let ratio = (shared + per_registration) as f64 / 625_000_000f64;
         assert!(
             (ratio - 1.0).abs() < 0.01,
-            "shared + per registration = {} is not within 1% of 369 MB",
+            "shared + per registration = {} is not within 1% of 625 MB",
             shared + per_registration
         );
     }
@@ -1070,7 +1070,8 @@ mod tests {
     fn worker_budget_at_the_reference_scale() {
         // Pinned with an explicit `available_parallelism` and registration
         // count, so this assertion never depends on the host: the library
-        // default budget yields 16 workers at the reference scale.
+        // default budget yields 7 workers at the reference scale: the 4x
+        // level-0 solve region leaves room for fewer concurrent registrations.
         let stack = StackContext::new(61, 8192, 5464, 3);
         let shared = bytes_shared_reference(stack);
         let bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
@@ -1081,27 +1082,27 @@ mod tests {
             32,
             60,
         );
-        assert_eq!(workers, 16);
+        assert_eq!(workers, 7);
     }
 
     #[test]
     fn single_sample_stacks_are_priced_by_templates_and_pyramids() {
-        // At 6000x4000x1 the 1254x836 solve region costs 25.2 MB of scratch,
-        // on top of its window (19.3 MB) and a patch window (3.6 MB); the
-        // 9 B per pixel stream term is 28.0 MB.
+        // At 6000x4000x1 the 2508x1672 solve region costs 100.6 MB of scratch,
+        // on top of its window (53.3 MB) and a patch window (3.6 MB); the
+        // 9 B per pixel stream term is 27.9 MB.
         let stack = StackContext::new(20, 6000, 4000, 1);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let patches = 8 * 384 * 384 * 28;
-        assert_eq!(shared, 32_000_000 + 141_772_400 + patches + 2000 * 72);
-        let solve = 24 * 1254 * 836 + 1778 * 1360 * 8 + 772 * 772 * 6;
+        assert_eq!(shared, 32_000_000 + 280_153_808 + patches + 2000 * 72);
+        let solve = 24 * 2508 * 1672 + 3032 * 2196 * 8 + 772 * 772 * 6;
         let stream = 6000 * (DEFAULT_TILE_SIZE as u64 + 5) * 9;
         assert!(solve > stream);
         assert_eq!(per_registration, 32_000_000 + solve);
-        assert!(shared < 128_000_000 + 141_772_400);
-        assert!(per_registration < 128_000_000 + 25_160_256);
+        assert!(shared < 128_000_000 + 280_153_808);
+        assert!(per_registration < 128_000_000 + 100_641_024);
         let workers = workers_for_budget(shared, per_registration, 2 << 30, 32, 19);
-        assert_eq!(workers, 19);
+        assert_eq!(workers, 9);
     }
 
     #[test]
@@ -1111,9 +1112,9 @@ mod tests {
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         let plane = 8192u64 * 5464 * 4;
         let patches = 8 * 384 * 384 * 28;
-        assert_eq!(shared, plane / 3 + 161_361_640 + patches + 2000 * 72);
+        assert_eq!(shared, plane / 3 + 299_706_264 + patches + 2000 * 72);
         let stream = 8192 * (DEFAULT_TILE_SIZE as u64 + 5) * 13;
-        let solve = 24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10;
+        let solve = 24 * 2507 * 1672 + 3031 * 2196 * 10 + 772 * 772 * 10;
         assert!(solve > stream);
         assert_eq!(per_registration, plane / 3 + solve);
         assert!(shared < 400_100_000, "shared {shared} B");

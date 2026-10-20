@@ -11,6 +11,8 @@
 //! and [`crate::project::stack_fingerprint`]. Neither substitutes for the
 //! other: this one exists to find a resumable ledger in milliseconds, that
 //! one to say years later exactly which bytes a project was computed from.
+//! The stage cache uses this fingerprint only to find a candidate entry; it
+//! reuses the entry only for frames whose content hashes match.
 //! This is also distinct from the **checkpoint** fingerprint, documented in
 //! full at [`super::stage_cache`]'s own module docs: the checkpoint DAG
 //! reads [`crate::project::stack_fingerprint`], never this type -- two
