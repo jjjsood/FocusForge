@@ -1036,6 +1036,8 @@ def source_privacy_cases() -> None:
         pdb = root / "source.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs"))
         pdb_inspection = module.inspect_windows_native(pdb)
         assert pdb_inspection["source_paths"] == ["/work", "/work/crates/cli/src/main.rs"] and pdb_inspection["coverage"]["module_c13_records"] == 1 and pdb_inspection["coverage"]["environment_records"] == 2
+        bare_pdb = root / "no-module-sources.pdb"; bare_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs", module_sources=False))
+        assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(bare_pdb)["source_paths"]
         trusted_pdb = root / "trusted-source.pdb"; trusted_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "C:/work/crates/cli/src/nested space/main.rs"))
         assert "C:/work/crates/cli/src/nested space/main.rs" in module.inspect_windows_native(trusted_pdb)["source_paths"]
         for index, private_source in enumerate(("/private checkout.Åsa/main.rs", "E:/private 用户/main.rs", "//server/private/checkout/main.rs")):
@@ -1200,6 +1202,12 @@ file_names[1] = {
     unused_clean = grouped.replace('include_directories[1] = "/work/crates/cli/src"', 'include_directories[1] = "/work/crates/cli/src"\ninclude_directories[2] = "/work/crates/unused"', 1)
     assert "/work/crates/unused" in inspect(unused_clean)["source_paths"]
     unused_private = unused_clean.replace('include_directories[2] = "/work/crates/unused"', 'include_directories[2] = "/private/checkout"')
+    empty_table = grouped + ".debug_line[0x00000200]\n.debug_line[0x00000221]\n"
+    assert inspect(empty_table)["source_paths"] == inspect(grouped)["source_paths"]
+    orphan_table = grouped + '.debug_line[0x00000200]\nfile_names[1] = {\n name: "orphan.rs"\n dir_index: 0\n}\n'
+    try: inspect(orphan_table)
+    except ValueError as error: assert str(error).startswith("unbound dSYM line table for x86_64"), str(error)
+    else: raise AssertionError("unreferenced table with files accepted")
     missing_table = grouped.replace(".debug_line[0x00000040]", ".debug_line[0x00000041]")
     for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for x86_64")):
         try: inspect(output)
@@ -1281,11 +1289,12 @@ def msf_pdb(guid: bytes, age: int) -> bytearray:
     return pdb
 
 
-def msf_pdb_with_source(guid: bytes, age: int, source: str, cwds: tuple[str, ...] = ("/work",)) -> bytearray:
+def msf_pdb_with_source(guid: bytes, age: int, source: str, cwds: tuple[str, ...] = ("/work",), module_sources: bool = True) -> bytearray:
     page_size, page_count = 512, 8
     pdb = bytearray(page_size * page_count)
     pdb[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
     source_bytes = source.encode() + b"\0"; c13 = struct.pack("<II", 0xF3, len(source_bytes)) + source_bytes + b"\0" * ((-len(source_bytes)) % 4) + struct.pack("<IIIBB", 0xF4, 8, 0, 0, 0) + b"\0\0"
+    if not module_sources: c13 = struct.pack("<II", 0xF2, 4) + b"\0" * 4
     environment = b"\0" + b"".join(b"cwd\0" + cwd.encode() + b"\0" for cwd in cwds) + b"src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
     module = bytearray(len(symbols) + len(c13)); module[:len(symbols)] = symbols; module[len(symbols):] = c13
     record = bytearray(64); struct.pack_into("<HIII", record, 34, 4, len(symbols), 0, len(c13)); record += b"module\0object\0"; record += b"\0" * ((-len(record)) % 4)

@@ -580,6 +580,8 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
             for index, value in files:
                 if index and index not in resolved_directories: raise ValueError(f"invalid dSYM line directory for {arch}: index {index}, {len(resolved_directories)} directories (indexes {sorted(resolved_directories)[:8]}), file {clipped(value)!r}")
                 unit_paths.add(resolved_native_source(resolved_directories.get(index, directory), value))
+        # dwarfdump also prints empty tables no unit points at; they name no source.
+        line_tables = {offset: records for offset, records in line_tables.items() if records[0] or records[1]}
         if line_tables:
             unbound = "; ".join(f"table 0x{offset:x} ({len(dirs)} dirs, {len(files)} files, first {clipped(files[0][1])!r})" if files else f"table 0x{offset:x} ({len(dirs)} dirs, no files)" for offset, (dirs, files) in sorted(line_tables.items())[:5])
             referenced = sorted({statement_list for _, _, statement_list in units.values() if statement_list is not None})
@@ -704,7 +706,8 @@ def _inspect_windows_native(path: Path) -> dict:
                     if item != end: raise ValueError("invalid C13 file checksum")
                 cursor13 = (end + 3) & ~3
             if c13_size:
-                if not strings or not offsets: raise ValueError("incomplete C13 source records")
+                # A module may carry only line or inlinee subsections and no source files.
+                if bool(strings) != bool(offsets): raise ValueError("incomplete C13 source records")
                 for position in offsets:
                     if position >= len(strings): raise ValueError("invalid C13 source offset")
                     end = strings.find(b"\0", position)
