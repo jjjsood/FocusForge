@@ -268,8 +268,9 @@ mod tests {
             pixelated: false,
             step: NonZeroU32::MIN,
         };
-        let shared = focusforge_gpu::device::shared_device_or_skip()
-            .expect("this GPU lifecycle test requires a device");
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
 
         let mut empty = CanvasRenderer::new();
         assert!(empty.display_renderer.is_none());
