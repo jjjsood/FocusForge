@@ -442,8 +442,16 @@ pub fn run(
             alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
         } else {
             let stage_key = StageKey::align(&fingerprint, &identity);
+            // The sources' content hashes, one frame at a time through the
+            // memo the background hash thread fills; a frame that cannot be
+            // hashed is a miss, and the seal reports the failure itself.
+            let frame_hash = |i: usize| {
+                project::source_hash_change_checked(&request.frames[i])
+                    .ok()
+                    .map(|(_, hash)| hash)
+            };
             let cache_hit = if request.cache {
-                stage_cache.and_then(|cache| cache.get_alignment(&stage_key))
+                stage_cache.and_then(|cache| cache.get_alignment(&stage_key, frame_hash))
             } else {
                 None
             };
@@ -543,7 +551,11 @@ pub fn run(
                 // alignment into a failed run.
                 if request.cache
                     && let Some(cache) = stage_cache
-                    && let Err(err) = cache.put_alignment(&stage_key, &request.frames, &alignment)
+                    && let Some(content) = (0..request.frames.len())
+                        .map(frame_hash)
+                        .collect::<Option<Vec<_>>>()
+                    && let Err(err) =
+                        cache.put_alignment(&stage_key, &request.frames, &content, &alignment)
                 {
                     observer.notice(&format!("warning: {err}"));
                 }

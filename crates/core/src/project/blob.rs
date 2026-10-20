@@ -133,9 +133,31 @@ impl FileStamp {
     }
 }
 
+/// The change time (`ctime`, nanoseconds) a memoised hash was taken at;
+/// `None` where the platform has no such time.
+type ChangeTime = Option<i128>;
+
+fn change_time(path: &Path) -> Result<ChangeTime, ProjectError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).map_err(|source| ProjectError::io(path, source))?;
+        Ok(Some(
+            i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
 /// Every source hashed in this process, by the path it was hashed at.
-static SOURCE_HASHES: LazyLock<Mutex<HashMap<PathBuf, (FileStamp, String)>>> =
-    LazyLock::new(Mutex::default);
+static SOURCE_HASHES: LazyLock<Mutex<HashMap<PathBuf, MemoEntry>>> = LazyLock::new(Mutex::default);
+
+/// A memoised hash with the stamp and change time it was taken at.
+type MemoEntry = (FileStamp, ChangeTime, String);
 
 /// The current stamp of the file at `path` and its blake3 content hash, hex.
 ///
@@ -143,6 +165,10 @@ static SOURCE_HASHES: LazyLock<Mutex<HashMap<PathBuf, (FileStamp, String)>>> =
 /// process's memo at the same stamp, else from reading the file. The memo
 /// lock is held through that read: sources are hashed one at a time
 /// process-wide, and never twice by two racing callers.
+///
+/// Like a project's own checks, this trusts the stamp: an in-place edit that
+/// keeps size, modification time and inode keeps the remembered hash. Use
+/// [`source_hash_change_checked`] where that must not hold.
 pub fn source_hash(
     path: &Path,
     recorded: Option<&SourceRef>,
@@ -151,12 +177,38 @@ pub fn source_hash(
     if let Some(recorded) = recorded.filter(|r| r.stamp() == stamp) {
         return Ok((stamp, recorded.hash.clone()));
     }
+    memoised_hash(path, stamp, false)
+}
+
+/// [`source_hash`] without a recorded hash, and with the memo's hash reused
+/// only if the file's change time (`ctime`) is also unchanged, so an in-place
+/// rewrite that restores size and modification time is hashed again.
+///
+/// Without a change time (non-Unix), such a rewrite within one process still
+/// reuses the memoised hash.
+pub fn source_hash_change_checked(path: &Path) -> Result<(FileStamp, String), ProjectError> {
+    memoised_hash(path, FileStamp::of(path)?, true)
+}
+
+/// The memoised hash at `stamp` (and, when `by_change_time`, the file's
+/// current change time), else a fresh read stored in the memo. A reused hash
+/// leaves the entry as it is, so its change time stays the one the hash was
+/// taken at.
+fn memoised_hash(
+    path: &Path,
+    stamp: FileStamp,
+    by_change_time: bool,
+) -> Result<(FileStamp, String), ProjectError> {
+    let changed = change_time(path)?;
     let mut memo = SOURCE_HASHES.lock().unwrap_or_else(PoisonError::into_inner);
-    let hash = match memo.get(path) {
-        Some((memoised, hash)) if *memoised == stamp => hash.clone(),
-        _ => hash_file(path)?,
-    };
-    memo.insert(path.to_path_buf(), (stamp, hash.clone()));
+    if let Some((memoised, at, hash)) = memo.get(path)
+        && *memoised == stamp
+        && (!by_change_time || *at == changed)
+    {
+        return Ok((stamp, hash.clone()));
+    }
+    let hash = hash_file(path)?;
+    memo.insert(path.to_path_buf(), (stamp, changed, hash.clone()));
     Ok((stamp, hash))
 }
 
@@ -380,5 +432,29 @@ mod tests {
         // fingerprint is derived from content hashes, so an empty stack and
         // a one-frame stack cannot collide the way a header digest might.
         assert_ne!(stack_fingerprint(&[]), stack_fingerprint(&[source("")]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_in_place_rewrite_with_a_restored_mtime_is_seen_only_by_the_change_checked_hash() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame.bin");
+        std::fs::write(&path, [7u8; 4096]).unwrap();
+        let (_, before) = source_hash(&path, None).unwrap();
+
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[9u8], 100).unwrap();
+        file.set_modified(modified).unwrap();
+        drop(file);
+
+        // The stamp-only call reuses the old hash and leaves the memo's
+        // change time alone, or the checked call would trust it afterwards.
+        assert_eq!(source_hash(&path, None).unwrap().1, before, "stamp only");
+        let (_, after) = source_hash_change_checked(&path).unwrap();
+        assert_ne!(after, before, "the change time moved");
+        assert_eq!(source_hash_change_checked(&path).unwrap().1, after);
+        assert_eq!(source_hash(&path, None).unwrap().1, after);
     }
 }
