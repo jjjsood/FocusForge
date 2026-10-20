@@ -53,6 +53,8 @@ _lock_dir() {
       env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
         git -C "$pool" rev-parse --show-toplevel 2>/dev/null
     )" || repo=""
+    # Git for Windows answers with a drive-letter path; the shell's own paths are MSYS ones.
+    if [ -n "$repo" ] && command -v cygpath >/dev/null 2>&1; then repo="$(cygpath -u "$repo")"; fi
     echo "${repo:-$pool}/.locks"
   else
     # No shared-target symlink -- most likely a plain checkout. A local
