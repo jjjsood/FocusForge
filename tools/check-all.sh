@@ -74,6 +74,22 @@ RUNLOG_TAIL="$TAIL_LINES"
 . "$REPO/tools/lib/run-logged.sh"
 runlog_init run || exit $?
 
+# A hosted runner that is lost takes its step logs with it. With FF_GATE_HEARTBEAT=<seconds> a
+# resource line is printed on that interval, and the streamed job log keeps the last ones.
+if [ -n "${FF_GATE_HEARTBEAT:-}" ]; then
+  (
+    while sleep "$FF_GATE_HEARTBEAT"; do
+      echo "heartbeat $(date +%H:%M:%S)" \
+        "$(free -m 2>/dev/null | awk '/^Mem/ {print "mem_used_mb=" $3 " mem_avail_mb=" $7}')" \
+        "$(df -Pm "$REPO" | awk 'NR==2 {print "disk_avail_mb=" $4}')" \
+        "target_mb=$(du -sm "$REPO/target" 2>/dev/null | cut -f1)" \
+        "top_rss_kb=$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -1)"
+    done
+  ) &
+  heartbeat_pid=$!
+  trap 'kill "$heartbeat_pid" 2>/dev/null' EXIT
+fi
+
 # A failing gate must not stop the run: every gate reports, then the summary.
 run_gate() { run_logged "$@" || true; }
 

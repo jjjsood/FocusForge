@@ -1929,6 +1929,8 @@ mod tests {
         }
     }
 
+    // The generated Bash completion is for Unix shells; a Windows runner's `bash` is not one.
+    #[cfg(unix)]
     fn bash_callback(script: &std::path::Path, context: &str, invocation: &str) -> Vec<String> {
         let output = std::process::Command::new("bash")
             .arg("-c")
@@ -1951,6 +1953,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_cli_bash_callback_completes_root_nested_commands_and_options() {
         let temporary = tempfile::tempdir().expect("temporary completion directory");
@@ -2097,19 +2100,18 @@ mod tests {
             .chain(actual.keys())
             .collect::<std::collections::BTreeSet<_>>();
         for path in paths {
+            // Reported with `/` on every platform, as the paths are written in the repository.
+            let shown = path.to_string_lossy().replace('\\', "/");
             match (generated.get(path), actual.get(path)) {
-                (Some(expected), Some(found)) if expected != found => errors.push(format!(
-                    "{} differs; run {CLI_ASSET_REGENERATION}",
-                    path.display()
-                )),
-                (Some(_), None) => errors.push(format!(
-                    "{} is missing; run {CLI_ASSET_REGENERATION}",
-                    path.display()
-                )),
-                (None, Some(_)) => errors.push(format!(
-                    "{} is orphaned; run {CLI_ASSET_REGENERATION}",
-                    path.display()
-                )),
+                (Some(expected), Some(found)) if expected != found => {
+                    errors.push(format!("{shown} differs; run {CLI_ASSET_REGENERATION}"))
+                }
+                (Some(_), None) => {
+                    errors.push(format!("{shown} is missing; run {CLI_ASSET_REGENERATION}"))
+                }
+                (None, Some(_)) => {
+                    errors.push(format!("{shown} is orphaned; run {CLI_ASSET_REGENERATION}"))
+                }
                 _ => {}
             }
         }

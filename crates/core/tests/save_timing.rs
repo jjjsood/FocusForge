@@ -214,7 +214,10 @@ fn run_scenarios(frames: &[PathBuf], method: &'static str, out: &Path) -> Vec<Fi
         &with_frames(&[&retouched]),
         || {
             std::fs::copy(&fused, &retouched).expect("the saved project must copy");
-            std::fs::File::open(&retouched)
+            // Flushing a file needs a handle with write access on Windows.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&retouched)
                 .and_then(|f| f.sync_all())
                 .expect("the copy must reach the disk");
         },

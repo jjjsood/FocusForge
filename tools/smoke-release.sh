@@ -26,6 +26,8 @@ python=$(command -v python3 || command -v python || true)
 
 mkdir -p "$(dirname "$out")"
 out=$(cd "$(dirname "$out")" && pwd)/$(basename "$out")
+# Native Python and the stub CLI print paths that must open outside the MSYS root (`/tmp/...`).
+if command -v cygpath >/dev/null 2>&1; then out=$(cygpath -m "$out"); cli=$(cygpath -m "$cli"); fi
 mkdir -p "$out/input/mantis-64" "$out/input/mantis-512" "$out/logs" "$out/env/data" "$out/env/config" "$out/env/cache"
 trap 'status=$?; printf "%s\\n" "$status" > "$out/exit-status"; exit "$status"' EXIT
 uname -s > "$out/source-os"

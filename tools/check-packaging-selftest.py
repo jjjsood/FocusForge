@@ -1038,6 +1038,12 @@ def source_privacy_cases() -> None:
         assert pdb_inspection["source_paths"] == ["/work", "/work/crates/cli/src/main.rs"] and pdb_inspection["coverage"]["module_c13_records"] == 1 and pdb_inspection["coverage"]["environment_records"] == 2
         bare_pdb = root / "no-module-sources.pdb"; bare_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs", module_sources=False))
         assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(bare_pdb)["source_paths"]
+        linked_pdb = root / "linked-names.pdb"; linked_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs", names_stream=True))
+        assert module.inspect_windows_native(linked_pdb)["source_paths"] == module.inspect_windows_native(pdb)["source_paths"]
+        broken_pdb = bytearray(linked_pdb.read_bytes()); broken_pdb[8 * 512:8 * 512 + 4] = bytes(4); linked_pdb.write_bytes(broken_pdb)
+        try: module.inspect_windows_native(linked_pdb)
+        except ValueError as error: assert "/names" in str(error), error
+        else: raise AssertionError("PDB with a damaged /names stream accepted")
         trusted_pdb = root / "trusted-source.pdb"; trusted_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "C:/work/crates/cli/src/nested space/main.rs"))
         assert "C:/work/crates/cli/src/nested space/main.rs" in module.inspect_windows_native(trusted_pdb)["source_paths"]
         for index, private_source in enumerate(("/private checkout.Åsa/main.rs", "E:/private 用户/main.rs", "//server/private/checkout/main.rs")):
@@ -1289,21 +1295,27 @@ def msf_pdb(guid: bytes, age: int) -> bytearray:
     return pdb
 
 
-def msf_pdb_with_source(guid: bytes, age: int, source: str, cwds: tuple[str, ...] = ("/work",), module_sources: bool = True) -> bytearray:
-    page_size, page_count = 512, 8
+def msf_pdb_with_source(guid: bytes, age: int, source: str, cwds: tuple[str, ...] = ("/work",), module_sources: bool = True, names_stream: bool = False) -> bytearray:
+    # names_stream: the linker moves file names into the PDB-wide /names stream and leaves only checksums in the module.
+    page_size, page_count = 512, 9 if names_stream else 8
     pdb = bytearray(page_size * page_count)
     pdb[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
     source_bytes = source.encode() + b"\0"; c13 = struct.pack("<II", 0xF3, len(source_bytes)) + source_bytes + b"\0" * ((-len(source_bytes)) % 4) + struct.pack("<IIIBB", 0xF4, 8, 0, 0, 0) + b"\0\0"
     if not module_sources: c13 = struct.pack("<II", 0xF2, 4) + b"\0" * 4
+    if names_stream: c13 = struct.pack("<IIIBB", 0xF4, 8, 1, 0, 0) + b"\0\0"
     environment = b"\0" + b"".join(b"cwd\0" + cwd.encode() + b"\0" for cwd in cwds) + b"src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
     module = bytearray(len(symbols) + len(c13)); module[:len(symbols)] = symbols; module[len(symbols):] = c13
     record = bytearray(64); struct.pack_into("<HIII", record, 34, 4, len(symbols), 0, len(c13)); record += b"module\0object\0"; record += b"\0" * ((-len(record)) % 4)
     file_info = struct.pack("<HHHHI", 1, 1, 0, 1, 0) + source_bytes
     dbi_size = 64 + len(record) + len(file_info)
-    directory = struct.pack("<IIIIIIIII", 5, 0xFFFFFFFF, 28, 0xFFFFFFFF, dbi_size, len(module), 4, 6, 7)
+    info_tail = struct.pack("<I", 7) + b"/names\0" + struct.pack("<IIIIIII", 1, 1, 1, 1, 0, 0, 5) if names_stream else b""
+    names = struct.pack("<III", 0xEFFEEFFE, 1, 1 + len(source_bytes)) + b"\0" + source_bytes
+    directory = struct.pack("<IIIIIIIII", 5, 0xFFFFFFFF, 28 + len(info_tail), 0xFFFFFFFF, dbi_size, len(module), 4, 6, 7)
+    if names_stream: directory = struct.pack("<IIIIIIIIII", 6, 0xFFFFFFFF, 28 + len(info_tail), 0xFFFFFFFF, dbi_size, len(module), len(names), 4, 6, 7) + struct.pack("<I", 8)
     struct.pack_into("<IIIIII", pdb, 32, page_size, 1, page_count, len(directory), 0, 5)
     struct.pack_into("<I", pdb, 5 * page_size, 3); pdb[3 * page_size:3 * page_size + len(directory)] = directory
-    struct.pack_into("<IIII", pdb, 4 * page_size, 2, 0xFFFFFFFF, 28, 4); struct.pack_into("<I", pdb, 4 * page_size + 8, age); pdb[4 * page_size + 12:4 * page_size + 28] = guid
+    struct.pack_into("<IIII", pdb, 4 * page_size, 2, 0xFFFFFFFF, 28, 4); struct.pack_into("<I", pdb, 4 * page_size + 8, age); pdb[4 * page_size + 12:4 * page_size + 28] = guid; pdb[4 * page_size + 28:4 * page_size + 28 + len(info_tail)] = info_tail
+    if names_stream: pdb[8 * page_size:8 * page_size + len(names)] = names
     dbi = memoryview(pdb)[6 * page_size:7 * page_size]; struct.pack_into("<iII", dbi, 0, -1, 19990903, age); struct.pack_into("<II", dbi, 24, len(record), 0); struct.pack_into("<II", dbi, 32, 0, len(file_info)); dbi[64:64 + len(record)] = record; dbi[64 + len(record):64 + len(record) + len(file_info)] = file_info; pdb[7 * page_size:7 * page_size + len(module)] = module
     return pdb
 

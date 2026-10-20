@@ -633,6 +633,28 @@ def pdb_streams(path: Path) -> tuple[list[bytes | None], int]:
     return streams, page_size
 
 
+def pdb_names_table(streams: list[bytes | None]) -> bytes:
+    """The PDB-wide /names string buffer, which linked modules' file checksums index into."""
+    info = streams[1] if len(streams) > 1 else None
+    if info is None or len(info) < 32: raise ValueError("missing PDB info stream")
+    size = struct.unpack_from("<I", info, 28)[0]; buffer = info[32:32 + size]; cursor = 32 + size
+    if len(buffer) != size or cursor + 8 > len(info): raise ValueError("invalid PDB named stream map")
+    count = struct.unpack_from("<I", info, cursor)[0]; cursor += 8
+    for _ in range(2):
+        if cursor + 4 > len(info): raise ValueError("invalid PDB named stream map")
+        cursor += 4 + 4 * struct.unpack_from("<I", info, cursor)[0]
+    if cursor + 8 * count > len(info): raise ValueError("invalid PDB named stream map")
+    for index in range(count):
+        key, stream = struct.unpack_from("<II", info, cursor + 8 * index)
+        if key < size and buffer[key:buffer.find(b"\0", key)] == b"/names":
+            names = streams[stream] if stream < len(streams) else None
+            if names is None or len(names) < 12: raise ValueError("invalid PDB /names stream")
+            signature, _, length = struct.unpack_from("<III", names)
+            if signature != 0xEFFEEFFE or 12 + length > len(names): raise ValueError("invalid PDB /names stream")
+            return names[12:12 + length]
+    raise ValueError("PDB has no /names stream")
+
+
 def _inspect_windows_native(path: Path) -> dict:
     streams, _ = pdb_streams(path)
     if len(streams) < 4 or streams[3] is None or len(streams[3]) < 64:
@@ -709,7 +731,7 @@ def _inspect_windows_native(path: Path) -> dict:
                 cursor13 = (end + 3) & ~3
             if c13_size:
                 # A module may carry only line or inlinee subsections and no source files.
-                if offsets and not strings: raise ValueError(f"C13 file checksums without a string table: {len(offsets)} records, c13 size {c13_size}")
+                if offsets and not strings: strings = pdb_names_table(streams)
                 for position in offsets:
                     if position >= len(strings): raise ValueError("invalid C13 source offset")
                     end = strings.find(b"\0", position)
@@ -1102,6 +1124,27 @@ def verify_windows(pairs: list[str]) -> None:
             raise ValueError(f"PE/PDB GUID+age mismatch for {name}")
 
 
+def dsym_dwarf_file(native: Path) -> Path | None:
+    if not native.is_dir(): return None
+    files = [item for item in (native / "Contents/Resources/DWARF").glob("*") if item.is_file()]
+    if len(files) != 1: raise ValueError(f"dSYM bundle without exactly one DWARF file: {native}")
+    return files[0]
+
+
+def add_binary_cfi(dump_syms: str, arch: str | None, binary: str, symbol: Path, scratch: Path) -> None:
+    """dsymutil copies no unwind tables, so take the STACK records from the linked binary itself."""
+    lines = symbol.read_text(encoding="utf-8").splitlines(keepends=True)
+    if any(line.startswith("STACK CFI ") for line in lines): return
+    shutil.rmtree(scratch, ignore_errors=True)
+    subprocess.run([dump_syms, "--store", str(scratch), *(["--arch", arch] if arch else []), binary], check=True)
+    found = list(scratch.glob("*/*/*.sym"))
+    if len(found) != 1: raise ValueError(f"expected one Breakpad file from {binary}, found {len(found)}")
+    other = found[0].read_text(encoding="utf-8").splitlines(keepends=True)
+    if other[0].split()[:4] != lines[0].split()[:4]: raise ValueError(f"binary and dSYM disagree on the module: {other[0].strip()!r} vs {lines[0].strip()!r}")
+    symbol.write_text("".join(lines + [line for line in other if line.startswith("STACK ")]), encoding="utf-8")
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
 def build(args: argparse.Namespace) -> None:
     output = Path(args.output).resolve()
     output_root = Path(args.output_root).resolve()
@@ -1126,8 +1169,12 @@ def build(args: argparse.Namespace) -> None:
             before = set((output / "store").glob("*/*/*.sym"))
             command = [args.dump_syms, "--inlines", "--store", str(output / "store")]
             if arch: command.extend(["--arch", arch])
-            subprocess.run([*command, value], check=True)
+            dwarf = dsym_dwarf_file(native[name])
+            # A linked Mach-O keeps only a debug map; the line tables live in the dSYM.
+            subprocess.run([*command, str(dwarf or value)], check=True)
             after = set((output / "store").glob("*/*/*.sym"))
+            if dwarf:
+                for symbol in sorted(after - before): add_binary_cfi(args.dump_syms, arch, value, symbol, output / "cfi-store")
             symbols_by_name[name].extend(sorted(after - before))
     for symbols in symbols_by_name.values():
         for symbol in symbols:

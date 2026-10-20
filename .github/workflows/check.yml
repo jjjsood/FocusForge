@@ -21,9 +21,8 @@ jobs:
     env:
       # Incremental caches only grow the target directory of a one-shot CI build.
       CARGO_INCREMENTAL: '0'
-      # Full debug info makes the GUI crate's test binaries alone take about 88 GB, more than the
-      # 86 GB a hosted Linux runner has free; the runner is lost mid-build when the disk fills.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # A hosted Linux runner has been lost mid-build; this leaves its memory and disk in the job log.
+      FF_GATE_HEARTBEAT: '30'
       # Makes `ln -s` in the shell selftests create real symlinks on Windows; unused elsewhere.
       MSYS: winsymlinks:nativestrict
     steps:

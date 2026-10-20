@@ -1236,6 +1236,14 @@ fn missing_and_changed_sources_are_reported() {
     }
 
     std::fs::copy(&paths[2], &paths[1]).unwrap();
+    // Windows' copy keeps the source's modification time, which this fixture shares with the
+    // original to within the file system's clock tick; an edit made later has a later one.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&paths[1])
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
     let pending = match Project::open_checked(&project_path).unwrap() {
         Opened::NeedsChoice(pending) => pending,
         Opened::Ready(_) => panic!("a frame with other content must block"),

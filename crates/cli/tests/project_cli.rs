@@ -340,6 +340,7 @@ fn report_names_the_project_and_no_image() {
 ///
 /// Sends a SIGINT once the fuse stage has actually started, rather than
 /// sleeping for a fixed duration.
+#[cfg(unix)]
 #[test]
 fn cancel_keeps_the_staged_planes_for_resume() {
     use std::io::{BufRead, BufReader};
@@ -403,6 +404,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
 
 /// `kill -INT <pid>`, the same spelling `job_cli.rs`'s own signal tests use
 /// -- no `libc` dependency, and the workspace denies `unsafe_code` anyway.
+#[cfg(unix)]
 fn send_sigint(pid: u32) {
     let status = Command::new("kill")
         .args(["-INT", &pid.to_string()])

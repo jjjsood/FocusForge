@@ -162,8 +162,9 @@ pub enum EntryError {
     #[error("{}: {source}", path.display())]
     Read {
         path: PathBuf,
+        // Boxed: `TiffError` is larger on Windows, where an `OsString` is 32 bytes.
         #[source]
-        source: TiffError,
+        source: Box<TiffError>,
     },
     /// A path with the project extension that will not open as a project,
     /// its message worded for the actual cause rather than one fixed
@@ -362,7 +363,10 @@ pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenO
             Err(TiffError::NoFrames { path }) => {
                 OpenOutcome::Refused(EntryError::NoReadableFrames { path })
             }
-            Err(source) => OpenOutcome::Refused(EntryError::Read { path: dir, source }),
+            Err(source) => OpenOutcome::Refused(EntryError::Read {
+                path: dir,
+                source: Box::new(source),
+            }),
         },
         OpenTarget::Frames { dir, frames } => {
             progress(frames.len(), frames.len());

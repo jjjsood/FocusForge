@@ -667,7 +667,8 @@ fn settings_slint_sources() -> Vec<(String, String)> {
         .into_iter()
         .map(|path| {
             let code = common::strip_line_comments(&fs::read_to_string(&path).unwrap());
-            (path.display().to_string(), code)
+            // Matched by `/`-separated suffixes, whatever the platform's separator is.
+            (path.display().to_string().replace('\\', "/"), code)
         })
         .collect()
 }

@@ -120,11 +120,18 @@ require_ready() {  # require_ready <holder name> <pid> <ready path>
   return 1
 }
 
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; *) windows=0 ;; esac
+
 NO_FLOCK_PATH="$TMP/no-flock-bin"
-mkdir -p "$NO_FLOCK_PATH"
-for command in bash basename cat chmod dirname env git grep ln mkdir mktemp ps python3 rm sh sleep touch true; do
-  ln -s "$(type -P "$command")" "$NO_FLOCK_PATH/$command"
-done
+if [ "$windows" = 1 ]; then
+  # Git for Windows ships no flock, and a symlinked MSYS tool cannot start away from its DLLs.
+  NO_FLOCK_PATH="$PATH"
+else
+  mkdir -p "$NO_FLOCK_PATH"
+  for command in bash basename cat chmod dirname env git grep ln mkdir mktemp ps python3 rm sh sleep touch true; do
+    ln -s "$(type -P "$command")" "$NO_FLOCK_PATH/$command"
+  done
+fi
 
 run_lock_without_flock() {  # run_lock_without_flock <checkout> <timeout> <lock args...>
   local checkout="$1" timeout="$2"
@@ -258,6 +265,12 @@ exercise_resource_identity() {
 
   for backend in native; do
     if [ "$backend" = flock ] && ! command -v flock >/dev/null 2>&1; then
+      continue
+    fi
+    if [ "$windows" = 1 ]; then
+      # The native holder's process id is a Windows one, which the MSYS process table cannot walk;
+      # the nested cases above cover the same refusal through the held-lock marker.
+      echo "skip [$backend owner ancestor]: not detectable by process id on Windows"
       continue
     fi
     out="$(run_lock "$outer" "$backend" 2 build -- \
