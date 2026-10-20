@@ -491,8 +491,6 @@ fn fatal_errors_match_with_or_without_strict() {
     #[cfg(unix)]
     {
         use focusforge_core::io::{TiffSpec, TiffWriter};
-        use std::os::unix::fs::PermissionsExt;
-
         let unreadable_dir = common::tmp_dir("cli_contract_unreadable_frame");
         let unreadable = unreadable_dir.join("00.tif");
         let mut writer = TiffWriter::create(
@@ -509,7 +507,7 @@ fn fatal_errors_match_with_or_without_strict() {
             .write_tile(common::full_rect(1, 1), &[0, 0, 0])
             .unwrap();
         writer.finish().unwrap();
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _locked = common::UnreadableFile::lock(&unreadable).unwrap();
         assert!(
             std::fs::File::open(&unreadable).is_err(),
             "test file must be unreadable"
