@@ -13,6 +13,8 @@ if (Test-Path (Join-Path $Symbols 'x86_64-pc-windows-msvc')) { $Symbols = Join-P
 if ($LASTEXITCODE -ne 0) { throw 'invalid symbol inventory' }
 $logs = Join-Path $root ('.scratch/check-package-windows/' + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
+# A hosted Windows runner has no GPU, only the WARP software adapter, which Slint refuses unless told otherwise.
+$env:SLINT_WGPU_CPU = '1'
 $product = Join-Path $env:ProgramFiles 'FocusForge'
 $installLog = Join-Path $logs 'install.log'
 $uninstallLog = Join-Path $logs 'uninstall.log'
