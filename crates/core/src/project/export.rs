@@ -1212,6 +1212,9 @@ impl ImageBuffer for JpegRowSource {
         let row_bytes = self.row_bytes();
         let mut state = self.state.borrow_mut();
         while !state.closed && y >= state.band_start_row + state.rows_in_band {
+            // Free the consumed band first: the sender may already be
+            // converting the band after the one this `recv` returns.
+            state.band = Vec::new();
             match state.rx.recv() {
                 Ok(band) => {
                     state.band_start_row += state.rows_in_band;
