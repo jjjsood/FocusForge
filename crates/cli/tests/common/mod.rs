@@ -233,6 +233,33 @@ fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
 }
 
+/// A file made unreadable (mode `000`) for the guard's lifetime. Dropping it,
+/// on success or while a failed assertion unwinds, restores a readable mode so
+/// nothing unreadable outlives the test.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub struct UnreadableFile {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnreadableFile {
+    #[allow(dead_code)]
+    pub fn lock(path: &Path) -> std::io::Result<Self> {
+        set_mode(path, 0o000)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnreadableFile {
+    fn drop(&mut self) {
+        let _ = set_mode(&self.path, 0o644);
+    }
+}
+
 /// Tries to create and remove a marker file in `dir`; `true` means the
 /// directory is still writable, so a mode change meant to block that either
 /// failed or has no effect on this filesystem.
