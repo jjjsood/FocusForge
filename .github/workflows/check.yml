@@ -21,18 +21,13 @@ jobs:
     env:
       # Incremental caches only grow the target directory of a one-shot CI build.
       CARGO_INCREMENTAL: '0'
+      # Full debug info makes the GUI crate's test binaries alone take about 88 GB, more than the
+      # 86 GB a hosted Linux runner has free; the runner is lost mid-build when the disk fills.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # Makes `ln -s` in the shell selftests create real symlinks on Windows; unused elsewhere.
       MSYS: winsymlinks:nativestrict
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Limit parallel builds on Linux
-        if: runner.os == 'Linux'
-        # The hosted Linux runner (4 CPUs, 16 GB, 86 GB free disk) is shut down twice at the same
-        # point of the debug build, which points at memory: debug-info linking of the many test
-        # binaries in parallel.
-        run: |
-          free -m
-          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12.10'
