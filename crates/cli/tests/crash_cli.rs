@@ -10,6 +10,9 @@
 //! `FOCUSFORGE_DATA_DIR` override keeps reports out of the tester's own
 //! data directory, and forces the crash with `FF_FORCE_CRASH`.
 
+// The native-crash cases are Unix-only; their helpers and imports have no user on Windows.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 mod common;
 
 use std::path::{Path, PathBuf};

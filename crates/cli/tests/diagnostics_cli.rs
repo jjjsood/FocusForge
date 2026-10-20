@@ -6,6 +6,9 @@
 //! `common::cli_bin`, whose `FOCUSFORGE_DATA_DIR` override keeps a run from
 //! ever touching the tester's own data directory.
 
+// Some cases are Unix-only; their helpers have no user on Windows.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 mod common;
 
 use std::path::{Path, PathBuf};

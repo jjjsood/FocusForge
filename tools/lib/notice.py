@@ -25,7 +25,7 @@ VERSION = re.compile(r"Version vendored: ([0-9.]+)")
 
 
 def run(command: list[str], root: Path) -> str:
-    completed = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    completed = subprocess.run(command, cwd=root, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if completed.returncode:
         raise ValueError(f"Cargo command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr.rstrip()}")
     return completed.stdout

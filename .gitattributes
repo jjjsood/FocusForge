@@ -1,0 +1,3 @@
+# Check out text with LF on every platform: the fixture manifest and the other content hashes
+# are computed over the committed bytes.
+* text=auto eol=lf
