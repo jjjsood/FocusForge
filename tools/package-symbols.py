@@ -923,8 +923,11 @@ def verify_inventory(root: Path, manifest: Path | None = None) -> dict:
                 raise ValueError(f"symbol inventory hash mismatch for {name}")
             module_os, module_cpu, module_id, module_name = module_header(symbol)
             expected_module = native.name if platform == "x86_64-pc-windows-msvc" else name
-            if module_os != os_name or module_cpu != cpu or module_name != expected_module or module_name != symbol_data.get("module_name") or module_id != native_id or module_id != symbol_data["module_id"] or symbol.parent.name != module_id or symbol.parent.parent.name != module_name:
-                raise ValueError(f"symbol inventory module mismatch for {name}")
+            # Breakpad producers disagree on the case of the OS token ("windows" and "Windows").
+            checks = {"os": module_os.lower() == os_name.lower(), "cpu": module_cpu == cpu, "name": module_name == expected_module, "recorded name": module_name == symbol_data.get("module_name"), "id": module_id == native_id, "recorded id": module_id == symbol_data["module_id"], "id directory": symbol.parent.name == module_id, "name directory": symbol.parent.parent.name == module_name}
+            failed = [f"{label}" for label, holds in checks.items() if not holds]
+            if failed:
+                raise ValueError(f"symbol inventory module mismatch for {name}: {', '.join(failed)} (header {module_os} {module_cpu} {module_id} {module_name}; expected {os_name} {cpu} {native_id} {expected_module})")
     expected = {"symbol-inventory.json"}
     for item in entries:
         native = root / item["native"]
