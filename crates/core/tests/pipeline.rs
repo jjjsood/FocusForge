@@ -672,6 +672,10 @@ fn the_strict_default_refuses_a_frame_the_off_centre_check_rejects() {
         "reference-frame".to_string(),
         ParamValue::Enum("first".to_string()),
     );
+    explicit.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
     let mut request = base_request(
         "strict_off_centre",
         mantis_frames(8)[3..=6].to_vec(),
@@ -1021,6 +1025,10 @@ fn the_host_cap_sets_the_alignment_workers_but_not_the_alignment() {
     let run_with_cap = |label: &str, cap: u64| {
         let mut explicit = ParamValues::new();
         explicit.insert("max-iterations".to_string(), ParamValue::Int(20));
+        explicit.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum("anchor".to_string()),
+        );
         let mut request = base_request(label, mantis_frames(4), ParamValues::new());
         request.align = Some(AlignRequest {
             algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc registered"),
