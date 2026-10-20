@@ -45,8 +45,9 @@ pub enum AlignError {
     Read {
         frame: usize,
         rect: Rect,
+        // Boxed: `AlgorithmError` is larger on Windows, where an `OsString` is 32 bytes.
         #[source]
-        source: AlgorithmError,
+        source: Box<AlgorithmError>,
     },
 
     /// A [`super::pyramid::LumaAssembler`] tile push whose rect is not

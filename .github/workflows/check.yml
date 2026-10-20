@@ -23,14 +23,14 @@ jobs:
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Free runner disk space
+      - name: Limit parallel builds on Linux
         if: runner.os == 'Linux'
-        # The hosted Linux runner has about 14 GB free; the debug build of every test binary
-        # needs more, and the runner is lost mid-build when the disk fills.
+        # The hosted Linux runner (4 CPUs, 16 GB, 86 GB free disk) is shut down twice at the same
+        # point of the debug build, which points at memory: debug-info linking of the many test
+        # binaries in parallel.
         run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          free -m
+          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12.10'
