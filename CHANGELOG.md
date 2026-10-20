@@ -12,5 +12,5 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
   three fusion methods, a Z-Map, and CPU or GPU processing.
 - A desktop editor and command-line tools for stacking, inspecting, exporting,
   retouching, reviewing, and packaging diagnostics.
-- Release packaging recipes for Linux AppImage and Debian packages, a universal
+- Release packaging recipes for Linux AppImage and Debian packages, an Apple silicon
   macOS DMG, and a Windows MSI.

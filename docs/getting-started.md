@@ -28,7 +28,7 @@ chmod +x "FocusForge-<version>-x86_64.AppImage"
 
 ## macOS and Windows
 
-A macOS release may provide `FocusForge-<version>-universal.dmg`. Open the
+A macOS release may provide `FocusForge-<version>-aarch64.dmg`. Open the
 disk image and drag `FocusForge.app` to `Applications`. Its CLI is
 `/Applications/FocusForge.app/Contents/MacOS/focusforge-cli`, and its shared
 resources are below `/Applications/FocusForge.app/Contents/Resources/share`.

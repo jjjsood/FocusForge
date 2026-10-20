@@ -17,7 +17,6 @@ TARGETS = (
     ("x86_64-unknown-linux-gnu", "Linux x86_64"),
     ("x86_64-pc-windows-msvc", "Windows x86_64"),
     ("aarch64-apple-darwin", "macOS arm64"),
-    ("x86_64-apple-darwin", "macOS x86_64"),
 )
 TREE_PACKAGE = re.compile(r"^([A-Za-z0-9_-]+) v([^\s]+)(?: \(([^)]+)\))?$")
 ABOUT_COPYRIGHT = re.compile(r"Copyright © [^\";]+")

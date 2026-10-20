@@ -20,19 +20,17 @@ attached=1
 app="$mount/FocusForge.app"
 for binary in focusforge-cli focusforge-gui; do
   path="$app/Contents/MacOS/$binary"
-  [[ -x $path && $(lipo -archs "$path" | tr ' ' '\n' | sort | tr '\n' ' ') == "arm64 x86_64 " ]] || { echo "invalid universal $binary" >&2; exit 1; }
-  file "$path" | grep -Eq 'Mach-O.*(x86_64.*arm64|arm64.*x86_64)' || { echo "not universal Mach-O: $binary" >&2; exit 1; }
+  [[ -x $path && $(lipo -archs "$path") == arm64 ]] || { echo "invalid arm64 $binary" >&2; exit 1; }
+  file "$path" | grep -Eq 'Mach-O.*arm64' || { echo "not an arm64 Mach-O: $binary" >&2; exit 1; }
   ! otool -l "$path" | grep -Eq '(__DWARF|__debug_)' || { echo "installed binary retains debug sections: $binary" >&2; exit 1; }
   ids() { dwarfdump --uuid "$1" | awk '{print $2 " " $3}' | sort; }
   shipping_ids=$(ids "$path")
-  for target in x86_64-apple-darwin aarch64-apple-darwin; do
-    debug="$symbols/$target/native/$binary.dSYM"
-    [[ -d $debug && $(printf '%s\n' "$shipping_ids" | awk '{print $2}' | tr -d '()' | sort | tr '\n' ' ') == "arm64 x86_64 " && $shipping_ids == $(ids "$debug") ]] || { echo "dSYM UUID mismatch: $binary/$target" >&2; exit 1; }
-  done
+  debug="$symbols/aarch64-apple-darwin/native/$binary.dSYM"
+  [[ -d $debug && $(printf '%s\n' "$shipping_ids" | awk '{print $2}' | tr -d '()' | sort | tr '\n' ' ') == "arm64 " && $shipping_ids == $(ids "$debug") ]] || { echo "dSYM UUID mismatch: $binary" >&2; exit 1; }
 done
 ! find "$app" -type d -name '*.dSYM' -print -quit | grep -q .
 ! find "$app" -type f \( -name '*.debug' -o -name '*.pdb' \) -print -quit | grep -q .
-for target in x86_64-apple-darwin aarch64-apple-darwin; do python3 "$root/tools/package-symbols.py" verify "$symbols/$target"; done
+python3 "$root/tools/package-symbols.py" verify "$symbols/aarch64-apple-darwin"
 plist="$app/Contents/Info.plist"
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist") == focusforge-gui ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") == "$version" ]]
@@ -62,7 +60,7 @@ PY
 force_crash() {
   local name=$1 binary=$2
   shift 2
-  local crash="$work/crashes/$name" dump metadata status target archive
+  local crash="$work/crashes/$name" dump metadata status archive
   mkdir -p "$crash/data" "$crash/config" "$crash/xdg"
   local started crash_pid
   started=$(date +%s)
@@ -90,8 +88,7 @@ assert data["pid"] == int(os.environ["CRASH_PID"]) and data["version"] == os.env
 stamp = datetime.datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00")).timestamp()
 assert stamp >= int(os.environ["CRASH_STARTED"]) - 5
 PY
-  case "$(uname -m)" in x86_64) target=x86_64-apple-darwin;; arm64) target=aarch64-apple-darwin;; *) exit 1;; esac
-  archive=$(find "$symbols/$target" -maxdepth 1 -name 'FocusForge-*-symbols.tar.gz' -type f -print -quit)
+  archive=$(find "$symbols/aarch64-apple-darwin" -maxdepth 1 -name 'FocusForge-*-symbols.tar.gz' -type f -print -quit)
   [[ -n $archive ]]
   python3 "$root/tools/symbolicate.py" "$dump" "$archive" > "$crash/stackwalk.json"
 }
