@@ -33,10 +33,10 @@ jobs:
         # shut down when memory runs out. Swap absorbs the peak; two jobs keep a second one away.
         run: |
           free -m
-          sudo fallocate -l 16G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 16G /mnt/gate-swap
+          sudo chmod 600 /mnt/gate-swap
+          sudo mkswap /mnt/gate-swap
+          sudo swapon /mnt/gate-swap
           echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
           free -m
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6

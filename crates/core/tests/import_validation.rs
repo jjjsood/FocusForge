@@ -605,6 +605,7 @@ fn fingerprint_mismatch_blocks_until_a_choice() {
     let mut bytes = std::fs::read(&changed_path).unwrap();
     bytes[0] ^= 0xFF;
     std::fs::write(&changed_path, &bytes).unwrap();
+    bump_mtime(&changed_path);
 
     match Project::open_checked(&project_path).unwrap() {
         Opened::NeedsChoice(pending) => {
@@ -673,6 +674,7 @@ fn proceeding_carries_the_mismatch_forward() {
     let mut bytes = std::fs::read(&changed_path).unwrap();
     bytes[0] ^= 0xFF;
     std::fs::write(&changed_path, &bytes).unwrap();
+    bump_mtime(&changed_path);
 
     let pending = match Project::open_checked(&project_path).unwrap() {
         Opened::NeedsChoice(pending) => pending,
@@ -944,6 +946,7 @@ fn no_failure_returns_a_partial_project() {
     let mut bytes = std::fs::read(&changed_path).unwrap();
     bytes[0] ^= 0xFF;
     std::fs::write(&changed_path, &bytes).unwrap();
+    bump_mtime(&changed_path);
     let pending = match Project::open_checked(&project_path).unwrap() {
         Opened::NeedsChoice(pending) => pending,
         Opened::Ready(_) => panic!("expected NeedsChoice"),
