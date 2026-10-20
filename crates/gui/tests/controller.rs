@@ -376,7 +376,9 @@ fn controller_api_is_slint_free() {
 // and the fall back to stacking.
 // ---------------------------------------------------------------------
 
-const SETTLE: Duration = Duration::from_secs(60);
+// A bound on a hang, not a speed requirement: a debug build on a loaded hosted Windows runner
+// needs well over a minute to fuse the 512 px fixture, and a settled run returns at once.
+const SETTLE: Duration = Duration::from_secs(300);
 
 /// A controller whose ledger, staging and held checkpoints live under a
 /// fresh directory named for `name`.
@@ -8736,28 +8738,31 @@ fn storage_view_without_directories() {
 
 #[test]
 fn storage_view_abbreviates_the_home_directory() {
+    // The test spells its paths with `/`; on Windows the view joins them with `\`.
     let home = Path::new("/home/someone");
     let config = home.join(".config/focusforge");
     let data = Path::new("/srv/data/focusforge");
     let scratch = home.join(".local/scratch");
     let view = storage_view(Some(&config), Some(data), &scratch, Some(home));
     assert_eq!(
-        view.settings_file.path,
+        view.settings_file.path.replace('\\', "/"),
         "~/.config/focusforge/settings.toml"
     );
-    assert_eq!(view.scratch.path, "~/.local/scratch");
+    assert_eq!(view.scratch.path.replace('\\', "/"), "~/.local/scratch");
     assert_eq!(
-        view.logs.path, "/srv/data/focusforge/logs",
+        view.logs.path.replace('\\', "/"),
+        "/srv/data/focusforge/logs",
         "a path outside the home directory stays absolute"
     );
 
     let sibling = storage_view(None, None, Path::new("/home/someone2/scratch"), Some(home));
     assert_eq!(
-        sibling.scratch.path, "/home/someone2/scratch",
+        sibling.scratch.path.replace('\\', "/"),
+        "/home/someone2/scratch",
         "a sibling directory sharing the home name's prefix is not under it"
     );
     let at_home = storage_view(None, None, home, Some(home));
-    assert_eq!(at_home.scratch.path, "~");
+    assert_eq!(at_home.scratch.path.replace('\\', "/"), "~");
 }
 
 /// Writes one stage-cache entry file under `<scratch>/stage-cache/<stage>/`.
