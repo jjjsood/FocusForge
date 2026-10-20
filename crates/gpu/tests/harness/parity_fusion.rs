@@ -461,6 +461,23 @@ impl TileReader for InMemoryFrames {
     }
 }
 
+/// The first `count` frames of `reader` over `rect`, as CPU tiles.
+fn read_in_memory_tiles(reader: &InMemoryFrames, count: usize, rect: Rect, spp: u32) -> Vec<Tile> {
+    (0..count)
+        .map(|frame| {
+            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
+            reader
+                .read_tile_into(frame, rect, &mut samples)
+                .expect("read in-memory tile");
+            Tile {
+                rect,
+                samples_per_pixel: spp,
+                samples,
+            }
+        })
+        .collect()
+}
+
 /// The unmasked parity contract: the Z-Map equals the CPU's except at proven
 /// near-ties between the two best frames, and every sample outside those
 /// pixels is within 1 LSB.
@@ -602,19 +619,7 @@ fn residual_large_n_matches_cpu() {
     };
     let sources: Vec<usize> = (0..999).map(|i| i % 8).collect();
     let reader = InMemoryFrames::repeating_mantis(&sources, 128, 128);
-    let tiles: Vec<Tile> = (0..sources.len())
-        .map(|frame| {
-            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
-            reader
-                .read_tile_into(frame, rect, &mut samples)
-                .expect("read in-memory tile");
-            Tile {
-                rect,
-                samples_per_pixel: spp,
-                samples,
-            }
-        })
-        .collect();
+    let tiles = read_in_memory_tiles(&reader, sources.len(), rect, spp);
     let mut cfg = ParamValues::new();
     cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
     let cpu = Laplacian
@@ -644,19 +649,7 @@ fn tile_at_the_dispatch_limit_matches_cpu() {
         height: side - 1,
     };
     let reader = InMemoryFrames::repeating_mantis(&[0, 2], side, side);
-    let tiles: Vec<Tile> = (0..2)
-        .map(|frame| {
-            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
-            reader
-                .read_tile_into(frame, rect, &mut samples)
-                .expect("read in-memory tile");
-            Tile {
-                rect,
-                samples_per_pixel: spp,
-                samples,
-            }
-        })
-        .collect();
+    let tiles = read_in_memory_tiles(&reader, 2, rect, spp);
 
     let mut cfg = ParamValues::new();
     cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
@@ -732,19 +725,7 @@ fn masked_fuse_matches_cpu() {
     };
     let (reader, rect, coverage) = masked_case();
     let (spp, levels, frame_count) = (reader.spp, 5u32, reader.frames.len());
-    let tiles: Vec<Tile> = (0..frame_count)
-        .map(|frame| {
-            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
-            reader
-                .read_tile_into(frame, rect, &mut samples)
-                .expect("read in-memory tile");
-            Tile {
-                rect,
-                samples_per_pixel: spp,
-                samples,
-            }
-        })
-        .collect();
+    let tiles = read_in_memory_tiles(&reader, frame_count, rect, spp);
     let mut cfg = ParamValues::new();
     cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
     let cpu = Laplacian
