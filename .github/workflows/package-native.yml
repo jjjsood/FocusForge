@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.95.0 --profile minimal
-          rustup target add --toolchain 1.95.0 x86_64-apple-darwin aarch64-apple-darwin
+          rustup target add --toolchain 1.95.0 aarch64-apple-darwin
           rustup default 1.95.0
       - name: Require exact check run
         if: github.event_name != 'pull_request'
@@ -50,7 +50,7 @@ jobs:
         run: tools/package-macos.sh --output target/distrib/native/macos
       - name: Check native package
         shell: bash
-        run: tools/check-package-macos.sh target/distrib/native/macos/FocusForge-0.1.0-universal.dmg
+        run: tools/check-package-macos.sh target/distrib/native/macos/FocusForge-0.1.0-aarch64.dmg
       - name: Upload package smoke receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

@@ -227,7 +227,7 @@ only after its same-commit checks pass. Before creating or pushing a tag, run
 the documented Linux package recipe and inspect its two artifacts locally.
 
 Pull requests run the same native package jobs without creating a release.
-macOS produces a universal DMG and Windows produces one combined MSI; their
+macOS produces an Apple silicon (arm64) DMG and Windows produces one combined MSI; their
 target runners validate the installed package before uploading it for the
 release checksum job.
 
@@ -276,7 +276,6 @@ its SHA-256 file with each installer; diagnose a retained minidump locally with
 only its pinned stackwalker and never contacts a symbol server.
 
 Release assets include `FocusForge-<version>-x86_64-unknown-linux-gnu-symbols.tar.gz`,
-`FocusForge-<version>-x86_64-apple-darwin-symbols.tar.gz`,
 `FocusForge-<version>-aarch64-apple-darwin-symbols.tar.gz`, and
 `FocusForge-<version>-x86_64-pc-windows-msvc-symbols.tar.gz`; keep each with
 its `symbols.sha256` or the release `native-artifacts.sha256` entry. GitHub

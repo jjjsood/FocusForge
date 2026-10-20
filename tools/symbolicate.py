@@ -60,7 +60,7 @@ def main() -> None:
     if not args.minidump.is_file() or not args.symbol_archive.is_file():
         raise SystemExit("minidump and archive must exist")
     machine, system = platform.machine().lower(), platform.system()
-    target = {("Linux", "x86_64"): "x86_64-unknown-linux-gnu", ("Linux", "amd64"): "x86_64-unknown-linux-gnu", ("Darwin", "x86_64"): "x86_64-apple-darwin", ("Darwin", "arm64"): "aarch64-apple-darwin", ("Windows", "amd64"): "x86_64-pc-windows-msvc"}.get((system, machine))
+    target = {("Linux", "x86_64"): "x86_64-unknown-linux-gnu", ("Linux", "amd64"): "x86_64-unknown-linux-gnu", ("Darwin", "arm64"): "aarch64-apple-darwin", ("Windows", "amd64"): "x86_64-pc-windows-msvc"}.get((system, machine))
     if not target:
         raise SystemExit(f"unsupported host target: {system}/{machine}")
     scratch = scratch_root()

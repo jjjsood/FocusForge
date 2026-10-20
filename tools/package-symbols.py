@@ -192,7 +192,6 @@ def module(path: Path) -> tuple[str, str]:
 def platform_header(platform: str) -> tuple[str, str, str]:
     known = {
         "x86_64-unknown-linux-gnu": ("Linux", "x86_64", ".debug"),
-        "x86_64-apple-darwin": ("Mac", "x86_64", ".dSYM"),
         "aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"),
         "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb"),
     }
@@ -479,14 +478,14 @@ def _inspect_linux_native(path: Path) -> dict:
 def valid_source_inspection(platform: str, path: Path, record: object) -> dict:
     if not isinstance(record, dict) or record.get("schema") != SOURCE_INSPECTION_SCHEMA or record.get("native_inspection_sha256") != digest(path):
         raise ValueError("invalid native source inspection")
-    expected_format = {"x86_64-unknown-linux-gnu": "elf-dwarf", "x86_64-apple-darwin": "macho-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
+    expected_format = {"x86_64-unknown-linux-gnu": "elf-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
     coverage, paths = record.get("coverage"), record.get("source_paths")
     if record.get("format") != expected_format or not isinstance(coverage, dict) or not isinstance(paths, list) or not paths or any(not isinstance(item, str) or not safe_native_source(item) for item in paths):
         raise ValueError("invalid native source inspection")
     if expected_format == "elf-dwarf":
         if not all(type(coverage.get(key)) is int and coverage[key] > 0 for key in ("compile_units", "line_tables")) or not all(type(coverage.get(key)) is int and coverage[key] >= 0 for key in ("source_less_compile_units", "no_line_compile_units")):
             raise ValueError("incomplete ELF source inspection")
-    if expected_format == "macho-dwarf" and (coverage.get("slices") != ["arm64", "x86_64"] or type(coverage.get("auxiliary_source_records")) is not int or coverage["auxiliary_source_records"] < 0):
+    if expected_format == "macho-dwarf" and (coverage.get("slices") != ["arm64"] or type(coverage.get("auxiliary_source_records")) is not int or coverage["auxiliary_source_records"] < 0):
         raise ValueError("incomplete Mach-O source inspection")
     if expected_format == "pdb-dbi" and (coverage.get("dbi_stream") != 3 or type(coverage.get("file_records")) is not int or coverage["file_records"] < 1 or not all(type(coverage.get(key)) is int and coverage[key] >= 0 for key in ("module_c13_records", "environment_records"))):
         raise ValueError("incomplete PDB source inspection")
@@ -518,7 +517,7 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
         raise ValueError("missing dSYM DWARF payload")
     paths: set[str] = set()
     slices: list[str] = []
-    for arch in ("x86_64", "arm64"):
+    for arch in ("arm64",):
         result = subprocess.run(["dwarfdump", "--arch", arch, "--debug-info", "--debug-line", str(dwarf)], text=True, encoding="utf-8", errors="strict", capture_output=True, check=False)
         if result.returncode or result.stderr:
             raise ValueError(f"dwarfdump failed for {arch}: {result.stderr.strip()}")
@@ -783,37 +782,26 @@ def inspect_native(platform: str, path: Path, logical_name: str) -> dict:
 
 
 def macho_uuids(path: Path) -> dict[str, bytes]:
+    """The UUID of a thin arm64 Mach-O, keyed by its architecture."""
     data = path.read_bytes()
-    if len(data) < 8 or struct.unpack_from(">I", data)[0] != 0xCAFEBABE:
-        raise ValueError(f"invalid universal Mach-O: {path}")
-    count = struct.unpack_from(">I", data, 4)[0]
-    if count != 2 or len(data) < 8 + count * 20:
-        raise ValueError(f"invalid universal Mach-O slices: {path}")
-    names = {0x1000007: "x86_64", 0x100000C: "arm64"}
-    found: dict[str, bytes] = {}
-    for index in range(count):
-        cpu, _, offset, size, _ = struct.unpack_from(">IIIII", data, 8 + index * 20)
-        if cpu not in names or offset + size > len(data) or size < 56:
-            raise ValueError(f"invalid universal Mach-O slice: {path}")
-        magic, slice_cpu, _, _, commands, command_bytes, _, _ = struct.unpack_from("<IIIIIIII", data, offset)
-        if magic != 0xFEEDFACF or slice_cpu != cpu or command_bytes < 24:
-            raise ValueError(f"invalid Mach-O header: {path}")
-        cursor, end, identifier = offset + 32, offset + 32 + command_bytes, None
-        for _ in range(commands):
-            if cursor + 8 > end:
-                break
-            command, length = struct.unpack_from("<II", data, cursor)
-            if length < 8 or cursor + length > end:
-                break
-            if command == 0x1B and length == 24:
-                identifier = data[cursor + 8:cursor + 24]
-            cursor += length
-        if identifier is None or names[cpu] in found:
-            raise ValueError(f"missing Mach-O UUID: {path}")
-        found[names[cpu]] = identifier
-    if set(found) != {"x86_64", "arm64"}:
-        raise ValueError(f"incomplete universal Mach-O UUIDs: {path}")
-    return found
+    if len(data) < 32:
+        raise ValueError(f"invalid Mach-O: {path}")
+    magic, cpu, _, _, commands, command_bytes, _, _ = struct.unpack_from("<IIIIIIII", data)
+    if magic != 0xFEEDFACF or cpu != 0x100000C or command_bytes < 24 or 32 + command_bytes > len(data):
+        raise ValueError(f"invalid arm64 Mach-O header: {path}")
+    cursor, end, identifier = 32, 32 + command_bytes, None
+    for _ in range(commands):
+        if cursor + 8 > end:
+            break
+        command, length = struct.unpack_from("<II", data, cursor)
+        if length < 8 or cursor + length > end:
+            break
+        if command == 0x1B and length == 24:
+            identifier = data[cursor + 8:cursor + 24]
+        cursor += length
+    if identifier is None:
+        raise ValueError(f"missing Mach-O UUID: {path}")
+    return {"arm64": identifier}
 
 
 def native_module_id(platform: str, native: Path, logical_name: str) -> str:
@@ -828,8 +816,7 @@ def native_module_id(platform: str, native: Path, logical_name: str) -> str:
     if not dwarf.is_file():
         raise ValueError(f"missing dSYM DWARF file: {native}")
     uuid_by_arch = macho_uuids(dwarf)
-    arch = "x86_64" if platform.startswith("x86_64") else "arm64"
-    return uuid_by_arch[arch].hex().upper() + "0"
+    return uuid_by_arch["arm64"].hex().upper() + "0"
 
 
 def assert_safe_tree(root: Path, allowed_files: set[str]) -> None:

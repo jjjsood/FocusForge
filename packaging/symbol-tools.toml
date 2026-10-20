@@ -20,12 +20,6 @@ sha256 = "0fc852a86b00337407d9d423cc388a24c3b489ccaaedcf92623cad57af5ca8ad"
 executable = "dump_syms"
 
 [[dump_syms.artifact]]
-target = "x86_64-apple-darwin"
-url = "https://github.com/mozilla/dump_syms/releases/download/v2.3.9/dump_syms-x86_64-apple-darwin.tar.xz"
-sha256 = "e255caf99e403b31613c756babcead8463f6e600c1a9e1e5531fbe27a7e29cf2"
-executable = "dump_syms"
-
-[[dump_syms.artifact]]
 target = "aarch64-apple-darwin"
 url = "https://github.com/mozilla/dump_syms/releases/download/v2.3.9/dump_syms-aarch64-apple-darwin.tar.xz"
 sha256 = "4945b7e5de0d7ad403822635f0fb912b69990fc412741ff2b7b512e168c40a32"
@@ -41,12 +35,6 @@ executable = "dump_syms.exe"
 target = "x86_64-unknown-linux-gnu"
 url = "https://github.com/rust-minidump/rust-minidump/releases/download/v0.27.0/minidump-stackwalk-x86_64-unknown-linux-gnu.tar.xz"
 sha256 = "0020324c54cc359596e927ee907204f4c8d4da6718765536edcabaa1622122ad"
-executable = "minidump-stackwalk"
-
-[[stackwalk.artifact]]
-target = "x86_64-apple-darwin"
-url = "https://github.com/rust-minidump/rust-minidump/releases/download/v0.27.0/minidump-stackwalk-x86_64-apple-darwin.tar.xz"
-sha256 = "801fa500d159fe474260ef1aad80706bed822434aced7fdb21c1b2c7a06afe6f"
 executable = "minidump-stackwalk"
 
 [[stackwalk.artifact]]

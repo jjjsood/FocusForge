@@ -15,14 +15,14 @@ prerequisites when run on Linux.
 | `check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]` | Every gate, one command, bounded output, pass/fail summary. `--static` is the pre-commit set. Skips cleanly until `Cargo.toml` exists. |
 | `check-licenses.sh [--advisories]` | `cargo deny` over the GPLv3 compatibility allowlist; `--advisories` checks RUSTSEC instead. Skips until `deny.toml` is committed. |
 | `check-headers.sh` | Requires the opening GPL-3.0-or-later SPDX comment on authored Rust, Slint, WGSL, shell, Python, and hook files. `check-headers-selftest.sh` proves its covered classes and exclusions. |
-| `check-notice.sh [--write]` | Compares root `NOTICE` with the locked, offline default CLI+GUI runtime graphs for four release targets. `--write` explicitly regenerates it; the check never edits files. Cargo's cached metadata and package index must be available. `check-notice-selftest.sh` covers deterministic rendering and stale component records. |
+| `check-notice.sh [--write]` | Compares root `NOTICE` with the locked, offline default CLI+GUI runtime graphs for three release targets. `--write` explicitly regenerates it; the check never edits files. Cargo's cached metadata and package index must be available. `check-notice-selftest.sh` covers deterministic rendering and stale component records. |
 | `check-fixtures.sh` | Verifies `fixtures/MANIFEST.sha256` both ways: every listed file still hashes correctly, and no unlisted file is hiding under `fixtures/`. |
 | `check-fixtures-selftest.sh` | Proves `check-fixtures.sh`'s refusals and passes against synthetic throwaway trees, so the gate is never trusted on the strength of only ever having been seen green. |
 | `check-workflow-selftest.py` | Guards the checked-in Actions workflow's native matrix, immutable action pins, one canonical gate call, and narrow hidden-log artifact upload. |
 | `package-linux.sh` | Builds the GUI+CLI AppImage and `.deb` in the pinned Ubuntu 22.04 container. Run `tools/with-lock.sh build -- tools/package-linux.sh`; outputs, SHA-256 file and provenance inventory go under `.scratch/package-linux/`. |
 | `check-package-linux.sh [.scratch/package-linux]` | Uses only generated artifacts and copied fixture/legal expectations in fresh Ubuntu 22.04 containers. It checks inventories, hashes, loader/GLIBC requirements, Debian dependencies, CLI metadata and GUI help. Run it under the build lock after `package-linux.sh`. |
-| `package-macos.sh [--output DIR]` | On macOS, builds universal GUI and CLI binaries, assembles `FocusForge.app`, and creates a DMG below `target/distrib/native/`. |
-| `check-package-macos.sh DMG` | On macOS, mounts a DMG read-only and checks both universal binaries, bundle metadata, legal files, icon, and the packaged CLI. |
+| `package-macos.sh [--output DIR]` | On macOS, builds arm64 GUI and CLI binaries, assembles `FocusForge.app`, and creates a DMG below `target/distrib/native/`. |
+| `check-package-macos.sh DMG` | On macOS, mounts a DMG read-only and checks both arm64 binaries, bundle metadata, legal files, icon, and the packaged CLI. |
 | `package-windows.ps1 [-OutputDirectory DIR]` | On Windows, verifies the pinned WiX package, builds both executables, and creates a combined MSI below `target/distrib/native/`. |
 | `check-package-windows.ps1 -Msi PATH` | On Windows, silently installs and uninstalls an MSI, retaining installer logs while checking executables, legal files, and Start-menu shortcut. |
 | `collect-native-artifacts.py` | Validates native package receipts and hashes from `target/distrib` before cargo-dist copies the declared DMG/MSI outputs. |
@@ -54,7 +54,7 @@ and exits 0.
 
 Release producers retain release line tables only until symbol extraction. The
 installer copies are stripped; Linux carries a GNU debuglink, macOS retains a
-universal `.dSYM`, and Windows retains a matching `.pdb` only in the symbol
+arm64 `.dSYM`, and Windows retains a matching `.pdb` only in the symbol
 archive. Keep the generated `FocusForge-<version>-<platform>-symbols.tar.gz`
 and its `symbols.sha256` or release `native-artifacts.sha256` checksum entry
 beside the installer when diagnosing a user dump. `package-symbols.py` needs

@@ -450,12 +450,12 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
         extras = dist["dist"]["extra-artifacts"]
     except (KeyError, TypeError, tomllib.TOMLDecodeError):
         return False
-    if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
+    if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
         return False
     if dist["dist"].get("local-artifacts-jobs") != ["./package-native"] or dist["dist"].get("pr-run-mode") != "upload": return False
     linux = next((item for item in extras if item.get("build") == ["tools/package-linux.sh"]), None)
     native_extra = next((item for item in extras if item.get("build") == ["python3", "tools/collect-native-artifacts.py"]), None)
-    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 7: return False
+    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 6: return False
     checker = "python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
     step = setup[setup.find("- name: Require exact check run"):setup.find("- name: Require locked release Cargo profile")]
     if checker not in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
@@ -491,7 +491,7 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
 def graph() -> None:
     config = (ROOT / "dist-workspace.toml").read_text(); setup = (ROOT / ".github/build-setup.yml").read_text()
     release = (ROOT / ".github/workflows/release.yml").read_text(); native = NATIVE_WORKFLOW.read_text(); assert valid_graph(config, setup, release, native)
-    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
+    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
     assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release, native)
     assert not valid_graph(config, setup.replace("if: github.event_name != 'pull_request'", "if: false", 1), release, native)
     assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release, native)
@@ -639,7 +639,7 @@ def native_boundaries() -> None:
     call(["bash", str(ROOT / "tools/package-macos.sh"), "--output", "/tmp/outside-native-packages"], False)
     call(["python3", "-c", "import pathlib; compile(pathlib.Path(__import__('sys').argv[1]).read_text(), __import__('sys').argv[1], 'exec')", str(NATIVE_COLLECTOR)])
     old_plan = os.environ.get("DIST_PLAN")
-    required = [f"FocusForge-{collector.version()}-x86_64-unknown-linux-gnu-symbols.tar.gz", f"FocusForge-{collector.version()}-universal.dmg", f"FocusForge-{collector.version()}-x86_64.msi", f"FocusForge-{collector.version()}-x86_64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-aarch64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-x86_64-pc-windows-msvc-symbols.tar.gz", "native-artifacts.sha256", "native-artifacts.json"]
+    required = [f"FocusForge-{collector.version()}-x86_64-unknown-linux-gnu-symbols.tar.gz", f"FocusForge-{collector.version()}-aarch64.dmg", f"FocusForge-{collector.version()}-x86_64.msi", f"FocusForge-{collector.version()}-aarch64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-x86_64-pc-windows-msvc-symbols.tar.gz", "native-artifacts.sha256", "native-artifacts.json"]
     plan = {"releases": [{"app_name": name, "app_version": collector.version(), "artifacts": [*(f"{name}-{target}.zip" for target in collector.TARGETS), *required]} for name in sorted(collector.PACKAGES)]}
     os.environ["DIST_PLAN"] = json.dumps(plan)
     try:
@@ -669,20 +669,17 @@ def native_boundaries() -> None:
                     if target_name.endswith("windows-msvc"):
                         guid = __import__("uuid").UUID(hex=identifier[:32]).bytes_le; age = int(identifier[32:], 16)
                         path.write_bytes(msf_pdb(guid, age)); return
-                    raw = bytes.fromhex(identifier[:32]); slices = []
-                    for cpu in (0x1000007, 0x100000C): slices.append(struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + raw)
-                    data = bytearray(12288); struct.pack_into(">II", data, 0, 0xCAFEBABE, 2)
-                    for index, (cpu, payload) in enumerate(zip((0x1000007, 0x100000C), slices)): offset = 4096 * (index + 1); struct.pack_into(">IIIII", data, 8 + index * 20, cpu, 3, offset, len(payload), 12); data[offset:offset + len(payload)] = payload
-                    dwarf = path / "Contents/Resources/DWARF" / logical; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(data)
-                for platform, kind, suffix in (("macos", "dmg", "universal.dmg"), ("windows", "msi", "x86_64.msi")):
+                    raw = bytes.fromhex(identifier[:32])
+                    dwarf = path / "Contents/Resources/DWARF" / logical; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + raw)
+                for platform, kind, suffix in (("macos", "dmg", "aarch64.dmg"), ("windows", "msi", "x86_64.msi")):
                     target = native / platform; target.mkdir(parents=True)
                     artifact = target / f"FocusForge-{collector.version()}-{suffix}"; artifact.write_bytes(platform.encode())
                     receipt = {"kind": kind, "version": collector.version(), "revision": revision, "artifact": artifact.name, "sha256": collector.sha256(artifact)}
                     (target / "native-receipt.json").write_text(json.dumps(receipt))
-                    for symbol_target in {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]:
+                    for symbol_target in {"macos": ("aarch64-apple-darwin",), "windows": ("x86_64-pc-windows-msvc",)}[platform]:
                         symbols = target / "symbols" / symbol_target
                         native_inputs = {}; symbols_by_name = {}
-                        module_os, module_cpu, suffix = {"x86_64-apple-darwin": ("Mac", "x86_64", ".dSYM"), "aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"), "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb")}[symbol_target]
+                        module_os, module_cpu, suffix = {"aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"), "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb")}[symbol_target]
                         for name, identifier in (("focusforge-cli", "73DB7F2DB3A643B9DFD8FF6C4DFF41940"), ("focusforge-gui", "05CE7935D101B8E6E397B49D6F6716080")):
                             debug_name = f"{name}{suffix}" if suffix != ".pdb" else f"actual-{name}.pdb"
                             debug = symbols / "native" / debug_name; debug.parent.mkdir(parents=True, exist_ok=True)
@@ -712,14 +709,14 @@ def native_boundaries() -> None:
             for field, value in (("revision", "0" * 40), ("version", "9.9.9"), ("artifact", "wrong.dmg"), ("kind", "msi"), ("sha256", "0" * 64)):
                 reject(receipt_field(field, value))
             reject(lambda: receipt.write_text("{"))
-            reject(lambda: (native / "macos/FocusForge-0.1.0-universal.dmg").unlink())
+            reject(lambda: (native / "macos/FocusForge-0.1.0-aarch64.dmg").unlink())
             reject(lambda: shutil.rmtree(native / "macos/symbols/aarch64-apple-darwin"))
             def wrong_target() -> None:
                 path = native / "windows/symbols/x86_64-pc-windows-msvc/symbol-inventory.json"
-                body = json.loads(path.read_text()); body["platform"] = "x86_64-apple-darwin"; path.write_text(json.dumps(body))
+                body = json.loads(path.read_text()); body["platform"] = "aarch64-apple-darwin"; path.write_text(json.dumps(body))
             reject(wrong_target)
             reject(lambda: (native / "windows/symbols/x86_64-pc-windows-msvc/FocusForge-0.1.0-x86_64-pc-windows-msvc-symbols.tar.gz").write_bytes(b"corrupt"))
-            reject(lambda: (native / "macos/symbols/x86_64-apple-darwin/stale").write_text("stale"))
+            reject(lambda: (native / "macos/symbols/aarch64-apple-darwin/stale").write_text("stale"))
             def duplicate() -> None:
                 nested = native / "native/macos"; nested.mkdir(parents=True)
                 shutil.copytree(native / "macos", nested, dirs_exist_ok=True)
@@ -1057,7 +1054,7 @@ def source_privacy_cases() -> None:
         try: module.inspect_windows_native(malformed_path)
         except ValueError: pass
         else: raise AssertionError("odd CodeView environment fields accepted")
-        for platform in ("x86_64-apple-darwin", "x86_64-pc-windows-msvc"):
+        for platform in ("aarch64-apple-darwin", "x86_64-pc-windows-msvc"):
             portable = root / platform
             if platform.endswith("apple-darwin"):
                 archive = write_macos_symbols(portable, platform)
@@ -1188,7 +1185,7 @@ file_names[1] = {
 """
     def inspect(output: str, auxiliary: dict | None = None) -> dict:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); bundle = root / "focusforge-cli.dSYM"; dwarf = bundle / "Contents/Resources/DWARF/focusforge-cli"; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(universal_macho())
+            root = Path(temporary); bundle = root / "focusforge-cli.dSYM"; dwarf = bundle / "Contents/Resources/DWARF/focusforge-cli"; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(thin_macho())
             (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "focusforge-cli"}))
             if auxiliary is not None:
                 resource = bundle / "Contents/Resources/00000000000000000000000000000001.plist"
@@ -1199,7 +1196,7 @@ file_names[1] = {
             try: return module.inspect_macos_native(bundle, "focusforge-cli")
             finally: os.environ["PATH"] = old
     record = inspect(grouped)
-    assert record["coverage"]["slices"] == ["arm64", "x86_64"] and "/work/crates/cli/src/two.rs" in record["source_paths"]
+    assert record["coverage"]["slices"] == ["arm64"] and "/work/crates/cli/src/two.rs" in record["source_paths"]
     no_line = grouped.replace(".debug_line", """0x00000060: DW_TAG_compile_unit
  DW_AT_name ("crates/cli/src/no-line.rs")
  DW_AT_comp_dir ("/work")
@@ -1213,10 +1210,10 @@ file_names[1] = {
     assert inspect(empty_table)["source_paths"] == inspect(grouped)["source_paths"]
     orphan_table = grouped + '.debug_line[0x00000200]\nfile_names[1] = {\n name: "orphan.rs"\n dir_index: 0\n}\n'
     try: inspect(orphan_table)
-    except ValueError as error: assert str(error).startswith("unbound dSYM line table for x86_64"), str(error)
+    except ValueError as error: assert str(error).startswith("unbound dSYM line table for arm64"), str(error)
     else: raise AssertionError("unreferenced table with files accepted")
     missing_table = grouped.replace(".debug_line[0x00000040]", ".debug_line[0x00000041]")
-    for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for x86_64")):
+    for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for arm64")):
         try: inspect(output)
         except ValueError as error: assert str(error).startswith(message), (label, str(error))
         else: raise AssertionError(f"{label} accepted")
@@ -1280,7 +1277,7 @@ standard_opcode_lengths[DW_LNS_copy] = 0
     for label, output in (("DWARF 4 directory past the table", four.replace("dir_index: 2", "dir_index: 7")), ("DWARF 5 directory past the table", five.replace("dir_index: 1", "dir_index: 7"))):
         with hosted_runner(module, runner):
             try: inspect(output)
-            except ValueError as error: assert "invalid dSYM line directory for x86_64: index 7, 2 directories" in str(error), (label, str(error))
+            except ValueError as error: assert "invalid dSYM line directory for arm64: index 7, 2 directories" in str(error), (label, str(error))
             else: raise AssertionError(f"{label} accepted")
 
 
@@ -1376,27 +1373,20 @@ def symbol_module() -> types.ModuleType:
 
 
 def fixture_inspections(module: types.ModuleType, platform: str, native: dict[str, Path]) -> dict[str, dict]:
-    coverage = {"compile_units": 1, "line_tables": 1, "source_less_compile_units": 0, "no_line_compile_units": 0} if platform == "x86_64-unknown-linux-gnu" else {"slices": ["arm64", "x86_64"], "auxiliary_source_records": 0} if platform.endswith("apple-darwin") else {"dbi_stream": 3, "file_records": 1, "module_c13_records": 0, "environment_records": 0}
-    kind = {"x86_64-unknown-linux-gnu": "elf-dwarf", "x86_64-apple-darwin": "macho-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
+    coverage = {"compile_units": 1, "line_tables": 1, "source_less_compile_units": 0, "no_line_compile_units": 0} if platform == "x86_64-unknown-linux-gnu" else {"slices": ["arm64"], "auxiliary_source_records": 0} if platform.endswith("apple-darwin") else {"dbi_stream": 3, "file_records": 1, "module_c13_records": 0, "environment_records": 0}
+    kind = {"x86_64-unknown-linux-gnu": "elf-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
     return {name: {"schema": module.SOURCE_INSPECTION_SCHEMA, "format": kind, "native_inspection_sha256": module.digest(path), "coverage": coverage, "source_paths": [f"/work/crates/{name.removeprefix('focusforge-')}/src/main.rs"]} for name, path in native.items()}
 
 
-def universal_macho() -> bytes:
-    uuids = (bytes.fromhex("00000000000000000000000000000001"), bytes.fromhex("11111111111111111111111111111111"))
-    slices = [struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + identifier for cpu, identifier in zip((0x1000007, 0x100000C), uuids)]
-    data = bytearray(12288)
-    struct.pack_into(">II", data, 0, 0xCAFEBABE, 2)
-    for index, (cpu, payload) in enumerate(zip((0x1000007, 0x100000C), slices)):
-        offset = 4096 * (index + 1)
-        struct.pack_into(">IIIII", data, 8 + index * 20, cpu, 3, offset, len(payload), 12)
-        data[offset:offset + len(payload)] = payload
-    return bytes(data)
+def thin_macho() -> bytes:
+    identifier = bytes.fromhex("00000000000000000000000000000001")
+    return struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + identifier
 
 
 def write_dsym(path: Path, name: str) -> None:
     dwarf = path / "Contents/Resources/DWARF" / name
     dwarf.parent.mkdir(parents=True, exist_ok=True)
-    dwarf.write_bytes(universal_macho())
+    dwarf.write_bytes(thin_macho())
     (path / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": name}))
 
 
@@ -1481,13 +1471,12 @@ def macos_checker_mock() -> None:
         gui = binary / "focusforge-gui"
         gui.write_text(gui.read_text() + "if [ \"$1\" = --exit-after ]; then while [ $# -gt 0 ]; do if [ \"$1\" = --screenshot ]; then printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\000\\001\\000\\000\\000\\001' > \"$2\"; exit 0; fi; shift; done; exit 64; fi\n")
         symbols = directory / "symbols"
-        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
-            write_macos_symbols(symbols / target, target)
+        write_macos_symbols(symbols / "aarch64-apple-darwin", "aarch64-apple-darwin")
         (app / "Info.plist").write_text("stub")
         template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
         stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
         bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
-        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-x86_64 arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O universal binary with 2 architectures: [x86_64] [arm64]'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
+        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
         for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
         info_file.write_text(info)
         checker_copy = directory / "tools/check-package-macos.sh"
@@ -1527,10 +1516,10 @@ def macos_checker_mock() -> None:
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0
         shutil.copy(ROOT / "LICENSE", template_resources / "LICENSE")
-        (symbols / "x86_64-apple-darwin/native/focusforge-cli.dSYM/Contents/Resources/DWARF/focusforge-cli").write_bytes(b"wrong")
+        (symbols / "aarch64-apple-darwin/native/focusforge-cli.dSYM/Contents/Resources/DWARF/focusforge-cli").write_bytes(b"wrong")
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0
-        write_macos_symbols(symbols / "x86_64-apple-darwin", "x86_64-apple-darwin")
+        write_macos_symbols(symbols / "aarch64-apple-darwin", "aarch64-apple-darwin")
         info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0 and log.read_text().count("detach") == 13
@@ -1548,18 +1537,18 @@ def macos_producer_mock() -> None:
         shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
         shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
         producer_copy = tools / "package-macos.sh"; producer_copy.write_text((ROOT / "tools/package-macos.sh").read_text())
-        macho = root / "macho"; macho.write_bytes(universal_macho())
-        dump_syms = mock / "dump_syms"; dump_syms.write_text("#!/usr/bin/env bash\nset -euo pipefail\nbinary=${!#}; store= arch=\nwhile (($#)); do case $1 in --store|--arch) [[ $1 == --store ]] && store=$2 || arch=$2; shift 2;; *) shift;; esac; done\nname=$(basename \"$binary\")\ncase $arch in x86_64) id=000000000000000000000000000000010;; arm64) id=111111111111111111111111111111110;; *) exit 2;; esac\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Mac %s %s %s\\nFILE 0 crates/%s/src/main.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$arch\" \"$id\" \"$name\" \"${name#focusforge-}\" \"${name//-/_}\" > \"$store/$name/$id/$name.sym\"\n"); dump_syms.chmod(0o755)
+        macho = root / "macho"; macho.write_bytes(thin_macho())
+        dump_syms = mock / "dump_syms"; dump_syms.write_text("#!/usr/bin/env bash\nset -euo pipefail\nbinary=${!#}; store=\nwhile (($#)); do case $1 in --store) store=$2; shift 2;; *) shift;; esac; done\nname=$(basename \"$binary\")\nid=000000000000000000000000000000010\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Mac arm64 %s %s\\nFILE 0 crates/%s/src/main.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$id\" \"$name\" \"${name#focusforge-}\" \"${name//-/_}\" > \"$store/$name/$id/$name.sym\"\n"); dump_syms.chmod(0o755)
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
-            "lipo": "#!/usr/bin/env bash\nif [[ $1 == -archs ]]; then echo \"${MOCK_ARCHES:-x86_64 arm64}\"; else while (($#)); do if [[ $1 == -output ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done; fi\n",
+            "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
             "hdiutil": "#!/usr/bin/env bash\n[[ -z ${MOCK_HDIUTIL_FAIL:-} ]] || exit 77; touch \"${!#}\"\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
             "shasum": "#!/usr/bin/env bash\nsha256sum \"${!#}\"\n",
             "git": "#!/usr/bin/env bash\necho 0123456789abcdef0123456789abcdef01234567\n",
             "dsymutil": "#!/usr/bin/env bash\nsource=$1; while (($#)); do if [[ $1 == -o ]]; then mkdir -p \"$2/Contents/Resources/DWARF\"; cp \"$MOCK_MACHO\" \"$2/Contents/Resources/DWARF/$(basename \"$source\")\"; printf '<plist version=\"1.0\"><dict/></plist>\\n' > \"$2/Contents/Info.plist\"; exit 0; fi; shift; done\n",
             "strip": "#!/usr/bin/env bash\nwhile (($#)); do if [[ $1 == -o ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done\n",
-            "dwarfdump": "#!/usr/bin/env bash\ncase \" $* \" in *' --debug-info '*) root=${MOCK_DWARF_ROOT:-/work}; cat <<EOF\n0x00000000: DW_TAG_compile_unit\n              DW_AT_name (\"$root/crates/cli/src/main.rs\")\n              DW_AT_comp_dir (\"$root\")\n              DW_AT_stmt_list (0x00000000)\n.debug_line[0x00000000]\ninclude_directories[1] = \"$root/crates/cli/src\"\nfile_names[1] = {\n  name: \"main.rs\"\n  dir_index: 1\n}\nEOF\n;; *) printf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\";; esac\n",
+            "dwarfdump": "#!/usr/bin/env bash\ncase \" $* \" in *' --debug-info '*) root=${MOCK_DWARF_ROOT:-/work}; cat <<EOF\n0x00000000: DW_TAG_compile_unit\n              DW_AT_name (\"$root/crates/cli/src/main.rs\")\n              DW_AT_comp_dir (\"$root\")\n              DW_AT_stmt_list (0x00000000)\n.debug_line[0x00000000]\ninclude_directories[1] = \"$root/crates/cli/src\"\nfile_names[1] = {\n  name: \"main.rs\"\n  dir_index: 1\n}\nEOF\n;; *) printf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\";; esac\n",
             "python3": f"#!/usr/bin/env bash\nif [[ $2 == install ]]; then echo '{dump_syms}'; exit 0; fi\nexec /usr/bin/python3 \"$@\"\n",
             "mv": "#!/usr/bin/env bash\nif [[ ${MOCK_MV_PROMOTION_FAIL:-} && $1 == *.next && $2 == */macos ]]; then exit 77; fi; exec /bin/mv \"$@\"\n",
         }
@@ -1569,10 +1558,9 @@ def macos_producer_mock() -> None:
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 0, result.stderr
         output = root / "target/distrib/native/macos"
-        artifact = output / "FocusForge-0.1.0-universal.dmg"; receipt = output / "native-receipt.json"
+        artifact = output / "FocusForge-0.1.0-aarch64.dmg"; receipt = output / "native-receipt.json"
         assert artifact.exists() and receipt.exists()
-        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
-            call(["/usr/bin/python3", str(tools / "package-symbols.py"), "verify", str(output / "symbols" / target)])
+        call(["/usr/bin/python3", str(tools / "package-symbols.py"), "verify", str(output / "symbols/aarch64-apple-darwin")])
         original = artifact.read_bytes(), receipt.read_bytes()
         env["MOCK_DWARF_ROOT"] = "/private checkout.Åsa"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
