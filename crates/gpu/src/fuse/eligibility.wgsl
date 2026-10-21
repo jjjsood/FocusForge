@@ -3,8 +3,9 @@
 // The GPU twins of the coverage rule in `focusforge_core::fuse::laplacian::
 // Laplacian::fuse`; `per_pixel` is one `u32` per pixel, `data` `spp` `f32`.
 // `exclude` writes `fill` over the pixels whose `per_pixel` is 0 (`-inf` into
-// a score, `0.0` into a residual); `mean_by_count` divides by `per_pixel`,
-// leaving 0 where it is 0.
+// a score, `0.0` into a residual); `mean_by_count` turns the compensated
+// residual sum `(data, lo)` of `residual.wgsl` into its mean with one division
+// per half, `data / n + lo / n`, leaving 0 where `per_pixel` is 0.
 
 struct Params {
     len: u32,
@@ -16,6 +17,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read> per_pixel: array<u32>;
 @group(0) @binding(1) var<storage, read_write> data: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> lo: array<f32>;
 
 @compute @workgroup_size(64)
 fn exclude(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -38,6 +40,6 @@ fn mean_by_count(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (n == 0u) {
         data[i] = 0.0;
     } else {
-        data[i] = data[i] / f32(n);
+        data[i] = data[i] / f32(n) + lo[i] / f32(n);
     }
 }

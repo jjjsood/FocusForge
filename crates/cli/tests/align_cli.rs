@@ -273,6 +273,8 @@ fn max_host_memory_bounds_the_alignment_workers() {
             "--json",
             "--set",
             "max-iterations=20",
+            "--set",
+            "reference-policy=anchor",
             "--max-host-memory",
             &cap.to_string(),
         ]);

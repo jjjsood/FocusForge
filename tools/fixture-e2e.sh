@@ -69,11 +69,12 @@ echo "OK: fact present -- mmap fast path: yes"
 
 # `align`, cheap: `--algorithm pyramidal-ecc` is explicit because the all-targets
 # debug build also registers a test algorithm, which makes the bare default
-# ambiguous. The default fallback records divergent frames against the
-# middle anchor. Never a `stack` invocation here: that is
-# minutes of debug-profile fusion this cheap gate must not pay for.
-echo "+ $CLI align fixtures/mantis-512 --algorithm pyramidal-ecc --json"
-ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --json)"
+# ambiguous. `reference-policy=anchor` is explicit because the pinned counts
+# below are those of registering every frame against the middle anchor. The
+# default fallback records divergent frames. Never a `stack` invocation here:
+# that is minutes of debug-profile fusion this cheap gate must not pay for.
+echo "+ $CLI align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json"
+ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json)"
 
 printf '%s' "$ALIGN_OUT" | grep -q '"frame_count": 8' \
   || { echo "FAIL: fixture e2e -- align missing fact: frame_count 8" >&2; exit 1; }

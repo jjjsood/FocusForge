@@ -41,11 +41,17 @@ fn stack_context(stack: &TiffStack) -> StackContext {
 }
 
 /// Fully resolved defaults for `PyramidalEcc`, `max-iterations` then lowered
-/// to 40 by every caller here (see the module docs).
+/// to 40 by every caller here (see the module docs), under the anchor policy
+/// these tests exercise.
 fn resolved_defaults(ctx: &StackContext) -> ParamValues {
     let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
         .expect("defaults resolve cleanly");
-    params::resolved_values(&resolved)
+    let mut cfg = params::resolved_values(&resolved);
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
+    cfg
 }
 
 fn lowered_max_iterations(ctx: &StackContext) -> ParamValues {

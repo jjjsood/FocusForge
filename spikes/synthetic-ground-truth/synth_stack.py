@@ -533,7 +533,8 @@ def direction_check_impulse(verbose=True):
 
 
 def run_align(out_dir, algo, mode, lax):
-    cmd = [CLI, "align", out_dir, "--json", "--algorithm", algo, "--set", f"mode={mode}"]
+    cmd = [CLI, "align", out_dir, "--json", "--algorithm", algo, "--set", f"mode={mode}",
+           "--set", "reference-policy=anchor"]
     if not lax:
         cmd.append("--strict")
     r = subprocess.run(cmd, capture_output=True, text=True)

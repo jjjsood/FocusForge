@@ -3321,6 +3321,19 @@ fn controller_on_mantis_512(name: &str) -> AppController {
     controller
 }
 
+/// [`controller_on_mantis_512`] with the default aligner's `anchor` reference
+/// policy, which parks the run at its Keep/Discard question at a fraction of
+/// the `chain` policy's cost.
+fn divergent_controller_on_mantis_512(name: &str) -> AppController {
+    let mut controller = controller_on_mantis_512(name);
+    controller.set_param_value(
+        "align",
+        "reference-policy",
+        focusforge_core::params::ParamValue::Enum("anchor".to_string()),
+    );
+    controller
+}
+
 #[test]
 fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
     let mut controller = controller_on_mantis_512("default_fuse_mantis_512");
@@ -3331,14 +3344,14 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         "a default fuse completes rather than failing"
     );
     assert_eq!(controller.checkpoint_count(), Some(0));
-    let names = ["00.tif", "01.tif", "06.tif", "07.tif"].map(String::from);
+    let names = ["00.tif", "01.tif"].map(String::from);
     assert_eq!(controller.pending_divergence(), Some(&names[..]));
 
     controller.keep_fused().expect("a parked run keeps");
     let job::RunState::Fused { at, unaligned } = controller.job_view().state else {
         panic!("a kept run settles to Fused");
     };
-    assert_eq!(unaligned, 4);
+    assert_eq!(unaligned, 2);
     assert_eq!(
         job::stage_word(&controller.job_view().state, None),
         format!("fused {at}"),
@@ -3347,16 +3360,16 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
     let kept: Vec<_> = controller
         .notifications()
         .iter()
-        .filter(|n| n.title == "4 frames unaligned")
+        .filter(|n| n.title == "2 frames unaligned")
         .collect();
     assert_eq!(kept.len(), 1, "keeping records the count once");
-    assert!(kept[0].message.contains("4 frames unaligned"));
+    assert!(kept[0].message.contains("2 frames unaligned"));
     let summary = controller.last_alignment().expect("a completed run");
     assert_eq!(
         (summary.source.as_str(), summary.backend.as_str()),
         ("computed", "cpu")
     );
-    assert_eq!(summary.unaligned, 4);
+    assert_eq!(summary.unaligned, 2);
     assert_eq!(summary.rerun, None);
 }
 
@@ -3380,7 +3393,7 @@ fn settle_until_parked(controller: &mut AppController) {
     }
 }
 
-const MANTIS_512_UNALIGNED: [&str; 4] = ["00.tif", "01.tif", "06.tif", "07.tif"];
+const MANTIS_512_UNALIGNED: [&str; 2] = ["00.tif", "01.tif"];
 const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
 
 /// Tab 0 (mantis-512) parks at its question; `tails` are the tabs queued
@@ -6941,7 +6954,7 @@ fn brush_cursor_hidden_under_every_modal() {
     // divergent run on a tab already holding a checkpoint, and
     // `brush_cursor_view` has no mode check either way.
     {
-        let mut c = controller_on_mantis_512("cursor_divergence");
+        let mut c = divergent_controller_on_mantis_512("cursor_divergence");
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(
             c.brush_cursor_view().is_some(),
@@ -7076,7 +7089,7 @@ fn canvas_input_blocked_under_every_modal() {
         c.toggle_projects_overlay();
     }
     {
-        let mut c = controller_on_mantis_512("blocked_divergence");
+        let mut c = divergent_controller_on_mantis_512("blocked_divergence");
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(c.start_fuse());
         settle_all(&mut c);
@@ -9030,11 +9043,11 @@ mod notification {
         let kept: Vec<_> = controller
             .notifications()
             .iter()
-            .filter(|n| n.title == "4 frames unaligned")
+            .filter(|n| n.title == "2 frames unaligned")
             .collect();
         assert_eq!(kept.len(), 1, "Keep records the count once");
         assert_eq!(kept[0].kind, Kind::Warning);
-        assert!(kept[0].message.contains("4 frames unaligned"));
+        assert!(kept[0].message.contains("2 frames unaligned"));
         assert!(kept[0].project_title.is_some());
     }
 

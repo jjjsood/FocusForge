@@ -481,7 +481,7 @@ prevent.
     "display_name": "Pyramidal ECC",
     "params": [{ "id": "mode", "value": "rotation-scale", "provenance": "Default" }],
     "reference": 3,
-    "reference_policy": "anchor",
+    "reference_policy": "chain",
     "failure_policy": "lax",
     "failure_count": 3,
     "alignments": [
@@ -552,7 +552,7 @@ exit 1, naming every failed frame.
 ```
 $ focusforge-cli align path/to/frames --algorithm pyramidal-ecc
 path/to/frames (8 frames)
-pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=lax failures=0)
+pyramidal-ecc - Pyramidal ECC (reference=3 policy=Chain failure_policy=lax failures=0)
 rho = ECC correlation in [-1, 1], not a pixel distance
 00.tif    tx=+12.41 ty=-3.07 scale=1.000842 rot=+0.0131deg  converged iters=12 rho=0.9814
 ...
@@ -597,7 +597,7 @@ by construction) -- always numbers here, since every `align` run computes.
   "display_name": "Pyramidal ECC",
   "params": [{ "id": "mode", "value": "rotation-scale", "provenance": "Default" }],
   "reference": 3,
-  "reference_policy": "anchor",
+  "reference_policy": "chain",
   "failure_policy": "lax",
   "failure_count": 1,
   "alignments": [

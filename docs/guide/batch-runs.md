@@ -114,7 +114,11 @@ Windows equivalent, so pausing is Unix-only there.
 A run's alignment result is kept in a stage cache under
 `.scratch/stage-cache/`, keyed by the frames and alignment parameters that
 produced it, so a re-run that changes only a fusion parameter (`--only`
-plus `--set`) skips a costly re-solve. `--no-cache` skips the cache
+plus `--set`) skips a costly re-solve. The frames are told apart by their
+content: a stack whose files have the same content hits even when moved,
+renamed, copied elsewhere or touched, while frames that were reshot or
+rewritten (even with the same size and settings) are aligned afresh.
+`--no-cache` skips the cache
 entirely for one run, reading nothing from it and leaving nothing behind;
 `focusforge-cli cache clear` empties it without touching any project or a
 `--resume` run's own recoverable state.

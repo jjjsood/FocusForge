@@ -38,6 +38,11 @@
 //! *coarse* levels, where the region is most of the (small) level; the
 //! budgeted level-0 pass only refines an estimate already close.
 //!
+//! Level 0's budget is [`LEVEL0_REGION_PIXELS`], the footprint level 1 solves
+//! over at full resolution: a smaller rect follows its own centre away from
+//! the level-1 fit (a jump of 40 px and more at 2^20 px on a 33-frame
+//! 5230x2868 stack, a 0.03 px median move at this budget).
+//!
 //! # Level-0 windows
 //!
 //! Level 0 is never resident. The reference template is prepared from the
@@ -155,13 +160,18 @@ const MIN_VALID_FRACTION: f64 = 0.75;
 const COARSE_EPSILON_FACTOR: f64 = 100.0;
 
 /// The fraction of each level axis [`PyramidalEcc::solve_region`] covers,
-/// before the [`MAX_REGION_PIXELS`] budget shrink.
+/// before the sample budget shrink.
 const REGION_FRACTION: f64 = 0.75;
 
-/// The sample budget [`PyramidalEcc::solve_region`] never exceeds: at
-/// 8192x5464 this turns a naive 6144x4098 (75%) rect into ~1253x836, a 43x
-/// reduction in per-iteration taps.
+/// The sample budget of a coarse level's solve region: at 8192x5464, level 1
+/// (4096x2732) has a 75 % rect of 3072x2049 that shrinks to ~1253x836.
 const MAX_REGION_PIXELS: u32 = 1 << 20;
+
+/// The sample budget of the level-0 solve region: four times
+/// [`MAX_REGION_PIXELS`], the footprint a capped level 1 covers at full
+/// resolution. Its four-column rotation-scale Jacobian, 16 B per pixel, stays
+/// at 64 MiB.
+const LEVEL0_REGION_PIXELS: u32 = 4 * MAX_REGION_PIXELS;
 
 /// The fewest solve-region pixels at which a level is offered to an align
 /// backend. Smaller levels cost less to solve than to hand over.
@@ -317,7 +327,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                     },
                 ],
             },
-            default: ParamValue::Enum("anchor".to_string()),
+            default: ParamValue::Enum("chain".to_string()),
             advanced: true,
             auto: None,
             host_default: None,
@@ -405,7 +415,7 @@ pub(crate) fn retained_template_bytes(width: u32, height: u32) -> u64 {
     let levels: u64 = (0..=MAX_LEVELS)
         .map(|k| {
             let region =
-                PyramidalEcc::solve_region(width.div_ceil(1 << k), height.div_ceil(1 << k));
+                PyramidalEcc::solve_region(width.div_ceil(1 << k), height.div_ceil(1 << k), k);
             region.width as u64 * region.height as u64 * (4 + 8 * 4 + 8)
         })
         .sum();
@@ -441,7 +451,7 @@ pub(crate) fn seed_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
 /// the luma plus the scratch plane smoothing works in) and the largest
 /// off-centre patch window at `4 + 2 * spp` bytes per pixel.
 pub(crate) fn solve_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
-    let region = PyramidalEcc::solve_region(width, height);
+    let region = PyramidalEcc::solve_region(width, height, 0);
     let per_px = 4 + 2 * spp as u64;
     let reach = LEVEL0_WINDOW_LIMIT_PX + LEVEL0_SMOOTHING_RADIUS_PX;
     let window_w = (region.width + 2 * reach).min(width) as u64;
@@ -460,18 +470,24 @@ pub struct PyramidalEcc;
 
 impl PyramidalEcc {
     /// The region [`solve_level`](crate::align::solve_level) solves over at
-    /// one `width x height` pyramid level: a centred rect covering
+    /// pyramid `level`, `width x height` pixels: a centred rect covering
     /// [`REGION_FRACTION`] of each axis, shrunk (aspect ratio preserved,
     /// about its own centre) so its pixel count never exceeds
-    /// [`MAX_REGION_PIXELS`]. On a 512px level:
+    /// [`LEVEL0_REGION_PIXELS`] at level 0 and [`MAX_REGION_PIXELS`] above it.
+    /// On a 512px level:
     /// `Rect { x: 64, y: 64, width: 384, height: 384 }`.
-    fn solve_region(width: u32, height: u32) -> Rect {
+    fn solve_region(width: u32, height: u32, level: u32) -> Rect {
+        let budget = if level == 0 {
+            LEVEL0_REGION_PIXELS
+        } else {
+            MAX_REGION_PIXELS
+        };
         let raw_w = ((width as f64) * REGION_FRACTION).round().max(1.0) as u32;
         let raw_h = ((height as f64) * REGION_FRACTION).round().max(1.0) as u32;
 
         let count = raw_w as u64 * raw_h as u64;
-        let (shrunk_w, shrunk_h) = if count > MAX_REGION_PIXELS as u64 {
-            let factor = (MAX_REGION_PIXELS as f64 / count as f64).sqrt();
+        let (shrunk_w, shrunk_h) = if count > budget as u64 {
+            let factor = (budget as f64 / count as f64).sqrt();
             (
                 ((raw_w as f64 * factor).floor().max(1.0)) as u32,
                 ((raw_h as f64 * factor).floor().max(1.0)) as u32,
@@ -1309,7 +1325,7 @@ impl PreparedReference {
         let pyramid = PyramidalEcc::build_pyramid(ctx, reference, depth)?;
 
         let mut templates = Vec::with_capacity(depth as usize + 1);
-        let region = PyramidalEcc::solve_region(dims.0, dims.1);
+        let region = PyramidalEcc::solve_region(dims.0, dims.1, 0);
         let window = grown_clamped(region, 1, dims);
         let plane = read_level0_luma(ctx, reference, window, smooths_level0(region, dims))?;
         templates.push(EccTemplate::prepare(
@@ -1320,7 +1336,7 @@ impl PreparedReference {
         ));
         for k in 1..=depth as usize {
             let level = pyramid.level(k);
-            let region = PyramidalEcc::solve_region(level.width(), level.height());
+            let region = PyramidalEcc::solve_region(level.width(), level.height(), k as u32);
             templates.push(EccTemplate::prepare(level, (0, 0), region, mode));
         }
 
@@ -1541,7 +1557,7 @@ mod tests {
         let reference_policy = &algo.params()[4];
         assert_eq!(
             reference_policy.default,
-            ParamValue::Enum("anchor".to_string())
+            ParamValue::Enum("chain".to_string())
         );
         let reference_frame = &algo.params()[5];
         assert_eq!(
@@ -1563,7 +1579,7 @@ mod tests {
 
     #[test]
     fn solve_region_is_the_centred_three_quarters_at_512px() {
-        let region = PyramidalEcc::solve_region(512, 512);
+        let region = PyramidalEcc::solve_region(512, 512, 0);
         assert_eq!(
             region,
             Rect {
@@ -1577,14 +1593,15 @@ mod tests {
 
     #[test]
     fn retained_templates_sum_the_solve_regions_of_every_level() {
-        // Level regions at 8192x5464: 1253x836 on levels 0-2 (the sample
-        // budget binds), then the 0.75 share of each halved level; 44 bytes
-        // per pixel (values, Jacobian, full-overlap terms).
+        // Level regions at 8192x5464: 2507x1672 on level 0 and 1253x836 on
+        // levels 1-2 (their sample budgets bind), then the 0.75 share of each
+        // halved level from level 3 (768x512) on; 44 bytes per pixel (values,
+        // Jacobian, full-overlap terms).
         // The eight 384 px (128 px at 512) patch templates, 28 bytes per
         // pixel, and the reference's 2000 features (72 bytes each) come on top.
         assert_eq!(
             retained_template_bytes(8192, 5464),
-            161_361_640 + 8 * 384 * 384 * 28 + 2000 * 72
+            299_706_264 + 8 * 384 * 384 * 28 + 2000 * 72
         );
         assert_eq!(
             retained_template_bytes(512, 512),
@@ -1605,11 +1622,11 @@ mod tests {
         );
         assert_eq!(
             solve_scratch_bytes(8192, 5464, 3),
-            24 * 1253 * 836 + 1777 * 1360 * 10 + 772 * 772 * 10
+            24 * 2507 * 1672 + 3031 * 2196 * 10 + 772 * 772 * 10
         );
         assert_eq!(
             solve_scratch_bytes(8192, 5464, 1),
-            24 * 1253 * 836 + 1777 * 1360 * 8 + 772 * 772 * 6
+            24 * 2507 * 1672 + 3031 * 2196 * 8 + 772 * 772 * 6
         );
     }
 
@@ -1795,10 +1812,10 @@ mod tests {
     fn a_solve_region_within_the_smoothing_reach_of_an_edge_reads_level_zero_unsmoothed() {
         // 40 px: the region starts 5 px in, short of the 7 px the smoothing
         // and the template's extra pixel need.
-        let region = PyramidalEcc::solve_region(40, 40);
+        let region = PyramidalEcc::solve_region(40, 40, 0);
         assert_eq!(region.x, 5);
         assert!(!smooths_level0(region, (40, 40)));
-        assert!(smooths_level0(PyramidalEcc::solve_region(W, H), (W, H)));
+        assert!(smooths_level0(PyramidalEcc::solve_region(W, H, 0), (W, H)));
 
         let mem = reader(40, 40, &[(0.0, 0.0), (1.0, 0.0)], false);
         let ctx = AlignContext::new(StackContext::new(2, 40, 40, 1), 0, &mem);
@@ -1813,7 +1830,7 @@ mod tests {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0), (80.0, 3.0)], false);
         let ctx = AlignContext::new(StackContext::new(3, W, H, 1), 0, &mem);
         let reference = smoothed(&whole_plane(&ctx, 0));
-        let region = PyramidalEcc::solve_region(W, H);
+        let region = PyramidalEcc::solve_region(W, H, 0);
         let params = test_params(6);
 
         for mode in [EccMode::Translation, EccMode::Similarity] {
@@ -1859,7 +1876,7 @@ mod tests {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0)], false);
         let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
         let reference = smoothed(&whole_plane(&ctx, 0));
-        let region = PyramidalEcc::solve_region(W, H);
+        let region = PyramidalEcc::solve_region(W, H, 0);
         let template =
             EccTemplate::prepare(&reference, (0, 0), region, EccMode::Translation).unwrap();
         let seed = Transform::translation(5000.0, 0.0);
@@ -1887,7 +1904,7 @@ mod tests {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0)], false);
         let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
         let reference = smoothed(&whole_plane(&ctx, 0));
-        let region = PyramidalEcc::solve_region(W, H);
+        let region = PyramidalEcc::solve_region(W, H, 0);
         let template =
             EccTemplate::prepare(&reference, (0, 0), region, EccMode::Translation).unwrap();
         let params = test_params(8);
@@ -2035,16 +2052,28 @@ mod tests {
 
     #[test]
     fn solve_region_respects_the_sample_budget() {
-        let region = PyramidalEcc::solve_region(8192, 5464);
-        let count = region.width as u64 * region.height as u64;
+        let pixels = |r: Rect| u64::from(r.width) * u64::from(r.height);
+        let level0 = PyramidalEcc::solve_region(8192, 5464, 0);
         assert!(
-            count <= MAX_REGION_PIXELS as u64,
-            "region {region:?} holds {count} px, over the {MAX_REGION_PIXELS} budget"
+            pixels(level0) <= LEVEL0_REGION_PIXELS as u64,
+            "region {level0:?} is over the {LEVEL0_REGION_PIXELS} budget"
         );
         // Shrinking the naive 6144x4098 (75%) rect by
-        // sqrt(2^20 / (6144*4098)) and flooring yields exactly this.
-        assert_eq!(region.width, 1253);
-        assert_eq!(region.height, 836);
+        // sqrt(4 * 2^20 / (6144*4098)) and flooring yields exactly this.
+        assert_eq!((level0.width, level0.height), (2507, 1672));
+
+        let level1 = PyramidalEcc::solve_region(4096, 2732, 1);
+        assert!(
+            pixels(level1) <= MAX_REGION_PIXELS as u64,
+            "region {level1:?} is over the {MAX_REGION_PIXELS} budget"
+        );
+        assert_eq!((level1.width, level1.height), (1253, 836));
+
+        // An uncapped level-0 rect is the footprint level 1 solves over.
+        let level0 = PyramidalEcc::solve_region(2400, 1320, 0);
+        let level1 = PyramidalEcc::solve_region(1200, 660, 1);
+        assert_eq!((level0.width, level0.height), (1800, 990));
+        assert_eq!((level1.width * 2, level1.height * 2), (1800, 990));
     }
 
     /// Frames of the blob scene, each moved by its shift: feature-rich, unlike
@@ -2232,7 +2261,7 @@ mod tests {
     /// The largest distance between where `fit` and `truth` send the corners
     /// of the level-0 solve region.
     fn corner_error_px(fit: &Transform, truth: &Transform) -> f64 {
-        let region = PyramidalEcc::solve_region(W, H);
+        let region = PyramidalEcc::solve_region(W, H, 0);
         let (x0, y0) = (f64::from(region.x), f64::from(region.y));
         let (x1, y1) = (x0 + f64::from(region.width), y0 + f64::from(region.height));
         [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
@@ -2753,9 +2782,10 @@ mod tests {
     fn ecc_level_routing_skips_small_regions() {
         const BIG_W: u32 = 1700;
         const BIG_H: u32 = 1100;
-        let region0 = PyramidalEcc::solve_region(BIG_W, BIG_H);
-        let region1 = PyramidalEcc::solve_region(BIG_W / 2, BIG_H / 2);
+        let region0 = PyramidalEcc::solve_region(BIG_W, BIG_H, 0);
+        let region1 = PyramidalEcc::solve_region(BIG_W / 2, BIG_H / 2, 1);
         let pixels = |r: Rect| u64::from(r.width) * u64::from(r.height);
+        assert_eq!((region0.width, region0.height), (1275, 825));
         assert!(pixels(region0) >= ECC_BACKEND_MIN_REGION_PX);
         assert!(pixels(region1) < ECC_BACKEND_MIN_REGION_PX);
 

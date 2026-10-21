@@ -66,7 +66,10 @@ pub use append::{
     AppendRequest, Deleted, append, append_at, append_op_chain, append_ops, append_ops_at,
     append_ops_onto, delete_checkpoint,
 };
-pub use blob::{FileStamp, Plane, StagedBlob, short_hash, source_hash, stack_fingerprint};
+pub use blob::{
+    FileStamp, Plane, StagedBlob, short_hash, source_hash, source_hash_change_checked,
+    stack_fingerprint,
+};
 pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
 pub use container::partial_path;
 use container::{ContainerWriter, Index};
