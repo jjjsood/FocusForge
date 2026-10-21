@@ -145,26 +145,26 @@ pub fn select(
     );
 }
 
-fn residual_params(len: u32, frame_count: f32) -> [u8; 16] {
+fn residual_params(len: u32) -> [u8; 16] {
     let mut bytes = [0u8; 16];
     bytes[0..4].copy_from_slice(&len.to_le_bytes());
-    bytes[4..8].copy_from_slice(&frame_count.to_le_bytes());
+    bytes[4..8].copy_from_slice(&1.0f32.to_le_bytes());
     bytes
 }
 
-/// `sum += value`, elementwise -- the GPU twin of the CPU residual sum.
-/// Every frame (including frame 0) runs through this identically; see the
-/// module docs of `crate::fuse` for why that is bit-identical to the CPU
-/// twin's "seed from frame 0, then fold in the rest".
+/// `(hi, lo) += value`, elementwise, as an exact two-sum -- the GPU twin of
+/// the CPU residual sum. Every frame (including frame 0) runs through this
+/// identically; `hi` and `lo` start zeroed, and `hi + lo` is the running sum.
 pub fn accumulate(
     batch: &mut TileBatch,
     pipelines: &FusionPipelines,
-    sum: &wgpu::Buffer,
+    hi: &wgpu::Buffer,
+    lo: &wgpu::Buffer,
     value: &wgpu::Buffer,
     len: u32,
 ) {
     let pipeline = pipelines.residual_accumulate(batch.device());
-    let params_buffer = batch.params(&residual_params(len, 0.0));
+    let params_buffer = batch.params(&residual_params(len));
     let entries = [
         wgpu::BindGroupEntry {
             binding: 0,
@@ -172,11 +172,15 @@ pub fn accumulate(
         },
         wgpu::BindGroupEntry {
             binding: 1,
-            resource: sum.as_entire_binding(),
+            resource: hi.as_entire_binding(),
         },
         wgpu::BindGroupEntry {
             binding: 2,
             resource: params_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: lo.as_entire_binding(),
         },
     ];
     batch.record(
@@ -184,36 +188,6 @@ pub fn accumulate(
         &entries,
         len,
         "focusforge-gpu-fuse-residual-accumulate-pass",
-    );
-}
-
-/// `sum /= frame_count`, elementwise, in place -- the GPU twin of the CPU
-/// residual mean. Binds only `sum` (1) and `params` (2) via
-/// `crate::fuse::shape_d`, whose doc covers why `value` (0) stays unbound.
-pub fn mean(
-    batch: &mut TileBatch,
-    pipelines: &FusionPipelines,
-    sum: &wgpu::Buffer,
-    len: u32,
-    frame_count: f32,
-) {
-    let pipeline = pipelines.residual_mean(batch.device());
-    let params_buffer = batch.params(&residual_params(len, frame_count));
-    let entries = [
-        wgpu::BindGroupEntry {
-            binding: 1,
-            resource: sum.as_entire_binding(),
-        },
-        wgpu::BindGroupEntry {
-            binding: 2,
-            resource: params_buffer.as_entire_binding(),
-        },
-    ];
-    batch.record(
-        pipeline,
-        &entries,
-        len,
-        "focusforge-gpu-fuse-residual-mean-pass",
     );
 }
 
@@ -250,23 +224,41 @@ pub fn exclude(
     );
 }
 
-/// `sum /= count` per pixel, in place, 0 where `count` (one `u32` per pixel)
-/// is 0 -- the GPU twin of the masked residual mean in `Laplacian::fuse`.
+/// `hi = hi / count + lo / count` per pixel, in place, 0 where `count` (one
+/// `u32` per pixel) is 0 -- the GPU twin of the residual mean in
+/// `Laplacian::fuse`, leaving the mean in `hi`.
 pub fn mean_by_count(
     batch: &mut TileBatch,
     pipelines: &FusionPipelines,
-    sum: &wgpu::Buffer,
+    hi: &wgpu::Buffer,
+    lo: &wgpu::Buffer,
     count: &wgpu::Buffer,
     len: u32,
     spp: u32,
 ) {
-    let device = batch.device();
-    run_eligibility(
-        batch,
-        pipelines.eligibility_mean_by_count(device),
-        sum,
-        count,
-        eligibility_params(len, spp, 0.0),
+    let pipeline = pipelines.eligibility_mean_by_count(batch.device());
+    let params_buffer = batch.params(&eligibility_params(len, spp, 0.0));
+    let entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: count.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: hi.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: params_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: lo.as_entire_binding(),
+        },
+    ];
+    batch.record(
+        pipeline,
+        &entries,
         len,
         "focusforge-gpu-fuse-eligibility-mean-by-count-pass",
     );

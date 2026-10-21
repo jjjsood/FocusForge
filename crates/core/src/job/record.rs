@@ -101,7 +101,7 @@ impl AlignIdentity {
 /// The alignment solver's revision. Bump it on any change that can move an
 /// aligned transform or a frame's status, so alignments computed before the
 /// change are neither reused from the stage cache nor resumed.
-pub const ALIGN_SOLVER_VERSION: u32 = 5;
+pub const ALIGN_SOLVER_VERSION: u32 = 6;
 
 /// The field names on [`AlignIdentity`] that are **not** one of
 /// `AlignAlgorithm::params()`'s declared parameters -- the named exceptions

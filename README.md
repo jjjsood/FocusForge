@@ -161,8 +161,8 @@ per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 ## Documentation
 
 See [`docs/`](docs/README.md) for [getting started](docs/getting-started.md)
-and the guides (the window, stacking,
-alignment, retouching, checkpoint history, batch runs, diagnostics) and the
+and the guides (the window, stacking, alignment, retouching, checkpoint
+history, batch runs, diagnostics) and the
 reference for every `focusforge-cli` subcommand, the project format and the
 TIFF layouts it reads and writes.
 
@@ -178,6 +178,5 @@ is used under its GPLv3 licensing option, which is what makes the whole
 application GPLv3 rather than a more permissive license; dependency licenses
 are held to a compatible allowlist and enforced by `cargo deny check
 licenses`.
-
 This software is based in part on the work of the Independent JPEG Group,
 carried by the `jpeg-encoder` crate's JPEG export path.

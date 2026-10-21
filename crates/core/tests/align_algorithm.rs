@@ -17,8 +17,8 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
-    DivergenceReason, EccLevelRecord, EccStatus, FailurePolicy, PyramidalEcc, Transform,
-    align_stack,
+    DivergenceReason, EccLevelRecord, EccStatus, FailurePolicy, PyramidalEcc, StackAlignment,
+    Transform, align_stack,
 };
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
@@ -499,6 +499,12 @@ fn unregisterable_frame_follows_failure_policy() {
         "reference-frame".to_string(),
         ParamValue::Enum("first".to_string()),
     );
+    // A fallback frame reports identity only when it registers against the
+    // reference itself; a chained one keeps the transform of the hops before it.
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
 
     let make_reader = || FramesReader {
         width,
@@ -672,8 +678,8 @@ fn rejects_out_of_range_parameters() {
 }
 
 /// Opens `fixtures/mantis-512` with its `StackContext` and fully resolved
-/// [`PyramidalEcc`] defaults -- the setup both whole-fixture tests below
-/// share.
+/// [`PyramidalEcc`] defaults under the anchor policy -- the setup both
+/// whole-fixture tests below share, and the one their pinned statuses hold for.
 fn fixture_with_defaults() -> (TiffStack, StackContext, ParamValues) {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -683,7 +689,11 @@ fn fixture_with_defaults() -> (TiffStack, StackContext, ParamValues) {
         height,
         stack.header(0).samples_per_pixel,
     );
-    let cfg = resolved_defaults(&stack_ctx);
+    let mut cfg = resolved_defaults(&stack_ctx);
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
     (stack, stack_ctx, cfg)
 }
 
@@ -970,6 +980,412 @@ fn a_periodic_scene_never_reports_a_wrong_converged_fit() {
             "frame {} reports {:?} at {error} px against a {budget} px budget",
             frame.frame,
             frame.status
+        );
+    }
+}
+
+/// Hashes a lattice point to `[-1, 1]`.
+fn lattice(ix: i64, iy: i64, seed: u32) -> f64 {
+    let mut h = (ix as u32).wrapping_mul(0x9E37_79B1)
+        ^ (iy as u32).wrapping_mul(0x85EB_CA77)
+        ^ seed.wrapping_mul(0xC2B2_AE3D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^= h >> 15;
+    f64::from(h) / f64::from(u32::MAX) * 2.0 - 1.0
+}
+
+/// Smooth value noise of wavelength `period` px, in `[-1, 1]`, defined at
+/// every real coordinate.
+fn value_noise(x: f64, y: f64, period: f64, seed: u32) -> f64 {
+    let (u, v) = (x / period, y / period);
+    let (iu, iv) = (u.floor(), v.floor());
+    let fade = |t: f64| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let (fu, fv) = (fade(u - iu), fade(v - iv));
+    let (ix, iy) = (iu as i64, iv as i64);
+    let top = lattice(ix, iy, seed) * (1.0 - fu) + lattice(ix + 1, iy, seed) * fu;
+    let bottom = lattice(ix, iy + 1, seed) * (1.0 - fu) + lattice(ix + 1, iy + 1, seed) * fu;
+    top * (1.0 - fv) + bottom * fv
+}
+
+/// A multi-scale texture with detail at every pyramid level, in `[-1, 1]`,
+/// as a camera focused `sigma` px off the surface sees it: each octave of
+/// wavelength `p` keeps the share `exp(-2 pi^2 sigma^2 / p^2)` of its amplitude.
+fn blurred_scene(x: f64, y: f64, sigma: f64) -> f64 {
+    [
+        (256.0, 1.0),
+        (96.0, 0.8),
+        (40.0, 0.6),
+        (18.0, 0.4),
+        (9.0, 0.25),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, &(period, weight))| {
+        let kept = (-2.0 * std::f64::consts::PI.powi(2) * sigma * sigma / (period * period)).exp();
+        weight * kept * value_noise(x, y, period, 11 + i as u32)
+    })
+    .sum::<f64>()
+        / 2.2
+}
+
+fn textured_scene(x: f64, y: f64) -> f64 {
+    blurred_scene(x, y, 0.0)
+}
+
+/// One-sample frames of `scene`: frame 0 is the scene as is, frame 1 shows it
+/// moved by `warps[warp_at(x, y)]` at each frame-1 pixel. Per-pixel noise of
+/// about 0.5 % of full scale keeps the frames from being exact resamplings.
+fn warped_pair(
+    (width, height): (u32, u32),
+    scene: impl Fn(f64, f64) -> f64,
+    warps: &[Transform],
+    warp_at: impl Fn(u32, u32) -> usize,
+) -> FramesReader {
+    let inverses: Vec<Transform> = warps
+        .iter()
+        .map(|w| w.inverse().expect("a similarity is invertible"))
+        .collect();
+    let mut rng = XorShift32(0x5EED_0001);
+    let mut sample = |value: f64| {
+        let noise = f64::from(rng.next() % 321) - 160.0;
+        (value * 65_535.0 + noise).clamp(0.0, 65_535.0) as u16
+    };
+    let mut reference = Vec::with_capacity((width * height) as usize);
+    let mut moved = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            reference.push(sample(0.5 + 0.4 * scene(f64::from(x), f64::from(y))));
+            let (sx, sy) = inverses[warp_at(x, y)]
+                .map_point(f64::from(x), f64::from(y))
+                .expect("a similarity maps every pixel");
+            moved.push(sample(0.5 + 0.4 * scene(sx, sy)));
+        }
+    }
+    two_frame_reader(width, height, 1, reference, moved)
+}
+
+const REGION_FRAME: (u32, u32) = (2400, 1320);
+
+/// The level-0 solve region of [`REGION_FRAME`] under a 2^20-px sample budget.
+const BUDGET_REGION: Rect = Rect {
+    x: 510,
+    y: 280,
+    width: 1380,
+    height: 759,
+};
+
+/// The box inside [`BUDGET_REGION`] and clear of every off-centre patch whose
+/// content follows its own motion.
+const CENTRE_BOX: Rect = Rect {
+    x: 700,
+    y: 450,
+    width: 1000,
+    height: 420,
+};
+
+fn in_box(x: u32, y: u32) -> bool {
+    (CENTRE_BOX.x..CENTRE_BOX.x + CENTRE_BOX.width).contains(&x)
+        && (CENTRE_BOX.y..CENTRE_BOX.y + CENTRE_BOX.height).contains(&y)
+}
+
+/// `1` well inside `rect`, `0` outside it, fading over 30 px at its edge.
+fn rect_mask(rect: Rect, x: f64, y: f64) -> f64 {
+    let axis = |p: f64, lo: u32, len: u32| {
+        ((p - f64::from(lo)).min(f64::from(lo + len) - p) / 30.0).clamp(0.0, 1.0)
+    };
+    axis(x, rect.x, rect.width) * axis(y, rect.y, rect.height)
+}
+
+/// Share of its amplitude the scene keeps inside [`BUDGET_REGION`], and the
+/// amplitude of the texture over [`CENTRE_BOX`].
+const FAINT_SHARE: f64 = 0.12;
+const BOX_CONTRAST: f64 = 0.3;
+
+/// A scene that is faint inside [`BUDGET_REGION`] except for a contrasty
+/// texture over [`CENTRE_BOX`]: a solve over the budget region sees almost
+/// only the box, a solve over the 75 % footprint mostly the content around it.
+fn scene_with_contrasty_box(x: f64, y: f64) -> f64 {
+    let faint = 1.0 - (1.0 - FAINT_SHARE) * rect_mask(BUDGET_REGION, x, y);
+    let box_texture = (value_noise(x, y, 28.0, 101) + value_noise(x, y, 60.0, 102)) / 2.0;
+    faint * textured_scene(x, y) + rect_mask(CENTRE_BOX, x, y) * BOX_CONTRAST * box_texture
+}
+
+/// Aligns frame 1 of a two-frame `reader` against frame 0 at resolved
+/// defaults under the strict policy.
+fn strict_pair_alignment(reader: &FramesReader) -> StackAlignment {
+    let stack_ctx = StackContext::new(2, reader.width, reader.height, 1);
+    let mut cfg = resolved_defaults(&stack_ctx);
+    cfg.insert(
+        "reference-frame".to_string(),
+        ParamValue::Enum("first".to_string()),
+    );
+    align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        reader,
+        &cfg,
+        FailurePolicy::Strict,
+    )
+    .expect("the run completes")
+}
+
+/// The motion most of [`REGION_FRAME`] follows, and the one its centre box
+/// follows.
+fn region_warps() -> (Transform, Transform) {
+    let (cx, cy) = (
+        f64::from(REGION_FRAME.0) / 2.0,
+        f64::from(REGION_FRAME.1) / 2.0,
+    );
+    let outer = Transform::translation(9.0, -6.0).compose(&similarity_about(
+        1.004,
+        0.3f64.to_radians(),
+        cx,
+        cy,
+    ));
+    let inner = Transform::translation(-3.0, 4.0).compose(&outer);
+    (outer, inner)
+}
+
+/// The distance, in level-0 pixels, between the level-0 fit and the level-1
+/// fit lifted to level 0, at each of the eight off-centre patch centres.
+fn level0_moves_from_level1(levels: &[EccLevelRecord], (width, height): (u32, u32)) -> Vec<f64> {
+    let fit = |level: u32| {
+        let record = levels
+            .iter()
+            .find(|r| r.level == level)
+            .expect("the level was solved");
+        let up = Transform::similarity(2.0, 0.0, 0.0, 0.0);
+        let down = Transform::similarity(0.5, 0.0, 0.0, 0.0);
+        let mut at_level0 = record.result.transform;
+        for _ in 0..level {
+            at_level0 = up.compose(&at_level0).compose(&down);
+        }
+        at_level0
+    };
+    let (level0, level1) = (fit(0), fit(1));
+    let mut moves = Vec::new();
+    for (row, fy) in [0.2, 0.5, 0.8].iter().enumerate() {
+        for (col, fx) in [0.2, 0.5, 0.8].iter().enumerate() {
+            if (row, col) == (1, 1) {
+                continue;
+            }
+            let (x, y) = (f64::from(width) * fx, f64::from(height) * fy);
+            let a = level0.map_point(x, y).expect("level-0 fit stays in domain");
+            let b = level1.map_point(x, y).expect("level-1 fit stays in domain");
+            moves.push(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt());
+        }
+    }
+    moves
+}
+
+/// The 75 % footprint of [`REGION_FRAME`]: the level-0 solve region once its
+/// budget holds it whole, and what level 1 solves over.
+const FOOTPRINT: Rect = Rect {
+    x: 300,
+    y: 165,
+    width: 1800,
+    height: 990,
+};
+
+/// Measured with `-- --nocapture`: a corner error of `0.316` px over
+/// [`FOOTPRINT`]. Pinned at about twice that.
+const REGION_FIT_TOLERANCE_PX: f64 = 0.6;
+
+/// Measured: level 0 moves the level-1 fit by `0.025` px at the eight patch
+/// centres. Pinned at four times that; a level 0 over a 2^20-px region moves it
+/// 1.6 to 1.8 px here and the frame fails the off-centre check.
+const LEVEL0_MOVE_TOLERANCE_PX: f64 = 0.1;
+
+#[test]
+fn level0_keeps_the_level1_fit_when_the_centre_disagrees() {
+    let (outer, inner) = region_warps();
+    let reader = warped_pair(
+        REGION_FRAME,
+        scene_with_contrasty_box,
+        &[outer, inner],
+        |x, y| usize::from(in_box(x, y)),
+    );
+
+    let result = strict_pair_alignment(&reader);
+    let frame = &result.frames[1];
+    assert_eq!(
+        frame.status,
+        AlignStatus::Converged,
+        "the frame must register: {frame:?}"
+    );
+    let error = corner_error(&frame.transform, &outer, FOOTPRINT);
+    eprintln!("level0_keeps: corner error = {error} px");
+    assert!(
+        error < REGION_FIT_TOLERANCE_PX,
+        "corner error {error} px exceeds {REGION_FIT_TOLERANCE_PX} px"
+    );
+
+    let stack_ctx = StackContext::new(2, REGION_FRAME.0, REGION_FRAME.1, 1);
+    let mut cfg = resolved_defaults(&stack_ctx);
+    cfg.insert(
+        "reference-frame".to_string(),
+        ParamValue::Enum("first".to_string()),
+    );
+    let mut levels = Vec::new();
+    PyramidalEcc
+        .align_frame_traced(
+            &AlignContext::new(stack_ctx, 0, &reader),
+            1,
+            &cfg,
+            &mut levels,
+        )
+        .expect("valid solver inputs");
+    let worst = level0_moves_from_level1(&levels, REGION_FRAME)
+        .into_iter()
+        .fold(0.0, f64::max);
+    eprintln!("level0_keeps: level 0 moves the level-1 fit by {worst} px");
+    assert!(
+        worst < LEVEL0_MOVE_TOLERANCE_PX,
+        "level 0 moved the level-1 fit by {worst} px, over {LEVEL0_MOVE_TOLERANCE_PX} px"
+    );
+}
+
+#[test]
+fn contradictory_outer_content_still_fails_the_off_centre_check() {
+    let reader = warped_pair(
+        REGION_FRAME,
+        scene_with_contrasty_box,
+        &[
+            Transform::translation(6.0, 0.0),
+            Transform::translation(-6.0, 0.0),
+            Transform::identity(),
+        ],
+        |x, y| {
+            if in_box(x, y) {
+                2
+            } else {
+                usize::from(x >= REGION_FRAME.0 / 2)
+            }
+        },
+    );
+
+    let result = strict_pair_alignment(&reader);
+    let frame = &result.frames[1];
+    eprintln!("contradictory_outer_content: {frame:?}");
+    assert_eq!(
+        frame.status,
+        AlignStatus::Diverged(DivergenceReason::ValidationFailed),
+        "no single similarity holds at the off-centre patches: {frame:?}"
+    );
+}
+
+/// How far frame `i` of a drifting stack has moved from the reference.
+struct Drift {
+    shift: (f64, f64),
+    scale: f64,
+}
+
+/// `count` one-sample frames of a scene whose depth ramps from left to right;
+/// frame `i` is focused on the column `i / (count - 1)` of the way across and
+/// blurred in proportion to each column's distance from it. Each frame is
+/// magnified and shifted by `drift` for every step it lies from the middle
+/// frame. Returns the frames and, per frame, the transform that maps the
+/// middle frame onto it.
+fn drifting_focus_stack(
+    (width, height): (u32, u32),
+    count: usize,
+    drift: &Drift,
+    blur_px: f64,
+) -> (FramesReader, Vec<Transform>) {
+    let middle = (count - 1) / 2;
+    let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let truth: Vec<Transform> = (0..count)
+        .map(|i| {
+            let steps = i as f64 - middle as f64;
+            Transform::translation(drift.shift.0 * steps, drift.shift.1 * steps)
+                .compose(&similarity_about(1.0 + drift.scale * steps, 0.0, cx, cy))
+        })
+        .collect();
+    let mut rng = XorShift32(0xF0C5_0001);
+    let frames = truth
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let inverse = w.inverse().expect("a similarity is invertible");
+            let focus = i as f64 / (count - 1) as f64;
+            let mut samples = Vec::with_capacity((width * height) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let (sx, sy) = inverse
+                        .map_point(f64::from(x), f64::from(y))
+                        .expect("a similarity maps every pixel");
+                    let sigma = blur_px * (sx / f64::from(width) - focus).abs();
+                    let noise = f64::from(rng.next() % 321) - 160.0;
+                    let value = 0.5 + 0.4 * blurred_scene(sx, sy, sigma);
+                    samples.push((value * 65_535.0 + noise).clamp(0.0, 65_535.0) as u16);
+                }
+            }
+            samples
+        })
+        .collect();
+    (
+        FramesReader {
+            width,
+            height,
+            spp: 1,
+            frames,
+        },
+        truth,
+    )
+}
+
+/// Measured with `-- --nocapture`: the anchor policy leaves 11 of the 30
+/// frames diverged (0 to 4 and 25 to 30), the chain policy registers all 30
+/// and its corner error against the planted warp grows by about 0.28 px per
+/// hop, to 4.2 px at the last frame. The budget is about twice that.
+fn drifting_stack_budget_px(hops: usize) -> f64 {
+    0.1 + 0.55 * hops as f64
+}
+
+#[test]
+fn default_policy_registers_a_drifting_focus_stack_strictly() {
+    let size = (640u32, 480u32);
+    let count = 31usize;
+    let drift = Drift {
+        shift: (1.5, -1.0),
+        scale: 0.002,
+    };
+    let (reader, truth) = drifting_focus_stack(size, count, &drift, 15.0);
+    let stack_ctx = StackContext::new(count, size.0, size.1, 1);
+
+    let result = align_stack(
+        &PyramidalEcc,
+        stack_ctx,
+        &reader,
+        &resolved_defaults(&stack_ctx),
+        FailurePolicy::Strict,
+    )
+    .expect("the run completes");
+
+    let failed: Vec<_> = result.failed().map(|f| (f.frame, f.status)).collect();
+    assert!(
+        failed.is_empty(),
+        "frames that did not register: {failed:?}"
+    );
+    assert_eq!(result.reference, 15);
+    for frame in &result.frames {
+        let error = corner_error(
+            &frame.transform,
+            &truth[frame.frame],
+            full_rect(size.0, size.1),
+        );
+        let budget = drifting_stack_budget_px(frame.frame.abs_diff(result.reference));
+        eprintln!(
+            "default_policy_registers_a_drifting_focus_stack_strictly: frame {} error = {error} px",
+            frame.frame
+        );
+        assert!(
+            error < budget,
+            "frame {} is {error} px from its planted warp, over {budget} px",
+            frame.frame
         );
     }
 }

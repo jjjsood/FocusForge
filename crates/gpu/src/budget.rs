@@ -111,8 +111,8 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
 
 /// Every byte one `warp_fuse_tile_gpu` call allocates on the device exactly
 /// once per tile, independent of frame count: the running best level and its
-/// interleaved `(score, winner)` plane per level, the residual sum and its
-/// eligible-frame count, the collapse's expand-and-add per level, the packed
+/// interleaved `(score, winner)` plane per level, the residual sum pair and
+/// its eligible-frame count, the collapse's expand-and-add per level, the packed
 /// output, and the tile's two readback staging buffers.
 fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
     let dims = level_dims(width, height, levels);
@@ -125,9 +125,9 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
         total += plane(wk, hk, spp64) + 8 * wk * hk;
     }
 
-    // Residual sum, at the coarsest level.
+    // Residual sum and its compensation term, at the coarsest level.
     let (wl, hl) = dims[levels as usize];
-    total += plane(wl, hl, spp64);
+    total += 2 * plane(wl, hl, spp64);
     // Eligible-frame count per residual pixel.
     total += 4 * wl * hl;
 
@@ -648,7 +648,7 @@ mod tests {
         // 512x512, 3 spp, 5 levels, warped -- the geometry `budget_gpu.rs`'s
         // serialization and allocator tests drive.
         let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
-        assert_eq!(bytes, 53_098_496);
+        assert_eq!(bytes, 53_101_568);
     }
 
     #[test]
@@ -678,9 +678,9 @@ mod tests {
 
     #[test]
     fn device_bytes_per_tile_scales_with_the_rect() {
-        assert_eq!(device_bytes_per_tile(704, 704, 3, 5, true), 100_389_344);
-        assert_eq!(device_bytes_per_tile(300, 187, 3, 5, true), 11_383_524);
-        assert_eq!(device_bytes_per_tile(512, 512, 3, 5, false), 43_836_416);
+        assert_eq!(device_bytes_per_tile(704, 704, 3, 5, true), 100_395_152);
+        assert_eq!(device_bytes_per_tile(300, 187, 3, 5, true), 11_384_244);
+        assert_eq!(device_bytes_per_tile(512, 512, 3, 5, false), 43_839_488);
     }
 
     #[test]

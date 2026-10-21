@@ -98,13 +98,12 @@
 //! # The residual
 //!
 //! The coarsest Gaussian (the pyramid's residual, carrying no detail to select on) is the
-//! **arithmetic mean of the eligible frames' residuals, in ascending frame order, accumulated in
-//! `f32`**. A frame is eligible at a residual pixel when its coverage mask, eroded by `2*(2^N - 1)`,
-//! is true at level-0 position `(2^N x, 2^N y)`; a pixel with no eligible frame is `0`. With no
-//! coverage mask this is the mean of every frame. The order is pinned because `f32` addition is
-//! not associative and a GPU twin must reproduce the exact sum. At 5 levels the residual is 1/32 resolution, so
-//! uncorrected frame drift is a fraction of one residual pixel -- too small
-//! to ghost visibly.
+//! **arithmetic mean of the eligible frames' residuals, summed in `f64` in ascending frame order,
+//! divided by the eligible count and rounded to `f32` once**. A frame is eligible at a residual
+//! pixel when its coverage mask, eroded by `2*(2^N - 1)`, is true at level-0 `(2^N x, 2^N y)`; none
+//! eligible gives `0`, no mask makes every frame eligible. The order is tile-limit independent. The
+//! GPU twin's compensated `f32` pair stays within 1 LSB at 16-bit. At 5 levels the residual is 1/32
+//! resolution, so uncorrected drift is a fraction of one residual pixel -- too small to ghost.
 //!
 //! # Memory
 //!
@@ -343,7 +342,7 @@ struct Running {
     best: Pyramid,
     best_scores: Vec<Vec<f32>>,
     winner: Vec<Vec<u16>>,
-    residual_sum: Vec<f32>,
+    residual_sum: Vec<f64>,
     residual_count: Vec<u32>,
 }
 
@@ -414,9 +413,14 @@ impl StackAlgorithm for Laplacian {
                     .map(|scores| vec![0u16; scores.len()])
                     .collect();
 
-                // Ascending frame order, `f32`, per the residual rule above.
+                // Ascending frame order, `f64`, per the residual rule above.
                 // Frame 0's own contribution is the seed.
-                let mut residual_sum: Vec<f32> = best.residual().data().to_vec();
+                let mut residual_sum: Vec<f64> = best
+                    .residual()
+                    .data()
+                    .iter()
+                    .map(|&value| f64::from(value))
+                    .collect();
                 let mut residual_count = vec![1u32; residual_sum.len()];
 
                 // An ineligible frame 0 must not seed the running best: its
@@ -457,7 +461,7 @@ impl StackAlgorithm for Laplacian {
                 .enumerate()
             {
                 if masks.as_ref().is_none_or(|m| m.residual[i / spp_usize]) {
-                    *sum += value;
+                    *sum += f64::from(value);
                     run.residual_count[i] += 1;
                 }
             }
@@ -497,7 +501,11 @@ impl StackAlgorithm for Laplacian {
             .iter_mut()
             .zip(residual_sum.iter().zip(&residual_count))
         {
-            *out = if count == 0 { 0.0 } else { *sum / count as f32 };
+            *out = if count == 0 {
+                0.0
+            } else {
+                (*sum / f64::from(count)) as f32
+            };
         }
 
         let collapsed = collapse(&best);
@@ -892,6 +900,60 @@ mod tests {
         }
         for x in 160..w {
             assert!(at(x).abs_diff(30000) <= 1, "both frames at x {x}");
+        }
+    }
+
+    const CONSTANT_TRIPLES: [[u16; 3]; 3] = [[40001; 3], [39835, 49858, 60138], [73, 3073, 5001]];
+
+    fn constant_tiles(triple: [u16; 3], count: usize, w: u32, h: u32) -> Vec<Tile> {
+        let samples: Vec<u16> = triple
+            .iter()
+            .copied()
+            .cycle()
+            .take((w * h * 3) as usize)
+            .collect();
+        (0..count)
+            .map(|_| tile_of(w, h, 3, samples.clone()))
+            .collect()
+    }
+
+    fn assert_every_sample_is(out: &TileOutput, triple: [u16; 3], context: &str) {
+        for (i, &sample) in out.tile.samples.iter().enumerate() {
+            assert_eq!(sample, triple[i % 3], "{context}: sample {i}");
+        }
+    }
+
+    #[test]
+    fn constant_stack_exports_the_constant() {
+        let (w, h) = (128u32, 128u32);
+        for triple in CONSTANT_TRIPLES {
+            let tiles = constant_tiles(triple, 999, w, h);
+            for n in [1usize, 61, 999] {
+                let ctx = TileCtx::new(rect(w, h), &tiles[..n]);
+                let out = Laplacian.fuse(&ctx, &cfg_with_levels(5)).unwrap();
+                assert_every_sample_is(&out, triple, &format!("{triple:?} at {n} frames"));
+            }
+        }
+    }
+
+    #[test]
+    fn constant_stack_masked_exports_the_constant() {
+        let (w, h) = (128u32, 128u32);
+        for triple in CONSTANT_TRIPLES {
+            let tiles = constant_tiles(triple, 999, w, h);
+            let coverage: Vec<Option<Vec<bool>>> = (0..tiles.len())
+                .map(|f| {
+                    if f % 2 == 1 {
+                        columns_uncovered_below(w, h, 16)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for n in [1usize, 61, 999] {
+                let out = fuse_masked(&tiles[..n], &coverage[..n], 5, w, h);
+                assert_every_sample_is(&out, triple, &format!("{triple:?} masked at {n} frames"));
+            }
         }
     }
 
