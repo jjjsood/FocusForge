@@ -188,7 +188,11 @@ sh /out/rustup-init.sh -y --default-toolchain 1.95.0 --profile minimal
 mkdir /work
 (cd /src && tar --exclude='./target' --exclude='./.scratch' --exclude='./.logs' --exclude='./.locks' -cf - .) | tar -C /work -xf -
 cd /work
-CARGO_TARGET_DIR=/out/target cargo build --release --locked -p focusforge-cli -p focusforge-gui |& tee /out/cargo-build.log
+# One read-and-execute segment instead of a read-only one followed by an
+# executable one: with separate segments the loader can leave a page-sized
+# hole between them, which the crash writer then reports as a second module
+# whose base is wrong, so no frame of a crash in the binary resolves.
+RUSTFLAGS='-C link-arg=-Wl,--no-rosegment' CARGO_TARGET_DIR=/out/target cargo build --release --locked -p focusforge-cli -p focusforge-gui |& tee /out/cargo-build.log
 for bin in focusforge-cli focusforge-gui; do test -x "/out/target/release/$bin"; done
 dump_syms=$(python3 tools/package-symbols.py install dump_syms x86_64-unknown-linux-gnu /out/symbol-tools)
 install -d /out/original /out/native-debug
