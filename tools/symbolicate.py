@@ -54,7 +54,16 @@ def verify_report(report: dict, inventory: dict) -> None:
         f"{frame.get('module')}!{frame.get('function')} {frame.get('file', frame.get('source'))}:{frame.get('line')}"
         for frame in frames[:8]
     )
-    raise ValueError(f"crashing thread lacks an application source frame (first frames: {seen or 'none'})")
+    applications = ", ".join(
+        f"{item.get('filename')} debug_id={item.get('debug_id')} loaded={item.get('loaded_symbols')} "
+        f"missing={item.get('missing_symbols')} corrupt={item.get('corrupt_symbols')} expected={known.get(item.get('debug_file'), (None, None))[1]}"
+        for item in modules
+        if item.get("filename") in {name for name, _ in known.values()} or item.get("debug_file") in known
+    )
+    raise ValueError(
+        f"crashing thread lacks an application source frame (first frames: {seen or 'none'}; "
+        f"crash: {report.get('crash_info')}; modules: {applications or 'none'})"
+    )
 
 
 def main() -> None:
