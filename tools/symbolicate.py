@@ -50,7 +50,11 @@ def verify_report(report: dict, inventory: dict) -> None:
         source = normalized_source(str(frame.get("file", frame.get("source", ""))))
         if source.startswith("crates/") and isinstance(frame.get("line"), int) and not isinstance(frame["line"], bool) and frame["line"] > 0:
             return
-    raise ValueError("crashing thread lacks an application source frame")
+    seen = "; ".join(
+        f"{frame.get('module')}!{frame.get('function')} {frame.get('file', frame.get('source'))}:{frame.get('line')}"
+        for frame in frames[:8]
+    )
+    raise ValueError(f"crashing thread lacks an application source frame (first frames: {seen or 'none'})")
 
 
 def main() -> None:

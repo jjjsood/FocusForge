@@ -1159,10 +1159,10 @@ fn refused_checkpoint_export_leaves_nothing() {
 
     // A changed source, named.
     let changed = build_branched("export_cli_refused_changed_sources");
-    let mut bytes = std::fs::read(&changed.source_paths[2]).unwrap();
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
-    std::fs::write(&changed.source_paths[2], &bytes).unwrap();
+    common::rewrite_changed(&changed.source_paths[2], |bytes| {
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+    });
     let out = dir.join("changed-sources.tif");
     let result = run_cli_in(
         changed.project_path.parent().unwrap(),

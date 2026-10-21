@@ -260,6 +260,24 @@ impl Drop for UnreadableFile {
     }
 }
 
+/// Rewrites `path` in place with `edit` applied to its bytes and moves its
+/// modification time a minute ahead. A project recognises an unchanged
+/// source by size and modification time alone, so an edit that keeps both
+/// goes unseen -- and a fast rewrite on a filesystem with a coarse clock
+/// (Windows) can keep the time.
+#[allow(dead_code)]
+pub fn rewrite_changed(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
+    let mut bytes = std::fs::read(path).unwrap();
+    edit(&mut bytes);
+    std::fs::write(path, &bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+}
+
 /// Tries to create and remove a marker file in `dir`; `true` means the
 /// directory is still writable, so a mode change meant to block that either
 /// failed or has no effect on this filesystem.
