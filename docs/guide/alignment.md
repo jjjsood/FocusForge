@@ -11,8 +11,9 @@ checking a result before committing to a full stack run.
 focusforge-cli align path/to/frames/
 ```
 
-Every other frame registers against one reference frame (the middle frame of
-the stack by default), reporting its recovered translation, scale and
+Every other frame registers toward one reference frame (the middle frame of
+the stack by default), by default hop-by-hop through its neighbours (see
+`reference-policy` below). Each row reports its recovered translation, scale and
 rotation, an iteration count, and `rho` — the ECC correlation the solver
 optimized, in `[-1, 1]`, not a pixel distance. The last line is the
 auto-crop rectangle `stack` would apply: the largest axis-aligned rectangle
