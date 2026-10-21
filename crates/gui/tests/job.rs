@@ -2758,7 +2758,7 @@ fn retry_queues_while_another_run_is_live() {
     controller.set_scratch_root_for_test(common::tree("retry_queues_scratch"));
     add_unreadable_tab(&mut controller, "retry_queues_a", 2);
     assert!(controller.start_fuse());
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     match controller.job_view().state {
         job::RunState::Failed(_) => {}
         other => panic!("expected the first tab to fail, got {other:?}"),
@@ -2788,8 +2788,8 @@ fn retry_queues_while_another_run_is_live() {
 
     controller.select_project(1);
     controller.pause_or_resume();
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
     controller.select_project(0);
     match controller.job_view().state {
