@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Spike shader: a gradient plus a hard-edged off-centre square, written into a
 // storage texture that Slint imports zero-copy via slint::Image::try_from(wgpu::Texture).
 //

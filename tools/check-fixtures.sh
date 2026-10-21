@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/check-fixtures.sh
 #
 # Checks fixtures/MANIFEST.sha256 both ways: every listed file still hashes
@@ -21,26 +22,67 @@ fi
 
 status=0
 
-if ! (cd fixtures && sha256sum --check --quiet MANIFEST.sha256); then
-  echo "FAIL: a fixture does not match MANIFEST.sha256." >&2
-  echo "  Regenerate with FOCUSFORGE_REFERENCE_STACK set: tools/make-fixtures.sh" >&2
-  status=1
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+  PYTHON=python
+else
+  echo "FAIL: tools/check-fixtures.sh needs Python 3" >&2
+  exit 1
 fi
 
-listed="$(sed -n 's/^[0-9a-f]\{64\}  //p' fixtures/MANIFEST.sha256 | LC_ALL=C sort)"
-present="$(cd fixtures && find . -type f ! -name MANIFEST.sha256 -printf '%P\n' | LC_ALL=C sort)"
-unlisted="$(comm -13 <(printf '%s\n' "$listed") <(printf '%s\n' "$present"))"
+"$PYTHON" - fixtures <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
 
-if [ -n "$unlisted" ]; then
-  echo "FAIL: files under fixtures/ that MANIFEST.sha256 does not list:" >&2
-  printf '%s\n' "$unlisted" | sed 's/^/  /' >&2
-  echo "  A fixture is generated, never added by hand. Regenerate with" >&2
-  echo "  FOCUSFORGE_REFERENCE_STACK set (tools/make-fixtures.sh) so the" >&2
-  echo "  manifest covers it." >&2
-  status=1
-fi
+root = Path(sys.argv[1])
+manifest = root / "MANIFEST.sha256"
+entries = []
+malformed = False
+for line in manifest.read_text(encoding="utf-8").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+    if match:
+        entries.append((match.group(2), match.group(1)))
+    elif line:
+        malformed = True
 
-if [ "$status" -eq 0 ]; then
-  echo "OK: $(printf '%s\n' "$listed" | wc -l) fixture files match the manifest"
-fi
-exit "$status"
+status = int(malformed)
+if malformed:
+    print("FAIL: malformed MANIFEST.sha256.", file=sys.stderr)
+for relative, expected in sorted(entries):
+    path = root / relative
+    try:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        print(f"{relative}: FAILED open or read", file=sys.stderr)
+        status = 1
+    else:
+        if actual != expected:
+            print(f"{relative}: FAILED", file=sys.stderr)
+            status = 1
+
+if status:
+    print("FAIL: a fixture does not match MANIFEST.sha256.", file=sys.stderr)
+    print("  Regenerate with FOCUSFORGE_REFERENCE_STACK set: tools/make-fixtures.sh", file=sys.stderr)
+
+present = sorted(
+    path.relative_to(root).as_posix()
+    for path in root.rglob("*")
+    if path.is_file() and path.name != "MANIFEST.sha256"
+)
+unlisted = sorted(set(present) - {relative for relative, _expected in entries})
+if unlisted:
+    print("FAIL: files under fixtures/ that MANIFEST.sha256 does not list:", file=sys.stderr)
+    for path in unlisted:
+        print(f"  {path}", file=sys.stderr)
+    print("  A fixture is generated, never added by hand. Regenerate with", file=sys.stderr)
+    print("  FOCUSFORGE_REFERENCE_STACK set (tools/make-fixtures.sh) so the", file=sys.stderr)
+    print("  manifest covers it.", file=sys.stderr)
+    status = 1
+
+if not status:
+    print(f"OK: {len(entries)} fixture files match the manifest")
+sys.exit(status)
+PY

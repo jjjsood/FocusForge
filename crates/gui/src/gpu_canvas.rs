@@ -268,8 +268,9 @@ mod tests {
             pixelated: false,
             step: NonZeroU32::MIN,
         };
-        let shared = focusforge_gpu::device::shared_device_or_skip()
-            .expect("this GPU lifecycle test requires a device");
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
 
         let mut empty = CanvasRenderer::new();
         assert!(empty.display_renderer.is_none());
@@ -576,8 +577,9 @@ pub enum CanvasRendererError {
     #[error("failed to open composite {}: {source}", path.display())]
     Composite {
         path: PathBuf,
+        // Boxed: `TiffError` is larger on Windows, where an `OsString` is 32 bytes.
         #[source]
-        source: TiffError,
+        source: Box<TiffError>,
     },
 }
 
@@ -721,7 +723,7 @@ impl CanvasRenderer {
         let composite = TiffStack::open_files(std::slice::from_ref(&composite_path.to_path_buf()))
             .map_err(|source| CanvasRendererError::Composite {
                 path: composite_path.to_path_buf(),
-                source,
+                source: Box::new(source),
             })?;
         self.zmap = zmap_path.and_then(|path| match ZMapReader::open(path) {
             Ok(zmap) => Some(Arc::new(zmap)),

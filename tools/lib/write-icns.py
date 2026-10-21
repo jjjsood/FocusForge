@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Pack PNGs into a macOS .icns icon suite.
 
 ImageMagick on this machine has no ICNS coder, so the container is written

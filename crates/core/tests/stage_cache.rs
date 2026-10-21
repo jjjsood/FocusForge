@@ -500,7 +500,13 @@ fn mtime_is_not_in_the_key() {
 
     let future = SystemTime::now() + Duration::from_secs(3600);
     for p in &paths {
-        fs::File::open(p).unwrap().set_modified(future).unwrap();
+        // Windows refuses to set a time through a handle opened for reading only.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
     }
 
     let key_after = StageKey::align(&header_fingerprint(&paths), &identity);

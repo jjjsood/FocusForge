@@ -45,9 +45,9 @@ Strokes that belong to no checkpoint yet are never dropped silently:
 ```bash
 focusforge-cli history list frames.ffp
 focusforge-cli retouch frames.ffp --ops ops.json
-focusforge-cli retouch frames.ffp --ops ops.json --from 5b71
-focusforge-cli export frames.ffp --checkpoint 5b71 --zmap zmap.tif
-focusforge-cli history delete frames.ffp --checkpoint 5b71
+focusforge-cli retouch frames.ffp --ops ops.json --from <checkpoint-id>
+focusforge-cli export frames.ffp --checkpoint <checkpoint-id> --zmap zmap.tif
+focusforge-cli history delete frames.ffp --checkpoint <checkpoint-id>
 ```
 
 - `list` prints every visible checkpoint, newest first, with its parent.
@@ -63,8 +63,9 @@ bytes reclaimed. `export --checkpoint <id>` renders any checkpoint to an image, 
 
 ## Damaged or moved projects
 
-A project is checked when it is opened and a damaged one is refused by name
-instead of being opened partly; the exit codes are in
+A project is checked when it is opened. A foreign header or a file cut before
+its first committed footer is refused by name; trailing bytes after an earlier
+valid footer are ignored. The exit codes are in
 [the CLI reference](../reference/cli.md#history). A project written by an
 older build that lacks the records the current one needs is refused, and
 re-stacking the frames produces a current project.

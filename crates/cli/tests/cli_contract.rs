@@ -417,6 +417,13 @@ fn quiet_stack_retains_a_fallback_warning_without_routine_stderr() {
     );
 }
 
+/// How the operating system words a path that does not exist.
+const MISSING_PATH: &str = if cfg!(windows) {
+    "The system cannot find the path specified"
+} else {
+    "No such file or directory"
+};
+
 fn assert_fatal_parity(args: &[&str], needle: &str) {
     let default = common::cli_bin("cli_contract")
         .args(args)
@@ -452,7 +459,7 @@ fn fatal_errors_match_with_or_without_strict() {
                 "--algorithm",
                 "pyramidal-ecc",
             ],
-            "No such file or directory",
+            MISSING_PATH,
         ),
         (
             vec!["align", frames, "--algorithm", "no-such-algorithm"],
@@ -484,8 +491,6 @@ fn fatal_errors_match_with_or_without_strict() {
     #[cfg(unix)]
     {
         use focusforge_core::io::{TiffSpec, TiffWriter};
-        use std::os::unix::fs::PermissionsExt;
-
         let unreadable_dir = common::tmp_dir("cli_contract_unreadable_frame");
         let unreadable = unreadable_dir.join("00.tif");
         let mut writer = TiffWriter::create(
@@ -502,7 +507,7 @@ fn fatal_errors_match_with_or_without_strict() {
             .write_tile(common::full_rect(1, 1), &[0, 0, 0])
             .unwrap();
         writer.finish().unwrap();
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _locked = common::UnreadableFile::lock(&unreadable).unwrap();
         assert!(
             std::fs::File::open(&unreadable).is_err(),
             "test file must be unreadable"
@@ -530,7 +535,7 @@ fn fatal_errors_match_with_or_without_strict() {
             "dummy-stack",
             "--no-align",
         ],
-        "No such file or directory",
+        MISSING_PATH,
     );
     assert_fatal_parity(
         &[

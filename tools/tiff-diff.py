@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Compare two TIFFs sample by sample, or summarise a Z-Map index plane.
 
 The tolerance argument is the whole point. Two things get compared in this

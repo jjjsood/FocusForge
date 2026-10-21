@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/check-licenses.sh [--advisories]
 #
 # The GPLv3 compatibility gate. FocusForge links Slint under its GPLv3 option,

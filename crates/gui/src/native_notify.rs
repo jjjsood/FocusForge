@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Delivery of notification banners through the operating system's
 //! notification service.
 

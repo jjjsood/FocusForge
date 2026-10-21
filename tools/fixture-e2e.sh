@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/fixture-e2e.sh
 #
 # Drive the built CLI over the checked-in fixtures. This is the gate that
@@ -26,6 +27,7 @@ cd "$REPO"
 export FOCUSFORGE_DATA_DIR="$REPO/.scratch/fixture-e2e-data"
 
 CLI=target/debug/focusforge-cli
+[ -f "$CLI.exe" ] && CLI="$CLI.exe"
 
 if [ ! -x "$CLI" ]; then
   echo "SKIP: no CLI binary yet ($CLI)"

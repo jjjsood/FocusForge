@@ -375,12 +375,10 @@ pub fn locate_and_settle(
 /// a filesystem where a mode change actually takes effect. Restores a
 /// writable mode before its own `TempDir` removes it.
 #[allow(dead_code)]
-#[cfg(unix)]
 pub struct ReadOnlyDir {
     dir: tempfile::TempDir,
 }
 
-#[cfg(unix)]
 impl std::ops::Deref for ReadOnlyDir {
     type Target = Path;
 
@@ -436,6 +434,15 @@ pub fn readonly_dir(label: &str, mode: u32, populate: impl FnOnce(&Path)) -> Opt
         return None;
     }
     Some(ReadOnlyDir { dir })
+}
+
+/// Windows has no mode bits to block writes with, so every caller takes its
+/// existing skip path.
+#[allow(dead_code)]
+#[cfg(not(unix))]
+pub fn readonly_dir(label: &str, _mode: u32, _populate: impl FnOnce(&Path)) -> Option<ReadOnlyDir> {
+    eprintln!("skipping {label}: directory permissions are not enforced by mode bits here");
+    None
 }
 
 /// A `<root>/focusforge` data directory holding roughly `total_log_bytes`

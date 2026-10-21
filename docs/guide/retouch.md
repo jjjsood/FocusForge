@@ -33,7 +33,7 @@ To see a result, export it:
 
 ```bash
 target/release/focusforge-cli history list path/to/frames/frames.ffp
-target/release/focusforge-cli export path/to/frames/frames.ffp --checkpoint 5b71 -o retouched.tif
+target/release/focusforge-cli export path/to/frames/frames.ffp --checkpoint <checkpoint-id> -o retouched.tif
 ```
 
 See [`reference/cli.md`](../reference/cli.md#retouch) for every flag.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/run-acceptance.sh              -- the unlimited run
 #        tools/run-acceptance.sh --limit 8G   -- the same run under an
 #                                                 enforced cgroup v2 memory

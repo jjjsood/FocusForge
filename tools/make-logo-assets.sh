@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/make-logo-assets.sh
 #
 # Rasterises the brand SVGs in assets/ into everything the three target

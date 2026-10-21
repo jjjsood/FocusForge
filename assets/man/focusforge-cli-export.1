@@ -1,0 +1,75 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-export 1  "export 0.1.0" 
+.SH NAME
+focusforge\-cli\-export \- Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
+.SH SYNOPSIS
+\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-v \fR]... [\fB\-\-icc\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-\-frame\fR] [\fB\-\-frame\-output\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
+.SH OPTIONS
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<FILE>\fR
+Write the image to this path
+.TP
+\fB\-\-zmap\fR \fI<FILE>\fR
+Write the Z\-Map to this path
+.TP
+\fB\-\-checkpoint\fR \fI<ID>\fR
+A checkpoint id or unique id prefix. Defaults to the head. An unedited image export needs no source frames; an edited one re\-reads and verifies the nearest fused ancestor\*(Aqs. `\-\-zmap` alone needs none
+.TP
+\fB\-\-format\fR \fI<FORMAT>\fR
+The image format to write: `tiff`, `png` or `jpeg`. Inferred from `\-o`\*(Aqs extension when omitted (`.tif`/`.tiff` \-> tiff, `.png` \-> png, `.jpg`/`.jpeg` \-> jpeg, no extension \-> tiff, the default); refused if it names a format other than a recognised extension\*(Aqs
+.TP
+\fB\-\-tiff\-bits\fR \fI<BITS>\fR
+TIFF bit depth: `16` (default) or `8`. TIFF only
+.TP
+\fB\-\-tiff\-compression\fR \fI<NAME>\fR
+TIFF strip compression: `none` (default), `lzw` or `deflate`. TIFF only
+.TP
+\fB\-\-png\-bits\fR \fI<BITS>\fR
+PNG bit depth: `16` (default) or `8`. PNG only
+.TP
+\fB\-\-png\-compression\fR \fI<NAME>\fR
+PNG compression effort: `fast`, `default` (default) or `best`. PNG only
+.TP
+\fB\-\-jpeg\-quality\fR \fI<N>\fR
+JPEG quality, 1\-100, default 95. JPEG only
+.TP
+\fB\-\-jpeg\-subsampling\fR \fI<SPEC>\fR
+JPEG chroma subsampling: `420` (default) or `444`. JPEG only
+.TP
+\fB\-\-exif\fR \fI<EXIF>\fR
+Carry the alignment reference frame\*(Aqs EXIF: `on` (default) or `off`
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-\-icc\fR \fI<ICC>\fR
+Embed an ICC profile: `on` (default) or `off`
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-\-xmp\fR \fI<XMP>\fR
+Carry the source frame\*(Aqs XMP packet verbatim: `on` or `off` (default)
+.TP
+\fB\-\-iptc\fR \fI<IPTC>\fR
+Carry the source frame\*(Aqs IPTC block verbatim: `on` or `off` (default). Never written to PNG
+.TP
+\fB\-\-frame\fR \fI<INDEX>\fR
+Write this source frame "as fused" \-\- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint\*(Aqs own composite width and height. Requires `\-\-frame\-output`
+.TP
+\fB\-\-frame\-output\fR \fI<FILE>\fR
+Where to write the frame `\-\-frame` names
+.TP
+\fB\-\-json\fR
+Emit the JSON report instead of human\-readable text
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The `.ffp` project to read
+.SH VERSION
+v0.1.0

@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-history-delete 1  "delete 0.1.0" 
+.SH NAME
+focusforge\-cli\-history\-delete \- Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint
+.SH SYNOPSIS
+\fBfocusforge\-cli history delete\fR [\fB\-\-json\fR] [\fB\-\-accept\-changed\-sources\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-checkpoint\fR> <\fIPROJECT\fR> 
+.SH DESCRIPTION
+Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint
+.SH OPTIONS
+.TP
+\fB\-\-checkpoint\fR \fI<CHECKPOINT>\fR
+The checkpoint to delete \-\- any unique prefix of its id
+.TP
+\fB\-\-json\fR
+Emit the JSON report instead of human\-readable text
+.TP
+\fB\-\-accept\-changed\-sources\fR
+Accept changed source frames, printing their warning instead of refusing
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPROJECT\fR>
+The project to delete from
+.SH VERSION
+v0.1.0

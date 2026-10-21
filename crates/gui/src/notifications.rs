@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The session's retained notifications and the rules that decide which of
 //! them reach the user as a toast.
 

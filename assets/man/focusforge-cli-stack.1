@@ -1,0 +1,93 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-stack 1  "stack 0.1.0" 
+.SH NAME
+focusforge\-cli\-stack \- Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+.SH SYNOPSIS
+\fBfocusforge\-cli stack\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-set\fR] [\fB\-\-groups\fR] [\fB\-\-write\-groups\fR] [\fB\-\-only\fR] [\fB\-\-no\-align\fR] [\fB\-\-no\-crop\fR] [\fB\-\-strict\fR] [\fB\-\-align\-algorithm\fR] [\fB\-v \fR]... [\fB\-\-align\-set\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-resume\fR] [\fB\-\-no\-progress\fR] [\fB\-\-tile\-size\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-\-max\-vram\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-\-cpu\fR] [\fB\-\-no\-cache\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+.SH DESCRIPTION
+Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+.SH OPTIONS
+.TP
+\fB\-o\fR, \fB\-\-output\fR \fI<DIR>\fR
+Directory to collect this run\*(Aqs projects into. Omit to write each project beside its own frames
+.TP
+\fB\-\-algorithm\fR \fI<ALGO>\fR
+Registered stacking algorithm id (`focusforge\-cli algorithms` lists them). Required unless a `\-\-preset` supplies `algo`
+.TP
+\fB\-\-json\fR
+Emit the JSON report instead of human\-readable text
+.TP
+\fB\-\-set\fR \fI<KEY=VALUE>\fR
+Set a parameter: `\-\-set key=value`, repeatable. A repeated key is last\-wins
+.TP
+\fB\-\-groups\fR \fI<PATH>\fR
+Group the frames as this TOML file says instead of proposing a grouping: one `[[group]]` block per stack, each with a `name` and a `frames` array of paths relative to `<dir>`. Every frame found under `<dir>` must appear in exactly one group
+.TP
+\fB\-\-write\-groups\fR \fI<PATH>\fR
+Write the proposed grouping to this path, in exactly the format `\-\-groups` reads, then carry on with the run. Edit it and feed it back with `\-\-groups` to override the proposal
+.TP
+\fB\-\-only\fR \fI<ID>\fR
+Run only the named result(s), repeatable: matches a group\*(Aqs identity (what `review \-\-json`\*(Aqs `identity` field prints, and what this run\*(Aqs own `\-\-status` stream uses) or its plain name. Every unselected group is skipped \-\- named on stderr, not re\-run \-\- and its project on disk is left untouched. Combine with `\-\-set`/`\-\-align\-set` to cheaply re\-run a subset after changing a fusion or alignment parameter
+.TP
+\fB\-\-no\-align\fR
+Skip alignment: frames are fused as read and the output keeps the full frame
+.TP
+\fB\-\-no\-crop\fR
+Skip the auto\-crop: the output keeps the full frame extent even when alignment is on
+.TP
+\fB\-\-strict\fR
+Refuse the run when an alignment fails. Meaningless with `\-\-no\-align`
+.TP
+\fB\-\-align\-algorithm\fR \fI<ALIGN_ALGO>\fR
+Alignment algorithm id. Optional: defaults to the sole registered alignment algorithm, refusing (and listing the choices) when more than one is registered
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-\-align\-set\fR \fI<KEY=VALUE>\fR
+Set an alignment parameter: `\-\-align\-set key=value`, repeatable. A repeated key is last\-wins
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-\-resume\fR
+Resume a previously cancelled run of this same stack, found by stack fingerprint under `.scratch/resume/` \-\- no argument. Refuses at exit 1 when no matching scratch state exists or it disagrees with this invocation\*(Aqs inputs
+.TP
+\fB\-\-no\-progress\fR
+Print no stage progress
+.TP
+\fB\-\-tile\-size\fR \fI<PX>\fR
+Override the scheduler\*(Aqs outer tile size, in pixels. Omit to use the scheduler\*(Aqs own default
+.TP
+\fB\-\-max\-host\-memory\fR \fI<SIZE>\fR
+A **ceiling only** on the adaptive host\-memory budget: it can lower the budget the host\-derived estimate resolved to, and can never raise it. Nobody has to pass this to get the machine\*(Aqs own concurrency \-\- omit it entirely and the budget is derived from the host. Accepts suffixed sizes (`8GiB`, `512MiB`, `4096`)
+.TP
+\fB\-\-max\-vram\fR \fI<SIZE>\fR
+A **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, and can never raise it. Omit it entirely to get the probed value. Accepts the same suffixed sizes as `\-\-max\-host\-memory`. Only present when the `gpu` feature is compiled in
+.TP
+\fB\-\-preset\fR \fI<PATH>\fR
+Read parameter values from a TOML preset: the `algo` and `align\-algo` keys plus the `[stack]` and `[align]` value tables. A flag always beats the file \-\- `\-\-set`/`\-\-align\-set` override the tables, `\-\-algorithm`/`\-\-align\-algorithm` override the keys
+.TP
+\fB\-\-write\-preset\fR \fI<PATH>\fR
+Write the preset that reproduces this run to this path: the algorithm ids plus the values you actually chose. Values left to an `auto` closure stay live and are never frozen into the file
+.TP
+\fB\-\-status\fR \fI<PATH>\fR
+Append one NDJSON status record for this stack to this path: identity, outcome, outputs and the error, if any. Every terminal path writes exactly one record
+.TP
+\fB\-\-dry\-run\fR
+Resolve everything, print what would happen \-\- parameters with their provenance, tile geometry, output paths \-\- and exit 0 without computing or writing anything. Stops *before* alignment, so it reports no crop rect and no output extent
+.TP
+\fB\-\-cpu\fR
+Force the CPU path even when a usable GPU adapter is available. Only in builds with GPU support
+.TP
+\fB\-\-no\-cache\fR
+Skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIDIR\fR>
+Directory of TIFF or supported RAW frames to fuse (non\-recursive, descending into `<dir>/frames` when that subdirectory exists)
+.SH VERSION
+v0.1.0

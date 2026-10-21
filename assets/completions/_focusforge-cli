@@ -1,0 +1,675 @@
+#compdef focusforge-cli
+
+autoload -U is-at-least
+
+_focusforge-cli() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_focusforge-cli_commands" \
+"*::: :->focusforge-cli" \
+&& ret=0
+    case $state in
+    (focusforge-cli)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-command-$line[1]:"
+        case $line[1] in
+            (info)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit the JSON document instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':path -- Path to a file or directory:_files' \
+&& ret=0
+;;
+(algorithms)
+_arguments "${_arguments_options[@]}" : \
+'*--set=[Set a parameter\: \`--set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--json[Emit the JSON document instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'::id -- Algorithm id. Omit to list every registered algorithm:_default' \
+&& ret=0
+;;
+(stack)
+_arguments "${_arguments_options[@]}" : \
+'-o+[Directory to collect this run'\''s projects into. Omit to write each project beside its own frames]:DIR:_files' \
+'--output=[Directory to collect this run'\''s projects into. Omit to write each project beside its own frames]:DIR:_files' \
+'--algorithm=[Registered stacking algorithm id (\`focusforge-cli algorithms\` lists them). Required unless a \`--preset\` supplies \`algo\`]:ALGO:_default' \
+'*--set=[Set a parameter\: \`--set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--groups=[Group the frames as this TOML file says instead of proposing a grouping\: one \`\[\[group\]\]\` block per stack, each with a \`name\` and a \`frames\` array of paths relative to \`<dir>\`. Every frame found under \`<dir>\` must appear in exactly one group]:PATH:_files' \
+'--write-groups=[Write the proposed grouping to this path, in exactly the format \`--groups\` reads, then carry on with the run. Edit it and feed it back with \`--groups\` to override the proposal]:PATH:_files' \
+'*--only=[Run only the named result(s), repeatable\: matches a group'\''s identity (what \`review --json\`'\''s \`identity\` field prints, and what this run'\''s own \`--status\` stream uses) or its plain name. Every unselected group is skipped -- named on stderr, not re-run -- and its project on disk is left untouched. Combine with \`--set\`/\`--align-set\` to cheaply re-run a subset after changing a fusion or alignment parameter]:ID:_default' \
+'--align-algorithm=[Alignment algorithm id. Optional\: defaults to the sole registered alignment algorithm, refusing (and listing the choices) when more than one is registered]:ALIGN_ALGO:_default' \
+'*--align-set=[Set an alignment parameter\: \`--align-set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--tile-size=[Override the scheduler'\''s outer tile size, in pixels. Omit to use the scheduler'\''s own default]:PX:_default' \
+'--max-host-memory=[A **ceiling only** on the adaptive host-memory budget\: it can lower the budget the host-derived estimate resolved to, and can never raise it. Nobody has to pass this to get the machine'\''s own concurrency -- omit it entirely and the budget is derived from the host. Accepts suffixed sizes (\`8GiB\`, \`512MiB\`, \`4096\`)]:SIZE:_default' \
+'--max-vram=[A **ceiling only** on the adaptive device (VRAM) budget\: it can lower the budget the startup probe settled on, and can never raise it. Omit it entirely to get the probed value. Accepts the same suffixed sizes as \`--max-host-memory\`. Only present when the \`gpu\` feature is compiled in]:SIZE:_default' \
+'--preset=[Read parameter values from a TOML preset\: the \`algo\` and \`align-algo\` keys plus the \`\[stack\]\` and \`\[align\]\` value tables. A flag always beats the file -- \`--set\`/\`--align-set\` override the tables, \`--algorithm\`/\`--align-algorithm\` override the keys]:PATH:_files' \
+'--write-preset=[Write the preset that reproduces this run to this path\: the algorithm ids plus the values you actually chose. Values left to an \`auto\` closure stay live and are never frozen into the file]:PATH:_files' \
+'--status=[Append one NDJSON status record for this stack to this path\: identity, outcome, outputs and the error, if any. Every terminal path writes exactly one record]:PATH:_files' \
+'--json[Emit the JSON report instead of human-readable text]' \
+'--no-align[Skip alignment\: frames are fused as read and the output keeps the full frame]' \
+'--no-crop[Skip the auto-crop\: the output keeps the full frame extent even when alignment is on]' \
+'--strict[Refuse the run when an alignment fails. Meaningless with \`--no-align\`]' \
+'--resume[Resume a previously cancelled run of this same stack, found by stack fingerprint under \`.scratch/resume/\` -- no argument. Refuses at exit 1 when no matching scratch state exists or it disagrees with this invocation'\''s inputs]' \
+'--no-progress[Print no stage progress]' \
+'--dry-run[Resolve everything, print what would happen -- parameters with their provenance, tile geometry, output paths -- and exit 0 without computing or writing anything. Stops *before* alignment, so it reports no crop rect and no output extent]' \
+'--cpu[Force the CPU path even when a usable GPU adapter is available. Only in builds with GPU support]' \
+'--no-cache[Skip the stage cache\: recompute the alignment even when a valid entry exists, and store no new entry]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':dir -- Directory of TIFF or supported RAW frames to fuse (non-recursive, descending into `<dir>/frames` when that subdirectory exists):_files' \
+&& ret=0
+;;
+(export)
+_arguments "${_arguments_options[@]}" : \
+'-o+[Write the image to this path]:FILE:_files' \
+'--output=[Write the image to this path]:FILE:_files' \
+'--zmap=[Write the Z-Map to this path]:FILE:_files' \
+'--checkpoint=[A checkpoint id or unique id prefix. Defaults to the head. An unedited image export needs no source frames; an edited one re-reads and verifies the nearest fused ancestor'\''s. \`--zmap\` alone needs none]:ID:_default' \
+'--format=[The image format to write\: \`tiff\`, \`png\` or \`jpeg\`. Inferred from \`-o\`'\''s extension when omitted (\`.tif\`/\`.tiff\` -> tiff, \`.png\` -> png, \`.jpg\`/\`.jpeg\` -> jpeg, no extension -> tiff, the default); refused if it names a format other than a recognised extension'\''s]:FORMAT:_default' \
+'--tiff-bits=[TIFF bit depth\: \`16\` (default) or \`8\`. TIFF only]:BITS:_default' \
+'--tiff-compression=[TIFF strip compression\: \`none\` (default), \`lzw\` or \`deflate\`. TIFF only]:NAME:_default' \
+'--png-bits=[PNG bit depth\: \`16\` (default) or \`8\`. PNG only]:BITS:_default' \
+'--png-compression=[PNG compression effort\: \`fast\`, \`default\` (default) or \`best\`. PNG only]:NAME:_default' \
+'--jpeg-quality=[JPEG quality, 1-100, default 95. JPEG only]:N:_default' \
+'--jpeg-subsampling=[JPEG chroma subsampling\: \`420\` (default) or \`444\`. JPEG only]:SPEC:_default' \
+'--exif=[Carry the alignment reference frame'\''s EXIF\: \`on\` (default) or \`off\`]:EXIF:_default' \
+'--icc=[Embed an ICC profile\: \`on\` (default) or \`off\`]:ICC:_default' \
+'--xmp=[Carry the source frame'\''s XMP packet verbatim\: \`on\` or \`off\` (default)]:XMP:_default' \
+'--iptc=[Carry the source frame'\''s IPTC block verbatim\: \`on\` or \`off\` (default). Never written to PNG]:IPTC:_default' \
+'--frame=[Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint'\''s own composite width and height. Requires \`--frame-output\`]:INDEX:_default' \
+'--frame-output=[Where to write the frame \`--frame\` names]:FILE:_files' \
+'--json[Emit the JSON report instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':project -- The `.ffp` project to read:_files' \
+&& ret=0
+;;
+(retouch)
+_arguments "${_arguments_options[@]}" : \
+'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. A brush stroke blends frame \`source_id\` over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
+'--from=[The state to append under -- any unique prefix of its id. Defaults to the project'\''s current head]:FROM:_default' \
+'--name=[Name the last appended state]:NAME:_default' \
+'--json[Emit the JSON report instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':project -- The project to append to:_files' \
+&& ret=0
+;;
+(history)
+_arguments "${_arguments_options[@]}" : \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_focusforge-cli__subcmd__history_commands" \
+"*::: :->history" \
+&& ret=0
+
+    case $state in
+    (history)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-history-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit the JSON document instead of human-readable text]' \
+'--accept-changed-sources[Accept changed source frames, printing their warning instead of refusing]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':project -- The project to list:_files' \
+&& ret=0
+;;
+(delete)
+_arguments "${_arguments_options[@]}" : \
+'--checkpoint=[The checkpoint to delete -- any unique prefix of its id]:CHECKPOINT:_default' \
+'--json[Emit the JSON report instead of human-readable text]' \
+'--accept-changed-sources[Accept changed source frames, printing their warning instead of refusing]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':project -- The project to delete from:_files' \
+&& ret=0
+;;
+(compact)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit the JSON report instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':project -- The project to compact:_files' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_focusforge-cli__subcmd__history__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-history-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(compact)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(align)
+_arguments "${_arguments_options[@]}" : \
+'--algorithm=[Registered alignment algorithm id. Optional\: defaults to the sole registered alignment algorithm]:ALGO:_default' \
+'--write-warped=[Write one warped TIFF per frame into this directory, at source dimensions, uncropped]:DIR:_files' \
+'*--set=[Set a parameter\: \`--set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--max-host-memory=[A **ceiling only** on the adaptive host-memory budget the alignment workers are sized from\: it can lower the budget the host-derived estimate resolved to, and can never raise it. Omit it entirely and the budget is derived from the host. Accepts suffixed sizes (\`8GiB\`, \`512MiB\`, \`4096\`)]:SIZE:_default' \
+'--max-vram=[A **ceiling only** on the adaptive device (VRAM) budget, for the alignment'\''s GPU levels and the \`--write-warped\` fuse backend\: it can lower the budget the startup probe settled on, and can never raise it. Accepts the same suffixed sizes as \`--max-host-memory\`. Only present when the \`gpu\` feature is compiled in]:SIZE:_default' \
+'--preset=[Read parameter values from a TOML preset. \`align\` uses only \`align-algo\` and the \`\[align\]\` table; a non-empty \`\[stack\]\` table or \`algo\` key is unused here and says so on stderr, so one preset file serves both subcommands]:PATH:_files' \
+'--write-preset=[Write the preset that reproduces this run to this path\: \`align-algo\` plus the \`\[align\]\` values you actually chose]:PATH:_files' \
+'--status=[Append one NDJSON status record for this run to this path]:PATH:_files' \
+'--json[Emit the JSON report instead of human-readable text]' \
+'--strict[Refuse the run when an alignment fails]' \
+'--no-progress[Print no progress at all. \`align\` has no fuse-tile units to count\: this suppresses only the one stage line \`align\` otherwise prints]' \
+'--cpu[Force the CPU path even when a usable GPU adapter is available\: the alignment'\''s large levels and the \`--write-warped\` fuse backend both stay on the CPU. Only present when the \`gpu\` feature is compiled in]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':dir -- Directory of TIFF frames to align (non-recursive, descending into `<dir>/frames` when that subdirectory exists):_files' \
+&& ret=0
+;;
+(review)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit one wrapped JSON document instead of a human-readable table]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':dir -- Directory to review\: a run'\''s `-o` output, or a plain directory of `*.ffp` projects:_files' \
+&& ret=0
+;;
+(cache)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit the JSON report instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_focusforge-cli__subcmd__cache_commands" \
+"*::: :->cache" \
+&& ret=0
+
+    case $state in
+    (cache)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-cache-command-$line[1]:"
+        case $line[1] in
+            (clear)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit the JSON report instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_focusforge-cli__subcmd__cache__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-cache-help-command-$line[1]:"
+        case $line[1] in
+            (clear)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(diagnostics)
+_arguments "${_arguments_options[@]}" : \
+'-o+[Where to write the ZIP. Omit for a dated name in the current directory]:FILE:_files' \
+'--output=[Where to write the ZIP. Omit for a dated name in the current directory]:FILE:_files' \
+'--include-minidumps[Include the minidump binaries. They cannot be redacted]' \
+'--force[Overwrite the output path when it already exists]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_focusforge-cli__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-help-command-$line[1]:"
+        case $line[1] in
+            (info)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(algorithms)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(stack)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(export)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(retouch)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(history)
+_arguments "${_arguments_options[@]}" : \
+":: :_focusforge-cli__subcmd__help__subcmd__history_commands" \
+"*::: :->history" \
+&& ret=0
+
+    case $state in
+    (history)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-help-history-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(compact)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(align)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(review)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(cache)
+_arguments "${_arguments_options[@]}" : \
+":: :_focusforge-cli__subcmd__help__subcmd__cache_commands" \
+"*::: :->cache" \
+&& ret=0
+
+    case $state in
+    (cache)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:focusforge-cli-help-cache-command-$line[1]:"
+        case $line[1] in
+            (clear)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(diagnostics)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_focusforge-cli_commands] )) ||
+_focusforge-cli_commands() {
+    local commands; commands=(
+'info:Print project, TIFF or RAW metadata for a file, or for every frame in a directory' \
+'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
+'stack:Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
+'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
+'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
+'history:List, delete or compact a project'\''s checkpoints. Every history operation is reachable through this command, headless' \
+'align:Compute and report the per-frame transforms for a stack\: readable text by default, a \`--json\` document on request, and an optional per-frame warped-TIFF dump for a visual check' \
+'review:Report one record per result found under a directory of projects, or a batch run'\''s output directory\: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of \`*.ffp\` files; never groups frames itself and writes nothing' \
+'cache:Remove every entry from the stage cache under \`.scratch/stage-cache/\`. Never touches \`.scratch/resume/\` or any project' \
+'diagnostics:Package this installation'\''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'focusforge-cli commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__algorithms_commands] )) ||
+_focusforge-cli__subcmd__algorithms_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli algorithms commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__align_commands] )) ||
+_focusforge-cli__subcmd__align_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli align commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__cache_commands] )) ||
+_focusforge-cli__subcmd__cache_commands() {
+    local commands; commands=(
+'clear:Remove every entry from the stage cache' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'focusforge-cli cache commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__cache__subcmd__clear_commands] )) ||
+_focusforge-cli__subcmd__cache__subcmd__clear_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli cache clear commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__cache__subcmd__help_commands] )) ||
+_focusforge-cli__subcmd__cache__subcmd__help_commands() {
+    local commands; commands=(
+'clear:Remove every entry from the stage cache' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'focusforge-cli cache help commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__cache__subcmd__help__subcmd__clear_commands] )) ||
+_focusforge-cli__subcmd__cache__subcmd__help__subcmd__clear_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli cache help clear commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__cache__subcmd__help__subcmd__help_commands] )) ||
+_focusforge-cli__subcmd__cache__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli cache help help commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__diagnostics_commands] )) ||
+_focusforge-cli__subcmd__diagnostics_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli diagnostics commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__export_commands] )) ||
+_focusforge-cli__subcmd__export_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli export commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help_commands] )) ||
+_focusforge-cli__subcmd__help_commands() {
+    local commands; commands=(
+'info:Print project, TIFF or RAW metadata for a file, or for every frame in a directory' \
+'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
+'stack:Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
+'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
+'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
+'history:List, delete or compact a project'\''s checkpoints. Every history operation is reachable through this command, headless' \
+'align:Compute and report the per-frame transforms for a stack\: readable text by default, a \`--json\` document on request, and an optional per-frame warped-TIFF dump for a visual check' \
+'review:Report one record per result found under a directory of projects, or a batch run'\''s output directory\: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of \`*.ffp\` files; never groups frames itself and writes nothing' \
+'cache:Remove every entry from the stage cache under \`.scratch/stage-cache/\`. Never touches \`.scratch/resume/\` or any project' \
+'diagnostics:Package this installation'\''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'focusforge-cli help commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__algorithms_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__algorithms_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help algorithms commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__align_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__align_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help align commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__cache_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__cache_commands() {
+    local commands; commands=(
+'clear:Remove every entry from the stage cache' \
+    )
+    _describe -t commands 'focusforge-cli help cache commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__cache__subcmd__clear_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__cache__subcmd__clear_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help cache clear commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__diagnostics_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__diagnostics_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help diagnostics commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__export_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__export_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help export commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__help_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help help commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__history_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__history_commands() {
+    local commands; commands=(
+'list:List every visible checkpoint, newest first' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
+    )
+    _describe -t commands 'focusforge-cli help history commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__history__subcmd__compact_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__history__subcmd__compact_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help history compact commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__history__subcmd__delete_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__history__subcmd__delete_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help history delete commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__history__subcmd__list_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__history__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help history list commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__info_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__info_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help info commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__retouch_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__retouch_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help retouch commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__review_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__review_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help review commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__stack_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__stack_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help stack commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history_commands] )) ||
+_focusforge-cli__subcmd__history_commands() {
+    local commands; commands=(
+'list:List every visible checkpoint, newest first' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'focusforge-cli history commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__compact_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__compact_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history compact commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__delete_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__delete_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history delete commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__help_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__help_commands() {
+    local commands; commands=(
+'list:List every visible checkpoint, newest first' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'focusforge-cli history help commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__help__subcmd__compact_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__help__subcmd__compact_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history help compact commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__help__subcmd__delete_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__help__subcmd__delete_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history help delete commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__help__subcmd__help_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history help help commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__help__subcmd__list_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history help list commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__history__subcmd__list_commands] )) ||
+_focusforge-cli__subcmd__history__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli history list commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__info_commands] )) ||
+_focusforge-cli__subcmd__info_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli info commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__retouch_commands] )) ||
+_focusforge-cli__subcmd__retouch_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli retouch commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__review_commands] )) ||
+_focusforge-cli__subcmd__review_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli review commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__stack_commands] )) ||
+_focusforge-cli__subcmd__stack_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli stack commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_focusforge-cli" ]; then
+    _focusforge-cli "$@"
+else
+    compdef _focusforge-cli focusforge-cli
+fi

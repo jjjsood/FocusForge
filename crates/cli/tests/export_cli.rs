@@ -1159,10 +1159,10 @@ fn refused_checkpoint_export_leaves_nothing() {
 
     // A changed source, named.
     let changed = build_branched("export_cli_refused_changed_sources");
-    let mut bytes = std::fs::read(&changed.source_paths[2]).unwrap();
-    let last = bytes.len() - 1;
-    bytes[last] ^= 0xFF;
-    std::fs::write(&changed.source_paths[2], &bytes).unwrap();
+    common::rewrite_changed(&changed.source_paths[2], |bytes| {
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+    });
     let out = dir.join("changed-sources.tif");
     let result = run_cli_in(
         changed.project_path.parent().unwrap(),
@@ -1213,35 +1213,32 @@ fn refused_checkpoint_export_leaves_nothing() {
         }
     }
 
-    // An unwritable destination.
-    let readonly_dir = dir.join("readonly");
-    std::fs::create_dir_all(&readonly_dir).unwrap();
+    // An unwritable destination. A read-only directory is a Unix permission; Windows has no
+    // mode to refuse with.
     #[cfg(unix)]
     {
+        let readonly_dir = dir.join("readonly");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    }
-    let unwritable = build_branched("export_cli_refused_unwritable");
-    let out = readonly_dir.join("out.tif");
-    let result = run_cli_in(
-        unwritable.project_path.parent().unwrap(),
-        &[
-            "export",
-            unwritable.project_path.to_str().unwrap(),
-            "--checkpoint",
-            &unwritable.root,
-            "-o",
-            out.to_str().unwrap(),
-        ],
-    );
-    assert!(!result.success);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+        let unwritable = build_branched("export_cli_refused_unwritable");
+        let out = readonly_dir.join("out.tif");
+        let result = run_cli_in(
+            unwritable.project_path.parent().unwrap(),
+            &[
+                "export",
+                unwritable.project_path.to_str().unwrap(),
+                "--checkpoint",
+                &unwritable.root,
+                "-o",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert!(!result.success);
         std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.exists());
+        assert!(!partial_of(&out).exists());
     }
-    assert!(!out.exists());
-    assert!(!partial_of(&out).exists());
 
     // Positive: a unique id prefix is accepted.
     let prefix_project = build_branched("export_cli_refused_prefix");

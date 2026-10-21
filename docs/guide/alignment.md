@@ -11,19 +11,9 @@ checking a result before committing to a full stack run.
 focusforge-cli align path/to/frames/
 ```
 
-```
-path/to/frames (8 frames)
-pyramidal-ecc - Pyramidal ECC (reference=3 policy=Chain failure_policy=lax failures=0)
-rho = ECC correlation in [-1, 1], not a pixel distance
-00.tif    tx=+12.41 ty=-3.07 scale=1.000842 rot=+0.0131deg  converged iters=12 rho=0.9814
-...
-03.tif    tx=+0.00 ty=+0.00 scale=1.000000 rot=+0.0000deg  converged iters=0 rho=1.0000 (reference)
-...
-auto-crop: 18,22 476x468
-```
-
-Every other frame registers against one reference frame (the middle frame of
-the stack by default), reporting its recovered translation, scale and
+Every other frame registers toward one reference frame (the middle frame of
+the stack by default), by default hop-by-hop through its neighbours (see
+`reference-policy` below). Each row reports its recovered translation, scale and
 rotation, an iteration count, and `rho` — the ECC correlation the solver
 optimized, in `[-1, 1]`, not a pixel distance. The last line is the
 auto-crop rectangle `stack` would apply: the largest axis-aligned rectangle

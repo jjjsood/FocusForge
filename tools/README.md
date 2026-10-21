@@ -3,12 +3,33 @@
 Scripts that check and drive **this** repository: gates, fixture generation
 from the reference stack, and the shared build/GPU lock.
 
+`tools/check-all.sh` is the one canonical build gate. Run it locally before
+acceptance or merge; GitHub Actions runs the same command on Linux, macOS and
+Windows for additional native-platform evidence. CI does not replace the local
+gate. It needs Rust 1.95.0 with rustfmt and clippy, cargo-deny 0.20.2,
+cargo-nextest 0.9.144, Python 3.12 with NumPy 2.2.6 (CI pins 3.12.10, the last 3.12 release with Windows and macOS builds), and Linux GUI link
+prerequisites when run on Linux.
+
 | script | what it does |
 |---|---|
 | `check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]` | Every gate, one command, bounded output, pass/fail summary. `--static` is the pre-commit set. Skips cleanly until `Cargo.toml` exists. |
 | `check-licenses.sh [--advisories]` | `cargo deny` over the GPLv3 compatibility allowlist; `--advisories` checks RUSTSEC instead. Skips until `deny.toml` is committed. |
+| `check-headers.sh` | Requires the opening GPL-3.0-or-later SPDX comment on authored Rust, Slint, WGSL, shell, Python, and hook files. `check-headers-selftest.sh` proves its covered classes and exclusions. |
+| `check-notice.sh [--write]` | Compares root `NOTICE` with the locked, offline default CLI+GUI runtime graphs for three release targets. `--write` explicitly regenerates it; the check never edits files. Cargo's cached metadata and package index must be available. `check-notice-selftest.sh` covers deterministic rendering and stale component records. |
 | `check-fixtures.sh` | Verifies `fixtures/MANIFEST.sha256` both ways: every listed file still hashes correctly, and no unlisted file is hiding under `fixtures/`. |
 | `check-fixtures-selftest.sh` | Proves `check-fixtures.sh`'s refusals and passes against synthetic throwaway trees, so the gate is never trusted on the strength of only ever having been seen green. |
+| `check-workflow-selftest.py` | Guards the checked-in Actions workflow's native matrix, immutable action pins, one canonical gate call, and narrow hidden-log artifact upload. |
+| `package-linux.sh` | Builds the GUI+CLI AppImage and `.deb` in the pinned Ubuntu 22.04 container. Run `tools/with-lock.sh build -- tools/package-linux.sh`; outputs, SHA-256 file and provenance inventory go under `.scratch/package-linux/`. |
+| `check-package-linux.sh [.scratch/package-linux]` | Uses only generated artifacts and copied fixture/legal expectations in fresh Ubuntu 22.04 containers. It checks inventories, hashes, loader/GLIBC requirements, Debian dependencies, CLI metadata and GUI help. Run it under the build lock after `package-linux.sh`. |
+| `package-macos.sh [--output DIR]` | On macOS, builds arm64 GUI and CLI binaries, assembles `FocusForge.app`, and creates a DMG below `target/distrib/native/`. |
+| `check-package-macos.sh DMG` | On macOS, mounts a DMG read-only and checks both arm64 binaries, bundle metadata, legal files, icon, and the packaged CLI. |
+| `package-windows.ps1 [-OutputDirectory DIR]` | On Windows, verifies the pinned WiX package, builds both executables, and creates a combined MSI below `target/distrib/native/`. |
+| `check-package-windows.ps1 -Msi PATH` | On Windows, silently installs and uninstalls an MSI, retaining installer logs while checking executables, legal files, and Start-menu shortcut. |
+| `collect-native-artifacts.py` | Validates native package receipts and hashes from `target/distrib` before cargo-dist copies the declared DMG/MSI outputs. |
+| `package-symbols.py` | Downloads checksum-pinned `dump_syms`, creates complete native debug plus Breakpad stores, and refuses stale, missing or mismatched GUI/CLI module identities and source paths outside the product, its dependencies and the toolchain. On a GitHub-hosted runner (`GITHUB_ACTIONS=true`) the checkout, cargo home, Xcode/Visual Studio/Windows SDK and Rust toolchain locations count as those; elsewhere only the container layout does. Its pins and license declarations live in `packaging/symbol-tools.toml`. |
+| `symbolicate.py MINIDUMP SYMBOL_ARCHIVE` | Extracts one verified local archive safely and runs the checksum-pinned offline stackwalker. It accepts only a crashing-thread application frame whose loaded module ID is in the archive. |
+| `check-release-gate.py` | Stdlib fail-closed release gate. Its offline cases live in `check-packaging-selftest.py`; hosted workflow use queries the exact `check.yml` push run and its three platform jobs for the candidate SHA. |
+| `check-packaging-selftest.py` | Offline mutations for package pins/configuration, artifact checker boundaries and release-gate refusal rules. Run it separately before package builds. It needs Bash, Python 3.12 and PowerShell 7+ on `PATH`; its macOS/Windows command journeys use local mocks and do not build installers. |
 | `fixture-e2e.sh` | Runs the built `focusforge-cli` over the checked-in fixtures. Cargo-free on purpose, so `check-all.sh` can run it beside the cargo gates. |
 | `tiff-diff.py A.tif B.tif [--tol N] [--zmap] [--bbox]` | The independent oracle for image outputs: compares two TIFFs pixel by pixel without going through this project's own reader or writer. `--tol` sets the allowed per-channel difference, `--zmap` compares `u16` source-index maps instead of RGB, `--bbox` prints the bounding rect of pixels differing beyond `--tol`. |
 | `image-metrics.py COMPOSITE.tif [--zmap ZMAP.tif] [--vs OTHER.tif] [--json]` | Reference-free numbers for a fused composite: clip fraction at 0 and at the maximum, row and column stripe energy, and grain, per channel; with `--zmap` the Z-Map coherence (the figure `focusforge-cli review` reports); with `--vs` the mean and maximum absolute difference and the differing-sample fraction against a second composite of the same size. Reads rows in bands through `lib/rawtiff.py`, so any image size fits in bounded memory. Input is an uncompressed strip TIFF, which is what `focusforge-cli export` writes by default (`--tiff-compression none`); LZW, deflate and tiled files are refused. The numbers carry no limits and rank nothing: stripe and grain follow the scene's own structure, so compare against a second method's or a known-good composite of the same scene (`--help` explains each number and what it does not show). `--json` prints one object with fixed keys. Exit 0 report printed, 1 unreadable or incomparable input, 2 usage error; `--selftest` checks every measure against synthetic images. |
@@ -30,3 +51,18 @@ from the reference stack, and the shared build/GPU lock.
 Every script skips rather than fails when the thing it checks does not exist
 yet — an empty repository is not a broken one. A skip prints `SKIP: <reason>`
 and exits 0.
+
+Release producers retain release line tables only until symbol extraction. The
+installer copies are stripped; Linux carries a GNU debuglink, macOS retains a
+arm64 `.dSYM`, and Windows retains a matching `.pdb` only in the symbol
+archive. Keep the generated `FocusForge-<version>-<platform>-symbols.tar.gz`
+and its `symbols.sha256` or release `native-artifacts.sha256` checksum entry
+beside the installer when diagnosing a user dump. `package-symbols.py` needs
+Python 3.10+; it verifies dump_syms 2.3.9 (MIT OR Apache-2.0) and
+minidump-stackwalk 0.27.0 (MIT) from the pinned release manifests before
+execution. GitHub Release assets carry the Linux, both macOS and Windows target
+archives next to their installers. Do not use network symbol retrieval:
+`symbolicate.py MINIDUMP SYMBOL_ARCHIVE` uses only the archive `store/` path.
+Line tables provide function/source-line diagnosis, not a promise of native
+types, local variables or deeper inline-debugging detail; missing archived data
+cannot be reconstructed from a stripped published binary.

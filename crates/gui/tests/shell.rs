@@ -667,7 +667,8 @@ fn settings_slint_sources() -> Vec<(String, String)> {
         .into_iter()
         .map(|path| {
             let code = common::strip_line_comments(&fs::read_to_string(&path).unwrap());
-            (path.display().to_string(), code)
+            // Matched by `/`-separated suffixes, whatever the platform's separator is.
+            (path.display().to_string().replace('\\', "/"), code)
         })
         .collect()
 }
@@ -2396,7 +2397,7 @@ fn performance_controls_report_to_their_callbacks() {
 }
 
 /// A cap entry longer than the field scrolls to keep the cursor in view,
-/// and Home brings the start back.
+/// and moving the cursor to the start brings the start back.
 #[test]
 fn performance_cap_entry_scrolls_to_follow_the_cursor() {
     use slint::platform::{Key, WindowEvent};
@@ -2434,16 +2435,20 @@ fn performance_cap_entry_scrolls_to_follow_the_cursor() {
             "field {field}: a long entry scrolls left, rest {rest}, now {scrolled}"
         );
 
-        app.window().dispatch_event(WindowEvent::KeyPressed {
-            text: Key::Home.into(),
-        });
-        app.window().dispatch_event(WindowEvent::KeyReleased {
-            text: Key::Home.into(),
-        });
+        // Plain Home moves no cursor on Apple platforms; the Control/Command
+        // chord with Left reaches the start of this one-word entry on all.
+        for key in [Key::Control, Key::LeftArrow] {
+            app.window()
+                .dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+        }
+        for key in [Key::LeftArrow, Key::Control] {
+            app.window()
+                .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+        }
         assert_eq!(
             performance_cap_inputs(&tab)[field].absolute_position().x,
             rest,
-            "field {field}: Home shows the start of the entry again"
+            "field {field}: the start-of-entry chord shows the start of the entry again"
         );
     }
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Selftest for tools/check-fixtures.sh.
 #
 # Runs copies of tools/check-fixtures.sh against synthetic fixtures/ trees
@@ -11,6 +12,11 @@ set -uo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$SELF/tools/check-fixtures.sh"
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+else
+  PYTHON=python
+fi
 
 PASS=0
 FAIL=0
@@ -23,11 +29,17 @@ fixture() {  # fixture <root> -- an intact two-frame fixture set plus the copied
   printf 'AAA' >"$root/fixtures/mantis-512/frames/00.tif"
   printf 'BBB' >"$root/fixtures/mantis-512/frames/01.tif"
   printf '%s\n' '# mantis-512 (selftest fixture)' >"$root/fixtures/mantis-512/README.md"
-  (
-    cd "$root/fixtures" &&
-      sha256sum mantis-512/README.md mantis-512/frames/00.tif mantis-512/frames/01.tif \
-        >MANIFEST.sha256
-  )
+  "$PYTHON" - "$root/fixtures" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+paths = sorted(path for path in root.rglob("*") if path.is_file())
+with (root / "MANIFEST.sha256").open("w", encoding="utf-8", newline="\n") as manifest:
+    for path in paths:
+        manifest.write(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}\n")
+PY
 }
 
 run_case() {  # run_case <name> <want-exit> <root> <needle>...
@@ -87,6 +99,11 @@ run_case "unlisted extra file" 1 "$d" \
 d="$TMP/c5"; fixture "$d"
 rm "$d/fixtures/mantis-512/frames/00.tif"
 run_case "missing listed file" 1 "$d" "FAILED open or read"
+
+# --- 6. a corrupt manifest must not silently become an empty one ----------
+d="$TMP/c6"; fixture "$d"
+printf 'not a sha256 manifest\n' >"$d/fixtures/MANIFEST.sha256"
+run_case "malformed manifest" 1 "$d" "FAIL: malformed MANIFEST.sha256"
 
 echo
 echo "--- $PASS passed, $FAIL failed ---"

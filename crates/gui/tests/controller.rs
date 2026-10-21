@@ -376,7 +376,9 @@ fn controller_api_is_slint_free() {
 // and the fall back to stacking.
 // ---------------------------------------------------------------------
 
-const SETTLE: Duration = Duration::from_secs(60);
+// A bound on a hang, not a speed requirement: a debug build on a loaded hosted Windows runner
+// needs well over a minute to fuse the 512 px fixture, and a settled run returns at once.
+const SETTLE: Duration = Duration::from_secs(300);
 
 /// A controller whose ledger, staging and held checkpoints live under a
 /// fresh directory named for `name`.
@@ -8749,28 +8751,31 @@ fn storage_view_without_directories() {
 
 #[test]
 fn storage_view_abbreviates_the_home_directory() {
+    // The test spells its paths with `/`; on Windows the view joins them with `\`.
     let home = Path::new("/home/someone");
     let config = home.join(".config/focusforge");
     let data = Path::new("/srv/data/focusforge");
     let scratch = home.join(".local/scratch");
     let view = storage_view(Some(&config), Some(data), &scratch, Some(home));
     assert_eq!(
-        view.settings_file.path,
+        view.settings_file.path.replace('\\', "/"),
         "~/.config/focusforge/settings.toml"
     );
-    assert_eq!(view.scratch.path, "~/.local/scratch");
+    assert_eq!(view.scratch.path.replace('\\', "/"), "~/.local/scratch");
     assert_eq!(
-        view.logs.path, "/srv/data/focusforge/logs",
+        view.logs.path.replace('\\', "/"),
+        "/srv/data/focusforge/logs",
         "a path outside the home directory stays absolute"
     );
 
     let sibling = storage_view(None, None, Path::new("/home/someone2/scratch"), Some(home));
     assert_eq!(
-        sibling.scratch.path, "/home/someone2/scratch",
+        sibling.scratch.path.replace('\\', "/"),
+        "/home/someone2/scratch",
         "a sibling directory sharing the home name's prefix is not under it"
     );
     let at_home = storage_view(None, None, home, Some(home));
-    assert_eq!(at_home.scratch.path, "~");
+    assert_eq!(at_home.scratch.path.replace('\\', "/"), "~");
 }
 
 /// Writes one stage-cache entry file under `<scratch>/stage-cache/<stage>/`.
@@ -9451,12 +9456,14 @@ fn fixture_valid_project_opens_over_its_frames() {
 
 /// A stroke of the shape a driver synthesises -- one press, one move to a far
 /// point, one release -- a long drag flushed every few moves, and a drag in
-/// stacking mode each reach their settled render in under a second.
+/// stacking mode each reach their settled render in a few seconds at most; a
+/// stroke that stalls takes far longer, and a loaded runner running the whole
+/// suite in parallel needs the margin (the one-move stroke took 1.05 s there).
 #[test]
 fn stroke_of_the_journey_shape_lands_quickly() {
     use std::time::{Duration, Instant};
 
-    const BUDGET: Duration = Duration::from_secs(1);
+    const BUDGET: Duration = Duration::from_secs(5);
     let (mut c, _root) = open_editor("stroke_of_the_journey_shape");
     set_size(&mut c, 8.0);
     let centre = at(MAP_WIDTH as f32 / 2.0, MAP_HEIGHT as f32 / 2.0);

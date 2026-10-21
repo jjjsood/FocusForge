@@ -13,6 +13,9 @@
 //! the spawned child's piped stderr -- never a sleep, since signal tests
 //! are the flakiest kind of test in a suite.
 
+// The SIGINT cases are Unix-only; their helpers and imports have no user on Windows.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};

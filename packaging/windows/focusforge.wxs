@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="FocusForge" Manufacturer="FocusForge" Version="$(var.Version)" UpgradeCode="E0A1B063-1D44-4A53-8F91-32D4293A1659" Language="1033">
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles6432Folder"><Directory Id="INSTALLFOLDER" Name="FocusForge" /></StandardDirectory>
+    <DirectoryRef Id="INSTALLFOLDER"><Directory Id="ShareDirectory" Name="share"><Directory Id="ManDirectory" Name="man"><Directory Id="Man1Directory" Name="man1" /></Directory><Directory Id="BashDirectory" Name="bash-completion"><Directory Id="BashCompletionsDirectory" Name="completions" /></Directory><Directory Id="ZshDirectory" Name="zsh"><Directory Id="ZshCompletionsDirectory" Name="vendor-completions" /></Directory><Directory Id="FishDirectory" Name="fish"><Directory Id="FishCompletionsDirectory" Name="vendor_completions.d" /></Directory><Directory Id="PowerShellDirectory" Name="powershell"><Directory Id="PowerShellCompletionsDirectory" Name="completions" /></Directory></Directory></DirectoryRef>
+    <StandardDirectory Id="ProgramMenuFolder"><Directory Id="FocusForgeMenu" Name="FocusForge" /></StandardDirectory>
+    <Feature Id="ProductFeature" Title="FocusForge" Level="1">
+      <Component Id="CliComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="CliFile" Source="$(var.Cli)" Name="focusforge-cli.exe" KeyPath="yes" /></Component>
+      <Component Id="GuiComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="GuiFile" Source="$(var.Gui)" Name="focusforge-gui.exe" KeyPath="yes" /></Component>
+      <Component Id="LicenseComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="LicenseFile" Source="$(var.License)" Name="LICENSE" KeyPath="yes" /></Component>
+      <Component Id="NoticeComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="NoticeFile" Source="$(var.Notice)" Name="NOTICE" KeyPath="yes" /></Component>
+      <Component Id="IconComponent" Directory="INSTALLFOLDER" Bitness="always64"><File Id="IconFile" Source="$(var.Icon)" Name="focusforge.ico" KeyPath="yes" /></Component>
+      <Component Id="ManRootComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManRoot" Source="$(var.CliAssets)\man\man1\focusforge-cli.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManInfoComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManInfo" Source="$(var.CliAssets)\man\man1\focusforge-cli-info.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManAlgorithmsComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManAlgorithms" Source="$(var.CliAssets)\man\man1\focusforge-cli-algorithms.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManStackComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManStack" Source="$(var.CliAssets)\man\man1\focusforge-cli-stack.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManExportComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManExport" Source="$(var.CliAssets)\man\man1\focusforge-cli-export.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManRetouchComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManRetouch" Source="$(var.CliAssets)\man\man1\focusforge-cli-retouch.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManHistoryComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistory" Source="$(var.CliAssets)\man\man1\focusforge-cli-history.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManAlignComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManAlign" Source="$(var.CliAssets)\man\man1\focusforge-cli-align.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManReviewComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManReview" Source="$(var.CliAssets)\man\man1\focusforge-cli-review.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManCacheComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManCache" Source="$(var.CliAssets)\man\man1\focusforge-cli-cache.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManDiagnosticsComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManDiagnostics" Source="$(var.CliAssets)\man\man1\focusforge-cli-diagnostics.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManHistoryListComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistoryList" Source="$(var.CliAssets)\man\man1\focusforge-cli-history-list.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManHistoryDeleteComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistoryDelete" Source="$(var.CliAssets)\man\man1\focusforge-cli-history-delete.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManHistoryCompactComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistoryCompact" Source="$(var.CliAssets)\man\man1\focusforge-cli-history-compact.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManCacheClearComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManCacheClear" Source="$(var.CliAssets)\man\man1\focusforge-cli-cache-clear.1.gz" KeyPath="yes" /></Component>
+      <Component Id="BashCompletion" Directory="BashCompletionsDirectory" Bitness="always64"><File Id="BashCompletionFile" Source="$(var.CliAssets)\bash-completion\completions\focusforge-cli" KeyPath="yes" /></Component>
+      <Component Id="ZshCompletion" Directory="ZshCompletionsDirectory" Bitness="always64"><File Id="ZshCompletionFile" Source="$(var.CliAssets)\zsh\vendor-completions\_focusforge-cli" KeyPath="yes" /></Component>
+      <Component Id="FishCompletion" Directory="FishCompletionsDirectory" Bitness="always64"><File Id="FishCompletionFile" Source="$(var.CliAssets)\fish\vendor_completions.d\focusforge-cli.fish" KeyPath="yes" /></Component>
+      <Component Id="PowerShellCompletion" Directory="PowerShellCompletionsDirectory" Bitness="always64"><File Id="PowerShellCompletionFile" Source="$(var.CliAssets)\powershell\completions\_focusforge-cli.ps1" KeyPath="yes" /></Component>
+      <Component Directory="FocusForgeMenu" Bitness="always64"><Shortcut Id="FocusForgeShortcut" Name="FocusForge" Target="[INSTALLFOLDER]focusforge-gui.exe" Icon="FocusForgeIcon"><ShortcutProperty Key="System.AppUserModel.ID" Value="org.focusforge.FocusForge" /></Shortcut><RemoveFolder Id="RemoveFocusForgeMenu" On="uninstall" /><RegistryValue Root="HKCU" Key="Software\\FocusForge" Name="installed" Type="integer" Value="1" KeyPath="yes" /></Component>
+    </Feature>
+    <Icon Id="FocusForgeIcon" SourceFile="$(var.Icon)" />
+  </Package>
+</Wix>

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Cut the checked-in fixture crops out of the reference stack.
 
 Driven by tools/make-fixtures.sh; see that script for the flags. The whole job

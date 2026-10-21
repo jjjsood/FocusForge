@@ -1362,6 +1362,1050 @@ mod tests {
         assert_eq!(generated_help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
+    fn cli_reference_at(path: &std::path::Path) -> Result<String, String> {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))
+    }
+
+    fn cli_reference() -> String {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/cli.md");
+        cli_reference_at(&path).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn table_cells(line: &str) -> Vec<String> {
+        let mut cells = vec![String::new()];
+        let mut escaped = false;
+        for character in line.chars() {
+            if escaped {
+                cells
+                    .last_mut()
+                    .expect("a table row has one cell")
+                    .push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '|' {
+                cells.push(String::new());
+            } else {
+                cells
+                    .last_mut()
+                    .expect("a table row has one cell")
+                    .push(character);
+            }
+        }
+        cells
+    }
+
+    fn table_rows(section: &str, header: &str) -> Vec<String> {
+        let Some(table) = section.split_once(header).map(|(_, table)| table) else {
+            return Vec::new();
+        };
+        table
+            .lines()
+            .skip(1)
+            .take_while(|line| line.starts_with('|'))
+            .filter(|line| !line.contains("---"))
+            .filter_map(|line| table_cells(line).into_iter().nth(1))
+            .map(|cell| cell.trim().trim_matches('`').to_string())
+            .collect()
+    }
+
+    fn section<'a>(reference: &'a str, heading: &str) -> Option<&'a str> {
+        let start = reference.find(heading)? + heading.len();
+        let level = heading
+            .chars()
+            .take_while(|character| *character == '#')
+            .count();
+        let end = reference[start..]
+            .match_indices('\n')
+            .find_map(|(offset, _)| {
+                let line = &reference[start + offset + 1..];
+                let next_level = line
+                    .chars()
+                    .take_while(|character| *character == '#')
+                    .count();
+                (next_level > 0 && next_level <= level).then_some(start + offset)
+            })
+            .unwrap_or(reference.len());
+        Some(&reference[start..end])
+    }
+
+    fn first_code_block(section: &str) -> Option<&str> {
+        let (_, after_open) = section.split_once("```\n")?;
+        after_open.split_once("\n```").map(|(block, _)| block)
+    }
+
+    fn documented_tokens(rows: &[String]) -> std::collections::BTreeSet<String> {
+        rows.iter()
+            .flat_map(|row| row.split_whitespace())
+            .map(|token| token.trim_end_matches(',').to_string())
+            .filter(|token| token.starts_with('-'))
+            .collect()
+    }
+
+    fn documented_command(row: &str) -> Option<String> {
+        let name = row.split_whitespace().next()?;
+        if let Some(name) = name.strip_prefix('[') {
+            return Some(name.split_once(']')?.0.trim_matches('`').to_string());
+        }
+        Some(name.trim_matches('`').to_string())
+    }
+
+    fn command_path(command: &clap::Command, parent: &str) -> String {
+        if parent.is_empty() {
+            command.get_name().to_string()
+        } else {
+            format!("{parent} {}", command.get_name())
+        }
+    }
+
+    fn check_cli_reference(command: &clap::Command, reference: &str) -> Vec<String> {
+        fn check(
+            command: &clap::Command,
+            parent: &str,
+            reference: &str,
+            inherited: &std::collections::BTreeSet<String>,
+            errors: &mut Vec<String>,
+        ) {
+            let path = command_path(command, parent);
+            let depth = path.split_whitespace().count() - 1;
+            let (synopsis, documented, commands) = if depth == 0 {
+                let root_end = reference.find("\n## ").unwrap_or(reference.len());
+                let root = &reference[..root_end];
+                let globals = section(reference, "## Global options").unwrap_or("");
+                (
+                    first_code_block(root),
+                    documented_tokens(&table_rows(globals, "| flag | meaning |")),
+                    table_rows(root, "| command | does |"),
+                )
+            } else {
+                let documented_path = path.strip_prefix("focusforge-cli ").unwrap_or(&path);
+                let heading = format!("{} `{documented_path}`", "#".repeat(depth + 1));
+                let body = match section(reference, &heading) {
+                    Some(body) => body,
+                    None => {
+                        errors.push(format!("missing section `{path}`"));
+                        return;
+                    }
+                };
+                (
+                    first_code_block(body),
+                    documented_tokens(&table_rows(body, "| flag | meaning |")),
+                    table_rows(body, "| subcommand | does |"),
+                )
+            };
+
+            let expected_usage = command
+                .clone()
+                .render_usage()
+                .to_string()
+                .trim_start_matches("Usage: ")
+                .to_string();
+            if synopsis != Some(expected_usage.as_str()) {
+                errors.push(format!("{path}: synopsis differs from `{expected_usage}`"));
+            }
+
+            let visible_subcommands: std::collections::BTreeSet<_> = command
+                .get_subcommands()
+                .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+                .map(|child| child.get_name().to_string())
+                .collect();
+            let hidden_subcommands: std::collections::BTreeSet<_> = command
+                .get_subcommands()
+                .filter(|child| child.is_hide_set())
+                .map(|child| child.get_name().to_string())
+                .collect();
+            let documented_subcommands: std::collections::BTreeSet<_> = commands
+                .iter()
+                .filter_map(|row| documented_command(row))
+                .collect();
+            for name in visible_subcommands.difference(&documented_subcommands) {
+                errors.push(format!("{path}: undocumented command `{name}`"));
+            }
+            for name in documented_subcommands.difference(&visible_subcommands) {
+                if hidden_subcommands.contains(name) {
+                    continue;
+                }
+                errors.push(format!("{path}: documented command `{name}` is absent"));
+            }
+
+            let visible_arguments: Vec<_> = command
+                .get_arguments()
+                .filter(|arg| !arg.is_hide_set())
+                .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
+                .collect();
+            let expected: std::collections::BTreeSet<_> = visible_arguments
+                .iter()
+                .flat_map(|arg| {
+                    [
+                        arg.get_short().map(|short| format!("-{short}")),
+                        arg.get_long().map(|long| format!("--{long}")),
+                    ]
+                })
+                .flatten()
+                .collect();
+            let hidden: std::collections::BTreeSet<_> = command
+                .get_arguments()
+                .filter(|arg| arg.is_hide_set())
+                .flat_map(|arg| {
+                    [
+                        arg.get_short().map(|short| format!("-{short}")),
+                        arg.get_long().map(|long| format!("--{long}")),
+                    ]
+                })
+                .flatten()
+                .collect();
+            for name in expected.difference(&documented) {
+                if inherited.contains(name) {
+                    continue;
+                }
+                errors.push(format!("{path}: undocumented argument `{name}`"));
+            }
+            let permitted_without_gpu = ["--max-vram", "--cpu"];
+            for name in documented.difference(&expected) {
+                if inherited.contains(name)
+                    || hidden.contains(name)
+                    || matches!(name.as_str(), "--help" | "-h" | "--version" | "-V")
+                {
+                    continue;
+                }
+                if !cfg!(feature = "gpu")
+                    && matches!(
+                        path.as_str(),
+                        "focusforge-cli stack" | "focusforge-cli align"
+                    )
+                    && permitted_without_gpu.contains(&name.as_str())
+                {
+                    continue;
+                }
+                errors.push(format!("{path}: documented argument `{name}` is absent"));
+            }
+
+            for child in command
+                .get_subcommands()
+                .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+            {
+                let mut child_inherited = inherited.clone();
+                child_inherited.extend(
+                    visible_arguments
+                        .iter()
+                        .filter(|arg| arg.is_global_set())
+                        .flat_map(|arg| {
+                            [
+                                arg.get_short().map(|short| format!("-{short}")),
+                                arg.get_long().map(|long| format!("--{long}")),
+                            ]
+                        })
+                        .flatten(),
+                );
+                check(child, &path, reference, &child_inherited, errors);
+            }
+        }
+
+        fn paths(
+            command: &clap::Command,
+            parent: &str,
+            known: &mut std::collections::BTreeSet<String>,
+        ) {
+            let path = command_path(command, parent);
+            known.insert(path.clone());
+            for child in command
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+            {
+                paths(child, &path, known);
+            }
+        }
+
+        let mut errors = Vec::new();
+        check(
+            command,
+            "",
+            reference,
+            &std::collections::BTreeSet::new(),
+            &mut errors,
+        );
+        let mut known = std::collections::BTreeSet::new();
+        paths(command, "", &mut known);
+        for line in reference.lines() {
+            let Some((hashes, title)) = line.split_once(' ') else {
+                continue;
+            };
+            if hashes.len() < 2 || !hashes.chars().all(|character| character == '#') {
+                continue;
+            }
+            let Some(title) = title
+                .strip_prefix('`')
+                .and_then(|title| title.strip_suffix('`'))
+            else {
+                continue;
+            };
+            if title.starts_with('-') {
+                continue;
+            }
+            let path = format!("focusforge-cli {title}");
+            if !known.contains(&path) {
+                errors.push(format!("documented section `{title}` is absent"));
+            }
+        }
+        errors
+    }
+
+    #[test]
+    fn cli_reference_matches_parser() {
+        let mut command = Cli::command();
+        command.build();
+        let errors = check_cli_reference(&command, &cli_reference());
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn cli_reference_check_reports_drift() {
+        let mut command = Cli::command();
+        command.build();
+        let reference = cli_reference();
+        assert_eq!(
+            table_rows(
+                "| flag | meaning |\n|---|---|\n| `--format <on\\|off>` | value |",
+                "| flag | meaning |"
+            ),
+            ["--format <on|off>"]
+        );
+        let drifted = reference
+            .replacen("| `--strict` |", "| `--strict-missing` |", 1)
+            .replacen(
+                "| `--algorithm <ALGO>` |",
+                "| `--algorithm <ALGO>` |\n| `--frobnicate` | invented |",
+                2,
+            )
+            .replacen("### `history list`", "### `history entries`", 1)
+            .replacen("-o, --output", "-x, --output", 1)
+            .replacen(
+                "focusforge-cli stack [OPTIONS] <DIR>",
+                "focusforge-cli stack [OPTIONS] <PATH>",
+                1,
+            );
+        let errors = check_cli_reference(&command, &drifted).join("\n");
+        for expected in [
+            "focusforge-cli stack: undocumented argument `--strict`",
+            "focusforge-cli align: documented argument `--frobnicate` is absent",
+            "missing section `focusforge-cli history list`",
+            "focusforge-cli stack: undocumented argument `-o`",
+            "focusforge-cli stack: documented argument `-x` is absent",
+            "focusforge-cli stack: synopsis differs",
+        ] {
+            assert!(
+                errors.contains(expected),
+                "missing {expected:?} in {errors}"
+            );
+        }
+
+        let hidden = command.clone().arg(
+            clap::Arg::new("hidden-reference-check")
+                .long("hidden-reference-check")
+                .hide(true),
+        );
+        let hidden_reference = reference.replacen(
+            "| `-v` |",
+            "| `--hidden-reference-check` | hidden |\n| `-v` |",
+            1,
+        );
+        assert!(check_cli_reference(&hidden, &hidden_reference).is_empty());
+
+        let hidden_subcommand = command.clone().subcommand(
+            clap::Command::new("hidden-reference-command")
+                .about("Hidden")
+                .hide(true),
+        );
+        assert!(check_cli_reference(&hidden_subcommand, &reference).is_empty());
+        let hidden_command_reference = reference.replacen(
+            "| [`info`](#info) |",
+            "| `hidden-reference-command` | hidden |\n| [`info`](#info) |",
+            1,
+        ) + "\n## `hidden-reference-command`\n\n```\nignored\n```\n";
+        assert!(check_cli_reference(&hidden_subcommand, &hidden_command_reference).is_empty());
+
+        let hidden_stack = command.clone().mut_subcommand("stack", |stack| {
+            stack.arg(
+                clap::Arg::new("hidden-stack-reference-check")
+                    .long("hidden-stack-reference-check")
+                    .hide(true),
+            )
+        });
+        let hidden_stack_reference = reference.replacen(
+            "| `--algorithm <ALGO>` | registered stacking algorithm id; required unless a `--preset` supplies `algo` (see `algorithms` below for the list) |",
+            "| `--hidden-stack-reference-check` | hidden |\n| `--algorithm <ALGO>` | registered stacking algorithm id; required unless a `--preset` supplies `algo` (see `algorithms` below for the list) |",
+            1,
+        );
+        assert!(check_cli_reference(&hidden_stack, &reference).is_empty());
+        assert!(check_cli_reference(&hidden_stack, &hidden_stack_reference).is_empty());
+
+        let missing_root_verbosity = reference.replacen(
+            "| `-v` | increase log detail; repeat it for more detail |\n",
+            "",
+            1,
+        );
+        assert!(
+            check_cli_reference(&command, &missing_root_verbosity)
+                .join("\n")
+                .contains("focusforge-cli: undocumented argument `-v`")
+        );
+        let missing_root_quiet = reference.replacen("| `-q, --quiet` | log errors only |\n", "", 1);
+        let quiet_errors = check_cli_reference(&command, &missing_root_quiet).join("\n");
+        assert!(quiet_errors.contains("focusforge-cli: undocumented argument `-q`"));
+        assert!(quiet_errors.contains("focusforge-cli: undocumented argument `--quiet`"));
+
+        let missing_cache_json = reference.replacen(
+            "| `--json` | emit the JSON report instead of human-readable text |",
+            "",
+            1,
+        );
+        assert!(
+            check_cli_reference(&command, &missing_cache_json)
+                .join("\n")
+                .contains("focusforge-cli cache: undocumented argument `--json`")
+        );
+        let without_inherited_cache_json = reference.replacen(
+            "### `cache clear`\n\n```\nfocusforge-cli cache clear [OPTIONS]\n```\n\n| flag | meaning |\n|---|---|\n| `--json` | emit the JSON report instead of human-readable text |",
+            "### `cache clear`\n\n```\nfocusforge-cli cache clear [OPTIONS]\n```\n\n| flag | meaning |\n|---|---|",
+            1,
+        );
+        assert!(check_cli_reference(&command, &without_inherited_cache_json).is_empty());
+
+        let generated_reference =
+            reference.replacen("| `-v` |", "| `--help` | generated |\n| `-v` |", 1);
+        assert!(check_cli_reference(&command, &generated_reference).is_empty());
+
+        let without_inherited = reference.replacen(
+            "| `-q, --quiet` | log errors only; results and required warnings remain visible |\n",
+            "",
+            1,
+        );
+        assert!(check_cli_reference(&command, &without_inherited).is_empty());
+
+        let missing_local_override = reference.replacen(
+            "| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |\n",
+            "",
+            1,
+        );
+        assert!(
+            check_cli_reference(&command, &missing_local_override)
+                .join("\n")
+                .contains(
+                    "focusforge-cli history list: undocumented argument `--accept-changed-sources`"
+                )
+        );
+        let parent_override = reference.replacen(
+            "| flag | meaning |\n|---|---|\n\n### `history list`",
+            "| flag | meaning |\n|---|---|\n| `--accept-changed-sources` | misplaced |\n\n### `history list`",
+            1,
+        );
+        assert!(
+            check_cli_reference(&command, &parent_override)
+                .join("\n")
+                .contains("focusforge-cli history: documented argument `--accept-changed-sources` is absent")
+        );
+        let compact_override = reference.replacen(
+            "### `history compact`\n\n```\nfocusforge-cli history compact [OPTIONS] <PROJECT>\n```\n\n| flag | meaning |\n|---|---|",
+            "### `history compact`\n\n```\nfocusforge-cli history compact [OPTIONS] <PROJECT>\n```\n\n| flag | meaning |\n|---|---|\n| `--accept-changed-sources` | misplaced |",
+            1,
+        );
+        assert!(
+            check_cli_reference(&command, &compact_override)
+                .join("\n")
+                .contains("focusforge-cli history compact: documented argument `--accept-changed-sources` is absent")
+        );
+
+        let invented_section = reference.replacen("## `review`", "## `frob`", 1);
+        let invented_errors = check_cli_reference(&command, &invented_section).join("\n");
+        assert!(invented_errors.contains("missing section `focusforge-cli review`"));
+        assert!(invented_errors.contains("documented section `frob` is absent"));
+
+        let drifted_child = reference.replacen(
+            "| `list <PROJECT> [--json] [--accept-changed-sources]` |",
+            "| `entries <PROJECT> [--json] [--accept-changed-sources]` |",
+            1,
+        );
+        let child_errors = check_cli_reference(&command, &drifted_child).join("\n");
+        assert!(child_errors.contains("focusforge-cli history: undocumented command `list`"));
+        assert!(
+            child_errors.contains("focusforge-cli history: documented command `entries` is absent")
+        );
+
+        let prose = reference.replacen("Every algorithm", "Every --frobnicate algorithm", 1);
+        assert!(check_cli_reference(&command, &prose).is_empty());
+
+        let visible = command
+            .clone()
+            .subcommand(clap::Command::new("reference-probe").about("Probe"));
+        assert!(
+            check_cli_reference(&visible, &reference)
+                .join("\n")
+                .contains("focusforge-cli: undocumented command `reference-probe`")
+        );
+
+        #[cfg(not(feature = "gpu"))]
+        {
+            let non_gpu =
+                reference.replacen("| `--cpu` |", "| `--not-gpu` | invented |\n| `--cpu` |", 1);
+            assert!(
+                check_cli_reference(&command, &non_gpu)
+                    .join("\n")
+                    .contains("focusforge-cli stack: documented argument `--not-gpu` is absent")
+            );
+            let wrong_owner = reference.replacen(
+                "| `--json` | emit the JSON document instead of human-readable text |",
+                "| `--json` | emit the JSON document instead of human-readable text |\n| `--cpu` | invented |",
+                1,
+            );
+            assert!(
+                check_cli_reference(&command, &wrong_owner)
+                    .join("\n")
+                    .contains("focusforge-cli info: documented argument `--cpu` is absent")
+            );
+        }
+
+        #[cfg(feature = "gpu")]
+        {
+            let missing_gpu = reference
+                .replacen("| `--max-vram <SIZE>` |", "| `--vram-missing <SIZE>` |", 2)
+                .replacen("| `--cpu` |", "| `--cpu-missing` |", 2);
+            let gpu_errors = check_cli_reference(&command, &missing_gpu).join("\n");
+            for expected in [
+                "focusforge-cli stack: undocumented argument `--max-vram`",
+                "focusforge-cli stack: undocumented argument `--cpu`",
+                "focusforge-cli align: undocumented argument `--max-vram`",
+                "focusforge-cli align: undocumented argument `--cpu`",
+            ] {
+                assert!(
+                    gpu_errors.contains(expected),
+                    "missing {expected:?} in {gpu_errors}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_reference_load_error_names_the_absolute_path() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-cli-reference.md");
+        let error = cli_reference_at(&path).expect_err("missing reference must fail");
+        assert!(error.contains(&path.display().to_string()));
+    }
+
+    const CLI_ASSET_REGENERATION: &str = "FOCUSFORGE_REGENERATE_CLI_ASSETS=1 cargo test -p focusforge-cli --bin focusforge-cli tests::regenerate_cli_assets -- --exact";
+
+    #[cfg(feature = "gpu")]
+    fn cli_assets_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets")
+    }
+
+    fn visible_commands(
+        command: &clap::Command,
+        names: &mut Vec<String>,
+        pages: &mut std::collections::BTreeMap<String, Vec<u8>>,
+        version: &'static str,
+    ) {
+        let name = names.join("-");
+        let mut page = command
+            .clone()
+            .display_name(name.clone())
+            .version(version)
+            .disable_help_subcommand(true);
+        page.build();
+        let man = clap_mangen::Man::new(page);
+        let mut bytes = Vec::new();
+        man.render(&mut bytes)
+            .expect("a Vec accepts generated manual output");
+        pages.insert(man.get_filename(), bytes);
+        for child in command
+            .get_subcommands()
+            .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+        {
+            names.push(child.get_name().to_owned());
+            visible_commands(child, names, pages, version);
+            names.pop();
+        }
+    }
+
+    // The generated Bash completion is for Unix shells; a Windows runner's `bash` is not one.
+    #[cfg(unix)]
+    fn bash_callback(script: &std::path::Path, context: &str, invocation: &str) -> Vec<String> {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "source \"$1\"\n{context}\nCOMPREPLY=()\n{invocation}\nprintf '%s\\n' \"${{COMPREPLY[@]}}\""
+            ))
+            .arg("bash")
+            .arg(script)
+            .output()
+            .expect("bash is available for completion generation tests");
+        assert!(
+            output.status.success(),
+            "Bash callback failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("Bash completion output is UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_cli_bash_callback_completes_root_nested_commands_and_options() {
+        let temporary = tempfile::tempdir().expect("temporary completion directory");
+        let script = temporary.path().join("focusforge-cli.bash");
+        std::fs::write(
+            &script,
+            generated_cli_assets()
+                .remove(std::path::Path::new("completions/focusforge-cli.bash"))
+                .expect("Bash completion is generated"),
+        )
+        .expect("write Bash completion");
+
+        let root = bash_callback(
+            &script,
+            "COMP_WORDS=(focusforge-cli '')\nCOMP_CWORD=1\nCOMP_LINE='focusforge-cli '\nCOMP_POINT=${#COMP_LINE}",
+            "_focusforge__cli focusforge-cli ''",
+        );
+        for expected in ["info", "history", "cache", "stack"] {
+            assert!(
+                root.contains(&expected.to_owned()),
+                "root lacks {expected}: {root:?}"
+            );
+        }
+
+        let history = bash_callback(
+            &script,
+            "COMP_WORDS=(focusforge-cli history '')\nCOMP_CWORD=2\nCOMP_LINE='focusforge-cli history '\nCOMP_POINT=${#COMP_LINE}",
+            "_focusforge__cli focusforge-cli '' history",
+        );
+        for expected in ["list", "delete", "compact"] {
+            assert!(
+                history.contains(&expected.to_owned()),
+                "history lacks {expected}: {history:?}"
+            );
+        }
+
+        let cache = bash_callback(
+            &script,
+            "COMP_WORDS=(focusforge-cli cache '')\nCOMP_CWORD=2\nCOMP_LINE='focusforge-cli cache '\nCOMP_POINT=${#COMP_LINE}",
+            "_focusforge__cli focusforge-cli '' cache",
+        );
+        assert!(
+            cache.contains(&"clear".to_owned()),
+            "cache lacks clear: {cache:?}"
+        );
+
+        let options = bash_callback(
+            &script,
+            "COMP_WORDS=(focusforge-cli history list --)\nCOMP_CWORD=3\nCOMP_LINE='focusforge-cli history list --'\nCOMP_POINT=${#COMP_LINE}",
+            "_focusforge__cli focusforge-cli -- list",
+        );
+        for expected in ["--json", "--accept-changed-sources"] {
+            assert!(
+                options.contains(&expected.to_owned()),
+                "history list lacks {expected}: {options:?}"
+            );
+        }
+    }
+
+    fn generated_cli_assets_for(
+        mut command: clap::Command,
+        version: &'static str,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        use clap_complete::{
+            aot,
+            aot::{Bash, Fish, PowerShell, Zsh},
+        };
+
+        command.build();
+        let mut manuals = std::collections::BTreeMap::new();
+        visible_commands(
+            &command,
+            &mut vec![command.get_name().to_owned()],
+            &mut manuals,
+            version,
+        );
+        let mut assets = manuals
+            .into_iter()
+            .map(|(name, bytes)| (std::path::PathBuf::from("man").join(name), bytes))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut bash = command.clone();
+        let mut bash_bytes = Vec::new();
+        aot::generate(Bash, &mut bash, "focusforge-cli", &mut bash_bytes);
+        let bash = String::from_utf8(bash_bytes)
+            .expect("clap Bash completion is UTF-8")
+            .replace("focusforge__subcmd__cli", "focusforge__cli")
+            .into_bytes();
+        assets.insert(
+            std::path::PathBuf::from("completions").join("focusforge-cli.bash"),
+            bash,
+        );
+        macro_rules! completion {
+            ($shell:expr, $name:literal) => {{
+                let mut command = command.clone();
+                let mut bytes = Vec::new();
+                aot::generate($shell, &mut command, "focusforge-cli", &mut bytes);
+                assets.insert(std::path::PathBuf::from("completions").join($name), bytes);
+            }};
+        }
+        completion!(Zsh, "_focusforge-cli");
+        completion!(Fish, "focusforge-cli.fish");
+        completion!(PowerShell, "_focusforge-cli.ps1");
+        assets
+    }
+
+    fn generated_cli_assets() -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        use clap::CommandFactory;
+
+        generated_cli_assets_for(Cli::command(), env!("CARGO_PKG_VERSION"))
+    }
+
+    fn regeneration_error(path: &std::path::Path, error: std::io::Error) -> String {
+        format!(
+            "cannot read {}: {error}; run {CLI_ASSET_REGENERATION}",
+            path.display()
+        )
+    }
+
+    fn compare_cli_assets(root: &std::path::Path) -> Result<(), Vec<String>> {
+        let generated = generated_cli_assets();
+        let mut actual = std::collections::BTreeMap::new();
+        for directory in ["man", "completions"] {
+            let path = root.join(directory);
+            let entries =
+                std::fs::read_dir(&path).map_err(|error| vec![regeneration_error(&path, error)])?;
+            for entry in entries {
+                let entry = entry.map_err(|error| vec![regeneration_error(&path, error)])?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| vec![regeneration_error(&entry.path(), error)])?;
+                if file_type.is_file() {
+                    let relative = std::path::PathBuf::from(directory).join(entry.file_name());
+                    actual.insert(
+                        relative.clone(),
+                        std::fs::read(entry.path())
+                            .map_err(|error| vec![regeneration_error(&entry.path(), error)])?,
+                    );
+                }
+            }
+        }
+        let mut errors = Vec::new();
+        let paths = generated
+            .keys()
+            .chain(actual.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        for path in paths {
+            // Reported with `/` on every platform, as the paths are written in the repository.
+            let shown = path.to_string_lossy().replace('\\', "/");
+            match (generated.get(path), actual.get(path)) {
+                (Some(expected), Some(found)) if expected != found => {
+                    errors.push(format!("{shown} differs; run {CLI_ASSET_REGENERATION}"))
+                }
+                (Some(_), None) => {
+                    errors.push(format!("{shown} is missing; run {CLI_ASSET_REGENERATION}"))
+                }
+                (None, Some(_)) => {
+                    errors.push(format!("{shown} is orphaned; run {CLI_ASSET_REGENERATION}"))
+                }
+                _ => {}
+            }
+        }
+        errors.sort();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn write_cli_assets(
+        root: &std::path::Path,
+        generated: &std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) -> Result<(), String> {
+        for name in ["man", "completions"] {
+            let directory = root.join(name);
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+            for entry in std::fs::read_dir(&directory)
+                .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+            {
+                let entry = entry
+                    .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+                let relative = std::path::PathBuf::from(name).join(entry.file_name());
+                if entry
+                    .file_type()
+                    .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?
+                    .is_file()
+                    && !generated.contains_key(&relative)
+                {
+                    std::fs::remove_file(entry.path()).map_err(|error| {
+                        format!("cannot remove {}: {error}", entry.path().display())
+                    })?;
+                }
+            }
+        }
+        for (path, bytes) in generated {
+            std::fs::write(root.join(path), bytes)
+                .map_err(|error| format!("cannot write {}: {error}", root.join(path).display()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn regeneration_requested(value: Option<&std::ffi::OsStr>) -> bool {
+        value == Some(std::ffi::OsStr::new("1"))
+    }
+
+    fn copy_generated_cli_assets(root: &std::path::Path) {
+        for (path, bytes) in generated_cli_assets() {
+            let destination = root.join(path);
+            std::fs::create_dir_all(destination.parent().expect("asset has a parent"))
+                .expect("asset parent");
+            std::fs::write(destination, bytes).expect("asset copy");
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn generated_cli_files_match_the_parser() {
+        let first = generated_cli_assets();
+        assert_eq!(first, generated_cli_assets());
+        assert_eq!(
+            first.keys().filter(|path| path.starts_with("man")).count(),
+            15
+        );
+        let manuals = first
+            .keys()
+            .filter(|path| path.starts_with("man"))
+            .map(|path| path.as_path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            manuals,
+            std::collections::BTreeSet::from([
+                std::path::Path::new("man/focusforge-cli.1"),
+                std::path::Path::new("man/focusforge-cli-info.1"),
+                std::path::Path::new("man/focusforge-cli-algorithms.1"),
+                std::path::Path::new("man/focusforge-cli-stack.1"),
+                std::path::Path::new("man/focusforge-cli-export.1"),
+                std::path::Path::new("man/focusforge-cli-retouch.1"),
+                std::path::Path::new("man/focusforge-cli-history.1"),
+                std::path::Path::new("man/focusforge-cli-align.1"),
+                std::path::Path::new("man/focusforge-cli-review.1"),
+                std::path::Path::new("man/focusforge-cli-cache.1"),
+                std::path::Path::new("man/focusforge-cli-diagnostics.1"),
+                std::path::Path::new("man/focusforge-cli-history-list.1"),
+                std::path::Path::new("man/focusforge-cli-history-delete.1"),
+                std::path::Path::new("man/focusforge-cli-history-compact.1"),
+                std::path::Path::new("man/focusforge-cli-cache-clear.1"),
+            ])
+        );
+        assert!(
+            first
+                .values()
+                .all(|bytes| !String::from_utf8_lossy(bytes).contains("--lax"))
+        );
+        let nested = String::from_utf8_lossy(
+            first
+                .get(std::path::Path::new("man/focusforge-cli-cache-clear.1"))
+                .expect("nested manual is generated"),
+        );
+        assert!(nested.contains("\\fB\\-q\\fR"));
+        assert!(nested.contains("\\fB\\-\\-quiet\\fR"));
+        let history_nested = String::from_utf8_lossy(
+            first
+                .get(std::path::Path::new("man/focusforge-cli-history-list.1"))
+                .expect("nested history manual is generated"),
+        );
+        assert!(history_nested.contains("\\fB\\-q\\fR"));
+        assert!(history_nested.contains(env!("CARGO_PKG_VERSION")));
+        for completion in [
+            "completions/focusforge-cli.bash",
+            "completions/_focusforge-cli",
+            "completions/focusforge-cli.fish",
+            "completions/_focusforge-cli.ps1",
+        ] {
+            let text = String::from_utf8_lossy(
+                first
+                    .get(std::path::Path::new(completion))
+                    .expect("completion is generated"),
+            );
+            assert!(text.contains("--zmap") || text.contains("-l zmap"));
+            assert!(text.contains("--quiet") || text.contains("-l quiet"));
+            assert!(text.contains("--cpu") || text.contains("-l cpu"));
+            assert!(text.contains("--max-vram") || text.contains("-l max-vram"));
+        }
+        compare_cli_assets(&cli_assets_root())
+            .unwrap_or_else(|errors| panic!("{}", errors.join("\n")));
+    }
+
+    #[test]
+    fn generated_cli_files_report_staleness() {
+        let temporary = tempfile::tempdir().expect("temporary assets directory");
+        copy_generated_cli_assets(temporary.path());
+        let changed = temporary.path().join("man/focusforge-cli.1");
+        std::fs::write(&changed, b"changed").expect("changed manual");
+        let missing = temporary.path().join("man/focusforge-cli-info.1");
+        std::fs::remove_file(&missing).expect("remove manual");
+        let changed_completion = temporary.path().join("completions/focusforge-cli.bash");
+        std::fs::write(&changed_completion, b"changed").expect("changed completion");
+        let missing_completion = temporary.path().join("completions/focusforge-cli.fish");
+        std::fs::remove_file(&missing_completion).expect("remove completion");
+        std::fs::write(temporary.path().join("man/orphan.1"), b"orphan").expect("orphan manual");
+        std::fs::write(temporary.path().join("completions/orphan"), b"orphan")
+            .expect("orphan completion");
+        let errors = compare_cli_assets(temporary.path())
+            .expect_err("mutations must be reported")
+            .join("\n");
+        assert!(errors.contains("man/focusforge-cli.1 differs"));
+        assert!(errors.contains("man/focusforge-cli-info.1 is missing"));
+        assert!(errors.contains("man/orphan.1 is orphaned"));
+        assert!(errors.contains("completions/focusforge-cli.bash differs"));
+        assert!(errors.contains("completions/focusforge-cli.fish is missing"));
+        assert!(errors.contains("completions/orphan is orphaned"));
+        assert!(errors.contains(CLI_ASSET_REGENERATION));
+    }
+
+    #[test]
+    fn generated_cli_asset_variations_cover_visible_hidden_and_versioned_commands() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        command = command
+            .subcommand(clap::Command::new("visible-test"))
+            .subcommand(clap::Command::new("hidden-test").hide(true))
+            .arg(
+                clap::Arg::new("hidden-test-argument")
+                    .long("hidden-test-argument")
+                    .hide(true),
+            );
+        let assets = generated_cli_assets_for(command, "9.9.9");
+        let manuals = assets
+            .keys()
+            .filter(|path| path.starts_with("man"))
+            .collect::<Vec<_>>();
+        assert_eq!(manuals.len(), 16);
+        assert!(assets.contains_key(std::path::Path::new("man/focusforge-cli-visible-test.1")));
+        assert!(!assets.contains_key(std::path::Path::new("man/focusforge-cli-hidden-test.1")));
+        assert!(manuals.iter().all(|path| {
+            let bytes = &assets[*path];
+            let text = String::from_utf8_lossy(bytes);
+            !text.contains("hidden-test-argument") && !text.contains("hidden-test")
+        }));
+        assert!(
+            manuals
+                .iter()
+                .all(|path| String::from_utf8_lossy(&assets[*path]).contains("9.9.9"))
+        );
+    }
+
+    #[test]
+    fn generated_cli_files_report_filesystem_failures_without_writing() {
+        let temporary = tempfile::tempdir().expect("temporary assets directory");
+        copy_generated_cli_assets(temporary.path());
+        let manual_directory = temporary.path().join("man");
+        std::fs::remove_dir_all(&manual_directory).expect("remove manual directory");
+        std::fs::write(&manual_directory, b"not a directory").expect("replace manual directory");
+        let error = compare_cli_assets(temporary.path())
+            .expect_err("non-directory must fail")
+            .join("\n");
+        assert!(error.contains(&manual_directory.display().to_string()));
+        assert!(error.contains(CLI_ASSET_REGENERATION));
+    }
+
+    #[test]
+    fn generated_cli_comparison_is_read_only() {
+        let temporary = tempfile::tempdir().expect("temporary assets directory");
+        copy_generated_cli_assets(temporary.path());
+        let before = std::fs::read(temporary.path().join("man/focusforge-cli.1")).expect("manual");
+        compare_cli_assets(temporary.path()).expect("comparison succeeds");
+        assert_eq!(
+            before,
+            std::fs::read(temporary.path().join("man/focusforge-cli.1")).expect("manual")
+        );
+    }
+
+    #[test]
+    fn generated_cli_cpu_generation_is_deterministic_and_does_not_use_default_goldens() {
+        let first = generated_cli_assets();
+        assert_eq!(first, generated_cli_assets());
+        assert_eq!(
+            first.keys().filter(|path| path.starts_with("man")).count(),
+            15
+        );
+        assert!(first.contains_key(std::path::Path::new("completions/_focusforge-cli.ps1")));
+        #[cfg(not(feature = "gpu"))]
+        assert!(first.values().all(|bytes| {
+            let text = String::from_utf8_lossy(bytes);
+            !text.contains("--cpu") && !text.contains("--max-vram")
+        }));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn cli_asset_writer_requires_exact_opt_in_and_is_idempotent() {
+        assert!(!regeneration_requested(None));
+        assert!(!regeneration_requested(Some(std::ffi::OsStr::new(""))));
+        assert!(!regeneration_requested(Some(std::ffi::OsStr::new("0"))));
+        assert!(regeneration_requested(Some(std::ffi::OsStr::new("1"))));
+
+        let temporary = tempfile::tempdir().expect("temporary assets directory");
+        let generated = generated_cli_assets();
+        std::fs::create_dir_all(temporary.path().join("man/subdirectory"))
+            .expect("owned directory");
+        std::fs::write(temporary.path().join("man/orphan.1"), b"orphan").expect("manual orphan");
+        std::fs::create_dir_all(temporary.path().join("completions"))
+            .expect("completion directory");
+        std::fs::write(temporary.path().join("completions/orphan"), b"orphan")
+            .expect("completion orphan");
+        std::fs::write(temporary.path().join("outside"), b"outside").expect("outside file");
+        write_cli_assets(temporary.path(), &generated).expect("first writer pass");
+        let first = generated
+            .keys()
+            .map(|path| {
+                (
+                    path.clone(),
+                    std::fs::read(temporary.path().join(path)).expect("written asset"),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(!temporary.path().join("man/orphan.1").exists());
+        assert!(!temporary.path().join("completions/orphan").exists());
+        assert!(temporary.path().join("man/subdirectory").is_dir());
+        assert_eq!(
+            std::fs::read(temporary.path().join("outside")).expect("outside file"),
+            b"outside"
+        );
+        write_cli_assets(temporary.path(), &generated).expect("second writer pass");
+        let second = generated
+            .keys()
+            .map(|path| {
+                (
+                    path.clone(),
+                    std::fs::read(temporary.path().join(path)).expect("written asset"),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(first, second);
+        compare_cli_assets(temporary.path()).expect("writer output matches parser");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn regenerate_cli_assets() {
+        if !regeneration_requested(std::env::var_os("FOCUSFORGE_REGENERATE_CLI_ASSETS").as_deref())
+        {
+            return;
+        }
+        write_cli_assets(&cli_assets_root(), &generated_cli_assets())
+            .expect("write generated CLI assets");
+    }
+
     /// Every export `ParamDesc` id is a `--<id>` flag on `export` whose help
     /// text names its default and every choice or numeric range -- the
     /// same one-source-of-truth check `no_crop_flag_reads_the_project_schema`

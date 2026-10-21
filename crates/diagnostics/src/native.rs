@@ -115,7 +115,35 @@ fn crash_signal(cc: &CrashContext) -> u32 {
 
 #[cfg(target_os = "macos")]
 fn crash_signal(cc: &CrashContext) -> u32 {
-    cc.exception.as_ref().map_or(0, |e| e.kind)
+    cc.exception
+        .as_ref()
+        .map_or(0, |e| mach_exception_signal(e.kind, e.code, e.subcode))
+}
+
+/// The POSIX signal number a Mach exception stands for. A bad access or
+/// stack-guard hit is a segmentation fault; an abort arrives as a software
+/// exception whose subcode is the signal itself. Numbered as
+/// [`signal_name`] expects.
+#[cfg(any(target_os = "macos", test))]
+fn mach_exception_signal(kind: u32, code: u64, subcode: Option<u64>) -> u32 {
+    const EXC_BAD_ACCESS: u32 = 1;
+    const EXC_BAD_INSTRUCTION: u32 = 2;
+    const EXC_ARITHMETIC: u32 = 3;
+    const EXC_SOFTWARE: u32 = 5;
+    const EXC_BREAKPOINT: u32 = 6;
+    const KERN_INVALID_ADDRESS: u64 = 1;
+    const KERN_PROTECTION_FAILURE: u64 = 2;
+    const EXC_SOFT_SIGNAL: u64 = 0x10003;
+
+    match kind {
+        EXC_BAD_ACCESS if matches!(code, KERN_INVALID_ADDRESS | KERN_PROTECTION_FAILURE) => 11,
+        EXC_BAD_ACCESS => 7,
+        EXC_BAD_INSTRUCTION => 4,
+        EXC_ARITHMETIC => 8,
+        EXC_BREAKPOINT => 5,
+        EXC_SOFTWARE if code == EXC_SOFT_SIGNAL => subcode.map_or(0, |s| s as u32),
+        _ => 0,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -377,5 +405,36 @@ pub(crate) fn raise(kind: &str) {
             "stack-overflow" => sadness_generator::raise_stack_overflow(),
             _ => sadness_generator::raise_abort(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KERN_INVALID_ADDRESS: u64 = 1;
+    const KERN_PROTECTION_FAILURE: u64 = 2;
+    const EXC_SOFT_SIGNAL: u64 = 0x10003;
+
+    #[test]
+    fn a_bad_access_is_a_segfault() {
+        for code in [KERN_INVALID_ADDRESS, KERN_PROTECTION_FAILURE] {
+            let signal = mach_exception_signal(1, code, Some(0x42));
+            assert_eq!(signal_name(signal), "SIGSEGV", "kern_return {code}");
+        }
+        assert_eq!(signal_name(mach_exception_signal(1, 10, None)), "SIGBUS");
+    }
+
+    #[test]
+    fn an_abort_arrives_as_a_software_exception_carrying_the_signal() {
+        let signal = mach_exception_signal(5, EXC_SOFT_SIGNAL, Some(6));
+        assert_eq!(signal_name(signal), "SIGABRT");
+    }
+
+    #[test]
+    fn the_other_hardware_exceptions_name_their_signals() {
+        assert_eq!(signal_name(mach_exception_signal(2, 1, None)), "SIGILL");
+        assert_eq!(signal_name(mach_exception_signal(3, 1, None)), "SIGFPE");
+        assert_eq!(signal_name(mach_exception_signal(6, 1, None)), "SIGTRAP");
     }
 }
