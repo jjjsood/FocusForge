@@ -1273,29 +1273,9 @@ fn invalid_scale_factor_draws_as_one() {
     let backdrop = backdrop_draw(image(6000, 4000), pane(600.0, 400.0)).unwrap();
     for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         let draw = viewport.draw(img, pane_at(500.0, 500.0, bad)).unwrap();
-        assert_eq!(
-            (draw.src, draw.dst, draw.crop, draw.pixelated, draw.step),
-            (
-                exact.src,
-                exact.dst,
-                exact.crop,
-                exact.pixelated,
-                exact.step
-            ),
-            "exact draw at factor {bad}"
-        );
+        assert_eq!(draw, exact, "exact draw at factor {bad}");
         let back = backdrop_draw(image(6000, 4000), pane_at(600.0, 400.0, bad)).unwrap();
-        assert_eq!(
-            (back.src, back.dst, back.crop, back.pixelated, back.step),
-            (
-                backdrop.src,
-                backdrop.dst,
-                backdrop.crop,
-                backdrop.pixelated,
-                backdrop.step
-            ),
-            "backdrop at factor {bad}"
-        );
+        assert_eq!(back, backdrop, "backdrop at factor {bad}");
     }
 }
 
