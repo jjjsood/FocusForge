@@ -2541,12 +2541,10 @@ fn chosen_path(answer: DialogAnswer) -> Option<PathBuf> {
     answer?.into_iter().next()
 }
 
-/// Opens the dialog `request` names and, once it answers with a path, opens
-/// that path and repaints when the load settles -- the rail's `New
-/// project`/`Open project…` actions and their `Ctrl+N`/`Ctrl+O` chrome-key
-/// twins share this one path. The projects overlay closes itself once the
-/// load settles onto a real tab (`AppController::accept`), the same as a
-/// successful open.
+/// Opens the dialog `request` names and opens everything it answers with
+/// (one folder or project, or a whole file selection), repainting when the
+/// load settles. The projects overlay closes once the load lands on a real
+/// tab (`AppController::accept`).
 fn open_from_picker(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
@@ -2557,10 +2555,10 @@ fn open_from_picker(
     let (controller, canvas) = (controller.clone(), canvas.clone());
     let (app_weak, load_timer) = (app_weak.clone(), load_timer.clone());
     picker::request(request, move |answer| {
-        let Some(path) = chosen_path(answer) else {
+        let Some(paths) = answer else {
             return;
         };
-        controller.lock().unwrap().open_paths(&[path]);
+        controller.lock().unwrap().open_paths(&paths);
         start_load_timer(
             app_weak,
             controller.clone(),
@@ -3753,7 +3751,7 @@ pub fn install(
     // The entry path: `open_paths`'s own sink pushes every property a load
     // raises (`ShellEvent::LoadReady` and friends); the load timer's repaint
     // feeds the canvas for whichever tab the open landed on.
-    app.on_open_folder_requested({
+    app.on_open_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
@@ -3765,7 +3763,7 @@ pub fn install(
                 &canvas,
                 &app_weak,
                 &load_timer,
-                DialogRequest::Entry,
+                DialogRequest::Images,
             )
         }
     });

@@ -119,7 +119,7 @@ export component FFCanvas inherits Rectangle {
     // its own text never bleeds around the loading indicator drawn over
     // this same region.
     in property <bool> load-active: false;
-    callback open-folder-requested();
+    callback open-requested();
 
     // The pane geometry `AppController::set_pane_geometry` needs, read back
     // as plain property reads -- no arithmetic, `pane-gutter`/`pane-divider`
@@ -292,6 +292,6 @@ export component FFCanvas inherits Rectangle {
         height: 100%;
         visible: root.show-empty-state && !root.load-active;
         drop-unavailable: root.drop-unavailable;
-        open-folder-requested => { root.open-folder-requested(); }
+        open-requested => { root.open-requested(); }
     }
 }

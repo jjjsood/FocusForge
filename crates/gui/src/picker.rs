@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::entry::RAW_EXTENSIONS;
 use crate::job::{ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 
 /// Opens the OS folder picker. `None` on cancel (or a missing dialog
@@ -138,6 +139,26 @@ pub fn pick_frames() -> Option<Vec<PathBuf>> {
         .pick_files()
 }
 
+/// `extensions` in lower and upper case: portal filters are case-sensitive
+/// globs, and camera files often carry upper-case extensions.
+fn both_cases(extensions: &[&str]) -> Vec<String> {
+    extensions
+        .iter()
+        .flat_map(|ext| [ext.to_string(), ext.to_uppercase()])
+        .collect()
+}
+
+/// Opens the OS file picker, multi-select, filtered to TIFF frames and to
+/// camera RAW -- the empty state's `Open…`. `None` on cancel (or a missing
+/// dialog backend, rfd#320).
+pub fn pick_images() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title("Open images")
+        .add_filter("TIFF frames", &both_cases(TIFF_EXTENSIONS))
+        .add_filter("Camera RAW", &both_cases(RAW_EXTENSIONS))
+        .pick_files()
+}
+
 /// Which dialog [`request`] opens.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialogRequest {
@@ -147,6 +168,8 @@ pub enum DialogRequest {
     Project,
     /// The multi-select TIFF frame picker.
     Frames,
+    /// The multi-select TIFF and camera RAW picker that starts a project.
+    Images,
     /// The project save dialog, starting at the proposed path.
     SaveProject(PathBuf),
     /// The image export dialog, starting at the proposed path.
@@ -154,7 +177,7 @@ pub enum DialogRequest {
 }
 
 /// A dialog's answer: `None` on cancel, otherwise the chosen paths -- one
-/// for every kind but [`DialogRequest::Frames`].
+/// for every kind but [`DialogRequest::Frames`] and [`DialogRequest::Images`].
 pub type DialogAnswer = Option<Vec<PathBuf>>;
 
 type Continuation = Box<dyn FnOnce(DialogAnswer)>;
@@ -170,6 +193,7 @@ fn run(request: DialogRequest) -> DialogAnswer {
         DialogRequest::Entry => one(pick_entry()),
         DialogRequest::Project => one(pick_project()),
         DialogRequest::Frames => pick_frames(),
+        DialogRequest::Images => pick_images(),
         DialogRequest::SaveProject(proposed) => one(pick_save_project(&proposed)),
         DialogRequest::SaveImage(proposed, format) => one(pick_save_image(&proposed, format)),
     }
@@ -288,6 +312,9 @@ mod tests {
             DialogRequest::Frames => {
                 Some(vec![PathBuf::from("/f/1.tif"), PathBuf::from("/f/2.tif")])
             }
+            DialogRequest::Images => {
+                Some(vec![PathBuf::from("/f/1.tif"), PathBuf::from("/f/2.tif")])
+            }
             DialogRequest::SaveProject(_) | DialogRequest::SaveImage(..) => None,
         }
     }
@@ -297,9 +324,15 @@ mod tests {
             DialogRequest::Entry,
             DialogRequest::Project,
             DialogRequest::Frames,
+            DialogRequest::Images,
             DialogRequest::SaveProject(PathBuf::from("/p/a.ffp")),
             DialogRequest::SaveImage(PathBuf::from("/p/a.png"), ExportFormat::Png),
         ]
+    }
+
+    #[test]
+    fn image_filters_list_each_extension_in_both_cases() {
+        assert_eq!(both_cases(&["tif", "tiff"]), ["tif", "TIF", "tiff", "TIFF"]);
     }
 
     #[test]

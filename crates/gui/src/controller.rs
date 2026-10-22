@@ -4414,7 +4414,10 @@ impl AppController {
     fn refuse(&mut self, err: EntryError) -> OpenOutcome {
         let message = err.to_string();
         match &err {
-            EntryError::Unreadable { path } | EntryError::NoReadableFrames { path } => {
+            EntryError::Unreadable { path }
+            | EntryError::NoReadableFrames { path }
+            | EntryError::MixedKinds { path }
+            | EntryError::SeveralFolders { path } => {
                 self.record_failure(not_a_project_card(path.clone()));
             }
             _ => {}

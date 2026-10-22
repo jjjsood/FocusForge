@@ -1664,7 +1664,7 @@ fn drop_caption_follows_drop_unavailable() {
 
 /// The empty state: the wordmark above one raised 520-wide card, centred
 /// on the canvas column, holding the title, the copy,
-/// the single `Open folder…` button (168 x 34) and the drop caption, in that
+/// the single `Open…` button (168 x 34) and the drop caption, in that
 /// order and all inside the card's 32 px inset.
 #[test]
 fn empty_state_is_a_card_under_the_wordmark() {
@@ -1686,15 +1686,15 @@ fn empty_state_is_a_card_under_the_wordmark() {
     assert_eq!(label(&app, "FFEmptyState::empty-title"), "No project open");
     assert_eq!(
         label(&app, "FFEmptyState::empty-body"),
-        "Open a folder of frames. Each detected stack becomes its own project, in its own tab."
+        "Choose the frames of one stack, or drop a folder: each stack it holds becomes its own project, in its own tab."
     );
-    assert_eq!(label(&app, "FFEmptyState::open-folder"), "Open folder…");
+    assert_eq!(label(&app, "FFEmptyState::open"), "Open…");
     assert_eq!(
         label(&app, "FFEmptyState::drop-caption"),
         "Drop a folder or stack"
     );
 
-    let button = rect(&app, "FFEmptyState::open-folder");
+    let button = rect(&app, "FFEmptyState::open");
     assert_eq!(
         (button.2, button.3),
         (168.0, 34.0),
@@ -1705,7 +1705,7 @@ fn empty_state_is_a_card_under_the_wordmark() {
     for id in [
         "FFEmptyState::empty-title",
         "FFEmptyState::empty-body",
-        "FFEmptyState::open-folder",
+        "FFEmptyState::open",
         "FFEmptyState::drop-caption",
     ] {
         let (x, y, w, h) = rect(&app, id);
@@ -1721,6 +1721,40 @@ fn empty_state_is_a_card_under_the_wordmark() {
         previous_bottom <= card.1 + card.3 - 32.0 + EPS,
         "the caption ends inside the card's bottom inset"
     );
+}
+
+/// The empty state offers one `Open…` button, no folder button, and pressing
+/// it raises `open-requested` once, at both window sizes.
+#[test]
+fn empty_state_open_button_raises_the_open_request() {
+    for (width, height) in [(1440, 900), (1200, 760)] {
+        let app = app_at(width, height);
+        assert_eq!(label(&app, "FFEmptyState::open"), "Open…");
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFEmptyState::open-folder")
+                .find_first()
+                .is_none(),
+            "{width}x{height}: no folder button"
+        );
+        let card = rect(&app, "FFEmptyState::empty-card");
+        let button = rect(&app, "FFEmptyState::open");
+        let caption = rect(&app, "FFEmptyState::drop-caption");
+        assert_eq!(button.0, card.0 + 32.0, "{width}x{height}: 32 px inset");
+        assert!(caption.1 >= button.1 + button.3, "caption below the button");
+
+        let requested = std::rc::Rc::new(std::cell::Cell::new(0));
+        app.on_open_requested({
+            let requested = requested.clone();
+            move || requested.set(requested.get() + 1)
+        });
+        ElementQuery::from_root(&app)
+            .match_id("FFEmptyState::open")
+            .find_first()
+            .expect("the open button")
+            .mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(requested.get(), 1, "{width}x{height}: one request");
+    }
 }
 
 /// The dock without a project: the checkpoint panel's empty line, a

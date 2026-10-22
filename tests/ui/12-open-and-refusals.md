@@ -39,16 +39,18 @@ Start: --open fixtures/blackmagic-micro-dng --open fixtures/mantis-64-lzw-p2-til
 16. Click **Close anyway** (`AppWindow::close-guard`).
     Expect: the dialog is gone and the tab strip shows one tab.
 17. Click the close glyph of the first tab (`FFTab::close-area` 0).
-    Expect: Must not: a dialog appears; the tab strip shows no tab and the canvas shows the title "No project open" (`FFEmptyState::empty-title`) and a button "Open folder…".
+    Expect: Must not: a dialog appears; the tab strip shows no tab and the canvas shows the title "No project open" (`FFEmptyState::empty-title`) and a button "Open…".
 18. Click **Projects** (`FFTabStrip::projects-button`).
     Expect: the overlay shows the gallery heading "Projects" with the count "1 · 1 did not open" and one card, headed "Not a project" and named "retouch"; no card shows a frame count.
 19. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overlay is gone and the canvas shows the text "Open a folder of frames. Each detected stack becomes its own project, in its own tab." and a filled **Open folder…** button; no pane labelled "Composite" is visible.
+    Expect: the overlay is gone and the canvas shows the text "Choose the frames of one stack, or drop a folder: each stack it holds becomes its own project, in its own tab." and a filled **Open…** button (`FFEmptyState::open`); no pane labelled "Composite" is visible.
 20. Click **Zoom in** (`FFZoomCluster::zoom-in`).
     Expect: the zoom readout (`FFZoomCluster::zoom-readout`) reads "—" and the bottom bar status text reads "No project open".
 21. Click **Fit** (`FFZoomCluster::zoom-fit`).
     Expect: the zoom readout still reads "—" and the canvas still shows the title "No project open".
 22. Click the **Overlay** toggle (`FFBottomBar::overlay-toggle`).
     Expect: Must not: the toggle turns on; it stays off and dimmed, and the right dock reads "No project open." with no **Images** or **Settings** tabs.
-23. (human only) Click **Open folder…** (`FFEmptyState::open-folder`), then cancel the folder chooser that opens.
-    Expect: a native folder chooser opens; after cancelling it the canvas still shows the title "No project open".
+23. (human only) Click **Open…** (`FFEmptyState::open`), then cancel the file chooser that opens.
+    Expect: a native file chooser titled "Open images" opens; after cancelling it the canvas still shows the title "No project open" and the tab strip shows no tab.
+24. (human only) Press `Ctrl+N`, then cancel the folder chooser that opens.
+    Expect: a native folder chooser titled "Open folder or project" opens, not the "Open images" one; after cancelling it the canvas still shows the title "No project open".

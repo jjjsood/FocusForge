@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The empty state: the wordmark above one raised card with the title, copy,
-// "Open folder…" button and drop caption; opaque, covers the canvas region.
+// "Open…" button and drop caption; opaque, covers the canvas region.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -9,7 +9,7 @@ import { FFButton } from "../components/ff_button.slint";
 
 export component FFEmptyState inherits Rectangle {
     in property <bool> drop-unavailable: false;
-    callback open-folder-requested();
+    callback open-requested();
 
     background: Theme.surface-base;
 
@@ -56,7 +56,7 @@ export component FFEmptyState inherits Rectangle {
                         }
 
                         empty-body := Text {
-                            text: "Open a folder of frames. Each detected stack becomes its own project, in its own tab.";
+                            text: "Choose the frames of one stack, or drop a folder: each stack it holds becomes its own project, in its own tab.";
                             color: Theme.text-muted;
                             font-size: Theme.text-body.size;
                             font-weight: Theme.text-body.weight;
@@ -70,11 +70,11 @@ export component FFEmptyState inherits Rectangle {
                         HorizontalLayout {
                             alignment: start;
 
-                            open-folder := FFButton {
+                            open := FFButton {
                                 width: 168px;
                                 kind: "primary";
-                                text: "Open folder…";
-                                clicked => { root.open-folder-requested(); }
+                                text: "Open…";
+                                clicked => { root.open-requested(); }
                             }
                         }
 
