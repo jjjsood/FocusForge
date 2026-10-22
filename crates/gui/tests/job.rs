@@ -1060,6 +1060,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&aligning)),
@@ -1077,6 +1079,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&fusing)),
@@ -1093,6 +1097,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&sealing)),
@@ -1123,6 +1129,8 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         eta: None,
         align_done,
         align_total,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -1138,6 +1146,8 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -1199,6 +1209,60 @@ fn progress_phase_names_the_preparation_pass() {
             Some("preparing")
         );
     }
+}
+
+fn prepare_progress(
+    prepare_done: usize,
+    prepare_total: usize,
+) -> focusforge_core::job::JobProgress {
+    focusforge_core::job::JobProgress {
+        stage: focusforge_core::job::JobStage::Prepare,
+        prepare_done,
+        prepare_total,
+        ..fuse_progress(0, 0)
+    }
+}
+
+#[test]
+fn prepare_progress_names_the_frame_count_and_fills_the_bar() {
+    use focusforge_gui::job::{Phase, RunState, bar_fraction, phase_line, progress_text};
+
+    for (done, total) in [(3, 8), (42, 61), (0, 5)] {
+        let snapshot = prepare_progress(done, total);
+        assert_eq!(
+            progress_text(&RunState::Running, Some(&snapshot)),
+            format!("{done} of {total}")
+        );
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&snapshot)).as_deref(),
+            Some(format!("preparing, {done} of {total}").as_str())
+        );
+        assert_eq!(bar_fraction(Some(&snapshot)), done as f32 / total as f32);
+        assert_eq!(Phase::Preparing.frames(&snapshot), Some((done, total)));
+    }
+}
+
+#[test]
+fn prepare_eta_text_follows_the_engine_estimate() {
+    use focusforge_gui::job::{RunState, eta_text};
+
+    let mut snapshot = prepare_progress(0, 8);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.prepare_done = 2;
+    snapshot.eta = Some(Duration::from_secs(95));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 1:35");
+}
+
+#[test]
+fn prepare_stage_announcement_records_the_frame_total() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{RunStage, StageObserver};
+
+    let observer = job::GuiObserver::new();
+    observer.stage(RunStage::Prepare { frames: 7 });
+    let recorded = observer.last_progress().expect("a Prepare snapshot");
+    assert_eq!(recorded.stage, JobStage::Prepare);
+    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 7));
 }
 
 #[test]

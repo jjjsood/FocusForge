@@ -343,21 +343,48 @@ pub fn run(
 
     let equalization = match request.equalize {
         Some(settings) => {
+            let frames_done = control.begin_prepare(frame_reader.len());
             control.set_stage(JobStage::Prepare);
             observer.stage(RunStage::Prepare {
                 frames: frame_reader.len(),
             });
-            let estimated = {
-                let _prepare = equalize_scope();
-                equalize::estimate(
-                    frame_reader,
-                    frame_reader.len(),
-                    (width, height),
-                    spp,
-                    settings,
-                    &|| control.state() == ControlState::CancelRequested,
-                )
-            };
+            let workers = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(frame_reader.len())
+                .min(control.admission_cap())
+                .max(1);
+            let done = AtomicBool::new(false);
+            let poll = request.poll;
+            // The stage span is re-entered on the watcher thread, which does
+            // not inherit it.
+            let parent = tracing::Span::current();
+            let estimated = std::thread::scope(|scope| {
+                let watcher = scope.spawn(|| {
+                    let _parent = parent.enter();
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(poll);
+                        observer.tick(&control.progress());
+                    }
+                });
+                let result = {
+                    let _prepare = equalize_scope();
+                    equalize::estimate(
+                        frame_reader,
+                        frame_reader.len(),
+                        (width, height),
+                        spp,
+                        settings,
+                        workers,
+                        &frames_done,
+                        &|| control.state() == ControlState::CancelRequested,
+                    )
+                };
+                done.store(true, Ordering::SeqCst);
+                watcher
+                    .join()
+                    .expect("prepare watcher thread must not panic");
+                result
+            });
             let report = match estimated {
                 Err(AlgorithmError::Cancelled) => {
                     return Ok(FuseOutcome::Cancelled {

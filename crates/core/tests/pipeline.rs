@@ -662,6 +662,115 @@ fn align_progress_counts_every_frame() {
     assert_eq!(progress.align_total, 0);
 }
 
+/// Logs the Prepare-stage tally of every tick, and the control's tally at
+/// the moment the align stage is announced.
+struct PrepareTickLog {
+    control: Arc<JobControl>,
+    prepare_ticks: Mutex<Vec<(usize, usize)>>,
+    all_ticks: Mutex<Vec<(usize, usize)>>,
+    at_align: Mutex<Option<(usize, usize)>>,
+}
+
+impl PrepareTickLog {
+    fn new(control: &Arc<JobControl>) -> Self {
+        PrepareTickLog {
+            control: Arc::clone(control),
+            prepare_ticks: Mutex::default(),
+            all_ticks: Mutex::default(),
+            at_align: Mutex::default(),
+        }
+    }
+}
+
+impl StageObserver for PrepareTickLog {
+    fn stage(&self, stage: RunStage) {
+        if matches!(stage, RunStage::Align { .. }) {
+            let p = self.control.progress();
+            *self.at_align.lock().expect("no panic while logging") =
+                Some((p.prepare_done, p.prepare_total));
+        }
+    }
+
+    fn tick(&self, progress: &JobProgress) {
+        let tally = (progress.prepare_done, progress.prepare_total);
+        self.all_ticks
+            .lock()
+            .expect("no panic while logging")
+            .push(tally);
+        if progress.stage == JobStage::Prepare {
+            self.prepare_ticks
+                .lock()
+                .expect("no panic while logging")
+                .push(tally);
+        }
+    }
+}
+
+fn prepare_request(label: &str, count: usize, equalize: Option<EqualizeSettings>) -> FuseRequest {
+    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    request.align = Some(dummy_align_request());
+    request.equalize = equalize;
+    request.poll = Duration::from_millis(1);
+    request
+}
+
+#[test]
+fn prepare_progress_counts_every_frame() {
+    for count in [2, 5] {
+        let request = prepare_request(
+            &format!("prepare_progress_{count}"),
+            count,
+            eq_settings(1.25, 0.0),
+        );
+        let control = JobControl::new();
+        let observer = PrepareTickLog::new(&control);
+        let outcome =
+            focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+                .unwrap_or_else(|err| panic!("a {count}-frame run must complete: {err}"));
+        assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+        assert_eq!(
+            *observer.at_align.lock().expect("no panic while logging"),
+            Some((count, count)),
+            "Prepare is complete when Align is announced"
+        );
+        let ticks = observer
+            .prepare_ticks
+            .lock()
+            .expect("no panic while logging");
+        let mut previous = 0;
+        for &(done, total) in ticks.iter() {
+            assert_eq!(total, count, "the total is the frame count on every tick");
+            assert!(done <= total, "done must never exceed total");
+            assert!(done >= previous, "done must never decrease");
+            previous = done;
+        }
+    }
+}
+
+#[test]
+fn prepare_progress_is_zero_without_equalization() {
+    let request = prepare_request("prepare_progress_off", 3, None);
+    let control = JobControl::new();
+    let observer = PrepareTickLog::new(&control);
+    let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+        .expect("a run without equalization must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let all = observer.all_ticks.lock().expect("no panic while logging");
+    assert!(all.iter().all(|&tally| tally == (0, 0)), "{all:?}");
+    assert!(
+        observer
+            .prepare_ticks
+            .lock()
+            .expect("no panic while logging")
+            .is_empty()
+    );
+    let progress = control.progress();
+    assert_eq!((progress.prepare_done, progress.prepare_total), (0, 0));
+    assert_eq!((progress.align_done, progress.align_total), (3, 3));
+}
+
 /// Frame 06 of the fixture solves with an 11% zoom against frame 03 that the
 /// off-centre check rejects. The strict default refuses the run and names that
 /// frame with the check's own wording; frames 03..=06 leave it the only failure.

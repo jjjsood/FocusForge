@@ -1288,7 +1288,8 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             .expect("no thread panicked while rendering");
         match stage {
             RunStage::Prepare { frames } => {
-                renderer.stage(&format!("prepare {frames} frames (brightness)"))
+                renderer.stage(&format!("prepare {frames} frames (brightness)"));
+                renderer.start(&self.control.progress());
             }
             // A peeked (resumed) alignment prints nothing -- it cost no
             // wall time and is not a stage a viewer is waiting through.
@@ -1331,10 +1332,12 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 _ => self.control.pause(),
             }
         }
-        // A tick outside the fuse stage and a cached or absent alignment
-        // (`align_total == 0`) carries a stale or zeroed total and must not
-        // render.
-        if progress.stage == focusforge_core::job::JobStage::Fuse || progress.align_total > 0 {
+        // Only the stage that is counting renders: a tick outside fuse,
+        // outside a counted prepare stage, and with a cached or absent
+        // alignment (`align_total == 0`) carries a stale or zeroed total.
+        use focusforge_core::job::JobStage;
+        let preparing = progress.stage == JobStage::Prepare && progress.prepare_total > 0;
+        if progress.stage == JobStage::Fuse || preparing || progress.align_total > 0 {
             self.renderer
                 .lock()
                 .expect("no thread panicked while rendering")
