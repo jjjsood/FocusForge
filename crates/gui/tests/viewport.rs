@@ -343,11 +343,10 @@ fn zoom_anchors_at_the_cursor() {
     vp.zoom_steps(2, anchor, img, p);
     vp.zoom_steps(-2, anchor, img, p);
     assert!((vp.scale() - start.0).abs() < 1e-9, "scale must round-trip");
+    let origin = vp.to_source_in((0.0, 0.0), p);
     assert!(
-        (vp.to_source_in((0.0, 0.0), p).0 - start.1.0).abs() < 1e-6
-            && (vp.to_source_in((0.0, 0.0), p).1 - start.1.1).abs() < 1e-6,
-        "origin must round-trip: got {:?}, expected {:?}",
-        vp.to_source_in((0.0, 0.0), p),
+        (origin.0 - start.1.0).abs() < 1e-6 && (origin.1 - start.1.1).abs() < 1e-6,
+        "origin must round-trip: got {origin:?}, expected {:?}",
         start.1
     );
 }
