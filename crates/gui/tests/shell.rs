@@ -2994,16 +2994,16 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         .match_type_name("FFErrorRow")
         .find_first()
         .expect("the Appearance save failure is visible");
-    let legend = ElementQuery::from_root(&app)
+    let source_note = ElementQuery::from_root(&app)
         .match_descendants()
         .match_accessible_role(AccessibleRole::Text)
         .match_predicate(|element| {
             element
                 .accessible_label()
-                .is_some_and(|label| label == "Editor source legend stays compact and read-only.")
+                .is_some_and(|label| label == "Editor source rows stay read-only.")
         })
         .find_first()
-        .expect("the legend precedes the save failure");
+        .expect("the source-rows note precedes the save failure");
     let session_note = ElementQuery::from_root(&app)
         .match_descendants()
         .match_accessible_role(AccessibleRole::Text)
@@ -3021,8 +3021,8 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         "the long native path error reserves its wrapped text height"
     );
     assert!(
-        legend.absolute_position().y + legend.size().height <= error_pos.y,
-        "the failure begins after the preceding legend"
+        source_note.absolute_position().y + source_note.size().height <= error_pos.y,
+        "the failure begins after the preceding source-rows note"
     );
     assert!(
         error_pos.y + error_size.height <= session_note.absolute_position().y,

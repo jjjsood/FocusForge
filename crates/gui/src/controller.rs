@@ -5615,9 +5615,7 @@ impl AppController {
             }
             return;
         }
-        let requests = if self.mode() == ShellMode::Editor
-            || self.source_presentation() == SourcePresentation::List
-        {
+        let requests = if self.source_presentation() == SourcePresentation::List {
             Vec::new()
         } else if let Some(tab) = self.state.active() {
             let height = self.image_row_height();
@@ -5629,10 +5627,17 @@ impl AppController {
                 let visible_end = ((scroll_y + self.state.images_viewport_height) / height)
                     .ceil()
                     .max(1.0) as usize;
+                let count = tab.frames.len();
+                let first = first.min(count);
+                let visible_end = visible_end.min(count);
                 let start = first.saturating_sub(2);
-                let end = visible_end.saturating_add(2).min(tab.frames.len());
-                tab.frames[start..end]
-                    .iter()
+                let end = visible_end.saturating_add(2).min(count);
+                // Visible rows render first, top to bottom, then the prefetch
+                // rows above and below.
+                let order = [first..visible_end, start..first, visible_end..end];
+                order
+                    .into_iter()
+                    .flat_map(|range| &tab.frames[range])
                     .filter(|path| tab.meta.get(*path).is_some_and(|meta| !meta.unresolved))
                     .map(|path| PreviewRequest {
                         tab_id: tab.id,
@@ -5671,7 +5676,17 @@ impl AppController {
                 .cloned()
                 .collect()
         };
-        if pending == self.preview_requests && remaining == self.preview_budget_bytes {
+        // A batch keeps running when the only change is rows it has finished
+        // leaving the pending list; it keeps the allowance it was admitted with.
+        let unfinished = self.preview_requests.iter().filter(|request| {
+            !self.preview_cache.contains_key(*request)
+                && !self.preview_failures.contains_key(*request)
+        });
+        if unfinished.eq(pending.iter())
+            && (remaining == self.preview_budget_bytes
+                || pending.len() < self.preview_requests.len())
+        {
+            self.preview_requests = pending;
             return;
         }
         self.preview_requests = pending;
@@ -7353,11 +7368,7 @@ impl AppController {
     }
 
     pub fn source_presentation(&self) -> SourcePresentation {
-        if self.mode() == ShellMode::Editor {
-            SourcePresentation::List
-        } else {
-            self.appearance.presentation
-        }
+        self.appearance.presentation
     }
 
     pub fn appearance_save_error(&self) -> Option<&str> {
@@ -10023,6 +10034,7 @@ mod tests {
                         resident_and_conversion: 8,
                         total: 12,
                         band_rows: 1,
+                        step: 1,
                     },
                 ))
             },
@@ -10171,6 +10183,125 @@ mod tests {
         assert_eq!(controller.source_preview_snapshot().cache_entries, 0);
         assert!(controller.source_preview(&source).is_none());
         assert!(!cache_has_source(&controller, &source));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_keeps_the_batch_in_flight_when_only_finished_rows_leave() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-preview-batch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..8 {
+            write_frame_with_capture_time(
+                &root.join(format!("{index:02}.tif")),
+                4,
+                4,
+                Some("2026:08:29 10:00:00"),
+            )
+            .unwrap();
+        }
+        let mut controller = AppController::new();
+        controller
+            .open_paths(std::slice::from_ref(&root))
+            .expect("the sources open")
+            .join()
+            .expect("the open worker does not panic");
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        controller.install_appearance(AppearanceSettings {
+            presentation: SourcePresentation::ImageList,
+        });
+        controller.set_images_viewport_height(120.0);
+        controller.images_viewport_scrolled(360.0);
+        let (tab_id, frames) = {
+            let tab = controller.state.active().expect("a tab is open");
+            (tab.id, tab.frames.clone())
+        };
+
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, frames[1].clone());
+        controller.refresh_source_previews();
+        assert_eq!(
+            controller
+                .preview_requests
+                .iter()
+                .map(|request| request.path.clone())
+                .collect::<Vec<_>>(),
+            [3, 1, 2, 4, 5].map(|index| frames[index].clone()),
+            "the visible row is first, then the rows above, then the rows below"
+        );
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            frames[1],
+            "the controlled worker reached the second row of the batch"
+        );
+
+        let request = |index: usize| super::PreviewRequest {
+            tab_id,
+            generation: controller.preview_generation,
+            path: frames[index].clone(),
+        };
+        let finished = request(3);
+        controller.preview_cache.insert(
+            finished,
+            Arc::new(PreviewPixels {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+            }),
+        );
+        controller.refresh_source_previews();
+        assert_eq!(
+            controller.preview_requests.len(),
+            4,
+            "the finished row leaves the pending list"
+        );
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a refresh that only lost finished rows does not restart the batch"
+        );
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the in-flight render completes");
+        let worker = controller.previews.as_ref().unwrap();
+        while worker.metrics().active_workers != 0 {
+            std::thread::yield_now();
+        }
+        assert!(
+            worker
+                .drain()
+                .iter()
+                .any(|outcome| outcome.request.path == frames[1] && outcome.result.is_ok()),
+            "the render that was in flight is published, not cancelled"
+        );
+
+        // A window change cancels the batch again.
+        let (started_rx, release_tx, completed_rx) =
+            install_blocked_preview_worker(&mut controller, frames[1].clone());
+        controller.refresh_source_previews();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        controller.images_viewport_scrolled(720.0);
+        release_tx.send(()).unwrap();
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the blocked render completes");
+        let worker = controller.previews.as_ref().unwrap();
+        while worker.metrics().active_workers != 0 {
+            std::thread::yield_now();
+        }
+        assert!(
+            worker
+                .drain()
+                .iter()
+                .all(|outcome| outcome.request.path != frames[1]),
+            "a scroll that leaves the row cancels its render"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
