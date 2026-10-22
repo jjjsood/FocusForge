@@ -20,11 +20,16 @@ fn image(width: u32, height: u32) -> ImageSize {
 }
 
 fn pane(width: f32, height: f32) -> PaneRect {
+    pane_at(width, height, 1.0)
+}
+
+fn pane_at(width: f32, height: f32, scale_factor: f32) -> PaneRect {
     PaneRect {
         x: 0.0,
         y: 0.0,
         width,
         height,
+        scale_factor,
     }
 }
 
@@ -279,12 +284,14 @@ fn opened_controller() -> AppController {
             y: 92.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 598.0,
             y: 92.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
     );
     controller
@@ -1210,4 +1217,114 @@ fn guarded_coverage_refuses_empty_or_outside_visible_draws() {
             "invalid visible draw {src:?} must not be clamped into guarded coverage"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// The pane's device scale factor.
+// ---------------------------------------------------------------------
+
+/// A viewport at `scale` logical px per source px: `fit` lands on it in a
+/// pane of `image * scale`, so the ladder needs no walking.
+fn viewport_at(image: ImageSize, scale: f64) -> focusforge_gui::viewport::Viewport {
+    let side = |len: u32| (f64::from(len) * scale) as f32;
+    fit(image, pane(side(image.width), side(image.height)))
+}
+
+#[test]
+fn step_follows_the_pane_scale_factor() {
+    let img = image(1000, 1000);
+    // (logical scale, factor, expected step)
+    for (scale, factor, step) in [
+        (0.5, 1.0, 2),
+        (0.5, 2.0, 1),
+        (0.5, 1.5, 1),
+        (0.25, 1.0, 4),
+        (0.25, 2.0, 2),
+    ] {
+        let viewport = viewport_at(img, scale);
+        let at_one = viewport.draw(img, pane(500.0, 500.0)).unwrap();
+        let draw = viewport.draw(img, pane_at(500.0, 500.0, factor)).unwrap();
+        assert_eq!(draw.step.get(), step, "scale {scale}, factor {factor}");
+        assert_eq!(draw.src, at_one.src);
+        assert_eq!(draw.dst, at_one.dst);
+        assert_eq!(draw.crop, at_one.crop);
+        assert_eq!(draw.pixelated, at_one.pixelated);
+    }
+}
+
+#[test]
+fn backdrop_step_follows_the_pane_scale_factor() {
+    let img = image(6000, 4000);
+    let step = |factor| {
+        backdrop_draw(img, pane_at(600.0, 400.0, factor))
+            .unwrap()
+            .step
+            .get()
+    };
+    assert_eq!(step(1.0), 10);
+    assert_eq!(step(2.0), 5);
+}
+
+#[test]
+fn invalid_scale_factor_draws_as_one() {
+    let img = image(1000, 1000);
+    let viewport = viewport_at(img, 0.5);
+    let exact = viewport.draw(img, pane(500.0, 500.0)).unwrap();
+    let backdrop = backdrop_draw(image(6000, 4000), pane(600.0, 400.0)).unwrap();
+    for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let draw = viewport.draw(img, pane_at(500.0, 500.0, bad)).unwrap();
+        assert_eq!(
+            (draw.src, draw.dst, draw.crop, draw.pixelated, draw.step),
+            (
+                exact.src,
+                exact.dst,
+                exact.crop,
+                exact.pixelated,
+                exact.step
+            ),
+            "exact draw at factor {bad}"
+        );
+        let back = backdrop_draw(image(6000, 4000), pane_at(600.0, 400.0, bad)).unwrap();
+        assert_eq!(
+            (back.src, back.dst, back.crop, back.pixelated, back.step),
+            (
+                backdrop.src,
+                backdrop.dst,
+                backdrop.crop,
+                backdrop.pixelated,
+                backdrop.step
+            ),
+            "backdrop at factor {bad}"
+        );
+    }
+}
+
+#[test]
+fn panes_with_different_scale_factors_draw_at_their_own_step() {
+    let img = image(1000, 1000);
+    let viewport = viewport_at(img, 0.5);
+    let (left, right) = (pane_at(500.0, 500.0, 1.0), pane_at(500.0, 500.0, 2.0));
+    let (left_draw, right_draw) = (
+        viewport.draw(img, left).unwrap(),
+        viewport.draw(img, right).unwrap(),
+    );
+    assert_eq!((left_draw.step.get(), right_draw.step.get()), (2, 1));
+
+    let equal = viewport.draw(img, pane_at(500.0, 500.0, 2.0)).unwrap();
+    assert_eq!(left_draw.src, equal.src);
+    assert_eq!(right_draw.src, equal.src);
+}
+
+#[test]
+fn guarded_refuses_a_physical_step_past_the_texture_limit() {
+    let img = image(1000, 1000);
+    let viewport = fit(img, pane(400.0, 400.0));
+
+    let logical = viewport.draw(img, pane_at(400.0, 400.0, 1.0)).unwrap();
+    assert_eq!((logical.step.get(), logical.extent()), (2, (500, 500)));
+    assert!(logical.guarded(img, 600).is_some());
+
+    let physical = viewport.draw(img, pane_at(400.0, 400.0, 2.0)).unwrap();
+    assert_eq!((physical.step.get(), physical.extent()), (1, (1000, 1000)));
+    assert!(physical.guarded(img, 600).is_none());
 }

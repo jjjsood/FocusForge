@@ -1033,18 +1033,21 @@ fn dispatch_coalesced(
 /// `pub` so `src/main.rs`'s startup push reads the same properties through
 /// the same function rather than re-listing them.
 pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
+    let scale_factor = app.window().scale_factor();
     (
         PaneRect {
             x: app.get_canvas_pane_left_x(),
             y: app.get_canvas_pane_left_y(),
             width: app.get_canvas_pane_left_width(),
             height: app.get_canvas_pane_left_height(),
+            scale_factor,
         },
         PaneRect {
             x: app.get_canvas_pane_right_x(),
             y: app.get_canvas_pane_right_y(),
             width: app.get_canvas_pane_right_width(),
             height: app.get_canvas_pane_right_height(),
+            scale_factor,
         },
     )
 }
@@ -1065,6 +1068,7 @@ fn comparison_rect(window: &ComparisonWindow) -> PaneRect {
         y: window.get_pane_y(),
         width: window.get_pane_width(),
         height: window.get_pane_height(),
+        scale_factor: window.window().scale_factor(),
     }
 }
 
@@ -1174,6 +1178,19 @@ fn open_comparison(
         canvas.clone(),
         ready.clone(),
     );
+    let last_scale = Cell::new(window.window().scale_factor());
+    let window_weak = window.as_weak();
+    // A scale-factor change without a resize fires no Slint callback.
+    if let Err(error) = window.window().set_rendering_notifier(move |state, _| {
+        if matches!(state, slint::RenderingState::BeforeRendering)
+            && let Some(window) = window_weak.upgrade()
+            && last_scale.replace(window.window().scale_factor()) != window.window().scale_factor()
+        {
+            slint::Timer::single_shot(Duration::ZERO, move || window.invoke_pane_resized());
+        }
+    }) {
+        tracing::warn!("comparison window cannot watch its scale factor: {error}");
+    }
     COMPARISON_WINDOW.with(|slot| *slot.borrow_mut() = Some(window.clone()));
     update_detached_geometry(app, &window, controller);
     controller.lock().unwrap().fit();

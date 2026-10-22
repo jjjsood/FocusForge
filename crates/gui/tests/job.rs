@@ -3254,12 +3254,14 @@ fn wheel_actions_are_blocked_under_the_settings_modal() {
             y: 0.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 566.0,
             y: 0.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
     );
     controller.fit_if_unfitted();
@@ -4617,12 +4619,14 @@ fn the_unsaved_mark_follows_unsealed_ops() {
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: w + 8.0,
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     c.set_pane_geometry(left, right);
     let events = record_events(&mut c);
@@ -6372,6 +6376,7 @@ fn set_fitted_panes(controller: &mut AppController) {
         y: 0.0,
         width: 566.0,
         height: 748.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane(0.0), pane(566.0));
     controller.fit_if_unfitted();
@@ -6396,6 +6401,7 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane(0.0), pane(w + 8.0));
 

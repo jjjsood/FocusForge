@@ -728,6 +728,7 @@ fn run_window<T: ComponentHandle + 'static>(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_handle = app_handle.clone();
+        let last_scale = std::cell::Cell::new(app.window().scale_factor());
         if let Err(e) = app
             .window()
             .set_rendering_notifier(move |state, api| match state {
@@ -788,6 +789,18 @@ fn run_window<T: ComponentHandle + 'static>(
                         }
                         *device.borrow_mut() = None;
                     });
+                }
+                // Slint reports no scale-factor change on its own, and one
+                // without a resize leaves the pane geometry stale.
+                slint::RenderingState::BeforeRendering => {
+                    if let Some(app) = app_handle.as_ref().and_then(|app| app.upgrade())
+                        && last_scale.replace(app.window().scale_factor())
+                            != app.window().scale_factor()
+                    {
+                        slint::Timer::single_shot(Duration::ZERO, move || {
+                            app.invoke_canvas_resized();
+                        });
+                    }
                 }
                 slint::RenderingState::AfterRendering => bridge::record_frame_rendered(),
                 _ => {}

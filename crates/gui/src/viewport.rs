@@ -23,6 +23,19 @@ pub struct PaneRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Device pixels per logical pixel of the window the pane is in; a
+    /// non-finite or non-positive value reads as 1.
+    pub scale_factor: f32,
+}
+
+/// The pane's device scale factor, or 1 when it is not a positive finite number.
+fn device_scale(pane: PaneRect) -> f64 {
+    let factor = f64::from(pane.scale_factor);
+    if factor.is_finite() && factor > 0.0 {
+        factor
+    } else {
+        1.0
+    }
 }
 
 /// The loaded project's composite/Z-Map size, in source pixels.
@@ -63,7 +76,8 @@ pub fn backdrop_draw(image: ImageSize, pane: PaneRect) -> Option<PaneDraw> {
     if image.width == 0 || image.height == 0 || pane.width <= 0.0 || pane.height <= 0.0 {
         return None;
     }
-    let axis = |image: u32, pane: f32| (image as f64 / pane as f64).ceil() as u32;
+    let device = device_scale(pane);
+    let axis = |image: u32, pane: f32| (image as f64 / (pane as f64 * device)).ceil() as u32;
     let step = axis(image.width, pane.width)
         .max(axis(image.height, pane.height))
         .max(1);
@@ -172,8 +186,9 @@ pub struct PaneDraw {
     /// `pixelated` at or above 100 %, `smooth` below it.
     pub pixelated: bool,
     /// Every `step`-th source row and column of `src` is read:
-    /// `max(1, floor(1 / scale))`, so a zoomed-out draw reads at least one
-    /// sample per pane pixel and under two per axis, and 1 at or above 100 %.
+    /// `max(1, floor(1 / (scale * factor)))` for the pane's device scale
+    /// factor, so a zoomed-out draw reads at least one sample per device pixel
+    /// and under two per axis, and 1 once a source pixel covers a device pixel.
     pub step: NonZeroU32,
 }
 
@@ -440,8 +455,11 @@ impl Viewport {
             ((x1 - x0) * self.scale) as f32,
             ((y1 - y0) * self.scale) as f32,
         );
-        // The epsilon lands the 50 % and 25 % stops on exactly 2 and 4.
-        let step = (1.0 / self.scale + 1e-6).floor().max(1.0) as u32;
+        // One sample per device pixel; the epsilon lands the 50 % and 25 %
+        // stops on exactly 2 and 4 at factor 1.
+        let step = (1.0 / (self.scale * device_scale(pane)) + 1e-6)
+            .floor()
+            .max(1.0) as u32;
         Some(PaneDraw {
             src,
             dst,

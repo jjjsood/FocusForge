@@ -26,12 +26,14 @@ fn base_pane() -> (PaneRect, PaneRect) {
             y: 0.0,
             width: 500.0,
             height: 500.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 500.0,
             y: 0.0,
             width: 500.0,
             height: 500.0,
+            scale_factor: 1.0,
         },
     )
 }
