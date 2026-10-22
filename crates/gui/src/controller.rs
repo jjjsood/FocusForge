@@ -2601,9 +2601,19 @@ impl AppController {
     /// A no-op with no dialog open; the dialog stays exactly as it was when
     /// `pick` returns `None` (the user cancelled the save dialog).
     pub fn export_confirmed(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) {
-        let Some(dialog) = self.state.export_dialog.as_ref() else {
-            return;
-        };
+        if let Some((tab_id, format, proposed)) = self.export_destination_request()
+            && let Some(path) = pick(&proposed)
+        {
+            self.export_destination_chosen(tab_id, format, path);
+        }
+    }
+
+    /// The first half of [`Self::export_confirmed`]: the exporting tab, the
+    /// format and the destination to propose. `None` with no dialog open, and
+    /// for a dialog past `Ready` or whose tab or source is gone -- these
+    /// close or cancel the modal as confirming always did.
+    pub fn export_destination_request(&mut self) -> Option<(u64, ExportFormat, PathBuf)> {
+        let dialog = self.state.export_dialog.as_ref()?;
         if !matches!(dialog.stage, ExportStage::Ready) {
             // Reached only for the writing state: its confirm button is
             // dimmed but still clickable, so this closes the modal rather
@@ -2611,20 +2621,46 @@ impl AppController {
             // routed to `export_locate_frames` before this method is ever
             // called.
             self.cancel_export();
-            return;
+            return None;
         }
         let tab_id = dialog.tab_id;
+        let format = dialog.choice.format;
+        let proposed = self
+            .state
+            .projects
+            .iter()
+            .find(|t| t.id == tab_id)
+            .filter(|tab| export_source_for(tab).is_some())
+            .map(|tab| export_proposed_path(tab, format));
+        if proposed.is_none() {
+            self.state.export_dialog = None;
+        }
+        Some((tab_id, format, proposed?))
+    }
+
+    /// The second half of [`Self::export_confirmed`]: starts the write to
+    /// `path`. Does nothing unless the modal is still the one that asked --
+    /// open on `tab_id`, `Ready` and on `format` -- since the chooser stays
+    /// live while the save dialog is up.
+    pub fn export_destination_chosen(&mut self, tab_id: u64, format: ExportFormat, path: PathBuf) {
+        let Some(dialog) = self.state.export_dialog.as_ref() else {
+            return;
+        };
+        if dialog.tab_id != tab_id
+            || !matches!(dialog.stage, ExportStage::Ready)
+            || dialog.choice.format != format
+        {
+            return;
+        }
         let choice = dialog.choice.clone();
-        let Some(tab) = self.state.projects.iter().find(|t| t.id == tab_id) else {
+        let Some(source) = self
+            .state
+            .projects
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(export_source_for)
+        else {
             self.state.export_dialog = None;
-            return;
-        };
-        let Some(source) = export_source_for(tab) else {
-            self.state.export_dialog = None;
-            return;
-        };
-        let proposed = export_proposed_path(tab, choice.format);
-        let Some(path) = pick(&proposed) else {
             return;
         };
         let destination_name = path.file_name().map_or_else(
@@ -6576,19 +6612,52 @@ impl AppController {
     /// save started; with another save running nothing happens and the
     /// question stays.
     pub fn start_save_and_close(&mut self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> bool {
+        match self.save_and_close_request() {
+            Some(ask) => {
+                let (tab_id, path) = ask.answer(pick);
+                self.save_and_close_chosen(tab_id, path)
+            }
+            None => false,
+        }
+    }
+
+    /// The first half of [`Self::start_save_and_close`]: where the asking tab
+    /// saves, leaving the question open. `None` with another save running
+    /// (the question stays) and, clearing the question, when no question is
+    /// open or its tab has nothing to write.
+    pub fn save_and_close_request(&mut self) -> Option<SaveAsk> {
         if self.save_in_flight() {
+            return None;
+        }
+        let ask = self
+            .state
+            .pending_close
+            .and_then(|id| self.tab_index(id))
+            .and_then(|index| self.save_request(index));
+        if ask.is_none() {
+            self.state.pending_close = None;
+            self.emit(ShellEvent::ProjectsChanged);
+        }
+        ask
+    }
+
+    /// The second half of [`Self::start_save_and_close`]: `path` is where the
+    /// asking tab saves, `None` when the save dialog was cancelled -- the
+    /// question clears either way. Does nothing unless the close question is
+    /// still open for `tab_id` and no save is running. Returns whether a save
+    /// started.
+    pub fn save_and_close_chosen(&mut self, tab_id: u64, path: Option<PathBuf>) -> bool {
+        if self.state.pending_close != Some(tab_id) || self.save_in_flight() {
             return false;
         }
-        let Some(index) = self.take_pending_close() else {
+        self.state.pending_close = None;
+        let started = path.is_some_and(|path| self.save_project_chosen(tab_id, path));
+        if started {
+            self.state.save.then = AfterSave::CloseTab(tab_id);
+        } else {
             self.emit(ShellEvent::ProjectsChanged);
-            return false;
-        };
-        if !self.save_project_at(index, pick) {
-            self.emit(ShellEvent::ProjectsChanged);
-            return false;
         }
-        self.state.save.then = AfterSave::CloseTab(self.state.projects[index].id);
-        true
+        started
     }
 
     /// [`Self::start_save_and_close`] run to completion on the calling
@@ -6659,6 +6728,43 @@ impl AppController {
         if self.save_in_flight() {
             return false;
         }
+        let chosen = answer_all(self.save_all_requests(), pick);
+        self.queue_save_all_and_quit(&chosen)
+    }
+
+    /// The first half of [`Self::start_save_all_and_quit`]: the proposed
+    /// destination of every never-saved tab that would lose work on close, in
+    /// tab order. Opened tabs write to their own file and ask nothing.
+    pub fn save_all_requests(&self) -> Vec<(u64, PathBuf)> {
+        self.state
+            .projects
+            .iter()
+            .filter(|tab| tab.loses_on_close())
+            .filter_map(|tab| match save_ask(tab) {
+                SaveAsk::Ask(id, proposed) => Some((id, proposed)),
+                SaveAsk::Write(..) => None,
+            })
+            .collect()
+    }
+
+    /// The second half of [`Self::start_save_all_and_quit`], for the dialogs
+    /// answered off the controller: queues every tab that would lose work on
+    /// close -- an opened tab to its own file, a never-saved one to its
+    /// `chosen` path -- and starts saving. The first never-saved tab without
+    /// one cancels the quit. A no-op unless the quit question is still open
+    /// and no save is running. Returns whether every tab had a destination.
+    pub fn save_all_and_quit_chosen(&mut self, chosen: &[(u64, PathBuf)]) -> bool {
+        if self.save_in_flight() || !self.state.pending_quit {
+            return false;
+        }
+        self.queue_save_all_and_quit(chosen)
+    }
+
+    /// Queues every tab that would lose work on close -- an opened tab to its
+    /// own file, a never-saved one to its `chosen` path -- and starts saving.
+    /// The first never-saved tab without one cancels the quit. Returns whether
+    /// every tab had a destination.
+    fn queue_save_all_and_quit(&mut self, chosen: &[(u64, PathBuf)]) -> bool {
         let mut queue = VecDeque::new();
         let mut declined = false;
         for tab in self
@@ -6667,7 +6773,13 @@ impl AppController {
             .iter()
             .filter(|tab| tab.loses_on_close())
         {
-            match save_target(tab, &pick) {
+            let target = match save_ask(tab) {
+                SaveAsk::Write(_, target) => Some(target),
+                SaveAsk::Ask(id, _) => chosen
+                    .iter()
+                    .find_map(|(chosen_id, path)| (*chosen_id == id).then(|| path.clone())),
+            };
+            match target {
                 Some(target) => queue.push_back((tab.id, target)),
                 None => {
                     declined = true;
@@ -6724,24 +6836,43 @@ impl AppController {
     /// [`Self::start_save_all_and_quit`] for a quit question. `false` with
     /// none open, and for a fuse question when no run started or was queued.
     pub fn start_close_guard_secondary(&mut self, pick: impl Fn(&Path) -> Option<PathBuf>) -> bool {
+        match self.close_guard_secondary_request() {
+            GuardSecondary::Done(started) => started,
+            GuardSecondary::Close(ask) => {
+                let (tab_id, path) = ask.answer(pick);
+                self.save_and_close_chosen(tab_id, path)
+            }
+            GuardSecondary::Quit(requests) => {
+                let chosen = answer_all(requests, pick);
+                self.save_all_and_quit_chosen(&chosen)
+            }
+        }
+    }
+
+    /// The first half of [`Self::start_close_guard_secondary`]: runs the fuse
+    /// and restore answers, which need no dialog, and for a close or quit
+    /// question returns what to ask, leaving the question open for
+    /// [`Self::save_and_close_chosen`] or [`Self::save_all_and_quit_chosen`].
+    pub fn close_guard_secondary_request(&mut self) -> GuardSecondary {
         if let Some((index, entry)) = self.take_pending_fuse() {
-            match index {
+            GuardSecondary::Done(match index {
                 Some(index) if self.snapshot_live(index) => self.resume_fuse(index, entry),
                 _ => false,
-            }
+            })
         } else if let Some((tab, key)) = self.take_pending_restore() {
             if let Some(index) = tab
                 && self.snapshot_live(index)
             {
                 self.restore_row(key);
             }
-            false
+            GuardSecondary::Done(false)
         } else if self.state.pending_close.is_some() {
-            self.start_save_and_close(pick)
-        } else if self.state.pending_quit {
-            self.start_save_all_and_quit(pick)
+            self.save_and_close_request()
+                .map_or(GuardSecondary::Done(false), GuardSecondary::Close)
+        } else if self.state.pending_quit && !self.save_in_flight() {
+            GuardSecondary::Quit(self.save_all_requests())
         } else {
-            false
+            GuardSecondary::Done(false)
         }
     }
 
@@ -8502,8 +8633,19 @@ impl AppController {
         &mut self,
         pick: impl FnOnce(&Path) -> Option<PathBuf>,
     ) -> bool {
+        match self.save_active_request() {
+            Some(ask) => {
+                let (tab_id, path) = ask.answer(pick);
+                path.is_some_and(|path| self.save_project_chosen(tab_id, path))
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::save_request`] on the active tab; `None` with none active.
+    pub fn save_active_request(&self) -> Option<SaveAsk> {
         self.active_project()
-            .is_some_and(|index| self.save_project_at(index, pick))
+            .and_then(|index| self.save_request(index))
     }
 
     /// [`Self::start_save_active_project`] run to completion on the calling
@@ -8514,32 +8656,29 @@ impl AppController {
         self.finish_saves() && started
     }
 
-    /// Starts writing tab `index`'s in-memory checkpoints and pending deletes
-    /// into one `.ffp` on a worker, after keeping a modified live as a
-    /// checkpoint. A never-saved tab asks `pick` (proposing
-    /// `<frames dir>/<group name>.ffp`); an opened one rewrites its own file.
-    /// [`Self::settle_save`] applies the result. `false` with nothing to
-    /// write, a declined pick, a refused snapshot or another save running.
-    fn save_project_at(
-        &mut self,
-        index: usize,
-        pick: impl FnOnce(&Path) -> Option<PathBuf>,
-    ) -> bool {
+    /// What saving tab `index`'s in-memory checkpoints and pending deletes
+    /// into one `.ffp` needs: an opened tab rewrites its own file, a
+    /// never-saved one asks where, proposing `<frames dir>/<group name>.ffp`.
+    /// `None` with nothing to write, no such tab or another save running.
+    pub fn save_request(&self, index: usize) -> Option<SaveAsk> {
+        if self.save_in_flight() {
+            return None;
+        }
+        let tab = self.state.projects.get(index)?;
+        tab.has_unsaved_write().then(|| save_ask(tab))
+    }
+
+    /// Starts writing tab `tab_id` to `path` on a worker, after keeping a
+    /// modified live as a checkpoint, once [`Self::save_request`] has named
+    /// the destination. [`Self::settle_save`] applies the result. `false`
+    /// when the tab is gone or has nothing to write, the snapshot is refused
+    /// or another save is running.
+    pub fn save_project_chosen(&mut self, tab_id: u64, path: PathBuf) -> bool {
         let _scope = measurement_scope("gui_save_project");
         if self.save_in_flight() {
             return false;
         }
-        let Some(tab) = self.state.projects.get(index) else {
-            return false;
-        };
-        if !tab.has_unsaved_write() {
-            return false;
-        }
-        let Some(target) = save_target(tab, pick) else {
-            return false;
-        };
-        let id = tab.id;
-        matches!(self.begin_save(id, target), SaveStart::Started)
+        matches!(self.begin_save(tab_id, path), SaveStart::Started)
     }
 
     /// Spawns the worker that writes tab `id` to `target` over a snapshot
@@ -9724,13 +9863,59 @@ fn export_proposed_path(tab: &ProjectTab, format: ExportFormat) -> PathBuf {
     ))
 }
 
-/// Where tab `tab` saves to: an opened project's own file, or for a
-/// never-saved one whatever `pick` answers to the proposed path.
-fn save_target(tab: &ProjectTab, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> Option<PathBuf> {
-    match &tab.project {
-        GuiProject::Opened(project) => Some(project.path().to_path_buf()),
-        GuiProject::Unsaved(group) => pick(&group.dir.join(format!("{}.ffp", group.name))),
+/// Where saving a tab goes: straight to a file, or through the save dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveAsk {
+    /// The tab's id and the file it rewrites -- an opened project's own.
+    Write(u64, PathBuf),
+    /// The tab's id and the path to propose for a never-saved tab.
+    Ask(u64, PathBuf),
+}
+
+impl SaveAsk {
+    /// The tab's id and its destination: `Write`'s file, or whatever `pick`
+    /// answers to `Ask`'s proposal.
+    fn answer(self, pick: impl FnOnce(&Path) -> Option<PathBuf>) -> (u64, Option<PathBuf>) {
+        match self {
+            Self::Write(id, path) => (id, Some(path)),
+            Self::Ask(id, proposed) => (id, pick(&proposed)),
+        }
     }
+}
+
+/// What the close guard's secondary answer needs next.
+#[derive(Debug)]
+pub enum GuardSecondary {
+    /// Answered without a dialog; whether a run started.
+    Done(bool),
+    /// The close question: where the asking tab saves.
+    Close(SaveAsk),
+    /// The quit question: the proposed destination of each never-saved tab.
+    Quit(Vec<(u64, PathBuf)>),
+}
+
+fn save_ask(tab: &ProjectTab) -> SaveAsk {
+    match &tab.project {
+        GuiProject::Opened(project) => SaveAsk::Write(tab.id, project.path().to_path_buf()),
+        GuiProject::Unsaved(group) => {
+            SaveAsk::Ask(tab.id, group.dir.join(format!("{}.ffp", group.name)))
+        }
+    }
+}
+
+/// `requests` answered in order by `pick`, up to the first decline.
+fn answer_all(
+    requests: Vec<(u64, PathBuf)>,
+    pick: impl Fn(&Path) -> Option<PathBuf>,
+) -> Vec<(u64, PathBuf)> {
+    let mut chosen = Vec::new();
+    for (id, proposed) in requests {
+        match pick(&proposed) {
+            Some(path) => chosen.push((id, path)),
+            None => break,
+        }
+    }
+    chosen
 }
 
 /// A path's own identity for a project or a card: an `Unsaved` tab's own

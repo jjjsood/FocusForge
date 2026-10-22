@@ -1646,6 +1646,22 @@ fn label(app: &AppWindow, id: &str) -> String {
         .to_string()
 }
 
+/// The drop caption is one short line wherever dropping works, and says so
+/// where it does not.
+#[test]
+fn drop_caption_follows_drop_unavailable() {
+    let app = app_at(1440, 900);
+    let caption = "FFEmptyState::drop-caption";
+    assert_eq!(label(&app, caption), "Drop a folder or stack");
+    app.set_drop_unavailable(true);
+    assert_eq!(
+        label(&app, caption),
+        "Dropping is unavailable on native Wayland"
+    );
+    app.set_drop_unavailable(false);
+    assert_eq!(label(&app, caption), "Drop a folder or stack");
+}
+
 /// The empty state: the wordmark above one raised 520-wide card, centred
 /// on the canvas column, holding the title, the copy,
 /// the single `Open folder…` button (168 x 34) and the drop caption, in that
@@ -1675,8 +1691,7 @@ fn empty_state_is_a_card_under_the_wordmark() {
     assert_eq!(label(&app, "FFEmptyState::open-folder"), "Open folder…");
     assert_eq!(
         label(&app, "FFEmptyState::drop-caption"),
-        "Dropping a folder works on X11, macOS and Windows — not on native Wayland. \
-         Open folder… works everywhere."
+        "Drop a folder or stack"
     );
 
     let button = rect(&app, "FFEmptyState::open-folder");

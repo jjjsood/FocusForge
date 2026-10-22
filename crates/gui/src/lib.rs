@@ -41,7 +41,7 @@ pub mod brush;
 /// `src/main.rs`/`src/picker.rs`/`src/bridge.rs` reach its types directly.
 pub mod entry;
 
-/// The native folder/file picker -- blocking, never `AsyncFileDialog`.
+/// The native folder/file picker, opened without blocking the event loop.
 /// `pub` so `src/bridge.rs` can call it.
 pub mod picker;
 

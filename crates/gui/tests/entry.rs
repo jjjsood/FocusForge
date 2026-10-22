@@ -401,16 +401,20 @@ fn no_grouping_vocabulary_after_the_answer() {
 }
 
 #[test]
-fn drop_caption_states_the_negative() {
+fn drop_caption_names_the_drop_and_the_wayland_line() {
     let contents =
         std::fs::read_to_string(common::ui_dir().join("shell").join("empty_state.slint")).unwrap();
     assert!(
-        contents.contains("native Wayland"),
-        "the caption must name native Wayland as the case that does not work"
+        contents.contains("Drop a folder or stack"),
+        "the caption names what a drop accepts"
     );
     assert!(
-        contents.contains("Open folder… works everywhere"),
-        "the caption must name the picker as the case that always works"
+        contents.contains("Dropping is unavailable on native Wayland"),
+        "the caption says so where dropping does not work"
+    );
+    assert!(
+        !contents.contains("Open folder… works everywhere"),
+        "the long platform caveat is gone"
     );
 }
 
