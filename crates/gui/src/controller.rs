@@ -2611,7 +2611,7 @@ impl AppController {
     /// The first half of [`Self::export_confirmed`]: the exporting tab, the
     /// format and the destination to propose. `None` with no dialog open, and
     /// for a dialog past `Ready` or whose tab or source is gone -- these
-    /// close or cancel the modal as confirming always did.
+    /// close or cancel the modal.
     pub fn export_destination_request(&mut self) -> Option<(u64, ExportFormat, PathBuf)> {
         let dialog = self.state.export_dialog.as_ref()?;
         if !matches!(dialog.stage, ExportStage::Ready) {
