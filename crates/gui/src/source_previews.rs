@@ -691,8 +691,6 @@ mod tests {
         spp: u32,
         compression: focusforge_core::io::StripCompression,
     ) {
-        use focusforge_core::io::{StripSpec, StripWriter};
-
         let mut bytes = Vec::new();
         for y in 0..height {
             for x in 0..width {
@@ -702,6 +700,19 @@ mod tests {
                 }
             }
         }
+        write_tiff(path, width, height, spp, compression, &bytes);
+    }
+
+    fn write_tiff(
+        path: &Path,
+        width: u32,
+        height: u32,
+        spp: u32,
+        compression: focusforge_core::io::StripCompression,
+        bytes: &[u8],
+    ) {
+        use focusforge_core::io::{StripSpec, StripWriter};
+
         let mut writer = StripWriter::create(
             path,
             StripSpec {
@@ -715,7 +726,7 @@ mod tests {
             },
         )
         .unwrap();
-        writer.write_rows(&bytes).unwrap();
+        writer.write_rows(bytes).unwrap();
         writer.finish().unwrap();
     }
 
@@ -781,21 +792,14 @@ mod tests {
             std::iter::repeat_n(40_000u16.to_le_bytes(), (width * height * 3) as usize)
                 .flatten()
                 .collect();
-        let mut writer = focusforge_core::io::StripWriter::create(
+        write_tiff(
             &path,
-            focusforge_core::io::StripSpec {
-                width,
-                height,
-                samples_per_pixel: 3,
-                bits_per_sample: 16,
-                compression: focusforge_core::io::StripCompression::None,
-                description: None,
-                metadata: Default::default(),
-            },
-        )
-        .unwrap();
-        writer.write_rows(&bytes).unwrap();
-        writer.finish().unwrap();
+            width,
+            height,
+            3,
+            focusforge_core::io::StripCompression::None,
+            &bytes,
+        );
 
         let cap = 32 * 1024 * 1024;
         let (stepped, stepped_reservation) =
@@ -847,17 +851,20 @@ mod tests {
             runs.sort();
             (runs[runs.len() / 2], reservation)
         };
-        let (old, old_reservation) = time(1);
-        let (new, new_reservation) = time(u32::MAX);
+        let (full, full_reservation) = time(1);
+        let (stepped, stepped_reservation) = time(u32::MAX);
         println!(
             "thumbnail of {}: step {} {:.1} ms, step {} {:.1} ms",
             frame.display(),
-            old_reservation.step,
-            old.as_secs_f64() * 1e3,
-            new_reservation.step,
-            new.as_secs_f64() * 1e3,
+            full_reservation.step,
+            full.as_secs_f64() * 1e3,
+            stepped_reservation.step,
+            stepped.as_secs_f64() * 1e3,
         );
-        assert!(new < old, "the stepped read is faster than the full read");
+        assert!(
+            stepped < full,
+            "the stepped read is faster than the full read"
+        );
     }
 
     #[test]
