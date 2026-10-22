@@ -988,6 +988,7 @@ mod tests {
         let paths: Vec<_> = crate::io::frame_paths(&dir)
             .expect("the stack directory enumerates")
             .into_iter()
+            // The directory also holds the stacked result, which is not a source frame.
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
