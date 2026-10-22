@@ -304,15 +304,12 @@ mod tests {
     type Posted = Box<dyn FnOnce() + Send>;
 
     /// The answer the fake runner gives for `request`: two paths for
-    /// `Frames`, none for the saves, one path otherwise.
+    /// `Frames` and `Images`, none for the saves, one path otherwise.
     fn fake_answer(request: &DialogRequest) -> Option<Vec<PathBuf>> {
         match request {
             DialogRequest::Entry => Some(vec![PathBuf::from("/pick/folder")]),
             DialogRequest::Project => Some(vec![PathBuf::from("/pick/a.ffp")]),
-            DialogRequest::Frames => {
-                Some(vec![PathBuf::from("/f/1.tif"), PathBuf::from("/f/2.tif")])
-            }
-            DialogRequest::Images => {
+            DialogRequest::Frames | DialogRequest::Images => {
                 Some(vec![PathBuf::from("/f/1.tif"), PathBuf::from("/f/2.tif")])
             }
             DialogRequest::SaveProject(_) | DialogRequest::SaveImage(..) => None,
