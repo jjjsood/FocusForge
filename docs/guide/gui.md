@@ -11,16 +11,20 @@ A folder argument proposes a grouping the same way `focusforge-cli stack`
 would and opens each proposed stack as its own tab; a `*.ffp` path reopens a
 project that was already stacked. `--open` is repeatable — each path is
 opened in turn, the next one waiting for the one before it to finish rather
-than racing it. Leaving `--open` off starts with no project open — use
-**Open project…** (below) or drop a folder or a set of frames onto the
-window. A path that fails to open shows the same refusal dialog a failed
+than racing it. Leaving `--open` off starts with an empty window: click
+**Open…** to choose the TIFF or camera RAW frames of one stack, which start
+one new tab, or drop a folder or a set of frames onto the window (the caption
+reads "Dropping is unavailable on native Wayland" where drops do not work).
+Ctrl+N and the Projects rail's **New project** ask for a folder instead. A path that fails to open shows the same refusal dialog a failed
 drop or picker choice would, rather than closing the window. A folder with
 no readable frames is refused naming the formats read, 16-bit TIFF and camera
-RAW; Escape closes the dialog.
+RAW; Escape closes the dialog. Dialogs with a Cancel button also show an x at
+the top right that acts as Cancel.
 
 Opening a folder, a project or a picker/drop result reads its frame headers
 and decodes a thumbnail off the window's own thread, so the window keeps
-responding while a large folder is scanned; a loading indicator appears over
+responding while a large folder is scanned, and while an open, save or
+export file dialog is up; a loading indicator appears over
 the canvas once a load has been running for half a second.
 
 ## Launch options
@@ -54,7 +58,8 @@ between two tabs of its own:
   a frame that would replace one already in the stack asks before doing so.
   The panel dims while its own tab's fuse is running, the same as
   **Settings**. The Appearance tab of the settings window sets whether the panel shows each frame as a
-  plain row, a row with a preview, or a large preview.
+  plain row, a row with a preview, or a large preview. The editor's source
+  list follows the same choice.
 - **Settings** holds every setting of the next fuse on this tab, in four
   sections; see [Settings](#settings) below. A value outside its declared
   range is flagged before the run starts.
@@ -68,7 +73,8 @@ window included, shows a coarse whole-image backdrop under the sharp view, so
 zooming out or panning past the loaded region shows no blank edge while the
 sharp pixels catch up. Drag the second window by
 its title bar; its dock icon or close button returns the image to the main
-window. It can also be minimized or maximized. On Linux, the second window
+window. It can also be minimized or maximized. It draws sharply over its
+whole area and follows the display's scale factor. On Linux, the second window
 currently uses X11 or XWayland when `DISPLAY` is available, otherwise native
 Wayland when `WAYLAND_DISPLAY` is available. Starting with neither display
 reports a clear error instead of choosing a different backend.
@@ -107,7 +113,8 @@ The **Settings** tab is generated from the same parameter schema
   the keyboard). Every frame gets one gain, bringing its mean to one target
   shared by all frames, bounded by the max gain; the target sits at the
   frames' average brightness at 0.0 and a stop higher or lower doubles or
-  halves it. While the gains are measured the bottom bar reads **Preparing**.
+  halves it. While the gains are measured the bottom bar reads **Preparing** with the number of frames done and an
+  estimated time remaining.
 - **FUSE** — the fusion method and the parameters it declares. The picker
   lists every method: **Details** (the default), **Soft transitions** and
   **Focus map**. Each method remembers its own settings while the tab is open.
