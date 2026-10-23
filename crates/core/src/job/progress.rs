@@ -38,6 +38,13 @@ pub struct JobProgress {
     /// The frame count a computed align stage started with, `0` when no
     /// frame is being counted.
     pub align_total: usize,
+    /// How many frames' brightness equalization has completed during the
+    /// prepare stage. `0` when the run does not equalize; like `align_done`
+    /// it keeps its final tally once the stage ends.
+    pub prepare_done: usize,
+    /// The frame count the prepare stage started with, `0` when the run does
+    /// not equalize.
+    pub prepare_total: usize,
 }
 
 /// Area-weighted mean ETA:

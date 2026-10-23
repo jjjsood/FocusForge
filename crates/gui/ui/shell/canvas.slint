@@ -114,11 +114,12 @@ export component FFCanvas inherits Rectangle {
     // either pane -- `tests/shell.rs`'s pane-geometry tests keep finding
     // `pane-left`/`pane-right` at their fixed rects regardless.
     in property <bool> show-empty-state: true;
+    in property <bool> drop-unavailable: false;
     // A background load in flight: hides the empty state for that span, so
     // its own text never bleeds around the loading indicator drawn over
     // this same region.
     in property <bool> load-active: false;
-    callback open-folder-requested();
+    callback open-requested();
 
     // The pane geometry `AppController::set_pane_geometry` needs, read back
     // as plain property reads -- no arithmetic, `pane-gutter`/`pane-divider`
@@ -290,6 +291,7 @@ export component FFCanvas inherits Rectangle {
         width: 100%;
         height: 100%;
         visible: root.show-empty-state && !root.load-active;
-        open-folder-requested => { root.open-folder-requested(); }
+        drop-unavailable: root.drop-unavailable;
+        open-requested => { root.open-requested(); }
     }
 }

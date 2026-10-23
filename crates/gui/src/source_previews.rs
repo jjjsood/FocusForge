@@ -2,6 +2,7 @@
 
 //! Bounded, full-source reductions for source-image views.
 
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -61,7 +62,7 @@ type WorkerExit = dyn Fn() + Send + Sync;
 pub struct PreviewWorker {
     mailbox: Arc<(Mutex<WorkerCommand>, Condvar)>,
     current_cancel: Mutex<Arc<AtomicBool>>,
-    outcome: Arc<(Mutex<Option<PreviewOutcome>>, Condvar)>,
+    outcome: Arc<Mutex<Vec<PreviewOutcome>>>,
     active: Arc<(Mutex<bool>, Condvar)>,
     peak_workers: Arc<AtomicU64>,
     outcome_bytes: Arc<AtomicU64>,
@@ -97,7 +98,7 @@ impl PreviewWorker {
     fn with_renderer(renderer: Arc<PreviewRenderer>, on_exit: Option<Arc<WorkerExit>>) -> Self {
         let mailbox = Arc::new((Mutex::new(WorkerCommand::Idle), Condvar::new()));
         let current_cancel = Mutex::new(Arc::new(AtomicBool::new(false)));
-        let outcome = Arc::new((Mutex::new(None), Condvar::new()));
+        let outcome = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new((Mutex::new(false), Condvar::new()));
         let peak_workers = Arc::new(AtomicU64::new(0));
         let outcome_bytes = Arc::new(AtomicU64::new(0));
@@ -155,10 +156,7 @@ impl PreviewWorker {
             .expect("preview cancellation lock");
         previous.store(true, Ordering::Release);
         *previous = Arc::clone(&cancel);
-        let (outcome, outcome_wake) = &*self.outcome;
-        outcome.lock().expect("preview outcome lock").take();
-        self.outcome_bytes.store(0, Ordering::Release);
-        outcome_wake.notify_all();
+        clear_outcomes(&self.outcome, &self.outcome_bytes);
         let (state, wake) = &*self.mailbox;
         *state.lock().expect("preview mailbox lock") = WorkerCommand::Set {
             requests,
@@ -168,17 +166,11 @@ impl PreviewWorker {
         wake.notify_one();
     }
 
+    /// Every outcome parked since the last drain, in render order.
     pub fn drain(&self) -> Vec<PreviewOutcome> {
-        let (outcome, wake) = &*self.outcome;
-        let result = outcome
-            .lock()
-            .expect("preview outcome lock")
-            .take()
-            .into_iter()
-            .collect();
+        let mut parked = self.outcome.lock().expect("preview outcome lock");
         self.outcome_bytes.store(0, Ordering::Release);
-        wake.notify_one();
-        result
+        std::mem::take(&mut *parked)
     }
 
     pub fn metrics(&self) -> PreviewMetrics {
@@ -200,10 +192,7 @@ impl PreviewWorker {
         let (state, mailbox_wake) = &*self.mailbox;
         *state.lock().expect("preview mailbox lock") = WorkerCommand::Idle;
         mailbox_wake.notify_one();
-        let (slot, wake) = &*self.outcome;
-        slot.lock().expect("preview outcome lock").take();
-        self.outcome_bytes.store(0, Ordering::Release);
-        wake.notify_all();
+        clear_outcomes(&self.outcome, &self.outcome_bytes);
         PreviewQuiescence(Arc::clone(&self.active))
     }
 }
@@ -223,16 +212,21 @@ impl Drop for PreviewWorker {
         let (state, wake) = &*self.mailbox;
         *state.lock().expect("preview mailbox lock") = WorkerCommand::Shutdown;
         wake.notify_one();
-        let (outcome, outcome_wake) = &*self.outcome;
-        outcome.lock().expect("preview outcome lock").take();
-        self.outcome_bytes.store(0, Ordering::Release);
-        outcome_wake.notify_all();
+        clear_outcomes(&self.outcome, &self.outcome_bytes);
     }
+}
+
+/// Drops every parked outcome and its byte count under the outcome lock, the
+/// lock the worker holds while it publishes.
+fn clear_outcomes(outcome: &Mutex<Vec<PreviewOutcome>>, outcome_bytes: &AtomicU64) {
+    let mut parked = outcome.lock().expect("preview outcome lock");
+    parked.clear();
+    outcome_bytes.store(0, Ordering::Release);
 }
 
 fn worker_loop(
     mailbox: Arc<(Mutex<WorkerCommand>, Condvar)>,
-    outcome: Arc<(Mutex<Option<PreviewOutcome>>, Condvar)>,
+    outcome: Arc<Mutex<Vec<PreviewOutcome>>>,
     active: Arc<(Mutex<bool>, Condvar)>,
     peak_workers: Arc<AtomicU64>,
     outcome_bytes: Arc<AtomicU64>,
@@ -261,49 +255,51 @@ fn worker_loop(
             }
             WorkerCommand::Idle => continue,
             WorkerCommand::Set {
-                mut requests,
+                requests,
                 budget,
                 cancel,
             } => {
-                if let Some(request) = requests.pop()
-                    && !cancel.load(Ordering::Acquire)
-                {
-                    let rendered = renderer(&request.path, budget, &cancel);
-                    if !cancel.load(Ordering::Acquire) {
-                        if let Ok((_, reservation)) = &rendered {
-                            tracing::debug!(
-                                path = %request.path.display(),
-                                configured_cap = budget.bytes(),
-                                decoder_cache = reservation.decoder_cache,
-                                read_scratch = reservation.read_scratch,
-                                band = reservation.band,
-                                accumulator = reservation.accumulator,
-                                reduced_samples = reservation.reduced_samples,
-                                result = reservation.result,
-                                resident_and_conversion = reservation.resident_and_conversion,
-                                total = reservation.total,
-                                "source preview render reservation"
-                            );
-                        }
-                        let reservation =
-                            rendered.as_ref().ok().map(|(_, reservation)| *reservation);
-                        let result = rendered.map(|(pixels, _)| Arc::new(pixels));
-                        let (slot, wake) = &*outcome;
-                        let mut slot = slot.lock().expect("preview outcome lock");
-                        while slot.is_some() && !cancel.load(Ordering::Acquire) {
-                            slot = wake.wait(slot).expect("preview outcome lock");
-                        }
-                        if !cancel.load(Ordering::Acquire) {
-                            let bytes = reservation.map_or(0, |reservation| reservation.total);
-                            outcome_bytes.store(bytes, Ordering::Release);
-                            peak_outcome_bytes.fetch_max(bytes, Ordering::AcqRel);
-                            *slot = Some(PreviewOutcome {
-                                request,
-                                result,
-                                reservation,
-                            });
-                        }
+                for request in requests {
+                    if cancel.load(Ordering::Acquire) {
+                        break;
                     }
+                    // Parked outcomes still count against the allowance.
+                    let admitted = HostBudget::explicit(
+                        budget
+                            .bytes()
+                            .saturating_sub(outcome_bytes.load(Ordering::Acquire)),
+                    );
+                    let rendered = renderer(&request.path, admitted, &cancel);
+                    if let Ok((_, reservation)) = &rendered {
+                        tracing::debug!(
+                            path = %request.path.display(),
+                            configured_cap = budget.bytes(),
+                            decoder_cache = reservation.decoder_cache,
+                            read_scratch = reservation.read_scratch,
+                            band = reservation.band,
+                            accumulator = reservation.accumulator,
+                            reduced_samples = reservation.reduced_samples,
+                            result = reservation.result,
+                            resident_and_conversion = reservation.resident_and_conversion,
+                            total = reservation.total,
+                            step = reservation.step,
+                            "source preview render reservation"
+                        );
+                    }
+                    let reservation = rendered.as_ref().ok().map(|(_, reservation)| *reservation);
+                    let result = rendered.map(|(pixels, _)| Arc::new(pixels));
+                    let mut parked = outcome.lock().expect("preview outcome lock");
+                    if cancel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let bytes = reservation.map_or(0, |reservation| reservation.total);
+                    let total = outcome_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+                    peak_outcome_bytes.fetch_max(total, Ordering::AcqRel);
+                    parked.push(PreviewOutcome {
+                        request,
+                        result,
+                        reservation,
+                    });
                 }
                 *active.0.lock().expect("preview activity lock") = false;
                 active.1.notify_all();
@@ -323,6 +319,8 @@ pub struct PreviewReservation {
     pub resident_and_conversion: u64,
     pub total: u64,
     pub band_rows: u32,
+    /// Row and column stride of the sampled grid read from frame 0.
+    pub step: u32,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -361,6 +359,21 @@ fn tonemap_source(samples: &[u16], width: u32, height: u32, spp: u32, rgba: &mut
     }
 }
 
+/// The largest stride whose sampled grid is still at least `target_width x
+/// target_height`, so the final reduction averages real samples in every cell.
+fn sample_step(width: u32, height: u32, target_width: u32, target_height: u32) -> u32 {
+    let along = |length: u32, target: u32| {
+        if target <= 1 {
+            length
+        } else {
+            (length - 1) / (target - 1)
+        }
+    };
+    along(width, target_width)
+        .min(along(height, target_height))
+        .max(1)
+}
+
 /// Renders one original source on the caller's worker thread.  This function
 /// opens and reads only here; callers on the UI thread only enqueue identities.
 pub fn render(
@@ -376,6 +389,15 @@ pub fn render_cancellable(
     path: &Path,
     host_budget: HostBudget,
     cancelled: &AtomicBool,
+) -> Result<(PreviewPixels, PreviewReservation), PreviewError> {
+    render_with_max_step(path, host_budget, cancelled, u32::MAX)
+}
+
+fn render_with_max_step(
+    path: &Path,
+    host_budget: HostBudget,
+    cancelled: &AtomicBool,
+    max_step: u32,
 ) -> Result<(PreviewPixels, PreviewReservation), PreviewError> {
     let cap = host_budget.bytes();
     let frame_set = open_frame_set(&[path.to_path_buf()], HostBudget::explicit(cap))
@@ -412,13 +434,32 @@ pub fn render_cancellable(
         .saturating_add(reduced_samples)
         .saturating_add(result)
         .saturating_add(resident_and_conversion);
-    let bytes_per_row = u64::from(frame.width)
+    let step =
+        sample_step(frame.width, frame.height, target_width, target_height).min(max_step.max(1));
+    let nz_step = NonZeroU32::new(step).expect("the sampling step is at least 1");
+    let grid_width = frame.width.div_ceil(step);
+    let grid_height = frame.height.div_ceil(step);
+    let bytes_per_row = u64::from(grid_width)
         .saturating_mul(u64::from(spp))
         .saturating_mul(2);
-    let mut band_rows = 64u32.min(frame.height.max(1));
+    // A stepped read of a row-at-a-time reader holds one full-width source row.
+    let step_row = if step > 1 {
+        u64::from(frame.width)
+            .saturating_mul(u64::from(spp))
+            .saturating_mul(2)
+    } else {
+        0
+    };
+    let mut band_rows = 64u32.min(grid_height.max(1));
     let reservation = loop {
         let band = bytes_per_row.saturating_mul(u64::from(band_rows));
-        let read_scratch = reader.read_scratch_bytes(frame.width, band_rows);
+        let read_scratch = if step > 1 {
+            reader
+                .read_scratch_bytes(frame.width, 1)
+                .saturating_add(step_row)
+        } else {
+            reader.read_scratch_bytes(frame.width, band_rows)
+        };
         let total = base.saturating_add(band).saturating_add(read_scratch);
         if total <= cap {
             break PreviewReservation {
@@ -431,6 +472,7 @@ pub fn render_cancellable(
                 resident_and_conversion,
                 total,
                 band_rows,
+                step,
             };
         }
         if band_rows == 1 {
@@ -440,26 +482,33 @@ pub fn render_cancellable(
     };
 
     let mut reducer =
-        Downsampler::new_full_source(frame.width, frame.height, spp, target_width, target_height);
+        Downsampler::new_full_source(grid_width, grid_height, spp, target_width, target_height);
     let mut band = vec![0u16; (bytes_per_row / 2 * u64::from(reservation.band_rows)) as usize];
-    let mut y = 0;
-    while y < frame.height {
+    let mut grid_row = 0;
+    while grid_row < grid_height {
         if cancelled.load(Ordering::Acquire) {
             return Err(PreviewError::Cancelled);
         }
-        let rows = reservation.band_rows.min(frame.height - y);
-        let rect = Rect {
+        let rows = reservation.band_rows.min(grid_height - grid_row);
+        let source_y = grid_row * step;
+        let source = Rect {
             x: 0,
-            y,
+            y: source_y,
             width: frame.width,
+            height: (rows * step).min(frame.height - source_y),
+        };
+        let grid = Rect {
+            x: 0,
+            y: grid_row,
+            width: grid_width,
             height: rows,
         };
-        let samples = rect.width as usize * rect.height as usize * spp as usize;
+        let samples = grid.width as usize * grid.height as usize * spp as usize;
         reader
-            .read_tile_into(0, rect, &mut band[..samples])
+            .read_tile_step_into(0, source, nz_step, spp, &mut band[..samples])
             .map_err(|error| PreviewError::Read(error.to_string()))?;
-        reducer.add_band(&band[..samples], rect);
-        y += rows;
+        reducer.add_band(&band[..samples], grid);
+        grid_row += rows;
     }
     let samples = reducer.finish();
     let mut rgba = vec![0; result as usize];
@@ -479,16 +528,20 @@ pub fn render_cancellable(
 mod raw_dng_fixture;
 
 #[cfg(test)]
+#[path = "../../core/tests/common/reference_stack.rs"]
+mod reference_stack_fixture;
+
+#[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
     use focusforge_core::tile::HostBudget;
 
     use super::{
-        PreviewError, PreviewPixels, PreviewRequest, PreviewReservation, PreviewWorker,
-        target_dimensions, tonemap_source,
+        PreviewError, PreviewOutcome, PreviewPixels, PreviewRequest, PreviewReservation,
+        PreviewWorker, target_dimensions, tonemap_source,
     };
 
     fn request(name: &str) -> PreviewRequest {
@@ -510,6 +563,7 @@ mod tests {
             resident_and_conversion: 8,
             total: 12,
             band_rows: 1,
+            step: 1,
         }
     }
 
@@ -630,6 +684,189 @@ mod tests {
         }
     }
 
+    fn write_gradient_tiff(
+        path: &Path,
+        width: u32,
+        height: u32,
+        spp: u32,
+        compression: focusforge_core::io::StripCompression,
+    ) {
+        let mut bytes = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                for channel in 0..spp {
+                    let value = ((x * 7 + y * 13 + channel * 1000) % 60_000) as u16;
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        write_tiff(path, width, height, spp, compression, &bytes);
+    }
+
+    fn write_tiff(
+        path: &Path,
+        width: u32,
+        height: u32,
+        spp: u32,
+        compression: focusforge_core::io::StripCompression,
+        bytes: &[u8],
+    ) {
+        use focusforge_core::io::{StripSpec, StripWriter};
+
+        let mut writer = StripWriter::create(
+            path,
+            StripSpec {
+                width,
+                height,
+                samples_per_pixel: spp,
+                bits_per_sample: 16,
+                compression,
+                description: None,
+                metadata: Default::default(),
+            },
+        )
+        .unwrap();
+        writer.write_rows(bytes).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn stepped_preview_follows_the_target_in_both_axes() {
+        use focusforge_core::io::{ReaderKind, StripCompression, open_frame_set};
+
+        let directory = tempfile::tempdir().unwrap();
+        let cap = 32 * 1024 * 1024;
+        // (width, height, step, grid width, grid height)
+        for (width, height, step, grid_width, grid_height) in [
+            (1000u32, 37u32, 3u32, 334u32, 13u32),
+            (37, 1000, 3, 13, 334),
+            (200, 120, 1, 200, 120),
+        ] {
+            for spp in [1u32, 3] {
+                for (compression, kind) in [
+                    (StripCompression::None, ReaderKind::Mmap),
+                    (StripCompression::Deflate, ReaderKind::Decoded),
+                ] {
+                    let path = directory.path().join("source.tif");
+                    write_gradient_tiff(&path, width, height, spp, compression);
+                    assert_eq!(
+                        open_frame_set(std::slice::from_ref(&path), HostBudget::explicit(cap))
+                            .unwrap()
+                            .kind,
+                        kind
+                    );
+                    let label = format!("{width}x{height} spp {spp} {kind:?}");
+                    let (preview, reservation) =
+                        super::render(&path, HostBudget::explicit(cap)).expect(&label);
+                    assert_eq!(
+                        (preview.width, preview.height),
+                        target_dimensions(width, height),
+                        "{label}"
+                    );
+                    assert_eq!(reservation.step, step, "{label}");
+                    assert_eq!(
+                        reservation.band,
+                        u64::from(grid_width)
+                            * u64::from(spp)
+                            * 2
+                            * u64::from(reservation.band_rows),
+                        "{label}: the band is sized from the sampled grid width"
+                    );
+                    assert_eq!(reservation.band_rows, 64.min(grid_height), "{label}");
+                    assert!(reservation.total <= cap, "{label}");
+                    assert!(
+                        preview.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stepped_preview_keeps_a_flat_source_flat() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("flat.tif");
+        let (width, height) = (1500u32, 900u32);
+        let bytes: Vec<u8> =
+            std::iter::repeat_n(40_000u16.to_le_bytes(), (width * height * 3) as usize)
+                .flatten()
+                .collect();
+        write_tiff(
+            &path,
+            width,
+            height,
+            3,
+            focusforge_core::io::StripCompression::None,
+            &bytes,
+        );
+
+        let cap = 32 * 1024 * 1024;
+        let (stepped, stepped_reservation) =
+            super::render(&path, HostBudget::explicit(cap)).unwrap();
+        let (full, full_reservation) = super::render_with_max_step(
+            &path,
+            HostBudget::explicit(cap),
+            &AtomicBool::new(false),
+            1,
+        )
+        .unwrap();
+        assert!(stepped_reservation.step > 1);
+        assert_eq!(full_reservation.step, 1);
+        assert_eq!(
+            stepped, full,
+            "a flat source reduces to the same pixels at any step"
+        );
+    }
+
+    /// Per-thumbnail time of the full read (stride 1) against the stepped read on
+    /// one reference-stack frame: `FOCUSFORGE_REFERENCE_STACK=<subject dir>`.
+    #[test]
+    #[ignore = "reads a reference-stack frame; set FOCUSFORGE_REFERENCE_STACK"]
+    fn reference_thumbnail_timing() {
+        let Some(directory) = super::reference_stack_fixture::reference_stack_dir() else {
+            return;
+        };
+        let mut frames: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "tif"))
+            .collect();
+        frames.sort();
+        let frame = frames
+            .first()
+            .expect("the reference directory holds a .tif");
+        let budget = HostBudget::explicit(512 * 1024 * 1024);
+        let time = |max_step: u32| {
+            let cancelled = AtomicBool::new(false);
+            let (_, reservation) =
+                super::render_with_max_step(frame, budget, &cancelled, max_step).unwrap();
+            let mut runs: Vec<_> = (0..5)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    super::render_with_max_step(frame, budget, &cancelled, max_step).unwrap();
+                    start.elapsed()
+                })
+                .collect();
+            runs.sort();
+            (runs[runs.len() / 2], reservation)
+        };
+        let (full, full_reservation) = time(1);
+        let (stepped, stepped_reservation) = time(u32::MAX);
+        println!(
+            "thumbnail of {}: step {} {:.1} ms, step {} {:.1} ms",
+            frame.display(),
+            full_reservation.step,
+            full.as_secs_f64() * 1e3,
+            stepped_reservation.step,
+            stepped.as_secs_f64() * 1e3,
+        );
+        assert!(
+            stepped < full,
+            "the stepped read is faster than the full read"
+        );
+    }
+
     #[test]
     fn supported_raw_preview_is_bounded_colored_and_leaves_original_untouched() {
         use super::raw_dng_fixture::{DngSpec, write_dng};
@@ -660,6 +897,135 @@ mod tests {
         assert!(reservation.decoder_cache > 0);
         assert!(reservation.total <= cap);
         assert_eq!(std::fs::read(source.path()).unwrap(), original);
+    }
+
+    fn one_pixel() -> PreviewPixels {
+        PreviewPixels {
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        }
+    }
+
+    /// Drains until `count` outcomes arrived or ten seconds passed.
+    fn collect_outcomes(worker: &PreviewWorker, count: usize) -> Vec<PreviewOutcome> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut outcomes = Vec::new();
+        while outcomes.len() < count && std::time::Instant::now() < deadline {
+            outcomes.extend(worker.drain());
+            std::thread::yield_now();
+        }
+        outcomes
+    }
+
+    fn wait_until_idle(worker: &PreviewWorker) {
+        while worker.metrics().active_workers != 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn one_request_renders_visible_rows_first() {
+        let rendered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = PreviewWorker::new_with_renderer(Arc::new({
+            let rendered = Arc::clone(&rendered);
+            move |path, _, _| {
+                rendered.lock().unwrap().push(path.to_path_buf());
+                Ok((one_pixel(), reservation()))
+            }
+        }));
+        let names = [
+            "visible-0",
+            "visible-1",
+            "prefetch-0",
+            "prefetch-1",
+            "prefetch-2",
+        ];
+        worker.set_visible(
+            names.iter().map(|name| request(name)).collect(),
+            HostBudget::explicit(1024),
+        );
+
+        let outcomes = collect_outcomes(&worker, names.len());
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.request.clone())
+                .collect::<Vec<_>>(),
+            names.iter().map(|name| request(name)).collect::<Vec<_>>(),
+            "one set_visible yields every request, in request order"
+        );
+        assert_eq!(
+            *rendered.lock().unwrap(),
+            names.iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+        assert_eq!(worker.metrics().peak_workers, 1);
+        assert!(worker.metrics().peak_outcome_bytes >= 12);
+    }
+
+    #[test]
+    fn batch_isolates_failed_rows_and_stops_on_replace() {
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (slow_release_tx, slow_release_rx) = mpsc::channel();
+        let slow_release_rx = Arc::new(std::sync::Mutex::new(slow_release_rx));
+        let worker = PreviewWorker::new_with_renderer(Arc::new(move |path, _, _| {
+            if path == Path::new("bad") {
+                return Err(PreviewError::Read("unreadable".to_string()));
+            }
+            if path == Path::new("slow") {
+                slow_started_tx
+                    .send(())
+                    .expect("test waits for the slow row");
+                slow_release_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .expect("test releases the slow row");
+            }
+            Ok((one_pixel(), reservation()))
+        }));
+
+        worker.set_visible(
+            ["first", "bad", "third", "fourth"].map(request).to_vec(),
+            HostBudget::explicit(1024),
+        );
+        let outcomes = collect_outcomes(&worker, 4);
+        assert_eq!(outcomes.len(), 4, "a failed row does not end the batch");
+        assert!(matches!(outcomes[1].result, Err(PreviewError::Read(_))));
+        assert!(outcomes[1].reservation.is_none());
+        for index in [0, 2, 3] {
+            assert!(outcomes[index].result.is_ok());
+        }
+
+        worker.set_visible(
+            ["parked", "slow", "stale-a", "stale-b"]
+                .map(request)
+                .to_vec(),
+            HostBudget::explicit(1024),
+        );
+        slow_started_rx.recv().expect("the second row is rendering");
+        while worker.metrics().outcome_bytes == 0 {
+            std::thread::yield_now();
+        }
+        worker.set_visible(
+            ["fresh-a", "fresh-b"].map(request).to_vec(),
+            HostBudget::explicit(1024),
+        );
+        assert_eq!(
+            worker.metrics().outcome_bytes,
+            0,
+            "the old set's parked row is dropped by the replacement"
+        );
+        slow_release_tx.send(()).expect("release the slow row");
+
+        let outcomes = collect_outcomes(&worker, 2);
+        wait_until_idle(&worker);
+        let mut requests: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| outcome.request.clone())
+            .collect();
+        requests.extend(worker.drain().into_iter().map(|outcome| outcome.request));
+        assert_eq!(requests, ["fresh-a", "fresh-b"].map(request).to_vec());
     }
 
     #[test]
@@ -765,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_worker_wakes_a_full_outcome_slot_and_releases_its_thread() {
+    fn dropping_a_worker_with_a_parked_outcome_releases_its_thread() {
         let (rendered_tx, rendered_rx) = mpsc::channel();
         let (exited_tx, exited_rx) = mpsc::channel();
         let worker = PreviewWorker::new_with_exit_probe(
@@ -790,8 +1156,6 @@ mod tests {
 
         drop(worker);
 
-        exited_rx
-            .recv()
-            .expect("drop wakes the worker from its full outcome slot");
+        exited_rx.recv().expect("drop releases the worker thread");
     }
 }

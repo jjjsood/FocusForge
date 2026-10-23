@@ -1145,12 +1145,14 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
         y: 92.0,
         width: 400.0,
         height: 800.0,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: 432.0,
         y: 92.0,
         width: 900.0,
         height: 500.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(left, right);
     let before = controller.plane_draw().unwrap();
@@ -1163,6 +1165,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
                 y: 0.0,
                 width,
                 height: 600.0,
+                scale_factor: 1.0,
             },
         );
         assert_eq!(controller.plane_draw().unwrap(), before);
@@ -1173,6 +1176,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
         y: 0.0,
         width: 820.0,
         height: 600.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry_for(PaneSource::Composite, detached);
     let frame = controller.frame_draw().unwrap();
@@ -1195,12 +1199,14 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
             y: 0.0,
             width: 80.0,
             height: 80.0,
+            scale_factor: 1.0,
         };
         let roomy = PaneRect {
             x: 100.0,
             y: 0.0,
             width: 400.0,
             height: 400.0,
+            scale_factor: 1.0,
         };
         let (left, right) = match detached {
             PaneSource::Frame => (narrow, roomy),
@@ -1215,12 +1221,14 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
             y: 0.0,
             width: 1_000.0,
             height: 1_000.0,
+            scale_factor: 1.0,
         };
         let resized_main = PaneRect {
             x: 0.0,
             y: 0.0,
             width: 200.0,
             height: 200.0,
+            scale_factor: 1.0,
         };
         let (left, right) = match detached {
             PaneSource::Frame => (replacement, resized_main),
@@ -1249,12 +1257,14 @@ fn detached_side_survives_resize_and_valid_mode_switches() {
         y: 0.0,
         width: 200.0,
         height: 300.0,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: 220.0,
         y: 0.0,
         width: 400.0,
         height: 250.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(left, right);
     controller.undock_requested(PaneSource::Frame);
@@ -1286,12 +1296,14 @@ fn side_geometry_arrives_before_open_in_either_order() {
             y: 0.0,
             width: 180.0,
             height: 320.0,
+            scale_factor: 1.0,
         };
         let composite = PaneRect {
             x: 0.0,
             y: 0.0,
             width: 320.0,
             height: 180.0,
+            scale_factor: 1.0,
         };
         let rect = |side| match side {
             PaneSource::Frame => frame,
@@ -1319,12 +1331,14 @@ fn detached_input_uses_its_own_local_coordinates() {
             y: 92.0,
             width: 40.0,
             height: 40.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 0.0,
             y: 0.0,
             width: 50.0,
             height: 50.0,
+            scale_factor: 1.0,
         },
     );
     let fitted = controller.zoom_readout();
@@ -1383,6 +1397,7 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
         y: 0.0,
         width: 80.0,
         height: 80.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane, pane);
     for _ in 0..3 {
@@ -1422,6 +1437,7 @@ fn detached_drag_ignores_another_windows_move_and_release() {
         y: 0.0,
         width: 80.0,
         height: 80.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane, pane);
     for _ in 0..3 {
@@ -1458,6 +1474,7 @@ fn main_input_maps_through_the_hit_panes_rect_when_local_origins_overlap() {
         y: 0.0,
         width: 300.0,
         height: 180.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(overlap, overlap);
 
@@ -1493,12 +1510,14 @@ fn editor_paints_from_an_unequal_detached_composite_pane() {
             y: 92.0,
             width: 180.0,
             height: 320.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 0.0,
             y: 0.0,
             width: 300.0,
             height: 180.0,
+            scale_factor: 1.0,
         },
     );
     let draw = controller.plane_draw().unwrap();
@@ -1542,12 +1561,14 @@ fn unequal_composite_pipette_reads_the_exact_projected_source_index() {
         y: 0.0,
         width: 180.0,
         height: 320.0,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: 0.0,
         y: 0.0,
         width: 300.0,
         height: 180.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(left, right);
     let map = map_rect(&controller);
@@ -1594,12 +1615,14 @@ fn editor_requires_a_real_unequal_composite_hit_before_painting() {
         y: 0.0,
         width: 180.0,
         height: 320.0,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: 200.0,
         y: 0.0,
         width: 300.0,
         height: 180.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(left, right);
 
@@ -3623,12 +3646,14 @@ fn frame_and_plane_panes_share_one_size_and_rect() {
         y: 0.0,
         width: 300.0,
         height: 300.0,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: 308.0,
         y: 0.0,
         width: 300.0,
         height: 300.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(left, right);
 
@@ -3735,12 +3760,14 @@ fn post_fuse_frame_uses_identity_at_the_composite_crop() {
             y: 0.0,
             width: 300.0,
             height: 300.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 308.0,
             y: 0.0,
             width: 300.0,
             height: 300.0,
+            scale_factor: 1.0,
         },
     );
     controller.fit();
@@ -3785,12 +3812,14 @@ const LEFT: PaneRect = PaneRect {
     y: 0.0,
     width: PANE_WIDTH,
     height: 320.0,
+    scale_factor: 1.0,
 };
 const RIGHT: PaneRect = PaneRect {
     x: PANE_WIDTH + 8.0,
     y: 0.0,
     width: PANE_WIDTH,
     height: 320.0,
+    scale_factor: 1.0,
 };
 const NO_MODS: Modifiers = Modifiers::NONE;
 const CTRL: Modifiers = Modifiers {

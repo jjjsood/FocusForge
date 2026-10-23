@@ -2215,15 +2215,197 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
     );
 
     let mut editor = controller_in_editor_mode("keyboard_visible_selection_editor");
+    editor.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+    });
     editor.set_images_viewport_height(10.0);
     editor.select_frame(0);
     editor.select_adjacent_resolved_frame(1);
     assert_eq!(editor.mode(), ShellMode::Editor);
-    assert_eq!(editor.source_presentation(), SourcePresentation::List);
+    assert_eq!(editor.source_presentation(), SourcePresentation::ImageList);
     assert!(
         editor.source_preview_row_visible(1),
-        "the compact read-only editor list follows keyboard selection"
+        "the read-only editor list follows keyboard selection in the Appearance presentation"
     );
+}
+
+#[test]
+fn editor_source_list_follows_appearance_presentation() {
+    let mut editor = controller_in_editor_mode("editor_follows_presentation");
+    assert_eq!(editor.mode(), ShellMode::Editor);
+    for (presentation, row_height, queues_previews) in [
+        (SourcePresentation::List, 26.0, false),
+        (SourcePresentation::ImageList, 120.0, true),
+        (SourcePresentation::Large, 200.0, true),
+    ] {
+        editor.install_appearance(AppearanceSettings { presentation });
+        editor.set_images_viewport_height(10.0);
+        assert_eq!(editor.source_presentation(), presentation);
+
+        editor.select_frame(0);
+        editor.images_viewport_scrolled(0.0);
+        editor.select_adjacent_resolved_frame(1);
+        editor.select_adjacent_resolved_frame(1);
+        assert!(
+            editor.source_preview_row_visible(2),
+            "{presentation:?}: keyboard selection keeps the third row visible"
+        );
+        assert!(
+            !editor.source_preview_row_visible(0),
+            "{presentation:?}: the first row has scrolled out of the viewport"
+        );
+        assert!(
+            editor.images_scroll_y() > row_height,
+            "{presentation:?}: scroll moved by whole {row_height}px rows"
+        );
+        assert_eq!(
+            editor.source_preview_snapshot().scheduled > 0,
+            queues_previews,
+            "{presentation:?}: preview requests"
+        );
+        for (index, row) in editor.images_panel().rows.iter().enumerate() {
+            assert_eq!(
+                row.trailing_text,
+                (index + 1).to_string(),
+                "{presentation:?}: legend rows carry the source number"
+            );
+        }
+    }
+}
+
+#[test]
+fn editor_legend_rows_stay_read_only_in_every_presentation() {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+    use slint::platform::{PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let controller = Arc::new(Mutex::new(controller_in_editor_mode(
+        "editor_legend_read_only",
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    app.set_dock_tab("images".into());
+    let settle = || {
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+    };
+    let selected_row = || {
+        controller
+            .lock()
+            .unwrap()
+            .images_panel()
+            .rows
+            .iter()
+            .position(|row| row.selected)
+    };
+    let names = || {
+        controller
+            .lock()
+            .unwrap()
+            .images_panel()
+            .rows
+            .iter()
+            .map(|row| row.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    for (presentation, name_slot) in [
+        (SourcePresentation::List, "FFImageRow::list-name-slot"),
+        (
+            SourcePresentation::ImageList,
+            "FFImageRow::image-list-name-slot",
+        ),
+        (SourcePresentation::Large, "FFImageRow::large-name-slot"),
+    ] {
+        {
+            let mut controller = controller.lock().unwrap();
+            controller.set_source_presentation(presentation);
+            controller.select_frame(0);
+        }
+        settle();
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id(name_slot)
+                .find_first()
+                .is_some(),
+            "{presentation:?}: the editor rows use the chosen layout"
+        );
+        let rows = ElementQuery::from_root(&app)
+            .match_id("FFImageRow::area")
+            .find_all();
+        let position = element_center(&rows[1]);
+        app.window()
+            .dispatch_event(WindowEvent::PointerMoved { position });
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        for control in [
+            "FFImageRow::list-exclude-button",
+            "FFImageRow::list-remove-button",
+            "FFImageRow::image-list-exclude-button",
+            "FFImageRow::image-list-remove-button",
+            "FFImageRow::large-exclude-button",
+            "FFImageRow::large-remove-button",
+        ] {
+            assert!(
+                ElementQuery::from_root(&app)
+                    .match_id(control)
+                    .find_first()
+                    .is_none(),
+                "{presentation:?}: a hovered editor row shows no {control}"
+            );
+        }
+
+        let before = names();
+        let dragged_to = slint::LogicalPosition::new(position.x, position.y + 150.0);
+        app.window().dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: dragged_to,
+        });
+        app.window().dispatch_event(WindowEvent::PointerReleased {
+            position: dragged_to,
+            button: PointerEventButton::Left,
+        });
+        settle();
+        assert_eq!(names(), before, "{presentation:?}: a drag reorders nothing");
+        assert!(
+            controller.lock().unwrap().pending_frame_change().is_none(),
+            "{presentation:?}: a drag starts no frame change"
+        );
+
+        controller.lock().unwrap().select_frame(0);
+        settle();
+        for event in [
+            WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            },
+            WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            },
+        ] {
+            app.window().dispatch_event(event);
+        }
+        settle();
+        assert_eq!(
+            selected_row(),
+            Some(1),
+            "{presentation:?}: a click selects the frame"
+        );
+    }
 }
 
 #[test]

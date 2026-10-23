@@ -521,10 +521,9 @@ impl Default for GuiObserver {
 
 impl StageObserver for GuiObserver {
     fn stage(&self, stage: RunStage) {
-        // The engine ticks only while aligning and fusing, so the brightness
-        // preparation, which blocks for seconds before either, is recorded
-        // here.
-        if matches!(stage, RunStage::Prepare { .. }) {
+        // The first Prepare snapshot is recorded here, so the bar shows the
+        // frame total before the engine's first tick.
+        if let RunStage::Prepare { frames } = stage {
             self.tick(&JobProgress {
                 stage: JobStage::Prepare,
                 units_done: 0,
@@ -535,6 +534,8 @@ impl StageObserver for GuiObserver {
                 eta: None,
                 align_done: 0,
                 align_total: 0,
+                prepare_done: 0,
+                prepare_total: frames,
             });
         }
     }
@@ -600,10 +601,13 @@ impl Phase {
 
     /// `Some((done, total))` while `self` works per frame and `progress`
     /// carries a non-zero total for it, `None` otherwise -- a cached or
-    /// resumed alignment included, since its total is `0`. `Aligning` is the
-    /// only phase with a frame total.
+    /// resumed alignment included, since its total is `0`. `Preparing` and
+    /// `Aligning` are the phases with a frame total.
     pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
         match self {
+            Phase::Preparing if progress.prepare_total > 0 => {
+                Some((progress.prepare_done, progress.prepare_total))
+            }
             Phase::Aligning if progress.align_total > 0 => {
                 Some((progress.align_done, progress.align_total))
             }
@@ -749,12 +753,16 @@ pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     }
 }
 
-/// The bar's fill fraction: during a computed align stage,
+/// The bar's fill fraction: during the prepare stage,
+/// `prepare_done / prepare_total`; during a computed align stage,
 /// `align_done / align_total`, restarting from zero once the fuse stage
 /// begins; otherwise `units_done / unit_total` of the fuse job. `0.0` before
 /// the first unit, during a cached align stage, or with no run at all.
 pub fn bar_fraction(progress: Option<&JobProgress>) -> f32 {
     match progress {
+        Some(p) if p.stage == JobStage::Prepare && p.prepare_total > 0 => {
+            p.prepare_done as f32 / p.prepare_total as f32
+        }
         Some(p) if p.stage == JobStage::Align && p.align_total > 0 => {
             p.align_done as f32 / p.align_total as f32
         }

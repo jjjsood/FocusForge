@@ -33,9 +33,9 @@ export component FFImageRow inherits Rectangle {
     callback drag-pointer(int, length);
     callback wheel(length);
 
-    property <bool> is-list: root.presentation == "list" || root.legend;
-    property <bool> is-image-list: root.presentation == "image-list" && !root.legend;
-    property <bool> is-large: root.presentation == "large" && !root.legend;
+    property <bool> is-list: root.presentation == "list";
+    property <bool> is-image-list: root.presentation == "image-list";
+    property <bool> is-large: root.presentation == "large";
     property <bool> interactive: !root.unresolved && (root.mutable || root.legend);
     property <bool> drag-pressed: false;
     timestamp-measure := Text {
@@ -261,7 +261,8 @@ export component FFImageRow inherits Rectangle {
             y: parent.height - ShellGeometry.image-preview-inset - ShellGeometry.image-list-time-height;
             width: 100%;
             height: ShellGeometry.image-list-time-height;
-            text: root.capture-stamp == "" ? "—" : root.capture-stamp;
+            property <string> detail: root.legend ? root.time-text : root.capture-stamp;
+            text: self.detail == "" ? "—" : self.detail;
             color: root.time-color;
             font-size: Theme.text-body.size;
             horizontal-alignment: right;

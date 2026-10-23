@@ -307,6 +307,53 @@ fn progress_line_contains_units_stage_and_eta() {
     assert!(!out.stderr.contains("eta 0s"), "stderr: {}", out.stderr);
 }
 
+#[test]
+fn prepare_progress_reaches_a_redirected_log() {
+    let dir = tmp_dir("job_cli_prepare_progress");
+    let mantis = mantis_512_dir();
+    let mut args = vec![
+        "stack",
+        mantis.to_str().unwrap(),
+        "-o",
+        dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu");
+    }
+    let out = run_cli_in(&dir, &args);
+    assert!(out.success, "stderr: {}", out.stderr);
+
+    let lines: Vec<&str> = out.stderr.lines().collect();
+    let prepare: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("prepare ") && line.ends_with(" frames"))
+        .filter(|(_, line)| line.contains('/'))
+        .map(|(at, _)| at)
+        .collect();
+    let first = prepare
+        .first()
+        .unwrap_or_else(|| panic!("no `prepare <k>/<N> frames` line: {}", out.stderr));
+    assert!(
+        lines[*first].starts_with("prepare 0/8 frames"),
+        "the first count line: {}",
+        lines[*first]
+    );
+    let first_fuse = lines
+        .iter()
+        .position(|line| line.starts_with("fuse "))
+        .unwrap_or_else(|| panic!("no fuse line: {}", out.stderr));
+    assert!(
+        prepare.iter().all(|&at| at < first_fuse),
+        "every prepare count precedes the first fuse line: {}",
+        out.stderr
+    );
+}
+
 /// `fuse <done>/<total> tiles <pct>% eta <...>` -> `(done, total)`, for
 /// every progress line on a captured stderr.
 fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {

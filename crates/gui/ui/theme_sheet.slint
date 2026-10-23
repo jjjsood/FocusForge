@@ -387,7 +387,7 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "Source presentations: List, Image list and Large previews"; }
         Rectangle {
             width: 3 * ShellGeometry.image-row-band-width + 2 * Theme.space-4;
-            height: ShellGeometry.image-header-height + 2 * ShellGeometry.large-preview-row-height;
+            height: ShellGeometry.image-header-height + 3 * ShellGeometry.large-preview-row-height;
 
             GroupHeading { x: 0px; y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "LIST"; }
             FFImageRow { x: 0px; y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "16:42:09"; selected: true; }
@@ -400,10 +400,12 @@ export component ThemeSheet inherits Window {
             FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "11.10.26 16:42"; selected: true; hovered: true; }
             FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; chip: Theme.status-success; name: "IMG_9821.tif"; time-text: ""; preview-state: "loading"; focused: true; }
             FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + 2 * ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; chip: Theme.status-failure; name: "IMG_9823.tif"; time-text: ""; preview-state: "missing"; unresolved: true; }
+            FFImageRow { x: ShellGeometry.image-row-band-width + Theme.space-4; y: ShellGeometry.image-header-height + 3 * ShellGeometry.image-list-row-height; width: ShellGeometry.image-row-band-width; presentation: "image-list"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-success; name: "IMG_9824.tif"; time-text: "3"; legend: true; mutable: false; hovered: true; }
 
             GroupHeading { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: 0px; width: ShellGeometry.image-row-band-width; height: ShellGeometry.image-header-height; text: "LARGE PREVIEWS"; }
             FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height; width: ShellGeometry.image-row-band-width; presentation: "large"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-warning; name: "IMG_9819.tif"; time-text: "16:42:09"; selected: true; hovered: true; }
             FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height + ShellGeometry.large-preview-row-height; width: ShellGeometry.image-row-band-width; presentation: "large"; chip: Theme.status-success; name: "IMG_9821.tif"; time-text: ""; preview-state: "unavailable"; job-disabled: true; focused: true; }
+            FFImageRow { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4); y: ShellGeometry.image-header-height + 2 * ShellGeometry.large-preview-row-height; width: ShellGeometry.image-row-band-width; presentation: "large"; preview: @image-url("../../../assets/build/social-preview-dark.png"); chip: Theme.status-success; name: "IMG_9824.tif"; time-text: "16:43:12"; legend: true; mutable: false; hovered: true; }
         }
 
         GroupHeading { text: "Source presentations: empty, tooltip, presentation menu and save error"; }
@@ -806,6 +808,25 @@ export component ThemeSheet inherits Window {
                     x: Theme.space-4;
                     y: Theme.space-4;
                     text: "Panel, tone rule: " + tone;
+                }
+            }
+        }
+
+        GroupHeading { text: "Modal panel: close control, dimmed close control"; }
+        for dimmed in [false, true]: Rectangle {
+            width: 500px;
+            height: 220px;
+            clip: true;
+            FFModalPanel {
+                modal-open: true;
+                show-close: true;
+                close-dimmed: dimmed;
+                panel-width: 440px;
+                panel-height: 180px;
+                FFHeading {
+                    x: Theme.space-4;
+                    y: Theme.space-4;
+                    text: dimmed ? "Panel, close dimmed" : "Panel, close";
                 }
             }
         }
@@ -1558,6 +1579,44 @@ export component ThemeSheet inherits Window {
                 info: "Finding the original frames again opens the project unchanged.";
                 secondary-label: "Locate frames…";
                 confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: long title wraps before the close control"; }
+        Rectangle {
+            width: 440px;
+            height: 280px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                panel-width: 420px;
+                panel-height: 260px;
+                title: "The source frames are not the same as the frames this project was made from";
+                body: "The frames in this location give a different fingerprint.";
+                confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: without the close control"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                closable: false;
+                tone: "warning";
+                title: "Discard the fused result?";
+                body: "The result of this run is thrown away and the project returns to its last checkpoint.";
+                cancel-label: "Keep";
+                confirm-label: "Discard";
                 confirm-kind: "danger";
             }
         }

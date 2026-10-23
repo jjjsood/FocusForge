@@ -7,7 +7,9 @@
 //! reader applies identical integer arithmetic.
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
@@ -235,17 +237,22 @@ const STRIP_SAMPLES: usize = 1 << 21;
 /// channel) to `neutral * 2^target_stops`, `neutral` being the mean of the
 /// frames' means. The gain is `target / mean` limited to
 /// `[1/max_gain, max_gain]`, in Q16; a zero-mean frame keeps unit gain and is
-/// flagged black. `cancelled` is polled before every strip read.
+/// flagged black. Frames are read on `workers` threads, each holding one
+/// strip buffer; the report is the same for any worker count. `cancelled` is
+/// polled before every strip read, and `frames_done` is incremented once as
+/// each frame's histogram completes.
+#[allow(clippy::too_many_arguments)] // one input apiece; a struct wrapper would only rename this list
 pub fn estimate(
     reader: &dyn TileReader,
     frame_count: usize,
     frame: (u32, u32),
     samples_per_pixel: u32,
     settings: EqualizeSettings,
-    cancelled: &dyn Fn() -> bool,
+    workers: usize,
+    frames_done: &AtomicUsize,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<EqualizationReport, AlgorithmError> {
-    let row_samples = (frame.0 as usize * samples_per_pixel as usize).max(1);
-    let strip_rows = (STRIP_SAMPLES / row_samples).clamp(1, frame.1.max(1) as usize) as u32;
+    let strip_rows = strip_rows_for(frame, samples_per_pixel);
     estimate_in_strips(
         reader,
         frame_count,
@@ -253,10 +260,56 @@ pub fn estimate(
         samples_per_pixel,
         settings,
         strip_rows,
+        workers,
+        frames_done,
         cancelled,
     )
 }
 
+/// The rows one strip holds: about [`STRIP_SAMPLES`] samples, at least one
+/// row, at most the frame.
+fn strip_rows_for(frame: (u32, u32), samples_per_pixel: u32) -> u32 {
+    let row_samples = (frame.0 as usize * samples_per_pixel as usize).max(1);
+    (STRIP_SAMPLES / row_samples).clamp(1, frame.1.max(1) as usize) as u32
+}
+
+/// The histogram of every sample of frame `index`, read in strips of
+/// `strip_rows` rows through the reusable `strip` buffer.
+fn frame_histogram(
+    reader: &dyn TileReader,
+    index: usize,
+    frame: (u32, u32),
+    samples_per_pixel: u32,
+    strip_rows: u32,
+    strip: &mut [u16],
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Box<[u64]>, AlgorithmError> {
+    let (width, height) = frame;
+    let row_samples = width as usize * samples_per_pixel as usize;
+    let mut histogram = vec![0u64; BINS].into_boxed_slice();
+    let mut y = 0;
+    while y < height {
+        if cancelled() {
+            return Err(AlgorithmError::Cancelled);
+        }
+        let rows = strip_rows.min(height - y);
+        let samples = &mut strip[..row_samples * rows as usize];
+        let rect = Rect {
+            x: 0,
+            y,
+            width,
+            height: rows,
+        };
+        reader.read_tile_into(index, rect, samples)?;
+        for &s in samples.iter() {
+            histogram[usize::from(s)] += 1;
+        }
+        y += rows;
+    }
+    Ok(histogram)
+}
+
+#[allow(clippy::too_many_arguments)] // `estimate` plus the strip height tests vary
 fn estimate_in_strips(
     reader: &dyn TileReader,
     frame_count: usize,
@@ -264,38 +317,52 @@ fn estimate_in_strips(
     samples_per_pixel: u32,
     settings: EqualizeSettings,
     strip_rows: u32,
-    cancelled: &dyn Fn() -> bool,
+    workers: usize,
+    frames_done: &AtomicUsize,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<EqualizationReport, AlgorithmError> {
-    let (width, height) = frame;
-    let row_samples = width as usize * samples_per_pixel as usize;
-    let mut strip = vec![0u16; row_samples * strip_rows as usize];
+    let strip_len = frame.0 as usize * samples_per_pixel as usize * strip_rows as usize;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers.max(1))
+        .thread_name(|i| format!("focusforge-prepare-{i}"))
+        .panic_handler(crate::pool::log_worker_panic)
+        .build()
+        .map_err(|source| AlgorithmError::Failed {
+            algorithm: "equalize".to_string(),
+            detail: format!("equalization thread pool: {source}"),
+        })?;
     // The gain needs every frame's mean first, and the output statistics
     // need the gain, so each frame's histogram is kept for that second step.
-    let mut histograms: Vec<Box<[u64]>> = Vec::with_capacity(frame_count);
-    for index in 0..frame_count {
-        let mut histogram = vec![0u64; BINS].into_boxed_slice();
-        let mut y = 0;
-        while y < height {
-            if cancelled() {
-                return Err(AlgorithmError::Cancelled);
-            }
-            let rows = strip_rows.min(height - y);
-            let samples = &mut strip[..row_samples * rows as usize];
-            let rect = Rect {
-                x: 0,
-                y,
-                width,
-                height: rows,
-            };
-            reader.read_tile_into(index, rect, samples)?;
-            for &s in samples.iter() {
-                histogram[usize::from(s)] += 1;
-            }
-            y += rows;
-        }
-        histograms.push(histogram);
-    }
+    // The histograms collect in frame order whichever worker finishes first.
+    let histograms = pool.install(|| {
+        (0..frame_count)
+            .into_par_iter()
+            .map_init(
+                || vec![0u16; strip_len],
+                |strip, index| {
+                    let histogram = frame_histogram(
+                        reader,
+                        index,
+                        frame,
+                        samples_per_pixel,
+                        strip_rows,
+                        strip,
+                        cancelled,
+                    )?;
+                    frames_done.fetch_add(1, Ordering::SeqCst);
+                    Ok(histogram)
+                },
+            )
+            .collect::<Result<Vec<_>, AlgorithmError>>()
+    })?;
+    Ok(report_from_histograms(&histograms, settings))
+}
 
+/// The report for frames whose histograms are `histograms`, in frame order.
+fn report_from_histograms(
+    histograms: &[Box<[u64]>],
+    settings: EqualizeSettings,
+) -> EqualizationReport {
     // Every frame holds the same number of samples, so the mean of the
     // frames' means is the total sum over the total count, rounded once.
     let totals: Vec<(u64, u64)> = histograms
@@ -316,13 +383,13 @@ fn estimate_in_strips(
         .zip(&means)
         .map(|(histogram, &mean)| frame_estimate(histogram, mean, target, settings.max_gain))
         .collect();
-    Ok(EqualizationReport {
+    EqualizationReport {
         max_gain: settings.max_gain,
         target_stops: settings.target_stops,
         neutral,
         target,
         frames,
-    })
+    }
 }
 
 /// The sum and count of `map(value)` over every sample `histogram` counts.
@@ -383,6 +450,9 @@ mod tests {
 
     use super::*;
     use crate::align::Registration;
+
+    /// Worker count for tests that do not vary it.
+    const WORKERS: usize = 3;
 
     /// Frames held in memory, optionally with a per-frame coverage mask that
     /// leaves the stored (non-zero) values in place, like a reader would not.
@@ -512,8 +582,18 @@ mod tests {
             let (w, h) = (37, 23);
             let stack = shifted_stack(w, h, spp, &[0.8, 1.0, 1.1]);
             // 5 rows per strip does not divide the 23-row height.
-            let report =
-                estimate_in_strips(&stack, 3, (w, h), spp, settings(1.5, 0.0), 5, &never).unwrap();
+            let report = estimate_in_strips(
+                &stack,
+                3,
+                (w, h),
+                spp,
+                settings(1.5, 0.0),
+                5,
+                WORKERS,
+                &AtomicUsize::new(0),
+                &never,
+            )
+            .unwrap();
             let gains = report.recorded().gains;
             let gained = GainReader::new(&stack, &gains);
             for (i, f) in report.frames.iter().enumerate() {
@@ -541,7 +621,17 @@ mod tests {
             .sum::<f64>()
             / 3.0;
         for stops in [-0.5, 0.0, 0.5] {
-            let report = estimate(&stack, 3, (w, h), 3, settings(2.0, stops), &never).unwrap();
+            let report = estimate(
+                &stack,
+                3,
+                (w, h),
+                3,
+                settings(2.0, stops),
+                WORKERS,
+                &AtomicUsize::new(0),
+                &never,
+            )
+            .unwrap();
             assert!((report.neutral - neutral).abs() < 1e-9);
             assert!((report.target - neutral * 2f64.powf(stops)).abs() < 1e-9);
             assert_eq!((report.max_gain, report.target_stops), (2.0, stops));
@@ -567,7 +657,17 @@ mod tests {
         let (w, h) = (16, 8);
         let mut stack = shifted_stack(w, h, 1, &[1.0, 1.0]);
         stack.frames[0] = vec![0; (w * h) as usize];
-        let report = estimate(&stack, 2, (w, h), 1, settings(2.0, 0.0), &never).unwrap();
+        let report = estimate(
+            &stack,
+            2,
+            (w, h),
+            1,
+            settings(2.0, 0.0),
+            WORKERS,
+            &AtomicUsize::new(0),
+            &never,
+        )
+        .unwrap();
         let black = &report.frames[0];
         assert!(black.black && !black.clamped);
         assert_eq!((black.gain, black.applied), (UNIT_GAIN, 1.0));
@@ -585,7 +685,17 @@ mod tests {
     fn gain_bound_clamps_and_reports_covering_bound_and_residual() {
         let (w, h) = (37, 23);
         let stack = shifted_stack(w, h, 1, &[1.0, 1.3]);
-        let report = estimate(&stack, 2, (w, h), 1, settings(1.1, 0.0), &never).unwrap();
+        let report = estimate(
+            &stack,
+            2,
+            (w, h),
+            1,
+            settings(1.1, 0.0),
+            WORKERS,
+            &AtomicUsize::new(0),
+            &never,
+        )
+        .unwrap();
         for (i, f) in report.frames.iter().enumerate() {
             assert!(f.clamped, "frame {i}: {f:?}");
             assert!(f.applied == 1.1 || (f.applied - 1.0 / 1.1).abs() < 1e-12);
@@ -618,7 +728,17 @@ mod tests {
             w,
             1,
         );
-        let report = estimate(&stack, 2, (w, h), 1, settings(2.0, 0.0), &never).unwrap();
+        let report = estimate(
+            &stack,
+            2,
+            (w, h),
+            1,
+            settings(2.0, 0.0),
+            WORKERS,
+            &AtomicUsize::new(0),
+            &never,
+        )
+        .unwrap();
         let f = &report.frames[1];
         assert!(f.applied > 1.0);
         assert_eq!(f.clipped_samples, u64::from(w * h) / 4);
@@ -668,10 +788,10 @@ mod tests {
 
     #[test]
     fn cancel_between_strips_returns_cancelled() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         let (w, h) = (37, 23);
         let stack = shifted_stack(w, h, 1, &[1.0, 1.0]);
         let polls = AtomicUsize::new(0);
+        let frames_done = AtomicUsize::new(0);
         let cancel_on_third = || polls.fetch_add(1, Ordering::SeqCst) == 2;
         let result = estimate_in_strips(
             &stack,
@@ -680,10 +800,298 @@ mod tests {
             1,
             settings(1.25, 0.0),
             5,
+            WORKERS,
+            &frames_done,
             &cancel_on_third,
         );
         assert!(matches!(result, Err(AlgorithmError::Cancelled)));
-        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert!(polls.load(Ordering::SeqCst) >= 3);
+        assert!(
+            frames_done.load(Ordering::SeqCst) < 2,
+            "the cancel landed before every frame finished"
+        );
+    }
+
+    /// Fails every read of one frame, otherwise reads the wrapped stack.
+    struct FailingFrame<'a> {
+        inner: &'a Stack,
+        frame: usize,
+    }
+
+    impl TileReader for FailingFrame<'_> {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            if frame == self.frame {
+                return Err(AlgorithmError::Failed {
+                    algorithm: "test".to_string(),
+                    detail: "frame is unreadable".to_string(),
+                });
+            }
+            self.inner.read_tile_into(frame, rect, out)
+        }
+
+        fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
+            self.inner.read_scratch_bytes(width, height)
+        }
+    }
+
+    #[test]
+    fn a_failing_frame_read_returns_the_error() {
+        let (w, h) = (37, 23);
+        let stack = shifted_stack(w, h, 1, &[1.0, 1.0, 1.0]);
+        let reader = FailingFrame {
+            inner: &stack,
+            frame: 1,
+        };
+        let frames_done = AtomicUsize::new(0);
+        // 7 rows per strip, unlike the 5 the other tests use, on one worker so
+        // frame 2 is never started.
+        let result = estimate_in_strips(
+            &reader,
+            3,
+            (w, h),
+            1,
+            settings(1.25, 0.0),
+            7,
+            1,
+            &frames_done,
+            &never,
+        );
+        match result {
+            Err(AlgorithmError::Failed { detail, .. }) => assert_eq!(detail, "frame is unreadable"),
+            other => panic!("expected the read error, got {other:?}"),
+        }
+        assert_eq!(frames_done.load(Ordering::SeqCst), 1);
+    }
+
+    /// The reference loop: frames read one after another on this thread.
+    #[allow(clippy::too_many_arguments)]
+    fn estimate_in_strips_sequential(
+        reader: &dyn TileReader,
+        frame_count: usize,
+        frame: (u32, u32),
+        samples_per_pixel: u32,
+        settings: EqualizeSettings,
+        strip_rows: u32,
+        frames_done: &AtomicUsize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<EqualizationReport, AlgorithmError> {
+        let row_samples = frame.0 as usize * samples_per_pixel as usize;
+        let mut strip = vec![0u16; row_samples * strip_rows as usize];
+        let mut histograms = Vec::with_capacity(frame_count);
+        for index in 0..frame_count {
+            histograms.push(frame_histogram(
+                reader,
+                index,
+                frame,
+                samples_per_pixel,
+                strip_rows,
+                &mut strip,
+                cancelled,
+            )?);
+            frames_done.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(report_from_histograms(&histograms, settings))
+    }
+
+    #[test]
+    fn parallel_and_sequential_estimates_are_identical() {
+        let (w, h) = (37, 23);
+        let stack = shifted_stack(w, h, 3, &[0.8, 1.0, 1.1, 0.95, 1.2]);
+        for strip_rows in [5, 7, 23] {
+            let sequential_done = AtomicUsize::new(0);
+            let sequential = estimate_in_strips_sequential(
+                &stack,
+                5,
+                (w, h),
+                3,
+                settings(1.5, 0.25),
+                strip_rows,
+                &sequential_done,
+                &never,
+            )
+            .unwrap();
+            for workers in [1, 3, 8] {
+                let parallel_done = AtomicUsize::new(0);
+                let parallel = estimate_in_strips(
+                    &stack,
+                    5,
+                    (w, h),
+                    3,
+                    settings(1.5, 0.25),
+                    strip_rows,
+                    workers,
+                    &parallel_done,
+                    &never,
+                )
+                .unwrap();
+                assert_eq!(parallel, sequential, "{workers} workers, {strip_rows} rows");
+                assert_eq!(parallel_done.load(Ordering::SeqCst), 5);
+            }
+        }
+
+        let frames_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames");
+        let stack = crate::io::TiffStack::open(&frames_dir).expect("mantis-512 opens");
+        let frame = stack.dimensions();
+        let spp = stack.header(0).samples_per_pixel;
+        let frames = stack.len();
+        let strip_rows = 64;
+        let sequential_done = AtomicUsize::new(0);
+        let sequential = estimate_in_strips_sequential(
+            &stack,
+            frames,
+            frame,
+            spp,
+            settings(1.25, 0.0),
+            strip_rows,
+            &sequential_done,
+            &never,
+        )
+        .unwrap();
+        let parallel_done = AtomicUsize::new(0);
+        let parallel = estimate(
+            &stack,
+            frames,
+            frame,
+            spp,
+            settings(1.25, 0.0),
+            4,
+            &parallel_done,
+            &never,
+        )
+        .unwrap();
+        assert_eq!(parallel, sequential, "mantis-512 reports differ");
+        assert_eq!(parallel_done.load(Ordering::SeqCst), frames);
+        assert_eq!(sequential_done.load(Ordering::SeqCst), frames);
+    }
+
+    /// Times the bare `estimate` work on the reference stack, sequential
+    /// against parallel. `FOCUSFORGE_PREPARE_VARIANT=sequential|parallel`
+    /// times that variant once, for runs after dropping the page cache.
+    #[test]
+    #[ignore = "reads the 16 GB reference stack"]
+    fn reference_stack_parallel_matches_sequential_and_is_timed() {
+        use std::time::{Duration, Instant};
+
+        let Some(dir) = std::env::var_os("FOCUSFORGE_REFERENCE_STACK")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+        else {
+            println!("FOCUSFORGE_REFERENCE_STACK not set");
+            return;
+        };
+        let paths: Vec<_> = crate::io::frame_paths(&dir)
+            .expect("the stack directory enumerates")
+            .into_iter()
+            // The directory also holds the stacked result, which is not a source frame.
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("IMG_"))
+            })
+            .collect();
+        let stack = crate::io::TiffStack::open_files(&paths).expect("the stack opens");
+        let frame = stack.dimensions();
+        let spp = stack.header(0).samples_per_pixel;
+        let frames = stack.len();
+        let strip_rows = strip_rows_for(frame, spp);
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(frames);
+        let eq = settings(1.25, 0.0);
+        println!("{frames} frames of {frame:?} x {spp}, {workers} workers");
+
+        let sequential = || {
+            let started = Instant::now();
+            let report = estimate_in_strips_sequential(
+                &stack,
+                frames,
+                frame,
+                spp,
+                eq,
+                strip_rows,
+                &AtomicUsize::new(0),
+                &never,
+            )
+            .expect("the sequential estimate runs");
+            (started.elapsed(), report)
+        };
+        let parallel = || {
+            let started = Instant::now();
+            let report = estimate_in_strips(
+                &stack,
+                frames,
+                frame,
+                spp,
+                eq,
+                strip_rows,
+                workers,
+                &AtomicUsize::new(0),
+                &never,
+            )
+            .expect("the parallel estimate runs");
+            (started.elapsed(), report)
+        };
+
+        match std::env::var("FOCUSFORGE_PREPARE_VARIANT").as_deref() {
+            Ok("sequential") => {
+                println!("cold sequential: {:?}", sequential().0);
+                return;
+            }
+            Ok("parallel") => {
+                println!("cold parallel: {:?}", parallel().0);
+                return;
+            }
+            _ => {}
+        }
+
+        let (warmup, oracle) = sequential();
+        println!("discarded warm-up (sequential): {warmup:?}");
+        let (mut seq_times, mut par_times): (Vec<Duration>, Vec<Duration>) =
+            (Vec::new(), Vec::new());
+        for round in 0..3 {
+            let (time, report) = sequential();
+            assert_eq!(report, oracle);
+            println!("round {round} sequential: {time:?}");
+            seq_times.push(time);
+            let (time, report) = parallel();
+            assert_eq!(
+                report, oracle,
+                "the gains differ from the sequential loop's"
+            );
+            println!("round {round} parallel:   {time:?}");
+            par_times.push(time);
+        }
+        seq_times.sort();
+        par_times.sort();
+        println!(
+            "sequential median {:?} (min {:?}, max {:?}); parallel median {:?} (min {:?}, max {:?})",
+            seq_times[1], seq_times[0], seq_times[2], par_times[1], par_times[0], par_times[2],
+        );
+    }
+
+    #[test]
+    fn every_frame_is_credited_once_it_is_read() {
+        let (w, h) = (37, 23);
+        let stack = shifted_stack(w, h, 1, &[0.9, 1.0, 1.1, 1.0]);
+        let frames_done = AtomicUsize::new(0);
+        estimate(
+            &stack,
+            4,
+            (w, h),
+            1,
+            settings(1.5, 0.0),
+            WORKERS,
+            &frames_done,
+            &never,
+        )
+        .unwrap();
+        assert_eq!(frames_done.load(Ordering::SeqCst), 4);
     }
 
     #[test]
@@ -696,7 +1104,17 @@ mod tests {
             px[2] = (f64::from(px[2]) * 1.1 / 0.8).round() as u16;
         }
         let stack = Stack::new(vec![ref_samples, tinted.clone()], w, 3);
-        let report = estimate(&stack, 2, (w, h), 3, settings(2.0, 0.0), &never).unwrap();
+        let report = estimate(
+            &stack,
+            2,
+            (w, h),
+            3,
+            settings(2.0, 0.0),
+            WORKERS,
+            &AtomicUsize::new(0),
+            &never,
+        )
+        .unwrap();
         let gains = report.recorded().gains;
         let gained = read_whole(&GainReader::new(&stack, &gains), 1, w, h, 3);
         for (a, b) in gained.chunks(3).zip(tinted.chunks(3)).step_by(7) {
