@@ -23,9 +23,9 @@ Use a fresh settings directory, where the source presentation is Image list. The
 8. Hover the second source row (`FFImageRow::area` 1).
    Expect: Must not: an eye or trash icon appears; `buttons FFDock::images-panel` lists no **Exclude** and no **Remove**; the row still shows its number "2" at the lower right.
 9. Click the second source row (`FFImageRow::area` 1).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the row is highlighted with an edge in its own colour and still shows its number "2", with no eye or trash icon.
+   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the row has an orange outline all around, and still shows its number "2", with no eye or trash icon.
 10. Click the first source row (`FFImageRow::area` 0).
-   Expect: the left pane label reads "00.tif"; the row is highlighted and shows its number "1".
+   Expect: the left pane label reads "00.tif"; the row has an orange outline and shows its number "1".
 11. Drag the first source row (`FFImageRow::area` 0) to the centre of the third source row (`FFImageRow::area` 2), using the logical element geometry without scale conversion.
    Expect: Must not: the rows reorder or the selection moves; the first three rows still read 00.tif, 01.tif, 02.tif from top to bottom and the left pane label still reads "00.tif".
 ## Large previews in the editor
@@ -35,14 +35,14 @@ Use a fresh settings directory, where the source presentation is Image list. The
    Expect: the field Presentation reads "Image list" and the text "Editor source rows stay read-only." is shown.
 14. Click **Presentation** (`FFMenu::root`).
    Expect: the three lines "List", "Image list" and "Large previews" appear.
-15. Click **Large previews** (`FFMenuList::root`).
+15. Click the entry **Large previews**, the last of the three (`FFMenuList::option-area` 2).
    Expect: the list is gone and the Presentation field reads "Large previews".
 16. Click **Close settings** (`FFSettingsModal::close`).
    Expect: the first dock row is a wide preview picture (`FFImageRow::large-identity`) with a colour square, "00.tif" and its number "1" on the line below it; the second row's preview picture starts under it; neither reads "Loading preview…".
 17. Hover the number of the first source row (`FFImageRow::large-timestamp-slot` 0).
    Expect: Must not: an eye or trash icon replaces the number; `buttons FFDock::images-panel` lists no **Exclude** and no **Remove**, and the number "1" is still shown.
 18. Click the preview picture of the second source row (`FFImageRow::large-identity` 1).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the second row is outlined with an accent-coloured edge.
+   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the second row has an orange outline.
 ## List in the editor
 19. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
    Expect: the Settings window opens.
@@ -50,7 +50,7 @@ Use a fresh settings directory, where the source presentation is Image list. The
    Expect: the field Presentation reads "Large previews".
 21. Click **Presentation** (`FFMenu::root`).
    Expect: the three lines "List", "Image list" and "Large previews" appear.
-22. Click **List** (`FFMenuList::root`).
+22. Click the entry **List**, the first of the three (`FFMenuList::option-area` 0).
    Expect: the list is gone and the Presentation field reads "List".
 23. Click **Close settings** (`FFSettingsModal::close`).
    Expect: the dock lists 00.tif to 07.tif, one compact line each with a colour square, the name and the numbers "1" to "8" at the right end; no preview pictures.

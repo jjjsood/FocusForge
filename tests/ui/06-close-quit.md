@@ -1,7 +1,7 @@
 # Close a tab and quit the window with unsaved work
 Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --fuse-tabs 0,1 --request-close
 ## The close question for the active tab
-1. Click **Keep** (`AppWindow::divergence-warning`) as soon as the dialog "Keep this fused result?" shows the line "00.tif, 01.tif, 06.tif and 07.tif could not be aligned and were fused as they are." (both fuses run after launch; the 8-frame tab is the active one).
+1. Click **Keep** (`AppWindow::divergence-warning`) as soon as the dialog "Keep this fused result?" shows the line "00.tif and 01.tif could not be aligned and were fused as they are." (both fuses run after launch; the 8-frame tab is the active one).
    Expect: (within 90 s) the dialog "Keep this fused result?" is replaced by a dialog titled "Save this state first?" with the line "Closing frames", the text "1 unsaved checkpoint." and the note "Saving asks where to write the project file."; its buttons read "Cancel", "Save and close" and "Close anyway", beside a **Close dialog** icon button at its top-right corner.
 2. Click **Cancel** (`AppWindow::close-guard`).
    Expect: the dialog is gone; the tab strip shows two tabs titled "frames", each carrying an "UNSAVED" marker; the dock header reads "8 frames".
