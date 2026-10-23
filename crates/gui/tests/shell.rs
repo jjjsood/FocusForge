@@ -3932,7 +3932,7 @@ mod dialog_close {
                 let (pw, ph) = (panel.size().width, panel.size().height);
                 let at = format!("{} at {width}x{height}", dialog.label);
 
-                assert_eq!((pw, ph), dialog.panel, "{at}: panel size unchanged");
+                assert_eq!((pw, ph), dialog.panel, "{at}: the panel keeps its size");
 
                 let button = close_button(&app, dialog);
                 let (bx, by) = (button.absolute_position().x, button.absolute_position().y);
