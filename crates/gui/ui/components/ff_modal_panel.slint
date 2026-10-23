@@ -4,6 +4,7 @@
 // its content placed as this component's children.
 
 import { Theme } from "../theme.slint";
+import { FFIconButton } from "ff_icon_button.slint";
 
 export component FFModalPanel inherits Rectangle {
     in property <bool> modal-open: false;
@@ -12,6 +13,13 @@ export component FFModalPanel inherits Rectangle {
     // "none" | "warning" (a red top rule) | "caution" (an amber top rule).
     in property <string> tone-rule: "none";
     in property <bool> clip-panel: false;
+    // A close control at the panel's top right, raising `close-requested`.
+    in property <bool> show-close: false;
+    // Halves the close control's opacity; it stays clickable.
+    in property <bool> close-dimmed: false;
+    // The width a title row keeps free so its text wraps before the control.
+    out property <length> close-reserve: root.show-close ? Theme.icon-md + 2 * Theme.space-2 : 0px;
+    callback close-requested();
 
     visible: root.modal-open;
     width: 100%;
@@ -59,5 +67,16 @@ export component FFModalPanel inherits Rectangle {
         }
 
         @children
+
+        if root.show-close: FFIconButton {
+            // The glyph's right edge lines up with the content inset; the
+            // button is centred on a `Theme.icon-lg` row at that inset.
+            x: parent.width - Theme.space-4 - Theme.icon-md - self.pad;
+            y: Theme.space-4 + (Theme.icon-lg - self.height) / 2;
+            icon: @image-url("../../../../assets/icons/x.svg");
+            name: "Close dialog";
+            opacity: root.close-dimmed ? 0.5 : 1.0;
+            triggered => { root.close-requested(); }
+        }
     }
 }

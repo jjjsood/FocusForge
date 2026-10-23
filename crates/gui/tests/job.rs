@@ -22,7 +22,9 @@ use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
 use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
-use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent, ShellMode};
+use focusforge_gui::{
+    AppController, ChromeKey, GuardSecondary, OpenOutcome, SaveAsk, ShellEvent, ShellMode,
+};
 
 use common::copy_frame;
 
@@ -1058,6 +1060,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&aligning)),
@@ -1075,6 +1079,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&fusing)),
@@ -1091,6 +1097,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&sealing)),
@@ -1121,6 +1129,8 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         eta: None,
         align_done,
         align_total,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -1136,6 +1146,8 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -1197,6 +1209,60 @@ fn progress_phase_names_the_preparation_pass() {
             Some("preparing")
         );
     }
+}
+
+fn prepare_progress(
+    prepare_done: usize,
+    prepare_total: usize,
+) -> focusforge_core::job::JobProgress {
+    focusforge_core::job::JobProgress {
+        stage: focusforge_core::job::JobStage::Prepare,
+        prepare_done,
+        prepare_total,
+        ..fuse_progress(0, 0)
+    }
+}
+
+#[test]
+fn prepare_progress_names_the_frame_count_and_fills_the_bar() {
+    use focusforge_gui::job::{Phase, RunState, bar_fraction, phase_line, progress_text};
+
+    for (done, total) in [(3, 8), (42, 61), (0, 5)] {
+        let snapshot = prepare_progress(done, total);
+        assert_eq!(
+            progress_text(&RunState::Running, Some(&snapshot)),
+            format!("{done} of {total}")
+        );
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&snapshot)).as_deref(),
+            Some(format!("preparing, {done} of {total}").as_str())
+        );
+        assert_eq!(bar_fraction(Some(&snapshot)), done as f32 / total as f32);
+        assert_eq!(Phase::Preparing.frames(&snapshot), Some((done, total)));
+    }
+}
+
+#[test]
+fn prepare_eta_text_follows_the_engine_estimate() {
+    use focusforge_gui::job::{RunState, eta_text};
+
+    let mut snapshot = prepare_progress(0, 8);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.prepare_done = 2;
+    snapshot.eta = Some(Duration::from_secs(95));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 1:35");
+}
+
+#[test]
+fn prepare_stage_announcement_records_the_frame_total() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{RunStage, StageObserver};
+
+    let observer = job::GuiObserver::new();
+    observer.stage(RunStage::Prepare { frames: 7 });
+    let recorded = observer.last_progress().expect("a Prepare snapshot");
+    assert_eq!(recorded.stage, JobStage::Prepare);
+    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 7));
 }
 
 #[test]
@@ -3188,12 +3254,14 @@ fn wheel_actions_are_blocked_under_the_settings_modal() {
             y: 0.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 566.0,
             y: 0.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
     );
     controller.fit_if_unfitted();
@@ -4551,12 +4619,14 @@ fn the_unsaved_mark_follows_unsealed_ops() {
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: w + 8.0,
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     c.set_pane_geometry(left, right);
     let events = record_events(&mut c);
@@ -5775,6 +5845,10 @@ fn the_bridge_never_calls_the_blocking_save_entries() {
         ".close_guard_secondary_pressed(",
         ".join_save(",
         ".finish_saves(",
+        ".start_save_active_project(",
+        ".start_close_guard_secondary(",
+        ".export_confirmed(",
+        "picker::pick_",
     ] {
         assert!(!code.contains(blocking), "bridge.rs calls {blocking}");
     }
@@ -6302,6 +6376,7 @@ fn set_fitted_panes(controller: &mut AppController) {
         y: 0.0,
         width: 566.0,
         height: 748.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane(0.0), pane(566.0));
     controller.fit_if_unfitted();
@@ -6326,6 +6401,7 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane(0.0), pane(w + 8.0));
 
@@ -6645,4 +6721,230 @@ fn a_project_saved_outside_its_frames_reopens_without_a_missing_card() {
     common::open_and_settle(&mut short, std::slice::from_ref(&target));
     assert!(short.sources_notice().is_some());
     assert_eq!(short.gallery_failure_kind(0), Some("sources-missing"));
+}
+
+/// Three tabs in order: never saved, opened (saved once, then fused again so
+/// it holds an unsaved checkpoint), never saved. Tab 0 is selected.
+fn controller_with_an_opened_tab_between(outer: &str) -> AppController {
+    let mut controller = controller_with_two_tabs(outer);
+    let root_c = common::tree(&format!("{outer}_c_frames"));
+    for i in 0..2 {
+        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root_c]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    save_to_proposed(&mut controller);
+    fuse_and_settle(&mut controller);
+    for index in [0, 2] {
+        controller.select_project(index);
+        fuse_and_settle(&mut controller);
+    }
+    controller.select_project(0);
+    controller
+}
+
+#[test]
+fn save_and_export_dialogs_run_unlocked_for_saves() {
+    use std::sync::Arc;
+
+    // Save project on a never-saved tab.
+    let mut controller = controller_with_frames("dialog_unlocked_save", 2);
+    fuse_and_settle(&mut controller);
+    let controller = Arc::new(Mutex::new(controller));
+    let Some(SaveAsk::Ask(id, proposed)) = controller.lock().unwrap().save_active_request() else {
+        panic!("a never-saved tab asks where to save");
+    };
+    assert!(controller.try_lock().is_ok(), "the dialog runs unlocked");
+    let chosen = common::tree("dialog_unlocked_save_elsewhere").join("renamed.ffp");
+    assert_ne!(chosen.file_name(), proposed.file_name());
+    {
+        let mut c = controller.lock().unwrap();
+        assert!(c.save_project_chosen(id, chosen.clone()));
+        assert!(c.finish_saves());
+    }
+    assert!(chosen.is_file());
+    assert!(!proposed.exists(), "nothing is written at the proposal");
+
+    // The close guard's "Save and close".
+    let mut controller = controller_with_two_tabs("dialog_unlocked_close");
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let controller = Arc::new(Mutex::new(controller));
+    let GuardSecondary::Close(SaveAsk::Ask(id, proposed)) =
+        controller.lock().unwrap().close_guard_secondary_request()
+    else {
+        panic!("the close question asks where the never-saved tab saves");
+    };
+    assert!(controller.try_lock().is_ok(), "the dialog runs unlocked");
+    let chosen = common::tree("dialog_unlocked_close_elsewhere").join("renamed.ffp");
+    {
+        let mut c = controller.lock().unwrap();
+        assert!(c.save_and_close_chosen(id, Some(chosen.clone())));
+        assert!(c.finish_saves());
+        assert_eq!(c.project_tabs().len(), 1, "the saved tab closed");
+    }
+    assert!(chosen.is_file());
+    assert!(!proposed.exists());
+
+    // Save all and quit: one request per never-saved tab, all unlocked.
+    let controller = Arc::new(Mutex::new(controller_with_an_opened_tab_between(
+        "dialog_unlocked_all",
+    )));
+    controller.lock().unwrap().window_close();
+    let GuardSecondary::Quit(requests) = controller.lock().unwrap().close_guard_secondary_request()
+    else {
+        panic!("the quit question asks for the never-saved tabs");
+    };
+    assert_eq!(requests.len(), 2);
+    let elsewhere = common::tree("dialog_unlocked_all_elsewhere");
+    let mut chosen = Vec::new();
+    for (n, (id, proposed)) in requests.iter().enumerate() {
+        assert!(controller.try_lock().is_ok(), "each dialog runs unlocked");
+        let path = elsewhere.join(format!("renamed-{n}.ffp"));
+        assert_ne!(path.file_name(), proposed.file_name());
+        chosen.push((*id, path));
+    }
+    {
+        let mut c = controller.lock().unwrap();
+        assert!(c.save_all_and_quit_chosen(&chosen));
+        assert!(c.finish_saves());
+    }
+    for (_, path) in &chosen {
+        assert!(path.is_file(), "{} must be written", path.display());
+    }
+}
+
+#[test]
+fn save_all_and_quit_chains_its_dialogs() {
+    let outer = "save_all_chain";
+    let mut controller = controller_with_an_opened_tab_between(outer);
+    let events = record_events(&mut controller);
+    let elsewhere = common::tree(&format!("{outer}_elsewhere"));
+    controller.window_close();
+    let requests = controller.save_all_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the opened tab between them asks nothing: {requests:?}"
+    );
+    assert!(
+        requests[0].1.starts_with(frames_dir(&format!("{outer}_a")))
+            && requests[1].1.starts_with(frames_dir(&format!("{outer}_c"))),
+        "tab order: {requests:?}"
+    );
+    let ids = [requests[0].0, requests[1].0];
+    assert!(controller.project_tabs()[1].unsaved);
+    let (a, c) = (elsewhere.join("a.ffp"), elsewhere.join("c.ffp"));
+    assert!(controller.save_all_and_quit_chosen(&[(ids[0], a.clone()), (ids[1], c.clone())]));
+    assert!(controller.finish_saves());
+    assert!(a.is_file() && c.is_file());
+    assert!(
+        !controller.project_tabs()[1].unsaved,
+        "the opened tab appended to its own file"
+    );
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 1);
+
+    // Declined on the second dialog: the tabs before it are saved, the
+    // window stays open and the quit is cancelled.
+    let outer = "save_all_chain_declined";
+    let mut controller = controller_with_an_opened_tab_between(outer);
+    let events = record_events(&mut controller);
+    let elsewhere = common::tree(&format!("{outer}_elsewhere"));
+    controller.window_close();
+    let requests = controller.save_all_requests();
+    let a = elsewhere.join("a.ffp");
+    assert!(!controller.save_all_and_quit_chosen(&[(requests[0].0, a.clone())]));
+    controller.finish_saves();
+    assert!(a.is_file(), "the first tab saved");
+    assert!(
+        !controller.project_tabs()[1].unsaved,
+        "the opened tab before the declined one saved"
+    );
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+    assert!(controller.pending_quit_copy().is_none());
+    assert_eq!(controller.project_tabs().len(), 3);
+}
+
+#[test]
+fn stale_dialog_answer_is_dropped_for_saves() {
+    let outer = "stale_dialog_saves";
+    let elsewhere = common::tree(&format!("{outer}_elsewhere"));
+    let target = |name: &str| elsewhere.join(name);
+
+    // Tab closed while the save dialog was up.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_tab"));
+    fuse_and_settle(&mut controller);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_active_request() else {
+        panic!("a never-saved tab asks");
+    };
+    controller.request_close(0);
+    controller.close_without_saving();
+    assert!(!controller.save_project_chosen(id, target("closed-tab.ffp")));
+    assert!(!controller.save_in_flight());
+    assert!(!target("closed-tab.ffp").exists());
+
+    // Close question answered "Close without saving" while the dialog was up.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_without"));
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_and_close_request() else {
+        panic!("the close question asks");
+    };
+    controller.close_without_saving();
+    assert!(!controller.save_and_close_chosen(id, Some(target("without.ffp"))));
+    assert!(!controller.save_in_flight());
+    assert!(!target("without.ffp").exists());
+
+    // Close question cancelled while the dialog was up: the tab stays.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_cancel"));
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_and_close_request() else {
+        panic!("the close question asks");
+    };
+    controller.cancel_close();
+    assert!(!controller.save_and_close_chosen(id, Some(target("cancelled.ffp"))));
+    assert!(!controller.save_in_flight());
+    assert!(!target("cancelled.ffp").exists());
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    // Quit question cancelled while the dialogs were up: no queue, no quit.
+    let mut controller = controller_with_an_opened_tab_between(&format!("{outer}_quit"));
+    let events = record_events(&mut controller);
+    controller.window_close();
+    let requests = controller.save_all_requests();
+    controller.close_guard_cancelled();
+    let chosen: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .map(|(n, (id, _))| (*id, target(&format!("quit-{n}.ffp"))))
+        .collect();
+    assert!(!controller.save_all_and_quit_chosen(&chosen));
+    assert!(!controller.save_in_flight());
+    assert!(chosen.iter().all(|(_, path)| !path.exists()));
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+
+    // A cancelled close dialog clears the question and keeps the tab open.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_none"));
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_and_close_request() else {
+        panic!("the close question asks");
+    };
+    assert!(!controller.save_and_close_chosen(id, None));
+    assert!(controller.pending_close().is_none());
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    // A cancelled quit dialog cancels the quit, without any save.
+    let mut controller = controller_with_an_opened_tab_between(&format!("{outer}_quit_none"));
+    let events = record_events(&mut controller);
+    controller.window_close();
+    assert!(!controller.save_all_and_quit_chosen(&[]));
+    assert!(controller.pending_quit_copy().is_none());
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
 }

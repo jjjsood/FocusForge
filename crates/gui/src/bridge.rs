@@ -6,6 +6,7 @@
 //! `ShellEvent` against the window.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -22,9 +23,9 @@ use crate::canvas::{
     truncate_pane_label,
 };
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, JobView, LocateTarget, OpenAs,
-    OpenOutcome, SettingsSection, ShellEvent, ShellMode, StoragePath, WindowChromeIntent,
-    WindowTarget,
+    AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
+    OpenAs, OpenOutcome, SaveAsk, SettingsSection, ShellEvent, ShellMode, StoragePath,
+    WindowChromeIntent, WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -46,6 +47,7 @@ use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
 use crate::notifications::Kind;
 use crate::overlay::Thumbnail;
+use crate::picker::{self, DialogAnswer, DialogRequest};
 use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::{PaneDraw, PaneRect};
 
@@ -1031,18 +1033,21 @@ fn dispatch_coalesced(
 /// `pub` so `src/main.rs`'s startup push reads the same properties through
 /// the same function rather than re-listing them.
 pub fn read_pane_geometry(app: &AppWindow) -> (PaneRect, PaneRect) {
+    let scale_factor = app.window().scale_factor();
     (
         PaneRect {
             x: app.get_canvas_pane_left_x(),
             y: app.get_canvas_pane_left_y(),
             width: app.get_canvas_pane_left_width(),
             height: app.get_canvas_pane_left_height(),
+            scale_factor,
         },
         PaneRect {
             x: app.get_canvas_pane_right_x(),
             y: app.get_canvas_pane_right_y(),
             width: app.get_canvas_pane_right_width(),
             height: app.get_canvas_pane_right_height(),
+            scale_factor,
         },
     )
 }
@@ -1063,6 +1068,7 @@ fn comparison_rect(window: &ComparisonWindow) -> PaneRect {
         y: window.get_pane_y(),
         width: window.get_pane_width(),
         height: window.get_pane_height(),
+        scale_factor: window.window().scale_factor(),
     }
 }
 
@@ -1172,6 +1178,19 @@ fn open_comparison(
         canvas.clone(),
         ready.clone(),
     );
+    let last_scale = Cell::new(window.window().scale_factor());
+    let window_weak = window.as_weak();
+    // A scale-factor change without a resize fires no Slint callback.
+    if let Err(error) = window.window().set_rendering_notifier(move |state, _| {
+        if matches!(state, slint::RenderingState::BeforeRendering)
+            && let Some(window) = window_weak.upgrade()
+            && last_scale.replace(window.window().scale_factor()) != window.window().scale_factor()
+        {
+            slint::Timer::single_shot(Duration::ZERO, move || window.invoke_pane_resized());
+        }
+    }) {
+        tracing::warn!("comparison window cannot watch its scale factor: {error}");
+    }
     COMPARISON_WINDOW.with(|slot| *slot.borrow_mut() = Some(window.clone()));
     update_detached_geometry(app, &window, controller);
     controller.lock().unwrap().fit();
@@ -2517,27 +2536,59 @@ impl CustomApplicationHandler for DropHandler {
     }
 }
 
-/// Opens `path`, if the picker returned one, and repaints once the load
-/// settles -- the rail's `New project`/`Open project…` actions and their
-/// `Ctrl+N`/`Ctrl+O` chrome-key twins share this one path. The projects
-/// overlay closes itself once the load settles onto a real tab
-/// (`AppController::accept`), the same as a successful open.
+/// The one path a single-path dialog answered with; `None` when cancelled.
+fn chosen_path(answer: DialogAnswer) -> Option<PathBuf> {
+    answer?.into_iter().next()
+}
+
+/// Opens the dialog `request` names and opens everything it answers with
+/// (one folder or project, or a whole file selection), repainting when the
+/// load settles. The projects overlay closes once the load lands on a real
+/// tab (`AppController::accept`).
 fn open_from_picker(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     load_timer: &Rc<RefCell<Option<slint::Timer>>>,
-    path: Option<PathBuf>,
+    request: DialogRequest,
 ) {
-    let Some(path) = path else { return };
-    controller.lock().unwrap().open_paths(&[path]);
-    start_load_timer(
-        app_weak.clone(),
-        controller.clone(),
-        canvas.clone(),
-        load_timer,
-        Vec::new(),
-    );
+    let (controller, canvas) = (controller.clone(), canvas.clone());
+    let (app_weak, load_timer) = (app_weak.clone(), load_timer.clone());
+    picker::request(request, move |answer| {
+        let Some(paths) = answer else {
+            return;
+        };
+        controller.lock().unwrap().open_paths(&paths);
+        start_load_timer(
+            app_weak,
+            controller.clone(),
+            canvas,
+            &load_timer,
+            Vec::new(),
+        );
+    });
+}
+
+/// Opens the folder dialog and hands the chosen folder to `locate`, which
+/// checks for itself that the question it answers is still open.
+fn locate_from_picker(
+    controller: &Arc<Mutex<AppController>>,
+    locate: impl FnOnce(&mut AppController, PathBuf) + 'static,
+) {
+    let controller = controller.clone();
+    picker::request(DialogRequest::Entry, move |answer| {
+        if let Some(folder) = chosen_path(answer) {
+            locate(&mut controller.lock().unwrap(), folder);
+        }
+    });
+}
+
+/// The active tab's id, `None` with no tab open.
+fn active_tab_id(controller: &Arc<Mutex<AppController>>) -> Option<u64> {
+    let controller = controller.lock().unwrap();
+    controller
+        .active_project()
+        .and_then(|index| controller.tab_id_at(index))
 }
 
 /// Opens the `Recent` row at `index` through [`AppController::open_recent`]
@@ -2562,22 +2613,141 @@ fn open_recent(
 }
 
 /// Starts one of the controller's saves -- `Save project`, its `Ctrl+S` twin
-/// and the close question's `Save and close` -- and shows the busy
-/// indicator. A save that cannot start closes the projects overlay before
-/// opening the failure toast; [`publish_saved`] shows the outcome of one
-/// that does.
+/// and the close guard's answers -- and shows the busy indicator. A save
+/// that cannot start closes the projects overlay before opening the failure
+/// toast; [`publish_saved`] shows the outcome of one that does.
 fn save_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
     app_weak: &slint::Weak<AppWindow>,
     toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
-    start: impl FnOnce(&mut AppController) -> bool,
+    start: impl FnOnce(&mut AppController),
 ) {
     start(&mut controller.lock().unwrap());
     let Some(app) = app_weak.upgrade() else {
         return;
     };
     show_save_state(&app, controller, canvas, toast_timer);
+}
+
+/// Hands `then` the tab `ask` names and where it saves: an opened tab's own
+/// file at once, a never-saved tab's whatever the save dialog answers (the
+/// dialog runs with the controller unlocked).
+fn ask_save(ask: SaveAsk, then: impl FnOnce(u64, Option<PathBuf>) + 'static) {
+    match ask {
+        SaveAsk::Write(id, path) => then(id, Some(path)),
+        SaveAsk::Ask(id, proposed) => {
+            picker::request(DialogRequest::SaveProject(proposed), move |answer| {
+                then(id, chosen_path(answer))
+            });
+        }
+    }
+}
+
+/// `Save project` on the active tab, from the toolbar, `Ctrl+S` or the
+/// projects rail.
+fn save_active_project(
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+    app_weak: &slint::Weak<AppWindow>,
+    toast_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let ask = controller.lock().unwrap().save_active_request();
+    let (controller, canvas) = (controller.clone(), canvas.clone());
+    let (app_weak, toast_timer) = (app_weak.clone(), toast_timer.clone());
+    let finish = move |chosen: Option<(u64, PathBuf)>| {
+        save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
+            if let Some((id, path)) = chosen {
+                c.save_project_chosen(id, path);
+            }
+        })
+    };
+    match ask {
+        Some(ask) => ask_save(ask, move |id, path| finish(path.map(|path| (id, path)))),
+        None => finish(None),
+    }
+}
+
+/// What the close guard's `Save…` answer needs to run a save and resume
+/// polling once a dialog has answered.
+#[derive(Clone)]
+struct GuardSave {
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+    app_weak: slint::Weak<AppWindow>,
+    job_timer: Rc<RefCell<Option<slint::Timer>>>,
+    toast_timer: Rc<RefCell<Option<slint::Timer>>>,
+}
+
+impl GuardSave {
+    /// Runs `start` on the controller, shows the save state it leaves and
+    /// resumes polling for pending work.
+    fn run(&self, start: impl FnOnce(&mut AppController)) {
+        save_project(
+            &self.controller,
+            &self.canvas,
+            &self.app_weak,
+            &self.toast_timer,
+            start,
+        );
+        poll_if_work_pending(
+            &self.app_weak,
+            &self.controller,
+            &self.canvas,
+            &self.job_timer,
+            &self.toast_timer,
+        );
+    }
+
+    /// The guard's secondary answer. A close question asks for its tab's
+    /// destination, a quit question for each never-saved tab's, one dialog at
+    /// a time; a declined dialog ends the chain and saves what was answered.
+    fn secondary(self) {
+        let request = self
+            .controller
+            .lock()
+            .unwrap()
+            .close_guard_secondary_request();
+        match request {
+            GuardSecondary::Done(_) => self.run(|_| {}),
+            GuardSecondary::Close(ask) => ask_save(ask, move |id, path| {
+                self.run(|c| {
+                    c.save_and_close_chosen(id, path);
+                })
+            }),
+            GuardSecondary::Quit(requests) => self.ask_each(requests.into(), Vec::new()),
+        }
+    }
+
+    fn ask_each(self, mut pending: VecDeque<(u64, PathBuf)>, mut chosen: Vec<(u64, PathBuf)>) {
+        if self
+            .controller
+            .lock()
+            .unwrap()
+            .pending_quit_copy()
+            .is_none()
+        {
+            return;
+        }
+        let Some((id, proposed)) = pending.pop_front() else {
+            self.run(|c| {
+                c.save_all_and_quit_chosen(&chosen);
+            });
+            return;
+        };
+        picker::request(
+            DialogRequest::SaveProject(proposed),
+            move |answer| match chosen_path(answer) {
+                Some(path) => {
+                    chosen.push((id, path));
+                    self.ask_each(pending, chosen)
+                }
+                None => self.run(|c| {
+                    c.save_all_and_quit_chosen(&chosen);
+                }),
+            },
+        );
+    }
 }
 
 /// Publishes a save worker's result: settles it, then shows what it changed
@@ -2819,24 +2989,35 @@ pub fn install(
             // re-attempting the export once it settles
             // (`AppController::settle_locate`).
             if controller.lock().unwrap().export_stage() == "refused" {
-                if let Some(folder) = crate::picker::pick_entry() {
-                    controller.lock().unwrap().export_locate_frames(folder);
-                }
+                locate_from_picker(&controller, |c, folder| {
+                    c.export_locate_frames(folder);
+                });
                 return;
             }
-            let started = {
-                let mut controller = controller.lock().unwrap();
-                let format = controller.export_format();
-                controller.export_confirmed(move |proposed| {
-                    crate::picker::pick_save_image(proposed, format)
-                });
-                controller.take_export_started()
+            let request = controller.lock().unwrap().export_destination_request();
+            let (controller, app_weak) = (controller.clone(), app_weak.clone());
+            let finish = move |chosen: Option<(u64, job::ExportFormat, PathBuf)>| {
+                let started = {
+                    let mut controller = controller.lock().unwrap();
+                    if let Some((tab_id, format, path)) = chosen {
+                        controller.export_destination_chosen(tab_id, format, path);
+                    }
+                    controller.take_export_started()
+                };
+                if let Some(app) = app_weak.upgrade() {
+                    push_export_dialog(&app, &controller.lock().unwrap());
+                }
+                if started {
+                    poll_export(app_weak, controller);
+                }
             };
-            if let Some(app) = app_weak.upgrade() {
-                push_export_dialog(&app, &controller.lock().unwrap());
-            }
-            if started {
-                poll_export(app_weak.clone(), controller.clone());
+            match request {
+                Some((tab_id, format, proposed)) => {
+                    picker::request(DialogRequest::SaveImage(proposed, format), move |answer| {
+                        finish(chosen_path(answer).map(|path| (tab_id, format, path)))
+                    });
+                }
+                None => finish(None),
             }
         }
     });
@@ -3177,7 +3358,7 @@ pub fn install(
                         &canvas,
                         &app_weak,
                         &load_timer,
-                        crate::picker::pick_entry(),
+                        DialogRequest::Entry,
                     )
                 }
                 ChromeKey::OpenProject => {
@@ -3187,14 +3368,12 @@ pub fn install(
                         &canvas,
                         &app_weak,
                         &load_timer,
-                        crate::picker::pick_project(),
+                        DialogRequest::Project,
                     )
                 }
                 ChromeKey::SaveProject => {
                     record_gallery_input();
-                    save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                        c.start_save_active_project(crate::picker::pick_save_project)
-                    })
+                    save_active_project(&controller, &canvas, &app_weak, &toast_timer)
                 }
             }
         }
@@ -3572,7 +3751,7 @@ pub fn install(
     // The entry path: `open_paths`'s own sink pushes every property a load
     // raises (`ShellEvent::LoadReady` and friends); the load timer's repaint
     // feeds the canvas for whichever tab the open landed on.
-    app.on_open_folder_requested({
+    app.on_open_requested({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
@@ -3584,7 +3763,7 @@ pub fn install(
                 &canvas,
                 &app_weak,
                 &load_timer,
-                crate::picker::pick_entry(),
+                DialogRequest::Images,
             )
         }
     });
@@ -3728,7 +3907,7 @@ pub fn install(
                     &canvas,
                     &app_weak,
                     &load_timer,
-                    crate::picker::pick_entry(),
+                    DialogRequest::Entry,
                 )
             }
         }
@@ -3747,12 +3926,9 @@ pub fn install(
     app.on_mismatch_locate_frames({
         let controller = controller.clone();
         move || {
-            if let Some(folder) = crate::picker::pick_entry() {
-                controller
-                    .lock()
-                    .unwrap()
-                    .locate_frames(LocateTarget::Mismatch, folder);
-            }
+            locate_from_picker(&controller, |c, folder| {
+                c.locate_frames(LocateTarget::Mismatch, folder);
+            })
         }
     });
     app.on_mismatch_cancelled({
@@ -3768,9 +3944,9 @@ pub fn install(
     app.on_sources_missing_locate_frames({
         let controller = controller.clone();
         move || {
-            if let Some(folder) = crate::picker::pick_entry() {
-                controller.lock().unwrap().locate_sources_notice(folder);
-            }
+            locate_from_picker(&controller, |c, folder| {
+                c.locate_sources_notice(folder);
+            })
         }
     });
     app.on_sources_missing_closed({
@@ -4056,14 +4232,21 @@ pub fn install(
         let toast_timer = toast_timer.clone();
         move || {
             record_images_input();
-            if let Some(paths) = crate::picker::pick_frames() {
+            let tab_id = active_tab_id(&controller);
+            let (controller, canvas) = (controller.clone(), canvas.clone());
+            let (app_weak, toast_timer) = (app_weak.clone(), toast_timer.clone());
+            picker::request(DialogRequest::Frames, move |answer| {
+                // The frames belong to the tab that asked for them.
+                let Some(paths) = answer.filter(|_| active_tab_id(&controller) == tab_id) else {
+                    return;
+                };
                 dispatch(&controller, &canvas, &app_weak, |controller| {
                     let _ = controller.add_frames(&paths);
                 });
                 if let Some(app) = app_weak.upgrade() {
                     push_toast(&app, &controller, &toast_timer);
                 }
-            }
+            });
         }
     });
     app.on_images_sort_menu_toggled({
@@ -4209,17 +4392,16 @@ pub fn install(
         }
     });
     app.on_close_guard_secondary_pressed({
-        let controller = controller.clone();
-        let canvas = canvas.clone();
-        let app_weak = app.as_weak();
-        let job_timer = job_timer.clone();
-        let toast_timer = toast_timer.clone();
+        let guard = GuardSave {
+            controller: controller.clone(),
+            canvas: canvas.clone(),
+            app_weak: app.as_weak(),
+            job_timer: job_timer.clone(),
+            toast_timer: toast_timer.clone(),
+        };
         move || {
             record_gallery_input();
-            save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                c.start_close_guard_secondary(crate::picker::pick_save_project)
-            });
-            poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
+            guard.clone().secondary();
         }
     });
     app.on_close_guard_confirmed({
@@ -4265,7 +4447,7 @@ pub fn install(
                 &canvas,
                 &app_weak,
                 &load_timer,
-                crate::picker::pick_entry(),
+                DialogRequest::Entry,
             )
         }
     });
@@ -4281,7 +4463,7 @@ pub fn install(
                 &canvas,
                 &app_weak,
                 &load_timer,
-                crate::picker::pick_project(),
+                DialogRequest::Project,
             )
         }
     });
@@ -4292,9 +4474,7 @@ pub fn install(
         let toast_timer = toast_timer.clone();
         move || {
             record_gallery_input();
-            save_project(&controller, &canvas, &app_weak, &toast_timer, |c| {
-                c.start_save_active_project(crate::picker::pick_save_project)
-            })
+            save_active_project(&controller, &canvas, &app_weak, &toast_timer)
         }
     });
     app.on_projects_close_project_requested({
@@ -4356,11 +4536,10 @@ pub fn install(
                 Some("sources-missing") => {
                     record_gallery_input();
                     let tab_id = controller.lock().unwrap().tab_id_at(i);
-                    if let (Some(tab_id), Some(folder)) = (tab_id, crate::picker::pick_entry()) {
-                        controller
-                            .lock()
-                            .unwrap()
-                            .locate_frames(LocateTarget::Tab(tab_id), folder);
+                    if let Some(tab_id) = tab_id {
+                        locate_from_picker(&controller, move |c, folder| {
+                            c.locate_frames(LocateTarget::Tab(tab_id), folder);
+                        });
                     }
                 }
                 Some("failed") | Some("cancelled") => {

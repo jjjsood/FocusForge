@@ -78,6 +78,16 @@ pub struct JobControl {
     /// The frame count a computed align stage started with; `0` until
     /// [`Self::begin_align`] is called.
     align_total: AtomicUsize,
+    /// How many frames' equalization histogram is complete during the
+    /// prepare stage -- shared through [`Self::begin_prepare`].
+    prepare_done: Arc<AtomicUsize>,
+    /// The frame count the prepare stage started with; `0` until
+    /// [`Self::begin_prepare`] is called.
+    prepare_total: AtomicUsize,
+    /// Offset from [`Self::epoch`] at which the prepare stage began; the
+    /// running clock does not tick before fuse, so the prepare ETA needs its
+    /// own origin.
+    prepare_start_nanos: AtomicU64,
     /// The live admission cap; [`NO_CAP`] when none is set.
     admission_cap: AtomicUsize,
     /// Nanoseconds of running time every fuse-stage admission check waits
@@ -104,6 +114,9 @@ impl JobControl {
             segment_start_nanos: AtomicU64::new(NO_SEGMENT),
             align_done: Arc::new(AtomicUsize::new(0)),
             align_total: AtomicUsize::new(0),
+            prepare_done: Arc::new(AtomicUsize::new(0)),
+            prepare_total: AtomicUsize::new(0),
+            prepare_start_nanos: AtomicU64::new(0),
             admission_cap: AtomicUsize::new(NO_CAP),
             min_running_nanos: AtomicU64::new(0),
         })
@@ -189,6 +202,17 @@ impl JobControl {
         Arc::clone(&self.align_done)
     }
 
+    /// Starts the prepare stage: stores `frames` as its total, zeroes the
+    /// counter, stamps the stage's start and hands back the shared counter
+    /// the equalization credits as each frame's histogram completes.
+    pub(crate) fn begin_prepare(&self, frames: usize) -> Arc<AtomicUsize> {
+        self.prepare_done.store(0, Ordering::SeqCst);
+        self.prepare_total.store(frames, Ordering::SeqCst);
+        self.prepare_start_nanos
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::SeqCst);
+        Arc::clone(&self.prepare_done)
+    }
+
     /// A plain snapshot, returned by value -- polled, never pushed.
     ///
     /// Every field is **live**: `units_done`/`pixels_done` are credited by
@@ -202,16 +226,32 @@ impl JobControl {
         let pixels_done = self.pixels_done.load(Ordering::SeqCst);
         let pixel_total = self.pixel_total.load(Ordering::SeqCst);
         let running = self.running_now();
+        let stage = JobStage::from_u8(self.stage.load(Ordering::SeqCst));
+        let prepare_done = self.prepare_done.load(Ordering::SeqCst);
+        let prepare_total = self.prepare_total.load(Ordering::SeqCst);
+        let eta = if stage == JobStage::Prepare {
+            let started = self.prepare_start_nanos.load(Ordering::SeqCst);
+            let elapsed = self.epoch.elapsed().as_nanos() as u64;
+            eta(
+                prepare_done as u64,
+                prepare_total as u64,
+                Duration::from_nanos(elapsed.saturating_sub(started)),
+            )
+        } else {
+            eta(pixels_done, pixel_total, running)
+        };
         JobProgress {
-            stage: JobStage::from_u8(self.stage.load(Ordering::SeqCst)),
+            stage,
             units_done,
             unit_total,
             pixels_done,
             pixel_total,
             running,
-            eta: eta(pixels_done, pixel_total, running),
+            eta,
             align_done: self.align_done.load(Ordering::SeqCst),
             align_total: self.align_total.load(Ordering::SeqCst),
+            prepare_done,
+            prepare_total,
         }
     }
 
@@ -422,6 +462,40 @@ mod tests {
 
         counter.fetch_add(3, Ordering::SeqCst);
         assert_eq!(control.progress().align_done, 3);
+    }
+
+    #[test]
+    fn prepare_eta_follows_the_frame_rate() {
+        let control = JobControl::new();
+        assert_eq!(control.progress().prepare_total, 0);
+
+        let counter = control.begin_prepare(4);
+        control.set_stage(JobStage::Prepare);
+        let p = control.progress();
+        assert_eq!((p.prepare_done, p.prepare_total), (0, 4));
+        assert_eq!(p.eta, None, "no frame has completed");
+
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let p = control.progress();
+        assert_eq!(p.prepare_done, 1);
+        assert!(p.eta.is_some_and(|d| d > Duration::ZERO), "{:?}", p.eta);
+
+        control.set_stage(JobStage::Fuse);
+        assert_eq!(
+            control.progress().eta,
+            None,
+            "outside Prepare the ETA is the pixel one"
+        );
+    }
+
+    #[test]
+    fn begin_prepare_restarts_the_counter() {
+        let control = JobControl::new();
+        control.begin_prepare(3).fetch_add(3, Ordering::SeqCst);
+        let counter = control.begin_prepare(5);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(control.progress().prepare_total, 5);
     }
 
     #[test]

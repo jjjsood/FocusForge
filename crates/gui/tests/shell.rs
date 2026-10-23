@@ -1646,9 +1646,25 @@ fn label(app: &AppWindow, id: &str) -> String {
         .to_string()
 }
 
+/// The drop caption is one short line wherever dropping works, and says so
+/// where it does not.
+#[test]
+fn drop_caption_follows_drop_unavailable() {
+    let app = app_at(1440, 900);
+    let caption = "FFEmptyState::drop-caption";
+    assert_eq!(label(&app, caption), "Drop a folder or stack");
+    app.set_drop_unavailable(true);
+    assert_eq!(
+        label(&app, caption),
+        "Dropping is unavailable on native Wayland"
+    );
+    app.set_drop_unavailable(false);
+    assert_eq!(label(&app, caption), "Drop a folder or stack");
+}
+
 /// The empty state: the wordmark above one raised 520-wide card, centred
 /// on the canvas column, holding the title, the copy,
-/// the single `Open folder…` button (168 x 34) and the drop caption, in that
+/// the single `Open…` button (168 x 34) and the drop caption, in that
 /// order and all inside the card's 32 px inset.
 #[test]
 fn empty_state_is_a_card_under_the_wordmark() {
@@ -1670,16 +1686,15 @@ fn empty_state_is_a_card_under_the_wordmark() {
     assert_eq!(label(&app, "FFEmptyState::empty-title"), "No project open");
     assert_eq!(
         label(&app, "FFEmptyState::empty-body"),
-        "Open a folder of frames. Each detected stack becomes its own project, in its own tab."
+        "Choose the frames of one stack, or drop a folder: each stack it holds becomes its own project, in its own tab."
     );
-    assert_eq!(label(&app, "FFEmptyState::open-folder"), "Open folder…");
+    assert_eq!(label(&app, "FFEmptyState::open"), "Open…");
     assert_eq!(
         label(&app, "FFEmptyState::drop-caption"),
-        "Dropping a folder works on X11, macOS and Windows — not on native Wayland. \
-         Open folder… works everywhere."
+        "Drop a folder or stack"
     );
 
-    let button = rect(&app, "FFEmptyState::open-folder");
+    let button = rect(&app, "FFEmptyState::open");
     assert_eq!(
         (button.2, button.3),
         (168.0, 34.0),
@@ -1690,7 +1705,7 @@ fn empty_state_is_a_card_under_the_wordmark() {
     for id in [
         "FFEmptyState::empty-title",
         "FFEmptyState::empty-body",
-        "FFEmptyState::open-folder",
+        "FFEmptyState::open",
         "FFEmptyState::drop-caption",
     ] {
         let (x, y, w, h) = rect(&app, id);
@@ -1706,6 +1721,40 @@ fn empty_state_is_a_card_under_the_wordmark() {
         previous_bottom <= card.1 + card.3 - 32.0 + EPS,
         "the caption ends inside the card's bottom inset"
     );
+}
+
+/// The empty state offers one `Open…` button, no folder button, and pressing
+/// it raises `open-requested` once, at both window sizes.
+#[test]
+fn empty_state_open_button_raises_the_open_request() {
+    for (width, height) in [(1440, 900), (1200, 760)] {
+        let app = app_at(width, height);
+        assert_eq!(label(&app, "FFEmptyState::open"), "Open…");
+        assert!(
+            ElementQuery::from_root(&app)
+                .match_id("FFEmptyState::open-folder")
+                .find_first()
+                .is_none(),
+            "{width}x{height}: no folder button"
+        );
+        let card = rect(&app, "FFEmptyState::empty-card");
+        let button = rect(&app, "FFEmptyState::open");
+        let caption = rect(&app, "FFEmptyState::drop-caption");
+        assert_eq!(button.0, card.0 + 32.0, "{width}x{height}: 32 px inset");
+        assert!(caption.1 >= button.1 + button.3, "caption below the button");
+
+        let requested = std::rc::Rc::new(std::cell::Cell::new(0));
+        app.on_open_requested({
+            let requested = requested.clone();
+            move || requested.set(requested.get() + 1)
+        });
+        ElementQuery::from_root(&app)
+            .match_id("FFEmptyState::open")
+            .find_first()
+            .expect("the open button")
+            .mock_single_click(slint::platform::PointerEventButton::Left);
+        assert_eq!(requested.get(), 1, "{width}x{height}: one request");
+    }
 }
 
 /// The dock without a project: the checkpoint panel's empty line, a
@@ -2979,16 +3028,16 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         .match_type_name("FFErrorRow")
         .find_first()
         .expect("the Appearance save failure is visible");
-    let legend = ElementQuery::from_root(&app)
+    let source_note = ElementQuery::from_root(&app)
         .match_descendants()
         .match_accessible_role(AccessibleRole::Text)
         .match_predicate(|element| {
             element
                 .accessible_label()
-                .is_some_and(|label| label == "Editor source legend stays compact and read-only.")
+                .is_some_and(|label| label == "Editor source rows stay read-only.")
         })
         .find_first()
-        .expect("the legend precedes the save failure");
+        .expect("the source-rows note precedes the save failure");
     let session_note = ElementQuery::from_root(&app)
         .match_descendants()
         .match_accessible_role(AccessibleRole::Text)
@@ -3006,8 +3055,8 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         "the long native path error reserves its wrapped text height"
     );
     assert!(
-        legend.absolute_position().y + legend.size().height <= error_pos.y,
-        "the failure begins after the preceding legend"
+        source_note.absolute_position().y + source_note.size().height <= error_pos.y,
+        "the failure begins after the preceding source-rows note"
     );
     assert!(
         error_pos.y + error_size.height <= session_note.absolute_position().y,
@@ -3604,5 +3653,338 @@ mod settings_escape {
         );
         rig.escape();
         assert!(!rig.overlay_open(), "the second Escape closes the overlay");
+    }
+}
+
+mod dialog_close {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    type Counts = Vec<(&'static str, Rc<Cell<u32>>)>;
+
+    /// Counts every argument-free callback the modal dialogs raise.
+    macro_rules! count_callbacks {
+        ($app:expr, $($on:ident => $name:literal),* $(,)?) => {{
+            let mut counts: Counts = Vec::new();
+            $({
+                let count = Rc::new(Cell::new(0u32));
+                let hit = count.clone();
+                $app.$on(move || hit.set(hit.get() + 1));
+                counts.push(($name, count));
+            })*
+            counts
+        }};
+    }
+
+    fn count_dialog_callbacks(app: &AppWindow) -> Counts {
+        count_callbacks!(app,
+            on_question_open_as_one => "question-open-as-one",
+            on_question_open_as_many => "question-open-as-many",
+            on_question_cancelled => "question-cancelled",
+            on_refusal_pick_another_folder => "refusal-pick-another-folder",
+            on_mismatch_open_anyway => "mismatch-open-anyway",
+            on_mismatch_locate_frames => "mismatch-locate-frames",
+            on_mismatch_cancelled => "mismatch-cancelled",
+            on_sources_missing_locate_frames => "sources-missing-locate-frames",
+            on_sources_missing_closed => "sources-missing-closed",
+            on_export_confirmed => "export-confirmed",
+            on_export_cancelled => "export-cancelled",
+            on_frame_warning_cancelled => "frame-warning-cancelled",
+            on_frame_warning_secondary_pressed => "frame-warning-secondary-pressed",
+            on_frame_warning_confirmed => "frame-warning-confirmed",
+            on_divergence_discarded => "divergence-discarded",
+            on_divergence_kept => "divergence-kept",
+            on_close_guard_cancelled => "close-guard-cancelled",
+            on_close_guard_secondary_pressed => "close-guard-secondary-pressed",
+            on_close_guard_confirmed => "close-guard-confirmed",
+            on_checkpoint_delete_cancelled => "checkpoint-delete-cancelled",
+            on_checkpoint_delete_confirmed => "checkpoint-delete-confirmed",
+        )
+    }
+
+    fn fired(counts: &Counts) -> Vec<(&'static str, u32)> {
+        counts
+            .iter()
+            .map(|(name, count)| (*name, count.get()))
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
+    /// A dialog that carries the close control: how to open it, the
+    /// `AppWindow` callback its own cancel raises, and its panel size.
+    struct Dialog {
+        type_name: &'static str,
+        label: &'static str,
+        cancel: &'static str,
+        panel: (f32, f32),
+        open: fn(&AppWindow),
+    }
+
+    const INCLUDED: [Dialog; 8] = [
+        Dialog {
+            type_name: "FFFrameSetWarning",
+            label: "frame-set warning",
+            cancel: "frame-warning-cancelled",
+            panel: (480.0, 300.0),
+            open: |app| app.set_frame_warning_open(true),
+        },
+        Dialog {
+            type_name: "FFCloseGuard",
+            label: "close guard",
+            cancel: "close-guard-cancelled",
+            panel: (480.0, 300.0),
+            open: |app| app.set_close_guard_open(true),
+        },
+        Dialog {
+            type_name: "FFCheckpointDelete",
+            label: "checkpoint delete",
+            cancel: "checkpoint-delete-cancelled",
+            panel: (560.0, 316.0),
+            open: |app| app.set_checkpoint_delete_open(true),
+        },
+        Dialog {
+            type_name: "FFFingerprintMismatch",
+            label: "fingerprint mismatch",
+            cancel: "mismatch-cancelled",
+            panel: (600.0, 362.0),
+            open: |app| app.set_mismatch_open(true),
+        },
+        Dialog {
+            type_name: "FFSourcesMissing",
+            label: "sources missing",
+            cancel: "sources-missing-closed",
+            panel: (540.0, 330.0),
+            open: |app| app.set_sources_missing_open(true),
+        },
+        Dialog {
+            type_name: "FFExportDialog",
+            label: "export, ready",
+            cancel: "export-cancelled",
+            panel: (560.0, 365.0),
+            open: |app| {
+                app.set_export_stage("ready".into());
+                app.set_export_open(true);
+            },
+        },
+        Dialog {
+            type_name: "FFExportDialog",
+            label: "export, refused",
+            cancel: "export-cancelled",
+            panel: (560.0, 365.0),
+            open: |app| {
+                app.set_export_stage("refused".into());
+                app.set_export_open(true);
+            },
+        },
+        Dialog {
+            type_name: "FFGroupingQuestion",
+            label: "grouping question",
+            cancel: "question-cancelled",
+            panel: (480.0, 200.0),
+            open: |app| app.set_question_open(true),
+        },
+    ];
+
+    fn dialog_root(app: &AppWindow, type_name: &str) -> ElementHandle {
+        ElementQuery::from_root(app)
+            .match_descendants()
+            .match_type_name(type_name)
+            .find_first()
+            .unwrap_or_else(|| panic!("no {type_name} in the window"))
+    }
+
+    fn close_buttons(root: &ElementHandle) -> Vec<ElementHandle> {
+        root.query_descendants()
+            .match_type_name("FFIconButton")
+            .match_predicate(|e| e.accessible_label().as_deref() == Some("Close dialog"))
+            .find_all()
+    }
+
+    fn close_button(app: &AppWindow, dialog: &Dialog) -> ElementHandle {
+        let mut found = close_buttons(&dialog_root(app, dialog.type_name));
+        assert_eq!(
+            found.len(),
+            1,
+            "{}: exactly one Close dialog control",
+            dialog.label
+        );
+        found.remove(0)
+    }
+
+    fn panel_of(root: &ElementHandle) -> ElementHandle {
+        root.query_descendants()
+            .match_id("FFModalPanel::panel")
+            .find_first()
+            .expect("the dialog's own panel")
+    }
+
+    fn click(handle: &ElementHandle) {
+        handle.mock_single_click(slint::platform::PointerEventButton::Left);
+    }
+
+    #[test]
+    fn dialog_close_button_acts_as_cancel() {
+        for dialog in &INCLUDED {
+            let app = app_at(1440, 900);
+            let counts = count_dialog_callbacks(&app);
+            (dialog.open)(&app);
+            let button = close_button(&app, dialog);
+            assert_eq!(button.accessible_role(), Some(AccessibleRole::Button));
+            if matches!(dialog.label, "sources missing" | "export, refused") {
+                let footer = dialog_root(&app, dialog.type_name)
+                    .query_descendants()
+                    .match_type_name("FFButton")
+                    .match_predicate(|e| e.accessible_label().as_deref() == Some("Close"))
+                    .find_all();
+                assert_eq!(footer.len(), 1, "{}: one footer Close", dialog.label);
+                assert_ne!(
+                    footer[0].absolute_position(),
+                    button.absolute_position(),
+                    "{}: the footer Close is a different element",
+                    dialog.label
+                );
+            }
+            click(&button);
+            assert_eq!(
+                fired(&counts),
+                [(dialog.cancel, 1)],
+                "{}: the Close dialog control raises its own cancel once and nothing else",
+                dialog.label
+            );
+        }
+    }
+
+    #[test]
+    fn dialog_close_button_acts_as_cancel_leaves_excluded_dialogs_bare() {
+        let app = app_at(1440, 900);
+        app.set_refusal_open(true);
+        app.set_divergence_open(true);
+        for type_name in ["FFRefusalDialog", "FFDivergenceWarning"] {
+            let root = dialog_root(&app, type_name);
+            assert!(
+                close_buttons(&root).is_empty(),
+                "{type_name} shows no Close dialog control"
+            );
+        }
+
+        app.set_settings_open(true);
+        let settings = dialog_root(&app, "FFSettingsModal");
+        let own: Vec<_> = settings
+            .query_descendants()
+            .match_type_name("FFIconButton")
+            .match_predicate(|e| {
+                e.accessible_label()
+                    .is_some_and(|label| label.starts_with("Close"))
+            })
+            .find_all();
+        assert_eq!(own.len(), 1, "the settings modal keeps exactly one");
+        assert_eq!(own[0].accessible_label().as_deref(), Some("Close settings"));
+    }
+
+    #[test]
+    fn export_close_button_cancels_a_running_write() {
+        let app = app_at(1440, 900);
+        let mut fused = common::controller_with_frames("export_close_writing", 2);
+        fused.set_align_algorithm("dummy-align");
+        assert!(fused.start_fuse());
+        while common::wait_for_settle(&mut fused, std::time::Duration::from_secs(60)).is_some() {}
+        assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
+        let controller: SharedController = std::sync::Arc::new(std::sync::Mutex::new(fused));
+        controller.lock().unwrap().checkpoint_export_requested();
+        assert!(
+            controller.lock().unwrap().export_view().is_some(),
+            "the export modal is open"
+        );
+        let _installed = focusforge_gui::bridge::install(
+            &app,
+            controller.clone(),
+            common::empty_canvas(),
+            Rc::new(std::cell::RefCell::new(None)),
+        );
+        let export = &INCLUDED[5];
+
+        (export.open)(&app);
+        assert_eq!(close_button(&app, export).computed_opacity(), 1.0);
+
+        app.set_export_stage("writing".into());
+        let button = close_button(&app, export);
+        assert_eq!(button.computed_opacity(), 0.5, "dimmed like the footer");
+        click(&button);
+        assert!(
+            controller.lock().unwrap().export_view().is_none(),
+            "the click reaches AppController::cancel_export"
+        );
+    }
+
+    #[test]
+    fn dialog_close_button_sits_in_the_panel_corner() {
+        const INSET: f32 = 16.0;
+        const GLYPH: f32 = 16.0;
+        for (width, height) in [(1440, 900), (1200, 760)] {
+            for dialog in &INCLUDED {
+                let app = app_at(width, height);
+                (dialog.open)(&app);
+                let root = dialog_root(&app, dialog.type_name);
+                let panel = panel_of(&root);
+                let (px, py) = (panel.absolute_position().x, panel.absolute_position().y);
+                let (pw, ph) = (panel.size().width, panel.size().height);
+                let at = format!("{} at {width}x{height}", dialog.label);
+
+                assert_eq!((pw, ph), dialog.panel, "{at}: the panel keeps its size");
+
+                let button = close_button(&app, dialog);
+                let (bx, by) = (button.absolute_position().x, button.absolute_position().y);
+                let (bw, bh) = (button.size().width, button.size().height);
+                let pad = (bw - GLYPH) / 2.0;
+                assert!(
+                    bx >= px && by >= py && bx + bw <= px + pw && by + bh <= py + ph,
+                    "{at}: the control lies inside the panel"
+                );
+                assert!(
+                    (bx + bw - pad - (px + pw - INSET)).abs() < EPS,
+                    "{at}: the glyph's right edge is on the content inset"
+                );
+                assert!(
+                    (by + bh / 2.0 - (py + INSET + 10.0)).abs() < EPS,
+                    "{at}: the control is centred on the first row at the top inset"
+                );
+
+                if let Some(footer) = root
+                    .query_descendants()
+                    .match_type_name("FFDialogFooter")
+                    .find_first()
+                {
+                    let footer_bottom = footer.absolute_position().y + footer.size().height;
+                    assert!(
+                        (py + ph - footer_bottom - INSET).abs() < EPS,
+                        "{at}: footer stays `space-4` above the panel bottom"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_longest_dialog_title_stops_before_the_close_control() {
+        for (width, height) in [(1440, 900), (1200, 760)] {
+            let app = app_at(width, height);
+            let mismatch = &INCLUDED[3];
+            (mismatch.open)(&app);
+            let title = dialog_root(&app, mismatch.type_name)
+                .query_descendants()
+                .match_predicate(|e| {
+                    e.accessible_label().as_deref() == Some("The source frames are not the same")
+                })
+                .find_first()
+                .expect("the title text");
+            let button = close_button(&app, mismatch);
+            assert!(
+                title.absolute_position().x + title.size().width
+                    <= button.absolute_position().x + EPS,
+                "{width}x{height}: the title ends left of the control"
+            );
+        }
     }
 }

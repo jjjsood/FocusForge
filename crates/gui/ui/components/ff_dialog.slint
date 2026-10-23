@@ -25,11 +25,15 @@ export component FFDialog inherits FFModalPanel {
     in property <string> secondary-label: "";
     in property <string> confirm-label: "Confirm";
     in property <string> confirm-kind: "primary";
+    // False leaves the top-right close control out.
+    in property <bool> closable: true;
     callback cancelled();
     callback secondary-pressed();
     callback confirmed();
 
     modal-open: root.open;
+    show-close: root.closable;
+    close-requested => { root.cancelled(); }
     tone-rule: root.tone == "warning" ? "warning" : root.tone == "caution" ? "caution" : "none";
 
     VerticalLayout {
@@ -48,6 +52,7 @@ export component FFDialog inherits FFModalPanel {
 
             HorizontalLayout {
                 spacing: Theme.space-2;
+                padding-right: root.close-reserve;
 
                 if root.tone == "warning": Image {
                     source: @image-url("../../../../assets/icons/triangle-alert.svg");

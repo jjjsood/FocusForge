@@ -112,7 +112,7 @@ export component AppWindow inherits Window {
     forward-focus: canvas-ground;
 
     // The entry path: the tab strip's own project list, scroll state, and
-    // the "+" forward. `open-folder-requested` is the empty state's button
+    // the "+" forward. `open-requested` is the empty state's button
     // (the picker); the strip's "+" raises `plus-clicked`, which selects
     // "+" itself.
     in property <[ProjectTabView]> project-tabs: [];
@@ -121,8 +121,9 @@ export component AppWindow inherits Window {
     in property <bool> can-scroll-left: false;
     in property <bool> can-scroll-right: false;
     in property <bool> show-empty-state: true;
+    in property <bool> drop-unavailable: false;
     in property <bool> plus-selected: true;
-    callback open-folder-requested();
+    callback open-requested();
     callback plus-clicked();
     callback tab-selected(int);
     callback tab-closed(int);
@@ -386,6 +387,7 @@ export component AppWindow inherits Window {
             frame-crop-h: root.frame-crop-h;
             pixelated: root.pixelated;
             show-empty-state: root.show-empty-state;
+            drop-unavailable: root.drop-unavailable;
             load-active: root.load-active;
             editor-mode: root.mode == "editor";
             cursor-extent: root.cursor-extent;
@@ -401,7 +403,7 @@ export component AppWindow inherits Window {
 
             frame-undock-requested => { root.frame-undock-requested(); }
             composite-undock-requested => { root.composite-undock-requested(); }
-            open-folder-requested => { root.open-folder-requested(); }
+            open-requested => { root.open-requested(); }
             canvas-scrolled(dx, dy, x, y, ctrl, shift, alt) => {
                 root.canvas-scrolled(dx, dy, x, y, ctrl, shift, alt);
             }

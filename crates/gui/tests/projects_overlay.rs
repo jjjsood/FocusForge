@@ -248,6 +248,8 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         eta: None,
         align_done,
         align_total,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -263,6 +265,8 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 

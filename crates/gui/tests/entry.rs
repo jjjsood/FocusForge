@@ -26,12 +26,14 @@ fn base_pane() -> (PaneRect, PaneRect) {
             y: 0.0,
             width: 500.0,
             height: 500.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 500.0,
             y: 0.0,
             width: 500.0,
             height: 500.0,
+            scale_factor: 1.0,
         },
     )
 }
@@ -168,6 +170,188 @@ fn drop_of_several_files_is_one_open() {
         1,
         "three dropped files become one project of three frames, not three projects"
     );
+}
+
+/// The active tab's frame paths, in the Images panel's order.
+fn active_frame_paths(controller: &AppController) -> Vec<PathBuf> {
+    controller
+        .images_panel()
+        .rows
+        .into_iter()
+        .map(|row| row.path)
+        .collect()
+}
+
+/// A tree holding `names`, each a copy of a mantis frame.
+fn tree_of_frames(label: &str, names: &[&str]) -> PathBuf {
+    let root = tree(label);
+    for (index, name) in names.iter().enumerate() {
+        copy_frame(&root, name, index);
+    }
+    root
+}
+
+#[test]
+fn picked_images_open_one_new_tab_of_exactly_those_frames() {
+    let root = tree_of_frames(
+        "entry_picked_exact",
+        &["00.tif", "01.tif", "02.tif", "03.tif", "04.tif"],
+    );
+    let picked = vec![
+        root.join("00.tif"),
+        root.join("02.tif"),
+        root.join("04.tif"),
+    ];
+
+    let mut empty = AppController::new();
+    let outcome = common::open_and_settle(&mut empty, &picked);
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(empty.project_tabs().len(), 1, "one new tab");
+    assert_eq!(
+        active_frame_paths(&empty),
+        picked,
+        "exactly the picked files"
+    );
+
+    let mut busy = with_one_project("entry_picked_exact_first");
+    let first = busy.project_tabs()[0].title.clone();
+    common::open_and_settle(&mut busy, &picked);
+    let tabs = busy.project_tabs();
+    assert_eq!(tabs.len(), 2, "the pick opens a tab beside the open one");
+    assert_eq!(tabs[0].title, first, "the earlier tab is unchanged");
+    assert_eq!(active_frame_paths(&busy), picked);
+}
+
+#[test]
+fn picked_images_order_matches_the_drop() {
+    let root = tree_of_frames("entry_picked_order", &["a.tif", "b.tif", "c.tif", "d.tif"]);
+    let by_name: Vec<PathBuf> = ["a.tif", "b.tif", "c.tif", "d.tif"]
+        .iter()
+        .map(|n| root.join(n))
+        .collect();
+    let reversed: Vec<PathBuf> = by_name.iter().rev().cloned().collect();
+    let shuffled = vec![
+        by_name[2].clone(),
+        by_name[0].clone(),
+        by_name[3].clone(),
+        by_name[1].clone(),
+    ];
+
+    for given in [&reversed, &shuffled] {
+        let mut picked = AppController::new();
+        common::open_and_settle(&mut picked, given);
+        assert_eq!(
+            active_frame_paths(&picked),
+            by_name,
+            "picked: ascending file name"
+        );
+
+        let mut dropped = AppController::new();
+        if let Some(handle) = dropped
+            .drop_paths(given)
+            .expect("an empty controller opens")
+        {
+            handle.join().expect("the load worker did not panic");
+        }
+        dropped.settle_open().expect("the drop started a load");
+        assert_eq!(
+            active_frame_paths(&dropped),
+            by_name,
+            "dropped: ascending file name"
+        );
+        assert_eq!(picked.project_tabs(), dropped.project_tabs());
+    }
+}
+
+#[test]
+fn a_picked_raw_set_opens_as_one_tab() {
+    let root = tree("entry_picked_raw");
+    let source = common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng");
+    std::fs::copy(&source, root.join("b.dng")).unwrap();
+    std::fs::copy(&source, root.join("A.DNG")).unwrap();
+
+    let mut controller = AppController::new();
+    let outcome =
+        common::open_and_settle(&mut controller, &[root.join("b.dng"), root.join("A.DNG")]);
+    assert!(
+        matches!(outcome, OpenOutcome::Opened(_)),
+        "a RAW-only set must open"
+    );
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(
+        active_frame_paths(&controller),
+        vec![root.join("A.DNG"), root.join("b.dng")]
+    );
+}
+
+#[test]
+fn an_upper_case_tif_extension_is_a_frame() {
+    let root = tree_of_frames("entry_picked_upper", &["00.TIF", "01.TIF"]);
+    let picked = vec![root.join("00.TIF"), root.join("01.TIF")];
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &picked);
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(active_frame_paths(&controller), picked);
+}
+
+#[test]
+fn picked_images_refusals_change_nothing() {
+    let root = tree_of_frames("entry_picked_refused_a", &["00.tif", "01.tif"]);
+    let other = tree_of_frames("entry_picked_refused_b", &["00.tif"]);
+    let note = root.join("notes.txt");
+    std::fs::write(&note, b"not a frame").unwrap();
+    let raw = root.join("raw.dng");
+    std::fs::copy(
+        common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng"),
+        &raw,
+    )
+    .unwrap();
+
+    let mut controller = with_one_project("entry_picked_refused_open");
+    let tabs = controller.project_tabs();
+
+    let mut refusals = Vec::new();
+    for set in [
+        vec![root.join("00.tif"), note.clone()],
+        vec![root.join("00.tif"), other.join("00.tif")],
+        vec![root.join("00.tif"), raw.clone()],
+    ] {
+        assert!(
+            controller.open_paths(&set).is_none(),
+            "{set:?} starts no load"
+        );
+        assert_eq!(controller.project_tabs(), tabs, "{set:?} changes nothing");
+        assert_eq!(
+            controller.refusal_title(),
+            None,
+            "the dialog keeps its own title"
+        );
+        refusals.push(
+            controller
+                .last_refusal()
+                .expect("a refusal is raised")
+                .to_string(),
+        );
+    }
+    assert!(refusals[0].ends_with("not a folder of frames or a FocusForge project"));
+    assert_eq!(
+        refusals[1],
+        "These files are in different folders. A stack's frames share one folder."
+    );
+    assert_eq!(
+        refusals[2],
+        "These files mix camera RAW and TIFF. A stack is one kind of file."
+    );
+
+    // An answer that arrives while a load is in flight opens nothing.
+    controller.set_open_hold(Duration::from_millis(300));
+    let first = controller
+        .open_paths(&[root.join("00.tif")])
+        .expect("the first pick starts a load");
+    assert!(controller.open_paths(&[root.join("01.tif")]).is_none());
+    first.join().unwrap();
+    controller.settle_open().expect("the first load settles");
+    assert_eq!(controller.project_tabs().len(), tabs.len() + 1);
 }
 
 // ---------------------------------------------------------------------
@@ -401,16 +585,20 @@ fn no_grouping_vocabulary_after_the_answer() {
 }
 
 #[test]
-fn drop_caption_states_the_negative() {
+fn drop_caption_names_the_drop_and_the_wayland_line() {
     let contents =
         std::fs::read_to_string(common::ui_dir().join("shell").join("empty_state.slint")).unwrap();
     assert!(
-        contents.contains("native Wayland"),
-        "the caption must name native Wayland as the case that does not work"
+        contents.contains("Drop a folder or stack"),
+        "the caption names what a drop accepts"
     );
     assert!(
-        contents.contains("Open folder… works everywhere"),
-        "the caption must name the picker as the case that always works"
+        contents.contains("Dropping is unavailable on native Wayland"),
+        "the caption says so where dropping does not work"
+    );
+    assert!(
+        !contents.contains("Open folder… works everywhere"),
+        "the long platform caveat is gone"
     );
 }
 

@@ -4,11 +4,11 @@ Start: --open fixtures/open-rejected --open fixtures/open-root-and-subfolder --o
 1. Click **Projects** (`FFTabStrip::projects-button`) while the launch's dialogs are up.
    Expect: (within 30 s) Must not: the Projects overview opens; a dialog titled "This project cannot be opened" with the text "This file is not a FocusForge project." and a **Close** button stays on top.
 2. Click **Close** by its id (`FFRefusalDialog::pick-area`; it is not listed by label).
-   Expect: that dialog is gone and a dialog titled "The frames are no longer there" shows the name "missing" and the text "3 of 3 cannot be found in this location.".
-3. Click **Close** (`AppWindow::sources-missing-dialog`).
-   Expect: that dialog is gone and a dialog titled "The source frames are not the same" shows the name "mismatch.ffp" with the buttons "Cancel", "Locate frames…" and "Open anyway".
+   Expect: that dialog is gone and a dialog titled "The frames are no longer there" shows the name "missing" and the text "3 of 3 cannot be found in this location."; its footer buttons read "Close" and "Locate frames…", beside a **Close dialog** icon button at its top-right corner (`buttons AppWindow::sources-missing-dialog` lists all three).
+3. Click **Close dialog** (`AppWindow::sources-missing-dialog`), the icon button at the dialog's top-right corner.
+   Expect: that dialog is gone and a dialog titled "The source frames are not the same" shows the name "mismatch.ffp" with the buttons "Cancel", "Locate frames…" and "Open anyway", beside a **Close dialog** icon button at its top-right corner.
 4. Click **Open anyway** (`AppWindow::mismatch-dialog`).
-   Expect: that dialog is gone and a question reads "This folder reads as 2 stacks of 6 frames." with the buttons "Open as one project", "Open as 2 projects" and "Cancel".
+   Expect: that dialog is gone and a question reads "This folder reads as 2 stacks of 6 frames." with the buttons "Open as one project", "Open as 2 projects" and "Cancel", beside a **Close dialog** icon button at its top-right corner.
 5. Click **Projects** (`FFTabStrip::projects-button`) while the question is up.
    Expect: Must not: the Projects overview opens; the question "This folder reads as 2 stacks of 6 frames." stays on screen.
 6. Click **Open as 2 projects** (`FFGroupingQuestion::many-button`).
