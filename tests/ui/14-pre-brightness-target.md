@@ -61,12 +61,16 @@ Use a fresh settings directory. The PREPARE section of the Settings dock holds t
 
 ## No project
 24. Click **close tab** (`FFTab::close-area`).
-    Expect: the dialog "Save this state first?" appears with Cancel, Save and close and Close anyway.
+    Expect: the dialog "Save this state first?" appears with Cancel, Save and close and Close anyway, beside a **Close dialog** icon button at its top-right corner.
 25. Click **Cancel** (`AppWindow::close-guard`).
     Expect: Must not: the project closes; the dialog is gone and the frames tab is still open.
 26. Click **close tab** (`FFTab::close-area`).
     Expect: the dialog "Save this state first?" appears.
-27. Click **Close anyway** (`AppWindow::close-guard`).
+27. Click **Close dialog** (`AppWindow::close-guard`), the icon button at the dialog's top-right corner.
+    Expect: Must not: the project closes; the dialog is gone and the frames tab is still open.
+28. Click **close tab** (`FFTab::close-area`).
+    Expect: the dialog "Save this state first?" appears.
+29. Click **Close anyway** (`AppWindow::close-guard`).
     Expect: the frames tab is gone; the dock reads "No project open." and no Equalize brightness or Target brightness row is visible.
-28. Click **Fuse stack** (`FFToolbar::fuse-button`).
+30. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: Must not: a run starts; Fuse stack stays greyed and the bottom bar reads "No project open".

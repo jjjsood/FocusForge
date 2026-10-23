@@ -35,17 +35,22 @@ export component FFGroupingQuestion inherits FFModalPanel {
     modal-open: root.question-open;
     panel-width: 480px;
     panel-height: 200px;
+    show-close: true;
+    close-requested => { root.cancelled(); }
 
     VerticalLayout {
         padding: Theme.space-4;
         spacing: Theme.space-3;
 
-        body := Text {
-            text: "This folder reads as " + root.project-count + " stacks of "
-                + root.frame-count + " frames.";
-            color: Theme.text-primary;
-            font-size: Theme.text-body.size;
-            wrap: word-wrap;
+        HorizontalLayout {
+            padding-right: root.close-reserve;
+            body := Text {
+                text: "This folder reads as " + root.project-count + " stacks of "
+                    + root.frame-count + " frames.";
+                color: Theme.text-primary;
+                font-size: Theme.text-body.size;
+                wrap: word-wrap;
+            }
         }
 
         HorizontalLayout {
@@ -150,6 +155,7 @@ export component FFFrameSetWarning inherits FFDialog {
 export component FFDivergenceWarning inherits FFDialog {
     tone: "warning";
     title: "Keep this fused result?";
+    closable: false;
     cancel-label: "Discard";
     confirm-label: "Keep";
     confirm-kind: "primary";
@@ -258,6 +264,9 @@ export component FFExportDialog inherits FFModalPanel {
     panel-height: 365px;
     clip-panel: true;
     tone-rule: root.stage == "refused" ? "warning" : "none";
+    show-close: true;
+    close-dimmed: root.stage == "writing";
+    close-requested => { root.cancelled(); }
 
     FFStatusGlyph {
         x: Theme.space-4;
@@ -268,7 +277,7 @@ export component FFExportDialog inherits FFModalPanel {
     title-text := FFHeading {
         x: 44px;
         y: Theme.space-4;
-        width: 500px;
+        width: 500px - root.close-reserve;
         height: 22px;
         text: "Export image";
     }

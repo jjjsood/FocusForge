@@ -812,6 +812,25 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Modal panel: close control, dimmed close control"; }
+        for dimmed in [false, true]: Rectangle {
+            width: 500px;
+            height: 220px;
+            clip: true;
+            FFModalPanel {
+                modal-open: true;
+                show-close: true;
+                close-dimmed: dimmed;
+                panel-width: 440px;
+                panel-height: 180px;
+                FFHeading {
+                    x: Theme.space-4;
+                    y: Theme.space-4;
+                    text: dimmed ? "Panel, close dimmed" : "Panel, close";
+                }
+            }
+        }
+
         GroupHeading { text: "Pane chrome: default, hover, disabled"; }
         HorizontalLayout {
             spacing: Theme.space-3;
@@ -1560,6 +1579,44 @@ export component ThemeSheet inherits Window {
                 info: "Finding the original frames again opens the project unchanged.";
                 secondary-label: "Locate frames…";
                 confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: long title wraps before the close control"; }
+        Rectangle {
+            width: 440px;
+            height: 280px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                tone: "warning";
+                panel-width: 420px;
+                panel-height: 260px;
+                title: "The source frames are not the same as the frames this project was made from";
+                body: "The frames in this location give a different fingerprint.";
+                confirm-label: "Open anyway";
+                confirm-kind: "danger";
+            }
+        }
+
+        GroupHeading { text: "Dialog: without the close control"; }
+        Rectangle {
+            width: 500px;
+            height: 320px;
+            clip: true;
+            FFDialog {
+                width: 100%;
+                height: 100%;
+                open: true;
+                closable: false;
+                tone: "warning";
+                title: "Discard the fused result?";
+                body: "The result of this run is thrown away and the project returns to its last checkpoint.";
+                cancel-label: "Keep";
+                confirm-label: "Discard";
                 confirm-kind: "danger";
             }
         }
