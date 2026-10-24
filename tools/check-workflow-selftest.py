@@ -18,7 +18,8 @@ def errors(text: str) -> list[str]:
                      "fail-fast: false", "contents: read", "tools/check-all.sh --log-dir .logs/gate/ci",
                      "if: always()", "include-hidden-files: true", "if-no-files-found: error",
                      "cargo fetch --locked", "CARGO_DENY_VERSION: 0.20.2", "NEXTEST_VERSION: 0.9.144",
-                     "numpy==2.2.6", "python-version: '3.12.10'", "checksum mismatch", "!target/tmp"):
+                     "numpy==2.2.6", "python-version: '3.12.10'", "checksum mismatch", "!target/tmp",
+                     "timeout-minutes: 240"):
         if required not in text:
             found.append(f"missing {required!r}")
     canonical = re.findall(r"^\s*run:\s*tools/check-all\.sh --log-dir \.logs/gate/ci\s*$", text, re.M)
@@ -56,6 +57,7 @@ def main() -> int:
     expect_rejected("artifact condition", text.replace("if: always()", "if: success()"))
     expect_rejected("artifact scope", text.replace("path: .logs/gate/ci/", "path: .logs/"))
     expect_rejected("mutable action", text.replace("@d23441a48e516b6c34aea4fa41551a30e30af803", "@v6"))
+    expect_rejected("unbounded gate", text.replace("timeout-minutes: 240", ""))
     expect_rejected("cache keeps target/tmp", text.replace("!target/tmp", ""))
     print("OK: workflow keeps one pinned canonical gate and narrow diagnostics")
     return 0

@@ -1542,9 +1542,10 @@ def macos_producer_mock() -> None:
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
             "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
-            "hdiutil": "#!/usr/bin/env bash\n[[ -z ${MOCK_HDIUTIL_FAIL:-} ]] || exit 77; touch \"${!#}\"\n",
+            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "sleep": "#!/usr/bin/env bash\nexit 0\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
-            "shasum": "#!/usr/bin/env bash\nsha256sum \"${!#}\"\n",
+            "shasum": "#!/usr/bin/env bash\nif [[ -n ${MOCK_SHASUM_FAIL:-} ]]; then echo 'shasum: mock read error' >&2; exit 5; fi\nsha256sum \"${!#}\"\n",
             "git": "#!/usr/bin/env bash\necho 0123456789abcdef0123456789abcdef01234567\n",
             "dsymutil": "#!/usr/bin/env bash\nsource=$1; while (($#)); do if [[ $1 == -o ]]; then mkdir -p \"$2/Contents/Resources/DWARF\"; cp \"$MOCK_MACHO\" \"$2/Contents/Resources/DWARF/$(basename \"$source\")\"; printf '<plist version=\"1.0\"><dict/></plist>\\n' > \"$2/Contents/Info.plist\"; exit 0; fi; shift; done\n",
             "strip": "#!/usr/bin/env bash\nwhile (($#)); do if [[ $1 == -o ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done\n",
@@ -1554,7 +1555,7 @@ def macos_producer_mock() -> None:
         }
         for name, body in commands.items():
             path = mock / name; path.write_text(body); path.chmod(0o755)
-        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_MACHO": str(macho)}
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C", "MOCK_MACHO": str(macho), "MOCK_HDIUTIL_COUNT": str(root / "hdiutil-count")}
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 0, result.stderr
         output = root / "target/distrib/native/macos"
@@ -1570,13 +1571,35 @@ def macos_producer_mock() -> None:
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
         env.pop("MOCK_ARCHES")
-        env["MOCK_HDIUTIL_FAIL"] = "1"
+        diagnostics = root / ".scratch/package-macos-diagnostics/diagnostics.log"
+        counter = Path(env["MOCK_HDIUTIL_COUNT"])
+        counter.unlink(missing_ok=True)
+        env["MOCK_HDIUTIL_FAIL"] = "3"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
-        assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        assert "hdiutil" in result.stderr and "77" in result.stderr and "mock reason 3" in result.stderr, result.stderr
+        assert "Filesystem" in result.stdout, result.stdout
+        logged = diagnostics.read_text()
+        assert all(f"mock reason {n}" in logged for n in (1, 2, 3)), logged
+        assert "hdiutil create failed with exit status 77 after 3 attempts" in result.stderr, result.stderr
         env.pop("MOCK_HDIUTIL_FAIL")
+        counter.unlink(missing_ok=True)
+        env["MOCK_SHASUM_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        assert any("shasum" in line and "failed with exit status 5" in line for line in result.stderr.splitlines()), result.stderr
+        assert "failed with exit status 5" in diagnostics.read_text()
+        env.pop("MOCK_SHASUM_FAIL")
         env["MOCK_MV_PROMOTION_FAIL"] = "1"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_MV_PROMOTION_FAIL")
+        counter.unlink(missing_ok=True)
+        env["MOCK_HDIUTIL_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 0 and artifact.exists() and receipt.exists(), result.stderr
+        logged = diagnostics.read_text()
+        assert "mock reason 1" in logged and "exit status 77" in logged, logged
 
 
 def windows_checker_mock() -> None:
@@ -1745,6 +1768,16 @@ def smoke_callers() -> None:
         if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
         assert paths == expected_paths
         assert "artifacts-" not in name
+    diagnostics_path = ".scratch/package-macos-diagnostics/"
+    producer = native.index("tools/package-macos.sh --output")
+    check = native.index("tools/check-package-macos.sh", producer)
+    step = native.index("- name: Upload package build diagnostics", producer)
+    block = native[step:native.index("      - name:", step + 1)]
+    assert producer < step < check and "if: always()" in block and upload in block
+    assert "name: package-build-diagnostics-macos" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
+    assert "continue-on-error" not in block and "|| true" not in block
+    assert [line.split("path:", 1)[1].strip() for line in block.splitlines() if line.strip().startswith("path:")] == [diagnostics_path]
+    assert diagnostics_path.rstrip("/") in (ROOT / "tools/package-macos.sh").read_text()
 
 
 if __name__ == "__main__":

@@ -141,6 +141,7 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Run canonical gate
+        timeout-minutes: 240
         run: tools/check-all.sh --log-dir .logs/gate/ci
       - name: Upload gate logs
         if: always()

@@ -202,18 +202,31 @@ fn run(request: DialogRequest) -> DialogAnswer {
 /// Opens `request`'s dialog and later calls `answer` on the event loop with
 /// the result. `false` -- and nothing opens -- while another dialog is open.
 pub fn request(request: DialogRequest, answer: impl FnOnce(DialogAnswer) + 'static) -> bool {
-    request_with(request, answer, run, |deliver| {
+    let dispatch = if cfg!(target_os = "macos") {
+        Dispatch::Inline
+    } else {
+        Dispatch::Thread
+    };
+    request_with(request, answer, dispatch, run, |deliver| {
         // The loop only refuses once it has stopped; no one is left to answer.
         let _ = slint::invoke_from_event_loop(deliver);
     })
 }
 
+/// Where a dialog runs.
+enum Dispatch {
+    Inline,
+    Thread,
+}
+
 /// [`request`] with the dialog runner and the event-loop hand-off supplied.
-/// `run` and `post` execute on a spawned thread (inline on macOS); `post`
-/// must make the closure it is given run on the calling thread.
+/// The caller picks where `run` executes: on the calling thread, answering
+/// before the call returns, or on a spawned thread whose answer `post` hands
+/// back; `post` must make the closure it is given run on the calling thread.
 fn request_with(
     request: DialogRequest,
     answer: impl FnOnce(DialogAnswer) + 'static,
+    dispatch: Dispatch,
     run: impl FnOnce(DialogRequest) -> DialogAnswer + Send + 'static,
     post: impl FnOnce(Box<dyn FnOnce() + Send>) + Send + 'static,
 ) -> bool {
@@ -228,21 +241,18 @@ fn request_with(
             continuation(answer);
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = post;
-        deliver(run(request));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let spawned = std::thread::Builder::new()
-            .name("file-dialog".into())
-            .spawn(move || {
-                let answer = run(request);
-                post(Box::new(move || deliver(answer)));
-            });
-        if spawned.is_err() {
-            deliver(None);
+    match dispatch {
+        Dispatch::Inline => deliver(run(request)),
+        Dispatch::Thread => {
+            let spawned = std::thread::Builder::new()
+                .name("file-dialog".into())
+                .spawn(move || {
+                    let answer = run(request);
+                    post(Box::new(move || deliver(answer)));
+                });
+            if spawned.is_err() {
+                deliver(None);
+            }
         }
     }
     true
@@ -343,7 +353,9 @@ mod tests {
             let accepted = request_with(
                 request.clone(),
                 move |answer| *sink.borrow_mut() = Some(answer),
+                Dispatch::Thread,
                 move |asked| {
+                    assert_eq!(std::thread::current().name(), Some("file-dialog"));
                     gate.recv().expect("the test releases the dialog");
                     fake_answer(&asked)
                 },
@@ -376,7 +388,9 @@ mod tests {
         assert!(request_with(
             DialogRequest::Entry,
             move |answer| sink.borrow_mut().push(answer),
+            Dispatch::Thread,
             move |asked| {
+                assert_eq!(std::thread::current().name(), Some("file-dialog"));
                 gate.recv().unwrap();
                 fake_answer(&asked)
             },
@@ -385,6 +399,7 @@ mod tests {
         let accepted = request_with(
             DialogRequest::Project,
             |_| panic!("the ignored request's continuation never runs"),
+            Dispatch::Thread,
             |_| panic!("the ignored request's dialog never opens"),
             |_| panic!("the ignored request posts nothing"),
         );
@@ -401,6 +416,7 @@ mod tests {
         assert!(request_with(
             DialogRequest::Frames,
             move |answer| *sink.borrow_mut() = Some(answer),
+            Dispatch::Thread,
             |asked| fake_answer(&asked),
             move |closure| post_tx.send(closure).unwrap(),
         ));
@@ -408,5 +424,40 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap()();
         assert_eq!(*third.borrow(), Some(fake_answer(&DialogRequest::Frames)));
+    }
+
+    #[test]
+    fn inline_dispatch_answers_before_returning() {
+        for request in all_requests() {
+            let (ran_on, ran_rx) = std::sync::mpsc::channel();
+            let got = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let sink = got.clone();
+            let again = std::rc::Rc::new(std::cell::Cell::new(false));
+            let asked_again = again.clone();
+            let expected = fake_answer(&request);
+            let accepted = request_with(
+                request.clone(),
+                move |answer| {
+                    *sink.borrow_mut() = Some(answer);
+                    asked_again.set(request_with(
+                        DialogRequest::Entry,
+                        |_| {},
+                        Dispatch::Inline,
+                        |_| None,
+                        |_| panic!("an inline dialog posts nothing"),
+                    ));
+                },
+                Dispatch::Inline,
+                move |asked| {
+                    ran_on.send(std::thread::current().id()).unwrap();
+                    fake_answer(&asked)
+                },
+                |_| panic!("an inline dialog posts nothing"),
+            );
+            assert!(accepted, "{request:?} was accepted");
+            assert_eq!(*got.borrow(), Some(expected), "{request:?}: answered");
+            assert_eq!(ran_rx.try_recv(), Ok(std::thread::current().id()));
+            assert!(again.get(), "{request:?}: the continuation may ask again");
+        }
     }
 }
