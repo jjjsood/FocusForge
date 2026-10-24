@@ -19,7 +19,16 @@ cargo build --locked --release --target "$target" -p focusforge-cli --bin focusf
 cargo build --locked --release --target "$target" -p focusforge-gui --bin focusforge-gui
 mkdir -p "$root/.scratch"
 staging=$(mktemp -d "$root/.scratch/package-macos.XXXXXX")
+diag="$root/.scratch/package-macos-diagnostics"
+rm -rf "$diag"
+mkdir -p "$diag"
 trap 'rm -rf "$staging"' EXIT
+# Prints stdin to stderr and appends it to the diagnostics log, which outlives the staging directory.
+log_stderr() { tee -a "$diag/diagnostics.log" >&2; }
+report_failure() {
+  { printf 'package-macos.sh: line %s: %s failed with exit status %s\n' "$3" "$2" "$1"; df -h "$staging" "$root/target" 2>&1 || true; } | log_stderr
+}
+trap 'report_failure $? "$BASH_COMMAND" $LINENO' ERR
 app="$staging/FocusForge.app"
 dump_syms=$(python3 "$root/tools/package-symbols.py" install dump_syms "$target" "$staging/tools")
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -43,7 +52,16 @@ cp "$root/LICENSE" "$root/NOTICE" "$app/Contents/Resources/"
 python3 "$root/tools/package-cli-assets.py" stage "$root" "$app/Contents/Resources"
 mkdir -p "$output"
 candidate="$staging/FocusForge-$version-aarch64.dmg"
-hdiutil create -quiet -volname FocusForge -srcfolder "$app" -ov -format UDZO "$candidate"
+{ df -h "$staging" "$output" 2>&1 || true; du -sh "$staging"; } | tee -a "$diag/diagnostics.log"
+for attempt in 1 2 3; do
+  if hdiutil create -volname FocusForge -srcfolder "$app" -ov -format UDZO "$candidate" 2> "$diag/hdiutil-$attempt.stderr"; then status=0; break; else status=$?; fi
+  { printf 'hdiutil create attempt %s failed with exit status %s\n' "$attempt" "$status"; cat "$diag/hdiutil-$attempt.stderr"; df -h "$staging" "$output" 2>&1 || true; } | log_stderr
+  if ((attempt < 3)); then sync; sleep 5; fi
+done
+if ((status != 0)); then
+  echo "hdiutil create failed with exit status $status after 3 attempts" | log_stderr
+  exit "$status"
+fi
 hash=$(shasum -a 256 "$candidate" | awk '{print $1}')
 revision=$(git -C "$root" rev-parse HEAD)
 printf '{"kind":"dmg","version":"%s","revision":"%s","artifact":"FocusForge-%s-aarch64.dmg","sha256":"%s"}\n' "$version" "$revision" "$version" "$hash" > "$staging/native-receipt.json"
