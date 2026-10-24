@@ -733,8 +733,8 @@ pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String
 
 /// The run's phase line for a card or overlay meta text: the lower-cased
 /// phase name, plus `, <k> of <N>` or `, from cache` when [`progress_text`]
-/// has a step text to show. `None` outside `Running` -- a name-only phase still returns
-/// `Some`, so it never falls back to some other line.
+/// has a step text to show. `None` outside `Running` -- a name-only phase
+/// still returns `Some`, so it never falls back to some other line.
 pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
     if !matches!(state, RunState::Running) {
         return None;
