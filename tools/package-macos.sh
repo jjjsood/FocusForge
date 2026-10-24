@@ -53,9 +53,13 @@ python3 "$root/tools/package-cli-assets.py" stage "$root" "$app/Contents/Resourc
 mkdir -p "$output"
 candidate="$staging/FocusForge-$version-aarch64.dmg"
 { df -h "$staging" "$output" 2>&1 || true; du -sh "$staging"; } | tee -a "$diag/diagnostics.log"
+app_mb=$(du -sm "$app" | cut -f1)
+printf 'app size: %s MB\n' "$app_mb" | tee -a "$diag/diagnostics.log"
 for attempt in 1 2 3; do
-  if hdiutil create -volname FocusForge -srcfolder "$app" -ov -format UDZO "$candidate" 2> "$diag/hdiutil-$attempt.stderr"; then status=0; break; else status=$?; fi
-  { printf 'hdiutil create attempt %s failed with exit status %s\n' "$attempt" "$status"; cat "$diag/hdiutil-$attempt.stderr"; df -h "$staging" "$output" 2>&1 || true; } | log_stderr
+  # Headroom over the app grows 20%, 40%, 60% (plus 50 MB), so a too-small image fails less often per retry.
+  size=$(( app_mb * (10 + 2 * attempt) / 10 + 50 ))
+  if hdiutil create -size "${size}m" -volname FocusForge -srcfolder "$app" -ov -format UDZO "$candidate" 2> "$diag/hdiutil-$attempt.stderr"; then status=0; break; else status=$?; fi
+  { printf 'hdiutil create attempt %s (-size %sm) failed with exit status %s\n' "$attempt" "$size" "$status"; cat "$diag/hdiutil-$attempt.stderr"; df -h "$staging" "$output" 2>&1 || true; } | log_stderr
   if ((attempt < 3)); then sync; sleep 5; fi
 done
 if ((status != 0)); then

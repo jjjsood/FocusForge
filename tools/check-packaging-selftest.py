@@ -1542,20 +1542,20 @@ def macos_producer_mock() -> None:
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
             "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
-            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
             "sleep": "#!/usr/bin/env bash\nexit 0\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
             "shasum": "#!/usr/bin/env bash\nif [[ -n ${MOCK_SHASUM_FAIL:-} ]]; then echo 'shasum: mock read error' >&2; exit 5; fi\nsha256sum \"${!#}\"\n",
             "git": "#!/usr/bin/env bash\necho 0123456789abcdef0123456789abcdef01234567\n",
             "dsymutil": "#!/usr/bin/env bash\nsource=$1; while (($#)); do if [[ $1 == -o ]]; then mkdir -p \"$2/Contents/Resources/DWARF\"; cp \"$MOCK_MACHO\" \"$2/Contents/Resources/DWARF/$(basename \"$source\")\"; printf '<plist version=\"1.0\"><dict/></plist>\\n' > \"$2/Contents/Info.plist\"; exit 0; fi; shift; done\n",
-            "strip": "#!/usr/bin/env bash\nwhile (($#)); do if [[ $1 == -o ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done\n",
+            "strip": "#!/usr/bin/env bash\nwhile (($#)); do if [[ $1 == -o ]]; then cp \"$MOCK_MACHO\" \"$2\"; head -c 8000000 /dev/zero >> \"$2\"; exit 0; fi; shift; done\n",
             "dwarfdump": "#!/usr/bin/env bash\ncase \" $* \" in *' --debug-info '*) root=${MOCK_DWARF_ROOT:-/work}; cat <<EOF\n0x00000000: DW_TAG_compile_unit\n              DW_AT_name (\"$root/crates/cli/src/main.rs\")\n              DW_AT_comp_dir (\"$root\")\n              DW_AT_stmt_list (0x00000000)\n.debug_line[0x00000000]\ninclude_directories[1] = \"$root/crates/cli/src\"\nfile_names[1] = {\n  name: \"main.rs\"\n  dir_index: 1\n}\nEOF\n;; *) printf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\";; esac\n",
             "python3": f"#!/usr/bin/env bash\nif [[ $2 == install ]]; then echo '{dump_syms}'; exit 0; fi\nexec /usr/bin/python3 \"$@\"\n",
             "mv": "#!/usr/bin/env bash\nif [[ ${MOCK_MV_PROMOTION_FAIL:-} && $1 == *.next && $2 == */macos ]]; then exit 77; fi; exec /bin/mv \"$@\"\n",
         }
         for name, body in commands.items():
             path = mock / name; path.write_text(body); path.chmod(0o755)
-        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C", "MOCK_MACHO": str(macho), "MOCK_HDIUTIL_COUNT": str(root / "hdiutil-count")}
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C", "MOCK_MACHO": str(macho), "MOCK_HDIUTIL_COUNT": str(root / "hdiutil-count"), "MOCK_HDIUTIL_ARGS": str(root / "hdiutil-args")}
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 0, result.stderr
         output = root / "target/distrib/native/macos"
@@ -1572,8 +1572,13 @@ def macos_producer_mock() -> None:
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
         env.pop("MOCK_ARCHES")
         diagnostics = root / ".scratch/package-macos-diagnostics/diagnostics.log"
-        counter = Path(env["MOCK_HDIUTIL_COUNT"])
-        counter.unlink(missing_ok=True)
+        counter, arg_log = Path(env["MOCK_HDIUTIL_COUNT"]), Path(env["MOCK_HDIUTIL_ARGS"])
+        def hdiutil_sizes() -> tuple[int, list[int]]:
+            lines = arg_log.read_text().splitlines()
+            sized = [re.search(r" -size (\d+)m ", line) for line in lines]
+            assert all(sized), lines
+            return int(lines[0].split()[0]), [int(match.group(1)) for match in sized]
+        counter.unlink(missing_ok=True); arg_log.unlink(missing_ok=True)
         env["MOCK_HDIUTIL_FAIL"] = "3"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
@@ -1582,6 +1587,8 @@ def macos_producer_mock() -> None:
         logged = diagnostics.read_text()
         assert all(f"mock reason {n}" in logged for n in (1, 2, 3)), logged
         assert "hdiutil create failed with exit status 77 after 3 attempts" in result.stderr, result.stderr
+        app_mb, sizes = hdiutil_sizes()
+        assert len(sizes) == 3 and sizes[0] >= app_mb + 50 and sizes[0] < sizes[1] < sizes[2], (app_mb, sizes)
         env.pop("MOCK_HDIUTIL_FAIL")
         counter.unlink(missing_ok=True)
         env["MOCK_SHASUM_FAIL"] = "1"
@@ -1594,12 +1601,13 @@ def macos_producer_mock() -> None:
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
         env.pop("MOCK_MV_PROMOTION_FAIL")
-        counter.unlink(missing_ok=True)
+        counter.unlink(missing_ok=True); arg_log.unlink(missing_ok=True)
         env["MOCK_HDIUTIL_FAIL"] = "1"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 0 and artifact.exists() and receipt.exists(), result.stderr
         logged = diagnostics.read_text()
         assert "mock reason 1" in logged and "exit status 77" in logged, logged
+        assert len(hdiutil_sizes()[1]) == 2, arg_log.read_text()
 
 
 def windows_checker_mock() -> None:
