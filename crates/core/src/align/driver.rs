@@ -536,6 +536,9 @@ pub fn align_stack_with(
         Err(lost @ AlgorithmError::BackendLost { .. }) => {
             let reason = lost.to_string();
             tracing::warn!(%reason, "rerunning the whole align stage on the CPU");
+            if let Some(control) = &options.control {
+                control.restart_align();
+            }
             if let Some(done) = &options.frames_done {
                 done.store(0, Ordering::SeqCst);
             }
@@ -1813,6 +1816,8 @@ mod tests {
     fn a_backend_loss_in_a_pooled_batch_reruns_the_stage_whatever_frame_failed_first() {
         let reader = NullReader;
         let stack = StackContext::new(4, 8, 8, 1);
+        let control = JobControl::new();
+        let frames_done = control.begin_align(4);
         let run = align_stack_with(
             &LossReachesTwoFramesAlign,
             stack,
@@ -1821,11 +1826,18 @@ mod tests {
             FailurePolicy::Strict,
             &AlignDriverOptions {
                 align_backend: Some(&DecliningBackend),
+                frames_done: Some(frames_done),
+                control: Some(Arc::clone(&control)),
                 ..Default::default()
             },
         )
         .expect("a loss anywhere in the batch reruns the stage on the CPU");
         assert!(run.rerun_reason.is_some());
         assert!(!run.backend_used);
+        assert_eq!(
+            control.progress().align_done,
+            4,
+            "the rerun restarts the count"
+        );
     }
 }

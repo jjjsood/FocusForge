@@ -1254,6 +1254,29 @@ fn prepare_eta_text_follows_the_engine_estimate() {
 }
 
 #[test]
+fn align_eta_text_follows_the_engine_estimate() {
+    use focusforge_gui::job::{RunState, bar_fraction, eta_text, progress_text};
+
+    let mut snapshot = align_progress(3, 61);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.eta = Some(Duration::from_secs(125));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 2:05");
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&snapshot)),
+        "3 of 61"
+    );
+    assert_eq!(bar_fraction(Some(&snapshot)), 3.0 / 61.0);
+    assert_eq!(eta_text(&RunState::Paused, Some(&snapshot)), "ETA —");
+
+    // Every frame done, the stage not yet moved on: the engine reports no
+    // estimate, never a rendered zero.
+    assert_eq!(
+        eta_text(&RunState::Running, Some(&align_progress(61, 61))),
+        "estimating"
+    );
+}
+
+#[test]
 fn prepare_stage_announcement_records_the_frame_total() {
     use focusforge_core::job::JobStage;
     use focusforge_core::pipeline::{RunStage, StageObserver};

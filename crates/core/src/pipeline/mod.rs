@@ -539,7 +539,11 @@ pub fn run(
                             budget: options.budget,
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
-                            on_pause: Some(&|control| observer.paused(control)),
+                            on_pause: Some(&|control| {
+                                let held = Instant::now();
+                                observer.paused(control);
+                                control.add_align_hold(held.elapsed());
+                            }),
                             align_backend: request.align_backend,
                         },
                     );
