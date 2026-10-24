@@ -4,6 +4,8 @@ param([Parameter(Mandatory = $true)][string]$Msi, [string]$Symbols = '')
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# msiexec rejects a relative path with forward slashes.
+$Msi = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Msi)
 $version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
 if (-not $Symbols) { $parent = Split-Path -Parent $Msi; if (-not $parent) { $parent = (Get-Location).Path }; $Symbols = Join-Path $parent 'symbols' }
 if (Test-Path (Join-Path $Symbols 'x86_64-pc-windows-msvc')) { $Symbols = Join-Path $Symbols 'x86_64-pc-windows-msvc' }
@@ -11,6 +13,8 @@ if (Test-Path (Join-Path $Symbols 'x86_64-pc-windows-msvc')) { $Symbols = Join-P
 if ($LASTEXITCODE -ne 0) { throw 'invalid symbol inventory' }
 $logs = Join-Path $root ('.scratch/check-package-windows/' + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
+# A hosted Windows runner has no GPU, only the WARP software adapter, which Slint refuses unless told otherwise.
+$env:SLINT_WGPU_CPU = '1'
 $product = Join-Path $env:ProgramFiles 'FocusForge'
 $installLog = Join-Path $logs 'install.log'
 $uninstallLog = Join-Path $logs 'uninstall.log'
@@ -53,7 +57,8 @@ function Assert-CrashRoundtrip([string]$Name, [string]$Binary, [string[]]$Argume
   if ($LASTEXITCODE -ne 0) { throw "$Name dump did not symbolicate" }
 }
 try {
-  & msiexec.exe /i $Msi /qn /norestart '/L*v' $installLog
+  # msiexec is a GUI program: only a pipeline makes PowerShell wait for it and set $LASTEXITCODE.
+  & msiexec.exe /i $Msi /qn /norestart '/L*v' $installLog | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "MSI install failed: $LASTEXITCODE" }
   foreach ($file in 'focusforge-cli.exe', 'focusforge-gui.exe', 'LICENSE', 'NOTICE', 'focusforge.ico') {
     if (-not (Test-Path (Join-Path $product $file))) { throw "missing installed file: $file" }
@@ -109,7 +114,7 @@ try {
   Assert-CrashRoundtrip 'focusforge-gui' (Join-Path $product 'focusforge-gui.exe')
 }
 finally {
-  & msiexec.exe /x $Msi /qn /norestart '/L*v' $uninstallLog
+  & msiexec.exe /x $Msi /qn /norestart '/L*v' $uninstallLog | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "MSI uninstall failed: $LASTEXITCODE" }
   if (Test-Path $product) { throw 'package directory remains after uninstall' }
   if (Test-Path $shortcut) { throw 'Start-menu shortcut remains after uninstall' }

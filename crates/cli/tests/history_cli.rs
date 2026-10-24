@@ -1345,9 +1345,7 @@ fn validation_states_are_reported() {
     // flag turns it into exit 0 plus its own warning.
     let manifest = Project::open(&project_path).unwrap().manifest().clone();
     let source_path = dir.join(&manifest.sources[0].path);
-    let mut frame_bytes = std::fs::read(&source_path).unwrap();
-    frame_bytes[0] ^= 0xFF;
-    std::fs::write(&source_path, &frame_bytes).unwrap();
+    common::rewrite_changed(&source_path, |bytes| bytes[0] ^= 0xFF);
 
     let output = run(&dir, &["history", "list", project_path.to_str().unwrap()]);
     assert_eq!(output.exit_code, Some(9));
@@ -1405,9 +1403,7 @@ fn accept_changed_sources_list_and_delete_changed_project() {
 
     let manifest = Project::open(&project).unwrap().manifest().clone();
     let source = dir.join(&manifest.sources[0].path);
-    let mut changed = std::fs::read(&source).unwrap();
-    changed[0] ^= 0xFF;
-    std::fs::write(source, changed).unwrap();
+    common::rewrite_changed(&source, |bytes| bytes[0] ^= 0xFF);
 
     let refused = run(&dir, &["history", "list", project.to_str().unwrap()]);
     assert_eq!(refused.exit_code, Some(9));

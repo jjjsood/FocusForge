@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The native folder/file picker: blocking, never `AsyncFileDialog`, which
-//! sidesteps slint-ui/slint#12437 (an open, macOS-only bug from an async
-//! dialog left open during a drag) by construction. Freezing the shell's
-//! own repaints while the dialog is up is correct: the portal dialog is a
-//! separate process with its own window.
+//! The native folder/file picker. [`crate::picker::request`] runs the blocking
+//! `rfd::FileDialog` on its own thread and delivers the answer on the event
+//! loop, so the window keeps repainting while the dialog is up. macOS keeps
+//! the blocking call on the main thread, which AppKit requires and which
+//! keeps slint-ui/slint#12437 (macOS-only, an async dialog left open during
+//! a drag) away.
 //!
 //! rfd 0.17.2's own risk
 //! (<https://github.com/PolyMeilex/rfd/issues/320>): a cancelled dialog and
 //! "no dialog backend available" both return `None` here. Either way
 //! nothing opens and the empty state stays on screen.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::entry::RAW_EXTENSIONS;
 use crate::job::{ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 
 /// Opens the OS folder picker. `None` on cancel (or a missing dialog
@@ -136,6 +139,125 @@ pub fn pick_frames() -> Option<Vec<PathBuf>> {
         .pick_files()
 }
 
+/// `extensions` in lower and upper case: portal filters are case-sensitive
+/// globs, and camera files often carry upper-case extensions.
+fn both_cases(extensions: &[&str]) -> Vec<String> {
+    extensions
+        .iter()
+        .flat_map(|ext| [ext.to_string(), ext.to_uppercase()])
+        .collect()
+}
+
+/// Opens the OS file picker, multi-select, filtered to TIFF frames and to
+/// camera RAW -- the empty state's `Open…`. `None` on cancel (or a missing
+/// dialog backend, rfd#320).
+pub fn pick_images() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title("Open images")
+        .add_filter("TIFF frames", &both_cases(TIFF_EXTENSIONS))
+        .add_filter("Camera RAW", &both_cases(RAW_EXTENSIONS))
+        .pick_files()
+}
+
+/// Which dialog [`request`] opens.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DialogRequest {
+    /// The folder picker.
+    Entry,
+    /// The `.ffp` file picker.
+    Project,
+    /// The multi-select TIFF frame picker.
+    Frames,
+    /// The multi-select TIFF and camera RAW picker that starts a project.
+    Images,
+    /// The project save dialog, starting at the proposed path.
+    SaveProject(PathBuf),
+    /// The image export dialog, starting at the proposed path.
+    SaveImage(PathBuf, ExportFormat),
+}
+
+/// A dialog's answer: `None` on cancel, otherwise the chosen paths -- one
+/// for every kind but [`DialogRequest::Frames`] and [`DialogRequest::Images`].
+pub type DialogAnswer = Option<Vec<PathBuf>>;
+
+type Continuation = Box<dyn FnOnce(DialogAnswer)>;
+
+thread_local! {
+    /// The open dialog's continuation, on the thread that asked.
+    static OPEN_DIALOG: RefCell<Option<Continuation>> = const { RefCell::new(None) };
+}
+
+fn run(request: DialogRequest) -> DialogAnswer {
+    let one = |path: Option<PathBuf>| path.map(|path| vec![path]);
+    match request {
+        DialogRequest::Entry => one(pick_entry()),
+        DialogRequest::Project => one(pick_project()),
+        DialogRequest::Frames => pick_frames(),
+        DialogRequest::Images => pick_images(),
+        DialogRequest::SaveProject(proposed) => one(pick_save_project(&proposed)),
+        DialogRequest::SaveImage(proposed, format) => one(pick_save_image(&proposed, format)),
+    }
+}
+
+/// Opens `request`'s dialog and later calls `answer` on the event loop with
+/// the result. `false` -- and nothing opens -- while another dialog is open.
+pub fn request(request: DialogRequest, answer: impl FnOnce(DialogAnswer) + 'static) -> bool {
+    let dispatch = if cfg!(target_os = "macos") {
+        Dispatch::Inline
+    } else {
+        Dispatch::Thread
+    };
+    request_with(request, answer, dispatch, run, |deliver| {
+        // The loop only refuses once it has stopped; no one is left to answer.
+        let _ = slint::invoke_from_event_loop(deliver);
+    })
+}
+
+/// Where a dialog runs.
+enum Dispatch {
+    Inline,
+    Thread,
+}
+
+/// [`request`] with the dialog runner and the event-loop hand-off supplied.
+/// The caller picks where `run` executes: on the calling thread, answering
+/// before the call returns, or on a spawned thread whose answer `post` hands
+/// back; `post` must make the closure it is given run on the calling thread.
+fn request_with(
+    request: DialogRequest,
+    answer: impl FnOnce(DialogAnswer) + 'static,
+    dispatch: Dispatch,
+    run: impl FnOnce(DialogRequest) -> DialogAnswer + Send + 'static,
+    post: impl FnOnce(Box<dyn FnOnce() + Send>) + Send + 'static,
+) -> bool {
+    if OPEN_DIALOG.with(|slot| slot.borrow().is_some()) {
+        return false;
+    }
+    OPEN_DIALOG.with(|slot| *slot.borrow_mut() = Some(Box::new(answer)));
+    // The slot empties before the continuation runs, so it may ask again.
+    fn deliver(answer: DialogAnswer) {
+        let continuation = OPEN_DIALOG.with(|slot| slot.borrow_mut().take());
+        if let Some(continuation) = continuation {
+            continuation(answer);
+        }
+    }
+    match dispatch {
+        Dispatch::Inline => deliver(run(request)),
+        Dispatch::Thread => {
+            let spawned = std::thread::Builder::new()
+                .name("file-dialog".into())
+                .spawn(move || {
+                    let answer = run(request);
+                    post(Box::new(move || deliver(answer)));
+                });
+            if spawned.is_err() {
+                deliver(None);
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +309,155 @@ mod tests {
             ensure_extension(PathBuf::from("/out/mantis.png"), ExportFormat::Tiff),
             Some(PathBuf::from("/out/mantis.png.tif"))
         );
+    }
+
+    type Posted = Box<dyn FnOnce() + Send>;
+
+    /// The answer the fake runner gives for `request`: two paths for
+    /// `Frames` and `Images`, none for the saves, one path otherwise.
+    fn fake_answer(request: &DialogRequest) -> Option<Vec<PathBuf>> {
+        match request {
+            DialogRequest::Entry => Some(vec![PathBuf::from("/pick/folder")]),
+            DialogRequest::Project => Some(vec![PathBuf::from("/pick/a.ffp")]),
+            DialogRequest::Frames | DialogRequest::Images => {
+                Some(vec![PathBuf::from("/f/1.tif"), PathBuf::from("/f/2.tif")])
+            }
+            DialogRequest::SaveProject(_) | DialogRequest::SaveImage(..) => None,
+        }
+    }
+
+    fn all_requests() -> Vec<DialogRequest> {
+        vec![
+            DialogRequest::Entry,
+            DialogRequest::Project,
+            DialogRequest::Frames,
+            DialogRequest::Images,
+            DialogRequest::SaveProject(PathBuf::from("/p/a.ffp")),
+            DialogRequest::SaveImage(PathBuf::from("/p/a.png"), ExportFormat::Png),
+        ]
+    }
+
+    #[test]
+    fn image_filters_list_each_extension_in_both_cases() {
+        assert_eq!(both_cases(&["tif", "tiff"]), ["tif", "TIF", "tiff", "TIFF"]);
+    }
+
+    #[test]
+    fn dialog_request_returns_before_the_answer() {
+        for request in all_requests() {
+            let (release, gate) = std::sync::mpsc::channel::<()>();
+            let (post_tx, post_rx) = std::sync::mpsc::channel::<Posted>();
+            let got = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let sink = got.clone();
+            let expected = fake_answer(&request);
+            let accepted = request_with(
+                request.clone(),
+                move |answer| *sink.borrow_mut() = Some(answer),
+                Dispatch::Thread,
+                move |asked| {
+                    assert_eq!(std::thread::current().name(), Some("file-dialog"));
+                    gate.recv().expect("the test releases the dialog");
+                    fake_answer(&asked)
+                },
+                move |closure| post_tx.send(closure).expect("the test holds the receiver"),
+            );
+            assert!(accepted, "{request:?} was accepted");
+            assert!(
+                got.borrow().is_none(),
+                "{request:?}: nothing answered while the dialog is open"
+            );
+            release.send(()).unwrap();
+            let posted = post_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the answer is posted");
+            assert!(
+                got.borrow().is_none(),
+                "{request:?}: posting is not delivering"
+            );
+            posted();
+            assert_eq!(*got.borrow(), Some(expected), "{request:?}");
+        }
+    }
+
+    #[test]
+    fn second_dialog_request_is_ignored_while_one_is_open() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (post_tx, post_rx) = std::sync::mpsc::channel::<Posted>();
+        let first = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = first.clone();
+        assert!(request_with(
+            DialogRequest::Entry,
+            move |answer| sink.borrow_mut().push(answer),
+            Dispatch::Thread,
+            move |asked| {
+                assert_eq!(std::thread::current().name(), Some("file-dialog"));
+                gate.recv().unwrap();
+                fake_answer(&asked)
+            },
+            move |closure| post_tx.send(closure).unwrap(),
+        ));
+        let accepted = request_with(
+            DialogRequest::Project,
+            |_| panic!("the ignored request's continuation never runs"),
+            Dispatch::Thread,
+            |_| panic!("the ignored request's dialog never opens"),
+            |_| panic!("the ignored request posts nothing"),
+        );
+        assert!(!accepted);
+        release.send(()).unwrap();
+        post_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()();
+        assert_eq!(*first.borrow(), vec![fake_answer(&DialogRequest::Entry)]);
+
+        let third = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sink = third.clone();
+        let (post_tx, post_rx) = std::sync::mpsc::channel::<Posted>();
+        assert!(request_with(
+            DialogRequest::Frames,
+            move |answer| *sink.borrow_mut() = Some(answer),
+            Dispatch::Thread,
+            |asked| fake_answer(&asked),
+            move |closure| post_tx.send(closure).unwrap(),
+        ));
+        post_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()();
+        assert_eq!(*third.borrow(), Some(fake_answer(&DialogRequest::Frames)));
+    }
+
+    #[test]
+    fn inline_dispatch_answers_before_returning() {
+        for request in all_requests() {
+            let (ran_on, ran_rx) = std::sync::mpsc::channel();
+            let got = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let sink = got.clone();
+            let again = std::rc::Rc::new(std::cell::Cell::new(false));
+            let asked_again = again.clone();
+            let expected = fake_answer(&request);
+            let accepted = request_with(
+                request.clone(),
+                move |answer| {
+                    *sink.borrow_mut() = Some(answer);
+                    asked_again.set(request_with(
+                        DialogRequest::Entry,
+                        |_| {},
+                        Dispatch::Inline,
+                        |_| None,
+                        |_| panic!("an inline dialog posts nothing"),
+                    ));
+                },
+                Dispatch::Inline,
+                move |asked| {
+                    ran_on.send(std::thread::current().id()).unwrap();
+                    fake_answer(&asked)
+                },
+                |_| panic!("an inline dialog posts nothing"),
+            );
+            assert!(accepted, "{request:?} was accepted");
+            assert_eq!(*got.borrow(), Some(expected), "{request:?}: answered");
+            assert_eq!(ran_rx.try_recv(), Ok(std::thread::current().id()));
+            assert!(again.get(), "{request:?}: the continuation may ask again");
+        }
     }
 }

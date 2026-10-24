@@ -9,7 +9,9 @@ ci = "github"
 hosting = "github"
 local-artifacts-jobs = ["./package-native"]
 pr-run-mode = "upload"
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]
+# release.yml carries the Linux package smoke steps added by hand after generation.
+allow-dirty = ["ci"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 installers = []
 github-build-setup = "../build-setup.yml"
 checksum = "sha256"
@@ -21,7 +23,7 @@ artifacts = [".scratch/package-linux/FocusForge-0.1.0-x86_64.AppImage", ".scratc
 
 [[dist.extra-artifacts]]
 build = ["python3", "tools/collect-native-artifacts.py"]
-artifacts = [".scratch/native-artifacts/FocusForge-0.1.0-universal.dmg", ".scratch/native-artifacts/FocusForge-0.1.0-x86_64.msi", ".scratch/native-artifacts/FocusForge-0.1.0-x86_64-apple-darwin-symbols.tar.gz", ".scratch/native-artifacts/FocusForge-0.1.0-aarch64-apple-darwin-symbols.tar.gz", ".scratch/native-artifacts/FocusForge-0.1.0-x86_64-pc-windows-msvc-symbols.tar.gz", ".scratch/native-artifacts/native-artifacts.sha256", ".scratch/native-artifacts/native-artifacts.json"]
+artifacts = [".scratch/native-artifacts/FocusForge-0.1.0-aarch64.dmg", ".scratch/native-artifacts/FocusForge-0.1.0-x86_64.msi", ".scratch/native-artifacts/FocusForge-0.1.0-aarch64-apple-darwin-symbols.tar.gz", ".scratch/native-artifacts/FocusForge-0.1.0-x86_64-pc-windows-msvc-symbols.tar.gz", ".scratch/native-artifacts/native-artifacts.sha256", ".scratch/native-artifacts/native-artifacts.json"]
 
 [dist.github-custom-runners]
 global = "ubuntu-24.04"

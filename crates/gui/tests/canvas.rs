@@ -913,12 +913,14 @@ fn right_pane_uses_composite_extent() {
             y: 0.0,
             width: 600.0,
             height: 600.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 600.0,
             y: 0.0,
             width: 600.0,
             height: 600.0,
+            scale_factor: 1.0,
         },
     );
     controller.fit();
@@ -1062,7 +1064,6 @@ fn frame_steps_keep_one_handle() {
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!("resident-memory measurement needs /proc/self/statm; skipping");
-        return;
     }
     #[cfg(target_os = "linux")]
     {
@@ -1166,6 +1167,7 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
         y: 0.0,
         width: 566.0,
         height: 377.0,
+        scale_factor: 1.0,
     };
 
     let mut vp = fit(img, pane);
@@ -2745,6 +2747,7 @@ fn backdrop_of(width: u32, height: u32, pane: f32) -> focusforge_gui::viewport::
             y: 0.0,
             width: pane,
             height: pane,
+            scale_factor: 1.0,
         },
     )
     .expect("a non-empty image and pane draw a backdrop")
@@ -3274,6 +3277,7 @@ fn backdrop_samples_match_a_direct_read() {
                     y: 0.0,
                     width: pane_side,
                     height: pane_side,
+                    scale_factor: 1.0,
                 },
             )
             .expect("a backdrop draw");
@@ -3654,4 +3658,58 @@ fn a_stroke_does_not_swallow_the_next_click() {
         click < BUDGET,
         "the Undo click took {click:?}, over {BUDGET:?}"
     );
+}
+
+/// A window's scale factor changes with its logical size untouched, as when
+/// a window moves to another monitor: the next geometry read carries the new
+/// factor into the draw.
+#[test]
+fn scale_factor_change_without_resize_reaches_the_next_draw() {
+    use slint::platform::WindowEvent;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    let mut controller = AppController::new();
+    open_fixture_tab(&mut controller, "scale_factor_change", "mantis-512", 3);
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1200, 760));
+    app.set_project_loaded(true);
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        Rc::new(RefCell::new(None)),
+    );
+    slint::platform::update_timers_and_animations();
+    app.invoke_canvas_resized();
+    {
+        let mut controller = controller.lock().unwrap();
+        controller.fit();
+        controller.zoom_out();
+    }
+    let before = controller
+        .lock()
+        .unwrap()
+        .frame_draw()
+        .expect("a loaded project draws");
+    assert!(
+        before.step.get() >= 2,
+        "the zoomed-out view decimates at factor 1 (step {})",
+        before.step
+    );
+    let width = app.get_canvas_pane_left_width();
+
+    app.window()
+        .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: 2.0 });
+    slint::platform::update_timers_and_animations();
+    app.invoke_canvas_resized();
+
+    assert_eq!(app.get_canvas_pane_left_width(), width);
+    let after = controller.lock().unwrap().frame_draw().unwrap();
+    assert_eq!(after.step.get(), (before.step.get() / 2).max(1));
+    assert_eq!(after.src, before.src);
 }

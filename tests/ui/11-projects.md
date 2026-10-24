@@ -55,7 +55,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 24. (human only) Click **Open project…** (`FFProjectsRail::open-project`), then cancel the file chooser that opens.
     Expect: the overlay stays open and still shows "No projects open".
 25. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overlay is gone; the canvas shows the title "No project open" and a button "Open folder…".
+    Expect: the overlay is gone; the canvas shows the title "No project open" and a button "Open…".
 26. Click **Fuse stack** (`FFToolbar::fuse-button`) with no project open.
     Expect: Must not: a job starts; the bottom bar status reads "No project open" and **Fuse stack** is greyed out (read with `buttons AppWindow::toolbar`: its line starts with `x`).
 27. Click **Export image** (`FFCheckpointPanel::checkpoint-export`) with no project open.

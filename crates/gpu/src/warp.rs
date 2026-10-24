@@ -253,7 +253,7 @@ pub(crate) fn warp_tile_dispatch(
                     .map_err(|source| AlignError::Read {
                         frame: frame_index,
                         rect: read,
-                        source,
+                        source: Box::new(source),
                     })?;
             }
             let src = Tile {

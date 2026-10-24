@@ -17,7 +17,6 @@ TARGETS = (
     ("x86_64-unknown-linux-gnu", "Linux x86_64"),
     ("x86_64-pc-windows-msvc", "Windows x86_64"),
     ("aarch64-apple-darwin", "macOS arm64"),
-    ("x86_64-apple-darwin", "macOS x86_64"),
 )
 TREE_PACKAGE = re.compile(r"^([A-Za-z0-9_-]+) v([^\s]+)(?: \(([^)]+)\))?$")
 ABOUT_COPYRIGHT = re.compile(r"Copyright © [^\";]+")
@@ -25,7 +24,7 @@ VERSION = re.compile(r"Version vendored: ([0-9.]+)")
 
 
 def run(command: list[str], root: Path) -> str:
-    completed = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    completed = subprocess.run(command, cwd=root, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if completed.returncode:
         raise ValueError(f"Cargo command failed ({completed.returncode}): {' '.join(command)}\n{completed.stderr.rstrip()}")
     return completed.stdout

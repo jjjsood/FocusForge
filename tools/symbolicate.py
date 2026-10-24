@@ -50,7 +50,20 @@ def verify_report(report: dict, inventory: dict) -> None:
         source = normalized_source(str(frame.get("file", frame.get("source", ""))))
         if source.startswith("crates/") and isinstance(frame.get("line"), int) and not isinstance(frame["line"], bool) and frame["line"] > 0:
             return
-    raise ValueError("crashing thread lacks an application source frame")
+    seen = "; ".join(
+        f"{frame.get('module')}!{frame.get('function')} {frame.get('file', frame.get('source'))}:{frame.get('line')}"
+        for frame in frames[:8]
+    )
+    applications = ", ".join(
+        f"{item.get('filename')} debug_id={item.get('debug_id')} loaded={item.get('loaded_symbols')} "
+        f"missing={item.get('missing_symbols')} corrupt={item.get('corrupt_symbols')} expected={known.get(item.get('debug_file'), (None, None))[1]}"
+        for item in modules
+        if item.get("filename") in {name for name, _ in known.values()} or item.get("debug_file") in known
+    )
+    raise ValueError(
+        f"crashing thread lacks an application source frame (first frames: {seen or 'none'}; "
+        f"crash: {report.get('crash_info')}; modules: {applications or 'none'})"
+    )
 
 
 def main() -> None:
@@ -60,7 +73,7 @@ def main() -> None:
     if not args.minidump.is_file() or not args.symbol_archive.is_file():
         raise SystemExit("minidump and archive must exist")
     machine, system = platform.machine().lower(), platform.system()
-    target = {("Linux", "x86_64"): "x86_64-unknown-linux-gnu", ("Linux", "amd64"): "x86_64-unknown-linux-gnu", ("Darwin", "x86_64"): "x86_64-apple-darwin", ("Darwin", "arm64"): "aarch64-apple-darwin", ("Windows", "amd64"): "x86_64-pc-windows-msvc"}.get((system, machine))
+    target = {("Linux", "x86_64"): "x86_64-unknown-linux-gnu", ("Linux", "amd64"): "x86_64-unknown-linux-gnu", ("Darwin", "arm64"): "aarch64-apple-darwin", ("Windows", "amd64"): "x86_64-pc-windows-msvc"}.get((system, machine))
     if not target:
         raise SystemExit(f"unsupported host target: {system}/{machine}")
     scratch = scratch_root()

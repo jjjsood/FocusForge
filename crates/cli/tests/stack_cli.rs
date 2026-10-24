@@ -1775,3 +1775,65 @@ fn equalize_settings_out_of_range_or_of_the_wrong_kind_are_refused_before_any_fr
         assert!(!out.stderr.contains(missing_dir), "{}", out.stderr);
     }
 }
+
+/// 999 copies of one constant frame stack to a composite equal to that
+/// constant: the Details residual mean stays exact at a large frame count.
+#[test]
+fn laplacian_constant_stack_round_trips() {
+    const CONSTANT: [u16; 3] = [39835, 49858, 60138];
+    let cwd = tmp_dir("stack_cli_constant_stack");
+    let frames = cwd.join("frames");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&frames).unwrap();
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let (width, height) = (128u32, 128u32);
+    let first = frames.join("frame-000.tif");
+    let samples: Vec<u16> = CONSTANT
+        .iter()
+        .copied()
+        .cycle()
+        .take((width * height * 3) as usize)
+        .collect();
+    let mut writer = TiffWriter::create(
+        &first,
+        TiffSpec {
+            width,
+            height,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .expect("constant frame writer must create");
+    writer
+        .write_tile(common::full_rect(width, height), &samples)
+        .expect("constant frame writer must accept the full tile");
+    writer.finish().expect("constant frame writer must finish");
+    for index in 1..999 {
+        std::fs::hard_link(&first, frames.join(format!("frame-{index:03}.tif"))).unwrap();
+    }
+
+    let out = run_cli_in(
+        &cwd,
+        &common::push_no_gpu(vec![
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            "laplacian",
+            "--no-align",
+            "--no-crop",
+            "--set",
+            "equalize=false",
+        ]),
+    );
+    assert!(out.success, "stack stderr: {}", out.stderr);
+
+    let (composite, _zmap) = export_both(&cwd, &out_dir.join("frame-000-998.ffp"));
+    let (samples, w, h, spp) = read_whole(&composite);
+    assert_eq!((w, h, spp), (width, height, 3));
+    for (i, &sample) in samples.iter().enumerate() {
+        assert_eq!(sample, CONSTANT[i % 3], "sample {i}");
+    }
+}

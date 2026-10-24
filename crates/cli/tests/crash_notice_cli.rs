@@ -184,12 +184,10 @@ fn an_unreadable_crash_file_still_hints() {
     std::fs::write(dir.join("crashes/truncated.json"), "{\"format\":1,").unwrap();
     std::fs::write(dir.join("crashes/frame.tif"), b"II*\0").unwrap();
     #[cfg(unix)]
-    let expected = {
-        use std::os::unix::fs::PermissionsExt;
-        let locked = dir.join("crashes/20260918T010203Z-focusforge-cli-7.json");
-        std::fs::write(&locked, "{\"format\":1,\"payload\":\"boom\"}").unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        2
+    let (expected, _locked) = {
+        let record = dir.join("crashes/20260918T010203Z-focusforge-cli-7.json");
+        std::fs::write(&record, "{\"format\":1,\"payload\":\"boom\"}").unwrap();
+        (2, common::UnreadableFile::lock(&record).unwrap())
     };
     #[cfg(not(unix))]
     let expected = 1;

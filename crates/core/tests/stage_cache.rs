@@ -23,6 +23,7 @@ use focusforge_core::job::{
     StageCache, StageKey,
 };
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
+use focusforge_core::project::source_hash_change_checked;
 use focusforge_core::registry;
 
 /// A directory of its own for one test, removed when the returned guard
@@ -57,6 +58,15 @@ fn sample_identity(algorithm: &str, policy: FailurePolicy) -> AlignIdentity {
     AlignIdentity::new(algorithm, params, policy, Vec::new())
 }
 
+/// Frame `i`'s content hash in the synthetic stacks.
+fn sample_hash(i: usize) -> Option<String> {
+    Some(format!("{i:064x}"))
+}
+
+fn sample_content(n: usize) -> Vec<String> {
+    (0..n).map(|i| sample_hash(i).unwrap()).collect()
+}
+
 fn sample_alignment(n: usize) -> StackAlignment {
     StackAlignment {
         reference: 0,
@@ -89,9 +99,9 @@ fn alignment_parameter_change_is_a_miss() {
     let scratch = tmp_dir("param-change");
     let cache = StageCache::open(scratch.path()).unwrap();
     cache
-        .put_alignment(&key_a, &[], &sample_alignment(2))
+        .put_alignment(&key_a, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
-    assert!(cache.get_alignment(&key_b).is_none());
+    assert!(cache.get_alignment(&key_b, sample_hash).is_none());
 }
 
 #[test]
@@ -103,11 +113,11 @@ fn a_strict_run_does_not_reuse_a_lax_alignment() {
     let cache = StageCache::open(scratch.path()).unwrap();
     let key_lax = StageKey::align(&fingerprint, &lax);
     cache
-        .put_alignment(&key_lax, &[], &sample_alignment(2))
+        .put_alignment(&key_lax, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
 
     let key_strict = StageKey::align(&fingerprint, &strict);
-    assert!(cache.get_alignment(&key_strict).is_none());
+    assert!(cache.get_alignment(&key_strict, sample_hash).is_none());
 }
 
 #[test]
@@ -118,19 +128,19 @@ fn changed_frame_is_a_miss() {
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
     cache
-        .put_alignment(&key, &[], &sample_alignment(2))
+        .put_alignment(&key, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
-    assert!(cache.get_alignment(&key).is_some());
+    assert!(cache.get_alignment(&key, sample_hash).is_some());
 
     let mut changed = fingerprint.clone();
     changed.frames[0].file_size += 1;
     let other_key = StageKey::align(&changed, &identity);
-    assert!(cache.get_alignment(&other_key).is_none());
+    assert!(cache.get_alignment(&other_key, sample_hash).is_none());
 
     let mut changed_strips = fingerprint;
     changed_strips.frames[0].strip_byte_counts[0] += 1;
     let other_key = StageKey::align(&changed_strips, &identity);
-    assert!(cache.get_alignment(&other_key).is_none());
+    assert!(cache.get_alignment(&other_key, sample_hash).is_none());
 }
 
 #[test]
@@ -305,13 +315,13 @@ fn changed_gains_change_the_align_digest() {
     identity.gains = vec![65_536, 65_537];
     let key = StageKey::align(&fingerprint, &identity);
     cache
-        .put_alignment(&key, &[], &sample_alignment(2))
+        .put_alignment(&key, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
-    assert!(cache.get_alignment(&key).is_some());
+    assert!(cache.get_alignment(&key, sample_hash).is_some());
     identity.gains = vec![65_536, 65_536];
     assert!(
         cache
-            .get_alignment(&StageKey::align(&fingerprint, &identity))
+            .get_alignment(&StageKey::align(&fingerprint, &identity), sample_hash)
             .is_none()
     );
 }
@@ -329,10 +339,10 @@ fn a_solver_revision_change_is_a_miss() {
     let scratch = tmp_dir("solver-revision");
     let cache = StageCache::open(scratch.path()).unwrap();
     cache
-        .put_alignment(&key_a, &[], &sample_alignment(3))
+        .put_alignment(&key_a, &[], &sample_content(3), &sample_alignment(3))
         .unwrap();
-    assert!(cache.get_alignment(&key_a).is_some());
-    assert!(cache.get_alignment(&key_b).is_none());
+    assert!(cache.get_alignment(&key_a, sample_hash).is_some());
+    assert!(cache.get_alignment(&key_b, sample_hash).is_none());
 }
 
 #[test]
@@ -364,9 +374,9 @@ fn a_renamed_input_directory_still_hits() {
     let scratch = tmp_dir("renamed");
     let cache = StageCache::open(scratch.path()).unwrap();
     cache
-        .put_alignment(&key_a, &[], &sample_alignment(3))
+        .put_alignment(&key_a, &[], &sample_content(3), &sample_alignment(3))
         .unwrap();
-    assert!(cache.get_alignment(&key_b).is_some());
+    assert!(cache.get_alignment(&key_b, sample_hash).is_some());
 }
 
 #[test]
@@ -412,8 +422,10 @@ fn a_round_trip_preserves_every_bit() {
     };
     let scratch = tmp_dir("round-trip");
     let cache = StageCache::open(scratch.path()).unwrap();
-    cache.put_alignment(&key, &[], &alignment).unwrap();
-    let back = cache.get_alignment(&key).expect("must hit");
+    cache
+        .put_alignment(&key, &[], &sample_content(2), &alignment)
+        .unwrap();
+    let back = cache.get_alignment(&key, sample_hash).expect("must hit");
 
     assert_eq!(back.frames.len(), alignment.frames.len());
     for (a, b) in alignment.frames.iter().zip(back.frames.iter()) {
@@ -427,9 +439,8 @@ fn a_round_trip_preserves_every_bit() {
     assert_eq!(alignment, back);
 }
 
-#[test]
-fn mtime_is_not_in_the_key() {
-    let scratch = tmp_dir("mtime");
+/// Copies the mantis-64 frames into `<scratch>/frames`, sorted.
+fn copy_mantis_frames(scratch: &tempfile::TempDir) -> Vec<PathBuf> {
     let frames_dir = scratch.path().join("frames");
     fs::create_dir_all(&frames_dir).unwrap();
     let source = common::fixtures_dir().join("mantis-64").join("frames");
@@ -448,37 +459,155 @@ fn mtime_is_not_in_the_key() {
         !paths.is_empty(),
         "fixtures/mantis-64/frames must hold at least one .tif"
     );
+    paths
+}
 
-    let fingerprint_before = StackFingerprint {
+fn header_fingerprint(paths: &[PathBuf]) -> StackFingerprint {
+    StackFingerprint {
         frames: paths
             .iter()
             .map(|p| FrameFingerprint::from(&FrameDesc::from(&TiffHeader::open(p).unwrap())))
             .collect(),
-    };
+    }
+}
+
+/// The whole-file hash of frame `i` of `paths`, as the pipeline asks for it.
+fn file_hash(paths: &[PathBuf], i: usize) -> Option<String> {
+    source_hash_change_checked(&paths[i])
+        .ok()
+        .map(|(_, hash)| hash)
+}
+
+#[test]
+fn mtime_is_not_in_the_key() {
+    let scratch = tmp_dir("mtime");
+    let paths = copy_mantis_frames(&scratch);
     let identity = sample_identity("ecc", FailurePolicy::Strict);
-    let key_before = StageKey::align(&fingerprint_before, &identity);
+    let key_before = StageKey::align(&header_fingerprint(&paths), &identity);
+    let content: Vec<String> = (0..paths.len())
+        .map(|i| file_hash(&paths, i).unwrap())
+        .collect();
 
     let cache = StageCache::open(scratch.path()).unwrap();
     cache
-        .put_alignment(&key_before, &paths, &sample_alignment(paths.len()))
+        .put_alignment(
+            &key_before,
+            &paths,
+            &content,
+            &sample_alignment(paths.len()),
+        )
         .unwrap();
 
     let future = SystemTime::now() + Duration::from_secs(3600);
     for p in &paths {
-        fs::File::open(p).unwrap().set_modified(future).unwrap();
+        // Windows refuses to set a time through a handle opened for reading only.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
     }
 
-    let fingerprint_after = StackFingerprint {
-        frames: paths
-            .iter()
-            .map(|p| FrameFingerprint::from(&FrameDesc::from(&TiffHeader::open(p).unwrap())))
-            .collect(),
-    };
-    let key_after = StageKey::align(&fingerprint_after, &identity);
+    let key_after = StageKey::align(&header_fingerprint(&paths), &identity);
     assert_eq!(key_before.digest(), key_after.digest());
     assert!(
-        cache.get_alignment(&key_after).is_some(),
+        cache
+            .get_alignment(&key_after, |i| file_hash(&paths, i))
+            .is_some(),
         "an entry keyed before the mtime touch must still hit after it"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_rewrite_with_restored_mtime_is_a_miss() {
+    let scratch = tmp_dir("rewrite");
+    let paths = copy_mantis_frames(&scratch);
+    let identity = sample_identity("ecc", FailurePolicy::Strict);
+    let key = StageKey::align(&header_fingerprint(&paths), &identity);
+    let content: Vec<String> = (0..paths.len())
+        .map(|i| file_hash(&paths, i).unwrap())
+        .collect();
+    let cache = StageCache::open(scratch.path()).unwrap();
+    cache
+        .put_alignment(&key, &paths, &content, &sample_alignment(paths.len()))
+        .unwrap();
+    assert!(
+        cache
+            .get_alignment(&key, |i| file_hash(&paths, i))
+            .is_some()
+    );
+
+    // Same length, same header, same inode, same modification time: only the
+    // pixels differ, and only the change time moves.
+    let last = paths.last().unwrap();
+    let modified = fs::metadata(last).unwrap().modified().unwrap();
+    let mut bytes = fs::read(last).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    use std::os::unix::fs::FileExt;
+    let file = fs::OpenOptions::new().write(true).open(last).unwrap();
+    file.write_all_at(&bytes, 0).unwrap();
+    file.set_modified(modified).unwrap();
+    drop(file);
+
+    let key_after = StageKey::align(&header_fingerprint(&paths), &identity);
+    assert_eq!(
+        key.digest(),
+        key_after.digest(),
+        "the headers are unchanged"
+    );
+    assert!(
+        cache
+            .get_alignment(&key_after, |i| file_hash(&paths, i))
+            .is_none(),
+        "a rewritten frame must not reuse the entry, whatever its mtime says"
+    );
+}
+
+#[test]
+fn a_header_match_with_other_content_is_a_miss() {
+    let scratch = tmp_dir("other-content");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    let fingerprint = sample_fingerprint(3);
+    let identity = sample_identity("ecc", FailurePolicy::Strict);
+    let key = StageKey::align(&fingerprint, &identity);
+    cache
+        .put_alignment(&key, &[], &sample_content(3), &sample_alignment(3))
+        .unwrap();
+
+    let mut asked = Vec::new();
+    let differs_at_the_last_frame = |i: usize| {
+        asked.push(i);
+        if i == 2 {
+            Some("f".repeat(64))
+        } else {
+            sample_hash(i)
+        }
+    };
+    assert!(
+        cache
+            .get_alignment(&key, differs_at_the_last_frame)
+            .is_none()
+    );
+    assert_eq!(asked, [0, 1, 2], "every frame up to the differing one");
+
+    let mut asked = Vec::new();
+    let differs_at_the_first_frame = |i: usize| {
+        asked.push(i);
+        Some("f".repeat(64))
+    };
+    assert!(
+        cache
+            .get_alignment(&key, differs_at_the_first_frame)
+            .is_none()
+    );
+    assert_eq!(asked, [0], "the lookup stops at the first differing frame");
+
+    assert!(
+        cache.get_alignment(&key, |_| None).is_none(),
+        "a frame that cannot be hashed is a miss"
     );
 }
 
@@ -490,7 +619,7 @@ fn truncated_entry_is_a_miss() {
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
     cache
-        .put_alignment(&key, &[], &sample_alignment(2))
+        .put_alignment(&key, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
 
     let path = cache.entry_path(&key);
@@ -498,7 +627,7 @@ fn truncated_entry_is_a_miss() {
     text.truncate(text.len() / 2);
     fs::write(&path, text).unwrap();
 
-    assert!(cache.get_alignment(&key).is_none());
+    assert!(cache.get_alignment(&key, sample_hash).is_none());
 }
 
 #[test]
@@ -509,9 +638,9 @@ fn entry_missing_a_required_field_is_a_miss() {
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
     cache
-        .put_alignment(&key, &[], &sample_alignment(2))
+        .put_alignment(&key, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
-    assert!(cache.get_alignment(&key).is_some());
+    assert!(cache.get_alignment(&key, sample_hash).is_some());
 
     let path = cache.entry_path(&key);
     let text = fs::read_to_string(&path).unwrap();
@@ -523,7 +652,7 @@ fn entry_missing_a_required_field_is_a_miss() {
         .remove("reference");
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
-    assert!(cache.get_alignment(&key).is_none());
+    assert!(cache.get_alignment(&key, sample_hash).is_none());
 }
 
 #[test]
@@ -534,9 +663,9 @@ fn entry_with_changed_frame_count_is_a_miss() {
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
     cache
-        .put_alignment(&key, &[], &sample_alignment(2))
+        .put_alignment(&key, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
-    assert!(cache.get_alignment(&key).is_some());
+    assert!(cache.get_alignment(&key, sample_hash).is_some());
 
     let path = cache.entry_path(&key);
     let text = fs::read_to_string(&path).unwrap();
@@ -544,7 +673,7 @@ fn entry_with_changed_frame_count_is_a_miss() {
     value["frame_count"] = serde_json::json!(3);
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
-    assert!(cache.get_alignment(&key).is_none());
+    assert!(cache.get_alignment(&key, sample_hash).is_none());
 }
 
 #[test]
@@ -563,14 +692,14 @@ fn a_digest_collision_is_a_miss() {
     // -- an entry whose file name matches key_a but whose stored digest is
     // key_b's.
     cache
-        .put_alignment(&key_b, &[], &sample_alignment(2))
+        .put_alignment(&key_b, &[], &sample_content(2), &sample_alignment(2))
         .unwrap();
     let path_b = cache.entry_path(&key_b);
     let path_a = cache.entry_path(&key_a);
     fs::create_dir_all(path_a.parent().unwrap()).unwrap();
     fs::rename(&path_b, &path_a).unwrap();
 
-    assert!(cache.get_alignment(&key_a).is_none());
+    assert!(cache.get_alignment(&key_a, sample_hash).is_none());
 }
 
 #[test]
@@ -581,7 +710,7 @@ fn alignment_entry_size_is_bounded() {
     let identity = sample_identity("ecc", FailurePolicy::Strict);
     let key = StageKey::align(&fingerprint, &identity);
     cache
-        .put_alignment(&key, &[], &sample_alignment(61))
+        .put_alignment(&key, &[], &sample_content(61), &sample_alignment(61))
         .unwrap();
 
     let path = cache.entry_path(&key);

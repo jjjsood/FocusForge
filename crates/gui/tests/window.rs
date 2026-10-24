@@ -285,6 +285,8 @@ fn refused_save_folder_is_logged_and_the_window_opens() {
     let dir = common::tree("refused_save_folder");
     let file = dir.join("not-a-folder");
     std::fs::write(&file, b"x").expect("write the regular file");
+    // Only the Unix block below adds a third folder.
+    #[cfg_attr(not(unix), allow(unused_mut, clippy::useless_vec))]
     let mut refused = vec![dir.join("missing"), file];
     #[cfg(unix)]
     {

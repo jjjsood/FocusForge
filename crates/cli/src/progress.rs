@@ -47,12 +47,19 @@ impl ProgressMode {
     }
 }
 
+/// `prepare <done>/<total> frames` while the prepare stage counts frames;
 /// `align <done>/<total> frames` while a computed align stage is running;
 /// otherwise `fuse <done>/<total> tiles <pct>% eta <duration|<1s|-->`.
 /// `eta` reads `--` until the first unit completes, and a genuine
 /// sub-second estimate renders as `<1s` rather than a `0s` that would
 /// read as "finished" while units are still running.
 pub fn format_line(progress: &JobProgress) -> String {
+    if progress.stage == JobStage::Prepare && progress.prepare_total > 0 {
+        return format!(
+            "prepare {}/{} frames",
+            progress.prepare_done, progress.prepare_total
+        );
+    }
     if progress.stage == JobStage::Align && progress.align_total > 0 {
         return format!(
             "align {}/{} frames",
@@ -219,6 +226,8 @@ mod tests {
             eta,
             align_done: 0,
             align_total: 0,
+            prepare_done: 0,
+            prepare_total: 0,
         }
     }
 
@@ -233,7 +242,33 @@ mod tests {
             eta: None,
             align_done,
             align_total,
+            prepare_done: 0,
+            prepare_total: 0,
         }
+    }
+
+    fn prepare_progress(prepare_done: usize, prepare_total: usize) -> JobProgress {
+        JobProgress {
+            stage: JobStage::Prepare,
+            prepare_done,
+            prepare_total,
+            ..progress(0, 0, None)
+        }
+    }
+
+    #[test]
+    fn prepare_line_counts_frames() {
+        assert_eq!(format_line(&prepare_progress(3, 8)), "prepare 3/8 frames");
+        assert_eq!(
+            format_line(&prepare_progress(61, 61)),
+            "prepare 61/61 frames"
+        );
+    }
+
+    #[test]
+    fn prepare_line_without_a_total_falls_back_to_the_fuse_line() {
+        let line = format_line(&prepare_progress(0, 0));
+        assert!(line.starts_with("fuse "), "line was: {line}");
     }
 
     #[test]

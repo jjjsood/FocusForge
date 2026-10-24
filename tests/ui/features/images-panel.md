@@ -11,4 +11,4 @@ Gotchas:
 - `--frame-remove-warning N` removes frame N right after open, before any checkpoint, so it removes at once with no warning; it only warns for a saved project. `--images-sort-menu-open` starts with the sort menu open.
 - A fresh settings folder shows Image list (120 px rows), where an 8-frame list runs below the fold and the lower rows are absent from the tree; 10-images-panel.md switches to List first so every row is mounted. A row drag starts on the file name (List) or on the file name or preview image (Image list, Large previews); 13-source-image-views.md drives it in Large previews. A step after a human-only drag must not depend on it having happened (the sort check mark stays on "Name" without a drag and is cleared with one).
 - Human only: dragging a row in List, the native file dialog behind the add icon, wheel scrolling the list, judging the frame thumbnails.
-Guides: 10-images-panel.md, 13-source-image-views.md
+Guides: 10-images-panel.md, 13-source-image-views.md, 19-editor-source-list.md

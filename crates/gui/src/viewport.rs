@@ -23,6 +23,19 @@ pub struct PaneRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Device pixels per logical pixel of the window the pane is in; a
+    /// non-finite or non-positive value reads as 1.
+    pub scale_factor: f32,
+}
+
+/// The pane's device scale factor, or 1 when it is not a positive finite number.
+fn device_scale(pane: PaneRect) -> f64 {
+    let factor = f64::from(pane.scale_factor);
+    if factor.is_finite() && factor > 0.0 {
+        factor
+    } else {
+        1.0
+    }
 }
 
 /// The loaded project's composite/Z-Map size, in source pixels.
@@ -38,7 +51,6 @@ pub struct ImageSize {
 pub struct Viewport {
     scale: f64,
     centre: (f64, f64),
-    reference: PaneRect,
     /// Whether this viewport is exactly the one `fit` last produced and has
     /// not been zoomed or panned away from since -- distinct from "does
     /// `scale` currently equal `fit_scale`", which a zoom can land on by
@@ -64,7 +76,8 @@ pub fn backdrop_draw(image: ImageSize, pane: PaneRect) -> Option<PaneDraw> {
     if image.width == 0 || image.height == 0 || pane.width <= 0.0 || pane.height <= 0.0 {
         return None;
     }
-    let axis = |image: u32, pane: f32| (image as f64 / pane as f64).ceil() as u32;
+    let device = device_scale(pane);
+    let axis = |image: u32, pane: f32| (image as f64 / (pane as f64 * device)).ceil() as u32;
     let step = axis(image.width, pane.width)
         .max(axis(image.height, pane.height))
         .max(1);
@@ -123,17 +136,7 @@ pub fn fit_two(image: ImageSize, left: PaneRect, right: PaneRect) -> Viewport {
     Viewport {
         scale,
         centre: (image.width as f64 / 2.0, image.height as f64 / 2.0),
-        reference: reference_pane(left, right),
         at_fit: true,
-    }
-}
-
-fn reference_pane(left: PaneRect, right: PaneRect) -> PaneRect {
-    PaneRect {
-        x: 0.0,
-        y: 0.0,
-        width: left.width.min(right.width),
-        height: left.height.min(right.height),
     }
 }
 
@@ -171,9 +174,9 @@ pub struct PaneDraw {
     /// hands the composite/Z-Map tile readers' stepped reads.
     pub src: (u32, u32, u32, u32),
     /// `(x, y, width, height)` in pane-local logical px -- `FFPane::image-x/
-    /// image-y/image-w/image-h`. The two panes share one viewport, not one
-    /// image extent: each uses the same source rect, centred inside its own
-    /// pane. Extra pane area remains the pane's black background.
+    /// image-y/image-w/image-h`. Each pane draws its own visible source rect
+    /// around the shared centre at the shared scale; a pane larger than the
+    /// image shows black beyond the image edge.
     pub dst: (f32, f32, f32, f32),
     /// `(x, y, width, height)` in pane-local logical px for the exact,
     /// continuous visible source rect. `FFPane` uses this to clip `dst` and
@@ -183,8 +186,9 @@ pub struct PaneDraw {
     /// `pixelated` at or above 100 %, `smooth` below it.
     pub pixelated: bool,
     /// Every `step`-th source row and column of `src` is read:
-    /// `max(1, floor(1 / scale))`, so a zoomed-out draw reads at least one
-    /// sample per pane pixel and under two per axis, and 1 at or above 100 %.
+    /// `max(1, floor(1 / (scale * factor)))` for the pane's device scale
+    /// factor, so a zoomed-out draw reads at least one sample per device pixel
+    /// and under two per axis, and 1 once a source pixel covers a device pixel.
     pub step: NonZeroU32,
 }
 
@@ -273,18 +277,6 @@ impl Viewport {
         self.scale
     }
 
-    /// The source-space point drawn at this viewport's reference pane's
-    /// top-left. Pane-specific callers use [`Self::to_source_in`].
-    pub fn origin(&self) -> (f64, f64) {
-        origin_for(self.centre, self.reference, self.scale)
-    }
-
-    /// The source-space point under a pane-local point: `origin() + local /
-    /// scale()`.
-    pub fn to_source(&self, local: (f32, f32)) -> (f64, f64) {
-        self.to_source_in(local, self.reference)
-    }
-
     /// The source-space point under `local` in `pane`.
     pub fn to_source_in(&self, local: (f32, f32), pane: PaneRect) -> (f64, f64) {
         let (ox, oy) = origin_for(self.centre, pane, self.scale);
@@ -334,7 +326,6 @@ impl Viewport {
             src.0 - (anchor.0 as f64 - gesture_pane.width as f64 / 2.0) / new_scale,
             src.1 - (anchor.1 as f64 - gesture_pane.height as f64 / 2.0) / new_scale,
         );
-        self.reference = reference_pane(gesture_pane, other_pane);
         self.at_fit = false;
         self.clamp_two(image, gesture_pane, other_pane);
     }
@@ -429,9 +420,9 @@ impl Viewport {
         if image.width == 0 || image.height == 0 || pane.width <= 0.0 || pane.height <= 0.0 {
             return None;
         }
-        let (origin_x, origin_y) = origin_for(self.centre, self.reference, self.scale);
-        let visible_w = self.reference.width as f64 / self.scale;
-        let visible_h = self.reference.height as f64 / self.scale;
+        let (origin_x, origin_y) = origin_for(self.centre, pane, self.scale);
+        let visible_w = pane.width as f64 / self.scale;
+        let visible_h = pane.height as f64 / self.scale;
 
         let x0 = origin_x.max(0.0);
         let y0 = origin_y.max(0.0);
@@ -453,23 +444,22 @@ impl Viewport {
             (sy1 - sy0) as u32,
         );
         let dst = (
-            ((pane.width - self.reference.width) as f64 / 2.0 + (sx0 - origin_x) * self.scale)
-                as f32,
-            ((pane.height - self.reference.height) as f64 / 2.0 + (sy0 - origin_y) * self.scale)
-                as f32,
+            ((sx0 - origin_x) * self.scale) as f32,
+            ((sy0 - origin_y) * self.scale) as f32,
             ((sx1 - sx0) * self.scale) as f32,
             ((sy1 - sy0) * self.scale) as f32,
         );
         let crop = (
-            ((pane.width - self.reference.width) as f64 / 2.0 + (x0 - origin_x) * self.scale)
-                as f32,
-            ((pane.height - self.reference.height) as f64 / 2.0 + (y0 - origin_y) * self.scale)
-                as f32,
+            ((x0 - origin_x) * self.scale) as f32,
+            ((y0 - origin_y) * self.scale) as f32,
             ((x1 - x0) * self.scale) as f32,
             ((y1 - y0) * self.scale) as f32,
         );
-        // The epsilon lands the 50 % and 25 % stops on exactly 2 and 4.
-        let step = (1.0 / self.scale + 1e-6).floor().max(1.0) as u32;
+        // One sample per device pixel; the epsilon lands the 50 % and 25 %
+        // stops on exactly 2 and 4 at factor 1.
+        let step = (1.0 / (self.scale * device_scale(pane)) + 1e-6)
+            .floor()
+            .max(1.0) as u32;
         Some(PaneDraw {
             src,
             dst,
@@ -498,7 +488,6 @@ impl Viewport {
         {
             self.scale = min;
         }
-        self.reference = reference_pane(left, right);
         self.clamp_two(image, left, right);
     }
 }

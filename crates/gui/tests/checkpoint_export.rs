@@ -1286,3 +1286,81 @@ fn a_format_refusal_names_its_cause_and_offers_close_only() {
     assert!(!out.exists());
     controller.cancel_export();
 }
+
+#[test]
+fn save_and_export_dialogs_run_unlocked_for_export() {
+    use std::sync::{Arc, Mutex};
+
+    let mut controller = scratch_controller("export_dialog_unlocked");
+    open_fused_tab(&mut controller, "export_dialog_unlocked", 3);
+    controller.checkpoint_export_requested();
+    controller.export_select_format("TIFF");
+    let controller = Arc::new(Mutex::new(controller));
+
+    let (tab_id, format, proposed) = controller
+        .lock()
+        .unwrap()
+        .export_destination_request()
+        .expect("a ready modal proposes a destination");
+    assert_eq!(format, ExportFormat::Tiff);
+    assert!(
+        controller.try_lock().is_ok(),
+        "the save dialog runs with the controller free"
+    );
+
+    let chosen = common::tree("export_dialog_unlocked_elsewhere").join("renamed.tif");
+    assert_ne!(chosen.file_name(), proposed.file_name());
+    let mut controller = controller.lock().unwrap();
+    controller.export_destination_chosen(tab_id, format, chosen.clone());
+    assert!(controller.take_export_started());
+    wait_export(&mut controller);
+    assert!(chosen.is_file(), "{} must be written", chosen.display());
+    assert!(!proposed.exists(), "nothing is written at the proposal");
+}
+
+#[test]
+fn stale_dialog_answer_is_dropped_for_export() {
+    let mut controller = scratch_controller("export_dialog_stale");
+    open_fused_tab(&mut controller, "export_dialog_stale", 3);
+    let out = common::tree("export_dialog_stale_out");
+    let target = |name: &str| out.join(name);
+
+    // The modal was cancelled while the dialog was up.
+    controller.checkpoint_export_requested();
+    controller.export_select_format("TIFF");
+    let (tab_id, format, _) = controller.export_destination_request().unwrap();
+    controller.cancel_export();
+    controller.export_destination_chosen(tab_id, format, target("cancelled.tif"));
+    assert!(!controller.take_export_started());
+    assert!(!target("cancelled.tif").exists());
+
+    // The format changed while the dialog was up: the path was chosen for
+    // another format, and the modal stays as the user left it.
+    controller.checkpoint_export_requested();
+    controller.export_select_format("TIFF");
+    let (tab_id, format, _) = controller.export_destination_request().unwrap();
+    controller.export_select_format("PNG");
+    controller.export_destination_chosen(tab_id, format, target("switched.tif"));
+    assert!(!controller.take_export_started());
+    assert!(!target("switched.tif").exists());
+    assert_eq!(controller.export_format(), ExportFormat::Png);
+    assert_eq!(controller.export_stage(), "ready");
+
+    // The modal already moved to writing: a second answer starts nothing.
+    controller.export_select_format("TIFF");
+    let (tab_id, format, _) = controller.export_destination_request().unwrap();
+    controller.export_destination_chosen(tab_id, format, target("first.tif"));
+    assert!(controller.take_export_started());
+    controller.export_destination_chosen(tab_id, format, target("second.tif"));
+    assert!(!controller.take_export_started());
+    wait_export(&mut controller);
+    assert!(target("first.tif").is_file());
+    assert!(!target("second.tif").exists());
+
+    // A cancelled dialog leaves the modal open on `Ready`.
+    controller.checkpoint_export_requested();
+    controller.export_confirmed(|_| None);
+    assert_eq!(controller.export_stage(), "ready");
+    assert!(!controller.take_export_started());
+    assert!(controller.export_destination_request().is_some());
+}

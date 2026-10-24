@@ -450,12 +450,12 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
         extras = dist["dist"]["extra-artifacts"]
     except (KeyError, TypeError, tomllib.TOMLDecodeError):
         return False
-    if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
+    if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
         return False
     if dist["dist"].get("local-artifacts-jobs") != ["./package-native"] or dist["dist"].get("pr-run-mode") != "upload": return False
     linux = next((item for item in extras if item.get("build") == ["tools/package-linux.sh"]), None)
     native_extra = next((item for item in extras if item.get("build") == ["python3", "tools/collect-native-artifacts.py"]), None)
-    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 7: return False
+    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 6: return False
     checker = "python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
     step = setup[setup.find("- name: Require exact check run"):setup.find("- name: Require locked release Cargo profile")]
     if checker not in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
@@ -491,7 +491,7 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
 def graph() -> None:
     config = (ROOT / "dist-workspace.toml").read_text(); setup = (ROOT / ".github/build-setup.yml").read_text()
     release = (ROOT / ".github/workflows/release.yml").read_text(); native = NATIVE_WORKFLOW.read_text(); assert valid_graph(config, setup, release, native)
-    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
+    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
     assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release, native)
     assert not valid_graph(config, setup.replace("if: github.event_name != 'pull_request'", "if: false", 1), release, native)
     assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release, native)
@@ -639,7 +639,7 @@ def native_boundaries() -> None:
     call(["bash", str(ROOT / "tools/package-macos.sh"), "--output", "/tmp/outside-native-packages"], False)
     call(["python3", "-c", "import pathlib; compile(pathlib.Path(__import__('sys').argv[1]).read_text(), __import__('sys').argv[1], 'exec')", str(NATIVE_COLLECTOR)])
     old_plan = os.environ.get("DIST_PLAN")
-    required = [f"FocusForge-{collector.version()}-x86_64-unknown-linux-gnu-symbols.tar.gz", f"FocusForge-{collector.version()}-universal.dmg", f"FocusForge-{collector.version()}-x86_64.msi", f"FocusForge-{collector.version()}-x86_64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-aarch64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-x86_64-pc-windows-msvc-symbols.tar.gz", "native-artifacts.sha256", "native-artifacts.json"]
+    required = [f"FocusForge-{collector.version()}-x86_64-unknown-linux-gnu-symbols.tar.gz", f"FocusForge-{collector.version()}-aarch64.dmg", f"FocusForge-{collector.version()}-x86_64.msi", f"FocusForge-{collector.version()}-aarch64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-x86_64-pc-windows-msvc-symbols.tar.gz", "native-artifacts.sha256", "native-artifacts.json"]
     plan = {"releases": [{"app_name": name, "app_version": collector.version(), "artifacts": [*(f"{name}-{target}.zip" for target in collector.TARGETS), *required]} for name in sorted(collector.PACKAGES)]}
     os.environ["DIST_PLAN"] = json.dumps(plan)
     try:
@@ -669,20 +669,17 @@ def native_boundaries() -> None:
                     if target_name.endswith("windows-msvc"):
                         guid = __import__("uuid").UUID(hex=identifier[:32]).bytes_le; age = int(identifier[32:], 16)
                         path.write_bytes(msf_pdb(guid, age)); return
-                    raw = bytes.fromhex(identifier[:32]); slices = []
-                    for cpu in (0x1000007, 0x100000C): slices.append(struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + raw)
-                    data = bytearray(12288); struct.pack_into(">II", data, 0, 0xCAFEBABE, 2)
-                    for index, (cpu, payload) in enumerate(zip((0x1000007, 0x100000C), slices)): offset = 4096 * (index + 1); struct.pack_into(">IIIII", data, 8 + index * 20, cpu, 3, offset, len(payload), 12); data[offset:offset + len(payload)] = payload
-                    dwarf = path / "Contents/Resources/DWARF" / logical; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(data)
-                for platform, kind, suffix in (("macos", "dmg", "universal.dmg"), ("windows", "msi", "x86_64.msi")):
+                    raw = bytes.fromhex(identifier[:32])
+                    dwarf = path / "Contents/Resources/DWARF" / logical; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + raw)
+                for platform, kind, suffix in (("macos", "dmg", "aarch64.dmg"), ("windows", "msi", "x86_64.msi")):
                     target = native / platform; target.mkdir(parents=True)
                     artifact = target / f"FocusForge-{collector.version()}-{suffix}"; artifact.write_bytes(platform.encode())
                     receipt = {"kind": kind, "version": collector.version(), "revision": revision, "artifact": artifact.name, "sha256": collector.sha256(artifact)}
                     (target / "native-receipt.json").write_text(json.dumps(receipt))
-                    for symbol_target in {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]:
+                    for symbol_target in {"macos": ("aarch64-apple-darwin",), "windows": ("x86_64-pc-windows-msvc",)}[platform]:
                         symbols = target / "symbols" / symbol_target
                         native_inputs = {}; symbols_by_name = {}
-                        module_os, module_cpu, suffix = {"x86_64-apple-darwin": ("Mac", "x86_64", ".dSYM"), "aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"), "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb")}[symbol_target]
+                        module_os, module_cpu, suffix = {"aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"), "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb")}[symbol_target]
                         for name, identifier in (("focusforge-cli", "73DB7F2DB3A643B9DFD8FF6C4DFF41940"), ("focusforge-gui", "05CE7935D101B8E6E397B49D6F6716080")):
                             debug_name = f"{name}{suffix}" if suffix != ".pdb" else f"actual-{name}.pdb"
                             debug = symbols / "native" / debug_name; debug.parent.mkdir(parents=True, exist_ok=True)
@@ -712,14 +709,14 @@ def native_boundaries() -> None:
             for field, value in (("revision", "0" * 40), ("version", "9.9.9"), ("artifact", "wrong.dmg"), ("kind", "msi"), ("sha256", "0" * 64)):
                 reject(receipt_field(field, value))
             reject(lambda: receipt.write_text("{"))
-            reject(lambda: (native / "macos/FocusForge-0.1.0-universal.dmg").unlink())
+            reject(lambda: (native / "macos/FocusForge-0.1.0-aarch64.dmg").unlink())
             reject(lambda: shutil.rmtree(native / "macos/symbols/aarch64-apple-darwin"))
             def wrong_target() -> None:
                 path = native / "windows/symbols/x86_64-pc-windows-msvc/symbol-inventory.json"
-                body = json.loads(path.read_text()); body["platform"] = "x86_64-apple-darwin"; path.write_text(json.dumps(body))
+                body = json.loads(path.read_text()); body["platform"] = "aarch64-apple-darwin"; path.write_text(json.dumps(body))
             reject(wrong_target)
             reject(lambda: (native / "windows/symbols/x86_64-pc-windows-msvc/FocusForge-0.1.0-x86_64-pc-windows-msvc-symbols.tar.gz").write_bytes(b"corrupt"))
-            reject(lambda: (native / "macos/symbols/x86_64-apple-darwin/stale").write_text("stale"))
+            reject(lambda: (native / "macos/symbols/aarch64-apple-darwin/stale").write_text("stale"))
             def duplicate() -> None:
                 nested = native / "native/macos"; nested.mkdir(parents=True)
                 shutil.copytree(native / "macos", nested, dirs_exist_ok=True)
@@ -973,7 +970,7 @@ def source_privacy_cases() -> None:
             return module.inspect_native("x86_64-unknown-linux-gnu", clean, "focusforge-cli")
         def rejects(label: str, rawline: str, message: str) -> None:
             try: inspect_records(rawline)
-            except ValueError as error: assert str(error) == message, (label, error)
+            except ValueError as error: assert str(error).startswith(message), (label, error)
             else: raise AssertionError(f"{label} accepted")
         try:
             empty_clean = main_table + """ Offset: 64
@@ -1036,6 +1033,14 @@ def source_privacy_cases() -> None:
         pdb = root / "source.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs"))
         pdb_inspection = module.inspect_windows_native(pdb)
         assert pdb_inspection["source_paths"] == ["/work", "/work/crates/cli/src/main.rs"] and pdb_inspection["coverage"]["module_c13_records"] == 1 and pdb_inspection["coverage"]["environment_records"] == 2
+        bare_pdb = root / "no-module-sources.pdb"; bare_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs", module_sources=False))
+        assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(bare_pdb)["source_paths"]
+        linked_pdb = root / "linked-names.pdb"; linked_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "/work/crates/cli/src/main.rs", names_stream=True))
+        assert module.inspect_windows_native(linked_pdb)["source_paths"] == module.inspect_windows_native(pdb)["source_paths"]
+        broken_pdb = bytearray(linked_pdb.read_bytes()); broken_pdb[8 * 512:8 * 512 + 4] = bytes(4); linked_pdb.write_bytes(broken_pdb)
+        try: module.inspect_windows_native(linked_pdb)
+        except ValueError as error: assert "/names" in str(error), error
+        else: raise AssertionError("PDB with a damaged /names stream accepted")
         trusted_pdb = root / "trusted-source.pdb"; trusted_pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "C:/work/crates/cli/src/nested space/main.rs"))
         assert "C:/work/crates/cli/src/nested space/main.rs" in module.inspect_windows_native(trusted_pdb)["source_paths"]
         for index, private_source in enumerate(("/private checkout.Åsa/main.rs", "E:/private 用户/main.rs", "//server/private/checkout/main.rs")):
@@ -1049,7 +1054,7 @@ def source_privacy_cases() -> None:
         try: module.inspect_windows_native(malformed_path)
         except ValueError: pass
         else: raise AssertionError("odd CodeView environment fields accepted")
-        for platform in ("x86_64-apple-darwin", "x86_64-pc-windows-msvc"):
+        for platform in ("aarch64-apple-darwin", "x86_64-pc-windows-msvc"):
             portable = root / platform
             if platform.endswith("apple-darwin"):
                 archive = write_macos_symbols(portable, platform)
@@ -1064,6 +1069,95 @@ def source_privacy_cases() -> None:
             try: module.verify_inventory(portable)
             except ValueError: pass
             else: raise AssertionError(f"portable {platform} inspection mutation accepted")
+
+
+def hosted_runner(module: types.ModuleType, root: str, hosted: bool = True):
+    """Pretend the checkout lives at `root`, on a hosted runner or not."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def scope():
+        saved_root, saved_env = module.ROOT, os.environ.get("GITHUB_ACTIONS")
+        module.ROOT = Path(root)
+        if hosted: os.environ["GITHUB_ACTIONS"] = "true"
+        else: os.environ.pop("GITHUB_ACTIONS", None)
+        try: yield
+        finally:
+            module.ROOT = saved_root
+            if saved_env is None: os.environ.pop("GITHUB_ACTIONS", None)
+            else: os.environ["GITHUB_ACTIONS"] = saved_env
+    return scope()
+
+
+def hosted_runner_path_cases() -> None:
+    module = symbol_module()
+    windows, macos = "D:/a/FocusForge/FocusForge", "/Users/runner/work/FocusForge/FocusForge"
+    accepted = (
+        (windows, r"D:\a\FocusForge\FocusForge\crates\gui\src\main.rs", "crates/gui/src/main.rs"),
+        (windows, r"d:\a\FocusForge\FocusForge\crates\gui\src\main.rs", "crates/gui/src/main.rs"),
+        (windows, r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
+        (windows, r"C:\Users\runneradmin\.cargo\git\checkouts\cv-9d8edb0abe48fcfc\d271a9a\akaze\src\lib.rs", "dependency/lib.rs"),
+        (windows, "/rustc/90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf\\library\\core\\src\\ops\\function.rs", "dependency/function.rs"),
+        (windows, r"D:\rustc\90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf\library\core\src\ptr\mod.rs", "dependency/mod.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\target\x86_64-pc-windows-msvc\release\build\focusforge-gui-1\out\app.rs", "dependency/app.rs"),
+        (windows, r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include\vector", "dependency/vector"),
+        (windows, r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt\stdio.h", "dependency/stdio.h"),
+        (windows, r"D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_main.cpp", "dependency/exe_main.cpp"),
+        (windows, r"C:\Users\runneradmin\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib\rustlib\etc\intrinsic.natvis", "dependency/intrinsic.natvis"),
+        (windows, r"\\?\D:\a\FocusForge\FocusForge\crates\cli\src\main.rs", "crates/cli/src/main.rs"),
+        (windows, r"\\?\C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
+        (macos, f"{macos}/crates/cli/src/main.rs", "crates/cli/src/main.rs"),
+        (macos, "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap-4.6.6/src/lib.rs", "dependency/lib.rs"),
+        (macos, "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/stdio.h", "dependency/stdio.h"),
+        (macos, "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/math.h", "dependency/math.h"),
+    )
+    rejected = (
+        (windows, r"C:\Users\runneradmin\private\main.rs"),
+        (windows, r"\\?\C:\Users\runneradmin\private\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge-other\crates\cli\src\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\..\secret\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\private\main.rs"),
+        (windows, r"C:\Program Files\Microsoft Visual Studio\..\..\Users\runneradmin\secret.h"),
+        (macos, "/Users/runner/Documents/secret.rs"),
+        (macos, f"{macos}/../private/main.rs"),
+        (macos, "/Users/runner/.cargo/registry/src/../../../private/main.rs"),
+    )
+    for root, source, expected in accepted:
+        with hosted_runner(module, root):
+            assert module.normalized_source(source) == expected, (source, module.normalized_source(source))
+    for root, source in rejected:
+        with hosted_runner(module, root):
+            try: module.normalized_source(source)
+            except ValueError as error: assert source in str(error), (source, str(error))
+            else: raise AssertionError(f"private runner source accepted: {source}")
+    long_source = "D:/other/" + "x" * 400 + "/main.rs"
+    try: module.normalized_source(long_source)
+    except ValueError as error:
+        shown = str(error).split(": ", 1)[1]
+        assert 0 < len(shown) <= 200 and long_source.startswith(shown.removesuffix("...")), shown
+    else: raise AssertionError("private long source accepted")
+    with tempfile.TemporaryDirectory() as temporary:
+        symbol = Path(temporary) / "app.sym"
+        good = r"D:\a\FocusForge\FocusForge\crates\gui\src\main.rs"
+        symbol.write_text(f"MODULE windows x86_64 {'A' * 33} app.pdb\nFILE 0 {good}\nFILE 1 C:\\Users\\runneradmin\\private\\one.rs\nFILE 2 C:\\Users\\runneradmin\\private\\two.rs\nFUNC 1 1 0 f\n")
+        with hosted_runner(module, windows):
+            try: module.canonicalize_symbol_sources(symbol)
+            except ValueError as error: assert r"C:\Users\runneradmin\private\one.rs" in str(error) and r"C:\Users\runneradmin\private\two.rs" in str(error), str(error)
+            else: raise AssertionError("private FILE records accepted")
+            symbol.write_text(f"MODULE windows x86_64 {'A' * 33} app.pdb\nFILE 0 {good}\nFUNC 1 1 0 f\n")
+            module.canonicalize_symbol_sources(symbol)
+        assert "FILE 0 crates/gui/src/main.rs\n" in symbol.read_text()
+    pdb_source = r"D:\a\FocusForge\FocusForge\crates\cli\src\main.rs"
+    with tempfile.TemporaryDirectory() as temporary:
+        pdb = Path(temporary) / "runner.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, pdb_source))
+        with hosted_runner(module, windows):
+            assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(pdb)["source_paths"]
+        with hosted_runner(module, windows, hosted=False):
+            try: module.inspect_windows_native(pdb)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "D:/a/FocusForge/FocusForge/crates/cli/src/main.rs" in str(error), str(error)
+            else: raise AssertionError("builder checkout accepted outside a hosted runner")
+        backslash = Path(temporary) / "backslash.pdb"; backslash.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"C:\work\crates\cli\src\main.rs", ("/work", "/work/crates/cli")))
+        assert "C:/work/crates/cli/src/main.rs" in module.inspect_windows_native(backslash)["source_paths"]
 
 
 def macos_source_cases() -> None:
@@ -1091,7 +1185,7 @@ file_names[1] = {
 """
     def inspect(output: str, auxiliary: dict | None = None) -> dict:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary); bundle = root / "focusforge-cli.dSYM"; dwarf = bundle / "Contents/Resources/DWARF/focusforge-cli"; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(universal_macho())
+            root = Path(temporary); bundle = root / "focusforge-cli.dSYM"; dwarf = bundle / "Contents/Resources/DWARF/focusforge-cli"; dwarf.parent.mkdir(parents=True); dwarf.write_bytes(thin_macho())
             (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "focusforge-cli"}))
             if auxiliary is not None:
                 resource = bundle / "Contents/Resources/00000000000000000000000000000001.plist"
@@ -1102,7 +1196,7 @@ file_names[1] = {
             try: return module.inspect_macos_native(bundle, "focusforge-cli")
             finally: os.environ["PATH"] = old
     record = inspect(grouped)
-    assert record["coverage"]["slices"] == ["arm64", "x86_64"] and "/work/crates/cli/src/two.rs" in record["source_paths"]
+    assert record["coverage"]["slices"] == ["arm64"] and "/work/crates/cli/src/two.rs" in record["source_paths"]
     no_line = grouped.replace(".debug_line", """0x00000060: DW_TAG_compile_unit
  DW_AT_name ("crates/cli/src/no-line.rs")
  DW_AT_comp_dir ("/work")
@@ -1112,10 +1206,16 @@ file_names[1] = {
     unused_clean = grouped.replace('include_directories[1] = "/work/crates/cli/src"', 'include_directories[1] = "/work/crates/cli/src"\ninclude_directories[2] = "/work/crates/unused"', 1)
     assert "/work/crates/unused" in inspect(unused_clean)["source_paths"]
     unused_private = unused_clean.replace('include_directories[2] = "/work/crates/unused"', 'include_directories[2] = "/private/checkout"')
+    empty_table = grouped + ".debug_line[0x00000200]\n.debug_line[0x00000221]\n"
+    assert inspect(empty_table)["source_paths"] == inspect(grouped)["source_paths"]
+    orphan_table = grouped + '.debug_line[0x00000200]\nfile_names[1] = {\n name: "orphan.rs"\n dir_index: 0\n}\n'
+    try: inspect(orphan_table)
+    except ValueError as error: assert str(error).startswith("unbound dSYM line table for arm64"), str(error)
+    else: raise AssertionError("unreferenced table with files accepted")
     missing_table = grouped.replace(".debug_line[0x00000040]", ".debug_line[0x00000041]")
-    for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for x86_64")):
+    for label, output, message in (("private no-line", private_no_line, "private source path in native symbols"), ("unused directory", unused_private, "private source path in native symbols"), ("missing stmt table", missing_table, "missing dSYM line table for arm64")):
         try: inspect(output)
-        except ValueError as error: assert str(error) == message
+        except ValueError as error: assert str(error).startswith(message), (label, str(error))
         else: raise AssertionError(f"{label} accepted")
     assert inspect(grouped, {"DBGBuildSourcePath": "/work", "DBGSourcePath": "/work/crates/cli/src"})["coverage"]["auxiliary_source_records"] == 1
     assert inspect(grouped, {"DBGSourcePathRemapping": {"/work": "/work/crates/cli/src"}})["coverage"]["auxiliary_source_records"] == 1
@@ -1123,6 +1223,63 @@ file_names[1] = {
         try: inspect(grouped, auxiliary)
         except ValueError: pass
         else: raise AssertionError(f"{label} accepted")
+    runner = "/Users/runner/work/FocusForge/FocusForge"; registry = "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foo-1.0.0"
+    def real(version: int, directories: list[tuple[int, str]], files: list[tuple[int, str]]) -> str:
+        text = f"""0x00000000: Compile Unit: length = 0x00000046, format = DWARF32, version = 0x000{version}, abbr_offset = 0x0000, addr_size = 0x08 (next unit at 0x0000004a)
+
+0x0000000c: DW_TAG_compile_unit
+              DW_AT_producer\t("clang LLVM (rustc version 1.95.0)")
+              DW_AT_language\t(DW_LANG_Rust)
+              DW_AT_name\t("{registry}/src/lib.rs/@/foo.cgu.0")
+              DW_AT_stmt_list\t(0x00000000)
+              DW_AT_comp_dir\t("{runner}")
+
+0x0000002a:   DW_TAG_namespace
+                DW_AT_name\t("foo")
+
+0x00000050: Compile Unit: length = 0x00000020, format = DWARF32, version = 0x000{version}, abbr_offset = 0x0000, addr_size = 0x08 (next unit at 0x00000074)
+
+0x0000005c: DW_TAG_compile_unit
+              DW_AT_name\t("crates/cli/src/main.rs/@/focusforge_cli.cgu.0")
+              DW_AT_comp_dir\t("{runner}")
+
+.debug_line contents:
+debug_line[0x00000000]
+Line table prologue:
+    total_length: 0x0000004e
+          format: DWARF32
+         version: {version}
+ prologue_length: 0x00000030
+ min_inst_length: 1
+max_ops_per_inst: 1
+ default_is_stmt: 1
+       line_base: -5
+      line_range: 14
+     opcode_base: 13
+standard_opcode_lengths[DW_LNS_copy] = 0
+"""
+        text += "".join(f'include_directories[{index:3}] = "{value}"\n' for index, value in directories)
+        for index, (directory, name) in enumerate(files, 1 if version < 5 else 0):
+            text += f'file_names[{index:3}]:\n           name: "{name}"\n      dir_index: {directory}\n' + ("   md5_checksum: 00000000000000000000000000000000\n" if version >= 5 else "       mod_time: 0x00000000\n         length: 0x00000000\n")
+        return text + "\nAddress            Line   Column File   ISA Discriminator OpIndex Flags\n------------------ ------ ------ ------ --- ------------- ------- -------------\n0x0000000100001000      5      0      1   0             0       0  is_stmt\n"
+    core = "/rustc/90b35a6239c3d8bdabc530a6a0816f7ff89a0aaf/library/core/src"
+    four = real(4, [(1, f"{registry}/src"), (2, core)], [(0, "crates/cli/src/extra.rs"), (1, "lib.rs"), (2, "mod.rs")])
+    five = real(5, [(0, runner), (1, f"{registry}/src")], [(0, "crates/cli/src/main.rs"), (1, "lib.rs")])
+    lib = "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foo-1.0.0/src/lib.rs"
+    for label, output, expected in (("DWARF 4 directory indexes from 1", four, {lib, f"{core}/mod.rs", "/work/crates/cli/src/extra.rs"}), ("DWARF 5 directory index 0", five, {lib, "/work/crates/cli/src/main.rs"})):
+        with hosted_runner(module, runner):
+            found = set(inspect(output)["source_paths"])
+        assert expected <= found and "/work" in found and all(not path.startswith("/Users/") for path in found), (label, sorted(found))
+        with hosted_runner(module, runner, hosted=False):
+            try: inspect(output)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "/Users/runner/" in str(error), (label, str(error))
+            else: raise AssertionError(f"{label}: builder checkout accepted outside a hosted runner")
+    for label, output in (("DWARF 4 directory past the table", four.replace("dir_index: 2", "dir_index: 7")), ("DWARF 5 directory past the table", five.replace("dir_index: 1", "dir_index: 7"))):
+        with hosted_runner(module, runner):
+            try: inspect(output)
+            except ValueError as error: assert "invalid dSYM line directory for arm64: index 7, 2 directories" in str(error), (label, str(error))
+            else: raise AssertionError(f"{label} accepted")
+
 
 def msf_pdb(guid: bytes, age: int) -> bytearray:
     page_size, page_count = 512, 6
@@ -1136,20 +1293,27 @@ def msf_pdb(guid: bytes, age: int) -> bytearray:
     return pdb
 
 
-def msf_pdb_with_source(guid: bytes, age: int, source: str) -> bytearray:
-    page_size, page_count = 512, 8
+def msf_pdb_with_source(guid: bytes, age: int, source: str, cwds: tuple[str, ...] = ("/work",), module_sources: bool = True, names_stream: bool = False) -> bytearray:
+    # names_stream: the linker moves file names into the PDB-wide /names stream and leaves only checksums in the module.
+    page_size, page_count = 512, 9 if names_stream else 8
     pdb = bytearray(page_size * page_count)
     pdb[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
     source_bytes = source.encode() + b"\0"; c13 = struct.pack("<II", 0xF3, len(source_bytes)) + source_bytes + b"\0" * ((-len(source_bytes)) % 4) + struct.pack("<IIIBB", 0xF4, 8, 0, 0, 0) + b"\0\0"
-    environment = b"\0cwd\0/work\0src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
+    if not module_sources: c13 = struct.pack("<II", 0xF2, 4) + b"\0" * 4
+    if names_stream: c13 = struct.pack("<IIIBB", 0xF4, 8, 1, 0, 0) + b"\0\0"
+    environment = b"\0" + b"".join(b"cwd\0" + cwd.encode() + b"\0" for cwd in cwds) + b"src\0" + source_bytes + b"\0"; environment += b"\0" * ((-(4 + len(environment))) % 4); symbol_record = struct.pack("<HH", 2 + len(environment), 0x113D) + environment; symbols = struct.pack("<I", 4) + symbol_record
     module = bytearray(len(symbols) + len(c13)); module[:len(symbols)] = symbols; module[len(symbols):] = c13
     record = bytearray(64); struct.pack_into("<HIII", record, 34, 4, len(symbols), 0, len(c13)); record += b"module\0object\0"; record += b"\0" * ((-len(record)) % 4)
     file_info = struct.pack("<HHHHI", 1, 1, 0, 1, 0) + source_bytes
     dbi_size = 64 + len(record) + len(file_info)
-    directory = struct.pack("<IIIIIIIII", 5, 0xFFFFFFFF, 28, 0xFFFFFFFF, dbi_size, len(module), 4, 6, 7)
+    info_tail = struct.pack("<I", 7) + b"/names\0" + struct.pack("<IIIIIII", 1, 1, 1, 1, 0, 0, 5) if names_stream else b""
+    names = struct.pack("<III", 0xEFFEEFFE, 1, 1 + len(source_bytes)) + b"\0" + source_bytes
+    directory = struct.pack("<IIIIIIIII", 5, 0xFFFFFFFF, 28 + len(info_tail), 0xFFFFFFFF, dbi_size, len(module), 4, 6, 7)
+    if names_stream: directory = struct.pack("<IIIIIIIIII", 6, 0xFFFFFFFF, 28 + len(info_tail), 0xFFFFFFFF, dbi_size, len(module), len(names), 4, 6, 7) + struct.pack("<I", 8)
     struct.pack_into("<IIIIII", pdb, 32, page_size, 1, page_count, len(directory), 0, 5)
     struct.pack_into("<I", pdb, 5 * page_size, 3); pdb[3 * page_size:3 * page_size + len(directory)] = directory
-    struct.pack_into("<IIII", pdb, 4 * page_size, 2, 0xFFFFFFFF, 28, 4); struct.pack_into("<I", pdb, 4 * page_size + 8, age); pdb[4 * page_size + 12:4 * page_size + 28] = guid
+    struct.pack_into("<IIII", pdb, 4 * page_size, 2, 0xFFFFFFFF, 28, 4); struct.pack_into("<I", pdb, 4 * page_size + 8, age); pdb[4 * page_size + 12:4 * page_size + 28] = guid; pdb[4 * page_size + 28:4 * page_size + 28 + len(info_tail)] = info_tail
+    if names_stream: pdb[8 * page_size:8 * page_size + len(names)] = names
     dbi = memoryview(pdb)[6 * page_size:7 * page_size]; struct.pack_into("<iII", dbi, 0, -1, 19990903, age); struct.pack_into("<II", dbi, 24, len(record), 0); struct.pack_into("<II", dbi, 32, 0, len(file_info)); dbi[64:64 + len(record)] = record; dbi[64 + len(record):64 + len(record) + len(file_info)] = file_info; pdb[7 * page_size:7 * page_size + len(module)] = module
     return pdb
 
@@ -1209,27 +1373,20 @@ def symbol_module() -> types.ModuleType:
 
 
 def fixture_inspections(module: types.ModuleType, platform: str, native: dict[str, Path]) -> dict[str, dict]:
-    coverage = {"compile_units": 1, "line_tables": 1, "source_less_compile_units": 0, "no_line_compile_units": 0} if platform == "x86_64-unknown-linux-gnu" else {"slices": ["arm64", "x86_64"], "auxiliary_source_records": 0} if platform.endswith("apple-darwin") else {"dbi_stream": 3, "file_records": 1, "module_c13_records": 0, "environment_records": 0}
-    kind = {"x86_64-unknown-linux-gnu": "elf-dwarf", "x86_64-apple-darwin": "macho-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
+    coverage = {"compile_units": 1, "line_tables": 1, "source_less_compile_units": 0, "no_line_compile_units": 0} if platform == "x86_64-unknown-linux-gnu" else {"slices": ["arm64"], "auxiliary_source_records": 0} if platform.endswith("apple-darwin") else {"dbi_stream": 3, "file_records": 1, "module_c13_records": 0, "environment_records": 0}
+    kind = {"x86_64-unknown-linux-gnu": "elf-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
     return {name: {"schema": module.SOURCE_INSPECTION_SCHEMA, "format": kind, "native_inspection_sha256": module.digest(path), "coverage": coverage, "source_paths": [f"/work/crates/{name.removeprefix('focusforge-')}/src/main.rs"]} for name, path in native.items()}
 
 
-def universal_macho() -> bytes:
-    uuids = (bytes.fromhex("00000000000000000000000000000001"), bytes.fromhex("11111111111111111111111111111111"))
-    slices = [struct.pack("<IIIIIIII", 0xFEEDFACF, cpu, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + identifier for cpu, identifier in zip((0x1000007, 0x100000C), uuids)]
-    data = bytearray(12288)
-    struct.pack_into(">II", data, 0, 0xCAFEBABE, 2)
-    for index, (cpu, payload) in enumerate(zip((0x1000007, 0x100000C), slices)):
-        offset = 4096 * (index + 1)
-        struct.pack_into(">IIIII", data, 8 + index * 20, cpu, 3, offset, len(payload), 12)
-        data[offset:offset + len(payload)] = payload
-    return bytes(data)
+def thin_macho() -> bytes:
+    identifier = bytes.fromhex("00000000000000000000000000000001")
+    return struct.pack("<IIIIIIII", 0xFEEDFACF, 0x100000C, 3, 0xA, 1, 24, 0, 0) + struct.pack("<II", 0x1B, 24) + identifier
 
 
 def write_dsym(path: Path, name: str) -> None:
     dwarf = path / "Contents/Resources/DWARF" / name
     dwarf.parent.mkdir(parents=True, exist_ok=True)
-    dwarf.write_bytes(universal_macho())
+    dwarf.write_bytes(thin_macho())
     (path / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": name}))
 
 
@@ -1271,7 +1428,7 @@ def write_windows_symbols(root: Path, shipping: Path) -> Path:
         exe, pdb = write_windows_native(shipping, name, bytes(range(offset * 16, offset * 16 + 16)), 0x20 + offset)
         debug = root / "native" / f"{name}.pdb"; debug.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(pdb, debug)
         identifier = module.native_module_id("x86_64-pc-windows-msvc", debug, name)
-        symbol = root / "store" / debug.name / identifier / f"{debug.name}.sym"
+        symbol = root / "store" / debug.name / identifier / f"{debug.stem}.sym"
         symbol.parent.mkdir(parents=True, exist_ok=True)
         symbol.write_text(f"MODULE Windows x86_64 {identifier} {debug.name}\nFILE 0 crates/{name.removeprefix('focusforge-')}/src/main.rs\nFUNC 1000 10 0 {name.replace('-', '_')}::main\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\n")
         native[name], symbols[name] = debug, [symbol]
@@ -1314,13 +1471,12 @@ def macos_checker_mock() -> None:
         gui = binary / "focusforge-gui"
         gui.write_text(gui.read_text() + "if [ \"$1\" = --exit-after ]; then while [ $# -gt 0 ]; do if [ \"$1\" = --screenshot ]; then printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\000\\001\\000\\000\\000\\001' > \"$2\"; exit 0; fi; shift; done; exit 64; fi\n")
         symbols = directory / "symbols"
-        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
-            write_macos_symbols(symbols / target, target)
+        write_macos_symbols(symbols / "aarch64-apple-darwin", "aarch64-apple-darwin")
         (app / "Info.plist").write_text("stub")
         template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
         stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
         bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
-        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-x86_64 arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O universal binary with 2 architectures: [x86_64] [arm64]'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
+        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
         for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
         info_file.write_text(info)
         checker_copy = directory / "tools/check-package-macos.sh"
@@ -1360,10 +1516,10 @@ def macos_checker_mock() -> None:
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0
         shutil.copy(ROOT / "LICENSE", template_resources / "LICENSE")
-        (symbols / "x86_64-apple-darwin/native/focusforge-cli.dSYM/Contents/Resources/DWARF/focusforge-cli").write_bytes(b"wrong")
+        (symbols / "aarch64-apple-darwin/native/focusforge-cli.dSYM/Contents/Resources/DWARF/focusforge-cli").write_bytes(b"wrong")
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0
-        write_macos_symbols(symbols / "x86_64-apple-darwin", "x86_64-apple-darwin")
+        write_macos_symbols(symbols / "aarch64-apple-darwin", "aarch64-apple-darwin")
         info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0 and log.read_text().count("detach") == 13
@@ -1381,31 +1537,31 @@ def macos_producer_mock() -> None:
         shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
         shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
         producer_copy = tools / "package-macos.sh"; producer_copy.write_text((ROOT / "tools/package-macos.sh").read_text())
-        macho = root / "macho"; macho.write_bytes(universal_macho())
-        dump_syms = mock / "dump_syms"; dump_syms.write_text("#!/usr/bin/env bash\nset -euo pipefail\nbinary=${!#}; store= arch=\nwhile (($#)); do case $1 in --store|--arch) [[ $1 == --store ]] && store=$2 || arch=$2; shift 2;; *) shift;; esac; done\nname=$(basename \"$binary\")\ncase $arch in x86_64) id=000000000000000000000000000000010;; arm64) id=111111111111111111111111111111110;; *) exit 2;; esac\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Mac %s %s %s\\nFILE 0 crates/%s/src/main.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$arch\" \"$id\" \"$name\" \"${name#focusforge-}\" \"${name//-/_}\" > \"$store/$name/$id/$name.sym\"\n"); dump_syms.chmod(0o755)
+        macho = root / "macho"; macho.write_bytes(thin_macho())
+        dump_syms = mock / "dump_syms"; dump_syms.write_text("#!/usr/bin/env bash\nset -euo pipefail\nbinary=${!#}; store=\nwhile (($#)); do case $1 in --store) store=$2; shift 2;; *) shift;; esac; done\nname=$(basename \"$binary\")\nid=000000000000000000000000000000010\nmkdir -p \"$store/$name/$id\"\nprintf 'MODULE Mac arm64 %s %s\\nFILE 0 crates/%s/src/main.rs\\nFUNC 1000 10 0 %s::main\\nSTACK CFI INIT 1000 10 .cfa: $rsp 8 +\\n' \"$id\" \"$name\" \"${name#focusforge-}\" \"${name//-/_}\" > \"$store/$name/$id/$name.sym\"\n"); dump_syms.chmod(0o755)
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
-            "lipo": "#!/usr/bin/env bash\nif [[ $1 == -archs ]]; then echo \"${MOCK_ARCHES:-x86_64 arm64}\"; else while (($#)); do if [[ $1 == -output ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done; fi\n",
-            "hdiutil": "#!/usr/bin/env bash\n[[ -z ${MOCK_HDIUTIL_FAIL:-} ]] || exit 77; touch \"${!#}\"\n",
+            "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
+            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "sleep": "#!/usr/bin/env bash\nexit 0\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
-            "shasum": "#!/usr/bin/env bash\nsha256sum \"${!#}\"\n",
+            "shasum": "#!/usr/bin/env bash\nif [[ -n ${MOCK_SHASUM_FAIL:-} ]]; then echo 'shasum: mock read error' >&2; exit 5; fi\nsha256sum \"${!#}\"\n",
             "git": "#!/usr/bin/env bash\necho 0123456789abcdef0123456789abcdef01234567\n",
             "dsymutil": "#!/usr/bin/env bash\nsource=$1; while (($#)); do if [[ $1 == -o ]]; then mkdir -p \"$2/Contents/Resources/DWARF\"; cp \"$MOCK_MACHO\" \"$2/Contents/Resources/DWARF/$(basename \"$source\")\"; printf '<plist version=\"1.0\"><dict/></plist>\\n' > \"$2/Contents/Info.plist\"; exit 0; fi; shift; done\n",
             "strip": "#!/usr/bin/env bash\nwhile (($#)); do if [[ $1 == -o ]]; then cp \"$MOCK_MACHO\" \"$2\"; exit 0; fi; shift; done\n",
-            "dwarfdump": "#!/usr/bin/env bash\ncase \" $* \" in *' --debug-info '*) root=${MOCK_DWARF_ROOT:-/work}; cat <<EOF\n0x00000000: DW_TAG_compile_unit\n              DW_AT_name (\"$root/crates/cli/src/main.rs\")\n              DW_AT_comp_dir (\"$root\")\n              DW_AT_stmt_list (0x00000000)\n.debug_line[0x00000000]\ninclude_directories[1] = \"$root/crates/cli/src\"\nfile_names[1] = {\n  name: \"main.rs\"\n  dir_index: 1\n}\nEOF\n;; *) printf 'UUID: 00000000-0000-0000-0000-000000000001 (x86_64) %s\\nUUID: 11111111-1111-1111-1111-111111111111 (arm64) %s\\n' \"$2\" \"$2\";; esac\n",
+            "dwarfdump": "#!/usr/bin/env bash\ncase \" $* \" in *' --debug-info '*) root=${MOCK_DWARF_ROOT:-/work}; cat <<EOF\n0x00000000: DW_TAG_compile_unit\n              DW_AT_name (\"$root/crates/cli/src/main.rs\")\n              DW_AT_comp_dir (\"$root\")\n              DW_AT_stmt_list (0x00000000)\n.debug_line[0x00000000]\ninclude_directories[1] = \"$root/crates/cli/src\"\nfile_names[1] = {\n  name: \"main.rs\"\n  dir_index: 1\n}\nEOF\n;; *) printf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\";; esac\n",
             "python3": f"#!/usr/bin/env bash\nif [[ $2 == install ]]; then echo '{dump_syms}'; exit 0; fi\nexec /usr/bin/python3 \"$@\"\n",
             "mv": "#!/usr/bin/env bash\nif [[ ${MOCK_MV_PROMOTION_FAIL:-} && $1 == *.next && $2 == */macos ]]; then exit 77; fi; exec /bin/mv \"$@\"\n",
         }
         for name, body in commands.items():
             path = mock / name; path.write_text(body); path.chmod(0o755)
-        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "MOCK_MACHO": str(macho)}
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C", "MOCK_MACHO": str(macho), "MOCK_HDIUTIL_COUNT": str(root / "hdiutil-count")}
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 0, result.stderr
         output = root / "target/distrib/native/macos"
-        artifact = output / "FocusForge-0.1.0-universal.dmg"; receipt = output / "native-receipt.json"
+        artifact = output / "FocusForge-0.1.0-aarch64.dmg"; receipt = output / "native-receipt.json"
         assert artifact.exists() and receipt.exists()
-        for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
-            call(["/usr/bin/python3", str(tools / "package-symbols.py"), "verify", str(output / "symbols" / target)])
+        call(["/usr/bin/python3", str(tools / "package-symbols.py"), "verify", str(output / "symbols/aarch64-apple-darwin")])
         original = artifact.read_bytes(), receipt.read_bytes()
         env["MOCK_DWARF_ROOT"] = "/private checkout.Åsa"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
@@ -1415,13 +1571,35 @@ def macos_producer_mock() -> None:
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
         env.pop("MOCK_ARCHES")
-        env["MOCK_HDIUTIL_FAIL"] = "1"
+        diagnostics = root / ".scratch/package-macos-diagnostics/diagnostics.log"
+        counter = Path(env["MOCK_HDIUTIL_COUNT"])
+        counter.unlink(missing_ok=True)
+        env["MOCK_HDIUTIL_FAIL"] = "3"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
-        assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        assert result.returncode == 77 and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        assert "hdiutil" in result.stderr and "77" in result.stderr and "mock reason 3" in result.stderr, result.stderr
+        assert "Filesystem" in result.stdout, result.stdout
+        logged = diagnostics.read_text()
+        assert all(f"mock reason {n}" in logged for n in (1, 2, 3)), logged
+        assert "hdiutil create failed with exit status 77 after 3 attempts" in result.stderr, result.stderr
         env.pop("MOCK_HDIUTIL_FAIL")
+        counter.unlink(missing_ok=True)
+        env["MOCK_SHASUM_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        assert any("shasum" in line and "failed with exit status 5" in line for line in result.stderr.splitlines()), result.stderr
+        assert "failed with exit status 5" in diagnostics.read_text()
+        env.pop("MOCK_SHASUM_FAIL")
         env["MOCK_MV_PROMOTION_FAIL"] = "1"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
+        env.pop("MOCK_MV_PROMOTION_FAIL")
+        counter.unlink(missing_ok=True)
+        env["MOCK_HDIUTIL_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 0 and artifact.exists() and receipt.exists(), result.stderr
+        logged = diagnostics.read_text()
+        assert "mock reason 1" in logged and "exit status 77" in logged, logged
 
 
 def windows_checker_mock() -> None:
@@ -1558,19 +1736,23 @@ def smoke_callers() -> None:
     assert "if ($LASTEXITCODE -ne 0) { throw 'installed CLI smoke failed' }" in windows
     assert native.count("- name: Check native package") == 2
     assert "uses: ./.github/workflows/package-native.yml" in release
-    build = release.index("- name: Build artifacts")
-    post_build = release.index("- id: cargo-dist", build)
-    linux_check = release.index("- name: Check Linux package", build)
-    check_step = release[linux_check:post_build]
+    global_start = release.index("\n  build-global-artifacts:")
+    global_job = release[global_start:release.index("\n  host:", global_start)]
+    local_job = release[release.index("\n  build-local-artifacts:"):global_start]
+    assert "check-package-linux" not in local_job and "package-smoke-receipts-linux" not in local_job
+    build = global_job.index('"--artifacts=global"')
+    post_build = global_job.index("- name: \"Upload artifacts\"", build)
+    linux_check = global_job.index("- name: Check Linux package", build)
+    check_step = global_job[linux_check:post_build]
     assert build < linux_check < post_build
-    assert "if: \"runner.os == 'Linux'\"" in check_step
+    assert "if:" not in check_step.split("- name: Upload package smoke receipts")[0]
     assert "tools/check-package-linux.sh .scratch/package-linux" in check_step
-    assert "|| true" not in check_step
+    assert "|| true" not in check_step and "continue-on-error" not in check_step
     upload = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
     receipt_specs = (
         (native, "tools/check-package-macos.sh", "- name: Upload native artifacts", "package-smoke-receipts-macos", (".scratch/check-package-macos.*/smoke",), True),
         (native, "tools/check-package-windows.ps1", "- name: Upload native artifacts", "package-smoke-receipts-windows", (".scratch/check-package-windows/*/smoke",), True),
-        (release, "tools/check-package-linux.sh .scratch/package-linux", "- id: cargo-dist", "package-smoke-receipts-linux-${{ join(matrix.targets, '_') }}", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
+        (global_job, "tools/check-package-linux.sh .scratch/package-linux", "- name: \"Upload artifacts\"", "package-smoke-receipts-linux-x86_64-unknown-linux-gnu", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
     )
     for source, checker, handoff, name, roots, launch in receipt_specs:
         checked = source.index(checker)
@@ -1586,7 +1768,17 @@ def smoke_callers() -> None:
         if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
         assert paths == expected_paths
         assert "artifacts-" not in name
+    diagnostics_path = ".scratch/package-macos-diagnostics/"
+    producer = native.index("tools/package-macos.sh --output")
+    check = native.index("tools/check-package-macos.sh", producer)
+    step = native.index("- name: Upload package build diagnostics", producer)
+    block = native[step:native.index("      - name:", step + 1)]
+    assert producer < step < check and "if: always()" in block and upload in block
+    assert "name: package-build-diagnostics-macos" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
+    assert "continue-on-error" not in block and "|| true" not in block
+    assert [line.split("path:", 1)[1].strip() for line in block.splitlines() if line.strip().startswith("path:")] == [diagnostics_path]
+    assert diagnostics_path.rstrip("/") in (ROOT / "tools/package-macos.sh").read_text()
 
 
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")

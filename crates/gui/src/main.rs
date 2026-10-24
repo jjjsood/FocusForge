@@ -16,6 +16,8 @@ use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, picker, 
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
+use slint::winit_030::winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+#[cfg(target_os = "linux")]
 use slint::winit_030::winit::platform::wayland::{EventLoopBuilderExtWayland, WindowExtWayland};
 #[cfg(target_os = "linux")]
 use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
@@ -521,6 +523,48 @@ impl LinuxDisplayBackend {
     }
 }
 
+/// The launcher's startup tokens, `DESKTOP_STARTUP_ID` then
+/// `XDG_ACTIVATION_TOKEN`; nothing off Linux.
+#[cfg(target_os = "linux")]
+type LaunchTokens = (Option<String>, Option<String>);
+#[cfg(not(target_os = "linux"))]
+struct LaunchTokens;
+
+/// Reads the launcher's startup tokens and removes them from the process
+/// environment, so no thread or child process started later inherits them.
+fn take_launch_tokens() -> LaunchTokens {
+    #[cfg(target_os = "linux")]
+    {
+        let tokens = (
+            std::env::var("DESKTOP_STARTUP_ID").ok(),
+            std::env::var("XDG_ACTIVATION_TOKEN").ok(),
+        );
+        winit::platform::startup_notify::reset_activation_token_env();
+        tokens
+    }
+    #[cfg(not(target_os = "linux"))]
+    LaunchTokens
+}
+
+/// The token that ends the launcher's startup notification: the variable of
+/// the session `backend` opens (X11 reads `DESKTOP_STARTUP_ID`, Wayland
+/// `XDG_ACTIVATION_TOKEN`), the other one when that is unset or empty.
+#[cfg(target_os = "linux")]
+fn startup_token(
+    backend: LinuxDisplayBackend,
+    x11: Option<String>,
+    wayland: Option<String>,
+) -> Option<String> {
+    let (first, second) = match backend {
+        LinuxDisplayBackend::X11 => (x11, wayland),
+        LinuxDisplayBackend::Wayland => (wayland, x11),
+    };
+    [first, second]
+        .into_iter()
+        .flatten()
+        .find(|token| !token.is_empty())
+}
+
 #[cfg(target_os = "linux")]
 fn adjust_manual_wgpu_flags(
     mut flags: wgpu::InstanceFlags,
@@ -560,12 +604,15 @@ fn teardown_is_current(generation: &std::cell::Cell<u64>, teardown: u64) -> bool
 }
 
 /// Selects Slint's pinned wgpu 29 backend before any window is created.
+/// Returns whether the session is native Wayland, where dropping files onto
+/// the window does not work.
 fn select_backend(
     controller: Arc<Mutex<AppController>>,
     canvas: Rc<RefCell<Canvas>>,
     app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>>,
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
-) -> Result<(), ExitCode> {
+    launch_tokens: LaunchTokens,
+) -> Result<bool, ExitCode> {
     #[cfg(target_os = "linux")]
     let display_backend = LinuxDisplayBackend::from_environment()?;
     let config = match manual_wgpu_configuration(
@@ -578,6 +625,8 @@ fn select_backend(
             return Err(ExitCode::from(1));
         }
     };
+    #[cfg(not(target_os = "linux"))]
+    let LaunchTokens = launch_tokens;
     // The drop route is installed on this *existing* `BackendSelector`
     // chain, before any window exists, which is why `controller` and
     // `canvas` are both built before `select_backend` runs rather than
@@ -586,6 +635,18 @@ fn select_backend(
     #[cfg(target_os = "linux")]
     let selector =
         selector.with_winit_event_loop_builder(linux_event_loop_builder(display_backend));
+    // The hook runs for every window; only the first takes the token.
+    #[cfg(target_os = "linux")]
+    let selector = match startup_token(display_backend, launch_tokens.0, launch_tokens.1) {
+        Some(token) => {
+            let token = std::cell::Cell::new(Some(winit::window::ActivationToken::from_raw(token)));
+            selector.with_winit_window_attributes_hook(move |attributes| match token.take() {
+                Some(token) => attributes.with_activation_token(token),
+                None => attributes,
+            })
+        }
+        None => selector,
+    };
     let selector = selector
         .require_wgpu_29(config)
         .with_winit_custom_application_handler(bridge::DropHandler::new(
@@ -611,7 +672,10 @@ fn select_backend(
     );
     #[cfg(not(target_os = "linux"))]
     println!("selected backend: winit, renderer: renderer-femtovg-wgpu (wgpu 29.0.4, Manual)");
-    Ok(())
+    #[cfg(target_os = "linux")]
+    return Ok(display_backend == LinuxDisplayBackend::Wayland);
+    #[cfg(not(target_os = "linux"))]
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -666,6 +730,7 @@ fn run_window<T: ComponentHandle + 'static>(
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_handle = app_handle.clone();
+        let last_scale = std::cell::Cell::new(app.window().scale_factor());
         if let Err(e) = app
             .window()
             .set_rendering_notifier(move |state, api| match state {
@@ -726,6 +791,18 @@ fn run_window<T: ComponentHandle + 'static>(
                         }
                         *device.borrow_mut() = None;
                     });
+                }
+                // Slint reports no scale-factor change on its own, and one
+                // without a resize leaves the pane geometry stale.
+                slint::RenderingState::BeforeRendering => {
+                    if let Some(app) = app_handle.as_ref().and_then(|app| app.upgrade())
+                        && last_scale.replace(app.window().scale_factor())
+                            != app.window().scale_factor()
+                    {
+                        slint::Timer::single_shot(Duration::ZERO, move || {
+                            app.invoke_canvas_resized();
+                        });
+                    }
                 }
                 slint::RenderingState::AfterRendering => bridge::record_frame_rendered(),
                 _ => {}
@@ -1633,6 +1710,8 @@ fn install_save_folder(args: &Args) {
 }
 
 fn main() -> ExitCode {
+    // Before any thread or child process exists, so none inherits the tokens.
+    let launch_tokens = take_launch_tokens();
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
     if let Some(code) = focusforge_diagnostics::run_monitor() {
@@ -1647,7 +1726,7 @@ fn main() -> ExitCode {
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");
 
-    let result = run(&Args::parse());
+    let result = run(&Args::parse(), launch_tokens);
     focusforge_gui::bridge::finish_input_trace();
     result
 }
@@ -1658,7 +1737,7 @@ fn main() -> ExitCode {
 /// for what it buffers to reach disk. Exit codes: 0 for a window closed
 /// normally, 1 for a failure while opening one, 2 for a refused argument, 3
 /// for a session ended because the graphics device was lost.
-fn run(args: &Args) -> ExitCode {
+fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     if let Some(section) = &args.settings_section
         && focusforge_gui::SettingsSection::from_slug(section).is_none()
     {
@@ -1699,14 +1778,16 @@ fn run(args: &Args) -> ExitCode {
     // Shared with `bridge::install`'s own failure toast, so a blocked drop
     // and a blocked add never close each other's auto-dismiss timer early.
     let toast_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
-    if let Err(code) = select_backend(
+    let drop_unavailable = match select_backend(
         controller.clone(),
         canvas.clone(),
         app_handle.clone(),
         toast_timer.clone(),
+        launch_tokens,
     ) {
-        return code;
-    }
+        Ok(unavailable) => unavailable,
+        Err(code) => return code,
+    };
 
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
@@ -1714,6 +1795,7 @@ fn run(args: &Args) -> ExitCode {
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
         *app_handle.borrow_mut() = Some(app.as_weak());
+        app.set_drop_unavailable(drop_unavailable);
         let focusforge_gui::bridge::Installed {
             controller,
             job_timer,
@@ -2040,6 +2122,39 @@ mod tests {
         assert!(
             adjust_manual_wgpu_flags(flags, LinuxDisplayBackend::X11, false)
                 .contains(wgpu::InstanceFlags::VALIDATION)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_token_comes_from_the_session_variable() {
+        let value = |v: &str| (!v.is_empty()).then(|| v.to_string());
+        let cases = [
+            // (backend, DESKTOP_STARTUP_ID, XDG_ACTIVATION_TOKEN, token)
+            (LinuxDisplayBackend::X11, "x", "w", Some("x")),
+            (LinuxDisplayBackend::Wayland, "x", "w", Some("w")),
+            (LinuxDisplayBackend::X11, "x", "", Some("x")),
+            (LinuxDisplayBackend::Wayland, "", "w", Some("w")),
+            (LinuxDisplayBackend::X11, "", "w", Some("w")),
+            (LinuxDisplayBackend::Wayland, "x", "", Some("x")),
+            (LinuxDisplayBackend::X11, "", "", None),
+            (LinuxDisplayBackend::Wayland, "", "", None),
+        ];
+        for (backend, x11, wayland, expected) in cases {
+            assert_eq!(
+                startup_token(backend, value(x11), value(wayland)),
+                expected.map(str::to_string),
+                "{backend:?}, x11 {x11:?}, wayland {wayland:?}"
+            );
+        }
+        // An empty variable reads as an unset one.
+        assert_eq!(
+            startup_token(
+                LinuxDisplayBackend::X11,
+                Some(String::new()),
+                Some(String::new())
+            ),
+            None
         );
     }
 }

@@ -2,7 +2,7 @@
 Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --fuse-tabs 0 --slow-run 4
 ## The fuse that started at launch
 1. Click the first tab (`FFTab::area` 0).
-   Expect: (within 60 s) a dialog titled "Keep this fused result?" shows two buttons, "Discard" and "Keep", and the text "00.tif, 01.tif, 06.tif and 07.tif could not be aligned", although **Fuse stack** was never clicked; the dock header behind it reads "8 frames · 0 excluded".
+   Expect: (within 60 s) a dialog titled "Keep this fused result?" shows two buttons, "Discard" and "Keep", and the text "00.tif and 01.tif could not be aligned", although **Fuse stack** was never clicked; the dock header behind it reads "8 frames · 0 excluded".
 2. Click the second tab (`FFTab::area` 1) while the dialog is open.
    Expect: Must not: the second tab opens; the dialog is still on screen and the dock header behind it still reads "8 frames · 0 excluded".
 3. Click **Projects** (`FFTabStrip::projects-button`) while the dialog is open.

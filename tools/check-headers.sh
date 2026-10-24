@@ -61,10 +61,10 @@ for base in (*patterns, ".githooks"):
         try:
             line = header_line(path)
         except UnicodeDecodeError:
-            bad.append(f"{path.relative_to(root)}: not UTF-8 source")
+            bad.append(f"{path.relative_to(root).as_posix()}: not UTF-8 source")
             continue
         if line != expected_header(path):
-            bad.append(f"{path.relative_to(root)}: missing opening SPDX header")
+            bad.append(f"{path.relative_to(root).as_posix()}: missing opening SPDX header")
 
 if bad:
     print("FAIL: source files missing SPDX-License-Identifier: GPL-3.0-or-later:", file=sys.stderr)

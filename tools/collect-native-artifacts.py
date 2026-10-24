@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 NATIVE = ROOT / "target/distrib"
 OUTPUT = ROOT / ".scratch/native-artifacts"
-TARGETS = {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-apple-darwin", "aarch64-apple-darwin"}
+TARGETS = {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"}
 PACKAGES = {"focusforge-cli", "focusforge-gui"}
 
 
@@ -61,7 +61,7 @@ def check_plan() -> None:
         required_symbols = {f"FocusForge-{version()}-{target}-symbols.tar.gz" for target in TARGETS}
         if symbol_assets != required_symbols:
             raise ValueError(f"release plan has unexpected symbol assets for {name}")
-        required = {f"FocusForge-{version()}-universal.dmg", f"FocusForge-{version()}-x86_64.msi", *required_symbols, "native-artifacts.sha256", "native-artifacts.json"}
+        required = {f"FocusForge-{version()}-aarch64.dmg", f"FocusForge-{version()}-x86_64.msi", *required_symbols, "native-artifacts.sha256", "native-artifacts.json"}
         if not required.issubset(artifacts):
             raise ValueError(f"release plan omits native artifacts for {name}")
 
@@ -76,7 +76,7 @@ def receipt(directory: Path, kind: str, artifact: Path) -> dict[str, str]:
 
 def collect() -> None:
     expected = {
-        "macos": ("dmg", f"FocusForge-{version()}-universal.dmg"),
+        "macos": ("dmg", f"FocusForge-{version()}-aarch64.dmg"),
         "windows": ("msi", f"FocusForge-{version()}-x86_64.msi"),
     }
     entries: list[tuple[str, Path, dict[str, str]]] = []
@@ -89,7 +89,7 @@ def collect() -> None:
             raise ValueError(f"unexpected native inputs for {platform}")
         artifact = directory / name
         symbols = directory / "symbols"
-        targets = {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]
+        targets = {"macos": ("aarch64-apple-darwin",), "windows": ("x86_64-pc-windows-msvc",)}[platform]
         if set(child.name for child in symbols.iterdir()) != set(targets):
             raise ValueError(f"unexpected {platform} symbol targets")
         for target in targets:
@@ -111,7 +111,7 @@ def collect() -> None:
         for platform, artifact, data in entries:
             destination = staging / artifact.name
             shutil.copyfile(artifact, destination)
-            targets = {"macos": ("x86_64-apple-darwin", "aarch64-apple-darwin"), "windows": ("x86_64-pc-windows-msvc",)}[platform]
+            targets = {"macos": ("aarch64-apple-darwin",), "windows": ("x86_64-pc-windows-msvc",)}[platform]
             symbols = []
             for target in targets:
                 symbol_archive = NATIVE / platform / "symbols" / target / f"FocusForge-{version()}-{target}-symbols.tar.gz"

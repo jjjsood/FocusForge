@@ -1,0 +1,55 @@
+name: Bug report
+description: Tell us about a reproducible problem.
+title: "[Bug]: "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: FocusForge version
+      description: Include the version from `focusforge-cli --version`.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: operating_system
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: processing_mode
+    attributes:
+      label: Processing mode
+      description: Select GPU when a GPU was used; otherwise select CPU.
+      options:
+        - GPU
+        - CPU
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        Include the command or window actions, input type, and what you expected.
+        Name the GPU model when GPU was selected, or confirm CPU mode.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics_bundle
+    attributes:
+      label: Diagnostics bundle
+      description: >-
+        Attach the ZIP from `focusforge-cli diagnostics` or Settings → Diagnostics.
+        See the [diagnostics guide](https://github.com/jjjsood/FocusForge/blob/main/docs/guide/diagnostics.md).
+        The bundle leaves minidumps out by default. Attach a minidump to this public
+        issue only when you intentionally want to share it.
+      placeholder: Drag the ZIP here, or explain why it could not be generated.
+    validations:
+      required: true

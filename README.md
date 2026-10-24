@@ -21,63 +21,32 @@
 
 ## Features
 
-- Fuses a directory of TIFF or supported RAW frames into a focus-stacked project
-  (`focusforge-cli stack`), out-of-core so the stack never has to fit in RAM
-- Detects and proposes how a mixed folder of frames splits into separate
-  stacks by capture time and directory structure, printed before the run and
-  overridable or saved to a file for editing and reuse
-- Aligns handheld or breathing frames before fusing them, recovering shift,
-  rotation and scale drift and cropping the result to the region every frame
-  covers (`focusforge-cli align` reports the same transforms on their own)
-- Three fusion methods — Details, Soft transitions and Focus map — each
-  producing a Z-Map naming the source frame behind every output pixel
-- Evens out brightness differences between frames before fusing, on by
-  default and bounded by a maximum gain, with a notice for any frame held at
-  the bound
-- Exports any checkpoint of a project as a TIFF, PNG or JPEG image
-  (`focusforge-cli export`), with per-format bit depth, compression, JPEG
-  quality and chroma subsampling, and EXIF, ICC, XMP and IPTC carried over;
-  rendered from the stored composite, separately from the run that produced it
-- Keeps every retouch as a checkpoint in a branching history: list,
-  restore, branch from, export and delete checkpoints in the window or with
-  `focusforge-cli history`
-- Reports outcome, sharpness and Z-Map coverage per stack after a run
-  (`focusforge-cli review`), so a failed stack in a batch is a visible record
-  rather than a missing file
-- Retouches the result with soft brush strokes from a chosen frame — brush,
-  pipette and a rainbow source overlay, unlimited undo with redo discarded
-  on a new edit — headless via `focusforge-cli retouch` or with a mouse in
-  the window's editor mode
-- Reusable parameter bundles (presets) and a re-run flag that fuses only the
-  stacks you name, so tuning one stack after a batch run costs one re-run,
-  not the whole folder again
-- Cancellable, pausable and resumable runs — Ctrl-C stops a run cleanly,
-  SIGUSR1 pauses one in place on Unix, and `--resume` picks a cancelled stack
-  back up without redoing finished work
-- Directory-wide stack inspection (`focusforge-cli info`) — dimensions, depth,
-  byte order, compression, layout and a uniform-layout check across every
-  frame, plain text or `--json`
-- Reads 16-bit unsigned chunky TIFF frames stored uncompressed, with LZW, or
-  with Deflate, in strip or tiled layouts; flags unsupported layouts by name
-  instead of silently misreading them
-- Fuses the `laplacian` algorithm on a GPU automatically when one is
-  available, falling back to the CPU cleanly when it isn't; either path
-  produces the same result, proven to match within 1 LSB at 16-bit
-- A single parameter schema drives every algorithm's settings; `focusforge-cli
-  algorithms` lists what's registered, prints a schema, and validates
-  `--set key=value` overrides against it
-- Keeps a structured log of every run and, on a crash, a report of what led
-  to it, all local to your own machine; `focusforge-cli diagnostics`
-  packages the evidence into one redacted ZIP, and the next start after a
-  crash tells you it's there
-- A window (`focusforge-gui`) alongside the CLI: open a folder or a saved
-  project into a tab, view the selected source frame beside the composite,
-  choose a method and edit its parameters in Prepare, Fuse, Align and
-  Finish sections, switch alignment on or off, run, pause, cancel or retry a fuse,
-  and switch into editor mode to retouch the result, browse its
-  checkpoints and export an image in the format you choose
-- Choose List, Image list or Large previews for the source panel; the chosen presentation persists with the rest of the window settings
-- Keeps every failure and processing notice in a notification center behind a bell, and raises an operating-system banner when the window is in the background
+**From shoot to sharp image**
+- Drop in a focus bracket straight from the camera, RAW or 16-bit TIFF, and get one image sharp from front to back
+- Shot several subjects in one session? FocusForge sorts the card into separate stacks for you; check the split before it runs
+- Long brackets of high-resolution frames run on an ordinary computer, however much memory the stack would need
+- Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
+- Flickering light or exposure drift between shots is evened out
+- Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map when you plan to retouch a lot
+- Fast on a graphics card, the same result without one
+
+**Fixing what the stack got wrong**
+- Halos, ghosting or a misplaced bristle? Brush in the right frame by hand with a soft brush
+- A colour overlay shows which shot every part of the image came from, so you know where to paint from
+- Unlimited undo, and every version of the edit kept: go back, try another direction, export any of them
+
+**Working through a whole session**
+- Use the desktop app, or script the same steps from the command line
+- Pause, cancel and pick up long runs later without starting over
+- Save your favourite settings as presets; re-run only the one stack you want to tweak
+- A summary after each batch shows which stacks worked, so nothing goes missing quietly
+- Problems and notices collect in one place, and reach you as a system notification while you're in another app
+
+**Delivering the result**
+- Export TIFF, PNG or JPEG with your camera metadata, colour profile and keywords intact
+- If something breaks, FocusForge packs a privacy-safe report you can send in
+
+Details for each are in the [guides](docs/README.md).
 
 ## Install
 
@@ -161,8 +130,8 @@ per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 ## Documentation
 
 See [`docs/`](docs/README.md) for [getting started](docs/getting-started.md)
-and the guides (the window, stacking,
-alignment, retouching, checkpoint history, batch runs, diagnostics) and the
+and the guides (the window, stacking, alignment, retouching, checkpoint
+history, batch runs, diagnostics) and the
 reference for every `focusforge-cli` subcommand, the project format and the
 TIFF layouts it reads and writes.
 
@@ -178,6 +147,5 @@ is used under its GPLv3 licensing option, which is what makes the whole
 application GPLv3 rather than a more permissive license; dependency licenses
 are held to a compatible allowlist and enforced by `cargo deny check
 licenses`.
-
 This software is based in part on the work of the Independent JPEG Group,
 carried by the `jpeg-encoder` crate's JPEG export path.

@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{
-    Group, GroupSignal, TiffError, TiffHeader, frame_paths, is_frame_path, one_group,
-    propose_with_progress,
+    Group, GroupSignal, TiffError, TiffHeader, frame_paths, has_extension, is_frame_path,
+    one_group, propose_with_progress,
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{
@@ -25,6 +25,8 @@ use focusforge_core::project::{
 // Re-exported so `controller.rs` can carry a `Proposal` in its own
 // pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
+// Re-exported so `picker.rs` filters on the same RAW set `classify` uses.
+pub(crate) use focusforge_core::io::RAW_EXTENSIONS;
 
 /// What a set of paths (a picker result, a drop gesture, `--open`'s single
 /// argument) resolves to, before any grouping question is asked.
@@ -32,8 +34,9 @@ pub use focusforge_core::io::Proposal;
 pub enum OpenTarget {
     /// A directory to propose a grouping over.
     Folder(PathBuf),
-    /// Exactly the frames given, from one common directory -- a multi-file
-    /// drop. No sibling scan: the dropped files *are* the project.
+    /// Exactly the frames given, from one common directory, sorted by file
+    /// name -- a picked or dropped file set. No sibling scan: the chosen
+    /// files *are* the project.
     Frames { dir: PathBuf, frames: Vec<PathBuf> },
     /// A saved `*.ffp` to reopen.
     Project(PathBuf),
@@ -162,8 +165,9 @@ pub enum EntryError {
     #[error("{}: {source}", path.display())]
     Read {
         path: PathBuf,
+        // Boxed: `TiffError` is larger on Windows, where an `OsString` is 32 bytes.
         #[source]
-        source: TiffError,
+        source: Box<TiffError>,
     },
     /// A path with the project extension that will not open as a project,
     /// its message worded for the actual cause rather than one fixed
@@ -178,6 +182,12 @@ pub enum EntryError {
     /// TIFF frames.
     #[error("{}: not a folder of frames or a FocusForge project", path.display())]
     Unreadable { path: PathBuf },
+    /// A file set holding both camera RAW and TIFF files.
+    #[error("These files mix camera RAW and TIFF. A stack is one kind of file.")]
+    MixedKinds { path: PathBuf },
+    /// A file set spread over several folders.
+    #[error("These files are in different folders. A stack's frames share one folder.")]
+    SeveralFolders { path: PathBuf },
 }
 
 /// [`EntryError::ProjectRefused`]'s own cause text: one sentence per group
@@ -225,9 +235,11 @@ pub enum ImportRefused {
 ///
 /// - Exactly one directory -> [`OpenTarget::Folder`].
 /// - One file whose extension is [`PROJECT_EXTENSION`] -> [`OpenTarget::Project`].
-/// - One or more files all passing [`is_frame_path`] -> [`OpenTarget::Frames`],
-///   their common parent as `dir`. Files with no common parent are
-///   [`EntryError::Unreadable`] too -- a project has one directory by
+/// - One or more files that are all TIFF frames ([`is_frame_path`]) or all
+///   camera RAW -> [`OpenTarget::Frames`], sorted by file name as a folder
+///   open sorts, their common parent as `dir`. A set mixing the two is
+///   [`EntryError::MixedKinds`]; one without a common parent is
+///   [`EntryError::SeveralFolders`] -- a project has one directory by
 ///   construction ([`Group::dir`]).
 /// - Anything else -> [`EntryError::Unreadable`].
 pub fn classify(paths: &[PathBuf]) -> Result<OpenTarget, EntryError> {
@@ -240,21 +252,30 @@ pub fn classify(paths: &[PathBuf]) -> Result<OpenTarget, EntryError> {
         }
     }
 
-    if !paths.is_empty() && paths.iter().all(|p| p.is_file() && is_frame_path(p)) {
-        let mut parents = paths.iter().filter_map(|p| p.parent());
-        if let Some(first) = parents.next()
-            && parents.all(|d| d == first)
-        {
-            return Ok(OpenTarget::Frames {
-                dir: first.to_path_buf(),
-                frames: paths.to_vec(),
-            });
+    let first = paths.first().cloned().unwrap_or_default();
+    let is_raw = |p: &PathBuf| has_extension(p, RAW_EXTENSIONS);
+    let is_tiff = |p: &PathBuf| is_frame_path(p);
+    if !paths.is_empty()
+        && paths
+            .iter()
+            .all(|p| p.is_file() && (is_tiff(p) || is_raw(p)))
+    {
+        if !(paths.iter().all(is_tiff) || paths.iter().all(is_raw)) {
+            return Err(EntryError::MixedKinds { path: first });
         }
+        let dir = first.parent();
+        if paths.iter().any(|p| p.parent() != dir) {
+            return Err(EntryError::SeveralFolders { path: first });
+        }
+        let mut frames = paths.to_vec();
+        frames.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        return Ok(OpenTarget::Frames {
+            dir: dir.map(Path::to_path_buf).unwrap_or_default(),
+            frames,
+        });
     }
 
-    Err(EntryError::Unreadable {
-        path: paths.first().cloned().unwrap_or_default(),
-    })
+    Err(EntryError::Unreadable { path: first })
 }
 
 /// Whether `path` ends in the project extension, in any case; the disk is
@@ -362,7 +383,10 @@ pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenO
             Err(TiffError::NoFrames { path }) => {
                 OpenOutcome::Refused(EntryError::NoReadableFrames { path })
             }
-            Err(source) => OpenOutcome::Refused(EntryError::Read { path: dir, source }),
+            Err(source) => OpenOutcome::Refused(EntryError::Read {
+                path: dir,
+                source: Box::new(source),
+            }),
         },
         OpenTarget::Frames { dir, frames } => {
             progress(frames.len(), frames.len());

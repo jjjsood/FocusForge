@@ -172,8 +172,10 @@ def module_header(path: Path) -> tuple[str, str, str, str]:
     if len(head) != 5 or head[0] != "MODULE" or len(head[3]) < 33 or not all(char in "0123456789ABCDEF" for char in head[3]):
         raise ValueError(f"invalid Breakpad MODULE: {path}")
     body = path.read_text(encoding="utf-8", errors="strict")
-    if not any(line.startswith("FILE ") for line in body.splitlines()) or not any(line.startswith("FUNC ") for line in body.splitlines()) or not any(line.startswith("STACK CFI ") for line in body.splitlines()):
-        raise ValueError(f"incomplete Breakpad symbols: {path}")
+    lines = body.splitlines()
+    missing = [record for record in ("FILE ", "FUNC ", "STACK CFI ") if not any(line.startswith(record) for line in lines)]
+    if missing:
+        raise ValueError(f"incomplete Breakpad symbols: {path} lacks {[record.strip() for record in missing]} in {len(lines)} lines")
     for line in body.splitlines():
         if line.startswith("FILE "):
             source = line.split(" ", 2)[-1]
@@ -190,7 +192,6 @@ def module(path: Path) -> tuple[str, str]:
 def platform_header(platform: str) -> tuple[str, str, str]:
     known = {
         "x86_64-unknown-linux-gnu": ("Linux", "x86_64", ".debug"),
-        "x86_64-apple-darwin": ("Mac", "x86_64", ".dSYM"),
         "aarch64-apple-darwin": ("Mac", "arm64", ".dSYM"),
         "x86_64-pc-windows-msvc": ("Windows", "x86_64", ".pdb"),
     }
@@ -200,11 +201,76 @@ def platform_header(platform: str) -> tuple[str, str, str]:
         raise ValueError("unsupported symbol target") from error
 
 
+def clipped(value: str) -> str:
+    return value if len(value) <= 200 else value[:197] + "..."
+
+
+def under(path: str, root: str) -> str | None:
+    """The part of `path` below `root`, or None; Windows roots compare without case."""
+    fold = str.casefold if re.match(r"^[A-Za-z]:", root) else str
+    prefix = root.rstrip("/") + "/"
+    if fold(path) == fold(root.rstrip("/")):
+        return ""
+    return path[len(prefix):] if fold(path[:len(prefix)]) == fold(prefix) else None
+
+
+TOOLCHAIN_ROOTS = re.compile(
+    r"^(?:/Applications/Xcode[^/]*\.app/Contents/Developer|/Library/Developer/CommandLineTools"
+    r"|[A-Za-z]:/Program Files(?: \(x86\))?/(?:Microsoft Visual Studio|Windows Kits)"
+    r"|[A-Za-z]:/[A-Za-z0-9]+/_work/\d+/s)/(.+)$"
+)
+
+
+def builder_location(value: str) -> str:
+    """Map the build host's checkout, cargo home, toolchain and SDK onto the container layout."""
+    # Windows canonical paths carry the extended-length prefix: "\\?\D:\a\..." is "D:\a\...".
+    path = posixpath.normpath(re.sub(r"^//\?/(?=[A-Za-z]:/)", "", value.replace("\\", "/")))
+    relative = under(path, ROOT.as_posix())
+    if relative is not None:
+        if relative.startswith("target/"):
+            return "/out/target/" + relative[len("target/"):]
+        return "/work/" + relative if relative else "/work"
+    cargo_home = os.environ.get("CARGO_HOME", "").replace("\\", "/")
+    relative = under(path, cargo_home) if cargo_home else None
+    if relative and relative.startswith(("registry/", "git/checkouts/")):
+        return "/root/.cargo/" + relative
+    for pattern, template in (
+        (r"/\.cargo/((?:registry/src|git/checkouts)/.+)$", "/root/.cargo/{}"),
+        (r"/lib/rustlib/(?:src|rustc-src)/rust/(library/.+)$", "/rustc/toolchain/{}"),
+        # The debugger visualizers a PDB lists beside its sources.
+        (r"/lib/rustlib/(etc/[^/]+\.natvis)$", "/rustc/toolchain/{}"),
+        (r"^[A-Za-z]:(/rustc/.+)$", "{}"),
+    ):
+        match = re.search(pattern, path)
+        if match:
+            return template.format(match.group(1))
+    match = TOOLCHAIN_ROOTS.match(path)
+    return "/usr/include/" + match.group(1) if match else path
+
+
+def native_source(path: str) -> str:
+    """A path read from native symbols; builder locations are mapped only on a public hosted runner."""
+    path = path.replace("\\", "/")
+    return builder_location(path) if os.environ.get("GITHUB_ACTIONS") == "true" else path
+
+
+def reject_private_native(paths) -> None:
+    rejected = sorted({path.replace("\\", "/") for path in paths if not safe_native_source(path)})
+    if rejected:
+        raise ValueError(f"private source path in native symbols: {clipped(rejected[0])}" + (f" (+{len(rejected) - 1} more)" if len(rejected) > 1 else ""))
+
+
+def absolute_native(value: str) -> bool:
+    value = value.replace("\\", "/")
+    return value.startswith("/") or re.match(r"^[A-Za-z]:/", value) is not None
+
+
 def normalized_source(value: str) -> str:
     """Map product paths and allow standard dependency records without escapes."""
     source = value.replace("\\", "/")
     if ".." in Path(source).parts:
-        raise ValueError("source path escapes its root")
+        raise ValueError(f"source path escapes its root: {clipped(value)}")
+    source = builder_location(source)
     for prefix in ("crates/", "/work/crates/", "C:/work/crates/"):
         if source.startswith(prefix):
             return "crates/" + source.split("crates/", 1)[1]
@@ -212,18 +278,24 @@ def normalized_source(value: str) -> str:
         return source
     if source.startswith(("/rustc/", "/rust/deps/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/out/target/", "/usr/include/")) or re.match(r"^/usr/lib/gcc/[^/]+/[^/]+/include/.+", source):
         return "dependency/" + source.rsplit("/", 1)[-1]
-    raise ValueError("private or unsupported source path in symbols")
+    raise ValueError(f"private or unsupported source path in symbols: {clipped(value)}")
 
 
 def canonicalize_symbol_sources(path: Path) -> None:
     lines = []
+    rejected: list[str] = []
     for line in path.read_text(encoding="utf-8", errors="strict").splitlines(keepends=True):
         if line.startswith("FILE "):
             parts = line.rstrip("\n").split(" ", 2)
             if len(parts) != 3:
                 raise ValueError("invalid Breakpad FILE record")
-            line = f"{parts[0]} {parts[1]} {normalized_source(parts[2])}\n"
+            try:
+                line = f"{parts[0]} {parts[1]} {normalized_source(parts[2])}\n"
+            except ValueError:
+                if parts[2] not in rejected: rejected.append(parts[2])
         lines.append(line)
+    if rejected:
+        raise ValueError("private or unsupported source path in symbols: " + "; ".join(clipped(value) for value in rejected[:5]) + (f" (+{len(rejected) - 5} more)" if len(rejected) > 5 else ""))
     path.write_text("".join(lines), encoding="utf-8")
 
 
@@ -325,8 +397,7 @@ def readelf_source_records(path: Path) -> tuple[list[str], int, int, int, int]:
             else:
                 no_line_count += 1
         resolved = resolved_native_source(base, source)
-        if not safe_native_source(posixpath.normpath(base.replace("\\", "/"))) or not safe_native_source(resolved):
-            raise ValueError("private source path in native symbols")
+        reject_private_native((posixpath.normpath(base.replace("\\", "/")), resolved))
         paths.update((posixpath.normpath(base.replace("\\", "/")), resolved))
     if not units:
         raise ValueError("missing DWARF line tables")
@@ -400,22 +471,21 @@ def readelf_source_records(path: Path) -> tuple[list[str], int, int, int, int]:
 
 def _inspect_linux_native(path: Path) -> dict:
     paths, units, tables, source_less, no_line = readelf_source_records(path)
-    if any(not safe_native_source(item) for item in paths):
-        raise ValueError("private source path in native symbols")
+    reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "elf-dwarf", "native_inspection_sha256": digest(path), "coverage": {"compile_units": units, "line_tables": tables, "source_less_compile_units": source_less, "no_line_compile_units": no_line}, "source_paths": paths}
 
 
 def valid_source_inspection(platform: str, path: Path, record: object) -> dict:
     if not isinstance(record, dict) or record.get("schema") != SOURCE_INSPECTION_SCHEMA or record.get("native_inspection_sha256") != digest(path):
         raise ValueError("invalid native source inspection")
-    expected_format = {"x86_64-unknown-linux-gnu": "elf-dwarf", "x86_64-apple-darwin": "macho-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
+    expected_format = {"x86_64-unknown-linux-gnu": "elf-dwarf", "aarch64-apple-darwin": "macho-dwarf", "x86_64-pc-windows-msvc": "pdb-dbi"}[platform]
     coverage, paths = record.get("coverage"), record.get("source_paths")
     if record.get("format") != expected_format or not isinstance(coverage, dict) or not isinstance(paths, list) or not paths or any(not isinstance(item, str) or not safe_native_source(item) for item in paths):
         raise ValueError("invalid native source inspection")
     if expected_format == "elf-dwarf":
         if not all(type(coverage.get(key)) is int and coverage[key] > 0 for key in ("compile_units", "line_tables")) or not all(type(coverage.get(key)) is int and coverage[key] >= 0 for key in ("source_less_compile_units", "no_line_compile_units")):
             raise ValueError("incomplete ELF source inspection")
-    if expected_format == "macho-dwarf" and (coverage.get("slices") != ["arm64", "x86_64"] or type(coverage.get("auxiliary_source_records")) is not int or coverage["auxiliary_source_records"] < 0):
+    if expected_format == "macho-dwarf" and (coverage.get("slices") != ["arm64"] or type(coverage.get("auxiliary_source_records")) is not int or coverage["auxiliary_source_records"] < 0):
         raise ValueError("incomplete Mach-O source inspection")
     if expected_format == "pdb-dbi" and (coverage.get("dbi_stream") != 3 or type(coverage.get("file_records")) is not int or coverage["file_records"] < 1 or not all(type(coverage.get(key)) is int and coverage[key] >= 0 for key in ("module_c13_records", "environment_records"))):
         raise ValueError("incomplete PDB source inspection")
@@ -447,7 +517,7 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
         raise ValueError("missing dSYM DWARF payload")
     paths: set[str] = set()
     slices: list[str] = []
-    for arch in ("x86_64", "arm64"):
+    for arch in ("arm64",):
         result = subprocess.run(["dwarfdump", "--arch", arch, "--debug-info", "--debug-line", str(dwarf)], text=True, encoding="utf-8", errors="strict", capture_output=True, check=False)
         if result.returncode or result.stderr:
             raise ValueError(f"dwarfdump failed for {arch}: {result.stderr.strip()}")
@@ -488,13 +558,13 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
             if statement and unit_active: statement_list = int(statement.group(1), 16)
             if table:
                 finish_table(); table_offset = int(table.group(1), 16)
-            directory_row = re.search(r"include_directories\[(\d+)\]\s*=\s*\"(.*)\"", line)
+            directory_row = re.search(r"include_directories\[\s*(\d+)\]\s*=\s*[\"'](.*)[\"']\s*$", line)
             if directory_row and table_offset is not None:
                 line_directories[int(directory_row.group(1))] = directory_row.group(2)
-            if table_offset is not None and re.search(r"file_names\[\d+\]", line): finish_file()
-            inline_file = re.search(r"file_names\[\d+\].*name:\s*\"(.*)\"", line)
+            if table_offset is not None and re.search(r"file_names\[\s*\d+\]", line): finish_file()
+            inline_file = re.search(r"file_names\[\s*\d+\].*name:\s*[\"'](.*)[\"']", line)
             if inline_file and table_offset is not None: file_name = inline_file.group(1)
-            name_row = re.search(r"\bname:\s*\"(.*)\"", line)
+            name_row = re.search(r"\bname:\s*[\"'](.*)[\"']", line)
             if name_row and not inline_file and table_offset is not None: file_name = name_row.group(1)
             index_row = re.search(r"dir_index:\s*(\d+)", line)
             if index_row and table_offset is not None: file_directory = int(index_row.group(1))
@@ -511,16 +581,20 @@ def _inspect_macos_native(path: Path, logical_name: str) -> dict:
             resolved_directories = {index: resolved_native_source(directory, value) for index, value in directories.items()}
             unit_paths.update(resolved_directories.values())
             for index, value in files:
-                if index and index not in resolved_directories: raise ValueError(f"invalid dSYM line directory for {arch}")
+                if index and index not in resolved_directories: raise ValueError(f"invalid dSYM line directory for {arch}: index {index}, {len(resolved_directories)} directories (indexes {sorted(resolved_directories)[:8]}), file {clipped(value)!r}")
                 unit_paths.add(resolved_native_source(resolved_directories.get(index, directory), value))
-        if line_tables: raise ValueError(f"unbound dSYM line table for {arch}")
+        # dwarfdump also prints empty tables no unit points at; they name no source.
+        line_tables = {offset: records for offset, records in line_tables.items() if records[0] or records[1]}
+        if line_tables:
+            unbound = "; ".join(f"table 0x{offset:x} ({len(dirs)} dirs, {len(files)} files, first {clipped(files[0][1])!r})" if files else f"table 0x{offset:x} ({len(dirs)} dirs, no files)" for offset, (dirs, files) in sorted(line_tables.items())[:5])
+            referenced = sorted({statement_list for _, _, statement_list in units.values() if statement_list is not None})
+            raise ValueError(f"unbound dSYM line table for {arch}: {len(line_tables)} unreferenced ({unbound}); {len(units)} units, {len(referenced)} reference a table {[hex(offset) for offset in referenced[:8]]}")
         if not unit_paths:
             raise ValueError(f"missing dSYM source records for {arch}")
         paths.update(unit_paths); slices.append(arch)
     auxiliary, auxiliary_records = macos_auxiliary_source_paths(path, {value.hex().upper() for value in macho_uuids(dwarf).values()})
-    paths.update(auxiliary)
-    if any(not safe_native_source(item) for item in paths):
-        raise ValueError("private source path in native symbols")
+    paths = {native_source(item) for item in paths | auxiliary}
+    reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "macho-dwarf", "native_inspection_sha256": digest(path), "coverage": {"slices": sorted(slices), "auxiliary_source_records": auxiliary_records}, "source_paths": sorted(paths)}
 
 
@@ -558,6 +632,28 @@ def pdb_streams(path: Path) -> tuple[list[bytes | None], int]:
         for block in pages: claim(block, "stream block")
         streams.append(b"".join(data[block * page_size:(block + 1) * page_size] for block in pages)[:size])
     return streams, page_size
+
+
+def pdb_names_table(streams: list[bytes | None]) -> bytes:
+    """The PDB-wide /names string buffer, which linked modules' file checksums index into."""
+    info = streams[1] if len(streams) > 1 else None
+    if info is None or len(info) < 32: raise ValueError("missing PDB info stream")
+    size = struct.unpack_from("<I", info, 28)[0]; buffer = info[32:32 + size]; cursor = 32 + size
+    if len(buffer) != size or cursor + 8 > len(info): raise ValueError("invalid PDB named stream map")
+    count = struct.unpack_from("<I", info, cursor)[0]; cursor += 8
+    for _ in range(2):
+        if cursor + 4 > len(info): raise ValueError("invalid PDB named stream map")
+        cursor += 4 + 4 * struct.unpack_from("<I", info, cursor)[0]
+    if cursor + 8 * count > len(info): raise ValueError("invalid PDB named stream map")
+    for index in range(count):
+        key, stream = struct.unpack_from("<II", info, cursor + 8 * index)
+        if key < size and buffer[key:buffer.find(b"\0", key)] == b"/names":
+            names = streams[stream] if stream < len(streams) else None
+            if names is None or len(names) < 12: raise ValueError("invalid PDB /names stream")
+            signature, _, length = struct.unpack_from("<III", names)
+            if signature != 0xEFFEEFFE or 12 + length > len(names): raise ValueError("invalid PDB /names stream")
+            return names[12:12 + length]
+    raise ValueError("PDB has no /names stream")
 
 
 def _inspect_windows_native(path: Path) -> dict:
@@ -618,7 +714,7 @@ def _inspect_windows_native(path: Path) -> dict:
                             if key.lower() == b"cwd":
                                 compilation_directories.append(value)
                                 module_directories.append(value)
-                            else: paths.append(resolved_native_source(compilation_directories[-1], value) if not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value) and compilation_directories else value)
+                            else: paths.append(resolved_native_source(compilation_directories[-1], value) if not absolute_native(value) and compilation_directories else value)
                             environment_records += 1
                 record = end
             c13 = module[symbol_size:symbol_size + c13_size]; cursor13 = 0; strings = b""; offsets: list[int] = []
@@ -635,23 +731,25 @@ def _inspect_windows_native(path: Path) -> dict:
                     if item != end: raise ValueError("invalid C13 file checksum")
                 cursor13 = (end + 3) & ~3
             if c13_size:
-                if not strings or not offsets: raise ValueError("incomplete C13 source records")
+                # A module may carry only line or inlinee subsections and no source files.
+                if offsets and not strings: strings = pdb_names_table(streams)
                 for position in offsets:
                     if position >= len(strings): raise ValueError("invalid C13 source offset")
                     end = strings.find(b"\0", position)
                     if end < 0: raise ValueError("unterminated C13 source record")
                     value = strings[position:end].decode("utf-8", "strict")
-                    if not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value):
+                    if not absolute_native(value):
                         if len(set(module_directories)) != 1:
                             raise ValueError("unresolved relative C13 source path")
                         value = resolved_native_source(module_directories[0], value)
                     paths.append(value)
                 c13_records += len(offsets)
         cursor = next_cursor
-    if any(not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value) for value in file_paths) and len(set(compilation_directories)) != 1: raise ValueError("unresolved relative PDB source path")
+    if any(not absolute_native(value) for value in file_paths) and len(set(compilation_directories)) != 1: raise ValueError("unresolved relative PDB source path")
     paths.extend(compilation_directories)
-    paths.extend(resolved_native_source(compilation_directories[0], value) if not value.startswith(("/", "//")) and not re.match(r"^[A-Za-z]:/", value) else value for value in file_paths)
-    if any(not safe_native_source(item) for item in paths): raise ValueError("private source path in native symbols")
+    paths.extend(resolved_native_source(compilation_directories[0], value) if not absolute_native(value) else value for value in file_paths)
+    paths = [native_source(item) for item in paths]
+    reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "pdb-dbi", "native_inspection_sha256": digest(path), "coverage": {"dbi_stream": 3, "file_records": len(file_paths), "module_c13_records": c13_records, "environment_records": environment_records}, "source_paths": sorted(set(paths))}
 
 
@@ -684,37 +782,26 @@ def inspect_native(platform: str, path: Path, logical_name: str) -> dict:
 
 
 def macho_uuids(path: Path) -> dict[str, bytes]:
+    """The UUID of a thin arm64 Mach-O, keyed by its architecture."""
     data = path.read_bytes()
-    if len(data) < 8 or struct.unpack_from(">I", data)[0] != 0xCAFEBABE:
-        raise ValueError(f"invalid universal Mach-O: {path}")
-    count = struct.unpack_from(">I", data, 4)[0]
-    if count != 2 or len(data) < 8 + count * 20:
-        raise ValueError(f"invalid universal Mach-O slices: {path}")
-    names = {0x1000007: "x86_64", 0x100000C: "arm64"}
-    found: dict[str, bytes] = {}
-    for index in range(count):
-        cpu, _, offset, size, _ = struct.unpack_from(">IIIII", data, 8 + index * 20)
-        if cpu not in names or offset + size > len(data) or size < 56:
-            raise ValueError(f"invalid universal Mach-O slice: {path}")
-        magic, slice_cpu, _, _, commands, command_bytes, _, _ = struct.unpack_from("<IIIIIIII", data, offset)
-        if magic != 0xFEEDFACF or slice_cpu != cpu or command_bytes < 24:
-            raise ValueError(f"invalid Mach-O header: {path}")
-        cursor, end, identifier = offset + 32, offset + 32 + command_bytes, None
-        for _ in range(commands):
-            if cursor + 8 > end:
-                break
-            command, length = struct.unpack_from("<II", data, cursor)
-            if length < 8 or cursor + length > end:
-                break
-            if command == 0x1B and length == 24:
-                identifier = data[cursor + 8:cursor + 24]
-            cursor += length
-        if identifier is None or names[cpu] in found:
-            raise ValueError(f"missing Mach-O UUID: {path}")
-        found[names[cpu]] = identifier
-    if set(found) != {"x86_64", "arm64"}:
-        raise ValueError(f"incomplete universal Mach-O UUIDs: {path}")
-    return found
+    if len(data) < 32:
+        raise ValueError(f"invalid Mach-O: {path}")
+    magic, cpu, _, _, commands, command_bytes, _, _ = struct.unpack_from("<IIIIIIII", data)
+    if magic != 0xFEEDFACF or cpu != 0x100000C or command_bytes < 24 or 32 + command_bytes > len(data):
+        raise ValueError(f"invalid arm64 Mach-O header: {path}")
+    cursor, end, identifier = 32, 32 + command_bytes, None
+    for _ in range(commands):
+        if cursor + 8 > end:
+            break
+        command, length = struct.unpack_from("<II", data, cursor)
+        if length < 8 or cursor + length > end:
+            break
+        if command == 0x1B and length == 24:
+            identifier = data[cursor + 8:cursor + 24]
+        cursor += length
+    if identifier is None:
+        raise ValueError(f"missing Mach-O UUID: {path}")
+    return {"arm64": identifier}
 
 
 def native_module_id(platform: str, native: Path, logical_name: str) -> str:
@@ -729,8 +816,7 @@ def native_module_id(platform: str, native: Path, logical_name: str) -> str:
     if not dwarf.is_file():
         raise ValueError(f"missing dSYM DWARF file: {native}")
     uuid_by_arch = macho_uuids(dwarf)
-    arch = "x86_64" if platform.startswith("x86_64") else "arm64"
-    return uuid_by_arch[arch].hex().upper() + "0"
+    return uuid_by_arch["arm64"].hex().upper() + "0"
 
 
 def assert_safe_tree(root: Path, allowed_files: set[str]) -> None:
@@ -743,7 +829,7 @@ def assert_safe_tree(root: Path, allowed_files: set[str]) -> None:
             raise ValueError("symbol tree contains empty directory")
         actual.update((current / name).relative_to(root).as_posix() for name in files)
     if actual != allowed_files:
-        raise ValueError("symbol tree contains stale or missing files")
+        raise ValueError(f"symbol tree contains stale or missing files: stale {sorted(actual - allowed_files)}, missing {sorted(allowed_files - actual)}")
 
 
 def write_inventory(root: Path, platform: str, version: str, native: dict[str, Path], symbols_by_name: dict[str, list[Path]] | None = None, inspections: dict[str, dict] | None = None) -> Path:
@@ -759,12 +845,14 @@ def write_inventory(root: Path, platform: str, version: str, native: dict[str, P
         symbols = []
         for match in matches:
             module_id, module_name = module(match)
-            if match.parent.name != module_id or match.name != f"{module_name}.sym" or match.parent.parent.name != module_name:
+            # dump_syms files a PDB's symbols as `<name>.pdb/<id>/<name>.sym`, the Breakpad convention.
+            file_names = {f"{module_name}.sym", f"{module_name[:-4]}.sym" if module_name.lower().endswith(".pdb") else ""}
+            if match.parent.name != module_id or match.name not in file_names or match.parent.parent.name != module_name:
                 raise ValueError(f"invalid store layout for {name}")
-            symbols.append({"path": str(match.relative_to(root)), "sha256": digest(match), "module_id": module_id, "module_name": module_name})
+            symbols.append({"path": match.relative_to(root).as_posix(), "sha256": digest(match), "module_id": module_id, "module_name": module_name})
         if len({item["module_id"] for item in symbols}) != len(symbols):
             raise ValueError(f"duplicate Breakpad module ID for {name}")
-        entry = {"name": name, "native": str(path.relative_to(root)), "native_sha256": digest(path), "native_id": native_module_id(platform, path, name), "native_source_inspection": inspection, "symbols": symbols}
+        entry = {"name": name, "native": path.relative_to(root).as_posix(), "native_sha256": digest(path), "native_id": native_module_id(platform, path, name), "native_source_inspection": inspection, "symbols": symbols}
         if platform == "x86_64-unknown-linux-gnu":
             entry["native_build_id"] = elf_build_id(path)
         if platform.endswith("apple-darwin"):
@@ -822,8 +910,11 @@ def verify_inventory(root: Path, manifest: Path | None = None) -> dict:
                 raise ValueError(f"symbol inventory hash mismatch for {name}")
             module_os, module_cpu, module_id, module_name = module_header(symbol)
             expected_module = native.name if platform == "x86_64-pc-windows-msvc" else name
-            if module_os != os_name or module_cpu != cpu or module_name != expected_module or module_name != symbol_data.get("module_name") or module_id != native_id or module_id != symbol_data["module_id"] or symbol.parent.name != module_id or symbol.parent.parent.name != module_name:
-                raise ValueError(f"symbol inventory module mismatch for {name}")
+            # Breakpad producers disagree on the case of the OS token ("windows" and "Windows").
+            checks = {"os": module_os.lower() == os_name.lower(), "cpu": module_cpu == cpu, "name": module_name == expected_module, "recorded name": module_name == symbol_data.get("module_name"), "id": module_id == native_id, "recorded id": module_id == symbol_data["module_id"], "id directory": symbol.parent.name == module_id, "name directory": symbol.parent.parent.name == module_name}
+            failed = [f"{label}" for label, holds in checks.items() if not holds]
+            if failed:
+                raise ValueError(f"symbol inventory module mismatch for {name}: {', '.join(failed)} (header {module_os} {module_cpu} {module_id} {module_name}; expected {os_name} {cpu} {native_id} {expected_module})")
     expected = {"symbol-inventory.json"}
     for item in entries:
         native = root / item["native"]
@@ -1027,6 +1118,27 @@ def verify_windows(pairs: list[str]) -> None:
             raise ValueError(f"PE/PDB GUID+age mismatch for {name}")
 
 
+def dsym_dwarf_file(native: Path) -> Path | None:
+    if not native.is_dir(): return None
+    files = [item for item in (native / "Contents/Resources/DWARF").glob("*") if item.is_file()]
+    if len(files) != 1: raise ValueError(f"dSYM bundle without exactly one DWARF file: {native}")
+    return files[0]
+
+
+def add_binary_cfi(dump_syms: str, arch: str | None, binary: str, symbol: Path, scratch: Path) -> None:
+    """dsymutil copies no unwind tables, so take the STACK records from the linked binary itself."""
+    lines = symbol.read_text(encoding="utf-8").splitlines(keepends=True)
+    if any(line.startswith("STACK CFI ") for line in lines): return
+    shutil.rmtree(scratch, ignore_errors=True)
+    subprocess.run([dump_syms, "--store", str(scratch), *(["--arch", arch] if arch else []), binary], check=True)
+    found = list(scratch.glob("*/*/*.sym"))
+    if len(found) != 1: raise ValueError(f"expected one Breakpad file from {binary}, found {len(found)}")
+    other = found[0].read_text(encoding="utf-8").splitlines(keepends=True)
+    if other[0].split()[:4] != lines[0].split()[:4]: raise ValueError(f"binary and dSYM disagree on the module: {other[0].strip()!r} vs {lines[0].strip()!r}")
+    symbol.write_text("".join(lines + [line for line in other if line.startswith("STACK ")]), encoding="utf-8")
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
 def build(args: argparse.Namespace) -> None:
     output = Path(args.output).resolve()
     output_root = Path(args.output_root).resolve()
@@ -1051,8 +1163,12 @@ def build(args: argparse.Namespace) -> None:
             before = set((output / "store").glob("*/*/*.sym"))
             command = [args.dump_syms, "--inlines", "--store", str(output / "store")]
             if arch: command.extend(["--arch", arch])
-            subprocess.run([*command, value], check=True)
+            dwarf = dsym_dwarf_file(native[name])
+            # A linked Mach-O keeps only a debug map; the line tables live in the dSYM.
+            subprocess.run([*command, str(dwarf or value)], check=True)
             after = set((output / "store").glob("*/*/*.sym"))
+            if dwarf:
+                for symbol in sorted(after - before): add_binary_cfi(args.dump_syms, arch, value, symbol, output / "cfi-store")
             symbols_by_name[name].extend(sorted(after - before))
     for symbols in symbols_by_name.values():
         for symbol in symbols:

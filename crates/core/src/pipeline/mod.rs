@@ -343,21 +343,48 @@ pub fn run(
 
     let equalization = match request.equalize {
         Some(settings) => {
+            let frames_done = control.begin_prepare(frame_reader.len());
             control.set_stage(JobStage::Prepare);
             observer.stage(RunStage::Prepare {
                 frames: frame_reader.len(),
             });
-            let estimated = {
-                let _prepare = equalize_scope();
-                equalize::estimate(
-                    frame_reader,
-                    frame_reader.len(),
-                    (width, height),
-                    spp,
-                    settings,
-                    &|| control.state() == ControlState::CancelRequested,
-                )
-            };
+            let workers = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(frame_reader.len())
+                .min(control.admission_cap())
+                .max(1);
+            let done = AtomicBool::new(false);
+            let poll = request.poll;
+            // The stage span is re-entered on the watcher thread, which does
+            // not inherit it.
+            let parent = tracing::Span::current();
+            let estimated = std::thread::scope(|scope| {
+                let watcher = scope.spawn(|| {
+                    let _parent = parent.enter();
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(poll);
+                        observer.tick(&control.progress());
+                    }
+                });
+                let result = {
+                    let _prepare = equalize_scope();
+                    equalize::estimate(
+                        frame_reader,
+                        frame_reader.len(),
+                        (width, height),
+                        spp,
+                        settings,
+                        workers,
+                        &frames_done,
+                        &|| control.state() == ControlState::CancelRequested,
+                    )
+                };
+                done.store(true, Ordering::SeqCst);
+                watcher
+                    .join()
+                    .expect("prepare watcher thread must not panic");
+                result
+            });
             let report = match estimated {
                 Err(AlgorithmError::Cancelled) => {
                     return Ok(FuseOutcome::Cancelled {
@@ -442,8 +469,16 @@ pub fn run(
             alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
         } else {
             let stage_key = StageKey::align(&fingerprint, &identity);
+            // The sources' content hashes, one frame at a time through the
+            // memo the background hash thread fills; a frame that cannot be
+            // hashed is a miss, and the seal reports the failure itself.
+            let frame_hash = |i: usize| {
+                project::source_hash_change_checked(&request.frames[i])
+                    .ok()
+                    .map(|(_, hash)| hash)
+            };
             let cache_hit = if request.cache {
-                stage_cache.and_then(|cache| cache.get_alignment(&stage_key))
+                stage_cache.and_then(|cache| cache.get_alignment(&stage_key, frame_hash))
             } else {
                 None
             };
@@ -543,7 +578,11 @@ pub fn run(
                 // alignment into a failed run.
                 if request.cache
                     && let Some(cache) = stage_cache
-                    && let Err(err) = cache.put_alignment(&stage_key, &request.frames, &alignment)
+                    && let Some(content) = (0..request.frames.len())
+                        .map(frame_hash)
+                        .collect::<Option<Vec<_>>>()
+                    && let Err(err) =
+                        cache.put_alignment(&stage_key, &request.frames, &content, &alignment)
                 {
                     observer.notice(&format!("warning: {err}"));
                 }

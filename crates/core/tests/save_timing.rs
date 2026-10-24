@@ -92,12 +92,13 @@ fn measure<S>(
     let warm = runs[runs.len() / 2];
     println!("{method} {scenario} warm {warm:.3} s");
 
+    // `timed` runs even when eviction is unsupported: a later scenario reads
+    // what it leaves behind.
     let state = setup();
-    match evict(evict_set) {
-        Ok(files) => {
-            let cold = timed(state).as_secs_f64();
-            println!("{method} {scenario} cold {cold:.3} s (evicted {files} files)");
-        }
+    let evicted = evict(evict_set);
+    let cold = timed(state).as_secs_f64();
+    match evicted {
+        Ok(files) => println!("{method} {scenario} cold {cold:.3} s (evicted {files} files)"),
         Err(reason) => println!("{method} {scenario} cold n/a ({reason})"),
     }
     Figure {
@@ -213,7 +214,10 @@ fn run_scenarios(frames: &[PathBuf], method: &'static str, out: &Path) -> Vec<Fi
         &with_frames(&[&retouched]),
         || {
             std::fs::copy(&fused, &retouched).expect("the saved project must copy");
-            std::fs::File::open(&retouched)
+            // Flushing a file needs a handle with write access on Windows.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&retouched)
                 .and_then(|f| f.sync_all())
                 .expect("the copy must reach the disk");
         },

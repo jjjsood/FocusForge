@@ -301,7 +301,7 @@ pub fn warp_tile(
                 |source: AlgorithmError| AlignError::Read {
                     frame: frame_index,
                     rect: read,
-                    source,
+                    source: Box::new(source),
                 },
             )?;
             let src = Tile {

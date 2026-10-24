@@ -606,7 +606,7 @@ def _selftest() -> int:
         refusals = [
             ("LZW composite", [p("lzw.tif")], p("lzw.tif"), "Compression=5"),
             ("tiled composite", [p("tiled.tif")], p("tiled.tif"), "tiled"),
-            ("missing file", [p("nope.tif")], p("nope.tif"), "No such file"),
+            ("missing file", [p("nope.tif")], p("nope.tif"), "WinError 2" if os.name == "nt" else "No such file"),
             ("z-map of another size", [p("clean.tif"), "--zmap", p("small.tif")], p("small.tif"), f"{w // 2}x{h // 2}"),
             ("3-channel z-map", [p("clean.tif"), "--zmap", p("zm3.tif")], p("zm3.tif"), "3 channel"),
             ("8-bit z-map", [p("clean.tif"), "--zmap", p("zm8.tif")], p("zm8.tif"), "8-bit"),
@@ -616,7 +616,9 @@ def _selftest() -> int:
         ]
         for label, argv, named, found in refusals:
             code, text = run(argv)
-            ok(f"refused, exit 1, names file and finding: {label}", code == 1 and named in text and found in text, f"exit {code}: {text}")
+            # OSError prints the file name as a repr, which doubles Windows backslashes.
+            names_file = named in text or named.replace("\\", "\\\\") in text
+            ok(f"refused, exit 1, names file and finding: {label}", code == 1 and names_file and found in text, f"exit {code}: {text}")
         code, text = run([p("lzw.tif")])
         ok("LZW refusal names the uncompressed export", "--tiff-compression none" in text, text)
         code, _ = run([p("clean.tif"), "--bogus"])

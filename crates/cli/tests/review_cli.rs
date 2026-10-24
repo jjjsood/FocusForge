@@ -856,7 +856,10 @@ fn link_reference_frames(dir: &Path, stack_dir: &Path) -> PathBuf {
         if !name.contains("IMG_") || !name.ends_with(".tif") {
             continue;
         }
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&path, frames.join(&name)).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&path, frames.join(&name)).unwrap();
         count += 1;
     }
     assert_eq!(count, 61, "IMG_-filtered list must be the 61 source frames");
