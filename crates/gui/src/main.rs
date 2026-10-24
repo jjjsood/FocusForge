@@ -528,7 +528,7 @@ impl LinuxDisplayBackend {
 #[cfg(target_os = "linux")]
 type LaunchTokens = (Option<String>, Option<String>);
 #[cfg(not(target_os = "linux"))]
-type LaunchTokens = ();
+struct LaunchTokens;
 
 /// Reads the launcher's startup tokens and removes them from the process
 /// environment, so no thread or child process started later inherits them.
@@ -542,6 +542,8 @@ fn take_launch_tokens() -> LaunchTokens {
         winit::platform::startup_notify::reset_activation_token_env();
         tokens
     }
+    #[cfg(not(target_os = "linux"))]
+    LaunchTokens
 }
 
 /// The token that ends the launcher's startup notification: the variable of
@@ -624,7 +626,7 @@ fn select_backend(
         }
     };
     #[cfg(not(target_os = "linux"))]
-    let () = launch_tokens;
+    let LaunchTokens = launch_tokens;
     // The drop route is installed on this *existing* `BackendSelector`
     // chain, before any window exists, which is why `controller` and
     // `canvas` are both built before `select_backend` runs rather than
