@@ -280,7 +280,7 @@ fn live_card_meta_names_the_phase() {
     );
     assert_eq!(
         job::phase_line(&RunState::Running, Some(&align_progress(0, 0))).as_deref(),
-        Some("aligning")
+        Some("aligning, from cache")
     );
     assert_eq!(
         job::phase_line(&RunState::Running, Some(&fuse_progress(4, 10))).as_deref(),
