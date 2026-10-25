@@ -626,13 +626,15 @@ fn a_slowed_run_holds_its_floor_and_matches_an_unslowed_run() {
 #[test]
 fn pause_and_cancel_act_inside_a_slowed_run_and_siblings_keep_their_speed() {
     let timeout = Duration::from_secs(120);
+    let floor = Duration::from_secs(20);
     let mut controller = controller_with_frames("slow_run_control", 3);
-    controller.set_slow_run(2, Duration::from_secs(20));
+    controller.set_slow_run(2, floor);
 
     assert!(controller.start_fuse(), "run 1 starts");
     common::wait_for_settle(&mut controller, timeout);
     let held = controller.held_checkpoints().len();
 
+    let run_2 = Instant::now();
     assert!(controller.start_fuse(), "run 2 starts");
     wait_until_fusing(&controller);
     controller.pause_or_resume();
@@ -645,14 +647,32 @@ fn pause_and_cancel_act_inside_a_slowed_run_and_siblings_keep_their_speed() {
     );
     assert_eq!(controller.job_view().state, job::RunState::Paused);
 
+    // Run 2 has run for at most `ran` -- less if the pause held it -- so
+    // its floor still owes at least `floor - ran` after the resume. A cancel
+    // that waited out the hold settles no earlier than that, however slow
+    // the host; one that acts inside it settles long before.
+    let resumed = Instant::now();
+    let ran = resumed - run_2;
     controller.pause_or_resume();
     controller.cancel_fuse();
-    common::wait_for_settle(&mut controller, Duration::from_secs(2));
+    common::wait_for_settle(&mut controller, timeout);
+    let cancelled = resumed.elapsed();
+    assert!(
+        cancelled < floor.saturating_sub(ran),
+        "the cancel waited out the hold: settled {cancelled:?} after the resume, \
+         {ran:?} into the {floor:?} floor"
+    );
     assert_eq!(controller.job_view().state, job::RunState::Idle);
     assert_eq!(controller.held_checkpoints().len(), held);
 
+    let run_3 = Instant::now();
     assert!(controller.start_fuse(), "run 3 starts");
-    common::wait_for_settle(&mut controller, Duration::from_secs(20));
+    common::wait_for_settle(&mut controller, timeout);
+    assert!(
+        run_3.elapsed() < floor,
+        "run 3 took {:?}, as long as the slowed run's floor",
+        run_3.elapsed()
+    );
     assert_eq!(
         controller.held_checkpoints().len(),
         held + 1,
