@@ -13,8 +13,9 @@ project that was already stacked. `--open` is repeatable — each path is
 opened in turn, the next one waiting for the one before it to finish rather
 than racing it. Leaving `--open` off starts with an empty window: click
 **Open…** to choose the TIFF or camera RAW frames of one stack, which start
-one new tab, or drop a folder or a set of frames onto the window (the caption
-reads "Dropping is unavailable on native Wayland" where drops do not work).
+one new tab (sorted by name), or drop a folder or a set of frames onto the
+window. The empty window's caption reads "Drop a folder or stack", or
+"Dropping is unavailable on native Wayland" where drops do not work.
 Ctrl+N and the Projects rail's **New project** ask for a folder instead. A path that fails to open shows the same refusal dialog a failed
 drop or picker choice would, rather than closing the window. A folder with
 no readable frames is refused naming the formats read, 16-bit TIFF and camera
@@ -26,6 +27,10 @@ and decodes a thumbnail off the window's own thread, so the window keeps
 responding while a large folder is scanned, and while an open, save or
 export file dialog is up; a loading indicator appears over
 the canvas once a load has been running for half a second.
+
+On Linux, a launch that carries a startup-notification token
+(`DESKTOP_STARTUP_ID` or `XDG_ACTIVATION_TOKEN`) tells the desktop once the
+window has appeared, so the launcher's busy cursor ends.
 
 ## Launch options
 
@@ -93,7 +98,10 @@ The toolbar's transport button reads **Fuse stack** on a tab with two or
 more frames still to fuse; while a run is going it becomes **Pause**,
 **Cancel** and, once paused, **Resume**. A failed run offers **Retry**,
 which starts the same request again. Progress, the current stage and an ETA
-show along the bottom of the window while a run is live. A failed run raises
+show along the bottom of the window while a run is live. Brightness
+preparation and a computed alignment each show frames done and an estimated
+time remaining; time spent paused is left out of the estimate. When alignment
+is reused from an earlier run, the bar reads "from cache" for that stage. A failed run raises
 a toast naming which step it failed at — setup, alignment or fusion —
 rather than a generic failure message.
 

@@ -162,6 +162,7 @@ set +e
 docker run --rm -i -v "$root:/src:ro" -v "$next:/out" -v "$input_manifest:/inputs/package-inputs.sha256:ro" -v "$legal_inputs:/inputs/type2-legal-inputs.tsv:ro" "$image" bash -s -- "$version" "$dist_url" "$dist_sha" "$app_url" "$app_sha" "$runtime_url" "$runtime_sha" "$revision" "$image" "$owner_uid" "$owner_gid" <<'CONTAINER'
 set -euo pipefail
 version=$1; dist_url=$2; dist_sha=$3; app_url=$4; app_sha=$5; runtime_url=$6; runtime_sha=$7; revision=$8; image=$9; owner_uid=${10}; owner_gid=${11}
+deb_version=${version/-/\~}
 trap 'chown -R "$owner_uid:$owner_gid" /out' EXIT
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -280,7 +281,7 @@ mkdir -p /out/deb/DEBIAN /tmp/debian
 printf '%s\n' 'Source: focusforge' 'Section: graphics' 'Priority: optional' 'Maintainer: FocusForge <release@focusforge.invalid>' 'Standards-Version: 4.6.0' '' 'Package: focusforge' 'Architecture: any' 'Description: Focus stacking desktop and command-line tools' > /tmp/debian/control
 depends=$(cd /tmp && dpkg-shlibdeps -O -e/out/deb/usr/bin/focusforge-cli -e/out/deb/usr/bin/focusforge-gui | sed -n 's/^shlibs:Depends=//p')
 test -n "$depends"
-printf '%s\n' "Package: focusforge" "Version: $version" 'Architecture: amd64' 'Maintainer: FocusForge' 'License: GPL-3.0-only' "Depends: $depends" 'Description: Focus stacking desktop and command-line tools' > /out/deb/DEBIAN/control
+printf '%s\n' "Package: focusforge" "Version: $deb_version" 'Architecture: amd64' 'Maintainer: FocusForge' 'License: GPL-3.0-only' "Depends: $depends" 'Description: Focus stacking desktop and command-line tools' > /out/deb/DEBIAN/control
 printf '%s\n' 'Native libraries resolved at package build by dpkg-shlibdeps:' "$depends" > /out/deb/usr/share/doc/focusforge/native-notices.txt
 dpkg-deb --build --root-owner-group /out/deb "/out/focusforge_${version}_amd64.deb" |& tee /out/dpkg-build.log
 ARCH=x86_64 VERSION="$version" APPIMAGE_EXTRACT_AND_RUN=1 /out/appimagetool.AppImage --runtime-file /out/runtime-x86_64 /out/AppDir "/out/FocusForge-${version}-x86_64.AppImage" |& tee /out/appimage-build.log

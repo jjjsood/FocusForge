@@ -9,6 +9,7 @@ $outputPath = [IO.Path]::GetFullPath((Join-Path $root $OutputDirectory))
 if (-not $outputPath.StartsWith($nativeRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'output must stay below target/distrib/native' }
 $version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"$').Matches[0].Groups[1].Value
 if (-not $version) { throw 'missing workspace version' }
+$msiVersion = ($version -split '-')[0]
 $tools = Get-Content (Join-Path $root 'packaging/native-tools.toml') -Raw
 $url = ([regex]::Match($tools, 'url = "([^"]+)"')).Groups[1].Value
 $expectedHash = ([regex]::Match($tools, 'sha256 = "([0-9a-f]{64})"')).Groups[1].Value
@@ -57,7 +58,7 @@ $symbolOutput = Join-Path $staging 'symbols/x86_64-pc-windows-msvc'
 & python $root/tools/package-symbols.py build --platform x86_64-pc-windows-msvc --version $version --dump-syms $dumpSyms[0] --output $symbolOutput --output-root $staging --symbols-per-native 1 "--native=focusforge-cli=$(Join-Path $native (Split-Path $cliPdb -Leaf))" "--native=focusforge-gui=$(Join-Path $native (Split-Path $guiPdb -Leaf))" "--binary=focusforge-cli=$cli" "--binary=focusforge-gui=$gui"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $msi = Join-Path $staging "FocusForge-$version-x86_64.msi"
-& dotnet $wix build -arch x64 -d "Version=$version" -d "Cli=$cli" -d "Gui=$gui" -d "License=$(Join-Path $root 'LICENSE')" -d "Notice=$(Join-Path $root 'NOTICE')" -d "Icon=$(Join-Path $root 'assets/build/focusforge.ico')" -d "CliAssets=$(Join-Path $resources 'share')" -o $msi (Join-Path $root 'packaging/windows/focusforge.wxs')
+& dotnet $wix build -arch x64 -d "Version=$msiVersion" -d "Cli=$cli" -d "Gui=$gui" -d "License=$(Join-Path $root 'LICENSE')" -d "Notice=$(Join-Path $root 'NOTICE')" -d "Icon=$(Join-Path $root 'assets/build/focusforge.ico')" -d "CliAssets=$(Join-Path $resources 'share')" -o $msi (Join-Path $root 'packaging/windows/focusforge.wxs')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $revision = (git -C $root rev-parse HEAD).Trim()
 $receipt = [ordered]@{ kind = 'msi'; version = $version; revision = $revision; artifact = (Split-Path $msi -Leaf); sha256 = (Get-FileHash -Algorithm SHA256 $msi).Hash.ToLowerInvariant() } | ConvertTo-Json -Compress

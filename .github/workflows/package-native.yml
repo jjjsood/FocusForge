@@ -58,7 +58,7 @@ jobs:
           if-no-files-found: warn
       - name: Check native package
         shell: bash
-        run: tools/check-package-macos.sh target/distrib/native/macos/FocusForge-0.1.0-aarch64.dmg
+        run: tools/check-package-macos.sh target/distrib/native/macos/FocusForge-0.1.0-rc.1-aarch64.dmg
       - name: Upload package smoke receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -124,7 +124,7 @@ jobs:
         run: tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows
       - name: Check native package
         shell: pwsh
-        run: tools/check-package-windows.ps1 -Msi target/distrib/native/windows/FocusForge-0.1.0-x86_64.msi
+        run: tools/check-package-windows.ps1 -Msi target/distrib/native/windows/FocusForge-0.1.0-rc.1-x86_64.msi
       - name: Upload package smoke receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

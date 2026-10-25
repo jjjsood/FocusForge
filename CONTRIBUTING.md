@@ -131,6 +131,10 @@ report and flight recording, and the crash-notice bookkeeping and
 diagnostics bundle's redaction and manifest, each writing into its own
 temporary directory rather than a shared one.
 
+Under `cargo nextest` (`.config/nextest.toml`) each test is killed after 15
+minutes and reported as a named TIMEOUT; the `hit_cap_behaviour` binary gets
+40.
+
 `tests/ui/` holds 18 journeys, each one whole path through the window as
 numbered clicks, keys and hovers with an `Expect:` line per step, plus
 `features/` files listing which journey covers which feature. They are run by
@@ -241,6 +245,12 @@ toasts are attributed through the AppUserModelID `org.focusforge.FocusForge`,
 which the installed Start-menu shortcut registers; a build run outside the MSI
 install may show no toast, or one under another application
 (https://github.com/hoodie/notify-rust/issues/219).
+
+The macOS package script sizes the disk image from the built app, retries
+`hdiutil create` up to three times with more headroom each time, and writes
+disk-space and `hdiutil` output to `.scratch/package-macos-diagnostics/`, which
+the package workflow uploads as an artifact. The hosted check job is bounded
+at 240 minutes.
 
 ### Release smoke checklist
 

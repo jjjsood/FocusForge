@@ -26,6 +26,6 @@ What has to exist before the rest can be tested, most valuable first.
 
 1. A seeded settings folder for the Recent list, and a journey that opens `fixtures/projects/valid.ffp` (the file exists; the corrupt, mismatch and missing projects are covered by journey 16).
 2. The export writing and refused states: they need a lone launch (`--export-dialog-preview`); saves and exports already land in the `--save-folder` destination.
-3. A journey that presses the keyboard shortcuts (Ctrl+Z, Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+W, Escape on the Projects overview): `Press` exists, only Escape on the refusal and in the notification center is pressed so far.
+3. A journey that presses the keyboard shortcuts (Ctrl+Z, Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+W, Escape on the Projects overview): `Press` exists, only Escape on the refusal, in the notification center and in the modal dialogs (journeys 05 and 06) is pressed so far.
 4. Fixture folders: a stack that aligns fully, one large enough to show the loading indicator.
 5. A driver drag that starts at a chosen point: `drag` and `hover` press at the element's centre.

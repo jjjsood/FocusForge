@@ -329,19 +329,37 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
 }
 
 /// Forwards to a [`job::GuiObserver`] and records the phase the bar would
-/// read the moment the brightness preparation is announced.
+/// read the moment the brightness preparation is announced, and the step text
+/// it would read the moment the align stage is announced.
 struct PhaseAtStage {
     inner: job::GuiObserver,
     at_prepare: Mutex<Option<job::Phase>>,
+    at_align: Mutex<Option<String>>,
+}
+
+impl PhaseAtStage {
+    fn new() -> Self {
+        Self {
+            inner: job::GuiObserver::new(),
+            at_prepare: Mutex::new(None),
+            at_align: Mutex::new(None),
+        }
+    }
 }
 
 impl StageObserver for PhaseAtStage {
     fn stage(&self, stage: pipeline::RunStage) {
         let prepares = matches!(stage, pipeline::RunStage::Prepare { .. });
+        let aligns = matches!(stage, pipeline::RunStage::Align { .. });
         StageObserver::stage(&self.inner, stage);
         if prepares {
             let phase = job::progress_phase(self.inner.last_progress().as_ref());
             *self.at_prepare.lock().unwrap() = Some(phase);
+        }
+        if aligns {
+            let progress = self.inner.last_progress();
+            let text = job::progress_text(&job::RunState::Running, progress.as_ref());
+            *self.at_align.lock().unwrap() = Some(text);
         }
     }
 
@@ -357,10 +375,7 @@ fn the_bar_reads_preparing_from_the_moment_equalization_starts() {
         max_gain: 1.25,
         target_stops: 0.0,
     });
-    let observer = PhaseAtStage {
-        inner: job::GuiObserver::new(),
-        at_prepare: Mutex::new(None),
-    };
+    let observer = PhaseAtStage::new();
     let control = focusforge_core::job::JobControl::new();
     pipeline::run(&request, &observer, control, None).expect("an equalized run completes");
     let at_prepare = observer
@@ -372,6 +387,91 @@ fn the_bar_reads_preparing_from_the_moment_equalization_starts() {
         at_prepare,
         job::Phase::Preparing,
         "the bar must not read Fusing while the brightness gains are estimated"
+    );
+}
+
+/// One `pipeline::run` of `request` through the stage cache under its
+/// scratch root: the step text the bar reads when the align stage is
+/// announced, and the report's alignment source.
+fn align_stage_text(request: &FuseRequest) -> (String, String) {
+    let observer = PhaseAtStage::new();
+    let cache = focusforge_core::job::StageCache::open(&request.scratch_root)
+        .expect("the stage cache opens under the scratch root");
+    let outcome = pipeline::run(
+        request,
+        &observer,
+        focusforge_core::job::JobControl::new(),
+        Some(&cache),
+    )
+    .expect("the run completes");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("the run was not cancelled");
+    };
+    let text = observer
+        .at_align
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("an aligned run announces its align stage");
+    (text, report.align_source.clone())
+}
+
+/// `no_align_request` with `dummy-align`, sealing to `name` so a repeat run
+/// of the same frames never meets a previous seal.
+fn dummy_align_request(label: &str, name: &str) -> FuseRequest {
+    let mut request = no_align_request(label, 3);
+    request.output = FuseOutput::Seal(request.scratch_root.join(name));
+    request.align = Some(pipeline::AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    });
+    request
+}
+
+#[test]
+fn a_fusion_only_change_reads_from_cache_while_aligning() {
+    let mut request = dummy_align_request("align_hint_cache", "first.ffp");
+    assert_eq!(
+        align_stage_text(&request),
+        (String::new(), "computed".to_string())
+    );
+
+    request.output = FuseOutput::Seal(request.scratch_root.join("second.ffp"));
+    request
+        .explicit
+        .insert("levels".to_string(), ParamValue::Int(5));
+    assert_eq!(
+        align_stage_text(&request),
+        ("from cache".to_string(), "cached".to_string()),
+        "a fusion parameter is not part of the alignment identity"
+    );
+
+    request.output = FuseOutput::Seal(request.scratch_root.join("third.ffp"));
+    request
+        .align
+        .as_mut()
+        .expect("an aligned request")
+        .explicit
+        .insert("max-shift".to_string(), ParamValue::Int(8));
+    assert_eq!(
+        align_stage_text(&request),
+        (String::new(), "computed".to_string()),
+        "an alignment parameter is"
+    );
+}
+
+#[test]
+fn clearing_the_stage_cache_drops_the_reuse_hint() {
+    let mut request = dummy_align_request("align_hint_cleared", "first.ffp");
+    assert_eq!(align_stage_text(&request).1, "computed");
+
+    job::clear_stage_cache(&request.scratch_root).expect("the cache clears");
+    request.output = FuseOutput::Seal(request.scratch_root.join("second.ffp"));
+    assert_eq!(
+        align_stage_text(&request),
+        (String::new(), "computed".to_string()),
+        "a cleared cache leaves nothing to reuse"
     );
 }
 
@@ -1254,6 +1354,29 @@ fn prepare_eta_text_follows_the_engine_estimate() {
 }
 
 #[test]
+fn align_eta_text_follows_the_engine_estimate() {
+    use focusforge_gui::job::{RunState, bar_fraction, eta_text, progress_text};
+
+    let mut snapshot = align_progress(3, 61);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.eta = Some(Duration::from_secs(125));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 2:05");
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&snapshot)),
+        "3 of 61"
+    );
+    assert_eq!(bar_fraction(Some(&snapshot)), 3.0 / 61.0);
+    assert_eq!(eta_text(&RunState::Paused, Some(&snapshot)), "ETA —");
+
+    // Every frame done, the stage not yet moved on: the engine reports no
+    // estimate, never a rendered zero.
+    assert_eq!(
+        eta_text(&RunState::Running, Some(&align_progress(61, 61))),
+        "estimating"
+    );
+}
+
+#[test]
 fn prepare_stage_announcement_records_the_frame_total() {
     use focusforge_core::job::JobStage;
     use focusforge_core::pipeline::{RunStage, StageObserver};
@@ -1263,6 +1386,71 @@ fn prepare_stage_announcement_records_the_frame_total() {
     let recorded = observer.last_progress().expect("a Prepare snapshot");
     assert_eq!(recorded.stage, JobStage::Prepare);
     assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 7));
+}
+
+#[test]
+fn a_cached_alignment_reads_as_reused() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{AlignSource, RunStage, StageObserver};
+    use focusforge_gui::job::{
+        RunState, bar_fraction, eta_text, phase_line, progress_text, stage_word,
+    };
+
+    let cached = || RunStage::Align {
+        frames: 9,
+        source: AlignSource::Cached,
+    };
+    let alone = job::GuiObserver::new();
+    alone.stage(cached());
+    let after_prepare = job::GuiObserver::new();
+    after_prepare.stage(RunStage::Prepare { frames: 5 });
+    after_prepare.stage(cached());
+
+    for observer in [&alone, &after_prepare] {
+        let snapshot = observer.last_progress().expect("an Align snapshot");
+        assert_eq!(snapshot.stage, JobStage::Align);
+        assert_eq!(snapshot.align_total, 0);
+        let running = RunState::Running;
+        assert_eq!(stage_word(&running, Some(&snapshot)), "Aligning");
+        assert_eq!(progress_text(&running, Some(&snapshot)), "from cache");
+        assert_eq!(bar_fraction(Some(&snapshot)), 0.0);
+        assert_eq!(eta_text(&running, Some(&snapshot)), "estimating");
+        assert_eq!(
+            phase_line(&running, Some(&snapshot)).as_deref(),
+            Some("aligning, from cache")
+        );
+        for held in [RunState::Paused, RunState::Cancelling] {
+            assert_eq!(progress_text(&held, Some(&snapshot)), "");
+        }
+    }
+}
+
+#[test]
+fn a_computed_alignment_shows_no_reuse_text() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{AlignSource, RunStage, StageObserver};
+    use focusforge_gui::job::{RunState, progress_text};
+
+    let observer = job::GuiObserver::new();
+    observer.stage(RunStage::Prepare { frames: 8 });
+    observer.stage(RunStage::Align {
+        frames: 8,
+        source: AlignSource::Computed,
+    });
+    let last = observer
+        .last_progress()
+        .expect("the Prepare snapshot stays");
+    assert_eq!(last.stage, JobStage::Prepare);
+
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&align_progress(3, 8))),
+        "3 of 8"
+    );
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&fuse_progress(2, 10))),
+        ""
+    );
+    assert_eq!(progress_text(&RunState::Running, None), "");
 }
 
 #[test]
@@ -1283,10 +1471,13 @@ fn progress_text_without_a_total_is_the_name_only() {
     use focusforge_gui::job::{RunState, bar_fraction, progress_text};
 
     // A cached alignment: `stage == Align`, but `align_total == 0` (no
-    // computed stage set a total) -- never `0 of <n>`, and never a rendered
-    // `0 of 0`.
+    // computed stage set a total) -- the reuse text, never `0 of <n>`, and
+    // never a rendered `0 of 0`.
     let cached = align_progress(0, 0);
-    assert_eq!(progress_text(&RunState::Running, Some(&cached)), "");
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&cached)),
+        "from cache"
+    );
     assert_eq!(bar_fraction(Some(&cached)), 0.0);
 
     // A fuse snapshot with no total yet -- the plan's totals not credited --
@@ -5047,6 +5238,16 @@ fn a_fusion_only_change_reuses_the_alignment() {
     let align_source = |controller: &mut AppController| {
         assert!(controller.start_fuse());
         common::wait_for_settle(controller, Duration::from_secs(120));
+        let view = controller.job_view();
+        assert_eq!(
+            view.step_text, "",
+            "nothing about the cache stays on the bar"
+        );
+        assert!(
+            view.stage_word.starts_with("fused"),
+            "a settled run reads fused HH:MM: {}",
+            view.stage_word
+        );
         controller
             .last_alignment()
             .expect("a completed run")
