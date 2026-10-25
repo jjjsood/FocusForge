@@ -370,7 +370,7 @@ because this example passes `--cpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
 `--no-progress` suppresses only the ticking progress line — per-frame while
-alignment runs, per-tile once fusion starts. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+brightness is prepared and alignment runs, per-tile once fusion starts. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
 entered the alignment stage at all — a real run reports numbers instead
 (see below).
 
