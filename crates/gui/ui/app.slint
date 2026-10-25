@@ -336,6 +336,9 @@ export component AppWindow inherits Window {
         // `key-pressed` auto-repeats while a key is held, which
         // `AppController::set_space_held`'s idempotence absorbs.
         key-pressed(event) => {
+            if event.text == Key.Escape && root.dismiss-front-dialog() {
+                return accept;
+            }
             root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
                 event.modifiers.alt);
             reject
@@ -856,6 +859,8 @@ export component AppWindow inherits Window {
     callback export-quality-changed(float);
     callback export-chroma-chosen(string, string);
     callback export-metadata-toggled();
+    // The id of the export row whose option list is open, or "".
+    in property <string> export-open-menu: "";
 
     // The visible toast; `toast-id` is its record's stable id.
     in property <bool> toast-open: false;
@@ -900,6 +905,68 @@ export component AppWindow inherits Window {
     in property <string> checkpoint-delete-body: "";
     callback checkpoint-delete-cancelled();
     callback checkpoint-delete-confirmed();
+
+    property <bool> dialog-open: root.question-open || root.refusal-open || root.mismatch-open
+        || root.sources-missing-open || root.export-open || root.frame-warning-open
+        || root.divergence-open || root.close-guard-open || root.checkpoint-delete-open;
+
+    // Keeps keyboard focus where Escape reaches `dismiss-front-dialog`
+    // while a dialog is up, and hands it back to the Settings content, if
+    // open, afterwards.
+    changed dialog-open => {
+        if root.dialog-open {
+            canvas-ground.focus();
+        } else if root.settings-open {
+            settings-modal.focus();
+        } else {
+            canvas-ground.focus();
+        }
+    }
+
+    // Raises the cancel of the front-most dialog, in paint order, and
+    // returns whether the key was taken. The divergence warning takes it and
+    // does nothing; the refusal leaves it to the controller's key handler.
+    function dismiss-front-dialog() -> bool {
+        if root.checkpoint-delete-open {
+            root.checkpoint-delete-cancelled();
+            return true;
+        }
+        if root.close-guard-open {
+            root.close-guard-cancelled();
+            return true;
+        }
+        if root.divergence-open {
+            return true;
+        }
+        if root.frame-warning-open {
+            root.frame-warning-cancelled();
+            return true;
+        }
+        if root.refusal-open {
+            return false;
+        }
+        if root.export-open {
+            if root.export-open-menu != "" {
+                root.export-menu-toggled(root.export-open-menu);
+            } else {
+                root.export-cancelled();
+            }
+            return true;
+        }
+        if root.sources-missing-open {
+            root.sources-missing-closed();
+            return true;
+        }
+        if root.mismatch-open {
+            root.mismatch-cancelled();
+            return true;
+        }
+        if root.question-open {
+            root.question-cancelled();
+            return true;
+        }
+        return false;
+    }
 
     grouping-question := FFGroupingQuestion {
         x: 0px;

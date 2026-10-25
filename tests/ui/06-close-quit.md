@@ -21,40 +21,44 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --fuse
    Expect: Must not: the toolbar row shows a **Fuse stack** button; the dialog "Quit without saving?" is still shown.
 9. Click **Cancel** (`AppWindow::close-guard`).
    Expect: the dialog is gone; the window is still open and the tab strip shows two tabs, each carrying an "UNSAVED" marker.
-10. Click **STACKING** (`FFModeSwitch::stacking-half`).
+10. Click **Close** (`FFTabStrip::window-close`).
+   Expect: a dialog titled "Quit without saving?" appears again with the line "Quitting FocusForge".
+11. Press Escape while the quit question is open.
+   Expect: Must not: the window closes; the dialog is gone, the window is still open and the tab strip shows two tabs, each carrying an "UNSAVED" marker.
+12. Click **STACKING** (`FFModeSwitch::stacking-half`).
    Expect: the toolbar row shows a **Fuse stack** button.
 ## Close one tab, keep the other
-11. Click the close glyph of the second tab (`FFTab::close-area` 1).
-   Expect: a dialog titled "Save this state first?" appears with the line "Closing frames", not "Quitting FocusForge".
-12. (human only) Click **Save and close** (`AppWindow::close-guard`), then cancel the file chooser that opens.
-   Expect: the file chooser is gone; the tab strip still shows two tabs and no "No project open" text is shown.
 13. Click the close glyph of the second tab (`FFTab::close-area` 1).
-   Expect: the dialog titled "Save this state first?" is shown with the line "Closing frames".
-14. Click **Close dialog** (`AppWindow::close-guard`), the icon button at the dialog's top-right corner.
-   Expect: Must not: the tab closes; the dialog is gone and the tab strip still shows two tabs, each carrying an "UNSAVED" marker.
+   Expect: a dialog titled "Save this state first?" appears with the line "Closing frames", not "Quitting FocusForge".
+14. (human only) Click **Save and close** (`AppWindow::close-guard`), then cancel the file chooser that opens.
+   Expect: the file chooser is gone; the tab strip still shows two tabs and no "No project open" text is shown.
 15. Click the close glyph of the second tab (`FFTab::close-area` 1).
    Expect: the dialog titled "Save this state first?" is shown with the line "Closing frames".
-16. Click **Close anyway** (`AppWindow::close-guard`).
+16. Click **Close dialog** (`AppWindow::close-guard`), the icon button at the dialog's top-right corner.
+   Expect: Must not: the tab closes; the dialog is gone and the tab strip still shows two tabs, each carrying an "UNSAVED" marker.
+17. Click the close glyph of the second tab (`FFTab::close-area` 1).
+   Expect: the dialog titled "Save this state first?" is shown with the line "Closing frames".
+18. Click **Close anyway** (`AppWindow::close-guard`).
    Expect: the dialog is gone; the tab strip shows one tab titled "frames" carrying an "UNSAVED" marker; the text "No project open" is not shown.
-17. Click **STACKING** (`FFModeSwitch::stacking-half`).
+19. Click **STACKING** (`FFModeSwitch::stacking-half`).
    Expect: the dock header reads "3 frames · 0 excluded", so the remaining tab is the first one.
 ## The quit question with one unsaved project
-18. Click **Close** (`FFTabStrip::window-close`).
-   Expect: a dialog titled "Quit without saving?" appears with a text starting "1 project has unsaved" and ending "Quitting now loses all of it."
-19. Click **Cancel** (`AppWindow::close-guard`).
-   Expect: the dialog is gone; the window is still open and the tab strip still shows the tab "frames" with its "UNSAVED" marker.
 20. Click **Close** (`FFTabStrip::window-close`).
-   Expect: the dialog titled "Quit without saving?" appears again with the line "Quitting FocusForge".
-21. Click **Close dialog** (`AppWindow::close-guard`), the icon button at the dialog's top-right corner.
-   Expect: Must not: the window closes; the dialog is gone, the window is still open and the tab strip still shows the tab "frames" with its "UNSAVED" marker.
+   Expect: a dialog titled "Quit without saving?" appears with a text starting "1 project has unsaved" and ending "Quitting now loses all of it."
+21. Click **Cancel** (`AppWindow::close-guard`).
+   Expect: the dialog is gone; the window is still open and the tab strip still shows the tab "frames" with its "UNSAVED" marker.
 22. Click **Close** (`FFTabStrip::window-close`).
    Expect: the dialog titled "Quit without saving?" appears again with the line "Quitting FocusForge".
-23. (human only) Click **Save all and quit** (`AppWindow::close-guard`), then cancel the file chooser that opens.
-   Expect: the file chooser is gone; the window is still open and the tab "frames" is still open with its "UNSAVED" marker.
+23. Click **Close dialog** (`AppWindow::close-guard`), the icon button at the dialog's top-right corner.
+   Expect: Must not: the window closes; the dialog is gone, the window is still open and the tab strip still shows the tab "frames" with its "UNSAVED" marker.
 24. Click **Close** (`FFTabStrip::window-close`).
+   Expect: the dialog titled "Quit without saving?" appears again with the line "Quitting FocusForge".
+25. (human only) Click **Save all and quit** (`AppWindow::close-guard`), then cancel the file chooser that opens.
+   Expect: the file chooser is gone; the window is still open and the tab "frames" is still open with its "UNSAVED" marker.
+26. Click **Close** (`FFTabStrip::window-close`).
    Expect: the dialog titled "Quit without saving?" is shown with a text starting "1 project has unsaved" and ending "Quitting now loses all of it."
 ## Quit without saving
-25. Click **Quit without saving** (`AppWindow::close-guard`).
+27. Click **Quit without saving** (`AppWindow::close-guard`).
    Expect: the window closes, so the next screenshot attempt finds no window.
-26. (human only) Look at the desktop after the previous step.
+28. (human only) Look at the desktop after the previous step.
    Expect: no FocusForge window remains and the FocusForge process has ended.
