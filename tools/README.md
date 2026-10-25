@@ -21,7 +21,7 @@ prerequisites when run on Linux.
 | `check-workflow-selftest.py` | Guards the checked-in Actions workflow's native matrix, immutable action pins, one canonical gate call, and narrow hidden-log artifact upload. |
 | `package-linux.sh` | Builds the GUI+CLI AppImage and `.deb` in the pinned Ubuntu 22.04 container. Run `tools/with-lock.sh build -- tools/package-linux.sh`; outputs, SHA-256 file and provenance inventory go under `.scratch/package-linux/`. |
 | `check-package-linux.sh [.scratch/package-linux]` | Uses only generated artifacts and copied fixture/legal expectations in fresh Ubuntu 22.04 containers. It checks inventories, hashes, loader/GLIBC requirements, Debian dependencies, CLI metadata and GUI help. Run it under the build lock after `package-linux.sh`. |
-| `package-macos.sh [--output DIR]` | On macOS, builds arm64 GUI and CLI binaries, assembles `FocusForge.app`, and creates a DMG below `target/distrib/native/`. |
+| `package-macos.sh [--output DIR]` | On macOS, builds arm64 GUI and CLI binaries, assembles `FocusForge.app`, and creates a DMG below `target/distrib/native/`, retrying the DMG step and keeping diagnostics under `.scratch/package-macos-diagnostics/`. |
 | `check-package-macos.sh DMG` | On macOS, mounts a DMG read-only and checks both arm64 binaries, bundle metadata, legal files, icon, and the packaged CLI. |
 | `package-windows.ps1 [-OutputDirectory DIR]` | On Windows, verifies the pinned WiX package, builds both executables, and creates a combined MSI below `target/distrib/native/`. |
 | `check-package-windows.ps1 -Msi PATH` | On Windows, silently installs and uninstalls an MSI, retaining installer logs while checking executables, legal files, and Start-menu shortcut. |

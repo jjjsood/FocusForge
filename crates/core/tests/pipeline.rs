@@ -330,6 +330,8 @@ struct PausingAlign {
     control: Arc<JobControl>,
     pause_on: usize,
     calls: Arc<AtomicUsize>,
+    /// Slept in every `align_frame`, so a watcher tick can land mid-stage.
+    delay: Duration,
 }
 
 impl AlignAlgorithm for PausingAlign {
@@ -353,6 +355,7 @@ impl AlignAlgorithm for PausingAlign {
         if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_on {
             self.control.pause();
         }
+        std::thread::sleep(self.delay);
         Ok(AlignOutcome {
             transform: Transform::identity(),
             status: AlignStatus::Converged,
@@ -436,6 +439,7 @@ fn pause_during_alignment_stops_registering_frames() {
             control: Arc::clone(&control),
             pause_on: PAUSE_ON,
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         }));
         let mut explicit = ParamValues::new();
         explicit.insert(
@@ -493,6 +497,7 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
             control: Arc::clone(&control),
             pause_on: PAUSE_ON,
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
         }));
         let mut explicit = ParamValues::new();
         explicit.insert(
@@ -660,6 +665,139 @@ fn align_progress_counts_every_frame() {
     let progress = control.progress();
     assert_eq!(progress.align_done, 0);
     assert_eq!(progress.align_total, 0);
+}
+
+/// Logs the stage, align tally and ETA of every tick, and the tally and ETA
+/// at the moment a hold begins; holds for 500 ms, then resumes.
+#[derive(Default)]
+struct AlignEtaLog {
+    ticks: Mutex<Vec<(JobStage, usize, Option<Duration>)>>,
+    hold_entry: Mutex<Option<(usize, Option<Duration>)>>,
+}
+
+impl StageObserver for AlignEtaLog {
+    fn tick(&self, progress: &JobProgress) {
+        self.ticks.lock().expect("no panic while logging").push((
+            progress.stage,
+            progress.align_done,
+            progress.eta,
+        ));
+    }
+
+    fn paused(&self, control: &JobControl) {
+        let progress = control.progress();
+        *self.hold_entry.lock().expect("no panic while logging") =
+            Some((progress.align_done, progress.eta));
+        std::thread::sleep(Duration::from_millis(500));
+        control.clear();
+    }
+}
+
+/// A chain-policy request over `count` mantis frames through a
+/// [`PausingAlign`] that sleeps `delay` per frame and pauses on call
+/// `pause_on`.
+fn timed_align_request(
+    label: &str,
+    count: usize,
+    control: &Arc<JobControl>,
+    pause_on: usize,
+    delay: Duration,
+) -> FuseRequest {
+    let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
+        control: Arc::clone(control),
+        pause_on,
+        calls: Arc::new(AtomicUsize::new(0)),
+        delay,
+    }));
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("chain".to_string()),
+    );
+    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    request.align = Some(AlignRequest {
+        algorithm,
+        explicit,
+        lax: false,
+    });
+    request.poll = Duration::from_millis(1);
+    request
+}
+
+#[test]
+fn align_progress_carries_an_eta() {
+    let control = JobControl::new();
+    let request = timed_align_request(
+        "align_eta",
+        5,
+        &control,
+        usize::MAX,
+        Duration::from_millis(20),
+    );
+    let cache = StageCache::open(&request.scratch_root).expect("stage cache must open");
+
+    let observer = AlignEtaLog::default();
+    let outcome = focusforge_core::pipeline::run(&request, &observer, control, Some(&cache))
+        .expect("a computed alignment must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    let align: Vec<_> = ticks.iter().filter(|t| t.0 == JobStage::Align).collect();
+    assert!(
+        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_none()),
+        "no ETA before a frame completes: {align:?}"
+    );
+    assert!(
+        align.iter().any(|t| 0 < t.1 && t.1 < 5 && t.2.is_some()),
+        "a mid-stage tick must carry an ETA: {align:?}"
+    );
+    drop(ticks);
+
+    // The same request against the same cache is served from it.
+    let observer = AlignEtaLog::default();
+    let outcome =
+        focusforge_core::pipeline::run(&request, &observer, JobControl::new(), Some(&cache))
+            .expect("a cached alignment must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    assert!(
+        !ticks
+            .iter()
+            .any(|t| t.0 == JobStage::Align && t.2.is_some()),
+        "a cached alignment has no per-frame work to estimate: {ticks:?}"
+    );
+}
+
+#[test]
+fn align_eta_excludes_a_pause() {
+    let control = JobControl::new();
+    let request = timed_align_request("align_eta_pause", 8, &control, 2, Duration::from_millis(20));
+    let observer = AlignEtaLog::default();
+    let outcome = focusforge_core::pipeline::run(&request, &observer, control, None)
+        .expect("a paused-then-resumed alignment must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let (done_at_hold, eta_at_hold) = observer
+        .hold_entry
+        .lock()
+        .expect("no panic while logging")
+        .expect("the hold must be entered");
+    let eta_at_hold = eta_at_hold.expect("frames were done when the hold began");
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    let after: Vec<_> = ticks
+        .iter()
+        .filter(|t| t.0 == JobStage::Align && t.1 > done_at_hold)
+        .filter_map(|t| t.2)
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "ticks after the resume must carry an ETA"
+    );
+    for eta in after {
+        assert!(
+            eta <= eta_at_hold + Duration::from_millis(250),
+            "{eta:?} after the hold vs {eta_at_hold:?} before it"
+        );
+    }
 }
 
 /// Logs the Prepare-stage tally of every tick, and the control's tally at

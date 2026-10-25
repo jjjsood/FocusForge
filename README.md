@@ -67,8 +67,6 @@ Debian/Ubuntu-family hosts install the dev package before building:
 sudo apt install libfontconfig1-dev
 ```
 
-There is no code-side workaround for a missing fontconfig on this renderer.
-
 ```bash
 cargo build --release
 ```
@@ -77,8 +75,6 @@ Produces `target/release/focusforge-cli` and `target/release/focusforge-gui`,
 with the GPU-accelerated fusion path compiled in by default. Pass
 `--no-default-features` to exclude it; without it, `stack` always runs on the
 CPU and `--cpu` does not exist as a flag.
-
-### CLI
 
 ### Inspect a stack
 
@@ -93,9 +89,6 @@ block per frame. TIFF entries show size, depth, byte order, compression and
 strip layout; RAW entries show decoder metadata without developing pixels. The
 report ends with a frame count, total size and a uniform-layout verdict. Add
 `--json` for the same report as machine-readable JSON.
-
-RAW frames use `rawler` as the only decoder. Files it cannot read return an
-error; there is no decoder fallback.
 
 ### Stack a folder
 

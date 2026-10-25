@@ -53,7 +53,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 23. Click **Settings** (`FFDockTabs::settings-tab`) while the dialog is open.
     Expect: Must not: the dock changes; it shows no row labelled "Algorithm" and the dialog "Keep this fused result?" is still shown.
 24. Click **Keep** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone, the bottom bar status reads "fused" followed by a time (for example "fused 16:34") and the right pane shows a filled composite.
+    Expect: the dialog is gone, the bottom bar status reads "fused" followed by a time (for example "fused 16:34") and the right pane shows a filled composite (within 10 s; the pane is blank for about 2 s after Keep, and a notification "2 frames unaligned" may cover the left pane label for a few seconds).
 25. Click **STACKING** (`FFModeSwitch::stacking-half`).
     Expect: the stacking toolbar shows a **Fuse stack** button (read with `buttons AppWindow::toolbar`) and the canvas shows the frame pane and the Composite pane.
 ## The overlay after a fuse

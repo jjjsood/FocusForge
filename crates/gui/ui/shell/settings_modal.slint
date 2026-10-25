@@ -67,6 +67,8 @@ export component FFSettingsModal inherits FFModalPanel {
     callback diagnostics-manifest-viewport-height-changed(length);
     callback diagnostics-manifest-scrolled(length);
 
+    forward-focus: content;
+
     changed settings-open => {
         if root.settings-open {
             content.focus();

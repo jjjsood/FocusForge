@@ -7,6 +7,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 dmg=$1
 symbols=${2:-"$(dirname "$dmg")/symbols"}
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)
+bundle_version=${version%%-*}
 mkdir -p "$root/.scratch"
 work=$(mktemp -d "$root/.scratch/check-package-macos.XXXXXX")
 mount="$work/mount"
@@ -33,8 +34,8 @@ done
 python3 "$root/tools/package-symbols.py" verify "$symbols/aarch64-apple-darwin"
 plist="$app/Contents/Info.plist"
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist") == focusforge-gui ]]
-[[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") == "$version" ]]
-[[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist") == "$version" ]]
+[[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") == "$bundle_version" ]]
+[[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist") == "$bundle_version" ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$plist") == focusforge ]]
 identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
 echo "CFBundleIdentifier: $identifier"

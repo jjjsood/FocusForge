@@ -23,7 +23,8 @@ pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
-    self, AlignRequest, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage, StageObserver,
+    self, AlignRequest, AlignSource, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage,
+    StageObserver,
 };
 pub use focusforge_core::project::PendingState;
 pub use focusforge_core::project::export::{
@@ -522,21 +523,29 @@ impl Default for GuiObserver {
 impl StageObserver for GuiObserver {
     fn stage(&self, stage: RunStage) {
         // The first Prepare snapshot is recorded here, so the bar shows the
-        // frame total before the engine's first tick.
-        if let RunStage::Prepare { frames } = stage {
-            self.tick(&JobProgress {
-                stage: JobStage::Prepare,
-                units_done: 0,
-                unit_total: 0,
-                pixels_done: 0,
-                pixel_total: 0,
-                running: Duration::ZERO,
-                eta: None,
-                align_done: 0,
-                align_total: 0,
-                prepare_done: 0,
-                prepare_total: frames,
-            });
+        // frame total before the engine's first tick. A cached alignment
+        // never ticks, so its stage is recorded here too; a computed one
+        // ticks on its own, with a real total.
+        let snapshot = |stage, prepare_total| JobProgress {
+            stage,
+            units_done: 0,
+            unit_total: 0,
+            pixels_done: 0,
+            pixel_total: 0,
+            running: Duration::ZERO,
+            eta: None,
+            align_done: 0,
+            align_total: 0,
+            prepare_done: 0,
+            prepare_total,
+        };
+        match stage {
+            RunStage::Prepare { frames } => self.tick(&snapshot(JobStage::Prepare, frames)),
+            RunStage::Align {
+                source: AlignSource::Cached,
+                ..
+            } => self.tick(&snapshot(JobStage::Align, 0)),
+            _ => {}
         }
     }
 
@@ -707,22 +716,25 @@ pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option
 
 /// The bottom bar's step-text slot: `"<done> of <total>"` while the current
 /// phase works per frame and `progress` carries a total for it
-/// ([`Phase::frames`]), empty for a name-only phase, outside a running state,
-/// or with no progress to derive a phase from.
+/// ([`Phase::frames`]), `"from cache"` while the align stage has no total
+/// (the alignment is served from the stage cache), empty for any other
+/// name-only phase, outside a running state, or with no progress to derive a
+/// phase from.
 pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     let (Some(phase), Some(p)) = (current_phase(state, progress), progress) else {
         return String::new();
     };
-    phase
-        .frames(p)
-        .map(|(done, total)| format!("{done} of {total}"))
-        .unwrap_or_default()
+    match (phase, phase.frames(p)) {
+        (_, Some((done, total))) => format!("{done} of {total}"),
+        (Phase::Aligning, None) => "from cache".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// The run's phase line for a card or overlay meta text: the lower-cased
-/// phase name, plus `, <k> of <N>` when [`progress_text`] has a frame count
-/// to show. `None` outside `Running` -- a name-only phase still returns
-/// `Some`, so it never falls back to some other line.
+/// phase name, plus `, <k> of <N>` or `, from cache` when [`progress_text`]
+/// has a step text to show. `None` outside `Running` -- a name-only phase
+/// still returns `Some`, so it never falls back to some other line.
 pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
     if !matches!(state, RunState::Running) {
         return None;

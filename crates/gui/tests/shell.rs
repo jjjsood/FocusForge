@@ -3545,14 +3545,17 @@ mod settings_escape {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    struct Rig {
-        app: AppWindow,
-        controller: SharedController,
+    pub(super) struct Rig {
+        pub(super) app: AppWindow,
+        pub(super) controller: SharedController,
         _installed: focusforge_gui::bridge::Installed,
     }
 
-    fn rig() -> Rig {
-        let controller: SharedController = Arc::new(Mutex::new(AppController::new()));
+    pub(super) fn rig() -> Rig {
+        rig_with(Arc::new(Mutex::new(AppController::new())))
+    }
+
+    pub(super) fn rig_with(controller: SharedController) -> Rig {
         let app = app_at(1440, 900);
         app.window()
             .dispatch_event(WindowEvent::WindowActiveChanged(true));
@@ -3575,7 +3578,7 @@ mod settings_escape {
             slint::platform::update_timers_and_animations();
         }
 
-        fn open_settings(&self, section: SettingsSection) {
+        pub(super) fn open_settings(&self, section: SettingsSection) {
             self.app.invoke_settings_open_requested();
             self.app
                 .invoke_settings_section_selected(section.slug().into());
@@ -3589,7 +3592,7 @@ mod settings_escape {
             self.event(WindowEvent::KeyReleased { text });
         }
 
-        fn click_element(&self, id: &str) {
+        pub(super) fn click_element(&self, id: &str) {
             let (x, y, w, h) = rect(&self.app, id);
             let position = slint::LogicalPosition::new(x + w / 2.0, y + h / 2.0);
             self.event(WindowEvent::PointerMoved { position });
@@ -3603,7 +3606,7 @@ mod settings_escape {
             });
         }
 
-        fn overlay_open(&self) -> bool {
+        pub(super) fn overlay_open(&self) -> bool {
             self.controller.lock().unwrap().projects_overlay_open()
         }
     }
@@ -3662,7 +3665,7 @@ mod dialog_close {
 
     use super::*;
 
-    type Counts = Vec<(&'static str, Rc<Cell<u32>>)>;
+    pub(super) type Counts = Vec<(&'static str, Rc<Cell<u32>>)>;
 
     /// Counts every argument-free callback the modal dialogs raise.
     macro_rules! count_callbacks {
@@ -3678,7 +3681,7 @@ mod dialog_close {
         }};
     }
 
-    fn count_dialog_callbacks(app: &AppWindow) -> Counts {
+    pub(super) fn count_dialog_callbacks(app: &AppWindow) -> Counts {
         count_callbacks!(app,
             on_question_open_as_one => "question-open-as-one",
             on_question_open_as_many => "question-open-as-many",
@@ -3704,7 +3707,7 @@ mod dialog_close {
         )
     }
 
-    fn fired(counts: &Counts) -> Vec<(&'static str, u32)> {
+    pub(super) fn fired(counts: &Counts) -> Vec<(&'static str, u32)> {
         counts
             .iter()
             .map(|(name, count)| (*name, count.get()))
@@ -3714,15 +3717,15 @@ mod dialog_close {
 
     /// A dialog that carries the close control: how to open it, the
     /// `AppWindow` callback its own cancel raises, and its panel size.
-    struct Dialog {
-        type_name: &'static str,
-        label: &'static str,
-        cancel: &'static str,
-        panel: (f32, f32),
-        open: fn(&AppWindow),
+    pub(super) struct Dialog {
+        pub(super) type_name: &'static str,
+        pub(super) label: &'static str,
+        pub(super) cancel: &'static str,
+        pub(super) panel: (f32, f32),
+        pub(super) open: fn(&AppWindow),
     }
 
-    const INCLUDED: [Dialog; 8] = [
+    pub(super) const INCLUDED: [Dialog; 8] = [
         Dialog {
             type_name: "FFFrameSetWarning",
             label: "frame-set warning",
@@ -3984,6 +3987,346 @@ mod dialog_close {
                 title.absolute_position().x + title.size().width
                     <= button.absolute_position().x + EPS,
                 "{width}x{height}: the title ends left of the control"
+            );
+        }
+    }
+}
+
+mod dialog_escape {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use focusforge_gui::{OpenOutcome, SettingsSection};
+    use slint::platform::{Key, WindowEvent};
+
+    use super::dialog_close::{Dialog, INCLUDED, count_dialog_callbacks, fired};
+    use super::settings_escape::{Rig, rig, rig_with};
+    use super::*;
+
+    fn active_app(width: u32, height: u32) -> AppWindow {
+        let app = app_at(width, height);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        app
+    }
+
+    /// Runs the `changed` handlers a property write queued.
+    fn settle_properties() {
+        slint::platform::update_timers_and_animations();
+    }
+
+    fn event(app: &AppWindow, event: WindowEvent) {
+        app.window().dispatch_event(event);
+        settle_properties();
+    }
+
+    fn key(app: &AppWindow, text: impl Into<slint::SharedString>) {
+        let text = text.into();
+        event(app, WindowEvent::KeyPressed { text: text.clone() });
+        event(app, WindowEvent::KeyReleased { text });
+    }
+
+    fn escape(app: &AppWindow) {
+        key(app, Key::Escape);
+    }
+
+    fn open(app: &AppWindow, dialog: &Dialog) {
+        (dialog.open)(app);
+        settle_properties();
+    }
+
+    fn close(app: &AppWindow, dialog: &Dialog) {
+        match dialog.cancel {
+            "frame-warning-cancelled" => app.set_frame_warning_open(false),
+            "close-guard-cancelled" => app.set_close_guard_open(false),
+            "checkpoint-delete-cancelled" => app.set_checkpoint_delete_open(false),
+            "mismatch-cancelled" => app.set_mismatch_open(false),
+            "sources-missing-closed" => app.set_sources_missing_open(false),
+            "export-cancelled" => app.set_export_open(false),
+            "question-cancelled" => app.set_question_open(false),
+            other => panic!("no open property known for {other}"),
+        }
+        settle_properties();
+    }
+
+    /// Records `(text, ctrl)` of every `canvas-key-pressed`, replacing any
+    /// handler already installed.
+    fn record_canvas_keys(app: &AppWindow) -> Rc<RefCell<Vec<(String, bool)>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        app.on_canvas_key_pressed({
+            let seen = seen.clone();
+            move |text, ctrl, _, _| seen.borrow_mut().push((text.to_string(), ctrl))
+        });
+        seen
+    }
+
+    fn push_export(rig: &Rig) {
+        focusforge_gui::bridge::push_export_dialog(&rig.app, &rig.controller.lock().unwrap());
+        settle_properties();
+    }
+
+    /// A bridged window over a fused two-frame project whose export modal is
+    /// open in the controller and pushed to the window.
+    fn fused_export_rig(name: &str) -> Rig {
+        let mut fused = common::controller_with_frames(name, 2);
+        fused.set_align_algorithm("dummy-align");
+        assert!(fused.start_fuse());
+        while common::wait_for_settle(&mut fused, Duration::from_secs(60)).is_some() {}
+        assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
+        fused.checkpoint_export_requested();
+        let rig = rig_with(Arc::new(Mutex::new(fused)));
+        push_export(&rig);
+        assert!(rig.app.get_export_open(), "the export modal is open");
+        rig
+    }
+
+    #[test]
+    fn escape_dismisses_a_dialog_as_its_cancel() {
+        for (width, height) in [(1440, 900), (1200, 760)] {
+            for dialog in &INCLUDED {
+                let app = active_app(width, height);
+                let counts = count_dialog_callbacks(&app);
+                open(&app, dialog);
+                escape(&app);
+                assert_eq!(
+                    fired(&counts),
+                    [(dialog.cancel, 1)],
+                    "{} at {width}x{height}: Escape raises its own cancel once and nothing else",
+                    dialog.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn escape_reaches_a_dialog_opened_over_a_focused_text_field() {
+        for dialog in [&INCLUDED[2], &INCLUDED[5]] {
+            let rig = rig();
+            let counts = count_dialog_callbacks(&rig.app);
+            let seen = record_canvas_keys(&rig.app);
+            rig.open_settings(SettingsSection::Diagnostics);
+            rig.click_element("FFDiagnosticsPanel::dest-field");
+
+            open(&rig.app, dialog);
+            escape(&rig.app);
+            assert_eq!(
+                fired(&counts),
+                [(dialog.cancel, 1)],
+                "{}: Escape reaches the dialog over the focused field",
+                dialog.label
+            );
+            assert!(rig.app.get_settings_open(), "Settings stays open");
+
+            close(&rig.app, dialog);
+            escape(&rig.app);
+            assert!(
+                !rig.app.get_settings_open(),
+                "{}: focus went back to Settings, so the next Escape closes it",
+                dialog.label
+            );
+            key(&rig.app, "x");
+            assert_eq!(*seen.borrow(), [("x".to_string(), false)]);
+        }
+
+        let app = active_app(1440, 900);
+        let seen = record_canvas_keys(&app);
+        open(&app, &INCLUDED[2]);
+        close(&app, &INCLUDED[2]);
+        key(&app, "x");
+        assert_eq!(
+            *seen.borrow(),
+            [("x".to_string(), false)],
+            "without Settings, a key after a dialog closes reaches the canvas"
+        );
+    }
+
+    #[test]
+    fn escape_closes_only_the_front_most_dialog() {
+        let app = active_app(1440, 900);
+        let counts = count_dialog_callbacks(&app);
+        app.set_question_open(true);
+        app.set_checkpoint_delete_open(true);
+        settle_properties();
+        escape(&app);
+        assert_eq!(fired(&counts), [("checkpoint-delete-cancelled", 1)]);
+        app.set_checkpoint_delete_open(false);
+        settle_properties();
+        escape(&app);
+        assert_eq!(
+            fired(&counts),
+            [
+                ("question-cancelled", 1),
+                ("checkpoint-delete-cancelled", 1)
+            ]
+        );
+
+        for dialog in [&INCLUDED[5], &INCLUDED[3], &INCLUDED[4], &INCLUDED[7]] {
+            let rig = rig();
+            let counts = count_dialog_callbacks(&rig.app);
+            rig.controller.lock().unwrap().toggle_projects_overlay();
+            open(&rig.app, dialog);
+            escape(&rig.app);
+            assert_eq!(fired(&counts), [(dialog.cancel, 1)], "{}", dialog.label);
+            assert!(
+                rig.overlay_open(),
+                "{}: the hidden overlay stays open",
+                dialog.label
+            );
+            close(&rig.app, dialog);
+            escape(&rig.app);
+            assert!(
+                !rig.overlay_open(),
+                "{}: the next Escape closes the overlay",
+                dialog.label
+            );
+        }
+
+        let rig = fused_export_rig("escape_refusal_over_export");
+        let counts = count_dialog_callbacks(&rig.app);
+        let empty = common::tree("escape_refusal_over_export_empty");
+        assert!(matches!(
+            common::open_and_settle(&mut rig.controller.lock().unwrap(), &[empty]),
+            OpenOutcome::Refused(_)
+        ));
+        rig.app.set_refusal_open(true);
+        settle_properties();
+        escape(&rig.app);
+        assert!(
+            !rig.app.get_refusal_open(),
+            "the first Escape closes the refusal"
+        );
+        assert!(
+            rig.app.get_export_open(),
+            "the export modal beneath stays open"
+        );
+        assert!(fired(&counts).is_empty(), "export-cancelled is not raised");
+        escape(&rig.app);
+        assert_eq!(fired(&counts), [("export-cancelled", 1)]);
+    }
+
+    #[test]
+    fn escape_closes_an_open_export_menu_before_the_dialog() {
+        for format in ["TIFF", "JPEG"] {
+            let rig = fused_export_rig(&format!("escape_menu_{format}"));
+            rig.controller.lock().unwrap().export_select_format(format);
+            let menu = {
+                let view = rig.controller.lock().unwrap().export_view().unwrap();
+                view.rows
+                    .iter()
+                    .find(|row| !row.choices.is_empty())
+                    .unwrap_or_else(|| panic!("{format} has a menu row"))
+                    .id
+                    .clone()
+            };
+            rig.controller.lock().unwrap().export_toggle_menu(&menu);
+            push_export(&rig);
+            let view = || rig.controller.lock().unwrap().export_view();
+            assert!(view().unwrap().rows.iter().any(|row| row.menu_open));
+            assert_eq!(rig.app.get_export_open_menu(), menu.as_str());
+
+            escape(&rig.app);
+            let after_first = view().expect("the first Escape leaves the modal open");
+            assert!(
+                after_first.rows.iter().all(|row| !row.menu_open),
+                "{format}: the first Escape closes the list"
+            );
+            assert_eq!(rig.app.get_export_open_menu(), "");
+            assert_eq!(rig.controller.lock().unwrap().export_stage(), "ready");
+
+            escape(&rig.app);
+            assert!(
+                view().is_none(),
+                "{format}: the second Escape closes the modal"
+            );
+        }
+    }
+
+    #[test]
+    fn escape_during_an_export_write() {
+        let rig = fused_export_rig("escape_during_write");
+        let written = common::tree("escape_during_write_out").join("written.tif");
+        {
+            let mut controller = rig.controller.lock().unwrap();
+            let (tab_id, format, _) = controller
+                .export_destination_request()
+                .expect("a ready modal proposes a destination");
+            controller.export_destination_chosen(tab_id, format, written.clone());
+            assert!(controller.take_export_started());
+        }
+        push_export(&rig);
+        assert_eq!(rig.app.get_export_stage(), "writing");
+
+        escape(&rig.app);
+        assert!(
+            rig.controller.lock().unwrap().export_view().is_none(),
+            "Escape closes the modal as the x does"
+        );
+        let start = Instant::now();
+        while !rig.controller.lock().unwrap().settle_export() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the write settles"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            written.is_file(),
+            "the write finished after the modal closed"
+        );
+    }
+
+    #[test]
+    fn escape_leaves_the_divergence_warning_open() {
+        let rig = rig();
+        let counts = count_dialog_callbacks(&rig.app);
+        rig.controller.lock().unwrap().toggle_projects_overlay();
+        rig.app.set_divergence_open(true);
+        settle_properties();
+        escape(&rig.app);
+        assert!(fired(&counts).is_empty(), "neither answer is raised");
+        assert!(rig.app.get_divergence_open());
+        assert!(rig.overlay_open(), "the key does not reach the overlay");
+
+        rig.app.set_frame_warning_open(true);
+        settle_properties();
+        escape(&rig.app);
+        assert!(
+            fired(&counts).is_empty(),
+            "the frame-set warning beneath is not cancelled"
+        );
+        assert!(rig.app.get_frame_warning_open());
+    }
+
+    #[test]
+    fn ctrl_chords_still_reach_the_canvas_under_a_dialog() {
+        let opens: [fn(&AppWindow); 2] = [
+            |app| app.set_export_open(true),
+            |app| app.set_mismatch_open(true),
+        ];
+        for open in opens {
+            let app = active_app(1440, 900);
+            let seen = record_canvas_keys(&app);
+            open(&app);
+            settle_properties();
+            event(
+                &app,
+                WindowEvent::KeyPressed {
+                    text: Key::Control.into(),
+                },
+            );
+            key(&app, "s");
+            event(
+                &app,
+                WindowEvent::KeyReleased {
+                    text: Key::Control.into(),
+                },
+            );
+            assert!(
+                seen.borrow().contains(&("s".to_string(), true)),
+                "Ctrl+S reaches canvas-key-pressed, saw {:?}",
+                seen.borrow()
             );
         }
     }

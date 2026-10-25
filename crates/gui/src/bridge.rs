@@ -4742,6 +4742,13 @@ pub fn push_export_view(app: &AppWindow, view: &crate::export_settings::ExportVi
         })
         .collect();
     app.set_export_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+    app.set_export_open_menu(
+        view.rows
+            .iter()
+            .find(|row| row.menu_open)
+            .map_or("", |row| row.id.as_str())
+            .into(),
+    );
     app.set_export_slider_group(view.slider_group);
     app.set_export_metadata_on(view.metadata);
 }
