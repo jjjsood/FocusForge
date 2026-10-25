@@ -273,7 +273,8 @@ owner_uid=$1; owner_gid=$2
 trap 'chown -R "$owner_uid:$owner_gid" /checks/crashes /checks/symbolicate /checks/deb-info.txt /checks/deb-info.json /checks/deb-smoke 2>/dev/null || true' EXIT
 deb=$(find /artifacts -maxdepth 1 -name '*.deb' -type f -print -quit)
 test -n "$deb"
-version=$(dpkg-deb --field "$deb" Version)
+version=$(sed -n 's/^focusforge-cli //p' /checks/expected/VERSION)
+[ "$(dpkg-deb --field "$deb" Version)" = "${version/-/\~}" ]
 dpkg-deb --field "$deb" Depends | grep -q .
 # The minimal base image excludes documentation; retain the package legal payload.
 apt-get -o 'DPkg::Options::=--path-include=/usr/share/doc/focusforge/*' -o 'DPkg::Options::=--path-include=/usr/share/man/man1/focusforge-cli*.gz' install -y -qq "$deb"

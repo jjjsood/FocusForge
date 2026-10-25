@@ -1467,7 +1467,7 @@ def macos_checker_mock() -> None:
         version_file.write_text("0.1.0\n")
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         for name in ("focusforge-cli", "focusforge-gui"):
-            path = binary / name; path.write_text(f"#!/bin/sh\nif [ -n \"$FF_FORCE_CRASH\" ]; then case {name} in focusforge-cli) [ \"${{1:-}}\" = algorithms ] || exit 64;; focusforge-gui) [ \"$#\" -eq 0 ] || exit 65;; esac; mkdir -p \"$FOCUSFORGE_DATA_DIR/focusforge/crashes\"; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_metadata|complete) printf MDMP > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp\";; esac; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_dump|complete) printf '{{\"binary\":\"{name}\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"0.1.0\",\"timestamp\":\"%s\"}}' \"$$\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json\";; esac; exit 1; elif [ \"$1\" = --version ]; then echo \"focusforge-cli $(cat {version_file})\"; elif [ \"$1\" = info ]; then cat {info_file}; fi\n"); path.chmod(0o755)
+            path = binary / name; path.write_text(f"#!/bin/sh\nif [ -n \"$FF_FORCE_CRASH\" ]; then case {name} in focusforge-cli) [ \"${{1:-}}\" = algorithms ] || exit 64;; focusforge-gui) [ \"$#\" -eq 0 ] || exit 65;; esac; mkdir -p \"$FOCUSFORGE_DATA_DIR/focusforge/crashes\"; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_metadata|complete) printf MDMP > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp\";; esac; case \"${{MOCK_CRASH_ARTIFACT:-complete}}\" in missing_dump|complete) printf '{{\"binary\":\"{name}\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"%s\",\"timestamp\":\"%s\"}}' \"$$\" \"$(cat {version_file})\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json\";; esac; exit 1; elif [ \"$1\" = --version ]; then echo \"focusforge-cli $(cat {version_file})\"; elif [ \"$1\" = info ]; then cat {info_file}; fi\n"); path.chmod(0o755)
         gui = binary / "focusforge-gui"
         gui.write_text(gui.read_text() + "if [ \"$1\" = --exit-after ]; then while [ $# -gt 0 ]; do if [ \"$1\" = --screenshot ]; then printf '\\211PNG\\r\\n\\032\\n\\000\\000\\000\\rIHDR\\000\\000\\000\\001\\000\\000\\000\\001' > \"$2\"; exit 0; fi; shift; done; exit 64; fi\n")
         symbols = directory / "symbols"
@@ -1476,7 +1476,7 @@ def macos_checker_mock() -> None:
         template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
         stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
         bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
-        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo 0.1.0;; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
+        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo \"${MOCK_PLIST_VERSION:-0.1.0}\";; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
         for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
         info_file.write_text(info)
         checker_copy = directory / "tools/check-package-macos.sh"
@@ -1523,6 +1523,13 @@ def macos_checker_mock() -> None:
         info_file.write_text('{"frame_count":3,"unreadable_count":0,"files":[]}')
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
         assert result.returncode != 0 and log.read_text().count("detach") == 13
+        info_file.write_text(info)
+        version_file.write_text("0.1.0-rc.1\n")
+        (directory / "Cargo.toml").write_text((directory / "Cargo.toml").read_text().replace('version = "0.1.0"', 'version = "0.1.0-rc.1"', 1))
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_PLIST_VERSION": "0.1.0-rc.1"})
+        assert result.returncode != 0
 
 
 def macos_producer_mock() -> None:
@@ -1542,7 +1549,7 @@ def macos_producer_mock() -> None:
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
             "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
-            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\n[[ -z ${MOCK_PLIST_OUT:-} ]] || cp \"$src/Contents/Info.plist\" \"$MOCK_PLIST_OUT\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
             "sleep": "#!/usr/bin/env bash\nexit 0\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
             "shasum": "#!/usr/bin/env bash\nif [[ -n ${MOCK_SHASUM_FAIL:-} ]]; then echo 'shasum: mock read error' >&2; exit 5; fi\nsha256sum \"${!#}\"\n",
@@ -1555,9 +1562,13 @@ def macos_producer_mock() -> None:
         }
         for name, body in commands.items():
             path = mock / name; path.write_text(body); path.chmod(0o755)
-        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C", "MOCK_MACHO": str(macho), "MOCK_HDIUTIL_COUNT": str(root / "hdiutil-count"), "MOCK_HDIUTIL_ARGS": str(root / "hdiutil-args")}
+        env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C", "MOCK_MACHO": str(macho), "MOCK_HDIUTIL_COUNT": str(root / "hdiutil-count"), "MOCK_HDIUTIL_ARGS": str(root / "hdiutil-args"), "MOCK_PLIST_OUT": str(root / "captured-info.plist")}
+        def bundle_versions() -> list[str]:
+            plist = plistlib.loads((root / "captured-info.plist").read_bytes())
+            return [plist["CFBundleShortVersionString"], plist["CFBundleVersion"]]
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode == 0, result.stderr
+        assert bundle_versions() == ["0.1.0", "0.1.0"], bundle_versions()
         output = root / "target/distrib/native/macos"
         artifact = output / "FocusForge-0.1.0-aarch64.dmg"; receipt = output / "native-receipt.json"
         assert artifact.exists() and receipt.exists()
@@ -1608,6 +1619,18 @@ def macos_producer_mock() -> None:
         logged = diagnostics.read_text()
         assert "mock reason 1" in logged and "exit status 77" in logged, logged
         assert len(hdiutil_sizes()[1]) == 2, arg_log.read_text()
+        env.pop("MOCK_HDIUTIL_FAIL")
+        counter.unlink(missing_ok=True)
+        cargo_toml = root / "Cargo.toml"
+        cargo_toml.write_text(cargo_toml.read_text().replace('version = "0.1.0"', 'version = "0.1.0-rc.1"', 1))
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 0, result.stderr
+        assert bundle_versions() == ["0.1.0", "0.1.0"], bundle_versions()
+        full = "FocusForge-0.1.0-rc.1-aarch64.dmg"
+        assert (output / full).exists() and not artifact.exists()
+        receipt_text = (output / "native-receipt.json").read_text()
+        assert '"version":"0.1.0-rc.1"' in receipt_text and f'"artifact":"{full}"' in receipt_text, receipt_text
+        assert list((output / "symbols/aarch64-apple-darwin").glob("FocusForge-0.1.0-rc.1-aarch64-apple-darwin-symbols.tar.gz"))
 
 
 def windows_checker_mock() -> None:
