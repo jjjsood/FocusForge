@@ -559,15 +559,23 @@ mod tests {
         control.set_stage(JobStage::Align);
         std::thread::sleep(Duration::from_millis(5));
         counter.fetch_add(1, Ordering::SeqCst);
+        let span = Instant::now();
         let before = control.progress().eta.expect("one frame is done");
 
         let held = Instant::now();
         std::thread::sleep(Duration::from_millis(50));
-        control.add_align_hold(held.elapsed());
+        let hold = held.elapsed();
+        control.add_align_hold(hold);
         let after = control.progress().eta.expect("one frame is done");
+        let span = span.elapsed();
+        // With one of four frames done the ETA is three times the counted
+        // time, and between the two reads at most `span - hold` of it was
+        // not held. A clock that ignored the hold grows by at least
+        // `3 * hold` instead, however long the sleep overran.
+        let unheld = span.saturating_sub(hold);
         assert!(
-            after <= before + Duration::from_millis(5),
-            "{after:?} vs {before:?}"
+            after <= before + unheld * 3 + Duration::from_micros(1),
+            "{after:?} vs {before:?}, hold {hold:?}, span {span:?}"
         );
     }
 
@@ -591,15 +599,25 @@ mod tests {
         counter.fetch_add(2, Ordering::SeqCst);
         assert!(control.progress().eta.is_some());
 
+        let before_restart = Instant::now();
         control.restart_align();
+        let after_restart = Instant::now();
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert_eq!(control.progress().eta, None);
         std::thread::sleep(Duration::from_millis(5));
         counter.fetch_add(1, Ordering::SeqCst);
-        // A clock that kept the 100 ms (or subtracted the 30 ms hold) gives
-        // an ETA of at least 3 * 70 ms or none at all.
+        let at_least = after_restart.elapsed();
         let eta = control.progress().eta.expect("one frame is done");
-        assert!(eta < Duration::from_millis(60), "{eta:?}");
+        let at_most = before_restart.elapsed();
+        // With one of four frames done the ETA is three times the time
+        // counted since the restart, which lies between the two bounds. A
+        // clock that kept the 100 ms lands above them; one that still
+        // subtracted the 30 ms hold lands below them, or gives no ETA.
+        let slack = Duration::from_micros(1);
+        assert!(
+            eta + slack >= at_least * 3 && eta <= at_most * 3 + slack,
+            "{eta:?} outside 3 * [{at_least:?}, {at_most:?}]"
+        );
     }
 
     #[test]
