@@ -23,6 +23,16 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 filter = 'binary_id(focusforge-core::hit_cap_behaviour)'
 slow-timeout = { period = "60s", terminate-after = 40 }
 
+# `stack_cli` spawns whole aligned laplacian stacks through the debug binary:
+# 42 s locally and 144-245 s on windows-2022, but one windows-2022 run took
+# `stack_output_carries_the_auto_crop` to 860 s and killed
+# `stack_aligns_before_fusing` at 900 s while unrelated in-process tests
+# slowed 5-16x and the align-only tests beside them ran at their usual speed.
+# 30 minutes for this binary.
+[[profile.default.overrides]]
+filter = 'binary_id(focusforge-cli::stack_cli)'
+slow-timeout = { period = "60s", terminate-after = 30 }
+
 # The GPU parity suite: one test at a time (they share one device), a SLOW
 # line every minute so a long test is told apart from a hung one, and a
 # per-test kill so a hang ends as a named TIMEOUT instead of a silent wait.

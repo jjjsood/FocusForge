@@ -2097,23 +2097,15 @@ fn a_second_open_while_one_is_in_flight_is_dropped() {
     assert_eq!(starts, 1, "exactly one LoadStarted must ever be seen");
 }
 
-/// A freshly opened tab's thumbnail is decoded on the worker, alongside the
-/// header walk -- `settle_open`, called here on the caller's own thread,
-/// only assembles a tab from bytes already decoded, so its own duration
-/// stays far below a decode measurable on a large-enough frame, while the
-/// worker's join time reflects the real decode cost.
-#[test]
-fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
-    use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
+/// Writes a small RGB frame at `path` and returns the length of its
+/// header, so a test can later cut the frame back to a file whose pixels no
+/// decode can read.
+fn frame_with_header_len(path: &std::path::Path) -> usize {
+    use focusforge_core::io::{TiffSpec, TiffWriter};
 
-    let root = tree("controller_thumbnail_worker");
-    let size = 3000u32;
-    let mut samples = vec![0u16; (size * size * 3) as usize];
-    for (i, s) in samples.iter_mut().enumerate() {
-        *s = (i % 65536) as u16;
-    }
+    let size = 64u32;
     let mut writer = TiffWriter::create(
-        &root.join("00.tif"),
+        path,
         TiffSpec {
             width: size,
             height: size,
@@ -2122,6 +2114,8 @@ fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
         },
     )
     .unwrap();
+    let header_len = fs::metadata(path).unwrap().len() as usize;
+    let samples: Vec<u16> = (0..size * size * 3).map(|i| (i * 97) as u16).collect();
     writer
         .write_tile(
             Rect {
@@ -2134,68 +2128,60 @@ fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
         )
         .unwrap();
     writer.finish().unwrap();
+    header_len
+}
 
-    let mut controller = AppController::new();
-    let worker_start = Instant::now();
-    let handle = controller.open_paths(&[root]).expect("a load must start");
-    handle.join().unwrap();
-    let worker_elapsed = worker_start.elapsed();
-
-    let settle_start = Instant::now();
-    let outcome = controller.settle_open();
-    let settle_elapsed = settle_start.elapsed();
-
-    assert!(matches!(outcome, Some(OpenOutcome::Opened(_))));
+/// Asserts every open card carries a picture and no thumbnail decode was
+/// started for any of them -- what `settle_open` leaves behind when it only
+/// assembles tabs from pictures the worker already decoded.
+fn assert_settled_with_worker_pictures(controller: &mut AppController, tabs: usize) {
+    let cards = controller.project_cards();
+    assert_eq!(cards.len(), tabs);
     assert!(
-        settle_elapsed < Duration::from_millis(50),
-        "settle_open must only assemble an already-decoded thumbnail: took {settle_elapsed:?}"
+        cards.iter().all(|card| card.picture.is_some()),
+        "the pixels were cut before settle_open: only the worker could have decoded them"
     );
     assert!(
-        worker_elapsed >= settle_elapsed,
-        "the worker's own duration must reflect the decode, not settle_open's: \
-         worker {worker_elapsed:?}, settle {settle_elapsed:?}"
+        !controller.take_thumbnails_started(),
+        "settle_open must not hand the decode to a later thumbnail worker"
     );
 }
 
-/// The same proof, for the path that opens a tab from an answered grouping
-/// question rather than directly from `open_paths` -- two subject
-/// directories large enough that a decode on `settle_open`'s own thread
-/// would be measurable there instead.
+/// A freshly opened tab's thumbnail is decoded on the load worker,
+/// alongside the header walk, and `settle_open` only assembles the tab from
+/// it. The frame's pixels are cut away after the worker joins and before
+/// `settle_open` runs, so a decode there (or one it starts) finds nothing
+/// to read and leaves the card without a picture.
+#[test]
+fn thumbnail_decode_runs_on_the_worker_not_on_settle() {
+    let root = tree("controller_thumbnail_worker");
+    let frame = root.join("00.tif");
+    let header_len = frame_with_header_len(&frame);
+
+    let mut controller = AppController::new();
+    let handle = controller.open_paths(&[root]).expect("a load must start");
+    handle.join().unwrap();
+
+    let bytes = fs::read(&frame).unwrap();
+    fs::write(&frame, &bytes[..header_len]).unwrap();
+
+    let outcome = controller.settle_open();
+    assert!(matches!(outcome, Some(OpenOutcome::Opened(_))));
+    assert_settled_with_worker_pictures(&mut controller, 1);
+}
+
+/// The same proof, for the path that opens tabs from an answered grouping
+/// question rather than directly from `open_paths`.
 #[test]
 fn answer_question_thumbnail_decode_runs_on_the_worker_not_on_settle() {
-    use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
-
     let root = tree("controller_question_thumbnail_worker");
-    let size = 3000u32;
-    let mut samples = vec![0u16; (size * size * 3) as usize];
-    for (i, s) in samples.iter_mut().enumerate() {
-        *s = (i % 65536) as u16;
-    }
+    let mut frames = Vec::new();
     for subject in ["subject-a", "subject-b"] {
         let dir = root.join(subject);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut writer = TiffWriter::create(
-            &dir.join("00.tif"),
-            TiffSpec {
-                width: size,
-                height: size,
-                samples_per_pixel: 3,
-                description: None,
-            },
-        )
-        .unwrap();
-        writer
-            .write_tile(
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width: size,
-                    height: size,
-                },
-                &samples,
-            )
-            .unwrap();
-        writer.finish().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let frame = dir.join("00.tif");
+        let header_len = frame_with_header_len(&frame);
+        frames.push((frame, header_len));
     }
 
     let mut controller = AppController::new();
@@ -2206,27 +2192,19 @@ fn answer_question_thumbnail_decode_runs_on_the_worker_not_on_settle() {
         Some(OpenOutcome::Question(..))
     ));
 
-    let worker_start = Instant::now();
     let handle = controller
         .answer_question(OpenAs::NProjects)
         .expect("answering the question must start a load");
     handle.join().unwrap();
-    let worker_elapsed = worker_start.elapsed();
 
-    let settle_start = Instant::now();
+    for (frame, header_len) in &frames {
+        let bytes = fs::read(frame).unwrap();
+        fs::write(frame, &bytes[..*header_len]).unwrap();
+    }
+
     let outcome = controller.settle_open();
-    let settle_elapsed = settle_start.elapsed();
-
     assert!(matches!(outcome, Some(OpenOutcome::Opened(_))));
-    assert!(
-        settle_elapsed < Duration::from_millis(50),
-        "settle_open must only assemble an already-decoded thumbnail: took {settle_elapsed:?}"
-    );
-    assert!(
-        worker_elapsed >= settle_elapsed,
-        "the worker's own duration must reflect the decode, not settle_open's: \
-         worker {worker_elapsed:?}, settle {settle_elapsed:?}"
-    );
+    assert_settled_with_worker_pictures(&mut controller, 2);
 }
 
 /// A worker's own failed thumbnail decode must not be retried in
