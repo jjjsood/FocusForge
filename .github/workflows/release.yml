@@ -295,6 +295,15 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # The raw macOS and Windows packages stay outside `artifacts-*`: host uploads every
+      # entry of that pattern to the release, and these are directory trees that
+      # tools/collect-native-artifacts.py turns into the release files here.
+      - name: Fetch native artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: native-*
+          path: target/distrib/
+          merge-multiple: true
       - id: cargo-dist
         shell: bash
         run: |
