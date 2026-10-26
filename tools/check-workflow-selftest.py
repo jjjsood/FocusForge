@@ -22,7 +22,7 @@ def errors(text: str) -> list[str]:
                      "timeout-minutes: 240", "NEXTEST_RETRIES: '2'"):
         if required not in text:
             found.append(f"missing {required!r}")
-    if not re.search(r"^on:\n  push:\n    tags-ignore:\n      - '\*\*'\n  pull_request:\n", text, re.M):
+    if not re.search(r"^on:\n  push:\n    branches:\n      - '\*\*'\n  pull_request:\n", text, re.M):
         found.append("trigger must be branch pushes and pull requests, never tags")
     canonical = re.findall(r"^\s*run:\s*tools/check-all\.sh --log-dir \.logs/gate/ci\s*$", text, re.M)
     if len(canonical) != 1:
@@ -54,7 +54,7 @@ def main() -> int:
         return 1
     expect_rejected("matrix", text.replace("windows-2022", "windows-missing"))
     expect_rejected("trigger", text.replace("pull_request:", "workflow_dispatch:"))
-    expect_rejected("tag trigger", text.replace("    tags-ignore:\n      - '**'\n", ""))
+    expect_rejected("tag trigger", text.replace("    branches:\n      - '**'\n", ""))
     expect_rejected("copied gate", text.replace("tools/check-all.sh --log-dir .logs/gate/ci", "cargo test --workspace"))
     expect_rejected("masked gate", text.replace("tools/check-all.sh --log-dir .logs/gate/ci", "tools/check-all.sh --log-dir .logs/gate/ci || true"))
     expect_rejected("artifact condition", text.replace("if: always()", "if: success()"))
