@@ -150,9 +150,7 @@ fn fingerprint_mismatch_blocks_and_does_not_default_to_proceed() {
         .manifest()
         .clone();
     let changed_path = dir.join(&manifest.sources[0].path);
-    let mut bytes = std::fs::read(&changed_path).unwrap();
-    bytes[0] ^= 0xFF;
-    std::fs::write(&changed_path, &bytes).unwrap();
+    common::rewrite_changed(&changed_path);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&project_path));
@@ -307,9 +305,7 @@ fn locate_frames_verifies_by_hash() {
         std::fs::copy(dir2.join(&source.path), good_dir.join(&source.path)).unwrap();
     }
     let changed = dir2.join(&manifest2.sources[0].path);
-    let mut bytes = std::fs::read(&changed).unwrap();
-    bytes[0] ^= 0xFF;
-    std::fs::write(&changed, &bytes).unwrap();
+    common::rewrite_changed(&changed);
 
     let mut controller2 = AppController::new();
     let outcome = common::open_and_settle(&mut controller2, &[project_path2]);
@@ -400,9 +396,7 @@ fn every_validation_state_is_rendered() {
         .manifest()
         .clone();
     let changed = dir.join(&manifest.sources[0].path);
-    let mut bytes = std::fs::read(&changed).unwrap();
-    bytes[0] ^= 0xFF;
-    std::fs::write(&changed, &bytes).unwrap();
+    common::rewrite_changed(&changed);
     let mut controller = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut controller, &[mismatch_path]),

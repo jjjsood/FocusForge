@@ -325,6 +325,24 @@ pub fn corrupt_blob(path: &Path, hash: &str) {
     std::fs::rename(&rewritten, path).expect("the copy replaces the project");
 }
 
+/// Flips the first byte of `path` in place and moves its modification time a
+/// minute ahead. A project recognises an unchanged source by size and
+/// modification time alone, so an edit that keeps both goes unseen -- and a
+/// fast rewrite on a filesystem with a coarse clock (Windows) can keep the
+/// time.
+#[allow(dead_code)]
+pub fn rewrite_changed(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(path, &bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+}
+
 /// Answers the pending grouping question, blocks until its worker finishes,
 /// and settles it -- `AppController::answer_question` runs off-thread too,
 /// the same as [`open_and_settle`].

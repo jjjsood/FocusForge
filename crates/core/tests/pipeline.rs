@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, StackAlgorithm,
@@ -332,6 +332,11 @@ struct PausingAlign {
     calls: Arc<AtomicUsize>,
     /// Slept in every `align_frame`, so a watcher tick can land mid-stage.
     delay: Duration,
+    /// An observer's tick count. When set, each `align_frame` returns only
+    /// once a tick has landed during it, or the job stops running, or 10 s
+    /// pass: a short stage on a loaded machine can otherwise end before the
+    /// watcher thread is first scheduled.
+    tick_count: Option<Arc<AtomicUsize>>,
 }
 
 impl AlignAlgorithm for PausingAlign {
@@ -352,10 +357,20 @@ impl AlignAlgorithm for PausingAlign {
         _frame: usize,
         _cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError> {
+        let entry = self.tick_count.as_ref().map(|t| t.load(Ordering::SeqCst));
         if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_on {
             self.control.pause();
         }
         std::thread::sleep(self.delay);
+        if let Some((ticks, entry)) = self.tick_count.as_ref().zip(entry) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while ticks.load(Ordering::SeqCst) == entry
+                && self.control.state() == ControlState::Running
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         Ok(AlignOutcome {
             transform: Transform::identity(),
             status: AlignStatus::Converged,
@@ -440,6 +455,7 @@ fn pause_during_alignment_stops_registering_frames() {
             pause_on: PAUSE_ON,
             calls: Arc::clone(&calls),
             delay: Duration::ZERO,
+            tick_count: None,
         }));
         let mut explicit = ParamValues::new();
         explicit.insert(
@@ -498,6 +514,7 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
             pause_on: PAUSE_ON,
             calls: Arc::clone(&calls),
             delay: Duration::ZERO,
+            tick_count: None,
         }));
         let mut explicit = ParamValues::new();
         explicit.insert(
@@ -672,6 +689,7 @@ fn align_progress_counts_every_frame() {
 #[derive(Default)]
 struct AlignEtaLog {
     ticks: Mutex<Vec<(JobStage, usize, Option<Duration>)>>,
+    tick_count: Arc<AtomicUsize>,
     hold_entry: Mutex<Option<(usize, Option<Duration>)>>,
 }
 
@@ -682,6 +700,7 @@ impl StageObserver for AlignEtaLog {
             progress.align_done,
             progress.eta,
         ));
+        self.tick_count.fetch_add(1, Ordering::SeqCst);
     }
 
     fn paused(&self, control: &JobControl) {
@@ -694,20 +713,22 @@ impl StageObserver for AlignEtaLog {
 }
 
 /// A chain-policy request over `count` mantis frames through a
-/// [`PausingAlign`] that sleeps `delay` per frame and pauses on call
-/// `pause_on`.
+/// [`PausingAlign`] that sleeps `delay` per frame, holds each frame until
+/// `observer` has ticked during it, and pauses on call `pause_on`.
 fn timed_align_request(
     label: &str,
     count: usize,
     control: &Arc<JobControl>,
     pause_on: usize,
     delay: Duration,
+    observer: &AlignEtaLog,
 ) -> FuseRequest {
     let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
         control: Arc::clone(control),
         pause_on,
         calls: Arc::new(AtomicUsize::new(0)),
         delay,
+        tick_count: Some(Arc::clone(&observer.tick_count)),
     }));
     let mut explicit = ParamValues::new();
     explicit.insert(
@@ -727,16 +748,17 @@ fn timed_align_request(
 #[test]
 fn align_progress_carries_an_eta() {
     let control = JobControl::new();
+    let observer = AlignEtaLog::default();
     let request = timed_align_request(
         "align_eta",
         5,
         &control,
         usize::MAX,
         Duration::from_millis(20),
+        &observer,
     );
     let cache = StageCache::open(&request.scratch_root).expect("stage cache must open");
 
-    let observer = AlignEtaLog::default();
     let outcome = focusforge_core::pipeline::run(&request, &observer, control, Some(&cache))
         .expect("a computed alignment must complete");
     assert!(matches!(outcome, FuseOutcome::Completed(_)));
@@ -770,8 +792,15 @@ fn align_progress_carries_an_eta() {
 #[test]
 fn align_eta_excludes_a_pause() {
     let control = JobControl::new();
-    let request = timed_align_request("align_eta_pause", 8, &control, 2, Duration::from_millis(20));
     let observer = AlignEtaLog::default();
+    let request = timed_align_request(
+        "align_eta_pause",
+        8,
+        &control,
+        2,
+        Duration::from_millis(20),
+        &observer,
+    );
     let outcome = focusforge_core::pipeline::run(&request, &observer, control, None)
         .expect("a paused-then-resumed alignment must complete");
     assert!(matches!(outcome, FuseOutcome::Completed(_)));
