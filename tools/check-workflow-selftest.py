@@ -19,9 +19,11 @@ def errors(text: str) -> list[str]:
                      "if: always()", "include-hidden-files: true", "if-no-files-found: error",
                      "cargo fetch --locked", "CARGO_DENY_VERSION: 0.20.2", "NEXTEST_VERSION: 0.9.144",
                      "numpy==2.2.6", "python-version: '3.12.10'", "checksum mismatch", "!target/tmp",
-                     "timeout-minutes: 240"):
+                     "timeout-minutes: 240", "NEXTEST_RETRIES: '2'"):
         if required not in text:
             found.append(f"missing {required!r}")
+    if not re.search(r"^on:\n  push:\n    tags-ignore:\n      - '\*\*'\n  pull_request:\n", text, re.M):
+        found.append("trigger must be branch pushes and pull requests, never tags")
     canonical = re.findall(r"^\s*run:\s*tools/check-all\.sh --log-dir \.logs/gate/ci\s*$", text, re.M)
     if len(canonical) != 1:
         found.append("canonical gate must occur exactly once without masking")
@@ -52,6 +54,7 @@ def main() -> int:
         return 1
     expect_rejected("matrix", text.replace("windows-2022", "windows-missing"))
     expect_rejected("trigger", text.replace("pull_request:", "workflow_dispatch:"))
+    expect_rejected("tag trigger", text.replace("    tags-ignore:\n      - '**'\n", ""))
     expect_rejected("copied gate", text.replace("tools/check-all.sh --log-dir .logs/gate/ci", "cargo test --workspace"))
     expect_rejected("masked gate", text.replace("tools/check-all.sh --log-dir .logs/gate/ci", "tools/check-all.sh --log-dir .logs/gate/ci || true"))
     expect_rejected("artifact condition", text.replace("if: always()", "if: success()"))
@@ -59,6 +62,7 @@ def main() -> int:
     expect_rejected("mutable action", text.replace("@d23441a48e516b6c34aea4fa41551a30e30af803", "@v6"))
     expect_rejected("unbounded gate", text.replace("timeout-minutes: 240", ""))
     expect_rejected("cache keeps target/tmp", text.replace("!target/tmp", ""))
+    expect_rejected("no flaky-test retries", text.replace("NEXTEST_RETRIES: '2'", ""))
     print("OK: workflow keeps one pinned canonical gate and narrow diagnostics")
     return 0
 

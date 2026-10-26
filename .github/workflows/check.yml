@@ -2,6 +2,9 @@ name: check
 
 on:
   push:
+    # A release tag's commit already ran this check on its branch push, and the release gate waits on the latest push run of a commit.
+    tags-ignore:
+      - '**'
   pull_request:
 
 permissions:
@@ -142,6 +145,10 @@ jobs:
         run: cargo fetch --locked
       - name: Run canonical gate
         timeout-minutes: 240
+        env:
+          # Hosted runners only: a failed test runs up to twice more, and one that then passes is
+          # reported as FLAKY in the gate log. The local gate runs without retries.
+          NEXTEST_RETRIES: '2'
         run: tools/check-all.sh --log-dir .logs/gate/ci
       - name: Upload gate logs
         if: always()

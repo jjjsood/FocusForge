@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import fnmatch
 import gzip
 import hashlib
 import importlib.util
@@ -494,6 +495,16 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
         producer_step = job[step_start:None if next_step < 0 else next_step]
         return "if:" not in producer_step and "continue-on-error" not in producer_step and "|| true" not in producer_step
     guarded = all(native_jobs[name] is not None and guarded_job(native_jobs[name] or "", producer[name]) for name in producer)
+    # host uploads every file of its `artifacts-*` download to the release, and `gh release create`
+    # rejects a directory; the native jobs upload directory trees, so only build-global may fetch them.
+    def downloads(part: str) -> list[str]:
+        return [pattern.strip("'\"") for pattern in re.findall(r"uses: actions/download-artifact@\S+\n\s+with:\n\s+pattern: (\S+)", part)]
+    native_uploads = re.findall(r"uses: actions/upload-artifact@\S+\n\s+with:\n\s+name: (\S+)", native)
+    native_raw = re.findall(r"- name: Upload native artifacts\n\s+uses: actions/upload-artifact@\S+\n\s+with:\n\s+name: (\S+)", native)
+    host_patterns, global_patterns = downloads(host_part), downloads(global_part)
+    if len(native_raw) != 2 or not host_patterns or len(native_uploads) != native.count("actions/upload-artifact@"): return False
+    if any(fnmatch.fnmatchcase(name, pattern) for name in native_uploads for pattern in host_patterns): return False
+    if not all(any(fnmatch.fnmatchcase(name, pattern) for pattern in global_patterns) for name in native_raw): return False
     return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == "GH_TOKEN= GITHUB_TOKEN= " + checker and re.search(r"if: ['\"]github\.event_name != 'pull_request'['\"]", generated_step) is not None and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- custom-package-native" in global_part and "- build-local-artifacts" in host_part and "- custom-package-native" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and "needs.custom-package-native.result == 'success'" in host_part and "needs.custom-package-native.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and "uses: ./.github/workflows/package-native.yml" in release and len(native_jobs) == 2 and guarded and native.count("if: github.event_name != 'pull_request'") == 2 and native.count("GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\"") == 2 and "continue-on-error" not in native and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions + native_actions)
 
 
@@ -516,6 +527,11 @@ def graph() -> None:
     assert not valid_graph(config, setup, release, native.replace("if: github.event_name != 'pull_request'", "if: false", 1))
     assert not valid_graph(config, setup, release, native.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1))
     assert not valid_graph(config, setup, release.replace("      - custom-package-native\n", "", 1), native)
+    assert not valid_graph(config, setup, release, native.replace("name: native-macos", "name: artifacts-native-macos"))
+    assert not valid_graph(config, setup, release, native.replace("name: native-windows", "name: artifacts-native-windows"))
+    assert not valid_graph(config, setup, release.replace("pattern: native-*", "pattern: unrelated-*"), native)
+    host_start = release.index("\n  host:")
+    assert not valid_graph(config, setup, release[:host_start] + release[host_start:].replace("pattern: artifacts-*", "pattern: '*'"), native)
     for job, command in (("macos", "tools/package-macos.sh --output target/distrib/native/macos"), ("macos", "tools/package-macos.sh"), ("windows", "tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows"), ("windows", "tools/package-windows.ps1")):
         start = native.index(f"  {job}:\n")
         insertion = native.index("      - name: Check native plan", start)

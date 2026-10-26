@@ -38,8 +38,9 @@ const CAPTURE_OFF: &str = "off";
 /// again in every generation of a re-spawn chain.
 const MONITOR_ARG: &str = "--focusforge-crash-monitor";
 
-/// The monitor ends its loop when no application has connected within this
-/// period, so a monitor whose parent died before connecting cannot linger.
+/// The monitor ends its loop when no application has identified itself
+/// within this period, so a monitor whose parent died before attaching
+/// cannot linger.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the application waits for its freshly spawned monitor to bind,
@@ -189,17 +190,17 @@ fn serve(socket: &str) -> Result<(), minidumper::Error> {
     let mut server = Server::with_name(socket_name(socket))?;
     let handler = Monitor::default();
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
-    let connected = handler.connected.clone();
+    let attached = handler.attached.clone();
     let watchdog = shutdown.clone();
     std::thread::spawn(move || {
         std::thread::sleep(IDLE_TIMEOUT);
-        if !connected.load(Ordering::SeqCst) {
+        if !attached.load(Ordering::SeqCst) {
             watchdog.store(true, Ordering::SeqCst);
         }
     });
     // `stale_timeout` stays `None`: it drops a client that has sent no
     // message within the period, and an application can work silently for
-    // minutes. The client's disconnect is what ends the loop instead.
+    // minutes. The application's disconnect is what ends the loop instead.
     server.run(Box::new(handler), &shutdown, None)
 }
 
@@ -215,7 +216,13 @@ struct ProcessInfo {
 
 #[derive(Default)]
 struct Monitor {
-    connected: std::sync::Arc<AtomicBool>,
+    /// Set once a client has sent [`MESSAGE_PROCESS_INFO`]: only that client
+    /// is the application. A connection that closes before identifying
+    /// itself is a failed attempt -- on macOS a client connects the socket
+    /// before it looks up the monitor's Mach port, and gives up on the
+    /// socket when that port is not registered yet -- and the application
+    /// is still to come.
+    attached: std::sync::Arc<AtomicBool>,
     process: Mutex<Option<ProcessInfo>>,
     signal: AtomicU32,
     crashed_at: AtomicI64,
@@ -270,6 +277,7 @@ impl ServerHandler for Monitor {
     fn on_message(&self, kind: u32, buffer: Vec<u8>) {
         match kind {
             MESSAGE_PROCESS_INFO => {
+                self.attached.store(true, Ordering::SeqCst);
                 if let Ok(info) = serde_json::from_slice::<serde_json::Value>(&buffer) {
                     *self.process.lock().unwrap_or_else(|e| e.into_inner()) = Some(ProcessInfo {
                         crash_dir: PathBuf::from(info["crash_dir"].as_str().unwrap_or_default()),
@@ -289,13 +297,12 @@ impl ServerHandler for Monitor {
         }
     }
 
-    fn on_client_connected(&self, _num_clients: usize) -> LoopAction {
-        self.connected.store(true, Ordering::SeqCst);
-        LoopAction::Continue
-    }
-
     fn on_client_disconnected(&self, _num_clients: usize) -> LoopAction {
-        LoopAction::Exit
+        if self.attached.load(Ordering::SeqCst) {
+            LoopAction::Exit
+        } else {
+            LoopAction::Continue
+        }
     }
 }
 
@@ -429,6 +436,44 @@ mod tests {
     fn an_abort_arrives_as_a_software_exception_carrying_the_signal() {
         let signal = mach_exception_signal(5, EXC_SOFT_SIGNAL, Some(6));
         assert_eq!(signal_name(signal), "SIGABRT");
+    }
+
+    /// A connection attempt that reaches the socket and then fails -- on
+    /// macOS, one made before the monitor has registered its Mach port --
+    /// closes without identifying itself. The monitor must keep waiting for
+    /// its application instead of taking that close for the application's.
+    #[test]
+    fn a_connection_that_never_identifies_itself_does_not_end_the_monitor() {
+        let socket = format!("{}-unidentified", default_socket());
+        let server = {
+            let socket = socket.clone();
+            std::thread::spawn(move || serve(&socket))
+        };
+        let connect = || {
+            let deadline = Instant::now() + CONNECT_TIMEOUT;
+            loop {
+                match Client::with_name(socket_name(&socket)) {
+                    Ok(client) => return client,
+                    Err(e) if Instant::now() >= deadline => panic!("no monitor to reach: {e}"),
+                    Err(_) => std::thread::sleep(CONNECT_RETRY),
+                }
+            }
+        };
+
+        drop(connect());
+        let application = connect();
+        application
+            .send_message(MESSAGE_PROCESS_INFO, "{}")
+            .expect("process information reaches the monitor");
+        application
+            .ping()
+            .expect("the monitor still serves after an unidentified connection closed");
+
+        drop(application);
+        server
+            .join()
+            .expect("the monitor thread does not panic")
+            .expect("the application's disconnect ends the loop cleanly");
     }
 
     #[test]
