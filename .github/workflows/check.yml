@@ -2,8 +2,9 @@ name: check
 
 on:
   push:
-    # A release tag's commit already ran this check on its branch push, and the release gate waits on the latest push run of a commit.
-    tags-ignore:
+    # Branch pushes only. A release tag's commit already ran this check on its branch push, and the release gate
+    # waits on the latest push run of a commit. `tags-ignore` alone would stop branch pushes from running at all.
+    branches:
       - '**'
   pull_request:
 

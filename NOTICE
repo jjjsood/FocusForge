@@ -223,7 +223,7 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64
-- Package: clipboard-win 5.4.1
+- Package: clipboard-win 5.4.3
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: BSL-1.0
   Targets: Windows x86_64
@@ -1927,15 +1927,15 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT
   Targets: Linux x86_64, Windows x86_64, macOS arm64
-- Package: zstd 0.14.0
+- Package: zstd 0.14.3
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: BSD-3-Clause
   Targets: Linux x86_64, Windows x86_64, macOS arm64
-- Package: zstd-safe 8.0.0
+- Package: zstd-safe 8.2.0
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: BSD-3-Clause
   Targets: Linux x86_64, Windows x86_64, macOS arm64
-- Package: zstd-sys 2.1.0+zstd.1.5.7
+- Package: zstd-sys 2.1.2+zstd.1.5.7
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: BSD-3-Clause
   Targets: Linux x86_64, Windows x86_64, macOS arm64
