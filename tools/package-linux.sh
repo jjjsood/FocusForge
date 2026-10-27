@@ -141,6 +141,7 @@ image=${pin_values[0]}
 app_url=${pin_values[1]}; app_sha=${pin_values[2]}; runtime_url=${pin_values[3]}; runtime_sha=${pin_values[4]}
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)
 revision=$(git -C "$root" rev-parse HEAD)
+mkdir -p "$root/.scratch"
 input_manifest=$(mktemp "$root/.scratch/package-linux-inputs.XXXXXX")
 legal_inputs=$(mktemp "$root/.scratch/package-linux-legal.XXXXXX")
 trap 'rm -f "$input_manifest" "$legal_inputs"' EXIT
