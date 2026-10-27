@@ -1707,9 +1707,19 @@ function global:msiexec.exe {
   $shortcut = Join-Path $env:ProgramData 'Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk'
   if ($Arguments[0] -eq '/i') {
     New-Item -ItemType Directory -Force -Path $product, (Split-Path $shortcut) | Out-Null
-    @('#!/usr/bin/env bash', 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"__VERSION__\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli __VERSION__; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
+    @('#!/bin/sh', 'exec bash -c "$(tail -n +4 "$0")" "$0" "$@"', ('#' + 'x' * 400), 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"__VERSION__\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli __VERSION__; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
+    # Line 3 of the mock script (bash rejects NUL bytes in its first 80, hence the sh trampoline) carries a PE header: e_lfanew at 0x3C, 'PE' at 0x80, optional-header Subsystem at 0xDC.
+    function Set-MockSubsystem([string]$Path, [byte]$Subsystem) {
+      $bytes = [IO.File]::ReadAllBytes($Path)
+      $bytes[0x3C] = 0x80; $bytes[0x3D] = 0; $bytes[0x3E] = 0; $bytes[0x3F] = 0
+      $bytes[0x80] = 0x50; $bytes[0x81] = 0x45; $bytes[0x82] = 0; $bytes[0x83] = 0
+      $bytes[0xDC] = $Subsystem; $bytes[0xDD] = 0
+      [IO.File]::WriteAllBytes($Path, $bytes)
+    }
+    Set-MockSubsystem (Join-Path $product 'focusforge-cli.exe') 3
     & chmod +x (Join-Path $product 'focusforge-cli.exe')
     Copy-Item (Join-Path $product 'focusforge-cli.exe') (Join-Path $product 'focusforge-gui.exe')
+    Set-MockSubsystem (Join-Path $product 'focusforge-gui.exe') $(if ($env:MOCK_GUI_CONSOLE) { 3 } else { 2 })
     & chmod +x (Join-Path $product 'focusforge-gui.exe')
     @('if [[ $1 == --exit-after ]]; then while (($#)); do if [[ $1 == --screenshot ]]; then printf "\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001" > "$2"; exit 0; fi; shift; done; exit 64; fi') | Add-Content (Join-Path $product 'focusforge-gui.exe')
     Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $product
@@ -1763,7 +1773,7 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         invocations = root / "invocations"
         env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
-        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False)):
+        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False), ({"MOCK_GUI_CONSOLE": "1"}, False)):
             shutil.rmtree(root / "symbols", ignore_errors=True)
             shutil.copytree(template, root / "symbols")
             case_env = env | mutation
@@ -1774,6 +1784,8 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
                 assert f"crash is missing {missing}" in result.stderr, result.stderr
             if "MOCK_AUMID" in mutation:
                 assert "invalid Start-menu shortcut AppUserModelID:" in result.stderr, result.stderr
+            if "MOCK_GUI_CONSOLE" in mutation:
+                assert "focusforge-gui.exe must be a windowed binary (PE subsystem 2)" in result.stderr, result.stderr
             assert not (root / "program-files/FocusForge").exists()
             assert not (root / "program-data/Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk").exists()
         assert invocations.read_text().splitlines()[:2] == ["focusforge-cli.exe:1:algorithms", "focusforge-gui.exe:0:"]
