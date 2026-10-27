@@ -56,6 +56,14 @@ function Assert-CrashRoundtrip([string]$Name, [string]$Binary, [string[]]$Argume
   & python (Join-Path $root 'tools/symbolicate.py') $dump.FullName $archive.FullName | Set-Content -NoNewline (Join-Path $crash 'stackwalk.json')
   if ($LASTEXITCODE -ne 0) { throw "$Name dump did not symbolicate" }
 }
+# Optional-header Subsystem of a PE file: 2 is a windowed (GUI) binary, 3 a console binary.
+function Get-PeSubsystem([string]$Path) {
+  $bytes = [IO.File]::ReadAllBytes($Path)
+  if ($bytes.Length -lt 0x40) { throw "$Path is not a PE file (too short)" }
+  $pe = [BitConverter]::ToUInt32($bytes, 0x3C)
+  if ($pe + 4 + 20 + 70 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw "$Path is not a PE file (no PE signature)" }
+  [int][BitConverter]::ToUInt16($bytes, $pe + 4 + 20 + 68)
+}
 try {
   # msiexec is a GUI program: only a pipeline makes PowerShell wait for it and set $LASTEXITCODE.
   & msiexec.exe /i $Msi /qn /norestart '/L*v' $installLog | Out-Null
@@ -63,6 +71,8 @@ try {
   foreach ($file in 'focusforge-cli.exe', 'focusforge-gui.exe', 'LICENSE', 'NOTICE', 'focusforge.ico') {
     if (-not (Test-Path (Join-Path $product $file))) { throw "missing installed file: $file" }
   }
+  $guiSubsystem = Get-PeSubsystem (Join-Path $product 'focusforge-gui.exe'); if ($guiSubsystem -ne 2) { throw "focusforge-gui.exe must be a windowed binary (PE subsystem 2), found subsystem $guiSubsystem" }
+  $cliSubsystem = Get-PeSubsystem (Join-Path $product 'focusforge-cli.exe'); if ($cliSubsystem -ne 3) { throw "focusforge-cli.exe must be a console binary (PE subsystem 3), found subsystem $cliSubsystem" }
   foreach ($file in 'LICENSE', 'NOTICE', 'focusforge.ico') { if ((Get-FileHash (Join-Path $root $file.Replace('focusforge.ico', 'assets/build/focusforge.ico'))).Hash -ne (Get-FileHash (Join-Path $product $file)).Hash) { throw "$file hash mismatch" } }
   $cli = Join-Path $product 'focusforge-cli.exe'
   $inventory = Get-Content (Join-Path $Symbols 'symbol-inventory.json') -Raw | ConvertFrom-Json
