@@ -480,3 +480,21 @@ fn native_crash_writes_a_minidump() {
     assert_eq!(metadata["reason"], "SIGSEGV");
     assert_eq!(metadata["minidump"], name);
 }
+
+/// Without the attribute an installed Windows build opens a console window
+/// behind the app. Only this binary may carry it: the CLI stays a console
+/// program.
+#[test]
+fn windows_build_has_no_console_window() {
+    let gui = include_str!("../src/main.rs");
+    assert!(
+        gui.lines()
+            .any(|line| line == r#"#![cfg_attr(windows, windows_subsystem = "windows")]"#),
+        "crates/gui/src/main.rs must start without a console on Windows"
+    );
+    let cli = include_str!("../../cli/src/main.rs");
+    assert!(
+        !cli.contains("windows_subsystem"),
+        "the CLI must stay a console program"
+    );
+}

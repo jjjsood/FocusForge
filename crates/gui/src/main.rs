@@ -3,6 +3,8 @@
 //! `focusforge-gui`'s entry point. Every flag below exists so the window
 //! can be observed without a person in front of it.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
