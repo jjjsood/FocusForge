@@ -225,15 +225,19 @@ memory, so tiling is the default path everywhere, not a fallback.
 
 ## Releases
 
-A human starts a release by pushing a version tag such as `v0.1.0`; the
-generated release workflow builds the supported matrix and creates the release
-only after its same-commit checks pass. Before creating or pushing a tag, run
-the documented Linux package recipe and inspect its two artifacts locally.
+A human starts a release by pushing a version tag such as `v0.1.0`;
+`.github/workflows/release.yml` builds the Linux, macOS and Windows packages and
+creates the release only after its same-commit checks pass. The release holds
+the installers (AppImage, `.deb`, DMG, MSI), one command-line archive per
+platform and a single `SHA256SUMS`; the release text puts the changelog entries
+above a download table. `tools/release-assets.py` decides that file list and fails on
+any extra or missing file. Before creating or pushing a tag, run the documented
+Linux package recipe and inspect its two artifacts locally.
 
-Pull requests run the same native package jobs without creating a release.
-macOS produces an Apple silicon (arm64) DMG and Windows produces one combined MSI; their
-target runners validate the installed package before uploading it for the
-release checksum job.
+Pull requests run the same package jobs and assemble the release files without
+creating a release. macOS produces an Apple silicon (arm64) DMG and Windows
+produces one combined MSI; their target runners validate the installed package
+before uploading it for the assemble job.
 
 The macOS and Windows targets are type-checked natively: the macOS and Windows
 legs of the check workflow each run `tools/check-all.sh`, which builds the
@@ -285,11 +289,12 @@ its SHA-256 file with each installer; diagnose a retained minidump locally with
 `python3 tools/symbolicate.py MINIDUMP SYMBOL_ARCHIVE`. The command downloads
 only its pinned stackwalker and never contacts a symbol server.
 
-Release assets include `FocusForge-<version>-x86_64-unknown-linux-gnu-symbols.tar.gz`,
-`FocusForge-<version>-aarch64-apple-darwin-symbols.tar.gz`, and
-`FocusForge-<version>-x86_64-pc-windows-msvc-symbols.tar.gz`; keep each with
-its `symbols.sha256` or the release `native-artifacts.sha256` entry. GitHub
-Releases publish these beside the matching installer. `package-symbols.py`
+The symbol archives (`FocusForge-<version>-x86_64-unknown-linux-gnu-symbols.tar.gz`,
+`FocusForge-<version>-aarch64-apple-darwin-symbols.tar.gz` and
+`FocusForge-<version>-x86_64-pc-windows-msvc-symbols.tar.gz`) are not release
+assets. Each release run keeps them for 90 days as the workflow artifacts
+`symbols-linux` and `symbols-native`; download them from the run's page and file
+each with the installer it belongs to. `package-symbols.py`
 requires Python 3.10+ and verifies dump_syms 2.3.9 (MIT OR Apache-2.0) and
 minidump-stackwalk 0.27.0 (MIT) before execution. It only supports local
 archives and stores; it does not fetch symbols for a dump.
@@ -300,8 +305,8 @@ stripped published binary cannot restore debug data that was not archived.
 
 Before tagging, move the `Unreleased` entries into a heading such as
 `## [0.1.0] - YYYY-MM-DD`, add a fresh `Unreleased` heading, and commit the
-result. The release workflow uses that version heading for release notes; tag
-only after that commit is ready.
+result. The release notes take that version heading (a candidate takes
+`Unreleased`); tag only after that commit is ready.
 
 When the CLI parser or workspace version changes, regenerate its packaged
 manuals and shell completions before running the package checks:

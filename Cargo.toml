@@ -23,10 +23,5 @@ debug = "line-tables-only"
 strip = "none"
 split-debuginfo = "off"
 
-# cargo-dist generic archives are shipping outputs, not symbol containers.
-[profile.dist]
-inherits = "release"
-strip = "debuginfo"
-
 [workspace.lints.rust]
 unsafe_code = "deny"

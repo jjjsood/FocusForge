@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Validate native package receipts before cargo-dist creates checksums."""
+"""Validate the macOS and Windows package receipts and symbol archives before they are released."""
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -17,8 +15,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 NATIVE = ROOT / "target/distrib"
 OUTPUT = ROOT / ".scratch/native-artifacts"
-TARGETS = {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"}
-PACKAGES = {"focusforge-cli", "focusforge-gui"}
 
 
 def version() -> str:
@@ -38,32 +34,6 @@ def sha256(path: Path) -> str:
 
 def revision() -> str:
     return os.environ.get("GITHUB_SHA") or subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
-
-
-def check_plan() -> None:
-    plan = json.loads(os.environ["DIST_PLAN"])
-    releases = plan.get("releases") if isinstance(plan, dict) else None
-    if not isinstance(releases, list) or len(releases) != len(PACKAGES):
-        raise ValueError("release plan has an unexpected release set")
-    by_name = {release.get("app_name"): release for release in releases if isinstance(release, dict)}
-    if set(by_name) != PACKAGES:
-        raise ValueError("release plan does not name both packages")
-    for name, release in by_name.items():
-        artifacts = release.get("artifacts")
-        if release.get("app_version") != version() or not isinstance(artifacts, list):
-            raise ValueError(f"invalid release metadata for {name}")
-        found = {match.group(1) for item in artifacts if (match := re.fullmatch(rf"{re.escape(name)}-(.+)\.(?:zip|tar\.xz|tar\.gz)", item))}
-        if found != TARGETS:
-            raise ValueError(f"release plan has unexpected targets for {name}")
-        if len(artifacts) != len(set(artifacts)):
-            raise ValueError(f"duplicate release artifact for {name}")
-        symbol_assets = {item for item in artifacts if item.endswith("-symbols.tar.gz")}
-        required_symbols = {f"FocusForge-{version()}-{target}-symbols.tar.gz" for target in TARGETS}
-        if symbol_assets != required_symbols:
-            raise ValueError(f"release plan has unexpected symbol assets for {name}")
-        required = {f"FocusForge-{version()}-aarch64.dmg", f"FocusForge-{version()}-x86_64.msi", *required_symbols, "native-artifacts.sha256", "native-artifacts.json"}
-        if not required.issubset(artifacts):
-            raise ValueError(f"release plan omits native artifacts for {name}")
 
 
 def receipt(directory: Path, kind: str, artifact: Path) -> dict[str, str]:
@@ -136,15 +106,5 @@ def collect() -> None:
             shutil.rmtree(previous)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check-plan", action="store_true")
-    args = parser.parse_args()
-    if args.check_plan:
-        check_plan()
-    else:
-        collect()
-
-
 if __name__ == "__main__":
-    main()
+    collect()
