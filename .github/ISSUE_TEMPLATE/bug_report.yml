@@ -7,7 +7,7 @@ body:
     attributes:
       label: FocusForge version
       description: Include the version from `focusforge-cli --version`.
-      placeholder: 0.1.0-rc.3
+      placeholder: 0.1.0-rc.4
     validations:
       required: true
   - type: dropdown
