@@ -116,6 +116,7 @@ run_gate "NOTICE"           tools/with-lock.sh build -- tools/check-notice.sh
 run_gate "NOTICE selftest"  tools/check-notice-selftest.sh
 run_gate "logging selftest" tools/check-logging-selftest.sh
 run_gate "workflow selftest" python3 tools/check-workflow-selftest.py
+run_gate "release assets selftest" python3 tools/check-release-assets-selftest.py
 run_gate "release smoke selftest" tools/smoke-release-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh

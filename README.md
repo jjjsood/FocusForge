@@ -19,6 +19,12 @@
 
 ![Source frame 30 beside the FocusForge composite](docs/assets/stack-before-after.jpg)
 
+<p align="center">
+  <a href="https://youtu.be/_Yl03_Xk66A"><img src="https://img.youtube.com/vi/_Yl03_Xk66A/hqdefault.jpg" alt="Watch the FocusForge promo video on YouTube" width="480"></a>
+  <br>
+  <a href="https://youtu.be/_Yl03_Xk66A">Watch the promo video</a>
+</p>
+
 ## Features
 
 **From shoot to sharp image**

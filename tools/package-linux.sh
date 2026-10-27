@@ -48,7 +48,7 @@ pins = parse(open(sys.argv[1], encoding="utf-8").read())
 sha256 = re.compile(r"[0-9a-f]{64}")
 if not re.fullmatch(r"ubuntu@sha256:[0-9a-f]{64}", pins["linux"]["container"]):
     raise SystemExit("invalid Linux container pin")
-for section in ("cargo_dist", "appimagetool", "type2_runtime"):
+for section in ("appimagetool", "type2_runtime"):
     value = pins[section]
     if not isinstance(value.get("url"), str) or not value["url"].startswith("https://"):
         raise SystemExit(f"invalid {section} URL")
@@ -116,7 +116,7 @@ for raw in open(sys.argv[1], encoding="utf-8"):
     elif section and "=" in line:
         key, value = (part.strip() for part in line.split("=", 1))
         values[(section, key)] = value.strip('"')
-for item in (("linux", "container"), ("cargo_dist", "url"), ("cargo_dist", "sha256"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256")):
+for item in (("linux", "container"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256")):
     print(values[item])
 PY
 }
@@ -137,8 +137,8 @@ if [ "${1:-}" = --write-legal-inputs ]; then
 fi
 
 mapfile -t pin_values < <(read_pin_values "$pins")
-image=${pin_values[0]}; dist_url=${pin_values[1]}; dist_sha=${pin_values[2]}
-app_url=${pin_values[3]}; app_sha=${pin_values[4]}; runtime_url=${pin_values[5]}; runtime_sha=${pin_values[6]}
+image=${pin_values[0]}
+app_url=${pin_values[1]}; app_sha=${pin_values[2]}; runtime_url=${pin_values[3]}; runtime_sha=${pin_values[4]}
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)
 revision=$(git -C "$root" rev-parse HEAD)
 input_manifest=$(mktemp "$root/.scratch/package-linux-inputs.XXXXXX")
@@ -159,9 +159,9 @@ owner_gid=$(id -g)
 clean_package_output "$next"
 mkdir -p "$next"
 set +e
-docker run --rm -i -v "$root:/src:ro" -v "$next:/out" -v "$input_manifest:/inputs/package-inputs.sha256:ro" -v "$legal_inputs:/inputs/type2-legal-inputs.tsv:ro" "$image" bash -s -- "$version" "$dist_url" "$dist_sha" "$app_url" "$app_sha" "$runtime_url" "$runtime_sha" "$revision" "$image" "$owner_uid" "$owner_gid" <<'CONTAINER'
+docker run --rm -i -v "$root:/src:ro" -v "$next:/out" -v "$input_manifest:/inputs/package-inputs.sha256:ro" -v "$legal_inputs:/inputs/type2-legal-inputs.tsv:ro" "$image" bash -s -- "$version" "$app_url" "$app_sha" "$runtime_url" "$runtime_sha" "$revision" "$image" "$owner_uid" "$owner_gid" <<'CONTAINER'
 set -euo pipefail
-version=$1; dist_url=$2; dist_sha=$3; app_url=$4; app_sha=$5; runtime_url=$6; runtime_sha=$7; revision=$8; image=$9; owner_uid=${10}; owner_gid=${11}
+version=$1; app_url=$2; app_sha=$3; runtime_url=$4; runtime_sha=$5; revision=$6; image=$7; owner_uid=${8}; owner_gid=${9}
 deb_version=${version/-/\~}
 trap 'chown -R "$owner_uid:$owner_gid" /out' EXIT
 export DEBIAN_FRONTEND=noninteractive
@@ -170,8 +170,6 @@ apt-get install -y -qq build-essential ca-certificates curl xz-utils file binuti
 dpkg_version=$(dpkg-deb --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 test "$dpkg_version" = 1.21.1
 fetch() { curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 -o "$2" "$1"; }
-fetch "$dist_url" /out/cargo-dist.tar.xz
-printf '%s  %s\n' "$dist_sha" /out/cargo-dist.tar.xz | sha256sum -c -
 fetch "$app_url" /out/appimagetool.AppImage
 printf '%s  %s\n' "$app_sha" /out/appimagetool.AppImage | sha256sum -c -
 fetch "$runtime_url" /out/runtime-x86_64
@@ -287,7 +285,7 @@ dpkg-deb --build --root-owner-group /out/deb "/out/focusforge_${version}_amd64.d
 ARCH=x86_64 VERSION="$version" APPIMAGE_EXTRACT_AND_RUN=1 /out/appimagetool.AppImage --runtime-file /out/runtime-x86_64 /out/AppDir "/out/FocusForge-${version}-x86_64.AppImage" |& tee /out/appimage-build.log
 (cd /out && sha256sum "FocusForge-${version}-x86_64.AppImage" "focusforge_${version}_amd64.deb") | tee /out/artifacts.sha256
 cp /inputs/package-inputs.sha256 /out/package-inputs.sha256
-printf 'source_revision=%s\nimage=%s\ndpkg_deb=%s\ncargo_dist=0.33.0 sha256=%s\nappimagetool=1.9.1 sha256=%s\ntype2_runtime=20251108 sha256=%s\n' "$revision" "$image" "$dpkg_version" "$dist_sha" "$app_sha" "$runtime_sha" > /out/inventory.txt
+printf 'source_revision=%s\nimage=%s\ndpkg_deb=%s\nappimagetool=1.9.1 sha256=%s\ntype2_runtime=20251108 sha256=%s\n' "$revision" "$image" "$dpkg_version" "$app_sha" "$runtime_sha" > /out/inventory.txt
 CONTAINER
 status=$?
 set -e

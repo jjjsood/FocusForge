@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["spikes"]
 
 [workspace.package]
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/jjjsood/FocusForge"
@@ -22,11 +22,6 @@ debug = false
 debug = "line-tables-only"
 strip = "none"
 split-debuginfo = "off"
-
-# cargo-dist generic archives are shipping outputs, not symbol containers.
-[profile.dist]
-inherits = "release"
-strip = "debuginfo"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

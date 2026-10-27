@@ -34,7 +34,6 @@ CHECKER = ROOT / "tools/check-package-linux.sh"
 NATIVE_COLLECTOR = ROOT / "tools/collect-native-artifacts.py"
 SYMBOL_PACKAGER = ROOT / "tools/package-symbols.py"
 SYMBOL_TOOLS = ROOT / "packaging/symbol-tools.toml"
-NATIVE_WORKFLOW = ROOT / ".github/workflows/package-native.yml"
 spec = importlib.util.spec_from_file_location("release_gate", ROOT / "tools/check-release-gate.py")
 gate = importlib.util.module_from_spec(spec)
 assert spec and spec.loader
@@ -79,7 +78,7 @@ def producer() -> None:
 
         def expected_values(path: Path) -> list[str]:
             parsed = tomllib.loads(path.read_text())
-            return [parsed[section][key] for section, key in (("linux", "container"), ("cargo_dist", "url"), ("cargo_dist", "sha256"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256"))]
+            return [parsed[section][key] for section, key in (("linux", "container"), ("appimagetool", "url"), ("appimagetool", "sha256"), ("type2_runtime", "url"), ("type2_runtime", "sha256"))]
 
         assert selected_values(pins) == expected_values(pins)
         parts = pins.read_text().split("[[type2_runtime.legal_inputs]]")
@@ -92,7 +91,7 @@ def producer() -> None:
             "[legal]\n[[legal.inputs]]\nname = \"alternate\"\nurl = \"https://example.invalid/alternate-license\"\nsha256 = \"" + "f" * 64 + "\"\n\n"
             + "\n\n".join(
                 f"[{section}]\n" + "\n".join(f"{key} = {json.dumps(value)}" for key, value in values[section].items() if isinstance(value, str))
-                for section in ("linux", "cargo_dist", "appimagetool", "type2_runtime")
+                for section in ("linux", "appimagetool", "type2_runtime")
             )
             + "\n"
         )
@@ -109,9 +108,6 @@ def producer() -> None:
         commented.write_text(
             "[linux] # selected container\n"
             + f'container = {json.dumps(values["linux"]["container"])}\n\n'
-            + "[cargo_dist] # selected tool\n"
-            + 'url = "https://example.invalid/dist#fragment=a=b"\n'
-            + f'sha256 = "{hashlib.sha256(b"dist-commented").hexdigest()}"\n\n'
             + "[type2_runtime] # selected runtime\n"
             + 'url = "https://example.invalid/runtime#fragment=a=b"\n'
             + f'sha256 = "{hashlib.sha256(b"runtime-commented").hexdigest()}"\n\n'
@@ -125,7 +121,6 @@ def producer() -> None:
         whitespace_headers.write_text(
             commented.read_text()
             .replace("[linux] #", "[ linux ] #")
-            .replace("[cargo_dist] #", "[ cargo_dist ] #")
             .replace("[type2_runtime] #", "[ type2_runtime ] #")
             .replace("[[type2_runtime.legal_inputs]] #", "[[ type2_runtime.legal_inputs ]] #")
             .replace("[appimagetool] #", "[ appimagetool ] #")
@@ -148,7 +143,7 @@ def producer() -> None:
         assert legal.read_text() == "kept\n"
         legal.write_text("kept\n")
         corrupt = directory / "corrupt.toml"
-        corrupt.write_text(pins.read_text().replace('sha256 = "4b3f0a5f0ebbdb798f6db649d01b32ba1518376b6f7a0502b7d92b75cc2c8293"', 'sha256 = "z"'))
+        corrupt.write_text(pins.read_text().replace('sha256 = "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"', 'sha256 = "z"'))
         call([str(PACKAGE), "--write-legal-inputs", str(legal), str(corrupt)], False)
         assert legal.read_text() == "kept\n"
         payload = directory / "payload"; payload.write_bytes(b"pinned")
@@ -409,9 +404,9 @@ def gate_checks() -> None:
     gate.urllib.request.urlopen = fake
     try:
         assert gate.request_pages("https://api.github.com/runs", 1e20, False)["pages"][1]["workflow_runs"]
-        gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(urllib.error.URLError("offline"))
+        gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None))
         try: gate.request_pages("https://api.github.com/runs", 1e20, False)
-        except urllib.error.URLError: pass
+        except urllib.error.HTTPError: pass
         else: raise AssertionError("API failure accepted")
         try: gate.request_pages("https://api.github.com/runs", 0, False)
         except ValueError: pass
@@ -452,154 +447,121 @@ def gate_checks() -> None:
         gate.remote = original_remote
 
 
-def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
-    try:
-        dist = tomllib.loads(config)
-        targets = dist["dist"]["targets"]
-        packages = dist["workspace"]["packages"]
-        extras = dist["dist"]["extra-artifacts"]
-    except (KeyError, TypeError, tomllib.TOMLDecodeError):
-        return False
-    if set(targets) != {"x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"} or packages != ["focusforge-cli", "focusforge-gui"]:
-        return False
-    if dist["dist"].get("local-artifacts-jobs") != ["./package-native"] or dist["dist"].get("pr-run-mode") != "upload": return False
-    linux = next((item for item in extras if item.get("build") == ["tools/package-linux.sh"]), None)
-    native_extra = next((item for item in extras if item.get("build") == ["python3", "tools/collect-native-artifacts.py"]), None)
-    if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 6: return False
-    checker = "python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
-    step = setup[setup.find("- name: Require exact check run"):setup.find("- name: Require locked release Cargo profile")]
-    if checker not in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
-    if "plan-gate" in release: return False
-    local, global_build, host = release.find("build-local-artifacts:"), release.find("build-global-artifacts:"), release.find("\n  host:")
-    local_part = release[local:global_build]; global_part = release[global_build:host]; host_part = release[host:release.find("\n  announce:", host)]
-    matrix = "matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}"
-    pinned_actions = [action for action in re.findall(r"uses:\s*['\"]?([^\s'\"]+)", release) if "@" in action]
-    condition = "if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null &&"
-    generated_step = local_part[local_part.find("Require exact check run"):local_part.find("Require locked release Cargo profile")]
-    run_line = next((line.strip().split(": ", 1)[1] for line in generated_step.splitlines() if line.strip().startswith("run: ")), "")
-    try: generated_command = json.loads(run_line)
-    except json.JSONDecodeError: return False
-    native_actions = re.findall(r"uses:\s*['\"]?([^\s'\"]+)", native)
-    def native_job(name: str) -> str | None:
-        match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", native, re.MULTILINE | re.DOTALL)
-        return match.group(1) if match else None
-    native_jobs = {name: native_job(name) for name in ("macos", "windows")}
-    producer = {"macos": r"tools/package-macos\.sh(?:\s+--output\s+target/distrib/native/macos)?", "windows": r"tools/package-windows\.ps1(?:\s+-OutputDirectory\s+target/distrib/native/windows)?"}
-    def guarded_job(job: str, command: str) -> bool:
-        guard = re.search(r"- name: Require exact check run\n\s+if: github\.event_name != 'pull_request'\n\s+shell: \w+\n\s+run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate\.py --anonymous --sha \"\$GITHUB_SHA\" --repository \"\$GITHUB_REPOSITORY\"", job)
-        header = job[:job.find("    steps:")]
-        runs = list(re.finditer(rf"^\s+run:\s*{command}\s*$", job, re.MULTILINE))
-        if "if:" in header or "needs:" in header or guard is None or len(runs) != 1 or guard.start() > runs[0].start(): return False
-        step_start = job.rfind("      - name:", 0, runs[0].start())
-        next_step = job.find("      - name:", runs[0].end())
-        producer_step = job[step_start:None if next_step < 0 else next_step]
-        return "if:" not in producer_step and "continue-on-error" not in producer_step and "|| true" not in producer_step
-    guarded = all(native_jobs[name] is not None and guarded_job(native_jobs[name] or "", producer[name]) for name in producer)
-    # host uploads every file of its `artifacts-*` download to the release, and `gh release create`
-    # rejects a directory; the native jobs upload directory trees, so only build-global may fetch them.
-    def downloads(part: str) -> list[str]:
-        return [pattern.strip("'\"") for pattern in re.findall(r"uses: actions/download-artifact@\S+\n\s+with:\n\s+pattern: (\S+)", part)]
-    native_uploads = re.findall(r"uses: actions/upload-artifact@\S+\n\s+with:\n\s+name: (\S+)", native)
-    native_raw = re.findall(r"- name: Upload native artifacts\n\s+uses: actions/upload-artifact@\S+\n\s+with:\n\s+name: (\S+)", native)
-    host_patterns, global_patterns = downloads(host_part), downloads(global_part)
-    if len(native_raw) != 2 or not host_patterns or len(native_uploads) != native.count("actions/upload-artifact@"): return False
-    if any(fnmatch.fnmatchcase(name, pattern) for name in native_uploads for pattern in host_patterns): return False
-    if not all(any(fnmatch.fnmatchcase(name, pattern) for pattern in global_patterns) for name in native_raw): return False
-    return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == "GH_TOKEN= GITHUB_TOKEN= " + checker and re.search(r"if: ['\"]github\.event_name != 'pull_request'['\"]", generated_step) is not None and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- custom-package-native" in global_part and "- build-local-artifacts" in host_part and "- custom-package-native" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and "needs.custom-package-native.result == 'success'" in host_part and "needs.custom-package-native.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and "uses: ./.github/workflows/package-native.yml" in release and len(native_jobs) == 2 and guarded and native.count("if: github.event_name != 'pull_request'") == 2 and native.count("GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\"") == 2 and "continue-on-error" not in native and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions + native_actions)
+def gate_retry_cases() -> None:
+    url = "https://api.github.com/runs"
+    page = {"total_count": 0, "workflow_runs": []}
+    class Reply(io.BytesIO):
+        headers = {"Link": ""}
+        def __enter__(self) -> "Reply": return self
+        def __exit__(self, *args: object) -> None: self.close()
+    def failure(code: int, **headers: str) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError(url, code, "stub", headers, None)
+    def run(*outcomes: Exception, limit: float = 1e6) -> tuple[object, list[float], int]:
+        script, sleeps, clock = list(outcomes), [], [0.0]
+        def urlopen(request: object, timeout: float) -> Reply:
+            if script:
+                raise script.pop(0)
+            return Reply(json.dumps(page).encode())
+        def pause(seconds: float) -> None: sleeps.append(seconds); clock[0] += seconds
+        saved = gate.urllib.request.urlopen, gate.time.sleep, gate.time.monotonic, gate.time.time
+        gate.urllib.request.urlopen, gate.time.sleep, gate.time.monotonic, gate.time.time = urlopen, pause, lambda: clock[0], lambda: 1000.0
+        try:
+            try: result: object = gate.request_pages(url, limit, True)
+            except (ValueError, urllib.error.HTTPError) as error: result = error
+        finally:
+            gate.urllib.request.urlopen, gate.time.sleep, gate.time.monotonic, gate.time.time = saved
+        return result, sleeps, len(script)
+    result, sleeps, _ = run(failure(403, **{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1030"}))
+    assert result == {"pages": [page], "total_count": 0} and sleeps == [31.0], (result, sleeps)
+    result, sleeps, _ = run(failure(403, **{"Retry-After": "7"}))
+    assert isinstance(result, dict) and sleeps == [7.0]
+    result, sleeps, _ = run(failure(429))
+    assert isinstance(result, dict) and sleeps == [5.0]
+    result, sleeps, _ = run(failure(502), urllib.error.URLError("offline"), TimeoutError("slow"))
+    assert isinstance(result, dict) and sleeps == [5.0, 10.0, 20.0]
+    for permanent in (failure(403), failure(403, **{"X-RateLimit-Remaining": "12"}), failure(404), failure(401)):
+        result, sleeps, left = run(permanent, failure(429))
+        assert isinstance(result, urllib.error.HTTPError) and result.code == permanent.code and not sleeps and left == 1
+    result, sleeps, _ = run(*[failure(403, **{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "99999"})] * 5, limit=200)
+    assert isinstance(result, ValueError) and "HTTP Error 403" in str(result) and "timed out" in str(result) and sum(sleeps) == 200, (result, sleeps)
+    saved_main, saved_open = gate.main, gate.urllib.request.urlopen
+    gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(failure(401))
+    try: assert saved_main(["--sha", "a" * 40, "--repository", "owner/repo"]) == 2
+    finally: gate.urllib.request.urlopen = saved_open
+
+
+def workflow_jobs(release: str) -> dict[str, str]:
+    body = release[release.index("\njobs:\n"):]
+    return {match.group(1): match.group(2) for match in re.finditer(r"^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", body, re.MULTILINE | re.DOTALL)}
+
+
+def job_steps(job: str) -> list[str]:
+    return re.split(r"^      - ", job[job.index("    steps:\n"):], flags=re.MULTILINE)[1:]
+
+
+def valid_release(release: str) -> bool:
+    """The invariants the release workflow keeps: a gate before any build, publishing only on a tag, pinned actions."""
+    jobs = workflow_jobs(release)
+    if set(jobs) != {"meta", "package-linux", "package-macos", "package-windows", "assemble", "publish"}: return False
+    if not re.search(r"^permissions: \{\}$", release, re.MULTILINE): return False
+    if re.search(r"continue-on-error|\|\| true|--anonymous|pull_request_target", release): return False
+    if any(not re.fullmatch(r"[0-9a-f]{40}", action.split("@", 1)[1]) for action in re.findall(r"uses:\s*([^\s]+)", release)): return False
+    if any("timeout-minutes:" not in job for job in jobs.values()): return False
+    write = [name for name, job in jobs.items() if "contents: write" in job]
+    if write != ["publish"]: return False
+    checker = 'python3 tools/check-release-gate.py --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"'
+    gate = [step for step in job_steps(jobs["meta"]) if "check-release-gate.py" in step]
+    if len(gate) != 1 or "if: github.ref_type == 'tag'" not in gate[0] or "GH_TOKEN: ${{ github.token }}" not in gate[0] or f"run: {checker}" not in gate[0]: return False
+    if "actions: read" not in jobs["meta"]: return False
+    packagers = {"package-linux": "tools/package-linux.sh", "package-macos": "tools/package-macos.sh", "package-windows": "tools/package-windows.ps1"}
+    for name, command in packagers.items():
+        job = jobs[name]
+        if not re.search(r"^    needs: meta$", job, re.MULTILINE) or re.search(r"^    if:", job, re.MULTILINE): return False
+        built = [step for step in job_steps(job) if re.search(rf"run: {re.escape(command)}\b", step)]
+        if len(built) != 1 or "if:" in built[0]: return False
+    if not re.search(r"^    needs: \[meta, package-linux, package-macos, package-windows\]$", jobs["assemble"], re.MULTILINE): return False
+    if "tools/release-assets.py assemble" not in jobs["assemble"] or "tools/collect-native-artifacts.py" not in jobs["assemble"]: return False
+    publish = jobs["publish"]
+    if not re.search(r"^    if: github\.ref_type == 'tag'$", publish, re.MULTILINE) or not re.search(r"^    needs: \[meta, assemble\]$", publish, re.MULTILINE): return False
+    if re.findall(r"^          (?:name|pattern): (\S+)$", publish, re.MULTILINE) != ["release-assets"]: return False
+    if "gh release create" not in publish or "--verify-tag" not in publish or "gh release" in "".join(job for name, job in jobs.items() if name != "publish"): return False
+    # Diagnostics and receipts upload after a failure; nothing else may run on `always()`.
+    for job in jobs.values():
+        for step in job_steps(job):
+            if "if: always()" in step and "actions/upload-artifact@" not in step: return False
+    return True
 
 
 def graph() -> None:
-    config = (ROOT / "dist-workspace.toml").read_text(); setup = (ROOT / ".github/build-setup.yml").read_text()
-    release = (ROOT / ".github/workflows/release.yml").read_text(); native = NATIVE_WORKFLOW.read_text(); assert valid_graph(config, setup, release, native)
-    assert not valid_graph(config.replace('targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]', "targets = []"), setup, release, native)
-    assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release, native)
-    assert not valid_graph(config, setup.replace("if: github.event_name != 'pull_request'", "if: false", 1), release, native)
-    assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release, native)
-    assert not valid_graph(config, setup.replace(checker := 'python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"', checker + ' || true'), release, native)
-    assert not valid_graph(config, setup, release.replace('Require exact check run', 'masked check run', 1), native)
-    assert not valid_graph(config, setup, release.replace('- name: "Require exact check run"', '- name: "Require exact check run"\n        continue-on-error: true', 1), native)
-    generated_run = next(line for line in release.splitlines() if 'tools/check-release-gate.py' in line)
-    assert not valid_graph(config, setup, release.replace(generated_run, generated_run[:-1] + ' || true"', 1), native)
-    assert not valid_graph(config, setup, release.replace("needs.build-local-artifacts.result == 'success'", "needs.build-local-artifacts.result == 'failure'", 1), native)
-    assert not valid_graph(config, setup, release.replace("needs.custom-package-native.result == 'success'", "needs.custom-package-native.result == 'failure'", 1), native)
-    assert not valid_graph(config, setup, release.replace("build-local-artifacts:", "plan-gate:\n  build-local-artifacts:", 1), native)
-    assert not valid_graph(config, setup, release.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1), native)
-    assert not valid_graph(config, setup, release, native.replace("if: github.event_name != 'pull_request'", "if: false", 1))
-    assert not valid_graph(config, setup, release, native.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1))
-    assert not valid_graph(config, setup, release.replace("      - custom-package-native\n", "", 1), native)
-    assert not valid_graph(config, setup, release, native.replace("name: native-macos", "name: artifacts-native-macos"))
-    assert not valid_graph(config, setup, release, native.replace("name: native-windows", "name: artifacts-native-windows"))
-    assert not valid_graph(config, setup, release.replace("pattern: native-*", "pattern: unrelated-*"), native)
-    host_start = release.index("\n  host:")
-    assert not valid_graph(config, setup, release[:host_start] + release[host_start:].replace("pattern: artifacts-*", "pattern: '*'"), native)
-    for job, command in (("macos", "tools/package-macos.sh --output target/distrib/native/macos"), ("macos", "tools/package-macos.sh"), ("windows", "tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows"), ("windows", "tools/package-windows.ps1")):
-        start = native.index(f"  {job}:\n")
-        insertion = native.index("      - name: Check native plan", start)
-        injected = native[:insertion] + f"      - name: any name\n        shell: bash\n        run: {command}\n" + native[insertion:]
-        assert not valid_graph(config, setup, release, injected)
-    assert not valid_graph(config, setup, release, native.replace("      - name: Build native package", "      - name: Build native package\n        if: true", 1))
-    assert not valid_graph(config, setup, release, native.replace("    runs-on: macos-14", "    if: false\n    runs-on: macos-14").replace("    runs-on: windows-2022", "    if: false\n    runs-on: windows-2022"))
-    matrix = "matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}"
-    assert not valid_graph(config, setup, release.replace(matrix, "matrix: { include: [] }", 1), native)
-    def workflow_job(name: str) -> str:
-        match = re.search(rf"^  {name}:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", release, re.MULTILINE | re.DOTALL)
-        assert match
-        return match.group(1)
-    def needs(job: str) -> list[str]:
-        match = re.search(r"^    needs:\n((?:      - [A-Za-z0-9_-]+\n)+)", job, re.MULTILINE)
-        return re.findall(r"- ([A-Za-z0-9_-]+)", match.group(1)) if match else []
-    local, custom, global_job, host, announce = (workflow_job(name) for name in ("build-local-artifacts", "custom-package-native", "build-global-artifacts", "host", "announce"))
-    assert needs(local) == ["plan"] and needs(custom) == ["plan"] and needs(global_job) == ["plan", "build-local-artifacts", "custom-package-native"] and needs(host) == ["plan", "build-local-artifacts", "custom-package-native", "build-global-artifacts"] and needs(announce) == ["plan", "host"]
-    local_condition = next(line.strip()[4:] for line in local.splitlines() if line.strip().startswith("if: "))
-    custom_condition = next(line.strip()[4:] for line in custom.splitlines() if line.strip().startswith("if: "))
-    host_condition = next(line.strip()[4:] for line in host.splitlines() if line.strip().startswith("if: "))
-    announce_condition = next(line.strip()[4:] for line in announce.splitlines() if line.strip().startswith("if: "))
-
-    def condition(expression: str, values: dict[str, object]) -> bool:
-        expression = expression.removeprefix("${{").removesuffix("}}").strip()
-        for name, value in sorted(values.items(), key=lambda pair: len(pair[0]), reverse=True):
-            expression = expression.replace(name, repr(value))
-        expression = expression.replace("&&", " and ").replace("||", " or ")
-        tree = ast.parse(expression, mode="eval")
-        assert all(isinstance(node, (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.NotEq, ast.Constant)) for node in ast.walk(tree))
-        return bool(eval(compile(tree, "<workflow condition>", "eval"), {"__builtins__": {}}, {}))
-
-    values = {
-        "always()": True,
-        "fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": bool(tomllib.loads(config)["dist"]["targets"]),
-        "fromJson(needs.plan.outputs.val).ci.github.pr_run_mode": "skip",
-        "needs.plan.outputs.publishing": "true",
-        "needs.plan.result": "success",
-        "needs.build-local-artifacts.result": "success",
-        "needs.custom-package-native.result": "success",
-        "needs.build-global-artifacts.result": "success",
+    release = (ROOT / ".github/workflows/release.yml").read_text()
+    assert valid_release(release)
+    assert not (ROOT / "dist-workspace.toml").exists() and not (ROOT / ".github/build-setup.yml").exists() and not (ROOT / ".github/workflows/package-native.yml").exists()
+    gate_if = "        if: github.ref_type == 'tag'\n        env:\n          GH_TOKEN"
+    refused = {
+        "gate skipped": release.replace(gate_if, "        if: false\n        env:\n          GH_TOKEN", 1),
+        "gate without token": release.replace("          GH_TOKEN: ${{ github.token }}\n        run: python3 tools/check-release-gate.py", "        run: python3 tools/check-release-gate.py", 1),
+        "gate anonymous": release.replace("tools/check-release-gate.py --sha", "tools/check-release-gate.py --anonymous --sha", 1),
+        "gate tolerated": release.replace('"$GITHUB_REPOSITORY"\n\n  package-linux', '"$GITHUB_REPOSITORY" || true\n\n  package-linux', 1),
+        "gate step tolerated": release.replace("      - name: Require exact check run\n", "      - name: Require exact check run\n        continue-on-error: true\n", 1),
+        "no actions permission": release.replace("      actions: read\n", "", 1),
+        "workflow-wide rights": release.replace("permissions: {}", "permissions:\n  contents: write", 1),
+        "assemble may write": release.replace("  assemble:\n    needs: [meta, package-linux, package-macos, package-windows]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 15\n    permissions:\n      contents: read", "  assemble:\n    needs: [meta, package-linux, package-macos, package-windows]\n    runs-on: ubuntu-24.04\n    timeout-minutes: 15\n    permissions:\n      contents: write", 1),
+        "publish on pull requests": release.replace("    if: github.ref_type == 'tag'\n    needs: [meta, assemble]", "    needs: [meta, assemble]", 1),
+        "publish without verified tag": release.replace(" --verify-tag", "", 1),
+        "publish skips assemble": release.replace("    needs: [meta, assemble]", "    needs: [meta]", 1),
+        "publish takes native trees": release.replace("          name: release-assets\n          path: release-assets\n      - name: Create GitHub Release", "          pattern: native-*\n          path: release-assets\n      - name: Create GitHub Release", 1),
+        "build ahead of the gate": release.replace("  package-macos:\n    needs: meta", "  package-macos:\n    needs: []", 1),
+        "build skipped": release.replace("      - name: Build native package\n        run: tools/package-macos.sh", "      - name: Build native package\n        if: false\n        run: tools/package-macos.sh", 1),
+        "build tolerated": release.replace("      - name: Build Linux package\n", "      - name: Build Linux package\n        continue-on-error: true\n", 1),
+        "assemble ignores a platform": release.replace("[meta, package-linux, package-macos, package-windows]", "[meta, package-linux, package-macos]", 1),
+        "unpinned action": release.replace("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "actions/checkout@v6", 1),
+        "no timeout": release.replace("    timeout-minutes: 10\n", "", 1),
+        "always() on a build step": release.replace("      - name: Check Linux package\n", "      - name: Check Linux package\n        if: always()\n", 1),
+        "release created outside publish": release.replace("      - name: Assemble the release\n", "      - name: Assemble the release\n        run: gh release create x\n", 1),
     }
-    assert condition(local_condition, values) and condition(host_condition, values)
-    for refused in ("failure", "cancelled"):
-        assert not condition(host_condition, values | {"needs.build-local-artifacts.result": refused})
-        assert not condition(host_condition, values | {"needs.build-global-artifacts.result": refused})
-        assert not condition(host_condition, values | {"needs.plan.result": refused, "needs.build-local-artifacts.result": "skipped"})
-    assert condition(host_condition, values | {"needs.build-local-artifacts.result": "skipped"})
-    assert not condition(local_condition, values | {"fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": False})
-    assert not condition(host_condition, values | {"needs.plan.outputs.publishing": "false"})
-    assert "- host" in announce and "if: ${{ always() && needs.host.result == 'success' }}" in announce
-    assert "if: ${{ needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' }}" in custom
-    def states(publishing: bool, pr_mode: str, native_result: str = "success", collector_result: str = "success") -> tuple[str, str, str, str]:
-        values = {"always()": True, "fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null": True, "fromJson(needs.plan.outputs.val).ci.github.pr_run_mode": pr_mode, "needs.plan.outputs.publishing": "true" if publishing else "false", "needs.plan.result": "success"}
-        local_result = "success" if condition(local_condition, values) else "skipped"
-        custom_result = native_result if condition(custom_condition, values) else "skipped"
-        results = {"plan": "success", "build-local-artifacts": local_result, "custom-package-native": custom_result}
-        global_result = collector_result if all(results[name] == "success" for name in needs(global_job)) else "skipped"
-        results["build-global-artifacts"] = global_result
-        values |= {f"needs.{name}.result": result for name, result in results.items()}
-        host_result = "success" if condition(host_condition, values) else "skipped"
-        values["needs.host.result"] = host_result
-        return custom_result, global_result, host_result, "success" if condition(announce_condition, values) else "skipped"
-    assert states(False, "upload") == ("success", "success", "skipped", "skipped")
-    assert states(True, "skip") == ("success", "success", "success", "success")
-    assert states(True, "skip", "failure") == ("failure", "skipped", "skipped", "skipped")
-    assert states(True, "skip", "cancelled") == ("cancelled", "skipped", "skipped", "skipped")
-    assert states(True, "skip", "success", "failure") == ("success", "failure", "skipped", "skipped")
+    for name, mutated in refused.items():
+        assert mutated != release, f"mutation did not apply: {name}"
+        assert not valid_release(mutated), f"accepted: {name}"
 
 
 def native_identity() -> str:
@@ -663,20 +625,6 @@ def native_boundaries() -> None:
     call(["bash", "-n", str(ROOT / "tools/package-macos.sh"), str(ROOT / "tools/check-package-macos.sh")])
     call(["bash", str(ROOT / "tools/package-macos.sh"), "--output", "/tmp/outside-native-packages"], False)
     call(["python3", "-c", "import pathlib; compile(pathlib.Path(__import__('sys').argv[1]).read_text(), __import__('sys').argv[1], 'exec')", str(NATIVE_COLLECTOR)])
-    old_plan = os.environ.get("DIST_PLAN")
-    required = [f"FocusForge-{collector.version()}-x86_64-unknown-linux-gnu-symbols.tar.gz", f"FocusForge-{collector.version()}-aarch64.dmg", f"FocusForge-{collector.version()}-x86_64.msi", f"FocusForge-{collector.version()}-aarch64-apple-darwin-symbols.tar.gz", f"FocusForge-{collector.version()}-x86_64-pc-windows-msvc-symbols.tar.gz", "native-artifacts.sha256", "native-artifacts.json"]
-    plan = {"releases": [{"app_name": name, "app_version": collector.version(), "artifacts": [*(f"{name}-{target}.zip" for target in collector.TARGETS), *required]} for name in sorted(collector.PACKAGES)]}
-    os.environ["DIST_PLAN"] = json.dumps(plan)
-    try:
-        collector.check_plan()
-        plan["releases"][0]["artifacts"].append(f"{plan['releases'][0]['app_name']}-aarch64-pc-windows-msvc.zip")
-        os.environ["DIST_PLAN"] = json.dumps(plan)
-        try: collector.check_plan()
-        except ValueError: pass
-        else: raise AssertionError("additional target accepted")
-    finally:
-        if old_plan is None: os.environ.pop("DIST_PLAN", None)
-        else: os.environ["DIST_PLAN"] = old_plan
     with tempfile.TemporaryDirectory() as temp:
         directory = Path(temp)
         native, output = directory / "native", directory / "output"
@@ -1795,52 +1743,44 @@ def smoke_callers() -> None:
     linux = (ROOT / "tools/check-package-linux.sh").read_text()
     macos = (ROOT / "tools/check-package-macos.sh").read_text()
     windows = (ROOT / "tools/check-package-windows.ps1").read_text()
-    native = NATIVE_WORKFLOW.read_text()
     release = (ROOT / ".github/workflows/release.yml").read_text()
+    jobs = workflow_jobs(release)
     assert linux.count("tools/smoke-release.sh") == 2
     assert '"$tree/bin/focusforge-cli"' in linux and '"/usr/bin/focusforge-cli"' in linux
     assert 'tools/smoke-release.sh" "$app/Contents/MacOS/focusforge-cli"' in macos
     assert "cygpath -u \"$1\"" in windows and "cygpath -u \"$2\"" in windows and "cygpath -u \"$3\"" in windows
     assert "if ($LASTEXITCODE -ne 0) { throw 'installed CLI smoke failed' }" in windows
-    assert native.count("- name: Check native package") == 2
-    assert "uses: ./.github/workflows/package-native.yml" in release
-    global_start = release.index("\n  build-global-artifacts:")
-    global_job = release[global_start:release.index("\n  host:", global_start)]
-    local_job = release[release.index("\n  build-local-artifacts:"):global_start]
-    assert "check-package-linux" not in local_job and "package-smoke-receipts-linux" not in local_job
-    build = global_job.index('"--artifacts=global"')
-    post_build = global_job.index("- name: \"Upload artifacts\"", build)
-    linux_check = global_job.index("- name: Check Linux package", build)
-    check_step = global_job[linux_check:post_build]
-    assert build < linux_check < post_build
-    assert "if:" not in check_step.split("- name: Upload package smoke receipts")[0]
-    assert "tools/check-package-linux.sh .scratch/package-linux" in check_step
-    assert "|| true" not in check_step and "continue-on-error" not in check_step
+    for name, builder, checker in (("package-linux", "tools/package-linux.sh", "tools/check-package-linux.sh .scratch/package-linux"), ("package-macos", "tools/package-macos.sh", "tools/check-package-macos.sh"), ("package-windows", "tools/package-windows.ps1", "tools/check-package-windows.ps1")):
+        steps = job_steps(jobs[name])
+        built = [index for index, step in enumerate(steps) if re.search(rf"run: {re.escape(builder)}\b", step)]
+        checked = [index for index, step in enumerate(steps) if re.search(rf"run: {re.escape(checker)}\b", step)]
+        assert len(built) == 1 and len(checked) == 1 and built[0] < checked[0], name
+        assert "if:" not in steps[checked[0]] and "|| true" not in steps[checked[0]] and "continue-on-error" not in steps[checked[0]]
     upload = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
     receipt_specs = (
-        (native, "tools/check-package-macos.sh", "- name: Upload native artifacts", "package-smoke-receipts-macos", (".scratch/check-package-macos.*/smoke",), True),
-        (native, "tools/check-package-windows.ps1", "- name: Upload native artifacts", "package-smoke-receipts-windows", (".scratch/check-package-windows/*/smoke",), True),
-        (global_job, "tools/check-package-linux.sh .scratch/package-linux", "- name: \"Upload artifacts\"", "package-smoke-receipts-linux-x86_64-unknown-linux-gnu", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
+        (jobs["package-macos"], "tools/check-package-macos.sh", "package-smoke-receipts-macos", (".scratch/check-package-macos.*/smoke",), True),
+        (jobs["package-windows"], "tools/check-package-windows.ps1", "package-smoke-receipts-windows", (".scratch/check-package-windows/*/smoke",), True),
+        (jobs["package-linux"], "tools/check-package-linux.sh .scratch/package-linux", "package-smoke-receipts-linux", (".scratch/package-linux/check/result/appimage/smoke", ".scratch/package-linux/check/result/deb-smoke"), False),
     )
-    for source, checker, handoff, name, roots, launch in receipt_specs:
+    for source, checker, name, roots, launch in receipt_specs:
         checked = source.index(checker)
         step = source.index("- name: Upload package smoke receipts", checked)
-        end = source.index(handoff, step)
-        block = source[step:end]
-        assert checked < step < end and f"name: {name}" in block and upload in block
-        assert "always()" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
+        end = source.find("\n      - ", step)
+        block = source[step:len(source) if end < 0 else end]
+        assert checked < step and f"name: {name}" in block and upload in block
+        assert "if: always()" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
         assert "continue-on-error" not in block and "|| true" not in block
         suffixes = ("commands.log", "exit-status", "installed-cli.sha256", "source-os", "logs/*.stdout", "logs/*.stderr", "logs/*.exit")
         paths = {line.strip() for line in block.split("path: |\n", 1)[1].split("          include-hidden-files: true", 1)[0].splitlines() if line.strip()}
         expected_paths = {f"{root}/{suffix}" for root in roots for suffix in suffixes}
         if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
         assert paths == expected_paths
-        assert "artifacts-" not in name
     diagnostics_path = ".scratch/package-macos-diagnostics/"
-    producer = native.index("tools/package-macos.sh --output")
-    check = native.index("tools/check-package-macos.sh", producer)
-    step = native.index("- name: Upload package build diagnostics", producer)
-    block = native[step:native.index("      - name:", step + 1)]
+    macos_job = jobs["package-macos"]
+    producer = macos_job.index("tools/package-macos.sh --output")
+    check = macos_job.index("tools/check-package-macos.sh", producer)
+    step = macos_job.index("- name: Upload package build diagnostics", producer)
+    block = macos_job[step:macos_job.index("      - name:", step + 1)]
     assert producer < step < check and "if: always()" in block and upload in block
     assert "name: package-build-diagnostics-macos" in block and "include-hidden-files: true" in block and "if-no-files-found: warn" in block
     assert "continue-on-error" not in block and "|| true" not in block
@@ -1849,4 +1789,4 @@ def smoke_callers() -> None:
 
 
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
