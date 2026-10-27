@@ -105,6 +105,28 @@ def approved(runs: dict, jobs: dict, sha: str) -> bool:
                for group in expected.values())
 
 
+def retry_delay(error: OSError, attempt: int) -> float | None:
+    """Seconds to wait before retrying after `error`, or None when it is permanent.
+
+    Rate limits (403 with an exhausted quota or a Retry-After, 429), server errors
+    and network failures are transient; every other HTTP status is not.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        headers = error.headers or {}
+        retry_after, reset = headers.get("Retry-After"), headers.get("X-RateLimit-Reset")
+        limited = error.code == 429 or (error.code == 403 and (headers.get("X-RateLimit-Remaining") == "0" or retry_after))
+        if not (limited or error.code >= 500):
+            return None
+        try:
+            if retry_after:
+                return max(1.0, float(retry_after))
+            if reset and limited:
+                return max(1.0, float(reset) - time.time() + 1)
+        except ValueError:
+            pass
+    return min(90.0, 5.0 * 2 ** attempt)
+
+
 def request_pages(url: str, deadline: float, use_token: bool) -> dict:
     pages = []
     seen = set()
@@ -113,25 +135,35 @@ def request_pages(url: str, deadline: float, use_token: bool) -> dict:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "https" or parsed.netloc != "api.github.com" or url in seen:
             raise ValueError("invalid pagination link")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ValueError("release gate timed out")
         seen.add(url)
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")) if use_token else None
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=min(20, remaining)) as response:
-            page = json.load(response)
-            if not isinstance(page, dict) or not isinstance(page.get("total_count"), int) or isinstance(page.get("total_count"), bool):
-                raise ValueError("malformed pagination response")
-            if total_count is None:
-                total_count = page["total_count"]
-            elif total_count != page["total_count"]:
-                raise ValueError("inconsistent pagination count")
-            pages.append(page)
-            links = response.headers.get("Link", "")
+        attempt, last_error = 0, None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("release gate timed out" + (f" waiting out: {last_error}" if last_error else ""))
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=min(20, remaining)) as response:
+                    page = json.load(response)
+                    links = response.headers.get("Link", "")
+            except OSError as error:
+                delay = retry_delay(error, attempt)
+                if delay is None:
+                    raise
+                attempt, last_error = attempt + 1, error
+                time.sleep(min(delay, max(0, deadline - time.monotonic())))
+                continue
+            break
+        if not isinstance(page, dict) or not isinstance(page.get("total_count"), int) or isinstance(page.get("total_count"), bool):
+            raise ValueError("malformed pagination response")
+        if total_count is None:
+            total_count = page["total_count"]
+        elif total_count != page["total_count"]:
+            raise ValueError("inconsistent pagination count")
+        pages.append(page)
         url = next((part.split(";", 1)[0].strip(" <>") for part in links.split(",") if 'rel="next"' in part), "")
     return {"pages": pages, "total_count": total_count}
 
@@ -151,7 +183,7 @@ def remote(repository: str, sha: str, wait_seconds: int, use_token: bool) -> tup
             jobs["head_sha"] = sha
             jobs["run_attempt"] = run["run_attempt"]
             return runs, jobs
-        # Anonymous REST reads allow 60 requests per hour.
+        # A 90 s cadence stays far below the 60 requests per hour of an anonymous read.
         time.sleep(min(90, max(0, deadline - time.monotonic())))
 
 
