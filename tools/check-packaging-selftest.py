@@ -409,9 +409,9 @@ def gate_checks() -> None:
     gate.urllib.request.urlopen = fake
     try:
         assert gate.request_pages("https://api.github.com/runs", 1e20, False)["pages"][1]["workflow_runs"]
-        gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(urllib.error.URLError("offline"))
+        gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None))
         try: gate.request_pages("https://api.github.com/runs", 1e20, False)
-        except urllib.error.URLError: pass
+        except urllib.error.HTTPError: pass
         else: raise AssertionError("API failure accepted")
         try: gate.request_pages("https://api.github.com/runs", 0, False)
         except ValueError: pass
@@ -452,6 +452,49 @@ def gate_checks() -> None:
         gate.remote = original_remote
 
 
+def gate_retry_cases() -> None:
+    url = "https://api.github.com/runs"
+    page = {"total_count": 0, "workflow_runs": []}
+    class Reply(io.BytesIO):
+        headers = {"Link": ""}
+        def __enter__(self) -> "Reply": return self
+        def __exit__(self, *args: object) -> None: self.close()
+    def failure(code: int, **headers: str) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError(url, code, "stub", headers, None)
+    def run(*outcomes: Exception, limit: float = 1e6) -> tuple[object, list[float], int]:
+        script, sleeps, clock = list(outcomes), [], [0.0]
+        def urlopen(request: object, timeout: float) -> Reply:
+            if script:
+                raise script.pop(0)
+            return Reply(json.dumps(page).encode())
+        def pause(seconds: float) -> None: sleeps.append(seconds); clock[0] += seconds
+        saved = gate.urllib.request.urlopen, gate.time.sleep, gate.time.monotonic, gate.time.time
+        gate.urllib.request.urlopen, gate.time.sleep, gate.time.monotonic, gate.time.time = urlopen, pause, lambda: clock[0], lambda: 1000.0
+        try:
+            try: result: object = gate.request_pages(url, limit, True)
+            except (ValueError, urllib.error.HTTPError) as error: result = error
+        finally:
+            gate.urllib.request.urlopen, gate.time.sleep, gate.time.monotonic, gate.time.time = saved
+        return result, sleeps, len(script)
+    result, sleeps, _ = run(failure(403, **{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1030"}))
+    assert result == {"pages": [page], "total_count": 0} and sleeps == [31.0], (result, sleeps)
+    result, sleeps, _ = run(failure(403, **{"Retry-After": "7"}))
+    assert isinstance(result, dict) and sleeps == [7.0]
+    result, sleeps, _ = run(failure(429))
+    assert isinstance(result, dict) and sleeps == [5.0]
+    result, sleeps, _ = run(failure(502), urllib.error.URLError("offline"), TimeoutError("slow"))
+    assert isinstance(result, dict) and sleeps == [5.0, 10.0, 20.0]
+    for permanent in (failure(403), failure(403, **{"X-RateLimit-Remaining": "12"}), failure(404), failure(401)):
+        result, sleeps, left = run(permanent, failure(429))
+        assert isinstance(result, urllib.error.HTTPError) and result.code == permanent.code and not sleeps and left == 1
+    result, sleeps, _ = run(*[failure(403, **{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "99999"})] * 5, limit=200)
+    assert isinstance(result, ValueError) and "HTTP Error 403" in str(result) and "timed out" in str(result) and sum(sleeps) == 200, (result, sleeps)
+    saved_main, saved_open = gate.main, gate.urllib.request.urlopen
+    gate.urllib.request.urlopen = lambda request, timeout: (_ for _ in ()).throw(failure(401))
+    try: assert saved_main(["--sha", "a" * 40, "--repository", "owner/repo"]) == 2
+    finally: gate.urllib.request.urlopen = saved_open
+
+
 def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
     try:
         dist = tomllib.loads(config)
@@ -466,9 +509,10 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
     linux = next((item for item in extras if item.get("build") == ["tools/package-linux.sh"]), None)
     native_extra = next((item for item in extras if item.get("build") == ["python3", "tools/collect-native-artifacts.py"]), None)
     if not linux or not native_extra or len(native_extra.get("artifacts", [])) != 6: return False
-    checker = "python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
+    checker = "python3 tools/check-release-gate.py --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\""
+    token = "GH_TOKEN: ${{ github.token }}"
     step = setup[setup.find("- name: Require exact check run"):setup.find("- name: Require locked release Cargo profile")]
-    if checker not in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
+    if checker not in step or token not in step or "--anonymous" in step or "if: github.event_name != 'pull_request'" not in step or "continue-on-error" in step or "|| true" in step: return False
     if "plan-gate" in release: return False
     local, global_build, host = release.find("build-local-artifacts:"), release.find("build-global-artifacts:"), release.find("\n  host:")
     local_part = release[local:global_build]; global_part = release[global_build:host]; host_part = release[host:release.find("\n  announce:", host)]
@@ -476,6 +520,7 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
     pinned_actions = [action for action in re.findall(r"uses:\s*['\"]?([^\s'\"]+)", release) if "@" in action]
     condition = "if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null &&"
     generated_step = local_part[local_part.find("Require exact check run"):local_part.find("Require locked release Cargo profile")]
+    if token not in generated_step or "--anonymous" in generated_step: return False
     run_line = next((line.strip().split(": ", 1)[1] for line in generated_step.splitlines() if line.strip().startswith("run: ")), "")
     try: generated_command = json.loads(run_line)
     except json.JSONDecodeError: return False
@@ -486,7 +531,7 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
     native_jobs = {name: native_job(name) for name in ("macos", "windows")}
     producer = {"macos": r"tools/package-macos\.sh(?:\s+--output\s+target/distrib/native/macos)?", "windows": r"tools/package-windows\.ps1(?:\s+-OutputDirectory\s+target/distrib/native/windows)?"}
     def guarded_job(job: str, command: str) -> bool:
-        guard = re.search(r"- name: Require exact check run\n\s+if: github\.event_name != 'pull_request'\n\s+shell: \w+\n\s+run: GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate\.py --anonymous --sha \"\$GITHUB_SHA\" --repository \"\$GITHUB_REPOSITORY\"", job)
+        guard = re.search(r"- name: Require exact check run\n\s+if: github\.event_name != 'pull_request'\n\s+shell: \w+\n\s+env:\n\s+GH_TOKEN: \$\{\{ github\.token \}\}\n\s+run: python3 tools/check-release-gate\.py --sha \"\$GITHUB_SHA\" --repository \"\$GITHUB_REPOSITORY\"", job)
         header = job[:job.find("    steps:")]
         runs = list(re.finditer(rf"^\s+run:\s*{command}\s*$", job, re.MULTILINE))
         if "if:" in header or "needs:" in header or guard is None or len(runs) != 1 or guard.start() > runs[0].start(): return False
@@ -505,7 +550,7 @@ def valid_graph(config: str, setup: str, release: str, native: str) -> bool:
     if len(native_raw) != 2 or not host_patterns or len(native_uploads) != native.count("actions/upload-artifact@"): return False
     if any(fnmatch.fnmatchcase(name, pattern) for name in native_uploads for pattern in host_patterns): return False
     if not all(any(fnmatch.fnmatchcase(name, pattern) for pattern in global_patterns) for name in native_raw): return False
-    return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == "GH_TOKEN= GITHUB_TOKEN= " + checker and re.search(r"if: ['\"]github\.event_name != 'pull_request'['\"]", generated_step) is not None and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- custom-package-native" in global_part and "- build-local-artifacts" in host_part and "- custom-package-native" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and "needs.custom-package-native.result == 'success'" in host_part and "needs.custom-package-native.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and "uses: ./.github/workflows/package-native.yml" in release and len(native_jobs) == 2 and guarded and native.count("if: github.event_name != 'pull_request'") == 2 and native.count("GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous --sha \"$GITHUB_SHA\" --repository \"$GITHUB_REPOSITORY\"") == 2 and "continue-on-error" not in native and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions + native_actions)
+    return min(local, global_build, host, local_part.find("Require exact check run"), local_part.find("dist build")) >= 0 and local_part.find("Require exact check run") < local_part.find("dist build") and generated_command == checker and re.search(r"if: ['\"]github\.event_name != 'pull_request'['\"]", generated_step) is not None and "continue-on-error" not in generated_step and "|| true" not in generated_step and "- custom-package-native" in global_part and "- build-local-artifacts" in host_part and "- custom-package-native" in host_part and "needs.build-local-artifacts.result == 'success'" in host_part and "needs.build-local-artifacts.result == 'skipped'" in host_part and "needs.custom-package-native.result == 'success'" in host_part and "needs.custom-package-native.result == 'skipped'" in host_part and matrix in local_part and condition in local_part and "uses: ./.github/workflows/package-native.yml" in release and len(native_jobs) == 2 and guarded and native.count("if: github.event_name != 'pull_request'") == 2 and native.count(checker) == 2 and native.count(token) == 2 and "--anonymous" not in native and "continue-on-error" not in native and all(re.fullmatch(r"[A-Za-z0-9_./-]+@[0-9a-f]{40}", action) for action in pinned_actions + native_actions)
 
 
 def graph() -> None:
@@ -515,7 +560,13 @@ def graph() -> None:
     assert not valid_graph(config.replace('packages = ["focusforge-cli", "focusforge-gui"]', "packages = []"), setup, release, native)
     assert not valid_graph(config, setup.replace("if: github.event_name != 'pull_request'", "if: false", 1), release, native)
     assert not valid_graph(config, setup.replace('- name: Require exact check run', '- name: Require exact check run\n  continue-on-error: true'), release, native)
-    assert not valid_graph(config, setup.replace(checker := 'python3 tools/check-release-gate.py --anonymous --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"', checker + ' || true'), release, native)
+    assert not valid_graph(config, setup.replace(checker := 'python3 tools/check-release-gate.py --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"', checker + ' || true'), release, native)
+    assert not valid_graph(config, setup.replace('python3 tools/check-release-gate.py', 'GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous', 1), release, native)
+    assert not valid_graph(config, setup.replace("    GH_TOKEN: ${{ github.token }}\n", "", 1), release, native)
+    assert not valid_graph(config, setup, release.replace('        shell: "bash"\n        env:\n          GH_TOKEN: ${{ github.token }}\n', '        shell: "bash"\n', 1), native)
+    assert not valid_graph(config, setup, release.replace('run: "python3 tools/check-release-gate.py', 'run: "GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous', 1), native)
+    assert not valid_graph(config, setup, release, native.replace('python3 tools/check-release-gate.py', 'GH_TOKEN= GITHUB_TOKEN= python3 tools/check-release-gate.py --anonymous', 1))
+    assert not valid_graph(config, setup, release, native.replace("          GH_TOKEN: ${{ github.token }}\n", "", 1))
     assert not valid_graph(config, setup, release.replace('Require exact check run', 'masked check run', 1), native)
     assert not valid_graph(config, setup, release.replace('- name: "Require exact check run"', '- name: "Require exact check run"\n        continue-on-error: true', 1), native)
     generated_run = next(line for line in release.splitlines() if 'tools/check-release-gate.py' in line)
@@ -1849,4 +1900,4 @@ def smoke_callers() -> None:
 
 
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
