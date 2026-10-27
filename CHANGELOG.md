@@ -6,6 +6,8 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-27
+
 ### Added
 
 - Focus stacking for TIFF and supported RAW frame sequences, with alignment,
