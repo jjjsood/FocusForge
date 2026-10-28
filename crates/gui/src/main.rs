@@ -1711,6 +1711,22 @@ fn install_save_folder(args: &Args) {
     }
 }
 
+/// A windowed Windows process starts without a console, so clap's help,
+/// version and error text would go nowhere. Attaching the starting terminal's
+/// console first lets it print there. Without a parent console (Explorer, the
+/// Start menu) the call fails and nothing opens; handles the parent already
+/// redirected are left alone.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: takes no pointers; the failure case is the one described above.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> ExitCode {
     // Before any thread or child process exists, so none inherits the tokens.
     let launch_tokens = take_launch_tokens();
@@ -1728,7 +1744,11 @@ fn main() -> ExitCode {
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");
 
-    let result = run(&Args::parse(), launch_tokens);
+    let args = Args::try_parse().unwrap_or_else(|error| {
+        attach_parent_console();
+        error.exit()
+    });
+    let result = run(&args, launch_tokens);
     focusforge_gui::bridge::finish_input_trace();
     result
 }

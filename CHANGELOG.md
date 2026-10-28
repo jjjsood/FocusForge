@@ -6,6 +6,11 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, `focusforge-gui --help`, `--version` and argument errors print to the
+  terminal that started the program.
+
 ## [0.1.0] - 2026-10-27
 
 ### Added
