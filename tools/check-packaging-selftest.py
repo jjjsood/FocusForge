@@ -1606,6 +1606,33 @@ def macos_producer_mock() -> None:
         assert list((output / "symbols/aarch64-apple-darwin").glob(f"FocusForge-{PRERELEASE}-aarch64-apple-darwin-symbols.tar.gz"))
 
 
+def linux_producer_fresh_root() -> None:
+    creator = 'mkdir -p "$root/.scratch"\n'
+    script = (ROOT / "tools/package-linux.sh").read_text()
+    def run(text: str) -> tuple[subprocess.CompletedProcess, Path, str]:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp); root, mock, log = base / "root", base / "mock", base / "docker.log"
+            (root / "tools").mkdir(parents=True); (root / "packaging").mkdir(); mock.mkdir()
+            shutil.copy(ROOT / "Cargo.toml", root / "Cargo.toml")
+            shutil.copy(ROOT / "packaging/linux-tools.toml", root / "packaging/linux-tools.toml")
+            (root / "tools/package-linux.sh").write_text(text)
+            (mock / "git").write_text("#!/usr/bin/env bash\ncase \"$*\" in *rev-parse*) echo 0123456789abcdef0123456789abcdef01234567;; *ls-files*) printf 'Cargo.toml\\0packaging/linux-tools.toml\\0';; *) exit 64;; esac\n")
+            (mock / "docker").write_text(f"#!/usr/bin/env bash\necho \"$*\" >> '{log}'\nexit 97\n")
+            for name in ("git", "docker"): (mock / name).chmod(0o755)
+            env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C"}
+            env.pop("FOCUSFORGE_PACKAGE_REUSE", None)
+            assert sorted(path.name for path in root.iterdir()) == ["Cargo.toml", "packaging", "tools"]
+            result = subprocess.run(["bash", str(root / "tools/package-linux.sh")], cwd=root, text=True, capture_output=True, env=env)
+            return result, root, log.read_text() if log.exists() else ""
+    result, root, docker = run(script)
+    assert result.returncode == 97 and "mktemp" not in result.stderr, (result.returncode, result.stderr)
+    assert docker.count("\n") == 1 and f"-v {root}:/src:ro" in docker, docker
+    mutated = script.replace(creator, "", 1)
+    assert mutated != script
+    result, _, docker = run(mutated)
+    assert result.returncode != 0 and "mktemp: failed to create file" in result.stderr and not docker, (result.returncode, result.stderr, docker)
+
+
 def windows_checker_mock() -> None:
     pwsh = shutil.which("pwsh")
     assert pwsh, "PowerShell is required for the Windows checker mock"
@@ -1789,4 +1816,4 @@ def smoke_callers() -> None:
 
 
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); linux_producer_fresh_root(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
