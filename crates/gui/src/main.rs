@@ -27,7 +27,7 @@ use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
 use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 
 #[derive(Parser)]
-#[command(name = "focusforge-gui")]
+#[command(name = "focusforge-gui", version)]
 struct Args {
     /// Exit this many milliseconds after the window is shown.
     #[arg(long)]
@@ -1993,6 +1993,18 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_flag_prints_the_binary_name_and_workspace_version() {
+        let error = Args::try_parse_from(["focusforge-gui", "--version"])
+            .err()
+            .expect("--version is a recognised flag that stops parsing");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let text = error.render().to_string();
+        assert!(text.starts_with("focusforge-gui "), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    }
 
     #[test]
     fn newer_setup_keeps_a_queued_older_teardown_stale() {
