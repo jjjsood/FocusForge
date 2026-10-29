@@ -8,7 +8,7 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ### Changed
 
-- Camera RAW stacks now fuse and align on unclipped 32-bit float samples and clip once, at the fused result, so highlights above the look's white point no longer clip before blending. (A RAW stack fused on the GPU backend still clips at the read.)
+- Camera RAW stacks now fuse and align on unclipped 32-bit float samples and clip once, at the fused result, so highlights above the look's white point no longer clip before blending.
 - RAW frames are decoded to the camera's linear colour and read through an invertible
   white-balance, colour-matrix and sRGB-curve transform, and brightness equalization of a
   RAW stack corrects exposure in linear light. A highlight that exceeds white after white

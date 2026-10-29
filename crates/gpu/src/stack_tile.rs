@@ -8,13 +8,33 @@
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::Transform;
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::tile::{Rect, SampleFormat, Tile};
 use focusforge_core::timing::{TimingCounter, gpu_tile_stage};
 
 use crate::device::SharedDevice;
-use crate::fuse::{FrameSource, FusionPipelines, fuse_planes_gpu, plane_from_packed};
-use crate::transfer::upload_tile;
+use crate::fuse::{
+    FrameSource, FusionPipelines, fuse_planes_gpu, plane_from_f32, plane_from_packed,
+};
+use crate::transfer::{upload_f32, upload_tile};
 use crate::warp::{WarpPipelines, warp_tile_dispatch};
+
+/// Reads `rect` of `frame_index` as `f32` and uploads it unchanged: an
+/// identity frame's base plane on the `f32` path.
+pub fn upload_frame_f32(
+    shared: &SharedDevice,
+    reader: &dyn TileReader,
+    frame_index: usize,
+    rect: Rect,
+    samples_per_pixel: u32,
+) -> Result<wgpu::Buffer, AlgorithmError> {
+    let mut samples =
+        vec![0f32; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
+    {
+        let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+        reader.read_tile_f32_into(frame_index, rect, &mut samples)?;
+    }
+    Ok(upload_f32(shared.device(), shared.queue(), &samples))
+}
 
 /// Drives the whole tile through both stages in one call. Takes no budget:
 /// the caller holds a `VramBudget` permit around it.
@@ -24,6 +44,11 @@ use crate::warp::{WarpPipelines, warp_tile_dispatch};
 /// already carries. An identity entry is the identical short-circuit "read
 /// `rect` directly" -- no dispatch, just an upload and a
 /// `plane_from_packed` join, exactly the same join a warped frame gets.
+///
+/// A reader whose `sample_format()` is `F32` is read and warped as `f32`:
+/// the uploaded or warped buffer is the frame's base plane itself, with no
+/// pack, no conversion kernel and no clamp; the fused tile is quantized to
+/// `u16` once, at the end of fusion.
 ///
 /// A warped frame with uncovered pixels hands its coverage mask to fusion,
 /// which excludes it where the Laplacian reach touches those pixels.
@@ -43,26 +68,39 @@ pub fn warp_fuse_tile_gpu(
     let queue = shared.queue();
     let frame_count = transforms.len();
 
+    let format = reader.sample_format();
     let mut source = |i: usize| -> Result<FrameSource, AlgorithmError> {
         let t = &transforms[i];
-        let (packed, covered) = if *t == Transform::identity() {
-            let mut samples =
-                vec![0u16; rect.width as usize * rect.height as usize * samples_per_pixel as usize];
-            {
-                let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
-                reader.read_tile_into(i, rect, &mut samples)?;
+        let (buffer, covered) = if *t == Transform::identity() {
+            match format {
+                SampleFormat::U16 => {
+                    let mut samples =
+                        vec![
+                            0u16;
+                            rect.width as usize * rect.height as usize * samples_per_pixel as usize
+                        ];
+                    {
+                        let _stage = gpu_tile_stage(TimingCounter::GpuTileReadNs);
+                        reader.read_tile_into(i, rect, &mut samples)?;
+                    }
+                    let tile = Tile {
+                        rect,
+                        samples_per_pixel,
+                        samples,
+                    };
+                    (upload_tile(device, queue, &tile), None)
+                }
+                SampleFormat::F32 => (
+                    upload_frame_f32(shared, reader, i, rect, samples_per_pixel)?,
+                    None,
+                ),
             }
-            let tile = Tile {
-                rect,
-                samples_per_pixel,
-                samples,
-            };
-            (upload_tile(device, queue, &tile), None)
         } else {
             let (buffer, covered) = warp_tile_dispatch(
                 shared,
                 warp_pipelines,
                 reader,
+                format,
                 i,
                 frame,
                 samples_per_pixel,
@@ -75,15 +113,18 @@ pub fn warp_fuse_tile_gpu(
             })?;
             (buffer, covered.contains(&false).then_some(covered))
         };
-        let plane = plane_from_packed(
-            device,
-            queue,
-            fuse_pipelines,
-            &packed,
-            rect.width,
-            rect.height,
-            samples_per_pixel,
-        );
+        let plane = match format {
+            SampleFormat::U16 => plane_from_packed(
+                device,
+                queue,
+                fuse_pipelines,
+                &buffer,
+                rect.width,
+                rect.height,
+                samples_per_pixel,
+            ),
+            SampleFormat::F32 => plane_from_f32(buffer, rect.width, rect.height, samples_per_pixel),
+        };
         Ok((plane, covered))
     };
 

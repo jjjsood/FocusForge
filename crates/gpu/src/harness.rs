@@ -15,7 +15,7 @@ use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{
     AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
 };
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::tile::{Rect, SampleFormat, Tile};
 
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
@@ -190,8 +190,16 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
         transforms: &[Transform],
+        sample_format: SampleFormat,
     ) -> Option<String> {
-        let (bytes, _) = tile_bytes(width, height, samples_per_pixel, levels, transforms);
+        let (bytes, _) = tile_bytes(
+            width,
+            height,
+            samples_per_pixel,
+            levels,
+            transforms,
+            sample_format,
+        );
         tile_shortfall_message(width, height, bytes, self.device_budget.bytes())
     }
 
@@ -320,6 +328,7 @@ impl TileBackend for GpuBackend {
             samples_per_pixel,
             levels,
             transforms,
+            reader.sample_format(),
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
@@ -380,10 +389,18 @@ fn tile_bytes(
     samples_per_pixel: u32,
     levels: u32,
     transforms: &[Transform],
+    sample_format: SampleFormat,
 ) -> (u64, bool) {
     let warped = transforms.iter().any(|t| *t != Transform::identity());
     (
-        device_bytes_per_tile(width, height, samples_per_pixel, levels, warped),
+        device_bytes_per_tile(
+            width,
+            height,
+            samples_per_pixel,
+            levels,
+            warped,
+            sample_format,
+        ),
         warped,
     )
 }

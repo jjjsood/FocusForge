@@ -368,6 +368,18 @@ pub(crate) fn plane_from_packed(
     }
 }
 
+/// Wraps an already-resident `f32` buffer of `width * height * spp` samples
+/// on the 16-bit scale as a [`GpuPlane`]: the `f32` path's join, with no
+/// pack and no conversion kernel.
+pub(crate) fn plane_from_f32(buffer: wgpu::Buffer, width: u32, height: u32, spp: u32) -> GpuPlane {
+    GpuPlane {
+        buffer,
+        width,
+        height,
+        spp,
+    }
+}
+
 /// Uploads `tile`'s samples through the packed-`u32` transport plus
 /// [`plane_from_packed`] -- the only place `u16` samples cross the bus in
 /// this module for a tile that has not already been dispatched on the GPU

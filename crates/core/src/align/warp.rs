@@ -317,7 +317,7 @@ pub fn warp_tile(
 
 /// [`warp_tile`] reading and warping in sample type `S`: the warped samples
 /// and the per-pixel coverage.
-pub(crate) fn warp_tile_samples<S: Sample>(
+pub fn warp_tile_samples<S: Sample>(
     reader: &dyn TileReader,
     frame_index: usize,
     frame: (u32, u32),

@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
 use crate::align::warp::WarpedTile;
 use crate::align::{AlignError, Transform};
-use crate::tile::{Rect, Tile};
+use crate::tile::{Rect, SampleFormat, Tile};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
 /// `String`s, so no `wgpu` type crosses into `crates/core`. `crates/gpu`
@@ -65,8 +65,8 @@ pub trait TileBackend: Send + Sync {
     }
 
     /// Why one `width` x `height` tile at `samples_per_pixel`, pyramid depth
-    /// `levels` and `transforms` (the shape [`Self::warp_fuse_tile`] takes)
-    /// cannot run on this backend's device, as a message naming the host
+    /// `levels`, `transforms` and the reader's `sample_format` (the shape
+    /// [`Self::warp_fuse_tile`] takes) cannot run on this backend's device, as a message naming the host
     /// path the run continues on; `None` when it fits. A caller that gets
     /// `Some` fuses on the host instead of calling this backend. Defaults to
     /// `None`, for a backend with no budget of its own.
@@ -77,6 +77,7 @@ pub trait TileBackend: Send + Sync {
         _samples_per_pixel: u32,
         _levels: u32,
         _transforms: &[Transform],
+        _sample_format: SampleFormat,
     ) -> Option<String> {
         None
     }

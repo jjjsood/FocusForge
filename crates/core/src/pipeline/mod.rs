@@ -650,6 +650,7 @@ pub fn run(
             spp,
             support.decimation_levels,
             &transforms,
+            gain_reader.sample_format(),
         )
     });
     if let Some(message) = &gpu_fallback {
