@@ -342,7 +342,17 @@ impl RawStack {
             cache.bytes -= evicted;
         }
         drop(cache);
-        let decoded = Arc::new(develop(&frame.metadata.path)?);
+        // The decoder runs its own rayon loops. On a pool worker, waiting for
+        // them could pick up another reader's job, which blocks on the decode
+        // lock this call holds; a plain thread waits on the global pool without
+        // taking any work.
+        let developed = std::thread::scope(|scope| {
+            scope
+                .spawn(|| develop(&frame.metadata.path))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })?;
+        let decoded = Arc::new(developed);
         if (decoded.width, decoded.height) != (frame.desc.width, frame.desc.height) {
             return Err(RawError::GeometryChanged {
                 path: frame.metadata.path.clone(),

@@ -194,10 +194,14 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         bytes.extend_from_slice(&payload);
     }
 
-    let mut file = Builder::new()
-        .suffix(".dng")
-        .tempfile()
-        .expect("temporary DNG");
+    let mut builder = Builder::new();
+    builder.suffix(".dng");
+    // Only integration tests get a target tmp directory; unit tests fall back to the system one.
+    let mut file = match option_env!("CARGO_TARGET_TMPDIR") {
+        Some(dir) => builder.tempfile_in(dir),
+        None => builder.tempfile(),
+    }
+    .expect("temporary DNG");
     file.write_all(&bytes).expect("write DNG");
     file.flush().expect("flush DNG");
     file.as_file_mut()

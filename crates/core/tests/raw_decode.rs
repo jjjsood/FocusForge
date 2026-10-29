@@ -1151,3 +1151,64 @@ fn matrix_delta(left: &[f32], right: &[f32]) -> f32 {
         .map(|(left, right)| (left - right).abs())
         .fold(0.0, f32::max)
 }
+
+/// A frame decode runs the decoder's own parallel loops while it holds the
+/// decode lock. A second read reaching the pool at any point of that decode
+/// must not end up running on a worker the decode waits for.
+#[test]
+fn a_pool_read_arriving_during_a_decode_finishes() {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    const SIDE: u32 = 512;
+    let mut spec = DngSpec::new(
+        12,
+        64,
+        4095,
+        [0, 1, 1, 2],
+        vec![512; (SIDE * SIDE) as usize],
+    );
+    spec.width = SIDE;
+    spec.height = SIDE;
+    let dng = write_dng(&spec, false);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: 1,
+    };
+    for arrival_ms in (0..120).step_by(2) {
+        let reader = Arc::new(
+            RawStack::open_files(&[PathBuf::from(dng.path()), PathBuf::from(dng.path())])
+                .expect("DNG pair opens"),
+        );
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("test pool"),
+        );
+        let (done, finished) = mpsc::channel();
+        let read = move |reader: Arc<RawStack>, frame: usize, done: mpsc::Sender<()>| {
+            reader
+                .read_tile_into(frame, rect, &mut vec![0; SIDE as usize * 3])
+                .expect("frame develops");
+            let _ = done.send(());
+        };
+        {
+            let (reader, pool, done) = (Arc::clone(&reader), Arc::clone(&pool), done.clone());
+            std::thread::spawn(move || pool.install(|| read(reader, 0, done)));
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(arrival_ms));
+            pool.spawn(move || read(reader, 1, done));
+        });
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| {
+                    panic!("a read arriving {arrival_ms} ms into a decode never finishes")
+                });
+        }
+    }
+}
