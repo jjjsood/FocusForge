@@ -20,6 +20,30 @@ use focusforge_core::project::Project;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
+/// Set once a write to stdout finds its reader gone.
+#[cfg(not(test))]
+static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shadows std's `println!` in every module below. Once stdout's reader has
+/// gone away, this and every later call drops its output, so the command
+/// runs on to its own exit status; any other write error panics as std's
+/// does.
+#[cfg(not(test))]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        if !$crate::STDOUT_CLOSED.load(Relaxed) {
+            if let Err(err) = writeln!(std::io::stdout().lock(), $($arg)*) {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    panic!("failed printing to stdout: {err}");
+                }
+                $crate::STDOUT_CLOSED.store(true, Relaxed);
+            }
+        }
+    }};
+}
+
 mod algorithms;
 mod align;
 mod diagnostics;
