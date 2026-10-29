@@ -482,14 +482,14 @@ fn decoded_frames_stay_within_budget() {
     let one_frame_budget =
         8 * 8 * 30 + std::fs::metadata(full.path()).expect("full DNG size").len();
     let recovered = RawStack::open_files_with_budget(
-        &[PathBuf::from(withheld.path()), PathBuf::from(full.path())],
+        &[PathBuf::from(full.path()), PathBuf::from(withheld.path())],
         one_frame_budget,
     )
     .expect("both headers open without decode");
     assert!(
         recovered
             .read_tile_into(
-                0,
+                1,
                 Rect {
                     x: 0,
                     y: 0,
@@ -502,7 +502,7 @@ fn decoded_frames_stay_within_budget() {
     );
     recovered
         .read_tile_into(
-            1,
+            0,
             Rect {
                 x: 0,
                 y: 0,
@@ -1210,5 +1210,268 @@ fn a_pool_read_arriving_during_a_decode_finishes() {
                     panic!("a read arriving {arrival_ms} ms into a decode never finishes")
                 });
         }
+    }
+}
+
+/// As-shot multipliers `[2.0, 1.0, 1.6]`.
+const AS_SHOT_NEUTRAL: [f32; 3] = [0.5, 1.0, 0.625];
+const XYZ_TO_CAMERA: [f32; 9] = [0.72, -0.21, -0.08, -0.31, 1.12, 0.12, -0.02, 0.19, 0.55];
+
+fn tinted_spec(samples: Vec<u16>, width: u32, height: u32, cfa: [u8; 4]) -> DngSpec {
+    let mut spec = DngSpec::new(12, 64, 4095, cfa, samples);
+    spec.width = width;
+    spec.height = height;
+    spec.as_shot_neutral = Some(AS_SHOT_NEUTRAL);
+    spec.color_matrix = Some(XYZ_TO_CAMERA);
+    spec
+}
+
+fn tinted_look() -> focusforge_core::io::raw::LookTransform {
+    let matrix = [
+        [XYZ_TO_CAMERA[0], XYZ_TO_CAMERA[1], XYZ_TO_CAMERA[2]],
+        [XYZ_TO_CAMERA[3], XYZ_TO_CAMERA[4], XYZ_TO_CAMERA[5]],
+        [XYZ_TO_CAMERA[6], XYZ_TO_CAMERA[7], XYZ_TO_CAMERA[8]],
+    ];
+    focusforge_core::io::raw::LookTransform::new([2.0, 1.0, 1.6, f32::NAN], matrix)
+}
+
+fn quantize(value: f64) -> u16 {
+    (value.clamp(0.0, 1.0) * f64::from(u16::MAX) + 0.5) as u16
+}
+
+fn read_whole(reader: &RawStack) -> Vec<u16> {
+    let (width, height) = reader.dimensions();
+    let mut out = vec![0; width as usize * height as usize * 3];
+    reader
+        .read_tile_into(
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            &mut out,
+        )
+        .expect("frame develops");
+    out
+}
+
+/// A flat field's camera-linear value: its sample scaled between the black
+/// and white levels of [`tinted_spec`].
+fn flat_field(level: u16) -> (Vec<u16>, f64) {
+    (
+        vec![level; 64],
+        f64::from(level - 64) / f64::from(4095 - 64),
+    )
+}
+
+#[test]
+fn camera_space_flat_field_is_the_look_of_the_level_scaled_sample() {
+    let (samples, linear) = flat_field(900);
+    let dng = write_dng(&tinted_spec(samples, 8, 8, [0, 1, 1, 2]), false);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    let expected = tinted_look().forward([linear; 3]).map(quantize);
+    for pixel in read_whole(&reader).chunks_exact(3) {
+        for channel in 0..3 {
+            assert!(
+                pixel[channel].abs_diff(expected[channel]) <= 1,
+                "{pixel:?} against {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn camera_space_one_channel_over_white_leaves_the_others_alone() {
+    let (samples, linear) = flat_field(2600);
+    let dng = write_dng(&tinted_spec(samples, 8, 8, [0, 1, 1, 2]), false);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    let look = tinted_look().forward([linear; 3]);
+    assert!(look.iter().any(|v| *v > 1.0) && look.iter().any(|v| (0.1..0.9).contains(v)));
+    let expected = look.map(quantize);
+    for pixel in read_whole(&reader).chunks_exact(3) {
+        for channel in 0..3 {
+            assert!(
+                pixel[channel].abs_diff(expected[channel]) <= 1,
+                "{pixel:?} against {expected:?}"
+            );
+        }
+    }
+}
+
+fn rawler_default_read(path: &std::path::Path) -> (usize, usize, Vec<u16>) {
+    use rawler::imgop::develop::{Intermediate, RawDevelop};
+    let source = RawSource::new(path).expect("source opens");
+    let decoder = rawler::get_decoder(&source).expect("decoder");
+    let image = decoder
+        .raw_image(&source, &RawDecodeParams::default(), false)
+        .expect("raw image");
+    let Intermediate::ThreeColor(pixels) = RawDevelop::default()
+        .develop_intermediate(&image)
+        .expect("develops")
+    else {
+        panic!("three-colour development expected");
+    };
+    let (width, height) = (pixels.width, pixels.height);
+    let samples = pixels
+        .into_flatten()
+        .into_iter()
+        .map(|v| quantize(f64::from(v)))
+        .collect();
+    (width, height, samples)
+}
+
+fn assert_matches_rawler_where_unclipped(path: &std::path::Path) {
+    let (width, height, rawler) = rawler_default_read(path);
+    let reader = RawStack::open_files(&[path.to_path_buf()]).expect("RAW opens");
+    assert_eq!(reader.dimensions(), (width as u32, height as u32));
+    let ours = read_whole(&reader);
+    let (mut compared, mut worst) = (0_usize, 0_u16);
+    for (a, b) in ours.chunks_exact(3).zip(rawler.chunks_exact(3)) {
+        if a.iter().any(|v| *v == 0 || *v == u16::MAX) {
+            continue;
+        }
+        compared += 1;
+        for channel in 0..3 {
+            worst = worst.max(a[channel].abs_diff(b[channel]));
+        }
+    }
+    assert!(
+        compared * 2 > width * height,
+        "only {compared} pixels compared"
+    );
+    assert!(worst <= 2, "{} differs by {worst} LSB", path.display());
+}
+
+#[test]
+fn camera_space_matches_rawler_on_tinted_synthetic_dngs() {
+    for cfa in [[0, 1, 1, 2], [1, 0, 2, 1], [2, 1, 1, 0]] {
+        let samples = (0..512).map(|i| 64 + (i * 1400 / 511) as u16).collect();
+        let dng = write_dng(&tinted_spec(samples, 32, 16, cfa), false);
+        assert_matches_rawler_where_unclipped(dng.path());
+    }
+}
+
+/// Two flat frames one stop apart in camera-linear light, equalized to the
+/// shared target: the camera-linear value both must reach.
+fn equalized_pair() -> (Vec<tempfile::NamedTempFile>, f64) {
+    let (dark, dark_linear) = flat_field(64 + 400);
+    let (bright, bright_linear) = flat_field(64 + 800);
+    assert!((bright_linear / dark_linear - 2.0).abs() < 1e-12);
+    let files = [dark, bright]
+        .into_iter()
+        .map(|samples| write_dng(&tinted_spec(samples, 8, 8, [0, 1, 1, 2]), false))
+        .collect();
+    (files, (dark_linear + bright_linear) / 2.0)
+}
+
+fn equalization_of(reader: &RawStack) -> focusforge_core::equalize::EqualizationReport {
+    use std::sync::atomic::AtomicUsize;
+    focusforge_core::equalize::estimate(
+        reader,
+        2,
+        reader.dimensions(),
+        3,
+        focusforge_core::equalize::EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        },
+        1,
+        &AtomicUsize::new(0),
+        &|| false,
+    )
+    .expect("equalization estimates")
+}
+
+fn open_pair(files: &[tempfile::NamedTempFile]) -> RawStack {
+    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+    RawStack::open_files(&paths).expect("DNG pair opens")
+}
+
+#[test]
+fn equalize_raw_estimates_on_camera_linear_means() {
+    let (files, target) = equalized_pair();
+    let report = equalization_of(&open_pair(&files));
+    let (dark, bright) = (&report.frames[0], &report.frames[1]);
+    let scale = f64::from(u16::MAX);
+    assert!(
+        (dark.mean - 400.0 / 4031.0 * scale).abs() < 0.1,
+        "{}",
+        dark.mean
+    );
+    assert!(
+        (bright.mean - 800.0 / 4031.0 * scale).abs() < 0.1,
+        "{}",
+        bright.mean
+    );
+    assert!((report.target - target * scale).abs() < 0.1);
+    assert!((dark.applied / bright.applied - 2.0).abs() < 1e-4);
+}
+
+#[test]
+fn equalize_raw_brings_a_frame_at_a_known_offset_to_the_reference_exposure() {
+    use focusforge_core::equalize::GainReader;
+    let (files, target) = equalized_pair();
+    let reader = open_pair(&files);
+    let gains = equalization_of(&reader).recorded().gains;
+    let expected = tinted_look().forward([target; 3]).map(quantize);
+    let gained = GainReader::new(&reader, &gains);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    let step = std::num::NonZeroU32::new(2).expect("nonzero step");
+    for frame in 0..2 {
+        let mut whole = vec![0; 8 * 8 * 3];
+        gained
+            .read_tile_into(frame, rect, &mut whole)
+            .expect("gained read");
+        let mut covered = vec![0; 8 * 8 * 3];
+        let coverage = gained
+            .read_tile_coverage_into(frame, rect, &mut covered)
+            .expect("gained coverage read");
+        let mut stepped = vec![0; 4 * 4 * 3];
+        gained
+            .read_tile_step_into(frame, rect, step, 3, &mut stepped)
+            .expect("gained step read");
+        assert!(coverage.is_none());
+        for read in [&whole, &covered, &stepped] {
+            for pixel in read.chunks_exact(3) {
+                for channel in 0..3 {
+                    assert!(
+                        pixel[channel].abs_diff(expected[channel]) <= 1,
+                        "frame {frame}: {pixel:?} against {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn equalize_raw_gains_replay_on_a_later_read() {
+    use focusforge_core::equalize::GainReader;
+    let (files, _) = equalized_pair();
+    let first = open_pair(&files);
+    let gains = equalization_of(&first).recorded().gains;
+    let rect = Rect {
+        x: 1,
+        y: 2,
+        width: 5,
+        height: 4,
+    };
+    let read = |reader: &RawStack, frame: usize| {
+        let mut out = vec![0; 5 * 4 * 3];
+        GainReader::new(reader, &gains)
+            .read_tile_into(frame, rect, &mut out)
+            .expect("gained read");
+        out
+    };
+    let later = open_pair(&files);
+    for frame in 0..2 {
+        assert_eq!(read(&first, frame), read(&later, frame));
     }
 }

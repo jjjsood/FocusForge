@@ -257,6 +257,29 @@ pub trait TileReader: Send + Sync {
         Ok(None)
     }
 
+    /// [`Self::read_tile_into`] with every sample multiplied by the Q16
+    /// `gain` ([`crate::equalize::UNIT_GAIN`] is 1.0). The default scales the
+    /// encoded samples; a reader whose samples are not linear light overrides
+    /// this to apply the gain to its linear values.
+    fn read_tile_gained_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_tile_into(frame, rect, out)?;
+        crate::equalize::apply_gain(out, gain);
+        Ok(())
+    }
+
+    /// The mean of each channel of `frame` in linear light, for a reader
+    /// whose samples are a nonlinear look of linear data. `None` for a reader
+    /// whose samples are the linear ones, or when the frame cannot be read.
+    fn linear_means(&self, _frame: usize) -> Option<[f64; 3]> {
+        None
+    }
+
     /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
     /// allocates besides `out`: decode buffers, warp sources and the like.
     /// Memory the reader keeps resident between reads (a decoded-segment

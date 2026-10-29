@@ -24,6 +24,10 @@ pub struct DngSpec {
     pub make: String,
     pub model: String,
     pub samples: Vec<u16>,
+    /// DNG AsShotNeutral; the as-shot white balance is its reciprocal.
+    pub as_shot_neutral: Option<[f32; 3]>,
+    /// Row-major ColorMatrix1 (XYZ to camera, D65); the identity when absent.
+    pub color_matrix: Option<[f32; 9]>,
 }
 
 impl DngSpec {
@@ -45,6 +49,8 @@ impl DngSpec {
             make: "FocusForge Test".to_string(),
             model: "Synthetic Bayer".to_string(),
             samples,
+            as_shot_neutral: None,
+            color_matrix: None,
         }
     }
 }
@@ -60,17 +66,10 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
     assert_eq!(spec.samples.len(), (spec.width * spec.height) as usize);
     assert!(matches!(spec.bits, 12 | 14));
     let payload = packed_samples(&spec.samples, spec.bits);
-    let matrix = [
-        (1_i32, 1_i32),
-        (0, 1),
-        (0, 1),
-        (0, 1),
-        (1, 1),
-        (0, 1),
-        (0, 1),
-        (0, 1),
-        (1, 1),
-    ];
+    let matrix = spec
+        .color_matrix
+        .unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+        .map(|value| ((value * 10_000.0).round() as i32, 10_000_i32));
     let [header_width, header_height] = spec.header_dimensions.unwrap_or([spec.width, spec.height]);
     let has_exif = spec.capture_time.is_some() || spec.serial_number.is_some();
     let mut entries = vec![
@@ -97,6 +96,12 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         Entry::short(33421, &[2, 2]),
         Entry::byte(33422, &spec.cfa),
     ];
+    if let Some(neutral) = spec.as_shot_neutral {
+        entries.push(Entry::rational(
+            50728,
+            &neutral.map(|value| ((value * 10_000.0).round() as u32, 10_000_u32)),
+        ));
+    }
     if let Some(modify_time) = &spec.modify_time {
         entries.push(Entry::ascii(306, modify_time));
     }
@@ -251,6 +256,23 @@ impl Entry {
             value: values
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        }
+    }
+
+    fn rational(tag: u16, values: &[(u32, u32)]) -> Self {
+        Self {
+            tag,
+            kind: 5,
+            count: values.len() as u32,
+            value: values
+                .iter()
+                .flat_map(|(numerator, denominator)| {
+                    numerator
+                        .to_le_bytes()
+                        .into_iter()
+                        .chain(denominator.to_le_bytes())
+                })
                 .collect(),
         }
     }

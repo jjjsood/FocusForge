@@ -6,6 +6,13 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Changed
+
+- RAW frames are decoded to the camera's linear colour and read through an invertible
+  white-balance, colour-matrix and sRGB-curve transform, and brightness equalization of a
+  RAW stack corrects exposure in linear light. A highlight that exceeds white after white
+  balance now clips per channel instead of desaturating toward white.
+
 ### Fixed
 
 - On Windows, `focusforge-gui --help`, `--version` and argument errors print to the

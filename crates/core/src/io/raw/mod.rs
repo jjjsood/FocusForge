@@ -1,24 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
-use rawler::imgop::develop::{Intermediate, RawDevelop};
+use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::rawsource::RawSource;
 
 use super::grouping::parse_exif_datetime;
 use super::{FrameDesc, FrameReader, RawIdentity};
 use crate::algorithm::{AlgorithmError, TileReader};
+use crate::equalize::UNIT_GAIN;
 use crate::tile::Rect;
+
+mod look;
+pub use look::LookTransform;
 
 /// Default bound for one developed RAW frame and its decode reservation.
 pub const DEFAULT_RAW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 // rawler's peak holds an original u16 mosaic (2 B/pixel), a scaled clone
-// (4 B/pixel), an f32 RGB intermediate (12 B/pixel), and the new f32 RGB
-// output while it is copied to retained u16 RGB (12 B/pixel).
+// (4 B/pixel), the demosaiced f32 RGB (12 B/pixel) and its default-cropped
+// copy (12 B/pixel). The cropped pixels are then moved, not copied, into the
+// retained frame.
 const DECODE_PEAK_BYTES_PER_PIXEL: u64 = 30;
 
 /// Decoder facts available before pixels are developed.
@@ -198,7 +203,13 @@ struct RawFrame {
 struct DecodedFrame {
     width: u32,
     height: u32,
-    samples: Vec<u16>,
+    /// Camera-linear RGB: black and white levels applied, no white balance,
+    /// colour matrix, curve or clip.
+    samples: Vec<[f32; 3]>,
+    /// Each channel's mean over the frame.
+    means: [f64; 3],
+    /// Grey replicated to three channels, so no colour transform applies.
+    monochrome: bool,
 }
 
 #[derive(Debug, Default)]
@@ -210,7 +221,7 @@ struct Cache {
 fn retained_bytes(frame: &DecodedFrame, path: &Path) -> Result<u64, RawError> {
     u64::try_from(frame.samples.len())
         .ok()
-        .and_then(|samples| samples.checked_mul(u64::try_from(std::mem::size_of::<u16>()).ok()?))
+        .and_then(|pixels| pixels.checked_mul(u64::try_from(std::mem::size_of::<[f32; 3]>()).ok()?))
         .ok_or_else(|| RawError::BudgetOverflow {
             path: path.to_path_buf(),
         })
@@ -223,6 +234,7 @@ pub struct RawStack {
     cache: Mutex<Cache>,
     decode_lock: Mutex<()>,
     cache_bytes: u64,
+    look: OnceLock<LookTransform>,
 }
 
 impl RawStack {
@@ -294,6 +306,7 @@ impl RawStack {
             cache: Mutex::new(Cache::default()),
             decode_lock: Mutex::new(()),
             cache_bytes,
+            look: OnceLock::new(),
         })
     }
 
@@ -311,6 +324,23 @@ impl RawStack {
     /// Description for frame `index`.
     pub fn frame(&self, index: usize) -> Option<&FrameDesc> {
         self.frames.get(index).map(|frame| &frame.desc)
+    }
+
+    /// The look transform of frame 0, shared by every frame of the set.
+    fn look(&self) -> Result<&LookTransform, RawError> {
+        if let Some(look) = self.look.get() {
+            return Ok(look);
+        }
+        let look = reference_look(&self.frames[0].metadata.path)?;
+        Ok(self.look.get_or_init(|| look))
+    }
+
+    fn decoded_serialized(&self, index: usize) -> Result<Arc<DecodedFrame>, RawError> {
+        let _decode = self
+            .decode_lock
+            .lock()
+            .expect("RAW decode mutex is not poisoned");
+        self.decoded(index)
     }
 
     fn decoded(&self, index: usize) -> Result<Arc<DecodedFrame>, RawError> {
@@ -393,12 +423,20 @@ impl TileReader for RawStack {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
-        let _decode = self
-            .decode_lock
-            .lock()
-            .expect("RAW decode mutex is not poisoned");
-        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
-        let path = self.frames[frame].metadata.path.clone();
+        self.read_tile_gained_into(frame, rect, UNIT_GAIN, out)
+    }
+
+    fn read_tile_gained_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        let decoded = self
+            .decoded_serialized(frame)
+            .map_err(crate::io::FrameError::from)?;
+        let path = &self.frames[frame].metadata.path;
         let in_bounds = rect.width > 0
             && rect.height > 0
             && rect
@@ -411,7 +449,7 @@ impl TileReader for RawStack {
                 .is_some_and(|bottom| bottom <= decoded.height);
         if !in_bounds {
             return Err(crate::io::FrameError::from(RawError::OutOfBounds {
-                path,
+                path: path.clone(),
                 requested: rect,
                 frame: (decoded.width, decoded.height),
             })
@@ -420,22 +458,48 @@ impl TileReader for RawStack {
         let expected = rect.width as usize * rect.height as usize * 3;
         if out.len() != expected {
             return Err(crate::io::FrameError::from(RawError::BufferSize {
-                path,
+                path: path.clone(),
                 expected,
                 got: out.len(),
             })
             .into());
         }
-        let stride = decoded.width as usize * 3;
+        let grey_look;
+        let look = if decoded.monochrome {
+            grey_look = LookTransform::new([f32::NAN; 4], IDENTITY_MATRIX);
+            &grey_look
+        } else {
+            self.look().map_err(crate::io::FrameError::from)?
+        };
+        let scale = f64::from(gain) / f64::from(UNIT_GAIN);
+        let stride = decoded.width as usize;
         let row_len = rect.width as usize * 3;
         for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
-            let source = source_y as usize * stride + rect.x as usize * 3;
-            let destination = row * row_len;
-            out[destination..destination + row_len]
-                .copy_from_slice(&decoded.samples[source..source + row_len]);
+            let source = source_y as usize * stride + rect.x as usize;
+            let pixels = &decoded.samples[source..source + rect.width as usize];
+            let destination = &mut out[row * row_len..(row + 1) * row_len];
+            for (pixel, target) in pixels.iter().zip(destination.chunks_exact_mut(3)) {
+                let looked = look.forward(pixel.map(|value| f64::from(value) * scale));
+                for (sample, value) in target.iter_mut().zip(looked) {
+                    *sample = quantize(value);
+                }
+            }
         }
         Ok(())
     }
+
+    fn linear_means(&self, frame: usize) -> Option<[f64; 3]> {
+        self.decoded_serialized(frame)
+            .ok()
+            .map(|decoded| decoded.means)
+    }
+}
+
+const IDENTITY_MATRIX: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// `value` clamped to `[0, 1]` and rounded to 16 bits.
+fn quantize(value: f64) -> u16 {
+    (value.clamp(0.0, 1.0) * f64::from(u16::MAX) + 0.5) as u16
 }
 
 fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
@@ -448,6 +512,8 @@ fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
         })
 }
 
+/// Camera-linear RGB of the file: black and white levels, demosaic and the
+/// sensor's default crop, nothing else.
 fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
     let source = RawSource::new(path).map_err(|source| RawError::Io {
         path: path.to_path_buf(),
@@ -457,37 +523,65 @@ fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
     let image = seam(path, || {
         decoder.raw_image(&source, &RawDecodeParams::default(), false)
     })?;
-    let intermediate = seam(path, || RawDevelop::default().develop_intermediate(&image))?;
-    match intermediate {
-        Intermediate::ThreeColor(pixels) => Ok(DecodedFrame {
-            width: pixels.width as u32,
-            height: pixels.height as u32,
-            samples: pixels
-                .into_flatten()
-                .into_iter()
-                .map(float_to_u16)
-                .collect(),
-        }),
-        Intermediate::Monochrome(pixels) => Ok(DecodedFrame {
-            width: pixels.width as u32,
-            height: pixels.height as u32,
-            samples: pixels
-                .data
-                .into_iter()
-                .flat_map(|sample| [float_to_u16(sample); 3])
-                .collect(),
-        }),
-        Intermediate::FourColor(_) => Err(RawError::Unsupported {
-            path: path.to_path_buf(),
-            make: String::new(),
-            model: String::new(),
-            detail: "development did not produce RGB".to_string(),
-        }),
-    }
+    let steps = [
+        ProcessingStep::Rescale,
+        ProcessingStep::Demosaic,
+        ProcessingStep::FujiRotate,
+        ProcessingStep::CropActiveArea,
+        ProcessingStep::CropDefault,
+    ];
+    let intermediate = seam(path, || {
+        RawDevelop::new_with(&steps).develop_intermediate(&image)
+    })?;
+    let (width, height, samples, monochrome) = match intermediate {
+        Intermediate::ThreeColor(pixels) => (pixels.width, pixels.height, pixels.data, false),
+        Intermediate::Monochrome(pixels) => (
+            pixels.width,
+            pixels.height,
+            pixels.data.into_iter().map(|value| [value; 3]).collect(),
+            true,
+        ),
+        Intermediate::FourColor(_) => {
+            return Err(RawError::Unsupported {
+                path: path.to_path_buf(),
+                make: String::new(),
+                model: String::new(),
+                detail: "development did not produce RGB".to_string(),
+            });
+        }
+    };
+    let means = channel_means(&samples);
+    Ok(DecodedFrame {
+        width: width as u32,
+        height: height as u32,
+        samples,
+        means,
+        monochrome,
+    })
 }
 
-fn float_to_u16(sample: f32) -> u16 {
-    (sample.clamp(0.0, 1.0) * f32::from(u16::MAX) + 0.5) as u16
+fn channel_means(samples: &[[f32; 3]]) -> [f64; 3] {
+    let mut sums = [0.0_f64; 3];
+    for pixel in samples {
+        for (sum, value) in sums.iter_mut().zip(pixel) {
+            *sum += f64::from(*value);
+        }
+    }
+    sums.map(|sum| sum / samples.len().max(1) as f64)
+}
+
+/// The look transform of the camera that took the file at `path`, from its
+/// metadata alone.
+fn reference_look(path: &Path) -> Result<LookTransform, RawError> {
+    let source = RawSource::new(path).map_err(|source| RawError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let decoder = seam(path, || rawler::get_decoder(&source))?;
+    let image = seam(path, || {
+        decoder.raw_image(&source, &RawDecodeParams::default(), true)
+    })?;
+    Ok(LookTransform::from_image(&image))
 }
 
 fn open_frame(path: &Path) -> Result<RawFrame, RawError> {
