@@ -66,10 +66,11 @@ pub trait TileBackend: Send + Sync {
 
     /// Why one `width` x `height` tile at `samples_per_pixel`, pyramid depth
     /// `levels`, `transforms` and the reader's `sample_format` (the shape
-    /// [`Self::warp_fuse_tile`] takes) cannot run on this backend's device, as a message naming the host
-    /// path the run continues on; `None` when it fits. A caller that gets
-    /// `Some` fuses on the host instead of calling this backend. Defaults to
-    /// `None`, for a backend with no budget of its own.
+    /// [`Self::warp_fuse_tile`] takes) cannot run on this backend's device, as
+    /// a message naming the host path the run continues on; `None` when it
+    /// fits. A caller that gets `Some` fuses on the host instead of calling
+    /// this backend. Defaults to `None`, for a backend with no budget of its
+    /// own.
     fn tile_budget_shortfall(
         &self,
         _width: u32,

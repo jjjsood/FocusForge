@@ -107,8 +107,8 @@ fn params_bytes(
 /// `frame`-pixel coordinate space) through `t`, entirely on the GPU -- the
 /// twin of `focusforge_core::align::warp::warp_from_tile`. The host-side
 /// [`map_coords`] runs first and can return
-/// [`AlignError::SourceTileTooSmall`] before anything is encoded; `covered` in the returned [`WarpedTile`] is the host's own
-/// choice, never a GPU readback.
+/// [`AlignError::SourceTileTooSmall`] before anything is encoded; `covered` in
+/// the returned [`WarpedTile`] is the host's own choice, never a GPU readback.
 pub fn warp_from_tile_gpu(
     shared: &SharedDevice,
     pipelines: &WarpPipelines,

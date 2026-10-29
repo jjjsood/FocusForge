@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The `f32` form of `warp_bicubic.wgsl`: the GPU twin of
-// `focusforge_core::align::warp::warp_samples_into::<f32>`. Same host-decided
-// coverage and coordinates, same tap order and edge clamp; the source and
-// destination are `f32` samples on the 16-bit scale and the result is written
-// as is, with no clamp and no rounding. One invocation per sample.
+// The `f32` form of `warp_bicubic.wgsl`, the GPU twin of
+// `focusforge_core::align::warp::warp_samples_into::<f32>`: same coordinates,
+// tap order and edge clamp, but samples are `f32` on the 16-bit scale and the
+// result is written without clamping or rounding. One invocation per sample.
 
 struct Coord {
     ix: i32,

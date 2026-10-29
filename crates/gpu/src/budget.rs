@@ -728,7 +728,7 @@ mod tests {
             let packed = packed_len(samples as usize) as u64;
             let u16_warped = device_bytes_per_tile(w, h, 3, 5, true, SampleFormat::U16);
             let f32_warped = device_bytes_per_tile(w, h, 3, 5, true, SampleFormat::F32);
-            // Destination and re-uploaded source are `plane`s and the base plane is the destination.
+            // Destination and re-uploaded source are `plane`s; the base plane is the destination.
             assert_eq!(
                 f32_warped + 2 * packed,
                 u16_warped + plane,

@@ -778,10 +778,7 @@ fn dummy_backend_f32_matches_host_fusion() {
     );
 
     // The same frames clipped at the read fuse differently: the f32 path is live.
-    let clipped = Frames {
-        format: SampleFormat::U16,
-        ..Frames::new(260, 190, 3, SampleFormat::U16)
-    };
+    let clipped = Frames::new(260, 190, 3, SampleFormat::U16);
     let (clipped_path, _, _) = fuse_frames(&clipped, "f32_clipped", None);
     assert_ne!(
         host_bytes,
