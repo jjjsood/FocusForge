@@ -22,6 +22,8 @@ pub struct LookTransform {
     balance: [f64; 3],
     to_srgb: Matrix,
     from_srgb: Matrix,
+    /// `to_srgb` with the white balance folded in, for [`Self::forward_f32`].
+    balanced_to_srgb: [[f32; 3]; 3],
 }
 
 impl LookTransform {
@@ -48,10 +50,13 @@ impl LookTransform {
             Some(inverse) => (inverse, srgb_to_camera),
             None => (IDENTITY, IDENTITY),
         };
+        let balanced_to_srgb =
+            std::array::from_fn(|i| std::array::from_fn(|j| (to_srgb[i][j] * balance[j]) as f32));
         Self {
             balance,
             to_srgb,
             from_srgb,
+            balanced_to_srgb,
         }
     }
 
@@ -94,6 +99,16 @@ impl LookTransform {
         apply(&self.to_srgb, balanced).map(encode)
     }
 
+    /// [`Self::forward`] in `f32`, within 1e-6 of it scaled by the larger of 1
+    /// and the input's largest magnitude: the per-pixel form for reads.
+    #[inline]
+    pub fn forward_f32(&self, rgb: [f32; 3]) -> [f32; 3] {
+        self.balanced_to_srgb.map(|row| {
+            let linear = row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2];
+            encode_f32(linear)
+        })
+    }
+
     /// Look-space `rgb` back to camera-linear: the exact inverse of
     /// [`Self::forward`].
     pub fn inverse(&self, rgb: [f64; 3]) -> [f64; 3] {
@@ -116,6 +131,18 @@ const ENCODED_KNEE: f64 = 12.92 * KNEE;
 fn encode(x: f64) -> f64 {
     let magnitude = x.abs();
     let encoded = if magnitude <= KNEE {
+        12.92 * magnitude
+    } else {
+        1.055 * magnitude.powf(1.0 / 2.4) - 0.055
+    };
+    encoded.copysign(x)
+}
+
+/// [`encode`] in `f32`.
+#[inline]
+fn encode_f32(x: f32) -> f32 {
+    let magnitude = x.abs();
+    let encoded = if magnitude <= KNEE as f32 {
         12.92 * magnitude
     } else {
         1.055 * magnitude.powf(1.0 / 2.4) - 0.055
@@ -201,6 +228,21 @@ mod look_transform {
             [1e-9, -1e-9, 3e-3],
         ]);
         all
+    }
+
+    #[test]
+    fn forward_f32_stays_within_1e6_of_the_f64_forward() {
+        let look = camera();
+        for rgb in triples() {
+            let exact = look.forward(rgb);
+            let fast = look.forward_f32(rgb.map(|v| v as f32));
+            let scale = rgb.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            for channel in 0..3 {
+                let error = (f64::from(fast[channel]) - exact[channel]).abs();
+                let limit = 1e-6 * scale;
+                assert!(error < limit, "{rgb:?}: {fast:?} against {exact:?}");
+            }
+        }
     }
 
     #[test]

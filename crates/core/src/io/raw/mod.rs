@@ -12,7 +12,7 @@ use super::grouping::parse_exif_datetime;
 use super::{FrameDesc, FrameReader, RawIdentity};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
-use crate::tile::Rect;
+use crate::tile::{Rect, Sample, SampleFormat};
 
 mod look;
 pub use look::LookTransform;
@@ -416,22 +416,16 @@ impl FrameReader for RawStack {
     }
 }
 
-impl TileReader for RawStack {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        self.read_tile_gained_into(frame, rect, UNIT_GAIN, out)
-    }
-
-    fn read_tile_gained_into(
+impl RawStack {
+    /// Reads `rect` of `frame` with the Q16 `gain` applied to the camera-linear
+    /// values, through the look, on the 16-bit scale (1.0 look white is
+    /// 65535). `S::narrow` is the only clip.
+    fn read_gained<S: Sample>(
         &self,
         frame: usize,
         rect: Rect,
         gain: u32,
-        out: &mut [u16],
+        out: &mut [S],
     ) -> Result<(), AlgorithmError> {
         let decoded = self
             .decoded_serialized(frame)
@@ -471,7 +465,7 @@ impl TileReader for RawStack {
         } else {
             self.look().map_err(crate::io::FrameError::from)?
         };
-        let scale = f64::from(gain) / f64::from(UNIT_GAIN);
+        let scale = gain as f32 / UNIT_GAIN as f32;
         let stride = decoded.width as usize;
         let row_len = rect.width as usize * 3;
         for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
@@ -479,28 +473,71 @@ impl TileReader for RawStack {
             let pixels = &decoded.samples[source..source + rect.width as usize];
             let destination = &mut out[row * row_len..(row + 1) * row_len];
             for (pixel, target) in pixels.iter().zip(destination.chunks_exact_mut(3)) {
-                let looked = look.forward(pixel.map(|value| f64::from(value) * scale));
+                let looked = look.forward_f32(pixel.map(|value| value * scale));
                 for (sample, value) in target.iter_mut().zip(looked) {
-                    *sample = quantize(value);
+                    *sample = S::narrow(value * WHITE);
                 }
             }
         }
         Ok(())
     }
+}
 
-    fn linear_means(&self, frame: usize) -> Option<[f64; 3]> {
-        self.decoded_serialized(frame)
-            .ok()
-            .map(|decoded| decoded.means)
+/// The 16-bit-scale value of look white.
+const WHITE: f32 = 65_535.0;
+
+impl TileReader for RawStack {
+    fn sample_format(&self) -> SampleFormat {
+        SampleFormat::F32
+    }
+
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, UNIT_GAIN, out)
+    }
+
+    fn read_tile_gained_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, gain, out)
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, UNIT_GAIN, out)
+    }
+
+    fn read_tile_gained_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, gain, out)
+    }
+
+    fn linear_means(&self, frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
+        let decoded = self
+            .decoded_serialized(frame)
+            .map_err(crate::io::FrameError::from)?;
+        Ok(Some(decoded.means))
     }
 }
 
 const IDENTITY_MATRIX: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
-/// `value` clamped to `[0, 1]` and rounded to 16 bits.
-fn quantize(value: f64) -> u16 {
-    (value.clamp(0.0, 1.0) * f64::from(u16::MAX) + 0.5) as u16
-}
 
 fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
     u64::from(frame.metadata.raw_width)

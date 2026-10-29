@@ -9,6 +9,7 @@
 
 use crate::fuse::PyramidError;
 use crate::fuse::pyramid::Plane;
+use crate::tile::Sample;
 
 /// How far a pixel of the detail plane reads in the source: the one-level
 /// reduce (`2`) plus the expand it is subtracted from (`2`). Coverage erosion
@@ -61,8 +62,8 @@ pub(crate) fn eligible(covered: &[bool], width: u32, height: u32, reach: u32) ->
 /// suffices. The level is cloned out of the pyramid (`Plane` has no cheaper
 /// move out of a [`crate::fuse::pyramid::Pyramid`]) and the pyramid,
 /// residual included, is dropped immediately after.
-pub(crate) fn detail_plane(
-    samples: &[u16],
+pub(crate) fn detail_plane<S: Sample>(
+    samples: &[S],
     width: u32,
     height: u32,
     spp: u32,

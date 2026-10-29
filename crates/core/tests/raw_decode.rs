@@ -1475,3 +1475,363 @@ fn equalize_raw_gains_replay_on_a_later_read() {
         assert_eq!(read(&first, frame), read(&later, frame));
     }
 }
+
+fn whole_rect(reader: &RawStack) -> Rect {
+    let (width, height) = reader.dimensions();
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
+
+/// `value` narrowed the way the `u16` read narrows an `f32` one.
+fn narrowed(value: f32) -> u16 {
+    (value.clamp(0.0, 65_535.0) + 0.5).floor() as u16
+}
+
+fn flat_dng(level: u16, width: u32, height: u32) -> (tempfile::NamedTempFile, f64) {
+    let linear = f64::from(level - 64) / f64::from(4095 - 64);
+    let samples = vec![level; (width * height) as usize];
+    (
+        write_dng(&tinted_spec(samples, width, height, [0, 1, 1, 2]), false),
+        linear,
+    )
+}
+
+#[test]
+fn raw_f32_read_keeps_headroom_and_matches_the_look() {
+    use focusforge_core::equalize::UNIT_GAIN;
+    let (dng, linear) = flat_dng(2600, 40, 24);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    assert_eq!(
+        reader.sample_format(),
+        focusforge_core::tile::SampleFormat::F32
+    );
+    let sub = Rect {
+        x: 5,
+        y: 3,
+        width: 17,
+        height: 9,
+    };
+    let scale = f64::from(u16::MAX);
+    let look = tinted_look();
+    for gain in [UNIT_GAIN, UNIT_GAIN / 2] {
+        let ratio = f64::from(gain) / f64::from(UNIT_GAIN);
+        let expected = look.forward([linear * ratio; 3]).map(|v| v * scale);
+        for rect in [sub, whole_rect(&reader)] {
+            let mut wide = vec![0.0f32; rect.width as usize * rect.height as usize * 3];
+            reader
+                .read_tile_gained_f32_into(0, rect, gain, &mut wide)
+                .expect("f32 gained read");
+            for pixel in wide.chunks_exact(3) {
+                for channel in 0..3 {
+                    assert!(
+                        (f64::from(pixel[channel]) - expected[channel]).abs() < 0.5,
+                        "gain {gain}: {pixel:?} against {expected:?}"
+                    );
+                }
+            }
+            let mut narrow = vec![0u16; wide.len()];
+            reader
+                .read_tile_gained_into(0, rect, gain, &mut narrow)
+                .expect("u16 gained read");
+            assert!(
+                narrow.iter().zip(&wide).all(|(n, w)| *n == narrowed(*w)),
+                "the u16 read is the narrowed f32 read"
+            );
+        }
+        let clips = expected.iter().any(|v| *v > scale);
+        assert_eq!(clips, gain == UNIT_GAIN, "{expected:?}");
+    }
+    let mut plain = vec![0.0f32; 3];
+    let one = Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+    reader.read_tile_f32_into(0, one, &mut plain).expect("read");
+    assert!(plain.iter().any(|v| *v > 65_535.0), "{plain:?}");
+}
+
+#[test]
+fn raw_f32_read_rejects_out_of_frame_rects_and_wrong_lengths() {
+    let (dng, _) = flat_dng(900, 40, 24);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    for rect in [
+        Rect {
+            x: 39,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1,
+        },
+        Rect {
+            x: u32::MAX,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+    ] {
+        let mut out = vec![9.0f32; 6];
+        let error = reader
+            .read_tile_f32_into(0, rect, &mut out)
+            .expect_err("a rect outside the frame is refused");
+        assert!(
+            error.to_string().contains("outside developed frame"),
+            "{error}"
+        );
+        assert_eq!(out, vec![9.0; 6]);
+    }
+    let whole = whole_rect(&reader);
+    for len in [40 * 24 * 3 - 1, 40 * 24 * 3 + 1] {
+        let mut out = vec![7.0f32; len];
+        let error = reader
+            .read_tile_f32_into(0, whole, &mut out)
+            .expect_err("a wrong length is refused");
+        assert!(error.to_string().contains(&len.to_string()), "{error}");
+        assert!(out.iter().all(|v| *v == 7.0));
+    }
+}
+
+#[test]
+fn equalize_raw_surfaces_a_decode_error() {
+    let (good, _) = flat_dng(900, 8, 8);
+    let truncated = write_dng(&tinted_spec(vec![900; 64], 8, 8, [0, 1, 1, 2]), true);
+    let files = [good, truncated];
+    let reader = open_pair(&files);
+    let started = std::sync::atomic::AtomicUsize::new(0);
+    let error = focusforge_core::equalize::estimate(
+        &reader,
+        2,
+        reader.dimensions(),
+        3,
+        focusforge_core::equalize::EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        },
+        1,
+        &started,
+        &|| false,
+    )
+    .expect_err("frame 1 cannot be decoded");
+    let text = error.to_string();
+    assert!(
+        text.contains(&truncated_name(reader.metadata(1).expect("metadata"))),
+        "{text}"
+    );
+    assert!(!text.contains("no linear-light mean"), "{text}");
+}
+
+fn truncated_name(metadata: &focusforge_core::io::raw::RawMetadata) -> String {
+    metadata
+        .path
+        .file_name()
+        .expect("file name")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Frame side: large enough that the fusion's tile margin leaves an interior.
+const SIDE: u32 = 112;
+
+/// The pixel the stacks are compared at: the frame centre, clear of the edge.
+const PROBE: Rect = Rect {
+    x: SIDE / 2,
+    y: SIDE / 2,
+    width: 1,
+    height: 1,
+};
+
+/// Serves only the `u16` read, so the sample format stays the `u16` default
+/// and every consumer reads clipped samples.
+struct NarrowOnly<'a>(&'a dyn TileReader);
+
+impl TileReader for NarrowOnly<'_> {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), focusforge_core::algorithm::AlgorithmError> {
+        self.0.read_tile_into(frame, rect, out)
+    }
+}
+
+/// The pixel `PROBE` of the weighted-average fusion of the two square frames
+/// `reader` serves.
+fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
+    use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
+    use focusforge_core::io::TiffStack;
+    use focusforge_core::params::{self, ParamValues, StackContext};
+    use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+
+    let (width, height, frame_count) = (SIDE, SIDE, 2);
+    let context = StackContext::new(frame_count, width, height, 3);
+    let algo = focusforge_core::registry::find_stack("weighted-average")
+        .expect("weighted-average resolves");
+    let resolved = params::resolve(algo.params(), &ParamValues::default(), &context)
+        .expect("parameters resolve");
+    let values = params::resolved_values(&resolved);
+
+    let out_dir = common::workspace_root()
+        .join(".scratch")
+        .join("raw-f32-stack");
+    std::fs::create_dir_all(&out_dir).expect("output dir");
+    let composite = out_dir.join(format!("{label}.tif"));
+    let mut options = TileSchedulerOptions::explicit_budget(out_dir.join(label), 1 << 30);
+    options.apply_support(algo.tile_support(&values));
+    options.tile_size = 80;
+    let scheduler = TileScheduler::new(reader, context, 3, &options).expect("scheduler builds");
+    let consumer = FusionConsumer::create(
+        algo,
+        values,
+        &composite,
+        None,
+        FusionGeometry {
+            width,
+            height,
+            samples_per_pixel: 3,
+            frame_count: frame_count as u32,
+            crop: None,
+            description: None,
+        },
+    )
+    .expect("consumer creates");
+    scheduler
+        .run(&NoopPreprocess, &consumer)
+        .expect("fusion runs");
+    consumer.finish().expect("fusion finishes");
+
+    TiffStack::open_files(&[composite])
+        .expect("composite reopens")
+        .read_tile(0, PROBE)
+        .expect("composite read")
+        .samples
+}
+
+/// A frame of 2x2-cell checkerboard texture: cells alternate between `level`
+/// and `level + 200`. Frames of different `level` carry identical detail, so
+/// the sharpness weights of a pair are equal.
+fn textured_dng(level: u16) -> tempfile::NamedTempFile {
+    let samples = (0..SIDE * SIDE)
+        .map(|i| {
+            let (x, y) = (i % SIDE, i / SIDE);
+            level + if (x / 2 + y / 2) % 2 == 0 { 0 } else { 200 }
+        })
+        .collect();
+    write_dng(&tinted_spec(samples, SIDE, SIDE, [0, 1, 1, 2]), false)
+}
+
+/// The probe pixel of each frame at `levels` as the reader serves it, and the
+/// weighted-average fusions of the frames through gain and warp readers: once
+/// natively `f32`, once through [`NarrowOnly`].
+#[derive(Debug)]
+struct PairFused {
+    frames: [[f32; 3]; 2],
+    wide: Vec<u16>,
+    narrow: Vec<u16>,
+}
+
+fn raw_pair_fused(levels: [u16; 2], label: &str) -> PairFused {
+    use focusforge_core::align::{Transform, WarpingReader};
+    use focusforge_core::equalize::{GainReader, UNIT_GAIN};
+
+    let files: Vec<_> = levels.iter().map(|level| textured_dng(*level)).collect();
+    let raw = open_pair(&files);
+    let mut frames = [[0.0f32; 3]; 2];
+    for (frame, pixel) in frames.iter_mut().enumerate() {
+        raw.read_tile_f32_into(frame, PROBE, pixel)
+            .expect("f32 read");
+    }
+    let gained = GainReader::new(&raw, &[UNIT_GAIN; 2]);
+    let warping = WarpingReader::new(&gained, (SIDE, SIDE), 3, vec![Transform::identity(); 2]);
+    PairFused {
+        frames,
+        wide: fused_probe_pixel(&warping, &format!("{label}-f32")),
+        narrow: fused_probe_pixel(&NarrowOnly(&warping), &format!("{label}-u16")),
+    }
+}
+
+impl PairFused {
+    /// The second frame's weight at the probe, read off the green channel of
+    /// `fused`: the sharpness weights are per pixel, the same for every
+    /// channel, and green stays below white in every frame, so clipping
+    /// cannot move it.
+    fn share(&self, fused: &[u16]) -> f32 {
+        let [a, b] = self.frames.map(|pixel| pixel[1]);
+        (f32::from(fused[1]) - a) / (b - a)
+    }
+
+    /// The blend of the frames' probe pixels at `share`, narrowed once, with
+    /// each frame clipped at white first when `clip` is set.
+    fn blend(&self, share: f32, clip: bool) -> [u16; 3] {
+        let [a, b] = self
+            .frames
+            .map(|pixel| pixel.map(|v| if clip { v.min(65_535.0) } else { v }));
+        std::array::from_fn(|c| narrowed(a[c] + share * (b[c] - a[c])))
+    }
+
+    /// Per channel, how far the unclipped second frame exceeds white.
+    fn headroom(&self) -> [f32; 3] {
+        self.frames[1].map(|v| (v - 65_535.0).max(0.0))
+    }
+
+    /// `fused` equals the blend of the frames at its own share, to 3 LSB.
+    fn assert_blend(&self, fused: &[u16], clip: bool, what: &str) {
+        let share = self.share(fused);
+        let expected = self.blend(share, clip);
+        assert!(
+            (0..3).all(|c| fused[c].abs_diff(expected[c]) <= 3),
+            "{what}: {fused:?} against {expected:?} at share {share}"
+        );
+    }
+}
+
+// Both frames carry the same texture, so the `f32` stack mixes them at the
+// probe and blends the unclipped samples, clipping the result once. The
+// `NarrowOnly` stack clips each frame at the read first: the second frame's
+// headroom is gone from the blend and from its sharpness weight.
+#[test]
+fn raw_f32_stack_fuses_unclipped_highlights_and_clips_once() {
+    let fused = raw_pair_fused([1500, 2600], "highlights");
+    assert!(
+        fused.frames.iter().all(|pixel| pixel[1] < 65_535.0),
+        "{fused:?}"
+    );
+    assert!(fused.headroom().iter().any(|v| *v > 100.0), "{fused:?}");
+    fused.assert_blend(&fused.wide, false, "f32 stack");
+    fused.assert_blend(&fused.narrow, true, "clipped stack");
+    // The blend is a real mix, and clipping the frames first would move it.
+    let share = fused.share(&fused.wide);
+    assert!((0.1..0.9).contains(&share), "share {share}");
+    let (unclipped, clipped) = (fused.blend(share, false), fused.blend(share, true));
+    assert!(
+        (0..3).any(|c| unclipped[c].abs_diff(clipped[c]) > 100),
+        "{unclipped:?} against {clipped:?}"
+    );
+    assert!(
+        (0..3).any(|c| fused.wide[c].abs_diff(fused.narrow[c]) > 100),
+        "{fused:?}"
+    );
+}
+
+#[test]
+fn raw_f32_stack_agrees_with_the_u16_stack_below_white() {
+    let fused = raw_pair_fused([900, 1200], "below-white");
+    assert_eq!(fused.headroom(), [0.0; 3], "{fused:?}");
+    assert!((0.1..0.9).contains(&fused.share(&fused.wide)), "{fused:?}");
+    fused.assert_blend(&fused.wide, false, "f32 stack");
+    fused.assert_blend(&fused.narrow, false, "u16 stack");
+    assert!(
+        (0..3).all(|c| fused.wide[c].abs_diff(fused.narrow[c]) <= 1),
+        "{fused:?}"
+    );
+}

@@ -23,7 +23,7 @@ use crate::gpu::AlignBackend;
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
 use crate::tile::plan::TileSupport;
-use crate::tile::{FramePreprocess, Rect, Tile};
+use crate::tile::{FramePreprocess, Rect, Sample, SampleFormat, Tile};
 use crate::timing::{TimingCounter, record_timing};
 
 pub use error::AlgorithmError;
@@ -218,6 +218,67 @@ impl<'a> TileCtx<'a> {
         Ok(())
     }
 
+    /// The sample type this context's frames are read in: `u16` for resident
+    /// tiles, the reader's native type for an on-demand context.
+    pub fn sample_format(&self) -> SampleFormat {
+        match &self.backing {
+            Backing::Resident { .. } => SampleFormat::U16,
+            Backing::OnDemand { reader, .. } => reader.sample_format(),
+        }
+    }
+
+    /// [`Self::for_each_frame`] handing each frame's samples in sample type
+    /// `S`: an on-demand context reads `S` from its reader and runs the
+    /// preprocess stage over it; a resident one widens its `u16` tiles when
+    /// `S` is `f32`. An algorithm picks `S` from [`Self::sample_format`].
+    pub fn for_each_frame_as<S: Sample>(
+        &self,
+        mut visit: impl FnMut(usize, &[S], Option<&[bool]>) -> Result<(), AlgorithmError>,
+    ) -> Result<(), AlgorithmError> {
+        match &self.backing {
+            Backing::Resident { tiles, coverage } => {
+                for (f, tile) in tiles.iter().enumerate() {
+                    self.frames_read.fetch_add(1, Ordering::Relaxed);
+                    let samples = S::from_u16(&tile.samples);
+                    visit(
+                        f,
+                        &samples,
+                        coverage.get(f).and_then(|mask| mask.as_deref()),
+                    )?;
+                }
+            }
+            Backing::OnDemand {
+                frame_count,
+                samples_per_pixel,
+                reader,
+                preprocess,
+            } => {
+                let len = self.rect.width as usize
+                    * self.rect.height as usize
+                    * *samples_per_pixel as usize;
+                let mut samples = vec![S::default(); len];
+                record_timing(
+                    TimingCounter::AllocationBytes,
+                    (samples.capacity() * std::mem::size_of::<S>()) as u64,
+                );
+                record_timing(TimingCounter::AllocationOperations, 1);
+                for f in 0..*frame_count {
+                    let coverage = S::read_tile_coverage(*reader, f, self.rect, &mut samples)?;
+                    self.frames_read.fetch_add(1, Ordering::Relaxed);
+                    samples = S::preprocess(
+                        *preprocess,
+                        f,
+                        self.rect,
+                        *samples_per_pixel,
+                        std::mem::take(&mut samples),
+                    )?;
+                    visit(f, &samples, coverage.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// How many frame-tiles [`Self::for_each_frame`] has produced so far,
     /// across every call.
     pub fn frames_read(&self) -> usize {
@@ -273,11 +334,59 @@ pub trait TileReader: Send + Sync {
         Ok(())
     }
 
+    /// The sample type this reader serves natively. A reader that serves
+    /// `f32` overrides the `f32` reads below; every other reader's `f32`
+    /// reads widen its `u16` ones.
+    fn sample_format(&self) -> SampleFormat {
+        SampleFormat::U16
+    }
+
+    /// [`Self::read_tile_into`] in `f32` samples on the 16-bit scale, which a
+    /// native `f32` reader serves without clipping to 65535.
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        widened(out, |scratch| self.read_tile_into(frame, rect, scratch))
+    }
+
+    /// [`Self::read_tile_coverage_into`] in `f32` samples. A native `f32`
+    /// reader without a coverage mask of its own reports full coverage.
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        if self.sample_format() == SampleFormat::F32 {
+            return self.read_tile_f32_into(frame, rect, out).map(|()| None);
+        }
+        widened(out, |scratch| {
+            self.read_tile_coverage_into(frame, rect, scratch)
+        })
+    }
+
+    /// [`Self::read_tile_gained_into`] in `f32` samples.
+    fn read_tile_gained_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        widened(out, |scratch| {
+            self.read_tile_gained_into(frame, rect, gain, scratch)
+        })
+    }
+
     /// The mean of each channel of `frame` in linear light, for a reader
     /// whose samples are a nonlinear look of linear data. `None` for a reader
-    /// whose samples are the linear ones, or when the frame cannot be read.
-    fn linear_means(&self, _frame: usize) -> Option<[f64; 3]> {
-        None
+    /// whose samples are the linear ones; an error when the frame cannot be
+    /// read.
+    fn linear_means(&self, _frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
+        Ok(None)
     }
 
     /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
@@ -301,6 +410,20 @@ pub trait TileReader: Send + Sync {
     ) -> Result<(), AlgorithmError> {
         read_tile_step_into(self, frame, rect, step, samples_per_pixel, out)
     }
+}
+
+/// Fills `out` with what `read` writes into a `u16` scratch of the same
+/// length; `out` is untouched when `read` fails.
+pub(crate) fn widened<T>(
+    out: &mut [f32],
+    read: impl FnOnce(&mut [u16]) -> Result<T, AlgorithmError>,
+) -> Result<T, AlgorithmError> {
+    let mut scratch = vec![0u16; out.len()];
+    let result = read(&mut scratch)?;
+    for (wide, narrow) in out.iter_mut().zip(&scratch) {
+        *wide = f32::from(*narrow);
+    }
+    Ok(result)
 }
 
 /// Reads every `step`-th row and column of `rect` from `frame` through
@@ -439,6 +562,21 @@ impl<'a> AlignContext<'a> {
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
         self.reader.read_tile_into(frame, rect, out)
+    }
+
+    /// The sample type the context's reader serves natively.
+    pub fn sample_format(&self) -> SampleFormat {
+        self.reader.sample_format()
+    }
+
+    /// [`Self::read_tile_into`] in `f32` samples on the 16-bit scale.
+    pub fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.reader.read_tile_f32_into(frame, rect, out)
     }
 }
 

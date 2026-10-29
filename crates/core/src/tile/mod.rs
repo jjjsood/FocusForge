@@ -14,6 +14,7 @@ pub mod control;
 mod error;
 pub mod plan;
 pub mod preprocess;
+mod sample;
 pub mod scheduler;
 pub mod scratch;
 
@@ -27,6 +28,7 @@ pub use control::{NoControl, TileControl};
 pub use error::TileError;
 pub use plan::{PlannedTile, TilePlan};
 pub use preprocess::{FramePreprocess, NoopPreprocess};
+pub use sample::{Sample, SampleFormat};
 pub use scheduler::{ControlledRun, TileRunReport, TileScheduler, TileSchedulerOptions};
 pub use scratch::ScratchDir;
 

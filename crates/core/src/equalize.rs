@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::tile::Rect;
+use crate::tile::{Rect, SampleFormat};
 
 /// Gain 1.0 in Q16 fixed point.
 pub const UNIT_GAIN: u32 = 1 << 16;
@@ -189,12 +189,16 @@ impl<'a> GainReader<'a> {
 
     /// The frame's gain is not unity and the reader applies it to linear
     /// light, which only its own gained read does.
-    fn gains_linear_light(&self, frame: usize) -> bool {
-        self.gain(frame) != UNIT_GAIN && self.inner.linear_means(frame).is_some()
+    fn gains_linear_light(&self, frame: usize) -> Result<bool, AlgorithmError> {
+        Ok(self.gain(frame) != UNIT_GAIN && self.inner.linear_means(frame)?.is_some())
     }
 }
 
 impl TileReader for GainReader<'_> {
+    fn sample_format(&self) -> SampleFormat {
+        self.inner.sample_format()
+    }
+
     fn read_tile_into(
         &self,
         frame: usize,
@@ -205,19 +209,47 @@ impl TileReader for GainReader<'_> {
             .read_tile_gained_into(frame, rect, self.gain(frame), out)
     }
 
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.inner
+            .read_tile_gained_f32_into(frame, rect, self.gain(frame), out)
+    }
+
     fn read_tile_coverage_into(
         &self,
         frame: usize,
         rect: Rect,
         out: &mut [u16],
     ) -> Result<Option<Vec<bool>>, AlgorithmError> {
-        if self.gains_linear_light(frame) {
+        if self.gains_linear_light(frame)? {
             self.read_tile_into(frame, rect, out)?;
             return Ok(None);
         }
         let coverage = self.inner.read_tile_coverage_into(frame, rect, out)?;
         apply_gain(out, self.gain(frame));
         Ok(coverage)
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        if self.inner.sample_format() == SampleFormat::U16 {
+            return crate::algorithm::widened(out, |scratch| {
+                self.read_tile_coverage_into(frame, rect, scratch)
+            });
+        }
+        if self.gain(frame) == UNIT_GAIN {
+            return self.inner.read_tile_coverage_f32_into(frame, rect, out);
+        }
+        self.read_tile_f32_into(frame, rect, out)?;
+        Ok(None)
     }
 
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
@@ -232,7 +264,7 @@ impl TileReader for GainReader<'_> {
         samples_per_pixel: u32,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
-        if self.gains_linear_light(frame) {
+        if self.gains_linear_light(frame)? {
             return crate::algorithm::read_tile_step_into(
                 self,
                 frame,
@@ -298,7 +330,7 @@ fn linear_means_of(
     frames_done: &AtomicUsize,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<Vec<f64>>, AlgorithmError> {
-    if reader.linear_means(0).is_none() {
+    if reader.linear_means(0)?.is_none() {
         return Ok(None);
     }
     let mut means = Vec::with_capacity(frame_count);
@@ -307,7 +339,7 @@ fn linear_means_of(
             return Err(AlgorithmError::Cancelled);
         }
         let channels = reader
-            .linear_means(frame)
+            .linear_means(frame)?
             .ok_or_else(|| AlgorithmError::Failed {
                 algorithm: "equalize".to_string(),
                 detail: format!("frame {frame} has no linear-light mean"),

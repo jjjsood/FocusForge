@@ -14,7 +14,9 @@ use focusforge_core::io::{
     FrameDesc, FrameError, FrameReader, Rect, TiffError, TiffSpec, TiffStack, TiffWriter,
 };
 use focusforge_core::params::{ParamDesc, ParamValues};
-use focusforge_core::tile::{NoopPreprocess, Tile, TileScheduler, TileSchedulerOptions};
+use focusforge_core::tile::{
+    NoopPreprocess, SampleFormat, Tile, TileScheduler, TileSchedulerOptions,
+};
 
 fn accepts_tile_reader(_: &dyn TileReader) {}
 
@@ -174,6 +176,99 @@ fn out_of_bounds_and_buffer_size_errors_pass_through() {
         ));
         assert!(out.iter().all(|sample| *sample == 7));
     }
+}
+
+#[test]
+fn f32_read_rejects_out_of_frame_rects_and_wrong_lengths() {
+    let source = MemoryReader::new();
+    let stack = write_tiff_stack("f32-boundary", &source.frames);
+    let reader: &dyn TileReader = &stack;
+    for rect in [
+        Rect {
+            x: 40,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1,
+        },
+        Rect {
+            x: u32::MAX,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+    ] {
+        let mut out = vec![9.0f32; 3];
+        let error = reader
+            .read_tile_f32_into(0, rect, &mut out)
+            .expect_err("a rect outside the frame is refused");
+        assert!(error.to_string().contains("outside"), "{error}");
+        assert_eq!(out, vec![9.0; 3]);
+        let mut gained = vec![9.0f32; 3];
+        reader
+            .read_tile_gained_f32_into(0, rect, 1 << 16, &mut gained)
+            .expect_err("the gained read refuses it too");
+        assert_eq!(gained, vec![9.0; 3]);
+        let mut covered = vec![9.0f32; 3];
+        reader
+            .read_tile_coverage_f32_into(0, rect, &mut covered)
+            .expect_err("the coverage read refuses it too");
+        assert_eq!(covered, vec![9.0; 3]);
+    }
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 24,
+    };
+    for len in [40 * 24 * 3 - 1, 40 * 24 * 3 + 1] {
+        let mut out = vec![7.0f32; len];
+        let error = reader
+            .read_tile_f32_into(0, full, &mut out)
+            .expect_err("a wrong length is refused");
+        assert!(error.to_string().contains(&len.to_string()), "{error}");
+        assert!(out.iter().all(|sample| *sample == 7.0));
+    }
+}
+
+#[test]
+fn f32_read_widens_the_u16_read() {
+    let source = MemoryReader::new();
+    let stack = write_tiff_stack("f32-widen", &source.frames);
+    let reader: &dyn TileReader = &stack;
+    assert_eq!(reader.sample_format(), SampleFormat::U16);
+    let rect = Rect {
+        x: 3,
+        y: 2,
+        width: 20,
+        height: 11,
+    };
+    let mut narrow = vec![0u16; 20 * 11 * 3];
+    reader.read_tile_into(1, rect, &mut narrow).unwrap();
+    let mut wide = vec![-1.0f32; narrow.len()];
+    reader.read_tile_f32_into(1, rect, &mut wide).unwrap();
+    assert!(narrow.iter().zip(&wide).all(|(n, w)| f32::from(*n) == *w));
+    let mut covered = vec![-1.0f32; narrow.len()];
+    assert!(
+        reader
+            .read_tile_coverage_f32_into(1, rect, &mut covered)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(covered, wide);
+    let mut gained = vec![-1.0f32; narrow.len()];
+    reader
+        .read_tile_gained_f32_into(1, rect, 1 << 15, &mut gained)
+        .unwrap();
+    assert!(narrow.iter().zip(&gained).all(|(n, g)| {
+        let half = ((u32::from(*n) << 15) + (1 << 15)) >> 16;
+        f32::from(half.min(65_535) as u16) == *g
+    }));
 }
 
 struct SourceSelector;

@@ -924,3 +924,141 @@ fn streamed_context_matches_the_resident_context() {
         );
     }
 }
+
+/// Frames served as `f32` only; the `u16` read fails, so a fusion that
+/// still reads `u16` cannot pass.
+struct WideFrames<'a> {
+    inner: &'a dyn TileReader,
+}
+
+impl TileReader for WideFrames<'_> {
+    fn sample_format(&self) -> focusforge_core::tile::SampleFormat {
+        focusforge_core::tile::SampleFormat::F32
+    }
+
+    fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "wide-frames".to_string(),
+            detail: "serves f32 only".to_string(),
+        })
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        let mut narrow = vec![0u16; out.len()];
+        self.inner.read_tile_into(frame, rect, &mut narrow)?;
+        for (wide, narrow) in out.iter_mut().zip(narrow) {
+            *wide = f32::from(narrow);
+        }
+        Ok(())
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_tile_f32_into(frame, rect, out).map(|()| None)
+    }
+}
+
+/// Flat `f32` frames, one value per frame.
+struct FlatWide(Vec<f32>);
+
+impl TileReader for FlatWide {
+    fn sample_format(&self) -> focusforge_core::tile::SampleFormat {
+        focusforge_core::tile::SampleFormat::F32
+    }
+
+    fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "flat-wide".to_string(),
+            detail: "serves f32 only".to_string(),
+        })
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        _: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(self.0[frame]);
+        Ok(())
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_tile_f32_into(frame, rect, out).map(|()| None)
+    }
+}
+
+#[test]
+fn f32_fusion_matches_the_u16_run_on_widened_frames() {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let wide = WideFrames { inner: &stack };
+    for algo_id in ["laplacian", "depth-map", "weighted-average"] {
+        let narrow = run_fusion_over(
+            stack_context(&stack),
+            &stack,
+            algo_id,
+            &format!("{algo_id}-u16-480"),
+            480,
+            &no_explicit(),
+            None,
+        );
+        let widened = run_fusion_over(
+            stack_context(&stack),
+            &wide,
+            algo_id,
+            &format!("{algo_id}-f32-480"),
+            480,
+            &no_explicit(),
+            None,
+        );
+        assert_eq!(widened.zmap, narrow.zmap, "{algo_id}: Z-Maps differ");
+        assert_eq!(
+            widened.composite, narrow.composite,
+            "{algo_id}: composites differ"
+        );
+    }
+}
+
+#[test]
+fn f32_fusion_clips_once_at_the_output() {
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(2));
+    let flat = FlatWide(vec![70_000.0, 50_000.0]);
+    let context = StackContext::new(2, 128, 128, 3);
+    // Averaging methods mean the unclipped values (60000, not the 57768 of
+    // a mean of clipped reads); selection copies frame 0 and clips it.
+    for (algo_id, expected) in [
+        ("weighted-average", 60_000),
+        ("laplacian", 60_000),
+        ("depth-map", 65_535),
+    ] {
+        let result = run_fusion_over(
+            context,
+            &flat,
+            algo_id,
+            &format!("{algo_id}-f32-flat"),
+            112,
+            &explicit,
+            None,
+        );
+        assert!(
+            result.composite.iter().all(|v| v.abs_diff(expected) <= 1),
+            "{algo_id}: expected {expected}, got {:?}",
+            &result.composite[..3]
+        );
+    }
+}
