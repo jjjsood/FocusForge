@@ -664,17 +664,31 @@ pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
     const TAG_MAKE: u16 = 271;
     const TAG_MODEL: u16 = 272;
     const TAG_ORIENTATION: u16 = 274;
+    const TAG_DNG_VERSION: u16 = 50706;
+    const TAG_DNG_BACKWARD_VERSION: u16 = 50707;
+    const TAG_UNIQUE_CAMERA_MODEL: u16 = 50708;
+    const TAG_BLACK_LEVEL: u16 = 50714;
+    const TAG_WHITE_LEVEL: u16 = 50717;
+    const TAG_COLOR_MATRIX_1: u16 = 50721;
+    const TAG_AS_SHOT_NEUTRAL: u16 = 50728;
+    const TAG_CALIBRATION_ILLUMINANT_1: u16 = 50778;
     const LINEAR_RAW: u16 = 34892;
+    const DNG_VERSION: [u8; 4] = [1, 4, 0, 0];
     let mut entries = vec![
         dng_shorts(TAG_PHOTOMETRIC, &[LINEAR_RAW]),
         dng_ascii(TAG_MAKE, &colour.make),
         dng_ascii(TAG_MODEL, &colour.model),
-        dng_entry(50706, FIELD_TYPE_BYTE, 4, vec![1, 4, 0, 0]),
-        dng_entry(50707, FIELD_TYPE_BYTE, 4, vec![1, 4, 0, 0]),
-        dng_ascii(50708, &colour.unique_model),
-        dng_shorts(50714, &[0; 3]),
+        dng_entry(TAG_DNG_VERSION, FIELD_TYPE_BYTE, 4, DNG_VERSION.to_vec()),
         dng_entry(
-            50717,
+            TAG_DNG_BACKWARD_VERSION,
+            FIELD_TYPE_BYTE,
+            4,
+            DNG_VERSION.to_vec(),
+        ),
+        dng_ascii(TAG_UNIQUE_CAMERA_MODEL, &colour.unique_model),
+        dng_shorts(TAG_BLACK_LEVEL, &[0; 3]),
+        dng_entry(
+            TAG_WHITE_LEVEL,
             FIELD_TYPE_LONG,
             3,
             [65_535_u32; 3]
@@ -682,15 +696,18 @@ pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
         ),
-        dng_rationals(50728, &colour.as_shot_neutral),
+        dng_rationals(TAG_AS_SHOT_NEUTRAL, &colour.as_shot_neutral),
     ];
     if let Some(orientation) = colour.orientation {
         entries.push(dng_shorts(TAG_ORIENTATION, &[orientation]));
     }
     for (slot, matrix) in colour.matrices.iter().enumerate() {
         let values: Vec<f64> = matrix.xyz_to_camera.iter().map(|&v| f64::from(v)).collect();
-        entries.push(dng_srationals(50721 + slot as u16, &values));
-        entries.push(dng_shorts(50778 + slot as u16, &[matrix.illuminant]));
+        entries.push(dng_srationals(TAG_COLOR_MATRIX_1 + slot as u16, &values));
+        entries.push(dng_shorts(
+            TAG_CALIBRATION_ILLUMINANT_1 + slot as u16,
+            &[matrix.illuminant],
+        ));
     }
     entries
 }

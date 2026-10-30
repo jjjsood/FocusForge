@@ -681,6 +681,7 @@ fn colour_temperature(illuminant: Illuminant) -> Option<u32> {
 /// The DNG colour data of the camera that took the file at `path`, read from
 /// the same header as the stack's look transform, so look and tags cannot
 /// disagree.
+///
 /// A monochrome sensor, a camera with no 3x3 matrix of known colour
 /// temperature and a file without usable as-shot multipliers are refused
 /// with [`RawError::Unsupported`].
