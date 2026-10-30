@@ -39,6 +39,30 @@ installer and follow its prompts. Its CLI is
 it to `PATH`. Its shared resources are below
 `$env:ProgramFiles\FocusForge\share`.
 
+## First launch on macOS
+
+`FocusForge.app` is ad-hoc signed rather than signed with an Apple Developer
+ID, and it is not notarized. macOS blocks the first launch of such an app
+whenever it carries the quarantine attribute a browser sets on every
+download.
+
+Open the app once and dismiss the message that Apple could not verify it,
+then open System Settings > Privacy & Security, scroll to the Security
+section and click Open Anyway. That button appears only for a short while
+after a blocked launch; launch the app again if it is missing. Control-click
+> Open no longer bypasses the check on macOS 15 and later.
+
+The same thing from a terminal, which also covers the CLI:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/FocusForge.app
+```
+
+A report that the app "is damaged and can't be opened" means the bundle
+carries no resource seal, not that the download is corrupt. Releases before
+0.1.1 are affected; check the file against `SHA256SUMS`, which lists the
+SHA-256 of every published artifact.
+
 ## Manuals and completions
 
 Every package contains 15 manual pages, including `focusforge-cli-stack(1)`,

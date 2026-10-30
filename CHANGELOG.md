@@ -6,6 +6,12 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Fixed
+
+- Seal the macOS app bundle with an ad-hoc signature, so a downloaded DMG no
+  longer opens as "damaged" with no way past it. The first launch now shows
+  the ordinary unnotarized-app prompt that Open Anyway clears.
+
 ## [0.1.0] - 2026-10-27
 
 ### Added

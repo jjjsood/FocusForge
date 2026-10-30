@@ -11,7 +11,7 @@ case "$output" in "$root"/target/distrib/native/*) ;; *) echo "output must stay 
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml" | head -1)
 [[ -n $version ]] || { echo "missing workspace version" >&2; exit 1; }
 bundle_version=${version%%-*}
-for command in cargo lipo hdiutil plutil shasum dsymutil strip dwarfdump; do command -v "$command" >/dev/null || { echo "missing $command" >&2; exit 1; }; done
+for command in cargo lipo hdiutil plutil shasum dsymutil strip dwarfdump codesign; do command -v "$command" >/dev/null || { echo "missing $command" >&2; exit 1; }; done
 # dsymutil below reads the debug map of the linked binary, which points at the object files; with the
 # profile's "off" rustc deletes those after linking and the dSYM loses the binaries' own line tables.
 export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=unpacked
@@ -51,6 +51,14 @@ plutil -lint "$app/Contents/Info.plist"
 cp "$root/assets/build/focusforge.icns" "$app/Contents/Resources/focusforge.icns"
 cp "$root/LICENSE" "$root/NOTICE" "$app/Contents/Resources/"
 python3 "$root/tools/package-cli-assets.py" stage "$root" "$app/Contents/Resources"
+# The linker leaves each arm64 binary ad-hoc signed but seals no resources, so Gatekeeper reads a
+# quarantined download as damaged and offers no way past it. Sealing the staged bundle -- ad-hoc, so
+# no Apple account and no secret -- turns that dead end into the ordinary unnotarized-app prompt that
+# "Open Anyway" clears. Only notarization removes the prompt itself. Sign last: the seal covers the
+# stripped binaries, the Info.plist and every staged resource above.
+codesign --force --sign - "$app/Contents/MacOS/focusforge-cli"
+codesign --force --sign - "$app"
+codesign --verify --strict --deep "$app"
 mkdir -p "$output"
 candidate="$staging/FocusForge-$version-aarch64.dmg"
 { df -h "$staging" "$output" 2>&1 || true; du -sh "$staging"; } | tee -a "$diag/diagnostics.log"

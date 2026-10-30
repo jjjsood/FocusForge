@@ -57,7 +57,7 @@ Details for each are in the [guides](docs/README.md).
 ## Install
 
 Linux: install the matching `.deb` or run its AppImage from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source.
-macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
+macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source. macOS blocks the first launch of the unnotarized app; see [first launch on macOS](docs/getting-started.md#first-launch-on-macos).
 Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source. See [getting started](docs/getting-started.md) for paths.
 
 ## Quick start
