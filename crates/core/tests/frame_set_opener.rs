@@ -4,7 +4,9 @@ mod common;
 #[path = "common/raw_dng.rs"]
 mod raw_dng;
 
-use focusforge_core::io::{FrameError, ReaderKind, TiffError, frame_paths, open_frame_set};
+use focusforge_core::io::{
+    FrameError, ReaderKind, TiffError, TiffHeader, classify_header, frame_paths, open_frame_set,
+};
 use focusforge_core::tile::HostBudget;
 use raw_dng::{DngSpec, write_dng};
 
@@ -136,6 +138,51 @@ fn mixed_sets_decode_and_unsupported_headers_refuse() {
     };
     assert!(error.to_string().contains("Compression=7"), "{error}");
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn eight_bit_sets_open_through_the_decoded_reader() {
+    let fixtures = common::fixtures_dir();
+    let header = TiffHeader::open(&fixtures.join("mantis8-64/frames/00.tif")).unwrap();
+    assert_eq!(classify_header(&header).unwrap(), ReaderKind::Decoded);
+    for set in ["mantis8-64", "mantis8-64-deflate-p2-strip-ii"] {
+        let paths = frame_paths(&fixtures.join(set)).unwrap();
+        let opened = open_frame_set(&paths, HostBudget::explicit(65_536)).unwrap();
+        assert_eq!(opened.kind, ReaderKind::Decoded, "{set}");
+    }
+}
+
+#[test]
+fn eight_bit_and_sixteen_bit_frames_do_not_mix() {
+    let fixtures = common::fixtures_dir();
+    let sixteen = fixtures.join("mantis-64/frames/00.tif");
+    let eight = fixtures.join("mantis8-64/frames/01.tif");
+    for (set, differing, first, second) in [
+        (
+            vec![sixteen.clone(), eight.clone()],
+            &eight,
+            "[16, 16, 16]",
+            "[8, 8, 8]",
+        ),
+        (
+            vec![eight.clone(), sixteen.clone()],
+            &sixteen,
+            "[8, 8, 8]",
+            "[16, 16, 16]",
+        ),
+    ] {
+        let error = match open_frame_set(&set, HostBudget::explicit(65_536)) {
+            Ok(_) => panic!("mixed bit depths must refuse"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+        assert!(text.contains(&differing.display().to_string()), "{text}");
+        assert!(text.contains(first) && text.contains(second), "{text}");
+        assert!(matches!(
+            error,
+            FrameError::Tiff(TiffError::FrameMismatch { .. })
+        ));
+    }
 }
 
 #[test]
