@@ -414,14 +414,85 @@ fn fuse_both(
         .expect("gpu backend")
         .warp_fuse_tile(reader, (w, h), transforms, rect, spp, FUSE_LEVELS)
         .expect("gpu f32 fuse");
-    let frames = (0..transforms.len())
+    (
+        cpu,
+        gpu,
+        warped_frames(&warping, transforms.len(), rect, spp),
+    )
+}
+
+/// Every frame of `warping` over `rect`, read as `f32`.
+fn warped_frames(
+    warping: &WarpingReader<'_>,
+    frame_count: usize,
+    rect: Rect,
+    spp: u32,
+) -> Vec<Vec<f32>> {
+    (0..frame_count)
         .map(|f| {
             let mut samples = vec![0f32; rect.width as usize * rect.height as usize * spp as usize];
             warping.read_tile_f32_into(f, rect, &mut samples).unwrap();
             samples
         })
-        .collect();
-    (cpu, gpu, frames)
+        .collect()
+}
+
+#[test]
+fn parity_f32_fuse_keeps_headroom() {
+    if shared_device_or_skip().is_none() {
+        return;
+    }
+    let reader = MantisF32::open(30_000.0);
+    let (w, h) = reader.stack.dimensions();
+    let spp = reader.stack.header(0).samples_per_pixel;
+    // The tile sits on the frame corner so the similarity warp leaves pixels uncovered.
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 168,
+    };
+    let transforms = [
+        Transform::identity(),
+        Transform::similarity(1.0, 0.02, -6.0, -4.0),
+        Transform::identity(),
+    ];
+    let warping = WarpingReader::new(&reader, (w, h), spp, transforms.to_vec());
+    let ctx = TileCtx::on_demand(rect, transforms.len(), spp, &warping, &NoopPreprocess);
+    let cpu = Laplacian
+        .fuse_f32(&ctx, &laplacian_config(FUSE_LEVELS))
+        .expect("cpu f32 fuse");
+    let gpu = gpu_backend()
+        .expect("gpu backend")
+        .warp_fuse_tile_f32(&reader, (w, h), &transforms, rect, spp, FUSE_LEVELS)
+        .expect("gpu f32 fuse");
+
+    let mut scratch = vec![0f32; rect.width as usize * rect.height as usize * spp as usize];
+    let coverage = warping
+        .read_tile_coverage_f32_into(1, rect, &mut scratch)
+        .unwrap()
+        .expect("the warped frame reports coverage");
+    assert!(
+        coverage.contains(&false),
+        "the warp leaves uncovered pixels"
+    );
+    for (what, output) in [("cpu", &cpu), ("gpu", &gpu)] {
+        assert!(
+            output.tile.samples.iter().any(|&s| s > 65_535.0),
+            "{what}: samples above white survive the fusion"
+        );
+    }
+    let frames = warped_frames(&warping, transforms.len(), rect, spp);
+    let frames: Vec<&[f32]> = frames.iter().map(Vec::as_slice).collect();
+    assert_matches_cpu_outside_near_ties(
+        "f32 fuse, unclipped",
+        &cpu,
+        &gpu,
+        &frames,
+        rect,
+        spp,
+        FUSE_LEVELS,
+    );
 }
 
 #[test]

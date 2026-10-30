@@ -13,7 +13,7 @@ use focusforge_core::timing::{TimingCounter, gpu_tile_stage};
 
 use crate::device::SharedDevice;
 use crate::fuse::{
-    FrameSource, FusionPipelines, fuse_planes_gpu, plane_from_f32, plane_from_packed,
+    FrameSource, FusedSample, FusionPipelines, fuse_planes_gpu, plane_from_f32, plane_from_packed,
 };
 use crate::transfer::{upload_f32, upload_tile};
 use crate::warp::{WarpPipelines, warp_tile_dispatch};
@@ -47,13 +47,13 @@ pub fn upload_frame_f32(
 ///
 /// A reader whose `sample_format()` is `F32` is read and warped as `f32`:
 /// the uploaded or warped buffer is the frame's base plane itself, with no
-/// pack, no conversion kernel and no clamp; the fused tile is quantized to
-/// `u16` once, at the end of fusion.
+/// pack, no conversion kernel and no clamp. The fused tile is read back as
+/// `O`: quantized to `u16` once at the end of fusion, or left `f32`.
 ///
 /// A warped frame with uncovered pixels hands its coverage mask to fusion,
 /// which excludes it where the Laplacian reach touches those pixels.
 #[allow(clippy::too_many_arguments)]
-pub fn warp_fuse_tile_gpu(
+pub fn warp_fuse_tile_gpu<O: FusedSample>(
     shared: &SharedDevice,
     warp_pipelines: &WarpPipelines,
     fuse_pipelines: &FusionPipelines,
@@ -63,7 +63,7 @@ pub fn warp_fuse_tile_gpu(
     rect: Rect,
     samples_per_pixel: u32,
     levels: u32,
-) -> Result<TileOutput, AlgorithmError> {
+) -> Result<TileOutput<O>, AlgorithmError> {
     let device = shared.device();
     let queue = shared.queue();
     let frame_count = transforms.len();
@@ -128,7 +128,7 @@ pub fn warp_fuse_tile_gpu(
         Ok((plane, covered))
     };
 
-    fuse_planes_gpu(
+    fuse_planes_gpu::<O>(
         shared,
         fuse_pipelines,
         frame_count,

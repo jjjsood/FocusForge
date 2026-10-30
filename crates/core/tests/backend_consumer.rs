@@ -126,18 +126,60 @@ impl TileBackend for DummyBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
-        let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.to_vec());
-        let ctx = TileCtx::on_demand(
+        laplacian_over(
+            reader,
+            frame,
+            transforms,
             rect,
-            transforms.len(),
             samples_per_pixel,
-            &warping,
-            &NoopPreprocess,
-        );
-        let mut cfg = ParamValues::new();
-        cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
-        Laplacian.fuse(&ctx, &cfg)
+            levels,
+            |ctx, cfg| Laplacian.fuse(ctx, cfg),
+        )
     }
+
+    fn warp_fuse_tile_f32(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        laplacian_over(
+            reader,
+            frame,
+            transforms,
+            rect,
+            samples_per_pixel,
+            levels,
+            |ctx, cfg| Laplacian.fuse_f32(ctx, cfg),
+        )
+    }
+}
+
+/// `fuse` over a [`TileCtx`] of `reader` warped by `transforms`, with the
+/// Laplacian depth `levels`.
+fn laplacian_over<O>(
+    reader: &dyn TileReader,
+    frame: (u32, u32),
+    transforms: &[Transform],
+    rect: Rect,
+    samples_per_pixel: u32,
+    levels: u32,
+    fuse: impl FnOnce(&TileCtx<'_>, &ParamValues) -> Result<TileOutput<O>, AlgorithmError>,
+) -> Result<TileOutput<O>, AlgorithmError> {
+    let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.to_vec());
+    let ctx = TileCtx::on_demand(
+        rect,
+        transforms.len(),
+        samples_per_pixel,
+        &warping,
+        &NoopPreprocess,
+    );
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
+    fuse(&ctx, &cfg)
 }
 
 fn open_stack() -> TiffStack {
@@ -340,6 +382,21 @@ impl LosingBackend {
     }
 }
 
+impl LosingBackend {
+    /// Records `rect` and loses the device once `healthy` dispatches are used.
+    fn dispatch(&self, rect: Rect) -> Result<(), AlgorithmError> {
+        self.rects.lock().unwrap().push(rect);
+        if self.dispatches.fetch_add(1, Ordering::SeqCst) >= self.healthy {
+            self.lost.store(true, Ordering::SeqCst);
+            return Err(AlgorithmError::Failed {
+                algorithm: "laplacian".to_string(),
+                detail: "device lost".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 const HEALTHY_TILES: usize = 2;
 
 impl TileBackend for LosingBackend {
@@ -399,25 +456,37 @@ impl TileBackend for LosingBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
-        self.rects.lock().unwrap().push(rect);
-        if self.dispatches.fetch_add(1, Ordering::SeqCst) >= self.healthy {
-            self.lost.store(true, Ordering::SeqCst);
-            return Err(AlgorithmError::Failed {
-                algorithm: "laplacian".to_string(),
-                detail: "device lost".to_string(),
-            });
-        }
-        let warping = WarpingReader::new(reader, frame, samples_per_pixel, transforms.to_vec());
-        let ctx = TileCtx::on_demand(
+        self.dispatch(rect)?;
+        laplacian_over(
+            reader,
+            frame,
+            transforms,
             rect,
-            transforms.len(),
             samples_per_pixel,
-            &warping,
-            &NoopPreprocess,
-        );
-        let mut cfg = ParamValues::new();
-        cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
-        Laplacian.fuse(&ctx, &cfg)
+            levels,
+            |ctx, cfg| Laplacian.fuse(ctx, cfg),
+        )
+    }
+
+    fn warp_fuse_tile_f32(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        self.dispatch(rect)?;
+        laplacian_over(
+            reader,
+            frame,
+            transforms,
+            rect,
+            samples_per_pixel,
+            levels,
+            |ctx, cfg| Laplacian.fuse_f32(ctx, cfg),
+        )
     }
 }
 
@@ -718,7 +787,7 @@ fn fuse_frames(
     options.levels = F32_LEVELS;
     let path =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("backend_consumer_{label}.tif"));
-    let sink = FusionConsumer::create(
+    let sink = FusionConsumer::create_as(
         &Laplacian,
         values,
         &path,
@@ -731,6 +800,7 @@ fn fuse_frames(
             crop: None,
             description: None,
         },
+        reader.sample_format(),
     )
     .expect("create must succeed");
     let scheduler =
@@ -770,6 +840,8 @@ fn dummy_backend_f32_matches_host_fusion() {
     assert!(planned >= 3, "tile seams must be crossed: {planned} tiles");
     let (via_backend, _, fallback) = fuse_frames(&reader, "f32_backend", Some(&DummyBackend));
     assert_eq!(fallback, 0);
+    let staged = TiffStack::open_staged(&host).expect("the composite reopens");
+    assert_eq!(staged.sample_format(), SampleFormat::F32);
     let host_bytes = std::fs::read(&host).expect("read host composite");
     assert_eq!(
         host_bytes,

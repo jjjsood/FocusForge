@@ -39,8 +39,7 @@
 //!   sample sum kept for the degenerate case -- and the denominator are
 //!   `f64`, as is the running best used for the tie-break.
 //! - **Narrow once, at the finished ratio.** `num / den` (or the plain mean)
-//!   is cast to `f32` per sample and written into a [`Plane`]. Nothing else
-//!   narrows.
+//!   is cast to `f32` per sample. Nothing else narrows.
 //!
 //! Both accumulations run in **ascending frame order**, pinned like every
 //! other accumulation in this crate: floating-point addition is not
@@ -56,9 +55,10 @@
 //! algorithm has and `laplacian` does not: its composite is bit-identical
 //! between a tiled and an untiled run, asserted with no tolerance in
 //! `tests/fuse_algorithms.rs`. Widening the accumulator is per-pixel and
-//! tile-independent; normalising by a tile statistic is not. The final `f32` blend is written into a [`Plane`] and
-//! converted with [`Plane::to_u16_into`] (`floor(clamp(v, 0, 65535) + 0.5)`)
-//! -- one rounding rule in the project, never an open-coded cast.
+//! tile-independent; normalising by a tile statistic is not. The final `f32` blend
+//! becomes the output sample with `Sample::narrow` (`floor(clamp(v, 0, 65535) +
+//! 0.5)` for `u16`, unchanged for `f32`) -- one rounding rule in the project,
+//! never an open-coded cast.
 //!
 //! # The degenerate rule
 //!
@@ -113,7 +113,6 @@ use std::sync::LazyLock;
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::laplacian::score_plane;
-use crate::fuse::pyramid::Plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
@@ -203,16 +202,32 @@ impl StackAlgorithm for WeightedAverage {
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         match ctx.sample_format() {
-            SampleFormat::U16 => self.fuse_as::<u16>(ctx, cfg),
-            SampleFormat::F32 => self.fuse_as::<f32>(ctx, cfg),
+            SampleFormat::U16 => self.fuse_as::<u16, u16>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, u16>(ctx, cfg),
+        }
+    }
+
+    fn fuse_f32(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, f32>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, f32>(ctx, cfg),
         }
     }
 
     /// Two `f64` sums per sample, and per pixel the `f64` weight and best,
     /// the winner and the eligible count (22 B); then, live with the sums,
-    /// the blended `f32` plane, its `Plane` copy, the zero-filled `u16`
-    /// seed and the `u16` output (12 B per sample).
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
+    /// the blended `f32` plane and the output (at most 8 B per sample, inside
+    /// the 12 B budgeted).
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        samples_per_pixel: u32,
+        _format: SampleFormat,
+    ) -> u64 {
         28 * u64::from(samples_per_pixel) + 22
     }
 
@@ -227,11 +242,12 @@ impl StackAlgorithm for WeightedAverage {
 }
 
 impl WeightedAverage {
-    fn fuse_as<S: Sample>(
+    /// Fuses frames read as `S` into a composite of `O` samples.
+    fn fuse_as<S: Sample, O: Sample>(
         &self,
         ctx: &TileCtx<'_>,
         cfg: &ParamValues,
-    ) -> Result<TileOutput, AlgorithmError> {
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
         let radius = cfg
             .get("radius")
@@ -318,16 +334,7 @@ impl WeightedAverage {
             }
         }
 
-        // One rounding rule in the project: round-trip through `Plane` so
-        // the pinned `floor(clamp(v, 0, 65535) + 0.5)` expression is the
-        // only place a `f32` sample becomes a `u16` one.
-        let mut plane = Plane::from_u16(&vec![0u16; pixel_count * spp_usize], width, height, spp)
-            .map_err(algorithm_error("weighted-average"))?;
-        plane.data_mut().copy_from_slice(&blended);
-        let mut samples = vec![0u16; pixel_count * spp_usize];
-        plane
-            .to_u16_into(&mut samples)
-            .map_err(algorithm_error("weighted-average"))?;
+        let samples: Vec<O> = blended.iter().map(|&v| O::narrow(v)).collect();
 
         crate::zmap::validate_tile(&winner, frame_count as u32)
             .map_err(algorithm_error("weighted-average"))?;
@@ -820,8 +827,13 @@ mod tests {
     #[test]
     fn working_bytes_per_pixel_are_pinned() {
         let cfg = ParamValues::new();
-        assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 3), 106);
-        assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 1), 50);
+        for format in [SampleFormat::U16, SampleFormat::F32] {
+            assert_eq!(
+                WeightedAverage.working_bytes_per_pixel(&cfg, 3, format),
+                106
+            );
+            assert_eq!(WeightedAverage.working_bytes_per_pixel(&cfg, 1, format), 50);
+        }
     }
 
     #[test]

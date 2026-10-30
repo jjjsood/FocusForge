@@ -8,6 +8,7 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ### Changed
 
+- A RAW project now keeps highlights above white in its saved result instead of clipping them at 16 bits, so a RAW project saved by an earlier version is refused on open and must be stacked from its source frames again.
 - Camera RAW stacks now fuse and align on unclipped 32-bit float samples and clip once, at the fused result, so highlights above the look's white point no longer clip before blending.
 - RAW frames are decoded to the camera's linear colour and read through an invertible
   white-balance, colour-matrix and sRGB-curve transform, and brightness equalization of a

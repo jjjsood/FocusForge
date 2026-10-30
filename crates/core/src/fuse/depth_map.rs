@@ -154,18 +154,35 @@ impl StackAlgorithm for DepthMap {
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         match ctx.sample_format() {
-            SampleFormat::U16 => self.fuse_as::<u16>(ctx, cfg),
-            SampleFormat::F32 => self.fuse_as::<f32>(ctx, cfg),
+            SampleFormat::U16 => self.fuse_as::<u16, u16>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, u16>(ctx, cfg),
         }
     }
 
-    /// The `u16` output (2 B per sample), the detail plane's one-level
-    /// pyramid with its cloned level (9 B per sample at the peak), and per
-    /// pixel the `f32` best and `u16` winner (6 B) plus the per-frame `f32`
-    /// detail, raw score and smoothed planes with the eligibility mask and
-    /// its erosion scratch (14 B).
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
-        11 * u64::from(samples_per_pixel) + 20
+    fn fuse_f32(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, f32>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, f32>(ctx, cfg),
+        }
+    }
+
+    /// The output (2 B per sample as `u16`, 4 B as `f32`), the detail
+    /// plane's one-level pyramid with its cloned level (9 B per sample at the
+    /// peak), and per pixel the `f32` best and `u16` winner (6 B) plus the
+    /// per-frame `f32` detail, raw score and smoothed planes with the
+    /// eligibility mask and its erosion scratch (14 B).
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        samples_per_pixel: u32,
+        format: SampleFormat,
+    ) -> u64 {
+        let per_sample = if format == SampleFormat::F32 { 13 } else { 11 };
+        per_sample * u64::from(samples_per_pixel) + 20
     }
 
     /// `4 + score-radius + smoothing-radius` on the one-level decimation
@@ -179,11 +196,12 @@ impl StackAlgorithm for DepthMap {
 }
 
 impl DepthMap {
-    fn fuse_as<S: Sample>(
+    /// Fuses frames read as `S` into a composite of `O` samples.
+    fn fuse_as<S: Sample, O: Sample>(
         &self,
         ctx: &TileCtx<'_>,
         cfg: &ParamValues,
-    ) -> Result<TileOutput, AlgorithmError> {
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
         let score_radius =
             cfg.get("score-radius")
@@ -203,7 +221,7 @@ impl DepthMap {
 
         let mut best = vec![f32::NEG_INFINITY; pixel_count];
         let mut winner = vec![NO_SOURCE; pixel_count];
-        let mut out = vec![0u16; pixel_count * spp_usize];
+        let mut out = vec![O::default(); pixel_count * spp_usize];
 
         ctx.for_each_frame_as::<S>(|f, samples, covered| {
             let detail =
@@ -234,7 +252,7 @@ impl DepthMap {
                         .iter_mut()
                         .zip(&samples[base..base + spp_usize])
                     {
-                        *out = u16::narrow(sample.widen());
+                        *out = O::narrow(sample.widen());
                     }
                 }
             }
@@ -568,8 +586,24 @@ mod tests {
     #[test]
     fn working_bytes_per_pixel_are_pinned() {
         let cfg = ParamValues::new();
-        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 3), 53);
-        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 1), 31);
+        assert_eq!(
+            DepthMap.working_bytes_per_pixel(&cfg, 3, SampleFormat::U16),
+            53
+        );
+        assert_eq!(
+            DepthMap.working_bytes_per_pixel(&cfg, 1, SampleFormat::U16),
+            31
+        );
+    }
+
+    #[test]
+    fn f32_output_adds_two_bytes_per_sample_to_the_working_bytes() {
+        let cfg = ParamValues::new();
+        for spp in [1, 3] {
+            let u16_bytes = DepthMap.working_bytes_per_pixel(&cfg, spp, SampleFormat::U16);
+            let f32_bytes = DepthMap.working_bytes_per_pixel(&cfg, spp, SampleFormat::F32);
+            assert_eq!(f32_bytes - u16_bytes, 2 * u64::from(spp));
+        }
     }
 
     #[test]

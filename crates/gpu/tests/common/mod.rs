@@ -102,11 +102,11 @@ pub const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
 
 /// The unmasked parity contract: the Z-Map equals the CPU's except at proven
 /// near-ties between the two best frames, and every sample outside those
-/// pixels is within 1 LSB.
-pub fn assert_matches_cpu_outside_near_ties<S: Sample>(
+/// pixels is within 1 LSB of the 16-bit scale.
+pub fn assert_matches_cpu_outside_near_ties<S: Sample, O: Sample>(
     label: &str,
-    cpu: &TileOutput,
-    gpu: &TileOutput,
+    cpu: &TileOutput<O>,
+    gpu: &TileOutput<O>,
     frames: &[&[S]],
     rect: Rect,
     spp: u32,
@@ -149,9 +149,12 @@ pub fn assert_matches_cpu_outside_near_ties<S: Sample>(
         .enumerate()
         .filter(|(pixel, _)| !near_ties.contains(pixel))
         .flat_map(|(_, (cpu, gpu))| cpu.iter().zip(gpu))
-        .map(|(&c, &g)| (i32::from(c) - i32::from(g)).abs())
-        .max()
+        .map(|(&c, &g)| (c.widen() - g.widen()).abs())
+        .max_by(f32::total_cmp)
         .expect("a non-empty composite");
     println!("{label} composite parity: worst |delta|={worst} outside near-tie pixels");
-    assert!(worst <= 1, "composite parity exceeded 1 LSB: worst={worst}");
+    assert!(
+        worst <= 1.0,
+        "composite parity exceeded 1 LSB: worst={worst}"
+    );
 }

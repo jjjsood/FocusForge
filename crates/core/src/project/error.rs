@@ -111,6 +111,14 @@ pub enum ProjectError {
     )]
     FingerprintDisagrees { path: PathBuf, checkpoint: String },
 
+    /// A RAW project whose fused checkpoint holds a 16-bit result, which
+    /// clipped everything above white.
+    #[error(
+        "{}: is a RAW project saved by an older version, which stored a clipped 16-bit result; stack its source frames again to open it",
+        path.display()
+    )]
+    ClippedRawResult { path: PathBuf },
+
     /// A checkpoint carries ops but no `fuse` record and no `parent` --
     /// there is nothing for its `stack_fingerprint` to be checked against.
     #[error(

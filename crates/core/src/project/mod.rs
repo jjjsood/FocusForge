@@ -502,10 +502,26 @@ impl Project {
             full_blob(&manifest.blobs, &c.zmap_blob, path)?;
             match &c.fuse {
                 Some(fuse) => {
-                    if !manifest.blobs.iter().any(|b| b.hash == fuse.composite.blob) {
+                    let Some(composite) = manifest
+                        .blobs
+                        .iter()
+                        .find(|b| b.hash == fuse.composite.blob)
+                    else {
                         return Err(ProjectError::MissingEntry {
                             path: path.to_path_buf(),
                             entry: format!("blobs/{}.zst", fuse.composite.blob),
+                        });
+                    };
+                    if composite.kind == BlobKind::Full
+                        && fuse.sources.first().is_some_and(|source| {
+                            crate::io::has_extension(
+                                Path::new(&source.path),
+                                crate::io::RAW_EXTENSIONS,
+                            )
+                        })
+                    {
+                        return Err(ProjectError::ClippedRawResult {
+                            path: path.to_path_buf(),
                         });
                     }
                     if c.stack_fingerprint != blob::stack_fingerprint(&fuse.sources) {

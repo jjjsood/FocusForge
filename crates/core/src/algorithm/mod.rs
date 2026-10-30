@@ -41,8 +41,8 @@ pub use error::AlgorithmError;
 /// a checked constructor on `TileOutput` itself still waits for its first
 /// real caller.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TileOutput {
-    pub tile: Tile,
+pub struct TileOutput<S = u16> {
+    pub tile: Tile<S>,
     pub zmap: Vec<u16>,
 }
 
@@ -598,6 +598,19 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     fn params(&self) -> &[ParamDesc];
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError>;
 
+    /// [`Self::fuse`] with the composite left in `f32`: nothing is clamped or
+    /// rounded to 16 bits. A method without an `f32` output refuses.
+    fn fuse_f32(
+        &self,
+        _ctx: &TileCtx<'_>,
+        _cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: self.id().to_string(),
+            detail: "this method has no f32 output".to_string(),
+        })
+    }
+
     /// Registered for tests only: resolvable by id, never chosen as a default.
     fn test_only(&self) -> bool {
         false
@@ -648,10 +661,16 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     /// Heap bytes per pixel of the read rect that one `fuse` call keeps live
     /// beyond the frame-tile and coverage mask the scheduler already counts:
     /// accumulators, per-frame planes and output, for `samples_per_pixel`
-    /// samples per pixel and the resolved `cfg`. The scheduler adds this to
-    /// its per-tile bytes. The default of 0 suits an algorithm that
+    /// samples per pixel, the resolved `cfg` and the stack's sample `format`
+    /// (an `F32` stack fuses into an `f32` output). The scheduler adds this
+    /// to its per-tile bytes. The default of 0 suits an algorithm that
     /// allocates nothing of its own.
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, _samples_per_pixel: u32) -> u64 {
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        _samples_per_pixel: u32,
+        _format: SampleFormat,
+    ) -> u64 {
         0
     }
 }

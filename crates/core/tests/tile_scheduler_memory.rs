@@ -166,13 +166,14 @@ fn peak_live_heap_stays_under_ceiling() {
     let values = params::resolved_values(&resolved);
 
     // Two accounted tiles of the method's own bytes: the budget admits two.
-    let tile_bytes = 128 * 128 * (3 * 2 + 1 + algo.working_bytes_per_pixel(&values, 3));
+    let tile_bytes =
+        128 * 128 * (3 * 2 + 1 + algo.working_bytes_per_pixel(&values, 3, SampleFormat::U16));
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_ceiling");
     let mut options = TileSchedulerOptions::explicit_budget(scratch_base, 2 * tile_bytes);
     options.tile_size = 128;
     options.levels = 2;
-    options.working_bytes_per_pixel = algo.working_bytes_per_pixel(&values, 3);
+    options.working_bytes_per_pixel = algo.working_bytes_per_pixel(&values, 3, SampleFormat::U16);
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
     assert_eq!(
@@ -647,7 +648,8 @@ fn declared_working_bytes_cover_the_measured_peak() {
         let resolved =
             params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve must succeed");
         let values = params::resolved_values(&resolved);
-        let declared = algo.working_bytes_per_pixel(&values, 3) * u64::from(width * height);
+        let declared =
+            algo.working_bytes_per_pixel(&values, 3, SampleFormat::U16) * u64::from(width * height);
 
         let fused = settled_peak(method, 8, width, height, true);
         let baseline = settled_peak(method, 8, width, height, false);
@@ -850,8 +852,9 @@ fn f32_working_bytes_cover_the_measured_peak() {
         }
         let stack_ctx = StackContext::new(8, width, height, 3);
         let resolved = params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve");
-        let declared = algo.working_bytes_per_pixel(&params::resolved_values(&resolved), 3)
-            * u64::from(width * height);
+        let declared =
+            algo.working_bytes_per_pixel(&params::resolved_values(&resolved), 3, SampleFormat::U16)
+                * u64::from(width * height);
         let measured = peak(method, true).saturating_sub(peak(method, false)) as u64;
         eprintln!("{method}: declared {declared} B, measured {measured} B (f32)");
         assert!(
