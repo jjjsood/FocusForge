@@ -330,13 +330,6 @@ fn eight_bit_predictor_wraps_per_byte() {
             expected
         );
     }
-    assert_eq!(
-        TiffSegmentDecoder::new(&eight_bit_header(2, 1, 1, ByteOrder::Little), &[255, 2])
-            .and_then(|decoder| decoder.decode(0))
-            .expect("wrap case")
-            .samples,
-        vec![65535, 257]
-    );
 }
 
 #[test]

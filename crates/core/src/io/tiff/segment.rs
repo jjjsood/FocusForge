@@ -429,14 +429,11 @@ fn samples_and_crop(
     let spp = header.samples_per_pixel as usize;
     let stored_width = info.stored_width as usize;
     let row_samples = stored_width * spp;
+    let predictor = header.predictor == 2;
     let decoded: Vec<u16> = if header.bytes_per_sample() == 1 {
         let mut bytes = raw.to_vec();
-        if header.predictor == 2 {
-            for row in bytes.chunks_exact_mut(row_samples) {
-                for sample in spp..row.len() {
-                    row[sample] = row[sample].wrapping_add(row[sample - spp]);
-                }
-            }
+        if predictor {
+            undo_predictor(&mut bytes, row_samples, spp, u8::wrapping_add);
         }
         bytes.into_iter().map(widen_8bit).collect()
     } else {
@@ -444,12 +441,8 @@ fn samples_and_crop(
             .chunks_exact(2)
             .map(|pair| header.byte_order.u16_from([pair[0], pair[1]]))
             .collect();
-        if header.predictor == 2 {
-            for row in samples.chunks_exact_mut(row_samples) {
-                for sample in spp..row.len() {
-                    row[sample] = row[sample].wrapping_add(row[sample - spp]);
-                }
-            }
+        if predictor {
+            undo_predictor(&mut samples, row_samples, spp, u16::wrapping_add);
         }
         samples
     };
@@ -462,6 +455,21 @@ fn samples_and_crop(
         cropped.extend_from_slice(&row[..info.valid_width as usize * spp]);
     }
     Ok(cropped)
+}
+
+/// Undoes TIFF Predictor 2: each sample is stored as the difference from the
+/// same channel of the previous pixel in its row.
+fn undo_predictor<T: Copy>(
+    samples: &mut [T],
+    row_samples: usize,
+    spp: usize,
+    add: impl Fn(T, T) -> T,
+) {
+    for row in samples.chunks_exact_mut(row_samples) {
+        for i in spp..row.len() {
+            row[i] = add(row[i], row[i - spp]);
+        }
+    }
 }
 
 /// Widens an 8-bit sample to the 16-bit range: 0 stays 0, 255 becomes 65535.
