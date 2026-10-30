@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::blob::FileStamp;
 use crate::align::Registration;
 use crate::params::ParamValues;
-use crate::tile::Rect;
+use crate::tile::{Rect, SampleFormat};
 
 /// A project's `manifest.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,7 +113,20 @@ pub struct BlobRecord {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum BlobKind {
+    /// Little-endian `u16` samples.
     Full,
+    /// Little-endian `f32` samples on the 16-bit scale, unclipped.
+    FullF32,
+}
+
+impl BlobKind {
+    /// The sample type the blob's bytes hold.
+    pub fn sample_format(self) -> SampleFormat {
+        match self {
+            BlobKind::Full => SampleFormat::U16,
+            BlobKind::FullF32 => SampleFormat::F32,
+        }
+    }
 }
 
 /// One source frame, referenced -- never embedded.

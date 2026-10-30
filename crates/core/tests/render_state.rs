@@ -13,9 +13,10 @@ use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
-    Project, ProjectError, SealRequest,
+    self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
+    Plane, Point, Project, ProjectError, SealRequest,
 };
+use focusforge_core::retouch::blend;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -555,4 +556,248 @@ fn pending_state_export_equals_the_saved_export() {
         "one line per missing source"
     );
     assert!(!refused.exists(), "a refused export leaves no file");
+}
+
+/// `image` rendered in `f32` over `tile`, laid out as the tile's own rows.
+fn render_tile_f32(image: &CheckpointImage, project: Option<&mut Project>, tile: Rect) -> Vec<f32> {
+    let spp = image.samples_per_pixel as usize;
+    let row = tile.width as usize * spp;
+    let mut out = vec![0f32; row * tile.height as usize];
+    image
+        .render_f32(project, tile, &mut |band, rect| {
+            let len = rect.width as usize * spp;
+            for r in 0..rect.height as usize {
+                let dst =
+                    (rect.y - tile.y) as usize * row + r * row + (rect.x - tile.x) as usize * spp;
+                out[dst..dst + len].copy_from_slice(&band[r * len..(r + 1) * len]);
+            }
+            Ok(())
+        })
+        .expect("the tile must render in f32");
+    out
+}
+
+fn cut_f32(plane: &[f32], width: u32, spp: u32, tile: Rect) -> Vec<f32> {
+    let mut out = Vec::new();
+    for y in tile.y..tile.y + tile.height {
+        let start = ((y * width + tile.x) * spp) as usize;
+        out.extend_from_slice(&plane[start..start + (tile.width * spp) as usize]);
+    }
+    out
+}
+
+fn bits(samples: &[f32]) -> Vec<u32> {
+    samples.iter().map(|s| s.to_bits()).collect()
+}
+
+fn narrowed(samples: &[f32]) -> Vec<u16> {
+    samples
+        .iter()
+        .map(|&s| (s.clamp(0.0, 65_535.0) + 0.5).floor() as u16)
+        .collect()
+}
+
+#[test]
+fn f32_held_saved_and_pending_render_agree() {
+    let (w, h, spp) = (37u32, 23u32, 3u32);
+    let dir = tmp_dir("render_state_f32");
+    let sources: Vec<PathBuf> = (0..2u32)
+        .map(|i| {
+            let path = dir.join(format!("frame-{i}.tif"));
+            write_tiff(&path, w, h, spp, |s| {
+                (1_000 + (s as u32 * 3 + i * 500) % 4_000) as u16
+            });
+            path
+        })
+        .collect();
+
+    let staged: Vec<f32> = (0..(w * h * spp) as usize)
+        .map(|i| match i % 11 {
+            7 => -250.5 - i as f32,
+            3 => i as f32 * 100.25,
+            _ => 90_000.0 + (i % 13) as f32 * 1.5,
+        })
+        .collect();
+    assert!(staged.iter().any(|&s| s > 65_535.0), "a sample above white");
+    assert!(staged.iter().any(|&s| s < 0.0), "a sample below black");
+    let composite = dir.join("composite.tif");
+    let mut writer = TiffWriter::create_f32(
+        &composite,
+        TiffSpec {
+            width: w,
+            height: h,
+            samples_per_pixel: spp,
+            description: Some("staged composite".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile_f32(full(w, h), &staged).unwrap();
+    writer.finish().unwrap();
+    let zmap = dir.join("zmap.tif");
+    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(w, h, 2).unwrap()).unwrap();
+    map.write_tile(full(w, h), &vec![0u16; (w * h) as usize])
+        .unwrap();
+    map.finish().unwrap();
+
+    let project_path = dir.join(format!("float.{}", project::PROJECT_EXTENSION));
+    let root = project::seal(SealRequest {
+        project_path: &project_path,
+        staged_composite: &composite,
+        staged_zmap: &zmap,
+        sources: &sources,
+        algorithm: "weighted_average",
+        params: &ParamValues::new(),
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        label: None,
+        metrics: Metrics::default(),
+    })
+    .expect("a float staged composite must seal")
+    .checkpoint;
+    let stroke = Op::BrushStroke {
+        source_id: 1,
+        path: vec![Point { x: 6, y: 11 }, Point { x: 30, y: 11 }],
+        radius: 6.0,
+        softness: 0.5,
+    };
+    let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
+        .expect("the stroke must append")
+        .checkpoint;
+
+    let mut project = Project::open(&project_path).unwrap();
+    let kind_of = |hash: &str| {
+        project
+            .manifest()
+            .blobs
+            .iter()
+            .find(|blob| blob.hash == hash)
+            .expect("the manifest lists the blob")
+            .kind
+    };
+    assert_eq!(
+        kind_of(&project.manifest().composite.blob),
+        BlobKind::FullF32
+    );
+    assert_eq!(kind_of(&project.manifest().zmap.blob), BlobKind::Full);
+
+    let held = HeldCheckpoint {
+        composite: composite.clone(),
+        zmap: zmap.clone(),
+        width: w,
+        height: h,
+        sources: sources.clone(),
+        algorithm: "weighted_average".to_string(),
+        params: ParamValues::new(),
+        align: None,
+        registration: Registration::default(),
+        composite_description: "staged composite".to_string(),
+        metrics: Metrics::default(),
+        created_at: 0,
+        compressed_composite: None,
+    };
+    let pending = project::PendingState {
+        composite: composite.clone(),
+        ops: Vec::new(),
+        sources: sources.clone(),
+        registration: Registration::default(),
+        reference: 0,
+        description: "staged composite".to_string(),
+    };
+    let pending_stroked = project::PendingState {
+        ops: vec![stroke.clone()],
+        ..pending.clone()
+    };
+    let held_image = CheckpointImage::prepare_held(&held).unwrap();
+    let pending_image = CheckpointImage::prepare_pending(&pending).unwrap();
+    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked).unwrap();
+    let root_image = CheckpointImage::prepare(&project, &root).unwrap();
+    let edited_image = CheckpointImage::prepare(&project, &edited).unwrap();
+
+    let info = ZMapInfo::new(w, h, 2).unwrap();
+    let edited_whole = render_tile_f32(&edited_image, Some(&mut project), full(w, h));
+    let mut soft_edge = 0;
+    for (i, (&after, &before)) in edited_whole.iter().zip(&staged).enumerate() {
+        let pixel = i as u32 / spp;
+        let alpha = blend::alpha(&stroke, info, pixel % w, pixel / w).unwrap();
+        if alpha == 0 {
+            assert_eq!(
+                after.to_bits(),
+                before.to_bits(),
+                "sample {i} is outside the stroke"
+            );
+        } else if alpha < 65_536 && before > 65_535.0 && after > 65_535.0 && after < before {
+            soft_edge += 1;
+        }
+    }
+    assert!(
+        soft_edge > 0,
+        "a soft-edge sample keeps a value above white"
+    );
+    assert_ne!(
+        bits(&edited_whole),
+        bits(&staged),
+        "the stroke must change the image"
+    );
+
+    for tile in [
+        full(w, h),
+        Rect {
+            x: 5,
+            y: 3,
+            width: 20,
+            height: 11,
+        },
+    ] {
+        let expect = cut_f32(&staged, w, spp, tile);
+        for (label, image, on_project) in [
+            ("held", &held_image, false),
+            ("pending", &pending_image, false),
+            ("saved root", &root_image, true),
+        ] {
+            let got = render_tile_f32(image, on_project.then_some(&mut project), tile);
+            assert_eq!(bits(&got), bits(&expect), "{label}: tile {tile:?}");
+        }
+        let expect = cut_f32(&edited_whole, w, spp, tile);
+        let saved = render_tile_f32(&edited_image, Some(&mut project), tile);
+        let unsaved = render_tile_f32(&pending_stroked_image, None, tile);
+        assert_eq!(bits(&saved), bits(&expect), "saved edit: tile {tile:?}");
+        assert_eq!(bits(&unsaved), bits(&expect), "pending edit: tile {tile:?}");
+    }
+
+    assert_eq!(
+        render_tile(&root_image, Some(&mut project), full(w, h)),
+        narrowed(&staged),
+        "render narrows the f32 samples"
+    );
+    assert_eq!(
+        render_tile(&edited_image, Some(&mut project), full(w, h)),
+        narrowed(&edited_whole),
+        "render narrows the retouched f32 samples"
+    );
+    let mut plane = Vec::new();
+    project
+        .read_plane_into(Plane::Composite, &mut |band, _| {
+            plane.extend_from_slice(band)
+        })
+        .unwrap();
+    assert_eq!(
+        plane,
+        narrowed(&staged),
+        "read_plane_into narrows the f32 blob"
+    );
+
+    let sixteen = dir.join("sixteen.tif");
+    write_tiff(&sixteen, w, h, spp, |s| s as u16);
+    let held_sixteen = HeldCheckpoint {
+        composite: sixteen,
+        ..held
+    };
+    let image = CheckpointImage::prepare_held(&held_sixteen).unwrap();
+    assert!(
+        image
+            .render_f32(None, full(w, h), &mut |_, _| Ok(()))
+            .is_err(),
+        "a 16-bit image is refused by render_f32"
+    );
 }

@@ -780,6 +780,21 @@ impl TileReader for crate::io::TiffStack {
             .map_err(crate::io::FrameError::from)
             .map_err(AlgorithmError::from)
     }
+
+    fn sample_format(&self) -> SampleFormat {
+        crate::io::TiffStack::sample_format(self)
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        crate::io::TiffStack::read_tile_f32_into(self, frame, rect, out)
+            .map_err(crate::io::FrameError::from)
+            .map_err(AlgorithmError::from)
+    }
 }
 
 #[cfg(test)]
