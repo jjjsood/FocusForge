@@ -16,10 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::io::{self, StripCompression, StripSpec, StripWriter};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, validate};
+use crate::tile::SampleFormat;
 
 use super::Project;
 use super::error::ProjectError;
-use super::render::{CheckpointImage, PendingState, Renderer, write_tiff, write_via_partial};
+use super::render::{
+    CheckpointImage, PendingState, RenderSink, Renderer, write_tiff, write_via_partial,
+};
 use super::seal::HeldCheckpoint;
 
 /// The largest side JPEG can encode: SOF0's width/height fields are 16 bits.
@@ -32,6 +35,8 @@ pub enum ExportFormat {
     Tiff,
     Png,
     Jpeg,
+    /// A linear DNG of a RAW project, in the camera's own colour space.
+    Dng,
 }
 
 impl ExportFormat {
@@ -44,6 +49,8 @@ impl ExportFormat {
             Some(ExportFormat::Png)
         } else if io::has_extension(path, io::JPEG_EXTENSIONS) {
             Some(ExportFormat::Jpeg)
+        } else if io::has_extension(path, io::DNG_EXTENSIONS) {
+            Some(ExportFormat::Dng)
         } else {
             None
         }
@@ -54,6 +61,7 @@ impl ExportFormat {
             ExportFormat::Tiff => "tiff",
             ExportFormat::Png => "png",
             ExportFormat::Jpeg => "jpeg",
+            ExportFormat::Dng => "dng",
         }
     }
 }
@@ -115,6 +123,7 @@ pub enum ExportOptions {
         quality: i64,
         subsampling: JpegSubsampling,
     },
+    Dng,
 }
 
 impl Default for ExportOptions {
@@ -278,6 +287,7 @@ pub fn params_for(format: ExportFormat) -> &'static [ParamDesc] {
         ExportFormat::Tiff => &TIFF_PARAMS,
         ExportFormat::Png => &PNG_PARAMS,
         ExportFormat::Jpeg => &JPEG_PARAMS,
+        ExportFormat::Dng => &[],
     }
 }
 
@@ -301,7 +311,8 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             id: "icc".to_string(),
             label: "Embed ICC profile".to_string(),
             help: "Embeds the source frame's own colour profile, or a built-in sRGB profile \
-                   for a RAW source."
+                   for a RAW source. Has no effect on a DNG, whose colour is defined by its \
+                   camera matrices."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(true),
@@ -421,6 +432,9 @@ pub enum IccStatus {
     BuiltinSrgb,
     None,
     Skipped,
+    /// The format has no ICC profile to embed (a DNG's colour is its camera
+    /// matrices).
+    Unsupported,
 }
 
 /// [`export_checkpoint`]'s companion result: which source frame the EXIF
@@ -489,6 +503,7 @@ impl ExportOptions {
             ExportOptions::Tiff { .. } => ExportFormat::Tiff,
             ExportOptions::Png { .. } => ExportFormat::Png,
             ExportOptions::Jpeg { .. } => ExportFormat::Jpeg,
+            ExportOptions::Dng => ExportFormat::Dng,
         }
     }
 
@@ -538,6 +553,7 @@ impl ExportOptions {
                     _ => JpegSubsampling::S444,
                 },
             },
+            ExportFormat::Dng => ExportOptions::Dng,
         })
     }
 
@@ -608,6 +624,7 @@ impl ExportOptions {
                     ),
                 );
             }
+            ExportOptions::Dng => {}
         }
         out
     }
@@ -682,11 +699,13 @@ pub fn export_checkpoint(
     let record = project.fuse_state(id)?;
     let frame = record.align.as_ref().map_or(0, |a| a.reference);
     let frame_path = project.source_path(&record.sources[frame]);
+    let first_path = project.source_path(&record.sources[0]);
     encode(
         &image,
-        &mut |sink| image.render(Some(&mut *project), image.full(), sink),
+        Some(project),
         frame,
         &frame_path,
+        &first_path,
         path,
         options,
         metadata_options,
@@ -706,9 +725,10 @@ pub fn export_held(
     let frame = held.align.as_ref().map_or(0, |a| a.reference);
     encode(
         &image,
-        &mut |sink| image.render(None, image.full(), sink),
+        None,
         frame,
         &held.sources[frame],
+        &held.sources[0],
         path,
         options,
         metadata_options,
@@ -730,25 +750,28 @@ pub fn export_pending(
     let frame_path = state.sources[frame].clone();
     encode(
         &image,
-        &mut |sink| image.render(None, image.full(), sink),
+        None,
         frame,
         &frame_path,
+        &state.sources[0],
         path,
         options,
         metadata_options,
     )
 }
 
-/// Validates `options`, writes `image` through `render` as `options` say (a
-/// `.partial` sibling of `path`, renamed onto it only once complete), and
-/// resolves `frame_path`'s metadata into the same file -- a damaged or
-/// missing block is named in the returned [`MetadataOutcome`], never fatal.
-/// Shared by [`export_checkpoint`], [`export_held`] and [`export_pending`].
+/// Validates `options`, renders `image` (against `project` for a saved
+/// checkpoint), writes it as `options` say through a `.partial` sibling of
+/// `path`, and resolves `frame_path`'s metadata into the same file; a bad
+/// block is named in the [`MetadataOutcome`], never fatal. A DNG takes its
+/// camera colour from `first_frame_path`, the frame the RAW look came from.
+#[allow(clippy::too_many_arguments)] // one input apiece; a struct wrapper would only rename this list
 fn encode(
     image: &CheckpointImage,
-    render: &mut Renderer<'_>,
+    mut project: Option<&mut Project>,
     frame: usize,
     frame_path: &Path,
+    first_frame_path: &Path,
     path: &Path,
     options: &ExportOptions,
     metadata_options: &MetadataOptions,
@@ -771,7 +794,18 @@ fn encode(
         metadata_options.iptc,
     );
 
+    let mut render =
+        |sink: &mut RenderSink<'_>| image.render(project.as_deref_mut(), image.full(), sink);
+    let render: &mut Renderer<'_> = &mut render;
     let blocks = match options {
+        ExportOptions::Dng => write_dng(
+            image,
+            project,
+            first_frame_path,
+            path,
+            &plan,
+            metadata_options,
+        )?,
         ExportOptions::Tiff {
             bits: TiffBits::Sixteen,
             compression: TiffCompression::None,
@@ -827,6 +861,90 @@ fn encode(
         xmp: blocks.xmp,
         iptc: blocks.iptc,
         warnings,
+    })
+}
+
+/// A linear DNG of a RAW document, through [`StripWriter`]: each rendered
+/// `f32` band goes back through the first frame's inverse look to camera
+/// space, is clipped to the sensor range and rounded to 16 bits. The EXIF
+/// plan rides along; the camera tags replace what it holds under the same tag.
+/// Nothing is rendered or created when `image` is no RAW document or the first
+/// frame cannot describe its camera colour.
+fn write_dng(
+    image: &CheckpointImage,
+    project: Option<&mut Project>,
+    first_frame_path: &Path,
+    path: &Path,
+    plan: &io::MetadataPlan,
+    metadata_options: &MetadataOptions,
+) -> Result<MetadataBlocks, ProjectError> {
+    if image.sample_format != SampleFormat::F32 || image.samples_per_pixel != 3 {
+        return Err(ProjectError::ExportDngNeedsRaw {
+            path: path.to_path_buf(),
+        });
+    }
+    let colour =
+        io::raw::dng_colour(first_frame_path).map_err(|source| ProjectError::ExportDngColour {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+    let mut ifd0 = plan.tags.ifd0.clone();
+    for entry in io::dng_entries(&colour) {
+        io::set_entry(&mut ifd0, entry);
+    }
+    let metadata = io::MetadataTags {
+        ifd0,
+        exif: plan.tags.exif.clone(),
+        gps: plan.tags.gps.clone(),
+    };
+
+    write_via_partial(path, |partial| {
+        let mut writer = StripWriter::create(
+            partial,
+            StripSpec {
+                width: image.width,
+                height: image.height,
+                samples_per_pixel: 3,
+                bits_per_sample: 16,
+                compression: StripCompression::None,
+                description: Some(image.description.clone()),
+                metadata,
+            },
+        )
+        .map_err(|err| ProjectError::container(partial, err))?;
+        let mut row_bytes: Vec<u8> = Vec::new();
+        image.render_f32(project, image.full(), &mut |band, _rect| {
+            row_bytes.clear();
+            for pixel in band.chunks_exact(3) {
+                let camera = colour
+                    .look
+                    .inverse([0, 1, 2].map(|c| f64::from(pixel[c]) / 65_535.0));
+                for value in camera {
+                    let sample = (value.clamp(0.0, 1.0) * 65_535.0).round() as u16;
+                    row_bytes.extend(sample.to_le_bytes());
+                }
+            }
+            writer
+                .write_rows(&row_bytes)
+                .map_err(|err| ProjectError::container(path, err))
+        })?;
+        writer
+            .finish()
+            .map_err(|err| ProjectError::container(path, err))
+            .map(|_| ())
+    })?;
+
+    // A RAW source has neither XMP nor IPTC, and a DNG holds no ICC profile.
+    Ok(MetadataBlocks {
+        exif: block_status(metadata_options.exif, true, plan.has_exif, false),
+        icc: if metadata_options.icc {
+            IccStatus::Unsupported
+        } else {
+            IccStatus::Off
+        },
+        xmp: block_status(metadata_options.xmp, true, false, false),
+        iptc: block_status(metadata_options.iptc, true, false, false),
+        warnings: Vec::new(),
     })
 }
 
@@ -1456,6 +1574,7 @@ mod tests {
             ("out.png", Some(ExportFormat::Png)),
             ("out.jpg", Some(ExportFormat::Jpeg)),
             ("out.JPEG", Some(ExportFormat::Jpeg)),
+            ("out.DNG", Some(ExportFormat::Dng)),
             ("out.webp", None),
             ("out", None),
         ] {

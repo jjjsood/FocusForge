@@ -6,6 +6,8 @@ use std::time::SystemTime;
 
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use rawler::imgop::xyz::Illuminant;
+use rawler::rawimage::RawImage;
 use rawler::rawsource::RawSource;
 
 use super::grouping::parse_exif_datetime;
@@ -607,18 +609,128 @@ fn channel_means(samples: &[[f32; 3]]) -> [f64; 3] {
     sums.map(|sum| sum / samples.len().max(1) as f64)
 }
 
-/// The look transform of the camera that took the file at `path`, from its
-/// metadata alone.
-fn reference_look(path: &Path) -> Result<LookTransform, RawError> {
+/// The header-only [`RawImage`] of the file at `path`: camera facts and
+/// colour data, no pixels.
+fn reference_image(path: &Path) -> Result<RawImage, RawError> {
     let source = RawSource::new(path).map_err(|source| RawError::Io {
         path: path.to_path_buf(),
         source,
     })?;
     let decoder = seam(path, || rawler::get_decoder(&source))?;
-    let image = seam(path, || {
+    seam(path, || {
         decoder.raw_image(&source, &RawDecodeParams::default(), true)
-    })?;
-    Ok(LookTransform::from_image(&image))
+    })
+}
+
+/// The look transform of the camera that took the file at `path`, from its
+/// metadata alone.
+fn reference_look(path: &Path) -> Result<LookTransform, RawError> {
+    Ok(LookTransform::from_image(&reference_image(path)?))
+}
+
+/// One of a camera's XYZ-to-camera matrices with the DNG light-source code of
+/// the illuminant it was measured under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DngMatrix {
+    /// DNG `CalibrationIlluminant` code.
+    pub illuminant: u16,
+    /// Row-major XYZ-to-camera matrix.
+    pub xyz_to_camera: [f32; 9],
+}
+
+/// What a DNG needs to describe the camera space of a RAW stack's document:
+/// the look transform whose inverse leads back to it, and the colour tags of
+/// the first frame, the frame the look was taken from.
+#[derive(Debug, Clone)]
+pub struct DngColour {
+    /// Camera-linear to look-space transform of the first frame.
+    pub look: LookTransform,
+    /// Camera make, cleaned to a short consistent name.
+    pub make: String,
+    /// Camera model, cleaned to a short consistent name.
+    pub model: String,
+    /// `make` and `model` joined: the DNG's unique camera model.
+    pub unique_model: String,
+    /// TIFF Orientation of the frame, `None` when the file carries none.
+    pub orientation: Option<u16>,
+    /// The camera's matrices with a known colour temperature, at most two,
+    /// the lower colour temperature first.
+    pub matrices: Vec<DngMatrix>,
+    /// As-shot neutral: the reciprocal of the white-balance multipliers,
+    /// normalised to green = 1.
+    pub as_shot_neutral: [f64; 3],
+}
+
+/// Correlated colour temperature in kelvin of the illuminants a camera
+/// matrix is commonly measured under.
+fn colour_temperature(illuminant: Illuminant) -> Option<u32> {
+    Some(match illuminant {
+        Illuminant::A => 2856,
+        Illuminant::Tungsten => 2850,
+        Illuminant::B => 4874,
+        Illuminant::D50 => 5003,
+        Illuminant::Daylight => 5500,
+        Illuminant::D55 => 5503,
+        Illuminant::D65 => 6504,
+        Illuminant::C => 6774,
+        Illuminant::D75 => 7504,
+        _ => return None,
+    })
+}
+
+/// The DNG colour data of the camera that took the file at `path`, read from
+/// the same header as the stack's look transform, so look and tags cannot
+/// disagree.
+/// A monochrome sensor, a camera with no 3x3 matrix of known colour
+/// temperature and a file without usable as-shot multipliers are refused
+/// with [`RawError::Unsupported`].
+pub fn dng_colour(path: &Path) -> Result<DngColour, RawError> {
+    panic_boundary(path, || {
+        let image = reference_image(path)?;
+        let refuse = |detail: &str| RawError::Unsupported {
+            path: path.to_path_buf(),
+            make: image.clean_make.clone(),
+            model: image.clean_model.clone(),
+            detail: detail.to_string(),
+        };
+        if image.is_monochrome() {
+            return Err(refuse("a monochrome sensor has no camera colour space"));
+        }
+        let wb = image.wb_coeffs;
+        if !wb[..3].iter().all(|c| c.is_finite() && *c > 0.0) {
+            return Err(refuse("the file carries no as-shot white balance"));
+        }
+        let mut matrices: Vec<(u32, DngMatrix)> = image
+            .color_matrix
+            .iter()
+            .filter_map(|(&illuminant, flat)| {
+                Some((
+                    colour_temperature(illuminant)?,
+                    DngMatrix {
+                        illuminant: illuminant as u16,
+                        xyz_to_camera: flat.as_slice().try_into().ok()?,
+                    },
+                ))
+            })
+            .collect();
+        matrices.sort_by_key(|(kelvin, _)| *kelvin);
+        let Some(coolest) = matrices.first().cloned() else {
+            return Err(refuse("the file carries no colour matrix"));
+        };
+        let mut chosen = vec![coolest.1];
+        if matrices.len() > 1 {
+            chosen.extend(matrices.pop().map(|(_, matrix)| matrix));
+        }
+        Ok(DngColour {
+            look: LookTransform::from_image(&image),
+            make: image.clean_make.clone(),
+            model: image.clean_model.clone(),
+            unique_model: format!("{} {}", image.clean_make, image.clean_model),
+            orientation: Some(image.orientation.to_u16()).filter(|&o| o != 0),
+            matrices: chosen,
+            as_shot_neutral: [0, 1, 2].map(|c| f64::from(wb[1]) / f64::from(wb[c])),
+        })
+    })
 }
 
 fn open_frame(path: &Path) -> Result<RawFrame, RawError> {

@@ -6,6 +6,10 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Added
+
+- `focusforge-cli export` writes a linear DNG (`.dng` or `--format dng`) of a camera RAW project, in the camera's own colour space with its colour matrices and as-shot white balance, so a raw converter develops it with exposure, white balance and highlight recovery still open.
+
 ### Changed
 
 - A RAW project now keeps highlights above white in its saved result instead of clipping them at 16 bits, so a RAW project saved by an earlier version is refused on open and must be stacked from its source frames again.

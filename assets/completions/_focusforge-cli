@@ -94,7 +94,7 @@ _arguments "${_arguments_options[@]}" : \
 '--output=[Write the image to this path]:FILE:_files' \
 '--zmap=[Write the Z-Map to this path]:FILE:_files' \
 '--checkpoint=[A checkpoint id or unique id prefix. Defaults to the head. An unedited image export needs no source frames; an edited one re-reads and verifies the nearest fused ancestor'\''s. \`--zmap\` alone needs none]:ID:_default' \
-'--format=[The image format to write\: \`tiff\`, \`png\` or \`jpeg\`. Inferred from \`-o\`'\''s extension when omitted (\`.tif\`/\`.tiff\` -> tiff, \`.png\` -> png, \`.jpg\`/\`.jpeg\` -> jpeg, no extension -> tiff, the default); refused if it names a format other than a recognised extension'\''s]:FORMAT:_default' \
+'--format=[The image format to write\: \`tiff\`, \`png\`, \`jpeg\` or \`dng\` (a linear DNG of a RAW project). Inferred from \`-o\`'\''s extension when omitted (\`.tif\`/\`.tiff\` -> tiff, \`.png\` -> png, \`.jpg\`/\`.jpeg\` -> jpeg, \`.dng\` -> dng, no extension -> tiff, the default); refused if it names a format other than a recognised extension'\''s]:FORMAT:_default' \
 '--tiff-bits=[TIFF bit depth\: \`16\` (default) or \`8\`. TIFF only]:BITS:_default' \
 '--tiff-compression=[TIFF strip compression\: \`none\` (default), \`lzw\` or \`deflate\`. TIFF only]:NAME:_default' \
 '--png-bits=[PNG bit depth\: \`16\` (default) or \`8\`. PNG only]:BITS:_default' \
@@ -102,7 +102,7 @@ _arguments "${_arguments_options[@]}" : \
 '--jpeg-quality=[JPEG quality, 1-100, default 95. JPEG only]:N:_default' \
 '--jpeg-subsampling=[JPEG chroma subsampling\: \`420\` (default) or \`444\`. JPEG only]:SPEC:_default' \
 '--exif=[Carry the alignment reference frame'\''s EXIF\: \`on\` (default) or \`off\`]:EXIF:_default' \
-'--icc=[Embed an ICC profile\: \`on\` (default) or \`off\`]:ICC:_default' \
+'--icc=[Embed an ICC profile\: \`on\` (default) or \`off\`. Has no effect on a DNG, whose colour is defined by its camera matrices]:ICC:_default' \
 '--xmp=[Carry the source frame'\''s XMP packet verbatim\: \`on\` or \`off\` (default)]:XMP:_default' \
 '--iptc=[Carry the source frame'\''s IPTC block verbatim\: \`on\` or \`off\` (default). Never written to PNG]:IPTC:_default' \
 '--frame=[Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint'\''s own composite width and height. Requires \`--frame-output\`]:INDEX:_default' \

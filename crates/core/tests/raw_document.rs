@@ -10,21 +10,27 @@ mod raw_dng;
 
 use std::path::{Path, PathBuf};
 
+use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::Registration;
+use focusforge_core::io::RawStack;
 use focusforge_core::io::TiffHeader;
+use focusforge_core::io::raw::{LookTransform, dng_colour};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{
-    ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression, TiffBits,
-    TiffCompression, to_8bit,
+    ExportOptions, IccStatus, JpegSubsampling, MetadataOptions, MetadataStatus, PngBits,
+    PngCompression, TiffBits, TiffCompression, to_8bit,
 };
 use focusforge_core::project::{
     self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
-    PendingState, Point, Project, SealRequest,
+    PendingState, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::tile::{Sample, SampleFormat};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use raw_dng::{DngSpec, write_dng};
+use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use rawler::imgop::xyz::Illuminant;
+use rawler::rawimage::RawPhotometricInterpretation;
 
 const AS_SHOT_NEUTRAL: [f32; 3] = [0.5, 1.0, 0.625];
 
@@ -48,6 +54,17 @@ fn full(width: u32, height: u32) -> Rect {
 /// frame, bright enough that the as-shot white balance pushes the red channel
 /// past white.
 fn dng_frames(count: usize, width: u32, height: u32) -> Vec<tempfile::NamedTempFile> {
+    dng_frames_with(count, width, height, |_| {})
+}
+
+/// [`dng_frames`] with `adjust` applied to every frame's spec before it is
+/// written.
+fn dng_frames_with(
+    count: usize,
+    width: u32,
+    height: u32,
+    adjust: impl Fn(&mut DngSpec),
+) -> Vec<tempfile::NamedTempFile> {
     (0..count)
         .map(|frame| {
             let samples = (0..width * height)
@@ -67,6 +84,7 @@ fn dng_frames(count: usize, width: u32, height: u32) -> Vec<tempfile::NamedTempF
             spec.width = width;
             spec.height = height;
             spec.as_shot_neutral = Some(AS_SHOT_NEUTRAL);
+            adjust(&mut spec);
             write_dng(&spec, false)
         })
         .collect()
@@ -520,7 +538,7 @@ fn seal_over(dir: &Path, sources: &[PathBuf], (width, height): (u32, u32), wide:
     let composite = dir.join("composite.tif");
     let len = (width * height * 3) as usize;
     if wide {
-        let samples: Vec<f32> = (0..len).map(|i| 70_000.0 + i as f32).collect();
+        let samples: Vec<f32> = (0..len).map(|i| i as f32 * 0.37 % 90_000.0).collect();
         let mut writer = TiffWriter::create_f32(&composite, spec).unwrap();
         writer
             .write_tile_f32(full(width, height), &samples)
@@ -600,4 +618,542 @@ fn legacy_raw_project_refused() {
         .collect();
     let tiff = seal_over(&tiff_dir, &tiff_sources, (width, height), false);
     Project::open(&tiff).expect("a TIFF project with a 16-bit result opens");
+}
+
+// --- linear DNG export -------------------------------------------------------
+
+const MATRIX_D65: [f32; 9] = [0.9, 0.05, -0.1, -0.2, 1.1, 0.08, 0.02, -0.15, 0.8];
+const MATRIX_A: [f32; 9] = [1.2, -0.1, 0.0, -0.3, 1.2, 0.1, 0.05, -0.2, 0.9];
+const ILLUMINANT_A: u16 = 17;
+const ILLUMINANT_D65: u16 = 21;
+const CAPTURE_TIME: &str = "2026:10:30 12:00:00";
+
+fn colour_frames(count: usize, width: u32, height: u32) -> Vec<tempfile::NamedTempFile> {
+    dng_frames_with(count, width, height, |spec| {
+        spec.color_matrix = Some(MATRIX_D65);
+        spec.orientation = Some(6);
+        spec.capture_time = Some(CAPTURE_TIME.to_string());
+    })
+}
+
+/// One entry of a little-endian TIFF directory: its field type, count and
+/// value bytes, offsets already followed.
+struct DirEntry {
+    tag: u16,
+    kind: u16,
+    count: u32,
+    value: Vec<u8>,
+}
+
+impl DirEntry {
+    fn shorts(&self) -> Vec<u16> {
+        self.value
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    }
+
+    fn longs(&self) -> Vec<u32> {
+        self.value
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()
+    }
+
+    fn ascii(&self) -> String {
+        String::from_utf8_lossy(&self.value)
+            .trim_end_matches('\0')
+            .to_string()
+    }
+
+    /// RATIONAL or SRATIONAL values as `f64`.
+    fn rationals(&self) -> Vec<f64> {
+        self.value
+            .chunks_exact(8)
+            .map(|b| {
+                let numerator = [b[0], b[1], b[2], b[3]];
+                let denominator = f64::from(u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
+                if self.kind == 10 {
+                    f64::from(i32::from_le_bytes(numerator)) / denominator
+                } else {
+                    f64::from(u32::from_le_bytes(numerator)) / denominator
+                }
+            })
+            .collect()
+    }
+}
+
+struct DngFile {
+    bytes: Vec<u8>,
+    ifd0: Vec<DirEntry>,
+    /// The offset of the directory after IFD0; 0 for none.
+    next_ifd: u32,
+}
+
+fn read_dir(bytes: &[u8], at: usize) -> (Vec<DirEntry>, u32) {
+    assert_eq!(&bytes[..2], b"II");
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let count = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+    let entries = (0..count)
+        .map(|i| {
+            let e = at + 2 + i * 12;
+            let tag = u16::from_le_bytes([bytes[e], bytes[e + 1]]);
+            let kind = u16::from_le_bytes([bytes[e + 2], bytes[e + 3]]);
+            let count = word(e + 4);
+            let size = match kind {
+                3 => 2,
+                4 => 4,
+                5 | 10 => 8,
+                _ => 1,
+            } * count as usize;
+            let start = if size <= 4 {
+                e + 8
+            } else {
+                word(e + 8) as usize
+            };
+            DirEntry {
+                tag,
+                kind,
+                count,
+                value: bytes[start..start + size].to_vec(),
+            }
+        })
+        .collect();
+    (entries, word(at + 2 + count * 12))
+}
+
+fn read_dng(path: &Path) -> DngFile {
+    let bytes = std::fs::read(path).unwrap();
+    let ifd0_at = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let (ifd0, next_ifd) = read_dir(&bytes, ifd0_at);
+    DngFile {
+        bytes,
+        ifd0,
+        next_ifd,
+    }
+}
+
+impl DngFile {
+    fn tag(&self, tag: u16) -> Option<&DirEntry> {
+        self.ifd0.iter().find(|e| e.tag == tag)
+    }
+
+    fn need(&self, tag: u16) -> &DirEntry {
+        self.tag(tag)
+            .unwrap_or_else(|| panic!("IFD0 carries tag {tag}"))
+    }
+
+    fn exif_ifd(&self) -> Option<Vec<DirEntry>> {
+        let at = self.tag(34665)?.longs()[0] as usize;
+        Some(read_dir(&self.bytes, at).0)
+    }
+
+    fn samples(&self) -> Vec<u16> {
+        let offsets = self.need(273).longs();
+        let counts = self.need(279).longs();
+        offsets
+            .iter()
+            .zip(&counts)
+            .flat_map(|(&at, &len)| self.bytes[at as usize..(at + len) as usize].chunks_exact(2))
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    }
+}
+
+fn dng_meta(exif: bool) -> MetadataOptions {
+    MetadataOptions {
+        exif,
+        icc: true,
+        xmp: true,
+        iptc: true,
+    }
+}
+
+fn assert_close(got: &[f64], want: &[f64], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() < 1e-4, "{what}: {got:?} vs {want:?}");
+    }
+}
+
+fn f64s(values: &[f32]) -> Vec<f64> {
+    values.iter().map(|&v| f64::from(v)).collect()
+}
+
+/// `wide` (look values, three per pixel) carried back through `look`'s
+/// inverse, clipped to the sensor range and rounded to 16 bits.
+fn camera_16bit(look: &LookTransform, wide: &[f32]) -> Vec<u16> {
+    wide.chunks_exact(3)
+        .flat_map(|px| {
+            let camera = look.inverse([0, 1, 2].map(|c| f64::from(px[c]) / 65_535.0));
+            camera.map(|c| (c.clamp(0.0, 1.0) * 65_535.0).round() as u16)
+        })
+        .collect()
+}
+
+fn assert_within(got: &[u16], want: &[u16], tolerance: u16, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.abs_diff(*w) <= tolerance,
+            "{what}: sample {i}: {g} vs {w}"
+        );
+    }
+}
+
+fn check_dng_tags(label: &str, second: Option<([f32; 9], u16)>, exif: bool) {
+    let frames = dng_frames_with(3, 24, 16, |spec| {
+        spec.color_matrix = Some(MATRIX_D65);
+        spec.color_matrix2 = second;
+        spec.orientation = Some(6);
+        spec.capture_time = Some(CAPTURE_TIME.to_string());
+    });
+    let dir = tmp_dir(&format!("raw_document_dng_tags_{label}"));
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let out = dir.join("out.dng");
+    let outcome =
+        project::export_held(&held, &out, &ExportOptions::Dng, &dng_meta(exif)).expect("DNG");
+    assert_eq!(outcome.icc, IccStatus::Unsupported, "{label}");
+    assert_eq!(outcome.xmp, MetadataStatus::Absent, "{label}");
+    assert_eq!(outcome.iptc, MetadataStatus::Absent, "{label}");
+
+    let dng = read_dng(&out);
+    assert_eq!(dng.next_ifd, 0, "{label}: one IFD");
+    assert_eq!(
+        dng.ifd0.iter().filter(|e| e.tag == 262).count(),
+        1,
+        "{label}"
+    );
+    assert_eq!(dng.need(262).shorts(), [34892], "{label}");
+    assert_eq!(dng.need(277).shorts(), [3], "{label}");
+    assert_eq!(dng.need(258).shorts(), [16, 16, 16], "{label}");
+    assert_eq!(dng.need(50706).value, [1, 4, 0, 0], "{label}: DNGVersion");
+    assert!(dng.need(50714).shorts().iter().all(|&b| b == 0), "{label}");
+    assert!(
+        dng.need(50717).longs().iter().all(|&w| w == 65_535),
+        "{label}"
+    );
+    assert!(dng.tag(34675).is_none(), "{label}: no ICC profile");
+
+    let source = rawler::decode_file(frames[0].path()).unwrap();
+    let wb = source.wb_coeffs;
+    let neutral: Vec<f64> = (0..3).map(|c| f64::from(wb[1] / wb[c])).collect();
+    assert_close(&dng.need(50728).rationals(), &neutral, label);
+
+    let mut expected = vec![(MATRIX_D65, ILLUMINANT_D65)];
+    expected.extend(second);
+    expected.sort_by_key(|&(_, illuminant)| illuminant != ILLUMINANT_A);
+    assert_eq!(dng.need(50721).count, 9, "{label}");
+    assert_close(&dng.need(50721).rationals(), &f64s(&expected[0].0), label);
+    assert_eq!(dng.need(50778).shorts(), [expected[0].1], "{label}");
+    match expected.get(1) {
+        Some((matrix, illuminant)) => {
+            assert_close(&dng.need(50722).rationals(), &f64s(matrix), label);
+            assert_eq!(dng.need(50779).shorts(), [*illuminant], "{label}");
+        }
+        None => {
+            assert!(
+                dng.tag(50722).is_none() && dng.tag(50779).is_none(),
+                "{label}"
+            );
+        }
+    }
+
+    assert_eq!(dng.need(50708).ascii(), "FocusForge Test Synthetic Bayer");
+    assert_eq!(dng.need(271).ascii(), "FocusForge Test", "{label}");
+    assert_eq!(dng.need(272).ascii(), "Synthetic Bayer", "{label}");
+    assert_eq!(dng.need(274).shorts(), [6], "{label}: Orientation");
+    match (exif, dng.exif_ifd()) {
+        (true, Some(entries)) => {
+            let taken = entries
+                .iter()
+                .find(|e| e.tag == 36867)
+                .expect("capture time");
+            assert_eq!(taken.ascii(), CAPTURE_TIME, "{label}");
+        }
+        (false, None) => {}
+        (on, found) => panic!("{label}: exif {on}, EXIF IFD present {}", found.is_some()),
+    }
+
+    let image = rawler::decode_file(&out).expect("a converter's reader opens the DNG");
+    assert_eq!(image.photometric, RawPhotometricInterpretation::LinearRaw);
+    assert_eq!(image.cpp, 3, "{label}");
+    assert_close(
+        &f64s(&image.wb_coeffs[..3]),
+        &f64s(&source.wb_coeffs[..3]),
+        label,
+    );
+    for (matrix, illuminant) in &expected {
+        let illuminant = Illuminant::try_from(*illuminant).unwrap();
+        assert_close(
+            &f64s(&image.color_matrix[&illuminant]),
+            &f64s(matrix),
+            label,
+        );
+    }
+}
+
+#[test]
+fn dng_tags() {
+    for exif in [true, false] {
+        check_dng_tags(&format!("one_{exif}"), None, exif);
+        check_dng_tags(&format!("two_{exif}"), Some((MATRIX_A, ILLUMINANT_A)), exif);
+    }
+}
+
+/// Rawler's camera-linear development of `path`, three samples per pixel.
+fn camera_linear(path: &Path) -> Vec<f32> {
+    let image = rawler::decode_file(path).unwrap();
+    let steps = [
+        ProcessingStep::Rescale,
+        ProcessingStep::Demosaic,
+        ProcessingStep::FujiRotate,
+        ProcessingStep::CropActiveArea,
+        ProcessingStep::CropDefault,
+    ];
+    match RawDevelop::new_with(&steps)
+        .develop_intermediate(&image)
+        .unwrap()
+    {
+        Intermediate::ThreeColor(pixels) => pixels.data.into_iter().flatten().collect(),
+        _ => panic!("a colour frame develops to three channels"),
+    }
+}
+
+#[test]
+fn dng_identical_frames_round_trip() {
+    let (width, height) = (24u32, 16u32);
+    let first = colour_frames(1, width, height).remove(0);
+    let dir = tmp_dir("raw_document_dng_identical");
+    let sources: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let copy = dir.join(format!("frame-{i}.dng"));
+            std::fs::copy(first.path(), &copy).unwrap();
+            copy
+        })
+        .collect();
+    let held = common::fuse_held(&sources, "weighted-average", false, &dir);
+    let out = dir.join("identical.dng");
+    project::export_held(&held, &out, &ExportOptions::Dng, &dng_meta(true)).unwrap();
+
+    let expected: Vec<u16> = camera_linear(&sources[0])
+        .iter()
+        .map(|&v| (f64::from(v) * 65_535.0).round().clamp(0.0, 65_535.0) as u16)
+        .collect();
+    assert_within(
+        &read_dng(&out).samples(),
+        &expected,
+        2,
+        "camera-linear samples",
+    );
+
+    let source = RawStack::open_files(&sources[..1]).unwrap();
+    let developed = RawStack::open_files(&[out]).unwrap();
+    let rect = full(width, height);
+    let mut want = vec![0f32; (width * height * 3) as usize];
+    let mut got = want.clone();
+    source.read_tile_f32_into(0, rect, &mut want).unwrap();
+    developed.read_tile_f32_into(0, rect, &mut got).unwrap();
+    assert!(
+        want.iter().any(|&v| v > 65_535.0),
+        "a look value above white"
+    );
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!((g - w).abs() < 65.5, "look sample {i}: {g} vs {w}");
+    }
+}
+
+#[test]
+fn dng_same_document_as_render() {
+    let mut raw = stroked_raw("raw_document_dng_same");
+    let dir = tmp_dir("raw_document_dng_same_out");
+    let size = full(raw.width, raw.height);
+    let look = dng_colour(raw._frames[0].path()).unwrap().look;
+    let meta = dng_meta(true);
+
+    let held_path = dir.join("held.dng");
+    project::export_held(&raw.held, &held_path, &ExportOptions::Dng, &meta).unwrap();
+    let held = read_dng(&held_path).samples();
+    let staged = read_f32(&raw.held.composite);
+    assert_within(&held, &camera_16bit(&look, &staged), 1, "held");
+
+    let pending_path = dir.join("pending.dng");
+    project::export_pending(&raw.pending, &pending_path, &ExportOptions::Dng, &meta).unwrap();
+    let pending_wide = render_f32(
+        &CheckpointImage::prepare_pending(&raw.pending).unwrap(),
+        None,
+        size,
+    );
+    assert_within(
+        &read_dng(&pending_path).samples(),
+        &camera_16bit(&look, &pending_wide),
+        1,
+        "pending with a stroke",
+    );
+
+    let saved_path = dir.join("saved.dng");
+    project::export_checkpoint(
+        &mut raw.project,
+        &raw.edited,
+        &saved_path,
+        &ExportOptions::Dng,
+        &meta,
+    )
+    .unwrap();
+    let saved = read_dng(&saved_path).samples();
+    assert_within(
+        &saved,
+        &camera_16bit(&look, &raw.edited_f32),
+        1,
+        "saved with a stroke",
+    );
+    assert_ne!(saved, held, "the stroke changes the DNG");
+}
+
+#[test]
+fn dng_keeps_highlights() {
+    let raw = stroked_raw("raw_document_dng_highlights");
+    let dir = tmp_dir("raw_document_dng_highlights_out");
+    let look = dng_colour(raw._frames[0].path()).unwrap().look;
+    let path = dir.join("held.dng");
+    project::export_held(&raw.held, &path, &ExportOptions::Dng, &dng_meta(true)).unwrap();
+    let dng = read_dng(&path).samples();
+    let tiff = narrowed(&read_f32(&raw.held.composite));
+
+    let kept = (0..tiff.len()).any(|i| {
+        let pixel = &dng[i / 3 * 3..i / 3 * 3 + 3];
+        let camera = [0, 1, 2].map(|c| f64::from(pixel[c]) / 65_535.0);
+        tiff[i] == 65_535 && dng[i] < 65_535 && look.forward(camera)[i % 3] > 1.0
+    });
+    assert!(kept, "a sample the TIFF clips is below white in the DNG");
+}
+
+#[test]
+fn dng_streams_in_bands() {
+    let (width, height) = (512u32, 384u32);
+    let frames = colour_frames(2, width, height);
+    let dir = tmp_dir("raw_document_dng_bands");
+    let project_path = seal_over(&dir, &paths(&frames), (width, height), true);
+    let mut project = Project::open(&project_path).unwrap();
+    let id = project.history().all()[0].id.clone();
+    let out = dir.join("bands.dng");
+    project::export_checkpoint(
+        &mut project,
+        &id,
+        &out,
+        &ExportOptions::Dng,
+        &dng_meta(true),
+    )
+    .unwrap();
+
+    let dng = read_dng(&out);
+    assert!(dng.need(273).count > 1, "more than one strip");
+    let look = dng_colour(frames[0].path()).unwrap().look;
+    let image = CheckpointImage::prepare(&project, &id).unwrap();
+    let wide = render_f32(&image, Some(&mut project), full(width, height));
+    assert_within(&dng.samples(), &camera_16bit(&look, &wide), 1, "bands");
+}
+
+fn assert_nothing_written(dir: &Path) {
+    let left: Vec<_> = std::fs::read_dir(dir).unwrap().collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+#[test]
+fn dng_refused() {
+    let (width, height) = (16u32, 12u32);
+    let out_dir = tmp_dir("raw_document_dng_refused_out");
+    let out = out_dir.join("refused.dng");
+
+    let tiff_dir = tmp_dir("raw_document_dng_refused_tiff");
+    let tiff_sources: Vec<PathBuf> = (0..2)
+        .map(|i| {
+            let path = tiff_dir.join(format!("frame-{i}.tif"));
+            let mut writer = TiffWriter::create(
+                &path,
+                TiffSpec {
+                    width,
+                    height,
+                    samples_per_pixel: 3,
+                    description: None,
+                },
+            )
+            .unwrap();
+            writer
+                .write_tile(full(width, height), &vec![1_000 * (i + 1) as u16; 576])
+                .unwrap();
+            writer.finish().unwrap();
+            path
+        })
+        .collect();
+    let tiff = seal_over(&tiff_dir, &tiff_sources, (width, height), false);
+    let mut project = Project::open(&tiff).unwrap();
+    let id = project.history().all()[0].id.clone();
+    let error = project::export_checkpoint(
+        &mut project,
+        &id,
+        &out,
+        &ExportOptions::Dng,
+        &dng_meta(true),
+    )
+    .expect_err("a TIFF project has no camera space");
+    assert!(
+        matches!(error, ProjectError::ExportDngNeedsRaw { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains(out.to_str().unwrap()), "{error}");
+    assert_nothing_written(&out_dir);
+
+    type Adjust = fn(&mut DngSpec);
+    let cases: [(&str, Adjust, &str); 3] = [
+        ("monochrome", |spec| spec.monochrome = true, "monochrome"),
+        (
+            "no_matrix",
+            |spec| spec.omit_color_matrix = true,
+            "colour matrix",
+        ),
+        (
+            "no_white_balance",
+            |spec| spec.as_shot_neutral = None,
+            "white balance",
+        ),
+    ];
+    for (label, adjust, reason) in cases {
+        let frames = dng_frames_with(2, width, height, adjust);
+        let dir = tmp_dir(&format!("raw_document_dng_refused_{label}"));
+        let sealed = seal_over(&dir, &paths(&frames), (width, height), true);
+        let mut project = Project::open(&sealed).unwrap();
+        let id = project.history().all()[0].id.clone();
+        let error = project::export_checkpoint(
+            &mut project,
+            &id,
+            &out,
+            &ExportOptions::Dng,
+            &dng_meta(true),
+        )
+        .expect_err(label);
+        assert!(
+            matches!(error, ProjectError::ExportDngColour { .. }),
+            "{label}: {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains(reason), "{label}: {text}");
+        assert!(text.contains(out.to_str().unwrap()), "{label}: {text}");
+        assert_nothing_written(&out_dir);
+    }
+
+    let frames = colour_frames(2, width, height);
+    let dir = tmp_dir("raw_document_dng_refused_unwritable");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let unwritable = dir.join("missing").join("out.dng");
+    let error = project::export_held(&held, &unwritable, &ExportOptions::Dng, &dng_meta(true))
+        .expect_err("the directory does not exist");
+    assert!(
+        matches!(error, ProjectError::ExportWriteFailed { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(unwritable.to_str().unwrap()),
+        "{error}"
+    );
 }

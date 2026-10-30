@@ -63,6 +63,7 @@ impl ExportChoice {
             ExportFormat::Tiff => &self.tiff,
             ExportFormat::Png => &self.png,
             ExportFormat::Jpeg => &self.jpeg,
+            ExportFormat::Dng => &ExportOptions::Dng,
         }
     }
 
@@ -72,6 +73,7 @@ impl ExportChoice {
             ExportFormat::Tiff => self.tiff = options,
             ExportFormat::Png => self.png = options,
             ExportFormat::Jpeg => self.jpeg = options,
+            ExportFormat::Dng => {}
         }
     }
 

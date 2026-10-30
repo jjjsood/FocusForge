@@ -77,8 +77,10 @@ pub struct StripSpec {
     /// `None` -> [`TiffSpec::default_description`].
     pub description: Option<String>,
     /// Extra IFD0 entries plus EXIF and GPS sub-IFDs, merged into the IFD
-    /// [`StripWriter::finish`] writes. Empty by default: an export with
-    /// nothing to carry costs this writer nothing beyond the field itself.
+    /// [`StripWriter::finish`] writes. An IFD0 entry replaces the writer's own
+    /// entry of the same tag (a DNG's PhotometricInterpretation, say). Empty
+    /// by default: an export with nothing to carry costs this writer nothing
+    /// beyond the field itself.
     pub metadata: MetadataTags,
 }
 
@@ -350,7 +352,12 @@ impl<W: Write + Seek> StripWriter<W> {
                 value: shorts(&vec![1u16; spp as usize]),
             },
         ];
-        entries.extend(self.metadata.ifd0.iter().cloned());
+        for entry in &self.metadata.ifd0 {
+            match entries.iter_mut().find(|e| e.tag == entry.tag) {
+                Some(built_in) => *built_in = entry.clone(),
+                None => entries.push(entry.clone()),
+            }
+        }
 
         // Pad to a word boundary: TIFF 6.0 requires the IFD to start on an
         // even byte offset.
@@ -1893,5 +1900,34 @@ mod strip_writer_tests {
         assert_eq!(n_entries, 13, "the fixed 13-tag layout, no extras");
         assert_eq!(header.width, width);
         assert_eq!(header.height, height);
+    }
+
+    #[test]
+    fn an_ifd0_entry_replaces_the_built_in_entry_of_its_tag() {
+        let (width, height, spp) = (5, 4, 3);
+        let mut spec = strip_spec(width, height, spp, 16, StripCompression::None);
+        spec.metadata.ifd0.push(TagEntry {
+            tag: TAG_PHOTOMETRIC,
+            field_type: 3,
+            count: 1,
+            value: shorts(&[34892]),
+        });
+        let mut writer = StripWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+        writer
+            .write_rows(&bytes_16(&gradient_16(width, height, spp)))
+            .unwrap();
+        let written = writer.finish().unwrap().into_inner();
+
+        let ifd0 = u32::from_le_bytes(written[4..8].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(written[ifd0..ifd0 + 2].try_into().unwrap()) as usize;
+        let photometric: Vec<u16> = (0..count)
+            .map(|i| ifd0 + 2 + i * 12)
+            .filter(|&at| {
+                u16::from_le_bytes(written[at..at + 2].try_into().unwrap()) == TAG_PHOTOMETRIC
+            })
+            .map(|at| u16::from_le_bytes(written[at + 8..at + 10].try_into().unwrap()))
+            .collect();
+        assert_eq!(photometric, [34892], "exactly one tag 262, the override");
+        assert_eq!(count, 13, "the override adds no entry");
     }
 }

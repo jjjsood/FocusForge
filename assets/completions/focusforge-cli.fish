@@ -77,7 +77,7 @@ complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -s 
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -s o -l output -d 'Write the image to this path' -r -F
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l zmap -d 'Write the Z-Map to this path' -r -F
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l checkpoint -d 'A checkpoint id or unique id prefix. Defaults to the head. An unedited image export needs no source frames; an edited one re-reads and verifies the nearest fused ancestor\'s. `--zmap` alone needs none' -r
-complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l format -d 'The image format to write: `tiff`, `png` or `jpeg`. Inferred from `-o`\'s extension when omitted (`.tif`/`.tiff` -> tiff, `.png` -> png, `.jpg`/`.jpeg` -> jpeg, no extension -> tiff, the default); refused if it names a format other than a recognised extension\'s' -r
+complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l format -d 'The image format to write: `tiff`, `png`, `jpeg` or `dng` (a linear DNG of a RAW project). Inferred from `-o`\'s extension when omitted (`.tif`/`.tiff` -> tiff, `.png` -> png, `.jpg`/`.jpeg` -> jpeg, `.dng` -> dng, no extension -> tiff, the default); refused if it names a format other than a recognised extension\'s' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l tiff-bits -d 'TIFF bit depth: `16` (default) or `8`. TIFF only' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l tiff-compression -d 'TIFF strip compression: `none` (default), `lzw` or `deflate`. TIFF only' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l png-bits -d 'PNG bit depth: `16` (default) or `8`. PNG only' -r
@@ -85,7 +85,7 @@ complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l jpeg-quality -d 'JPEG quality, 1-100, default 95. JPEG only' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l jpeg-subsampling -d 'JPEG chroma subsampling: `420` (default) or `444`. JPEG only' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l exif -d 'Carry the alignment reference frame\'s EXIF: `on` (default) or `off`' -r
-complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l icc -d 'Embed an ICC profile: `on` (default) or `off`' -r
+complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l icc -d 'Embed an ICC profile: `on` (default) or `off`. Has no effect on a DNG, whose colour is defined by its camera matrices' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l xmp -d 'Carry the source frame\'s XMP packet verbatim: `on` or `off` (default)' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l iptc -d 'Carry the source frame\'s IPTC block verbatim: `on` or `off` (default). Never written to PNG' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l frame -d 'Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint\'s own composite width and height. Requires `--frame-output`' -r

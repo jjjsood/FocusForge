@@ -19,7 +19,7 @@ use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
-pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
+pub use focusforge_core::io::{DNG_EXTENSIONS, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{

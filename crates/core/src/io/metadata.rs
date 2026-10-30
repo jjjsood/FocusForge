@@ -12,7 +12,7 @@ use rawler::formats::tiff::{Rational, SRational};
 use rawler::tags::{ExifGpsTag, ExifTag};
 
 use super::paths::{RAW_EXTENSIONS, has_extension};
-use super::raw::RawStack;
+use super::raw::{DngColour, RawStack};
 use super::tiff::header::{self, TAG_ICC_PROFILE, TAG_IPTC, TAG_XMP, TiffHeader};
 use super::tiff::writer::ifd0_with_sub_ifds;
 
@@ -80,7 +80,8 @@ fn exif_datetime(now: DateTime<FixedOffset>) -> String {
     now.format("%Y:%m:%d %H:%M:%S").to_string()
 }
 
-fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
+/// Puts `entry` in `entries`, replacing the entry of the same tag if there is one.
+pub(crate) fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
     if let Some(existing) = entries.iter_mut().find(|e| e.tag == entry.tag) {
         *existing = entry;
     } else {
@@ -599,6 +600,99 @@ pub(crate) fn xmp_tag_entry(bytes: &[u8]) -> TagEntry {
 /// TIFF tag 33723, `UNDEFINED`.
 pub(crate) fn iptc_tag_entry(bytes: &[u8]) -> TagEntry {
     raw_block_entry(TAG_IPTC, FIELD_TYPE_UNDEFINED, bytes)
+}
+
+/// Denominator of the rationals a DNG's colour tags are written with.
+const DNG_RATIONAL_DENOMINATOR: u32 = 10_000;
+
+fn dng_entry(tag: u16, field_type: u16, count: usize, value: Vec<u8>) -> TagEntry {
+    TagEntry {
+        tag,
+        field_type,
+        count: count as u32,
+        value,
+    }
+}
+
+fn dng_shorts(tag: u16, values: &[u16]) -> TagEntry {
+    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    dng_entry(tag, FIELD_TYPE_SHORT, values.len(), bytes)
+}
+
+fn dng_ascii(tag: u16, text: &str) -> TagEntry {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(0);
+    dng_entry(tag, FIELD_TYPE_ASCII, bytes.len(), bytes)
+}
+
+/// `values` as signed rationals over [`DNG_RATIONAL_DENOMINATOR`].
+fn dng_srationals(tag: u16, values: &[f64]) -> TagEntry {
+    let scale = f64::from(DNG_RATIONAL_DENOMINATOR);
+    let bytes = values
+        .iter()
+        .flat_map(|v| {
+            let numerator = ((v * scale).round() as i32).to_le_bytes();
+            numerator
+                .into_iter()
+                .chain(DNG_RATIONAL_DENOMINATOR.to_le_bytes())
+        })
+        .collect();
+    dng_entry(tag, FIELD_TYPE_SRATIONAL, values.len(), bytes)
+}
+
+/// `values` as unsigned rationals over [`DNG_RATIONAL_DENOMINATOR`].
+fn dng_rationals(tag: u16, values: &[f64]) -> TagEntry {
+    let scale = f64::from(DNG_RATIONAL_DENOMINATOR);
+    let bytes = values
+        .iter()
+        .flat_map(|v| {
+            let numerator = ((v * scale).round() as u32).to_le_bytes();
+            numerator
+                .into_iter()
+                .chain(DNG_RATIONAL_DENOMINATOR.to_le_bytes())
+        })
+        .collect();
+    dng_entry(tag, FIELD_TYPE_RATIONAL, values.len(), bytes)
+}
+
+/// The IFD0 entries that make a 16-bit, three-sample file a linear DNG 1.4
+/// in `colour`'s camera space: LinearRaw photometric interpretation, black 0
+/// and white 65535, the camera identity, its matrices and as-shot neutral,
+/// and the frame's orientation.
+pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
+    const TAG_PHOTOMETRIC: u16 = 262;
+    const TAG_MAKE: u16 = 271;
+    const TAG_MODEL: u16 = 272;
+    const TAG_ORIENTATION: u16 = 274;
+    const LINEAR_RAW: u16 = 34892;
+    let mut entries = vec![
+        dng_shorts(TAG_PHOTOMETRIC, &[LINEAR_RAW]),
+        dng_ascii(TAG_MAKE, &colour.make),
+        dng_ascii(TAG_MODEL, &colour.model),
+        dng_entry(50706, FIELD_TYPE_BYTE, 4, vec![1, 4, 0, 0]),
+        dng_entry(50707, FIELD_TYPE_BYTE, 4, vec![1, 4, 0, 0]),
+        dng_ascii(50708, &colour.unique_model),
+        dng_shorts(50714, &[0; 3]),
+        dng_entry(
+            50717,
+            FIELD_TYPE_LONG,
+            3,
+            [65_535_u32; 3]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        dng_rationals(50728, &colour.as_shot_neutral),
+    ];
+    if let Some(orientation) = colour.orientation {
+        entries.push(dng_shorts(TAG_ORIENTATION, &[orientation]));
+    }
+    for (slot, matrix) in colour.matrices.iter().enumerate() {
+        let values: Vec<f64> = matrix.xyz_to_camera.iter().map(|&v| f64::from(v)).collect();
+        entries.push(dng_srationals(50721 + slot as u16, &values));
+        entries.push(dng_shorts(50778 + slot as u16, &[matrix.illuminant]));
+    }
+    entries
 }
 
 /// The namespace header (`http://ns.adobe.com/xap/1.0/\0`) an XMP packet is

@@ -186,6 +186,22 @@ pub enum ProjectError {
         samples_per_pixel: u32,
     },
 
+    /// A DNG export of an image that is not a camera RAW document: only a
+    /// project whose sources are all camera RAW has a camera colour space to
+    /// write. Refused before any pixel is rendered.
+    #[error("{}: a DNG holds camera RAW data, and this project's sources are not camera RAW", path.display())]
+    ExportDngNeedsRaw { path: PathBuf },
+
+    /// A DNG export whose first source frame cannot describe its camera
+    /// colour space (a monochrome sensor, no colour matrix, no as-shot white
+    /// balance). Refused before any pixel is rendered.
+    #[error("{}: cannot write a DNG: {source}", path.display())]
+    ExportDngColour {
+        path: PathBuf,
+        #[source]
+        source: Box<crate::io::RawError>,
+    },
+
     /// [`super::render::CheckpointImage::prepare_pending`] found at least one of
     /// the state's sources missing on disk: `detail` names each, one per line,
     /// `missing: <path>`. There is no stored fingerprint to compare a

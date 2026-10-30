@@ -28,6 +28,15 @@ pub struct DngSpec {
     pub as_shot_neutral: Option<[f32; 3]>,
     /// Row-major ColorMatrix1 (XYZ to camera, D65); the identity when absent.
     pub color_matrix: Option<[f32; 9]>,
+    /// Row-major ColorMatrix2 and its CalibrationIlluminant2 code.
+    pub color_matrix2: Option<([f32; 9], u16)>,
+    /// Write no ColorMatrix1 and no CalibrationIlluminant1.
+    pub omit_color_matrix: bool,
+    /// PhotometricInterpretation 1 (BlackIsZero); rawler's DNG decoder still
+    /// wants the CFA tags.
+    pub monochrome: bool,
+    /// EXIF Orientation of the frame.
+    pub orientation: Option<u16>,
 }
 
 impl DngSpec {
@@ -51,6 +60,10 @@ impl DngSpec {
             samples,
             as_shot_neutral: None,
             color_matrix: None,
+            color_matrix2: None,
+            omit_color_matrix: false,
+            monochrome: false,
+            orientation: None,
         }
     }
 }
@@ -76,7 +89,7 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         Entry::long(257, &[spec.height]),
         Entry::short(258, &[spec.bits]),
         Entry::short(259, &[1]),
-        Entry::short(262, &[32803]),
+        Entry::short(262, &[if spec.monochrome { 1 } else { 32803 }]),
         Entry::ascii(271, &spec.make),
         Entry::ascii(272, &spec.model),
         Entry::long(273, &[0]),
@@ -91,11 +104,23 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         Entry::short(50713, &[2, 2]),
         Entry::short(50714, &[spec.black; 4]),
         Entry::long(50717, &[spec.white]),
-        Entry::srational(50721, &matrix),
-        Entry::short(50778, &[21]),
-        Entry::short(33421, &[2, 2]),
-        Entry::byte(33422, &spec.cfa),
     ];
+    if !spec.omit_color_matrix {
+        entries.push(Entry::srational(50721, &matrix));
+        entries.push(Entry::short(50778, &[21]));
+    }
+    if let Some((matrix2, illuminant)) = spec.color_matrix2 {
+        entries.push(Entry::srational(
+            50722,
+            &matrix2.map(|value| ((value * 10_000.0).round() as i32, 10_000_i32)),
+        ));
+        entries.push(Entry::short(50779, &[illuminant]));
+    }
+    entries.push(Entry::short(33421, &[2, 2]));
+    entries.push(Entry::byte(33422, &spec.cfa));
+    if let Some(orientation) = spec.orientation {
+        entries.push(Entry::short(274, &[orientation]));
+    }
     if let Some(neutral) = spec.as_shot_neutral {
         entries.push(Entry::rational(
             50728,
