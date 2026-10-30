@@ -44,9 +44,10 @@ fn full(width: u32, height: u32) -> Rect {
     }
 }
 
-/// `path`'s first image: its width, height, samples per pixel and samples.
+/// `path`'s first image: its width, height, samples per pixel and samples,
+/// a float file narrowed to `u16`.
 fn read_tiff(path: &Path) -> (u32, u32, u32, Vec<u16>) {
-    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
+    let stack = TiffStack::open_staged(path).unwrap();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let mut samples = vec![0u16; (width * height * spp) as usize];

@@ -706,21 +706,55 @@ fn render_ops<S: DocumentSample>(
     )
 }
 
-/// A saved checkpoint's image as a TIFF: [`CheckpointImage::prepare`] then
-/// [`CheckpointImage::render`] into a `.partial` sibling of `path`, renamed
-/// onto it only once every band has been written; removed instead on any
-/// error, so a refused or interrupted render leaves nothing behind.
+/// A saved checkpoint's image as a TIFF holding the image's own samples: a
+/// 16-bit file for a `u16` image, a 32-bit float file for an `f32` one, values
+/// above white included. [`CheckpointImage::prepare`] then the render, into a
+/// `.partial` sibling of `path`, renamed onto it only once every band has
+/// been written; removed instead on any error, so a refused or interrupted
+/// render leaves nothing behind.
 pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
     let image = CheckpointImage::prepare(project, id)?;
-    write_tiff(
-        &image,
-        &mut |sink| image.render(Some(&mut *project), image.full(), sink),
-        path,
-    )
+    match image.sample_format {
+        SampleFormat::U16 => write_tiff(
+            &image,
+            &mut |sink| image.render(Some(&mut *project), image.full(), sink),
+            path,
+        ),
+        SampleFormat::F32 => write_tiff_f32(&image, project, path),
+    }
 }
 
-/// The default 16-bit uncompressed TIFF encoder: the view render's only
-/// encoder, and every export format's own `Tiff{Sixteen, None}` case.
+/// [`write_tiff`] for an `f32` image: its unclipped render as a 32-bit float
+/// TIFF.
+fn write_tiff_f32(
+    image: &CheckpointImage,
+    project: &mut Project,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    write_via_partial(path, |partial| {
+        let mut writer = TiffWriter::create_f32(
+            partial,
+            TiffSpec {
+                width: image.width,
+                height: image.height,
+                samples_per_pixel: image.samples_per_pixel,
+                description: Some(image.description.clone()),
+            },
+        )
+        .map_err(|err| ProjectError::container(partial, err))?;
+        image.render_f32(Some(project), image.full(), &mut |band, rect| {
+            writer
+                .write_tile_f32(rect, band)
+                .map_err(|err| ProjectError::container(path, err))
+        })?;
+        writer
+            .finish()
+            .map_err(|err| ProjectError::container(path, err))
+    })
+}
+
+/// The default 16-bit uncompressed TIFF encoder: the view render's encoder
+/// for a `u16` image, and every export format's own `Tiff{Sixteen, None}` case.
 /// `render` streams `image`'s bands -- bound to whatever produced it, a
 /// live project or a caller-supplied Z-Map file.
 pub(super) fn write_tiff(

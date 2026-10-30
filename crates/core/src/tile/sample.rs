@@ -179,6 +179,43 @@ mod tests {
     }
 
     #[test]
+    fn u16_narrow_clips_every_f32() {
+        let cases = [
+            (f32::NAN, 0),
+            (f32::NEG_INFINITY, 0),
+            (f32::INFINITY, 65_535),
+            (-0.0, 0),
+            (f32::MAX, 65_535),
+            (f32::MIN, 0),
+            (0.5, 1),
+            (65_534.5, 65_535),
+            (65_535.0, 65_535),
+            (65_535.5, 65_535),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(u16::narrow(value), expected, "{value}");
+        }
+
+        let sweep: Vec<f32> = (-40..=40)
+            .map(|i| -2.0 + i as f32 * 0.05)
+            .chain((0..=2_000).map(|i| i as f32 * 32.75))
+            .chain((-40..=40).map(|i| 65_535.0 + i as f32 * 0.05))
+            .collect();
+        for pair in sweep.windows(2) {
+            assert!(
+                u16::narrow(pair[0]) <= u16::narrow(pair[1]),
+                "{} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for &value in &sweep {
+            let expected = (f64::from(value).clamp(0.0, 65_535.0) + 0.5).floor() as u16;
+            assert_eq!(u16::narrow(value), expected, "{value}");
+        }
+    }
+
+    #[test]
     fn f32_narrowing_keeps_the_value() {
         for value in [-3.5_f32, 0.25, 65_535.0, 98_304.0] {
             assert_eq!(f32::narrow(value), value);

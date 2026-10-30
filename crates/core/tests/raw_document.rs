@@ -11,8 +11,13 @@ mod raw_dng;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::align::Registration;
+use focusforge_core::io::TiffHeader;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
+use focusforge_core::project::export::{
+    ExportOptions, JpegSubsampling, MetadataOptions, PngBits, PngCompression, TiffBits,
+    TiffCompression, to_8bit,
+};
 use focusforge_core::project::{
     self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
     PendingState, Point, Project, SealRequest,
@@ -155,6 +160,224 @@ fn blob_kind(project: &Project, hash: &str) -> BlobKind {
         .find(|blob| blob.hash == hash)
         .expect("the manifest lists the blob")
         .kind
+}
+
+/// A stroked RAW checkpoint and the states that must render the same: the
+/// held result, a pending state with the stroke, and a saved root with the
+/// stroke appended.
+struct StrokedRaw {
+    _frames: Vec<tempfile::NamedTempFile>,
+    width: u32,
+    height: u32,
+    held: HeldCheckpoint,
+    pending: PendingState,
+    project: Project,
+    edited: String,
+    edited_f32: Vec<f32>,
+}
+
+fn stroked_raw(name: &str) -> StrokedRaw {
+    let (width, height) = (37u32, 23u32);
+    let frames = dng_frames(3, width, height);
+    let dir = tmp_dir(name);
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let staged = read_f32(&held.composite);
+    assert!(
+        staged.iter().any(|&s| s > 65_535.0),
+        "headroom precondition"
+    );
+    let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
+    let root = seal_held(&project_path, &held);
+    let stroke = Op::BrushStroke {
+        source_id: 1,
+        path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
+        radius: 40.0,
+        softness: 0.5,
+    };
+    let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
+        .expect("the stroke must append")
+        .checkpoint;
+    let mut project = Project::open(&project_path).unwrap();
+    let pending = PendingState {
+        composite: held.composite.clone(),
+        ops: vec![stroke],
+        sources: held.sources.clone(),
+        registration: held.registration.clone(),
+        reference: 0,
+        description: held.composite_description.clone(),
+    };
+    let image = CheckpointImage::prepare(&project, &edited).unwrap();
+    let edited_f32 = render_f32(&image, Some(&mut project), full(width, height));
+    assert!(
+        edited_f32.iter().any(|&s| s > 65_535.0),
+        "the stroke's samples stay unclamped"
+    );
+    StrokedRaw {
+        _frames: frames,
+        width,
+        height,
+        held,
+        pending,
+        project,
+        edited,
+        edited_f32,
+    }
+}
+
+fn read_u16(path: &Path) -> Vec<u16> {
+    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let mut samples = vec![0u16; (width * height * spp) as usize];
+    stack
+        .read_tile_into(0, full(width, height), &mut samples)
+        .unwrap();
+    samples
+}
+
+/// The samples of an uncompressed 8-bit TIFF: its strips back to back.
+fn read_strips_8bit(path: &Path) -> Vec<u8> {
+    let header = TiffHeader::open(path).unwrap();
+    assert_eq!(&*header.bits_per_sample, &[8, 8, 8], "{path:?}");
+    let bytes = std::fs::read(path).unwrap();
+    header
+        .strip_offsets
+        .iter()
+        .zip(&header.strip_byte_counts)
+        .flat_map(|(&at, &len)| bytes[at as usize..(at + len) as usize].to_vec())
+        .collect()
+}
+
+/// A PNG's bit depth and decoded bytes (16-bit samples big-endian).
+fn read_png(path: &Path) -> (png::BitDepth, Vec<u8>) {
+    let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    buf.truncate(info.buffer_size());
+    (info.bit_depth, buf)
+}
+
+/// Exports through `export` in every format and checks each file against
+/// `wide` clipped once to 16 bits (and once more to 8).
+fn check_exports(
+    dir: &Path,
+    label: &str,
+    wide: &[f32],
+    (width, height): (u32, u32),
+    export: &mut dyn FnMut(&Path, &ExportOptions),
+) {
+    let expect16 = narrowed(wide);
+    let expect8: Vec<u8> = expect16.iter().map(|&v| to_8bit(v)).collect();
+    assert!(
+        expect16.contains(&65_535),
+        "{label}: a sample at full scale"
+    );
+
+    let tiff = |bits| ExportOptions::Tiff {
+        bits,
+        compression: TiffCompression::None,
+    };
+    let png = |bits| ExportOptions::Png {
+        bits,
+        compression: PngCompression::Default,
+    };
+
+    let path = dir.join(format!("{label}-16.tif"));
+    export(&path, &tiff(TiffBits::Sixteen));
+    assert_eq!(read_u16(&path), expect16, "{label}: 16-bit TIFF");
+
+    let path = dir.join(format!("{label}-8.tif"));
+    export(&path, &tiff(TiffBits::Eight));
+    assert_eq!(read_strips_8bit(&path), expect8, "{label}: 8-bit TIFF");
+
+    let path = dir.join(format!("{label}-16.png"));
+    export(&path, &png(PngBits::Sixteen));
+    let (depth, bytes) = read_png(&path);
+    assert_eq!(depth, png::BitDepth::Sixteen, "{label}");
+    let samples: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .collect();
+    assert_eq!(samples, expect16, "{label}: 16-bit PNG");
+
+    let path = dir.join(format!("{label}-8.png"));
+    export(&path, &png(PngBits::Eight));
+    let (depth, bytes) = read_png(&path);
+    assert_eq!(depth, png::BitDepth::Eight, "{label}");
+    assert_eq!(bytes, expect8, "{label}: 8-bit PNG");
+
+    // With no metadata the JPEG is the 8-bit samples through the encoder.
+    let path = dir.join(format!("{label}.jpg"));
+    export(
+        &path,
+        &ExportOptions::Jpeg {
+            quality: 90,
+            subsampling: JpegSubsampling::S444,
+        },
+    );
+    let mut expected = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut expected, 90);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    encoder
+        .encode(
+            &expect8,
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), expected, "{label}: JPEG");
+}
+
+#[test]
+fn raw_exports_clip_once() {
+    let mut raw = stroked_raw("raw_document_exports");
+    let dir = tmp_dir("raw_document_exports_out");
+    let size = (raw.width, raw.height);
+    let meta = MetadataOptions {
+        exif: false,
+        icc: false,
+        xmp: false,
+        iptc: false,
+    };
+
+    let staged = read_f32(&raw.held.composite);
+    let held = raw.held.clone();
+    check_exports(&dir, "held", &staged, size, &mut |path, options| {
+        project::export_held(&held, path, options, &meta).unwrap();
+    });
+
+    let pending = raw.pending.clone();
+    let wide = render_f32(
+        &CheckpointImage::prepare_pending(&pending).unwrap(),
+        None,
+        full(size.0, size.1),
+    );
+    assert_eq!(bits(&wide), bits(&raw.edited_f32), "pending equals saved");
+    check_exports(&dir, "pending", &wide, size, &mut |path, options| {
+        project::export_pending(&pending, path, options, &meta).unwrap();
+    });
+
+    let wide = raw.edited_f32.clone();
+    let edited = raw.edited.clone();
+    check_exports(&dir, "saved", &wide, size, &mut |path, options| {
+        project::export_checkpoint(&mut raw.project, &edited, path, options, &meta).unwrap();
+    });
+}
+
+#[test]
+fn raw_view_render_keeps_headroom() {
+    let mut raw = stroked_raw("raw_document_view");
+    let dir = tmp_dir("raw_document_view_out");
+    let view = dir.join("view.tif");
+    project::render_checkpoint(&mut raw.project, &raw.edited, &view).unwrap();
+    assert_eq!(
+        bits(&read_f32(&view)),
+        bits(&raw.edited_f32),
+        "the view render is the f32 render"
+    );
 }
 
 #[test]
