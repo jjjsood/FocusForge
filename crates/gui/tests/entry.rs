@@ -403,10 +403,9 @@ fn empty_folder_is_refused_with_a_fix() {
 }
 
 #[test]
-fn png_and_jpeg_only_folder_is_refused() {
-    let root = tree("entry_png_jpeg_folder");
+fn png_only_folder_is_refused() {
+    let root = tree("entry_png_folder");
     std::fs::write(root.join("a.png"), b"not decoded").unwrap();
-    std::fs::write(root.join("b.jpg"), b"not decoded").unwrap();
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[root]);
     assert_no_readable_frames_body(&controller, outcome);

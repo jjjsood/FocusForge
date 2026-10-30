@@ -427,7 +427,9 @@ fn render_with_max_step(
     }
     let decoder_cache = match kind {
         focusforge_core::io::ReaderKind::Mmap => 0,
-        focusforge_core::io::ReaderKind::Decoded | focusforge_core::io::ReaderKind::Raw => cap / 4,
+        focusforge_core::io::ReaderKind::Decoded
+        | focusforge_core::io::ReaderKind::Raw
+        | focusforge_core::io::ReaderKind::Jpeg => cap / 4,
     };
     let base = decoder_cache
         .saturating_add(accumulator)

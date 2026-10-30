@@ -45,7 +45,7 @@ pub struct RawIdentity {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrameError {
-    /// RAW and TIFF frames cannot share one development path.
+    /// RAW, JPEG and TIFF frames cannot share one development path.
     #[error("{} is {found}, but first frame {} is {first}", path.display(), first_path.display())]
     MixedFormats {
         /// First frame path.
@@ -63,6 +63,9 @@ pub enum FrameError {
     /// A read through a RAW-backed reader failed.
     #[error(transparent)]
     Raw(#[from] crate::io::RawError),
+    /// A read through a JPEG-backed reader failed.
+    #[error(transparent)]
+    Jpeg(#[from] crate::io::JpegError),
 }
 
 /// An opened set of frames and its tile-shaped pixel source.

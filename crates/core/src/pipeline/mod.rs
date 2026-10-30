@@ -179,12 +179,12 @@ pub struct FuseReport {
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
-/// are developed to sRGB-encoded values; TIFF frames are 16-bit unsigned
+/// are developed to sRGB-encoded values; TIFF and JPEG frames are unsigned
 /// samples whose transfer function is not read from the file.
 pub fn working_space(kind: ReaderKind) -> &'static str {
     match kind {
         ReaderKind::Raw => "encoded-srgb",
-        ReaderKind::Mmap | ReaderKind::Decoded => "encoded-unknown-transfer",
+        ReaderKind::Mmap | ReaderKind::Decoded | ReaderKind::Jpeg => "encoded-unknown-transfer",
     }
 }
 
@@ -1401,6 +1401,7 @@ mod tests {
             (ReaderKind::Raw, "encoded-srgb"),
             (ReaderKind::Mmap, "encoded-unknown-transfer"),
             (ReaderKind::Decoded, "encoded-unknown-transfer"),
+            (ReaderKind::Jpeg, "encoded-unknown-transfer"),
         ] {
             assert_eq!(working_space(kind), expected, "{kind:?}");
         }

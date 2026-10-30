@@ -1709,6 +1709,7 @@ dependencies = [
  "focusforge-core",
  "focusforge-diagnostics",
  "focusforge-gpu",
+ "jpeg-encoder",
  "png",
  "serde",
  "serde_json",
@@ -1748,6 +1749,7 @@ dependencies = [
  "tracing-subscriber",
  "weezl",
  "zstd",
+ "zune-jpeg",
 ]
 
 [[package]]

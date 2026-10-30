@@ -28,6 +28,7 @@ const TAG_BITS_PER_SAMPLE: u16 = 258;
 const TAG_COMPRESSION: u16 = 259;
 const TAG_PHOTOMETRIC: u16 = 262;
 const TAG_IMAGE_DESCRIPTION: u16 = 270;
+const TAG_ORIENTATION: u16 = 274;
 pub(crate) const TAG_STRIP_OFFSETS: u16 = 273;
 const TAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TAG_ROWS_PER_STRIP: u16 = 278;
@@ -214,6 +215,24 @@ fn read_ifd<S: ByteSource>(
         });
     }
     Ok(entries)
+}
+
+/// The Orientation value (tag 274) in IFD0 of an in-memory TIFF blob, such
+/// as an EXIF segment carries; `None` when the blob is malformed or has no
+/// such tag.
+pub(crate) fn exif_orientation(blob: &[u8]) -> Option<u16> {
+    let byte_order = match blob.get(0..2)? {
+        b"II" => ByteOrder::Little,
+        b"MM" => ByteOrder::Big,
+        _ => return None,
+    };
+    let ifd0 = u64::from(byte_order.u32_at(blob.get(4..8)?)?);
+    let entry = read_ifd(&blob, byte_order, ifd0, Path::new(""))
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.tag == TAG_ORIENTATION && entry.count == 1)?;
+    let value = byte_order.ints_at(entry.field_type, 1, &entry.payload)?;
+    u16::try_from(*value.first()?).ok()
 }
 
 /// One open header's source, byte order, size and path, bundled so entry

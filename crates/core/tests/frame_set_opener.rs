@@ -4,6 +4,8 @@ mod common;
 #[path = "common/raw_dng.rs"]
 mod raw_dng;
 
+use std::path::PathBuf;
+
 use focusforge_core::io::{
     FrameError, ReaderKind, TiffError, TiffHeader, classify_header, frame_paths, open_frame_set,
 };
@@ -210,6 +212,107 @@ fn raw_sets_open_lazily_and_mixed_formats_name_the_differing_frame() {
         FrameError::MixedFormats { path, found: "TIFF", .. } if path.ends_with("00.tif")
     ));
     assert!(error.to_string().contains("raw.dng"));
+}
+
+fn write_jpeg(dir: &std::path::Path, name: &str, width: u16, height: u16, grey: bool) -> PathBuf {
+    let components = if grey { 1 } else { 3 };
+    let data = vec![100; usize::from(width) * usize::from(height) * components];
+    let color = if grey {
+        jpeg_encoder::ColorType::Luma
+    } else {
+        jpeg_encoder::ColorType::Rgb
+    };
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, 90)
+        .encode(&data, width, height, color)
+        .expect("frame encodes");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("frame file");
+    path
+}
+
+fn open_error(paths: &[PathBuf]) -> FrameError {
+    match open_frame_set(paths, HostBudget::explicit(65_536)) {
+        Ok(_) => panic!("the set must be refused"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn jpeg_sets_open_with_the_decoded_cache_quarter() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let paths = [
+        write_jpeg(dir.path(), "00.jpg", 24, 16, false),
+        write_jpeg(dir.path(), "01.JPEG", 24, 16, false),
+    ];
+    let opened = open_frame_set(&paths, HostBudget::explicit(1 << 20)).expect("JPEG set opens");
+    assert_eq!(opened.kind, ReaderKind::Jpeg);
+    assert_eq!(opened.reader.len(), 2);
+    assert_eq!(opened.scheduler_budget.bytes(), (1 << 20) * 3 / 4);
+}
+
+#[test]
+fn jpeg_mixed_with_tiff_or_raw_names_both_frames_and_formats() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let jpeg = write_jpeg(dir.path(), "00.jpg", 24, 16, false);
+    let tiff = common::fixtures_dir().join("mantis-64/frames/00.tif");
+    let dng = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        true,
+    );
+    let raw = dir.path().join("raw.dng");
+    std::fs::copy(dng.path(), &raw).expect("copy RAW source");
+    for (other, other_format) in [(tiff, "TIFF"), (raw, "RAW")] {
+        for (set, first, found, first_format, found_format) in [
+            (
+                vec![jpeg.clone(), other.clone()],
+                &jpeg,
+                &other,
+                "JPEG",
+                other_format,
+            ),
+            (
+                vec![other.clone(), jpeg.clone()],
+                &other,
+                &jpeg,
+                other_format,
+                "JPEG",
+            ),
+        ] {
+            match open_error(&set) {
+                FrameError::MixedFormats {
+                    first_path,
+                    first: first_name,
+                    path,
+                    found: found_name,
+                } => {
+                    assert_eq!(
+                        (&first_path, first_name, &path, found_name),
+                        (first, first_format, found, found_format)
+                    );
+                }
+                other => panic!("expected MixedFormats, got {other}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn jpeg_frames_must_share_geometry_and_components() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let first = write_jpeg(dir.path(), "00.jpg", 24, 16, false);
+    let wide = write_jpeg(dir.path(), "01.jpg", 32, 16, false);
+    let grey = write_jpeg(dir.path(), "02.jpg", 24, 16, true);
+    for (differing, expected) in [(&wide, "24x16"), (&grey, "components")] {
+        let error = open_error(&[first.clone(), differing.clone()]);
+        let text = error.to_string();
+        assert!(text.contains(&differing.display().to_string()), "{text}");
+        assert!(text.contains(expected), "{text}");
+        assert!(matches!(
+            error,
+            FrameError::Jpeg(focusforge_core::io::JpegError::FrameMismatch { .. })
+        ));
+    }
 }
 
 fn patch_short_tag(bytes: &mut [u8], wanted_tag: u16, value: u16) {
