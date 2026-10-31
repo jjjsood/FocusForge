@@ -22,6 +22,8 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ### Fixed
 
+- On Windows, `focusforge-cli` and `focusforge-gui` start on a machine without the Visual C++
+  redistributable.
 - The macOS app in the DMG is ad-hoc signed, so a downloaded copy no longer opens as
   "damaged"; the getting-started guide explains the Gatekeeper prompt of an app that is
   not notarized.

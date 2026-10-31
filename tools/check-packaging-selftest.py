@@ -1710,19 +1710,30 @@ function global:msiexec.exe {
   $shortcut = Join-Path $env:ProgramData 'Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk'
   if ($Arguments[0] -eq '/i') {
     New-Item -ItemType Directory -Force -Path $product, (Split-Path $shortcut) | Out-Null
-    @('#!/bin/sh', 'exec bash -c "$(tail -n +4 "$0")" "$0" "$@"', ('#' + 'x' * 400), 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"__VERSION__\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli __VERSION__; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
-    # Line 3 of the mock script (bash rejects NUL bytes in its first 80, hence the sh trampoline) carries a PE header: e_lfanew at 0x3C, 'PE' at 0x80, optional-header Subsystem at 0xDC.
-    function Set-MockSubsystem([string]$Path, [byte]$Subsystem) {
+    @('#!/bin/sh', 'exec bash -c "$(tail -n +4 "$0")" "$0" "$@"', ('#' + 'x' * 1000), 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"__VERSION__\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli __VERSION__; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
+    # Line 3 of the mock script (bash rejects NUL bytes in its first 80, hence the sh trampoline) carries a PE32+ header: e_lfanew at 0x3C, 'PE' at 0x80, one section (table at 0x188) mapping RVA 0x3000 to file offset 0x200, Subsystem at 0xDC, and an import directory with one descriptor per DLL at 0x200 and the names from 0x280.
+    function Set-MockPe([string]$Path, [byte]$Subsystem, [string[]]$Imports) {
       $bytes = [IO.File]::ReadAllBytes($Path)
-      $bytes[0x3C] = 0x80; $bytes[0x3D] = 0; $bytes[0x3E] = 0; $bytes[0x3F] = 0
-      $bytes[0x80] = 0x50; $bytes[0x81] = 0x45; $bytes[0x82] = 0; $bytes[0x83] = 0
-      $bytes[0xDC] = $Subsystem; $bytes[0xDD] = 0
+      function Put([int]$Offset, [uint32]$Value, [int]$Width) { for ($i = 0; $i -lt $Width; $i++) { $bytes[$Offset + $i] = [byte](($Value -shr (8 * $i)) -band 0xFF) } }
+      Put 0x3C 0x80 4; Put 0x80 0x4550 4
+      Put 0x86 1 2; Put 0x94 0xF0 2; Put 0x98 0x20B 2; Put 0xDC $Subsystem 2
+      Put 0x104 16 4; Put 0x110 0x3000 4; Put 0x114 (20 * ($Imports.Count + 1)) 4
+      Put 0x190 0x200 4; Put 0x194 0x3000 4; Put 0x198 0x200 4; Put 0x19C 0x200 4
+      for ($n = 0; $n -lt $Imports.Count; $n++) {
+        $descriptor = 0x200 + 20 * $n
+        foreach ($field in 0, 4, 8, 16) { Put ($descriptor + $field) 0 4 }
+        Put ($descriptor + 12) (0x3080 + 0x30 * $n) 4
+        $name = [Text.Encoding]::ASCII.GetBytes($Imports[$n] + [char]0)
+        [Array]::Copy($name, 0, $bytes, 0x280 + 0x30 * $n, $name.Length)
+      }
+      for ($i = 0; $i -lt 20; $i++) { $bytes[0x200 + 20 * $Imports.Count + $i] = 0 }
       [IO.File]::WriteAllBytes($Path, $bytes)
     }
-    Set-MockSubsystem (Join-Path $product 'focusforge-cli.exe') 3
+    $imports = @('KERNEL32.dll', 'api-ms-win-crt-runtime-l1-1-0.dll')
+    Set-MockPe (Join-Path $product 'focusforge-cli.exe') 3 ($imports + @(if ($env:MOCK_CRT_IMPORT) { $env:MOCK_CRT_IMPORT }))
     & chmod +x (Join-Path $product 'focusforge-cli.exe')
     Copy-Item (Join-Path $product 'focusforge-cli.exe') (Join-Path $product 'focusforge-gui.exe')
-    Set-MockSubsystem (Join-Path $product 'focusforge-gui.exe') $(if ($env:MOCK_GUI_CONSOLE) { 3 } else { 2 })
+    Set-MockPe (Join-Path $product 'focusforge-gui.exe') $(if ($env:MOCK_GUI_CONSOLE) { 3 } else { 2 }) $imports
     & chmod +x (Join-Path $product 'focusforge-gui.exe')
     @('if [[ $1 == --exit-after ]]; then while (($#)); do if [[ $1 == --screenshot ]]; then printf "\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001" > "$2"; exit 0; fi; shift; done; exit 64; fi') | Add-Content (Join-Path $product 'focusforge-gui.exe')
     Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $product
@@ -1776,7 +1787,7 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         invocations = root / "invocations"
         env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
-        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False), ({"MOCK_GUI_CONSOLE": "1"}, False)):
+        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False), ({"MOCK_GUI_CONSOLE": "1"}, False), ({"MOCK_CRT_IMPORT": "VCRUNTIME140.dll"}, False)):
             shutil.rmtree(root / "symbols", ignore_errors=True)
             shutil.copytree(template, root / "symbols")
             case_env = env | mutation
@@ -1789,6 +1800,11 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
                 assert "invalid Start-menu shortcut AppUserModelID:" in result.stderr, result.stderr
             if "MOCK_GUI_CONSOLE" in mutation:
                 assert "focusforge-gui.exe must be a windowed binary (PE subsystem 2)" in result.stderr, result.stderr
+            if not mutation:
+                assert "focusforge-cli.exe imports: KERNEL32.dll, api-ms-win-crt-runtime-l1-1-0.dll" in result.stdout, result.stdout
+                assert "focusforge-gui.exe imports: KERNEL32.dll, api-ms-win-crt-runtime-l1-1-0.dll" in result.stdout, result.stdout
+            if "MOCK_CRT_IMPORT" in mutation:
+                assert "focusforge-cli.exe links the dynamic C runtime: VCRUNTIME140.dll" in result.stderr, result.stderr
             assert not (root / "program-files/FocusForge").exists()
             assert not (root / "program-data/Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk").exists()
         assert invocations.read_text().splitlines()[:2] == ["focusforge-cli.exe:1:algorithms", "focusforge-gui.exe:0:"]
