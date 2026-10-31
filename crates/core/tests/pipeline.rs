@@ -34,7 +34,7 @@ use focusforge_core::pipeline::{
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
-use focusforge_core::tile::{Rect, Tile, TileError};
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError};
 use focusforge_core::zmap::ZMapReader;
 
 fn mantis_frames(count: usize) -> Vec<PathBuf> {
@@ -1388,6 +1388,7 @@ impl TileBackend for CappedBackend {
         _samples_per_pixel: u32,
         _levels: u32,
         _transforms: &[Transform],
+        _sample_format: SampleFormat,
     ) -> Option<String> {
         self.asked.lock().unwrap().push((width, height));
         self.shortfall.clone()

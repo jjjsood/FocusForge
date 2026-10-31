@@ -27,7 +27,7 @@ use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
 use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 
 #[derive(Parser)]
-#[command(name = "focusforge-gui")]
+#[command(name = "focusforge-gui", version)]
 struct Args {
     /// Exit this many milliseconds after the window is shown.
     #[arg(long)]
@@ -97,8 +97,8 @@ struct Args {
     toolbar_state: Option<String>,
     /// Opens the export modal at startup with literal preview text, for
     /// inspecting a state no click sequence quickly reaches: `ready`,
-    /// `ready-png`, `ready-jpeg`, `ready-menu`, `writing`, `refused` or
-    /// `refused-format`.
+    /// `ready-png`, `ready-jpeg`, `ready-dng`, `ready-menu`, `writing`,
+    /// `refused` or `refused-format`.
     #[arg(long)]
     export_dialog_preview: Option<String>,
     /// Opens the `Images` panel's sort menu at startup, for inspecting it
@@ -230,14 +230,15 @@ const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "f
 /// sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
-    // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
-    // list open), `writing`, `refused` or `refused-format` (a format cause,
-    // no `Locate frames…`).
+    // `ready`, `ready-png`, `ready-jpeg`, `ready-dng`, `ready-menu` (TIFF
+    // compression list open), `writing`, `refused` or `refused-format` (a
+    // format cause, no `Locate frames…`).
     let (stage, variant) = spec.split_once('-').unwrap_or((spec, ""));
     let choice = focusforge_gui::export_settings::ExportChoice {
         format: match variant {
             "png" => ExportFormat::Png,
             "jpeg" => ExportFormat::Jpeg,
+            "dng" => ExportFormat::Dng,
             _ => ExportFormat::Tiff,
         },
         ..Default::default()
@@ -1711,6 +1712,22 @@ fn install_save_folder(args: &Args) {
     }
 }
 
+/// A windowed Windows process starts without a console, so clap's help,
+/// version and error text would go nowhere. Attaching the starting terminal's
+/// console first lets it print there. Without a parent console (Explorer, the
+/// Start menu) the call fails and nothing opens; handles the parent already
+/// redirected are left alone.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: takes no pointers; the failure case is the one described above.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> ExitCode {
     // Before any thread or child process exists, so none inherits the tokens.
     let launch_tokens = take_launch_tokens();
@@ -1728,7 +1745,11 @@ fn main() -> ExitCode {
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");
 
-    let result = run(&Args::parse(), launch_tokens);
+    let args = Args::try_parse().unwrap_or_else(|error| {
+        attach_parent_console();
+        error.exit()
+    });
+    let result = run(&args, launch_tokens);
     focusforge_gui::bridge::finish_input_trace();
     result
 }
@@ -1973,6 +1994,18 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_flag_prints_the_binary_name_and_workspace_version() {
+        let error = Args::try_parse_from(["focusforge-gui", "--version"])
+            .err()
+            .expect("--version is a recognised flag that stops parsing");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let text = error.render().to_string();
+        assert!(text.starts_with("focusforge-gui "), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    }
 
     #[test]
     fn newer_setup_keeps_a_queued_older_teardown_stale() {

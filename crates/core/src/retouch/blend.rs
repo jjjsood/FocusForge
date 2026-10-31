@@ -12,7 +12,7 @@ use std::num::NonZeroU32;
 
 use crate::algorithm::TileReader;
 use crate::project::{Op, Point};
-use crate::tile::Rect;
+use crate::tile::{Rect, Sample};
 use crate::zmap::ZMapInfo;
 
 use super::RetouchError;
@@ -293,6 +293,28 @@ pub fn blend_sample(out: u16, src: u16, alpha: u32) -> u16 {
     ((out * (u64::from(OPAQUE) - alpha) + src * alpha + 32768) >> 16) as u16
 }
 
+/// A sample type a stroke blends in. `u16` uses [`blend_sample`]'s integer
+/// rule; `f32` mixes linearly with no clamp, so values outside `0..=65535`
+/// survive.
+pub trait Blend: Sample {
+    /// `out` mixed toward `src` by the Q16 `alpha`: `out` at 0, `src` at 65536.
+    fn blend(out: Self, src: Self, alpha: u32) -> Self;
+}
+
+impl Blend for u16 {
+    fn blend(out: Self, src: Self, alpha: u32) -> Self {
+        blend_sample(out, src, alpha)
+    }
+}
+
+impl Blend for f32 {
+    fn blend(out: Self, src: Self, alpha: u32) -> Self {
+        debug_assert!(alpha <= OPAQUE, "alpha is Q16 in 0..=65536");
+        let alpha = alpha as f32 / OPAQUE as f32;
+        out * (1.0 - alpha) + src * alpha
+    }
+}
+
 /// Whether a stroke with Q16 `alpha` shows its own source at a pixel: more
 /// than half of full coverage. The one rule [`top_source`] and
 /// [`overlay_colors`] share.
@@ -378,13 +400,13 @@ pub fn overlay_colors(
 /// only pixels inside `region` and the stroke's footprint change.
 ///
 /// Cost follows the area near the path, not the path's bounding box.
-pub fn apply(
+pub fn apply<S: Blend>(
     op: &Op,
     info: ZMapInfo,
     out_rect: Rect,
-    out: &mut [u16],
+    out: &mut [S],
     region: Rect,
-    src: &[u16],
+    src: &[S],
     spp: usize,
 ) -> Result<(), RetouchError> {
     let stroke = validate(op, info)?;
@@ -422,7 +444,7 @@ pub fn apply(
             .iter_mut()
             .zip(&src[src_at..src_at + spp])
         {
-            *o = blend_sample(*o, s, a);
+            *o = S::blend(*o, s, a);
         }
     });
     Ok(())
@@ -446,36 +468,31 @@ pub struct PlacedStroke<'a> {
 /// by `blend`, called as [`apply`] is: [`apply`] itself, or a blend with the
 /// same result.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_strokes(
+pub fn apply_strokes<S: Sample>(
     info: ZMapInfo,
     out_rect: Rect,
-    out: &mut [u16],
+    out: &mut [S],
     strokes: &[PlacedStroke<'_>],
     frames: &dyn TileReader,
     origin: (u32, u32),
     spp: usize,
-    mut blend: impl FnMut(
-        &Op,
-        ZMapInfo,
-        Rect,
-        &mut [u16],
-        Rect,
-        &[u16],
-        usize,
-    ) -> Result<(), RetouchError>,
+    mut blend: impl FnMut(&Op, ZMapInfo, Rect, &mut [S], Rect, &[S], usize) -> Result<(), RetouchError>,
 ) -> Result<(), RetouchError> {
-    let mut frame: Vec<u16> = Vec::new();
+    let mut frame: Vec<S> = Vec::new();
     for stroke in strokes {
         let Some(region) = stroke.footprint.intersect(out_rect) else {
             continue;
         };
-        frame.resize(region.width as usize * region.height as usize * spp, 0);
+        frame.resize(
+            region.width as usize * region.height as usize * spp,
+            S::default(),
+        );
         let at_frame = Rect {
             x: region.x + origin.0,
             y: region.y + origin.1,
             ..region
         };
-        frames.read_tile_into(stroke.frame, at_frame, &mut frame)?;
+        S::read_tile(frames, stroke.frame, at_frame, &mut frame)?;
         blend(stroke.op, info, out_rect, out, region, &frame, spp)?;
     }
     Ok(())
@@ -500,6 +517,44 @@ mod tests {
 
     fn info(width: u32, height: u32) -> ZMapInfo {
         ZMapInfo::new(width, height, 4).unwrap()
+    }
+
+    #[test]
+    fn f32_blend_keeps_the_endpoints_and_does_not_clamp() {
+        assert_eq!(<f32 as Blend>::blend(70_000.5, 12.0, 0), 70_000.5);
+        assert_eq!(<f32 as Blend>::blend(70_000.5, 12.0, OPAQUE), 12.0);
+        assert_eq!(<f32 as Blend>::blend(-300.25, 90_000.0, OPAQUE), 90_000.0);
+        let mixed = <f32 as Blend>::blend(100_000.0, 20_000.0, OPAQUE / 4);
+        assert_eq!(mixed, 80_000.0, "a quarter of the way from 100000 to 20000");
+        let below = <f32 as Blend>::blend(-500.0, 100.0, OPAQUE / 2);
+        assert_eq!(below, -200.0, "negative samples blend unclamped");
+    }
+
+    #[test]
+    fn u16_blend_is_the_integer_formula() {
+        for (out, src, alpha) in [(0, 65_535, 1), (65_535, 0, 65_535), (123, 456, 32_768)] {
+            assert_eq!(
+                <u16 as Blend>::blend(out, src, alpha),
+                blend_sample(out, src, alpha)
+            );
+        }
+    }
+
+    #[test]
+    fn apply_blends_f32_samples_without_a_clamp() {
+        let map = info(4, 1);
+        let op = stroke_op(0, vec![pt(0, 0), pt(3, 0)], 10.0, 0.0);
+        let whole = rect(0, 0, 4, 1);
+        let mut out = vec![90_000.0f32; 4];
+        apply(&op, map, whole, &mut out, whole, &[70_000.0f32; 4], 1).unwrap();
+        assert_eq!(
+            out,
+            vec![70_000.0f32; 4],
+            "an opaque stroke copies the source"
+        );
+        let mut out = vec![70_000.0f32; 4];
+        apply(&op, map, whole, &mut out, whole, &[-20.0f32; 4], 1).unwrap();
+        assert_eq!(out, vec![-20.0f32; 4]);
     }
 
     fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {

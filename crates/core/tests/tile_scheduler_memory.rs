@@ -32,7 +32,8 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{
-    NoopPreprocess, Rect, TileConsumer, TileError, TileJob, TileScheduler, TileSchedulerOptions,
+    NoopPreprocess, Rect, SampleFormat, TileConsumer, TileError, TileJob, TileScheduler,
+    TileSchedulerOptions,
 };
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -165,13 +166,14 @@ fn peak_live_heap_stays_under_ceiling() {
     let values = params::resolved_values(&resolved);
 
     // Two accounted tiles of the method's own bytes: the budget admits two.
-    let tile_bytes = 128 * 128 * (3 * 2 + 1 + algo.working_bytes_per_pixel(&values, 3));
+    let tile_bytes =
+        128 * 128 * (3 * 2 + 1 + algo.working_bytes_per_pixel(&values, 3, SampleFormat::U16));
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_ceiling");
     let mut options = TileSchedulerOptions::explicit_budget(scratch_base, 2 * tile_bytes);
     options.tile_size = 128;
     options.levels = 2;
-    options.working_bytes_per_pixel = algo.working_bytes_per_pixel(&values, 3);
+    options.working_bytes_per_pixel = algo.working_bytes_per_pixel(&values, 3, SampleFormat::U16);
     let scheduler =
         TileScheduler::new(&stack, stack_ctx, 3, &options).expect("scheduler must build");
     assert_eq!(
@@ -646,7 +648,8 @@ fn declared_working_bytes_cover_the_measured_peak() {
         let resolved =
             params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve must succeed");
         let values = params::resolved_values(&resolved);
-        let declared = algo.working_bytes_per_pixel(&values, 3) * u64::from(width * height);
+        let declared =
+            algo.working_bytes_per_pixel(&values, 3, SampleFormat::U16) * u64::from(width * height);
 
         let fused = settled_peak(method, 8, width, height, true);
         let baseline = settled_peak(method, 8, width, height, false);
@@ -678,6 +681,185 @@ fn peak_heap_is_independent_of_frame_count() {
             "{method}: peak {large} B at 64 frames exceeds the 8-frame peak {small} B by \
              {} B, one frame tile is {frame_tile} B",
             large.saturating_sub(small)
+        );
+    }
+}
+
+/// [`PatternReader`]'s content served as `f32` only: its `u16` read fails.
+struct PatternReaderF32;
+
+impl TileReader for PatternReaderF32 {
+    fn sample_format(&self) -> SampleFormat {
+        SampleFormat::F32
+    }
+
+    fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "pattern".to_string(),
+            detail: "serves f32 only".to_string(),
+        })
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        let mut narrow = vec![0u16; out.len()];
+        PatternReader.read_tile_into(frame, rect, &mut narrow)?;
+        for (wide, narrow) in out.iter_mut().zip(narrow) {
+            *wide = f32::from(narrow);
+        }
+        Ok(())
+    }
+}
+
+/// [`NoAllocConsumer`] over `f32` frame tiles.
+struct NoAllocF32Consumer;
+
+impl TileConsumer for NoAllocF32Consumer {
+    fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+        job.ctx().for_each_frame_as::<f32>(|_, _, _| Ok(()))
+    }
+}
+
+struct ZeroReaderF32;
+
+impl TileReader for ZeroReaderF32 {
+    fn sample_format(&self) -> SampleFormat {
+        SampleFormat::F32
+    }
+
+    fn read_tile_into(&self, _: usize, _: Rect, out: &mut [u16]) -> Result<(), AlgorithmError> {
+        out.fill(0);
+        Ok(())
+    }
+
+    fn read_tile_f32_into(&self, _: usize, _: Rect, out: &mut [f32]) -> Result<(), AlgorithmError> {
+        out.fill(0.0);
+        Ok(())
+    }
+}
+
+/// A reader serving `f32` is accounted at four bytes a sample: exactly
+/// `pixels * samples * 2` above the same tile as `u16`; a host budget of that
+/// many bytes is accepted and one byte less is refused by name.
+#[test]
+fn f32_tile_budget_counts_four_byte_samples() {
+    let _guard = serial();
+    let (side, spp) = (128u64, 3u64);
+    let u16_bytes = side * side * (spp * 2 + 1);
+    let f32_bytes = side * side * (spp * 4 + 1);
+    assert_eq!(f32_bytes - u16_bytes, side * side * spp * 2);
+
+    let stack_ctx = StackContext::new(8, 128, 128, 3);
+    let build = |reader: &dyn TileReader, usable: u64, name: &str| {
+        let facts = HostFacts::new(usable * 4, usable, None, None, 4);
+        let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+        let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
+        options.tile_size = 128;
+        options.levels = 0;
+        TileScheduler::new(reader, stack_ctx, 3, &options).map(|s| s.bytes_per_tile())
+    };
+    // The host budget is 40% of the usable bytes.
+    let exact = f32_bytes * 5 / 2;
+    assert_eq!(
+        build(&ZeroReaderF32, exact, "f32_budget_exact").unwrap(),
+        f32_bytes
+    );
+    assert_eq!(
+        build(&ZeroReader, exact, "f32_budget_u16").unwrap(),
+        u16_bytes
+    );
+    match build(&ZeroReaderF32, exact - 2, "f32_budget_short") {
+        Err(TileError::HostMemoryTooSmall {
+            budget_bytes,
+            bytes_per_tile,
+            ..
+        }) => {
+            assert_eq!(budget_bytes, f32_bytes - 1);
+            assert_eq!(bytes_per_tile, f32_bytes);
+        }
+        other => panic!("one byte below the f32 tile must be refused by name: {other:?}"),
+    }
+}
+
+/// The live heap of one fused tile over an `f32` reader, beyond a
+/// pass-through of the same frames, stays within the method's declared
+/// working bytes.
+#[test]
+fn f32_working_bytes_cover_the_measured_peak() {
+    let _guard = serial();
+    let (width, height) = (128u32, 128u32);
+    let peak = |method: &str, fuse: bool| {
+        let algo = registry::find_stack(method).expect("method must be registered");
+        let mut explicit = ParamValues::new();
+        if method == "laplacian" {
+            explicit.insert("levels".to_string(), params::ParamValue::Int(2));
+        }
+        let stack_ctx = StackContext::new(8, width, height, 3);
+        let resolved = params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve");
+        let values = params::resolved_values(&resolved);
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let tag = format!("tile_scheduler_memory_f32_{method}_{fuse}");
+        let mut options = TileSchedulerOptions::explicit_budget(base.join(&tag), 1);
+        options.apply_support(algo.tile_support(&values));
+        options.tile_size = 128;
+        let scheduler = TileScheduler::new(&PatternReaderF32, stack_ctx, 3, &options)
+            .expect("scheduler must build");
+        let fusion = fuse.then(|| {
+            FusionConsumer::create(
+                algo,
+                values,
+                &base.join(format!("{tag}.tif")),
+                Some(&base.join(format!("{tag}-zmap.tif"))),
+                focusforge_core::fuse::FusionGeometry {
+                    width,
+                    height,
+                    samples_per_pixel: 3,
+                    frame_count: 8,
+                    crop: None,
+                    description: None,
+                },
+            )
+            .expect("consumer must create")
+        });
+        let consumer: &dyn TileConsumer = match &fusion {
+            Some(fusion) => fusion,
+            None => &NoAllocF32Consumer,
+        };
+        let settled = (0..4)
+            .map(|_| {
+                let live = LIVE.load(Ordering::SeqCst);
+                reset_peak();
+                scheduler.run(&NoopPreprocess, consumer).expect("run");
+                peak_since_reset().saturating_sub(live)
+            })
+            .skip(1)
+            .min()
+            .expect("repetitions");
+        if let Some(fusion) = fusion {
+            fusion.finish().expect("finish must succeed");
+        }
+        settled
+    };
+    for method in ["laplacian", "weighted-average", "depth-map"] {
+        let algo = registry::find_stack(method).expect("method must be registered");
+        let mut explicit = ParamValues::new();
+        if method == "laplacian" {
+            explicit.insert("levels".to_string(), params::ParamValue::Int(2));
+        }
+        let stack_ctx = StackContext::new(8, width, height, 3);
+        let resolved = params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve");
+        let declared =
+            algo.working_bytes_per_pixel(&params::resolved_values(&resolved), 3, SampleFormat::U16)
+                * u64::from(width * height);
+        let measured = peak(method, true).saturating_sub(peak(method, false)) as u64;
+        eprintln!("{method}: declared {declared} B, measured {measured} B (f32)");
+        assert!(
+            measured <= declared,
+            "{method}: measured {measured} B exceeds the declared {declared} B"
         );
     }
 }

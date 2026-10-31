@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::fuse::laplacian::{EligibleMasks, score_radius};
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::tile::{Rect, Sample, Tile};
 use focusforge_core::timing::{
     TimingCounter, gpu_tile_scope, gpu_tile_stage, measurement_scope, record_timing,
 };
@@ -33,7 +33,9 @@ use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, record_pass, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{create_storage_buffer, download_buffer, upload_storage, upload_tile};
+use crate::transfer::{
+    create_storage_buffer, download_buffer, download_f32, upload_storage, upload_tile,
+};
 
 /// Shape A: one storage buffer read, one storage buffer read/write, one
 /// uniform -- `plane_from_u16`, `plane_to_u16`, `reduce::{horizontal,
@@ -368,6 +370,18 @@ pub(crate) fn plane_from_packed(
     }
 }
 
+/// Wraps an already-resident `f32` buffer of `width * height * spp` samples
+/// on the 16-bit scale as a [`GpuPlane`]: the `f32` path's join, with no
+/// pack and no conversion kernel.
+pub(crate) fn plane_from_f32(buffer: wgpu::Buffer, width: u32, height: u32, spp: u32) -> GpuPlane {
+    GpuPlane {
+        buffer,
+        width,
+        height,
+        spp,
+    }
+}
+
 /// Uploads `tile`'s samples through the packed-`u32` transport plus
 /// [`plane_from_packed`] -- the only place `u16` samples cross the bus in
 /// this module for a tile that has not already been dispatched on the GPU
@@ -449,12 +463,86 @@ struct BestLevel {
     height: u32,
 }
 
+/// A sample type the fused composite is read back as: `u16` quantizes the
+/// collapsed `f32` plane on the device and reads it packed, `f32` reads the
+/// plane itself, nothing clamped.
+pub trait FusedSample: Sample {
+    /// The buffer to read back for `plane`'s `sample_count` samples.
+    fn finalize(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipelines: &FusionPipelines,
+        plane: wgpu::Buffer,
+        sample_count: usize,
+    ) -> wgpu::Buffer;
+
+    /// Reads `buffer` back as `sample_count` samples.
+    fn download(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        sample_count: usize,
+    ) -> Result<Vec<Self>, AlgorithmError>;
+}
+
+impl FusedSample for u16 {
+    fn finalize(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipelines: &FusionPipelines,
+        plane: wgpu::Buffer,
+        sample_count: usize,
+    ) -> wgpu::Buffer {
+        let word_count = (packed_len(sample_count) / 4) as u32;
+        convert::plane_to_u16(
+            device,
+            queue,
+            pipelines,
+            &plane,
+            word_count,
+            sample_count as u32,
+        )
+    }
+
+    fn download(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        sample_count: usize,
+    ) -> Result<Vec<Self>, AlgorithmError> {
+        let packed = download_buffer(device, queue, buffer, packed_len(sample_count) as u64)?;
+        Ok(unpack_samples(&packed, sample_count))
+    }
+}
+
+impl FusedSample for f32 {
+    fn finalize(
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _pipelines: &FusionPipelines,
+        plane: wgpu::Buffer,
+        _sample_count: usize,
+    ) -> wgpu::Buffer {
+        plane
+    }
+
+    fn download(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        sample_count: usize,
+    ) -> Result<Vec<Self>, AlgorithmError> {
+        Ok(download_f32(device, queue, buffer, sample_count)?)
+    }
+}
+
 /// Fuses `rect` across `frame_count` frames at pyramid depth `levels`,
-/// entirely on the GPU -- the WGSL twin of `Laplacian::fuse`. `source`
-/// supplies frame `i`'s base [`GpuPlane`], already resident. The two
-/// `download_buffer` calls at the tail (composite, Z-Map) are the only
-/// readbacks; the module docs cover why frame 0 needs no special case.
-pub(crate) fn fuse_planes_gpu(
+/// entirely on the GPU -- the WGSL twin of `Laplacian::fuse` (`u16`) or
+/// `Laplacian::fuse_f32` (`f32`). `source` supplies frame `i`'s base
+/// [`GpuPlane`], already resident. The two readbacks at the tail (composite,
+/// Z-Map) are the only ones; the module docs cover why frame 0 needs no
+/// special case.
+pub(crate) fn fuse_planes_gpu<O: FusedSample>(
     shared: &SharedDevice,
     pipelines: &FusionPipelines,
     frame_count: usize,
@@ -462,7 +550,7 @@ pub(crate) fn fuse_planes_gpu(
     samples_per_pixel: u32,
     levels: u32,
     source: &mut dyn FnMut(usize) -> Result<FrameSource, AlgorithmError>,
-) -> Result<TileOutput, AlgorithmError> {
+) -> Result<TileOutput<O>, AlgorithmError> {
     let _tile = gpu_tile_scope();
     let device = shared.device();
     let queue = shared.queue();
@@ -658,20 +746,11 @@ pub(crate) fn fuse_planes_gpu(
     batch.submit();
 
     let sample_count = current_width as usize * current_height as usize * spp as usize;
-    let word_count = (packed_len(sample_count) / 4) as u32;
-    let packed_out = convert::plane_to_u16(
-        device,
-        queue,
-        pipelines,
-        &current_buffer,
-        word_count,
-        sample_count as u32,
-    );
+    let out_buffer = O::finalize(device, queue, pipelines, current_buffer, sample_count);
     drop(reconstruct);
 
     let readback = gpu_tile_stage(TimingCounter::GpuTileReadbackNs);
-    let packed_bytes = download_buffer(device, queue, &packed_out, (word_count as u64) * 4)?;
-    let samples = unpack_samples(&packed_bytes, sample_count);
+    let samples = O::download(device, queue, &out_buffer, sample_count)?;
 
     let (winner_best, ww, wh) = winner_buffer.expect("levels >= 1 guarantees a level-0 winner");
     let winner_count = ww as usize * wh as usize;
@@ -736,7 +815,7 @@ pub fn fuse_tile_gpu(
         Ok((upload_plane(device, queue, pipelines, &tile), covered))
     };
 
-    fuse_planes_gpu(
+    fuse_planes_gpu::<u16>(
         shared,
         pipelines,
         frame_count,

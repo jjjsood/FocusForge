@@ -17,9 +17,9 @@ use focusforge_core::align::WarpingReader;
 use focusforge_core::equalize::{EqualizeSettings, GainReader};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
-    COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
+    COMPOSITE_FILENAME, FrameError, FrameReader, RawError, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
-pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
+pub use focusforge_core::io::{DNG_EXTENSIONS, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
@@ -33,7 +33,9 @@ pub use focusforge_core::project::export::{
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
+use focusforge_core::retouch::blend::Blend;
 use focusforge_core::retouch::{RetouchError, blend};
+use focusforge_core::tile::SampleFormat;
 pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
 use focusforge_gpu::blend::Blender;
@@ -1095,6 +1097,17 @@ pub fn export_refusal_lines(err: &ExportError) -> Vec<String> {
             "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
                 .to_string(),
         ],
+        ExportError::Project(ProjectError::ExportDngNeedsRaw { .. }) => vec![
+            "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+                .to_string(),
+        ],
+        ExportError::Project(ProjectError::ExportDngColour { source, .. }) => {
+            let reason = match &**source {
+                RawError::Unsupported { detail, .. } => detail.clone(),
+                other => other.to_string(),
+            };
+            vec![format!("DNG can't describe this image's colour: {reason}.")]
+        }
         ExportError::Project(ProjectError::ExportOptions { source }) => {
             vec![format!("Some export settings aren't valid: {source}.")]
         }
@@ -1127,6 +1140,22 @@ pub enum EditSessionError {
     Composite(#[from] focusforge_core::TiffError),
     #[error(transparent)]
     Frames(#[from] FrameError),
+    #[error(
+        "{}: the composite holds {} samples, but its source frames are read as {}",
+        .path.display(), sample_label(*.composite), sample_label(*.sources)
+    )]
+    SampleFormatMismatch {
+        path: PathBuf,
+        composite: SampleFormat,
+        sources: SampleFormat,
+    },
+}
+
+fn sample_label(format: SampleFormat) -> &'static str {
+    match format {
+        SampleFormat::U16 => "16-bit",
+        SampleFormat::F32 => "32-bit float",
+    }
 }
 
 /// What a region render starts from before its ops are blended over it.
@@ -1154,7 +1183,7 @@ pub struct RegionRender {
 
 /// What a region-render worker renders: each region, in dispatch order, with
 /// its samples or the reason it failed.
-type Rendered = Vec<(Rect, Result<Vec<u16>, String>)>;
+type Rendered = Vec<(Rect, Result<Vec<f32>, String>)>;
 
 /// What a worker parks: its regions, the pre-drag tiles it holds once the
 /// batch is done (`None` when it panicked), and whether the batch ended the
@@ -1248,33 +1277,72 @@ struct RenderInput {
 /// Renders `job`: the pre-image's samples over its region with its ops
 /// blended in order from their frames, the same step a saved checkpoint's
 /// render takes. The result is installed in `local`; a job that ends the
-/// drag then empties `snapshot`, whether it rendered or not.
+/// drag then empties `snapshot`, whether it rendered or not. The samples are
+/// the base's own type: a 16-bit base blends on the device while one is
+/// attached, a float base on the CPU. They come back as `f32`.
 fn render_region(
     input: &RenderInput,
     job: &RegionRender,
     local: &mut crate::canvas::ResidentTiles,
     snapshot: &mut crate::canvas::ResidentTiles,
-) -> Result<Vec<u16>, String> {
-    let rendered = blend_region(input, job, local, snapshot);
+) -> Result<Vec<f32>, String> {
+    let rendered = match input.base.sample_format() {
+        SampleFormat::U16 => {
+            // A stroke the device cannot blend, or any device failure, goes
+            // through the CPU blend, which leaves the same samples.
+            let mut device_failed = false;
+            let blend_stroke = |op: &Op,
+                                info: ZMapInfo,
+                                out_rect: Rect,
+                                out: &mut [u16],
+                                region: Rect,
+                                src: &[u16],
+                                spp: usize| {
+                if let Some(blender) = &input.blender {
+                    match blender.apply(op, info, out_rect, out, region, src, spp) {
+                        Ok(()) => return Ok(()),
+                        Err(error) => {
+                            if !std::mem::replace(&mut device_failed, true) {
+                                tracing::warn!(
+                                    %error, ?region, "device blend failed; blending on the CPU"
+                                );
+                            }
+                        }
+                    }
+                }
+                blend::apply(op, info, out_rect, out, region, src, spp)
+            };
+            blend_region(input, job, local, snapshot, blend_stroke)
+                .map(|samples| samples.into_iter().map(f32::from).collect())
+        }
+        SampleFormat::F32 => blend_region(input, job, local, snapshot, blend::apply::<f32>),
+    };
     if job.ends_drag {
         snapshot.clear();
     }
     rendered
 }
 
-fn blend_region(
+/// [`render_region`] in sample type `S`, each stroke blended by `blend_stroke`.
+fn blend_region<S: Blend>(
     input: &RenderInput,
     job: &RegionRender,
     local: &mut crate::canvas::ResidentTiles,
     snapshot: &mut crate::canvas::ResidentTiles,
-) -> Result<Vec<u16>, String> {
+    mut blend_stroke: impl FnMut(
+        &Op,
+        ZMapInfo,
+        Rect,
+        &mut [S],
+        Rect,
+        &[S],
+        usize,
+    ) -> Result<(), RetouchError>,
+) -> Result<Vec<S>, String> {
     let region = job.region;
     let spp = input.samples_per_pixel;
-    let mut out = vec![0u16; region.width as usize * region.height as usize * spp];
-    input
-        .base
-        .read_tile_into(0, region, &mut out)
-        .map_err(|error| error.to_string())?;
+    let mut out = vec![S::default(); region.width as usize * region.height as usize * spp];
+    S::read_tile(&*input.base, 0, region, &mut out).map_err(|error| error.to_string())?;
     match job.pre {
         PreImage::Base => {}
         PreImage::Current => local.overlay_into(region, &mut out),
@@ -1297,28 +1365,6 @@ fn blend_region(
             });
         }
     }
-    // A stroke the device cannot blend, or any device failure, goes through
-    // the CPU blend, which leaves the same samples.
-    let mut device_failed = false;
-    let mut blend_stroke = |op: &Op,
-                            info: ZMapInfo,
-                            out_rect: Rect,
-                            out: &mut [u16],
-                            region: Rect,
-                            src: &[u16],
-                            spp: usize| {
-        if let Some(blender) = &input.blender {
-            match blender.apply(op, info, out_rect, out, region, src, spp) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    if !std::mem::replace(&mut device_failed, true) {
-                        tracing::warn!(%error, ?region, "device blend failed; blending on the CPU");
-                    }
-                }
-            }
-        }
-        blend::apply(op, info, out_rect, out, region, src, spp)
-    };
     with_registered_sources(&*input.sources, &input.registration, |reader, origin| {
         blend::apply_strokes(
             input.info,
@@ -1610,7 +1656,7 @@ pub fn open_edit_session(
         width: 1,
         height: 1,
     };
-    let base = Arc::new(TiffStack::open_files(&[composite.to_path_buf()])?);
+    let base = Arc::new(TiffStack::open_staged(composite)?);
     let header = base.header(0);
     let mut first = vec![0u16; header.samples_per_pixel as usize];
     base.read_tile_into(0, pixel, &mut first)?;
@@ -1635,6 +1681,13 @@ pub fn open_edit_session(
             .ok()
     });
     let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
+    if base.sample_format() != sources.sample_format() {
+        return Err(EditSessionError::SampleFormatMismatch {
+            path: composite.to_path_buf(),
+            composite: base.sample_format(),
+            sources: sources.sample_format(),
+        });
+    }
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
         tile_size,
@@ -1951,6 +2004,32 @@ mod export_refusal_tests {
             vec![
                 "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
             ]
+        );
+    }
+
+    #[test]
+    fn dng_refusals_name_the_cause() {
+        let needs_raw = ExportError::Project(ProjectError::ExportDngNeedsRaw {
+            path: PathBuf::from("/tmp/out.dng"),
+        });
+        assert_eq!(
+            export_refusal_lines(&needs_raw),
+            vec![
+                "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+            ]
+        );
+        let colour = ExportError::Project(ProjectError::ExportDngColour {
+            path: PathBuf::from("/tmp/out.dng"),
+            source: Box::new(RawError::Unsupported {
+                path: PathBuf::from("a.dng"),
+                make: "Acme".to_string(),
+                model: "M1".to_string(),
+                detail: "monochrome sensor".to_string(),
+            }),
+        });
+        assert_eq!(
+            export_refusal_lines(&colour),
+            vec!["DNG can't describe this image's colour: monochrome sensor."]
         );
     }
 

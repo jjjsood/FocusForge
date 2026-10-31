@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::entry::RAW_EXTENSIONS;
-use crate::job::{ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
+use crate::job::{DNG_EXTENSIONS, ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 
 /// Opens the OS folder picker. `None` on cancel (or a missing dialog
 /// backend, rfd#320).
@@ -84,6 +84,7 @@ fn image_extensions(format: ExportFormat) -> &'static [&'static str] {
         ExportFormat::Tiff => TIFF_EXTENSIONS,
         ExportFormat::Png => PNG_EXTENSIONS,
         ExportFormat::Jpeg => JPEG_EXTENSIONS,
+        ExportFormat::Dng => DNG_EXTENSIONS,
     }
 }
 

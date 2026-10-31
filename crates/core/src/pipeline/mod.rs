@@ -333,7 +333,10 @@ pub fn run(
     };
 
     options.apply_support(support);
-    options.working_bytes_per_pixel = request.algorithm.working_bytes_per_pixel(&values, spp);
+    options.working_bytes_per_pixel =
+        request
+            .algorithm
+            .working_bytes_per_pixel(&values, spp, frame_reader.sample_format());
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
@@ -650,6 +653,7 @@ pub fn run(
             spp,
             support.decimation_levels,
             &transforms,
+            gain_reader.sample_format(),
         )
     });
     if let Some(message) = &gpu_fallback {
@@ -747,7 +751,7 @@ pub fn run(
 
     let is_resuming = !ledger.completed().is_empty();
     let (sink, surviving): (FusionConsumer, Option<Vec<usize>>) = if is_resuming {
-        match FusionConsumer::resume(
+        match FusionConsumer::resume_as(
             scheduler.plan(),
             ledger.completed(),
             request.algorithm,
@@ -755,6 +759,7 @@ pub fn run(
             &staged_composite,
             Some(&staged_zmap),
             geometry.clone(),
+            gain_reader.sample_format(),
         ) {
             Ok((sink, surviving)) => (sink, Some(surviving)),
             Err(err) => {
@@ -764,12 +769,13 @@ pub fn run(
             }
         }
     } else {
-        match FusionConsumer::create(
+        match FusionConsumer::create_as(
             request.algorithm,
             values.clone(),
             &staged_composite,
             Some(&staged_zmap),
             geometry,
+            gain_reader.sample_format(),
         ) {
             Ok(sink) => (sink, None),
             Err(err) => {
@@ -1198,7 +1204,7 @@ fn measure_metrics(
     sources: &dyn FrameReader,
     gained: &dyn TileReader,
 ) -> Metrics {
-    let Ok(stack) = TiffStack::open_files(std::slice::from_ref(&composite.to_path_buf())) else {
+    let Ok(stack) = TiffStack::open_staged(composite) else {
         return Metrics::default();
     };
     let (width, height) = FrameReader::dimensions(&stack);

@@ -34,6 +34,7 @@ use super::manifest::{
 use super::{HASH_ALGORITHM, Project, blob_entry, checkpoint_entry};
 use crate::align::Registration;
 use crate::params::ParamValues;
+use crate::tile::SampleFormat;
 
 /// Everything one seal needs. Borrowed rather than owned: the caller
 /// already holds every one of these.
@@ -547,7 +548,10 @@ fn blob_records(composite: &BlobRecord, zmap: &BlobRecord) -> Vec<BlobRecord> {
 pub(super) fn record(blob: &StagedBlob) -> BlobRecord {
     BlobRecord {
         hash: blob.hash.clone(),
-        kind: BlobKind::Full,
+        kind: match blob.format {
+            SampleFormat::U16 => BlobKind::Full,
+            SampleFormat::F32 => BlobKind::FullF32,
+        },
         compression: "zstd".to_string(),
         uncompressed_len: blob.uncompressed_len,
         compressed_len: blob.compressed_len,

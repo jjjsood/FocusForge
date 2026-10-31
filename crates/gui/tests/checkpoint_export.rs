@@ -5,6 +5,9 @@
 
 mod common;
 
+#[path = "../../core/tests/common/raw_dng.rs"]
+mod raw_dng;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -912,6 +915,8 @@ fn quality_fraction(quality: i64) -> f32 {
     (quality - 1) as f32 / 99.0
 }
 
+const DNG_NOTE: &str = "No settings: 16-bit, uncompressed, in the camera's own colour.";
+
 fn metadata_off() -> MetadataOptions {
     MetadataOptions {
         exif: false,
@@ -922,15 +927,39 @@ fn metadata_off() -> MetadataOptions {
 }
 
 #[test]
+fn metadata_switch_is_shared_by_every_format() {
+    let (mut controller, _edited) = open_edited_modal("export_modal_formats");
+    controller.export_select_format("DNG");
+    assert!(controller.export_view().unwrap().metadata);
+    controller.export_toggle_metadata();
+    assert!(!controller.export_view().unwrap().metadata);
+    controller.export_select_format("TIFF");
+    assert!(!controller.export_view().unwrap().metadata);
+    controller.export_select_format("DNG");
+    assert!(!controller.export_view().unwrap().metadata);
+    controller.cancel_export();
+}
+
+#[test]
 fn format_switch_shows_only_that_formats_settings() {
     let (mut controller, _edited) = open_edited_modal("export_format_switch");
     for format in export_settings::FORMATS {
         let label = format.id().to_uppercase();
         controller.export_select_format(&label);
         let view = controller.export_view().expect("the modal is open");
-        assert_eq!(view.segments, ["TIFF", "PNG", "JPEG"]);
+        assert_eq!(view.segments, ["TIFF", "PNG", "JPEG", "DNG"]);
         assert_eq!(view.selected, label);
+        assert_eq!(
+            view.note,
+            if format == ExportFormat::Dng {
+                DNG_NOTE
+            } else {
+                ""
+            },
+            "{label}'s note"
+        );
         assert_eq!(view.heading, format!("{label} SETTINGS"));
+        assert_eq!(view.rows.is_empty(), format == ExportFormat::Dng);
         assert!(view.metadata, "Metadata is on at first open");
         assert_eq!(view.slider_group, format == ExportFormat::Jpeg);
         let schema = params_for(format);
@@ -959,6 +988,153 @@ fn format_switch_shows_only_that_formats_settings() {
             quality.to_string(),
             "fraction {} maps back",
             view.rows[0].fraction
+        );
+    }
+}
+
+const RAW_W: u32 = 37;
+const RAW_H: u32 = 23;
+
+/// A RAW project: three 37 x 23 DNG frames under an `f32` composite, a
+/// fused root and one op-bearing child. The returned frames keep the DNG
+/// files alive.
+fn build_raw_edited(name: &str) -> (Edited, Vec<tempfile::NamedTempFile>) {
+    let dir = common::tree(name);
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: RAW_W,
+        height: RAW_H,
+    };
+    let frames: Vec<_> = (0..FRAMES as u32)
+        .map(|frame| {
+            let samples = (0..RAW_W * RAW_H)
+                .map(|i| {
+                    let (x, y) = (i % RAW_W, i / RAW_W);
+                    let checker = if (x / 2 + y / 2) % 2 == 0 { 0 } else { 380 };
+                    (2_700 + frame * 40 + checker) as u16
+                })
+                .collect();
+            let mut spec = raw_dng::DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+            spec.width = RAW_W;
+            spec.height = RAW_H;
+            spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
+            raw_dng::write_dng(&spec, false)
+        })
+        .collect();
+    let sources: Vec<PathBuf> = frames.iter().map(|f| f.path().to_path_buf()).collect();
+    let composite = dir.join("composite.tif");
+    let stored: Vec<f32> = (0..(RAW_W * RAW_H * 3) as usize)
+        .map(|i| (i * 7919 % 120_000) as f32 * 0.9 - 20_000.0)
+        .collect();
+    let mut writer = TiffWriter::create_f32(
+        &composite,
+        TiffSpec {
+            width: RAW_W,
+            height: RAW_H,
+            samples_per_pixel: 3,
+            description: Some("staged".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile_f32(whole, &stored).unwrap();
+    writer.finish().unwrap();
+    let zmap = dir.join("zmap.tif");
+    let mut map = focusforge_core::zmap::ZMapWriter::create(
+        &zmap,
+        ZMapInfo::new(RAW_W, RAW_H, FRAMES as u32).unwrap(),
+    )
+    .unwrap();
+    map.write_tile(whole, &vec![0u16; (RAW_W * RAW_H) as usize])
+        .unwrap();
+    map.finish().unwrap();
+
+    let project = dir.join("raw.ffp");
+    let t0 = 1_756_468_800;
+    let root = seal_at(
+        SealRequest {
+            project_path: &project,
+            staged_composite: &composite,
+            staged_zmap: &zmap,
+            sources: &sources,
+            algorithm: "laplacian-pyramid",
+            params: &ParamValues::new(),
+            align: None,
+            registration: Registration::default(),
+            composite_description: "staged".to_string(),
+            label: None,
+            metrics: Metrics::default(),
+        },
+        t0,
+    )
+    .unwrap()
+    .checkpoint;
+    let edited = append_ops_onto(
+        &project,
+        &root,
+        vec![Op::BrushStroke {
+            source_id: 1,
+            path: vec![Point { x: 20, y: 10 }],
+            radius: 4.0,
+            softness: 0.0,
+        }],
+        None,
+        t0 + 60,
+    )
+    .unwrap()
+    .checkpoint;
+    (
+        Edited {
+            project,
+            sources,
+            root,
+            edited,
+        },
+        frames,
+    )
+}
+
+/// The modal's DNG export of a RAW project, Metadata on and off, is the
+/// file `export_checkpoint` writes. With Metadata on the export stamps the
+/// current second, so the GUI file must equal the core file written just
+/// before or just after it.
+fn dng_cases_equal_the_core_export() {
+    let (raw, _frames) = build_raw_edited("export_raw_dng");
+    let mut controller = scratch_controller("export_raw_dng");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&raw.project));
+    let row = row_index(&controller, &raw.edited);
+    controller.select_checkpoint_row(row);
+    let mut project = Project::open(&raw.project).unwrap();
+    let dir = common::tree("export_raw_dng_out");
+
+    for metadata_on in [true, false] {
+        let options = if metadata_on {
+            MetadataOptions::default()
+        } else {
+            metadata_off()
+        };
+        let core = |name: &str, project: &mut Project| {
+            let out = dir.join(name);
+            export_checkpoint(project, &raw.edited, &out, &ExportOptions::Dng, &options)
+                .unwrap_or_else(|e| panic!("core DNG export: {e}"));
+            fs::read(out).unwrap()
+        };
+        let before = core(&format!("core-before-{metadata_on}.dng"), &mut project);
+
+        controller.checkpoint_export_requested();
+        controller.export_select_format("DNG");
+        if controller.export_view().unwrap().metadata != metadata_on {
+            controller.export_toggle_metadata();
+        }
+        let gui_out = dir.join(format!("gui-{metadata_on}.dng"));
+        export_to(&mut controller, &gui_out);
+        assert!(controller.export_copy().is_none(), "the modal closes");
+
+        let after = core(&format!("core-after-{metadata_on}.dng"), &mut project);
+        let gui = fs::read(&gui_out).unwrap();
+        assert!(
+            gui == before || gui == after,
+            "Metadata {metadata_on}: the modal's DNG differs from the core export"
         );
     }
 }
@@ -1079,6 +1255,8 @@ fn modal_export_equals_cli_export_for_every_format() {
         );
     }
 
+    dng_cases_equal_the_core_export();
+
     // The opening defaults are the CLI's defaults, 4:2:0 JPEG included.
     controller.checkpoint_export_requested();
     controller.export_select_format("JPEG");
@@ -1096,7 +1274,12 @@ fn modal_export_equals_cli_export_for_every_format() {
 #[test]
 fn destination_extension_follows_the_format() {
     let (mut controller, _edited) = open_edited_modal("export_extension");
-    for (label, extension) in [("TIFF", "tif"), ("PNG", "png"), ("JPEG", "jpg")] {
+    for (label, extension) in [
+        ("TIFF", "tif"),
+        ("PNG", "png"),
+        ("JPEG", "jpg"),
+        ("DNG", "dng"),
+    ] {
         controller.export_select_format(label);
         let mut proposed = None;
         controller.export_confirmed(|p| {
@@ -1284,6 +1467,29 @@ fn a_format_refusal_names_its_cause_and_offers_close_only() {
         "a format refusal offers Close only"
     );
     assert!(!out.exists());
+    controller.cancel_export();
+}
+
+#[test]
+fn dng_refused_for_a_tiff_project() {
+    let (mut controller, _edited) = open_edited_modal("export_dng_tiff_project");
+    controller.export_select_format("DNG");
+    let dir = common::tree("export_dng_tiff_project_out");
+    let out = dir.join("a.dng");
+    export_to(&mut controller, &out);
+
+    assert_eq!(controller.export_stage(), "refused");
+    assert_eq!(
+        controller.export_refusal_lines(),
+        &["DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+            .to_string()]
+    );
+    assert!(!controller.export_can_locate(), "Close only");
+    assert!(!out.exists(), "a refused export leaves no file");
+    assert!(
+        !dir.join("a.dng.partial").exists(),
+        "a refused export leaves no .partial"
+    );
     controller.cancel_export();
 }
 

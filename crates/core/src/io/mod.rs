@@ -34,13 +34,13 @@ pub use grouping::{
     propose_with_progress,
 };
 pub(crate) use metadata::{
-    IccOrigin, MetadataPlan, XMP_APP1_HEADER, exif_blob, icc_tag_entry, iptc_tag_entry,
-    photoshop_iptc_segment, resolve_plan, xmp_tag_entry,
+    IccOrigin, MetadataPlan, XMP_APP1_HEADER, dng_entries, exif_blob, icc_tag_entry,
+    iptc_tag_entry, photoshop_iptc_segment, resolve_plan, set_entry, xmp_tag_entry,
 };
 pub use metadata::{MetadataTags, SourceKind, SourceMetadata, TagEntry, read_source_metadata};
 pub use paths::{
-    JPEG_EXTENSIONS, PNG_EXTENSIONS, RAW_EXTENSIONS, TIFF_EXTENSIONS, all_frame_paths,
-    frame_paths_for_extensions, has_extension,
+    DNG_EXTENSIONS, JPEG_EXTENSIONS, PNG_EXTENSIONS, RAW_EXTENSIONS, TIFF_EXTENSIONS,
+    all_frame_paths, frame_paths_for_extensions, has_extension,
 };
 pub use raw::{DEFAULT_RAW_CACHE_BYTES, RawError, RawMetadata, RawStack};
 pub use tiff::decoded::{CacheStats, DecodedTiffStack};

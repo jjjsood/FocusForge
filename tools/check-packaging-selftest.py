@@ -1446,10 +1446,11 @@ def macos_checker_mock() -> None:
         symbols = directory / "symbols"
         write_macos_symbols(symbols / "aarch64-apple-darwin", "aarch64-apple-darwin")
         (app / "Info.plist").write_text("stub")
+        (app / "_CodeSignature").mkdir(); (app / "_CodeSignature/CodeResources").write_text("sealed\n")
         template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
         stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
         bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
-        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo \"${MOCK_PLIST_VERSION:-" + NUMERIC + "}\";; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
+        commands = {"codesign": "#!/usr/bin/env bash\napp=${!#}\n[[ -f $app/Contents/_CodeSignature/CodeResources ]] || { echo \"$app: code object is not signed at all\" >&2; exit 1; }\nif [[ $1 == --verify ]]; then printf '%s: valid on disk\\n%s: satisfies its Designated Requirement\\n' \"$app\" \"$app\" >&2; else printf 'Executable=%s/Contents/MacOS/focusforge-gui\\nSignature=adhoc\\nSealed Resources%s\\n' \"$app\" \"${MOCK_SEALED- version=2 rules=13 files=40}\" >&2; fi\n", "hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo \"${MOCK_PLIST_VERSION:-" + NUMERIC + "}\";; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
         for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
         info_file.write_text(info)
         checker_copy = directory / "tools/check-package-macos.sh"
@@ -1500,9 +1501,14 @@ def macos_checker_mock() -> None:
         version_file.write_text(f"{PRERELEASE}\n")
         (directory / "Cargo.toml").write_text(with_prerelease((directory / "Cargo.toml").read_text()))
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
-        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert result.returncode == 0 and "Signature=adhoc" in result.stdout, (result.stdout, result.stderr)
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_PLIST_VERSION": PRERELEASE})
         assert result.returncode != 0
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_SEALED": "=none"})
+        assert result.returncode != 0 and "unsealed bundle resources: FocusForge.app" in result.stderr, (result.stdout, result.stderr)
+        shutil.rmtree(template / "FocusForge.app/Contents/_CodeSignature")
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and "invalid code signature: FocusForge.app" in result.stderr, (result.stdout, result.stderr)
 
 
 def macos_producer_mock() -> None:
@@ -1522,7 +1528,8 @@ def macos_producer_mock() -> None:
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
             "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
-            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\n[[ -z ${MOCK_PLIST_OUT:-} ]] || cp \"$src/Contents/Info.plist\" \"$MOCK_PLIST_OUT\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\n[[ -z ${MOCK_PLIST_OUT:-} ]] || cp \"$src/Contents/Info.plist\" \"$MOCK_PLIST_OUT\"\nif ! diff <(cd \"$src\" && find . -type f ! -path './Contents/_CodeSignature/*' -exec sha256sum {} + | sort) \"$src/Contents/_CodeSignature/CodeResources\" >/dev/null 2>&1; then echo 'hdiutil: mock source folder does not match its seal' >&2; exit 78; fi\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "codesign": "#!/usr/bin/env bash\nif [[ -n ${MOCK_CODESIGN_FAIL:-} ]]; then echo 'codesign: mock signing error' >&2; exit 9; fi\napp=${!#}; mkdir -p \"$app/Contents/_CodeSignature\"\n(cd \"$app\" && find . -type f ! -path './Contents/_CodeSignature/*' -exec sha256sum {} + | sort) > \"$app/Contents/_CodeSignature/CodeResources\"\n",
             "sleep": "#!/usr/bin/env bash\nexit 0\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
             "shasum": "#!/usr/bin/env bash\nif [[ -n ${MOCK_SHASUM_FAIL:-} ]]; then echo 'shasum: mock read error' >&2; exit 5; fi\nsha256sum \"${!#}\"\n",
@@ -1581,6 +1588,18 @@ def macos_producer_mock() -> None:
         assert any("shasum" in line and "failed with exit status 5" in line for line in result.stderr.splitlines()), result.stderr
         assert "failed with exit status 5" in diagnostics.read_text()
         env.pop("MOCK_SHASUM_FAIL")
+        counter.unlink(missing_ok=True)
+        env["MOCK_CODESIGN_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 9 and not counter.exists() and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        assert any("codesign" in line and "failed with exit status 9" in line for line in result.stderr.splitlines()), result.stderr
+        assert "failed with exit status 9" in diagnostics.read_text()
+        env.pop("MOCK_CODESIGN_FAIL")
+        if shutil.which("codesign") is None:
+            (mock / "codesign").rename(mock / "codesign.aside")
+            result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+            (mock / "codesign.aside").rename(mock / "codesign")
+            assert result.returncode == 1 and "missing codesign" in result.stderr, result.stderr
         env["MOCK_MV_PROMOTION_FAIL"] = "1"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
@@ -1593,6 +1612,15 @@ def macos_producer_mock() -> None:
         assert "mock reason 1" in logged and "exit status 77" in logged, logged
         assert len(hdiutil_sizes()[1]) == 2, arg_log.read_text()
         env.pop("MOCK_HDIUTIL_FAIL")
+        script = producer_copy.read_text()
+        sign = 'codesign --force --deep --sign - "$app"\n'
+        stage = 'python3 "$root/tools/package-cli-assets.py" stage "$root" "$app/Contents/Resources"\n'
+        for mutated in (script.replace(sign, ""), script.replace(sign, "").replace(stage, sign + stage)):
+            assert mutated != script
+            producer_copy.write_text(mutated); counter.unlink(missing_ok=True)
+            result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+            assert result.returncode == 78 and "does not match its seal" in result.stderr and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        producer_copy.write_text(script)
         counter.unlink(missing_ok=True)
         cargo_toml = root / "Cargo.toml"
         cargo_toml.write_text(with_prerelease(cargo_toml.read_text()))
@@ -1604,6 +1632,33 @@ def macos_producer_mock() -> None:
         receipt_text = (output / "native-receipt.json").read_text()
         assert f'"version":"{PRERELEASE}"' in receipt_text and f'"artifact":"{full}"' in receipt_text, receipt_text
         assert list((output / "symbols/aarch64-apple-darwin").glob(f"FocusForge-{PRERELEASE}-aarch64-apple-darwin-symbols.tar.gz"))
+
+
+def linux_producer_fresh_root() -> None:
+    creator = 'mkdir -p "$root/.scratch"\n'
+    script = (ROOT / "tools/package-linux.sh").read_text()
+    def run(text: str) -> tuple[subprocess.CompletedProcess, Path, str]:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp); root, mock, log = base / "root", base / "mock", base / "docker.log"
+            (root / "tools").mkdir(parents=True); (root / "packaging").mkdir(); mock.mkdir()
+            shutil.copy(ROOT / "Cargo.toml", root / "Cargo.toml")
+            shutil.copy(ROOT / "packaging/linux-tools.toml", root / "packaging/linux-tools.toml")
+            (root / "tools/package-linux.sh").write_text(text)
+            (mock / "git").write_text("#!/usr/bin/env bash\ncase \"$*\" in *rev-parse*) echo 0123456789abcdef0123456789abcdef01234567;; *ls-files*) printf 'Cargo.toml\\0packaging/linux-tools.toml\\0';; *) exit 64;; esac\n")
+            (mock / "docker").write_text(f"#!/usr/bin/env bash\necho \"$*\" >> '{log}'\nexit 97\n")
+            for name in ("git", "docker"): (mock / name).chmod(0o755)
+            env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C"}
+            env.pop("FOCUSFORGE_PACKAGE_REUSE", None)
+            assert sorted(path.name for path in root.iterdir()) == ["Cargo.toml", "packaging", "tools"]
+            result = subprocess.run(["bash", str(root / "tools/package-linux.sh")], cwd=root, text=True, capture_output=True, env=env)
+            return result, root, log.read_text() if log.exists() else ""
+    result, root, docker = run(script)
+    assert result.returncode == 97 and "mktemp" not in result.stderr, (result.returncode, result.stderr)
+    assert docker.count("\n") == 1 and f"-v {root}:/src:ro" in docker, docker
+    mutated = script.replace(creator, "", 1)
+    assert mutated != script
+    result, _, docker = run(mutated)
+    assert result.returncode != 0 and "mktemp: failed to create file" in result.stderr and not docker, (result.returncode, result.stderr, docker)
 
 
 def windows_checker_mock() -> None:
@@ -1789,4 +1844,4 @@ def smoke_callers() -> None:
 
 
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); linux_producer_fresh_root(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")

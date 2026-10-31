@@ -22,8 +22,8 @@ use focusforge_core::project::{
     self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
     Project, ProjectError, SealRequest, partial_path,
 };
-use focusforge_core::retouch::blend;
-use focusforge_core::tile::HostBudget;
+use focusforge_core::retouch::blend::{self, Blend};
+use focusforge_core::tile::{HostBudget, Sample};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
 use raw_dng::{DngSpec, write_dng};
@@ -44,9 +44,10 @@ fn full(width: u32, height: u32) -> Rect {
     }
 }
 
-/// `path`'s first image: its width, height, samples per pixel and samples.
+/// `path`'s first image: its width, height, samples per pixel and samples,
+/// a float file narrowed to `u16`.
 fn read_tiff(path: &Path) -> (u32, u32, u32, Vec<u16>) {
-    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
+    let stack = TiffStack::open_staged(path).unwrap();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let mut samples = vec![0u16; (width * height * spp) as usize];
@@ -130,17 +131,17 @@ fn render_tiled(image: &CheckpointImage, project: &mut Project, size: u32) -> Ve
 
 /// What blending `ops` over `composite` gives, pixel by pixel: every stroke's
 /// frame is `frames`' own read of the composite's extent shifted by `origin`.
-fn reference_blend(
-    composite: &[u16],
+fn reference_blend<S: Blend>(
+    composite: &[S],
     (width, height, spp): (u32, u32, u32),
     frame_count: u32,
     ops: &[Op],
     frames: &dyn TileReader,
     origin: (u32, u32),
-) -> Vec<u16> {
+) -> Vec<S> {
     let info = ZMapInfo::new(width, height, frame_count).unwrap();
     let mut out = composite.to_vec();
-    let mut frame = vec![0u16; out.len()];
+    let mut frame = vec![S::default(); out.len()];
     for op in ops {
         let Op::BrushStroke { source_id, .. } = op else {
             panic!("only strokes are blended");
@@ -151,15 +152,13 @@ fn reference_blend(
             width,
             height,
         };
-        frames
-            .read_tile_into(usize::from(*source_id), at, &mut frame)
-            .unwrap();
+        S::read_tile(frames, usize::from(*source_id), at, &mut frame).unwrap();
         for y in 0..height {
             for x in 0..width {
                 let a = blend::alpha(op, info, x, y).unwrap();
                 let at = ((y * width + x) * spp) as usize;
                 for i in at..at + spp as usize {
-                    out[i] = blend::blend_sample(out[i], frame[i], a);
+                    out[i] = S::blend(out[i], frame[i], a);
                 }
             }
         }
@@ -240,8 +239,17 @@ fn composite_pattern(len: usize) -> Vec<u16> {
     (0..len).map(|s| (s * 3 % 65_521) as u16).collect()
 }
 
+/// [`composite_pattern`] as `f32`, reaching above white and below black.
+fn composite_pattern_f32(len: usize) -> Vec<f32> {
+    composite_pattern(len)
+        .into_iter()
+        .map(|v| f32::from(v) * 1.5 - 100.0)
+        .collect()
+}
+
 /// A saved root over `sources` (each `WIDTH` x `HEIGHT` x `SPP`) whose
-/// composite is [`composite_pattern`], sealed with `registration`.
+/// composite is [`composite_pattern`] -- as `f32` for RAW `sources` --
+/// sealed with `registration`.
 fn seal_synthetic(
     dir: &Path,
     sources: &[PathBuf],
@@ -249,13 +257,25 @@ fn seal_synthetic(
     registration: Registration,
 ) -> (PathBuf, String) {
     let composite = dir.join("composite.tif");
-    write_tiff(
-        &composite,
-        width,
-        height,
-        spp,
-        &composite_pattern((width * height * spp) as usize),
-    );
+    let len = (width * height * spp) as usize;
+    if focusforge_core::io::has_extension(&sources[0], focusforge_core::io::RAW_EXTENSIONS) {
+        let mut writer = TiffWriter::create_f32(
+            &composite,
+            TiffSpec {
+                width,
+                height,
+                samples_per_pixel: spp,
+                description: Some("staged composite".to_string()),
+            },
+        )
+        .unwrap();
+        writer
+            .write_tile_f32(full(width, height), &composite_pattern_f32(len))
+            .unwrap();
+        writer.finish().unwrap();
+    } else {
+        write_tiff(&composite, width, height, spp, &composite_pattern(len));
+    }
     let zmap = dir.join("zmap.tif");
     let info = ZMapInfo::new(width, height, sources.len() as u32).unwrap();
     let mut map = ZMapWriter::create(&zmap, info).unwrap();
@@ -468,8 +488,8 @@ fn stroke_over_raw_frames() {
     let ops = vec![stroke(2, &[(2, 3), (5, 4)], 3.0, 0.5)];
     let edited = append(&project_path, &root, ops.clone());
 
-    let composite = composite_pattern((width * height * spp) as usize);
-    let expected = reference_blend(
+    let composite = composite_pattern_f32((width * height * spp) as usize);
+    let blended = reference_blend(
         &composite,
         (width, height, spp),
         sources.len() as u32,
@@ -477,7 +497,8 @@ fn stroke_over_raw_frames() {
         &*set.reader,
         (0, 0),
     );
-    assert_ne!(expected, composite, "the stroke must change the image");
+    assert_ne!(blended, composite, "the stroke must change the image");
+    let expected: Vec<u16> = blended.iter().map(|&v| u16::narrow(v)).collect();
 
     let mut project = Project::open(&project_path).unwrap();
     let view = dir.join("view.tif");

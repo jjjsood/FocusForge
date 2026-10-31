@@ -187,6 +187,20 @@ fn exported_zmap_matches_the_golden_map() {
 }
 
 #[test]
+fn dng_listed() {
+    let dir = std::env::temp_dir();
+    let result = run_cli_in(&dir, &["export", "--help"]);
+    assert!(result.success, "stderr: {}", result.stderr);
+    let help = result
+        .stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(help.contains("`tiff`, `png`, `jpeg` or `dng`"), "{help}");
+    assert!(help.contains("Has no effect on a DNG"), "{help}");
+}
+
+#[test]
 fn export_needs_at_least_one_output_flag() {
     let shared = shared_project();
     let result = run_cli_in(&shared.cwd, &["export", shared.project.to_str().unwrap()]);

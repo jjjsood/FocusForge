@@ -22,7 +22,7 @@ use weezl::encode::Encoder as LzwEncoder;
 use super::super::error::TiffError;
 use super::super::metadata::{MetadataTags, TagEntry};
 use super::header::{ByteOrder, TAG_EXIF_IFD, TAG_GPS_IFD, TAG_STRIP_OFFSETS, TiffHeader};
-use crate::tile::Rect;
+use crate::tile::{Rect, SampleFormat};
 
 const TAG_IMAGE_WIDTH: u16 = 256;
 const TAG_IMAGE_LENGTH: u16 = 257;
@@ -77,8 +77,10 @@ pub struct StripSpec {
     /// `None` -> [`TiffSpec::default_description`].
     pub description: Option<String>,
     /// Extra IFD0 entries plus EXIF and GPS sub-IFDs, merged into the IFD
-    /// [`StripWriter::finish`] writes. Empty by default: an export with
-    /// nothing to carry costs this writer nothing beyond the field itself.
+    /// [`StripWriter::finish`] writes. An IFD0 entry replaces the writer's own
+    /// entry of the same tag (a DNG's PhotometricInterpretation, say). Empty
+    /// by default: an export with nothing to carry costs this writer nothing
+    /// beyond the field itself.
     pub metadata: MetadataTags,
 }
 
@@ -350,7 +352,12 @@ impl<W: Write + Seek> StripWriter<W> {
                 value: shorts(&vec![1u16; spp as usize]),
             },
         ];
-        entries.extend(self.metadata.ifd0.iter().cloned());
+        for entry in &self.metadata.ifd0 {
+            match entries.iter_mut().find(|e| e.tag == entry.tag) {
+                Some(built_in) => *built_in = entry.clone(),
+                None => entries.push(entry.clone()),
+            }
+        }
 
         // Pad to a word boundary: TIFF 6.0 requires the IFD to start on an
         // even byte offset.
@@ -604,13 +611,17 @@ impl TiffSpec {
     }
 }
 
-/// Random-access 16-bit TIFF writer. Never holds a whole frame in memory.
+/// Random-access TIFF writer for 16-bit unsigned or 32-bit float samples.
+/// Never holds a whole frame in memory.
 pub struct TiffWriter<W: Write + Seek> {
     sink: W,
     path: PathBuf,
     width: u32,
     height: u32,
     samples_per_pixel: u32,
+    /// What the file holds: [`write_tile`](TiffWriter::write_tile) writes
+    /// `U16`, [`write_tile_f32`](TiffWriter::write_tile_f32) writes `F32`.
+    format: SampleFormat,
     pixel_start: u64,
     row_bytes: u64,
     /// One merged, sorted interval list per image row.
@@ -622,11 +633,21 @@ impl TiffWriter<File> {
     /// Create `path`, write its header and offset tables, and return a
     /// writer ready for [`write_tile`](TiffWriter::write_tile).
     pub fn create(path: &Path, spec: TiffSpec) -> Result<Self, TiffError> {
+        Self::create_as(path, spec, SampleFormat::U16)
+    }
+
+    /// [`Self::create`] for a 32-bit float file, written with
+    /// [`write_tile_f32`](TiffWriter::write_tile_f32).
+    pub fn create_f32(path: &Path, spec: TiffSpec) -> Result<Self, TiffError> {
+        Self::create_as(path, spec, SampleFormat::F32)
+    }
+
+    fn create_as(path: &Path, spec: TiffSpec, format: SampleFormat) -> Result<Self, TiffError> {
         let file = File::create(path).map_err(|source| TiffError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut writer = Self::new(file, spec)?;
+        let mut writer = Self::new_as(file, spec, format)?;
         writer.path = path.to_path_buf();
         Ok(writer)
     }
@@ -645,6 +666,15 @@ impl TiffWriter<File> {
     /// writing anything further, so `finish()` accepts a resumed file only
     /// once seeded coverage plus newly written rows again cover every row.
     pub fn reopen(path: &Path, spec: TiffSpec) -> Result<Self, TiffError> {
+        Self::reopen_as(path, spec, SampleFormat::U16)
+    }
+
+    /// [`Self::reopen`] for a file [`Self::create_f32`] created.
+    pub fn reopen_f32(path: &Path, spec: TiffSpec) -> Result<Self, TiffError> {
+        Self::reopen_as(path, spec, SampleFormat::F32)
+    }
+
+    fn reopen_as(path: &Path, spec: TiffSpec, format: SampleFormat) -> Result<Self, TiffError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -654,7 +684,7 @@ impl TiffWriter<File> {
                 source,
             })?;
         let header = TiffHeader::parse(path, &file)?;
-        let (pixel_start, row_bytes) = validate_reopen(path, &header, &spec)?;
+        let (pixel_start, row_bytes) = validate_reopen(path, &header, &spec, format)?;
 
         Ok(TiffWriter {
             sink: file,
@@ -662,6 +692,7 @@ impl TiffWriter<File> {
             width: header.width,
             height: header.height,
             samples_per_pixel: header.samples_per_pixel,
+            format,
             pixel_start,
             row_bytes,
             coverage: vec![Vec::new(); header.height as usize],
@@ -678,8 +709,8 @@ impl TiffWriter<File> {
     pub(crate) fn holds_rows(&self, rect: Rect) -> bool {
         let file_len = self.sink.metadata().map(|m| m.len()).unwrap_or(0);
         let last_row = self.pixel_start + (rect.y + rect.height - 1) as u64 * self.row_bytes;
-        let last_row_end =
-            last_row + (rect.x + rect.width) as u64 * self.samples_per_pixel as u64 * 2;
+        let last_row_end = last_row
+            + (rect.x + rect.width) as u64 * self.samples_per_pixel as u64 * self.format.bytes();
         file_len >= last_row_end
     }
 }
@@ -701,7 +732,7 @@ fn spec_description(spec: &TiffSpec) -> String {
 /// Shared by [`TiffWriter::<File>::reopen`]: validates `spec` against an
 /// already-parsed header, refusing anything that is not the file `create`
 /// would itself have produced -- byte order, compression, `RowsPerStrip`,
-/// dimensions, description, and an arithmetic strip-offset table
+/// dimensions, sample type, description, and an arithmetic strip-offset table
 /// (`pixel_start + s * row_bytes`, taken from `strip_offsets[0]` and
 /// `header.row_bytes()` rather than recomputed, so a layout the parse
 /// accepted is the layout the writer uses). Returns `(pixel_start,
@@ -712,6 +743,7 @@ fn validate_reopen(
     path: &Path,
     header: &TiffHeader,
     spec: &TiffSpec,
+    format: SampleFormat,
 ) -> Result<(u64, u64), TiffError> {
     macro_rules! check {
         ($field:literal, $expected:expr, $found:expr) => {
@@ -735,6 +767,17 @@ fn validate_reopen(
         "samples_per_pixel",
         spec.samples_per_pixel,
         header.samples_per_pixel
+    );
+    let spp = spec.samples_per_pixel as usize;
+    check!(
+        "bits_per_sample",
+        vec![bits_per_sample(format); spp],
+        header.bits_per_sample.to_vec()
+    );
+    check!(
+        "sample_format",
+        vec![sample_format_code(format); spp],
+        header.sample_format.to_vec()
     );
 
     let expected_description = spec_description(spec);
@@ -775,7 +818,11 @@ impl<W: Write + Seek> TiffWriter<W> {
     /// pixels, every out-of-line value word-aligned. `path` in any error
     /// this writer reports is empty unless the writer was created via
     /// [`TiffWriter::<File>::create`].
-    pub fn new(mut sink: W, spec: TiffSpec) -> Result<Self, TiffError> {
+    pub fn new(sink: W, spec: TiffSpec) -> Result<Self, TiffError> {
+        Self::new_as(sink, spec, SampleFormat::U16)
+    }
+
+    fn new_as(mut sink: W, spec: TiffSpec, format: SampleFormat) -> Result<Self, TiffError> {
         let TiffSpec {
             width,
             height,
@@ -789,7 +836,7 @@ impl<W: Write + Seek> TiffWriter<W> {
         description_bytes.push(0);
 
         let photometric: u16 = if spp >= 3 { 2 } else { 1 };
-        let row_bytes = u64::from(width) * u64::from(spp) * 2;
+        let row_bytes = u64::from(width) * u64::from(spp) * format.bytes();
         let n_strips = height; // RowsPerStrip = 1: one strip per row.
 
         // (tag, field_type, count, data), already in tag order.
@@ -800,7 +847,7 @@ impl<W: Write + Seek> TiffWriter<W> {
                 TAG_BITS_PER_SAMPLE,
                 3,
                 spp,
-                shorts(&vec![16u16; spp as usize]),
+                shorts(&vec![bits_per_sample(format); spp as usize]),
             ),
             (TAG_COMPRESSION, 3, 1, shorts(&[1u16])),
             (TAG_PHOTOMETRIC, 3, 1, shorts(&[photometric])),
@@ -825,7 +872,12 @@ impl<W: Write + Seek> TiffWriter<W> {
                 longs(&vec![row_bytes as u32; n_strips as usize]),
             ),
             (TAG_PLANAR_CONFIG, 3, 1, shorts(&[1u16])),
-            (TAG_SAMPLE_FORMAT, 3, spp, shorts(&vec![1u16; spp as usize])),
+            (
+                TAG_SAMPLE_FORMAT,
+                3,
+                spp,
+                shorts(&vec![sample_format_code(format); spp as usize]),
+            ),
         ];
 
         let n = entries.len() as u32;
@@ -886,6 +938,7 @@ impl<W: Write + Seek> TiffWriter<W> {
             width,
             height,
             samples_per_pixel: spp,
+            format,
             pixel_start,
             row_bytes,
             coverage: vec![Vec::new(); height as usize],
@@ -896,9 +949,37 @@ impl<W: Write + Seek> TiffWriter<W> {
     /// Write `samples` (chunky, `rect.width * rect.height * samples_per_pixel`
     /// `u16`s) into `rect` of the frame. A rect not fully inside the frame,
     /// or zero-sized, is `OutOfBounds`; a wrong-length buffer is
-    /// `BufferSize`. No whole-frame buffer anywhere: `row_buf` is reused
+    /// `BufferSize`; a writer created for float samples refuses with
+    /// `SampleType`. No whole-frame buffer anywhere: `row_buf` is reused
     /// across calls and across rows of the same call.
     pub fn write_tile(&mut self, rect: Rect, samples: &[u16]) -> Result<(), TiffError> {
+        self.write_samples(rect, samples, SampleFormat::U16, |sample, bytes| {
+            bytes.copy_from_slice(&sample.to_le_bytes());
+        })
+    }
+
+    /// [`Self::write_tile`] for `f32` samples, on a writer created with
+    /// [`Self::create_f32`] or [`Self::reopen_f32`].
+    pub fn write_tile_f32(&mut self, rect: Rect, samples: &[f32]) -> Result<(), TiffError> {
+        self.write_samples(rect, samples, SampleFormat::F32, |sample, bytes| {
+            bytes.copy_from_slice(&sample.to_le_bytes());
+        })
+    }
+
+    fn write_samples<T: Copy>(
+        &mut self,
+        rect: Rect,
+        samples: &[T],
+        format: SampleFormat,
+        encode: impl Fn(T, &mut [u8]),
+    ) -> Result<(), TiffError> {
+        if format != self.format {
+            return Err(TiffError::SampleType {
+                path: self.path.clone(),
+                expected: self.format,
+                got: format,
+            });
+        }
         let in_bounds = rect.width > 0
             && rect.height > 0
             && rect
@@ -927,16 +1008,17 @@ impl<W: Write + Seek> TiffWriter<W> {
         }
 
         let row_samples = rect.width as usize * spp;
-        self.row_buf.resize(row_samples * 2, 0);
+        let width = format.bytes() as usize;
+        self.row_buf.resize(row_samples * width, 0);
         for r in 0..rect.height {
             let row = rect.y + r;
             let src = &samples[r as usize * row_samples..(r as usize + 1) * row_samples];
-            for (i, &s) in src.iter().enumerate() {
-                self.row_buf[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
+            for (&s, bytes) in src.iter().zip(self.row_buf.chunks_exact_mut(width)) {
+                encode(s, bytes);
             }
             let offset = self.pixel_start
                 + u64::from(row) * self.row_bytes
-                + u64::from(rect.x) * spp as u64 * 2;
+                + u64::from(rect.x) * spp as u64 * format.bytes();
             self.sink
                 .seek(SeekFrom::Start(offset))
                 .map_err(|source| TiffError::Io {
@@ -1010,6 +1092,18 @@ impl<W: Write + Seek> TiffWriter<W> {
             source,
         })?;
         Ok(())
+    }
+}
+
+fn bits_per_sample(format: SampleFormat) -> u16 {
+    format.bytes() as u16 * 8
+}
+
+/// The `SampleFormat` tag value: 1 unsigned integer, 3 IEEE float.
+fn sample_format_code(format: SampleFormat) -> u16 {
+    match format {
+        SampleFormat::U16 => 1,
+        SampleFormat::F32 => 3,
     }
 }
 
@@ -1259,8 +1353,13 @@ mod tests {
     fn validate_reopen_accepts_the_header_it_would_itself_produce() {
         let writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
         let header = parse_cursor(&writer.sink);
-        let (pixel_start, row_bytes) =
-            validate_reopen(Path::new("test.tif"), &header, &spec(4, 4, 1)).unwrap();
+        let (pixel_start, row_bytes) = validate_reopen(
+            Path::new("test.tif"),
+            &header,
+            &spec(4, 4, 1),
+            SampleFormat::U16,
+        )
+        .unwrap();
         assert_eq!(pixel_start, writer.pixel_start);
         assert_eq!(row_bytes, writer.row_bytes);
     }
@@ -1269,7 +1368,12 @@ mod tests {
     fn validate_reopen_refuses_a_mismatched_width() {
         let writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
         let header = parse_cursor(&writer.sink);
-        match validate_reopen(Path::new("test.tif"), &header, &spec(8, 4, 1)) {
+        match validate_reopen(
+            Path::new("test.tif"),
+            &header,
+            &spec(8, 4, 1),
+            SampleFormat::U16,
+        ) {
             Err(TiffError::ReopenMismatch { field: "width", .. }) => {}
             other => panic!("expected ReopenMismatch on width, got {other:?}"),
         }
@@ -1281,7 +1385,12 @@ mod tests {
         let header = parse_cursor(&writer.sink);
         let mut mismatched = spec(4, 4, 1);
         mismatched.description = Some("something else".to_string());
-        match validate_reopen(Path::new("test.tif"), &header, &mismatched) {
+        match validate_reopen(
+            Path::new("test.tif"),
+            &header,
+            &mismatched,
+            SampleFormat::U16,
+        ) {
             Err(TiffError::ReopenMismatch {
                 field: "image_description",
                 ..
@@ -1301,7 +1410,12 @@ mod tests {
                 .sink,
         );
         header.rows_per_strip = 2;
-        match validate_reopen(Path::new("test.tif"), &header, &spec(4, 4, 1)) {
+        match validate_reopen(
+            Path::new("test.tif"),
+            &header,
+            &spec(4, 4, 1),
+            SampleFormat::U16,
+        ) {
             Err(TiffError::ReopenMismatch {
                 field: "rows_per_strip",
                 ..
@@ -1389,6 +1503,40 @@ mod tests {
             assert_eq!(value, 9, "pixel {i} must be 9");
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f32_layout_declares_32_bit_float_samples() {
+        let writer =
+            TiffWriter::new_as(Cursor::new(Vec::new()), spec(4, 4, 3), SampleFormat::F32).unwrap();
+        let header = parse_cursor(&writer.sink);
+        assert_eq!(&*header.bits_per_sample, &[32, 32, 32]);
+        assert_eq!(&*header.sample_format, &[3, 3, 3]);
+        assert_eq!(header.row_bytes(), 4 * 3 * 4);
+    }
+
+    #[test]
+    fn f32_holds_rows_counts_four_bytes_a_sample() {
+        let dir =
+            std::env::temp_dir().join(format!("ff-tiff-writer-f32-holds-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("holds.tif");
+        let rows = |height| Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height,
+        };
+        {
+            let mut writer = TiffWriter::create_f32(&path, spec(4, 4, 3)).unwrap();
+            writer
+                .write_tile_f32(rows(2), &[1.5f32; 4 * 2 * 3])
+                .unwrap();
+        }
+        let reopened = TiffWriter::reopen_f32(&path, spec(4, 4, 3)).unwrap();
+        assert!(reopened.holds_rows(rows(2)));
+        assert!(!reopened.holds_rows(rows(3)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1752,5 +1900,34 @@ mod strip_writer_tests {
         assert_eq!(n_entries, 13, "the fixed 13-tag layout, no extras");
         assert_eq!(header.width, width);
         assert_eq!(header.height, height);
+    }
+
+    #[test]
+    fn an_ifd0_entry_replaces_the_built_in_entry_of_its_tag() {
+        let (width, height, spp) = (5, 4, 3);
+        let mut spec = strip_spec(width, height, spp, 16, StripCompression::None);
+        spec.metadata.ifd0.push(TagEntry {
+            tag: TAG_PHOTOMETRIC,
+            field_type: 3,
+            count: 1,
+            value: shorts(&[34892]),
+        });
+        let mut writer = StripWriter::new(Cursor::new(Vec::new()), spec).unwrap();
+        writer
+            .write_rows(&bytes_16(&gradient_16(width, height, spp)))
+            .unwrap();
+        let written = writer.finish().unwrap().into_inner();
+
+        let ifd0 = u32::from_le_bytes(written[4..8].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(written[ifd0..ifd0 + 2].try_into().unwrap()) as usize;
+        let photometric: Vec<u16> = (0..count)
+            .map(|i| ifd0 + 2 + i * 12)
+            .filter(|&at| {
+                u16::from_le_bytes(written[at..at + 2].try_into().unwrap()) == TAG_PHOTOMETRIC
+            })
+            .map(|at| u16::from_le_bytes(written[at + 8..at + 10].try_into().unwrap()))
+            .collect();
+        assert_eq!(photometric, [34892], "exactly one tag 262, the override");
+        assert_eq!(count, 13, "the override adds no entry");
     }
 }
