@@ -636,6 +636,9 @@ pub struct DngMatrix {
     pub illuminant: u16,
     /// Row-major XYZ-to-camera matrix.
     pub xyz_to_camera: [f32; 9],
+    /// Row-major `CameraCalibration` of the slot this matrix came from, when
+    /// the file has one.
+    pub calibration: Option<[f32; 9]>,
 }
 
 /// What a DNG needs to describe the camera space of a RAW stack's document:
@@ -659,6 +662,8 @@ pub struct DngColour {
     /// As-shot neutral: the reciprocal of the white-balance multipliers,
     /// normalised to green = 1.
     pub as_shot_neutral: [f64; 3],
+    /// `AnalogBalance` of the first frame, when the file has one.
+    pub analog_balance: Option<[f64; 3]>,
 }
 
 /// Correlated colour temperature in kelvin of the illuminants a camera
@@ -675,6 +680,43 @@ fn colour_temperature(illuminant: Illuminant) -> Option<u32> {
         Illuminant::C => 6774,
         Illuminant::D75 => 7504,
         _ => return None,
+    })
+}
+
+/// A DNG's `CameraCalibration` matrices keyed by the `CalibrationIlluminant`
+/// code of their slot, and its `AnalogBalance`. Empty for other formats.
+#[derive(Default)]
+struct Calibration {
+    by_illuminant: Vec<(u16, [f32; 9])>,
+    analog_balance: Option<[f64; 3]>,
+}
+
+fn calibration(path: &Path) -> Result<Calibration, RawError> {
+    let source = RawSource::new(path).map_err(|source| RawError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let decoder = seam(path, || rawler::get_decoder(&source))?;
+    let Some(root) = seam(path, || decoder.ifd(WellKnownIFD::Root))? else {
+        return Ok(Calibration::default());
+    };
+    // Slot 1 and slot 2: (CalibrationIlluminant, CameraCalibration).
+    let by_illuminant = [(50778_u16, 50723_u16), (50779, 50724)]
+        .into_iter()
+        .filter_map(|(illuminant_tag, calibration_tag)| {
+            let illuminant =
+                u16::try_from(root.get_entry(illuminant_tag)?.value.force_u32(0)).ok()?;
+            let values = values_f32(root.get_entry(calibration_tag))?;
+            Some((illuminant, values.try_into().ok()?))
+        })
+        .collect();
+    let analog_balance = values_f32(root.get_entry(50727_u16))
+        .and_then(|values| <[f32; 3]>::try_from(values).ok())
+        .map(|values| values.map(f64::from))
+        .filter(|values| values.iter().all(|v| v.is_finite() && *v > 0.0));
+    Ok(Calibration {
+        by_illuminant,
+        analog_balance,
     })
 }
 
@@ -710,6 +752,7 @@ pub fn dng_colour(path: &Path) -> Result<DngColour, RawError> {
                     DngMatrix {
                         illuminant: illuminant as u16,
                         xyz_to_camera: flat.as_slice().try_into().ok()?,
+                        calibration: None,
                     },
                 ))
             })
@@ -722,6 +765,14 @@ pub fn dng_colour(path: &Path) -> Result<DngColour, RawError> {
         if matrices.len() > 1 {
             chosen.extend(matrices.pop().map(|(_, matrix)| matrix));
         }
+        let calibration = calibration(path)?;
+        for matrix in &mut chosen {
+            matrix.calibration = calibration
+                .by_illuminant
+                .iter()
+                .find(|(illuminant, _)| *illuminant == matrix.illuminant)
+                .map(|(_, calibration)| *calibration);
+        }
         Ok(DngColour {
             look: LookTransform::from_image(&image),
             make: image.clean_make.clone(),
@@ -730,6 +781,7 @@ pub fn dng_colour(path: &Path) -> Result<DngColour, RawError> {
             orientation: Some(image.orientation.to_u16()).filter(|&o| o != 0),
             matrices: chosen,
             as_shot_neutral: [0, 1, 2].map(|c| f64::from(wb[1]) / f64::from(wb[c])),
+            analog_balance: calibration.analog_balance,
         })
     })
 }

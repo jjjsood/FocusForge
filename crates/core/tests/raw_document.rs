@@ -624,6 +624,9 @@ fn legacy_raw_project_refused() {
 
 const MATRIX_D65: [f32; 9] = [0.9, 0.05, -0.1, -0.2, 1.1, 0.08, 0.02, -0.15, 0.8];
 const MATRIX_A: [f32; 9] = [1.2, -0.1, 0.0, -0.3, 1.2, 0.1, 0.05, -0.2, 0.9];
+const CALIBRATION_D65: [f32; 9] = [1.0122, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.9778];
+const CALIBRATION_A: [f32; 9] = [1.05, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.95];
+const ANALOG_BALANCE: [f32; 3] = [1.02, 1.0, 0.97];
 const ILLUMINANT_A: u16 = 17;
 const ILLUMINANT_D65: u16 = 21;
 const CAPTURE_TIME: &str = "2026:10:30 12:00:00";
@@ -801,10 +804,14 @@ fn assert_within(got: &[u16], want: &[u16], tolerance: u16, what: &str) {
     }
 }
 
-fn check_dng_tags(label: &str, second: Option<([f32; 9], u16)>, exif: bool) {
+fn check_dng_tags(label: &str, second: Option<([f32; 9], u16)>, exif: bool, calibrated: bool) {
     let frames = dng_frames_with(3, 24, 16, |spec| {
         spec.color_matrix = Some(MATRIX_D65);
         spec.color_matrix2 = second;
+        if calibrated {
+            spec.camera_calibration = [Some(CALIBRATION_D65), second.map(|_| CALIBRATION_A)];
+            spec.analog_balance = Some(ANALOG_BALANCE);
+        }
         spec.orientation = Some(6);
         spec.capture_time = Some(CAPTURE_TIME.to_string());
     });
@@ -843,6 +850,40 @@ fn check_dng_tags(label: &str, second: Option<([f32; 9], u16)>, exif: bool) {
     let mut expected = vec![(MATRIX_D65, ILLUMINANT_D65)];
     expected.extend(second);
     expected.sort_by_key(|&(_, illuminant)| illuminant != ILLUMINANT_A);
+    let calibration_of = |illuminant: u16| match illuminant {
+        ILLUMINANT_D65 => CALIBRATION_D65,
+        _ => CALIBRATION_A,
+    };
+    for (slot, (_, illuminant)) in expected.iter().enumerate() {
+        let tag = dng.tag(50723 + slot as u16);
+        match (calibrated, tag) {
+            (true, Some(entry)) => assert_close(
+                &entry.rationals(),
+                &f64s(&calibration_of(*illuminant)),
+                label,
+            ),
+            (false, None) => {}
+            (on, found) => panic!(
+                "{label}: calibrated {on}, CameraCalibration{} present {}",
+                slot + 1,
+                found.is_some()
+            ),
+        }
+    }
+    if expected.len() == 1 {
+        assert!(
+            dng.tag(50724).is_none(),
+            "{label}: one slot, one calibration"
+        );
+    }
+    match (calibrated, dng.tag(50727)) {
+        (true, Some(entry)) => assert_close(&entry.rationals(), &f64s(&ANALOG_BALANCE), label),
+        (false, None) => {}
+        (on, found) => panic!(
+            "{label}: calibrated {on}, AnalogBalance present {}",
+            found.is_some()
+        ),
+    }
     assert_eq!(dng.need(50721).count, 9, "{label}");
     assert_close(&dng.need(50721).rationals(), &f64s(&expected[0].0), label);
     assert_eq!(dng.need(50778).shorts(), [expected[0].1], "{label}");
@@ -896,8 +937,12 @@ fn check_dng_tags(label: &str, second: Option<([f32; 9], u16)>, exif: bool) {
 #[test]
 fn dng_tags() {
     for exif in [true, false] {
-        check_dng_tags(&format!("one_{exif}"), None, exif);
-        check_dng_tags(&format!("two_{exif}"), Some((MATRIX_A, ILLUMINANT_A)), exif);
+        for calibrated in [true, false] {
+            let label = format!("{exif}_{calibrated}");
+            check_dng_tags(&format!("one_{label}"), None, exif, calibrated);
+            let second = Some((MATRIX_A, ILLUMINANT_A));
+            check_dng_tags(&format!("two_{label}"), second, exif, calibrated);
+        }
     }
 }
 

@@ -30,6 +30,11 @@ pub struct DngSpec {
     pub color_matrix: Option<[f32; 9]>,
     /// Row-major ColorMatrix2 and its CalibrationIlluminant2 code.
     pub color_matrix2: Option<([f32; 9], u16)>,
+    /// Row-major CameraCalibration1 and CameraCalibration2, beside the
+    /// ColorMatrix of the same slot.
+    pub camera_calibration: [Option<[f32; 9]>; 2],
+    /// DNG AnalogBalance.
+    pub analog_balance: Option<[f32; 3]>,
     /// Write no ColorMatrix1 and no CalibrationIlluminant1.
     pub omit_color_matrix: bool,
     /// PhotometricInterpretation 1 (BlackIsZero); rawler's DNG decoder still
@@ -61,6 +66,8 @@ impl DngSpec {
             as_shot_neutral: None,
             color_matrix: None,
             color_matrix2: None,
+            camera_calibration: [None, None],
+            analog_balance: None,
             omit_color_matrix: false,
             monochrome: false,
             orientation: None,
@@ -115,6 +122,20 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
             &matrix2.map(|value| ((value * 10_000.0).round() as i32, 10_000_i32)),
         ));
         entries.push(Entry::short(50779, &[illuminant]));
+    }
+    for (slot, calibration) in spec.camera_calibration.iter().enumerate() {
+        if let Some(calibration) = calibration {
+            entries.push(Entry::srational(
+                50723 + slot as u16,
+                &calibration.map(|value| ((value * 10_000.0).round() as i32, 10_000_i32)),
+            ));
+        }
+    }
+    if let Some(balance) = spec.analog_balance {
+        entries.push(Entry::rational(
+            50727,
+            &balance.map(|value| ((value * 10_000.0).round() as u32, 10_000_u32)),
+        ));
     }
     entries.push(Entry::short(33421, &[2, 2]));
     entries.push(Entry::byte(33422, &spec.cfa));

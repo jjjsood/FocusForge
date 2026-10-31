@@ -657,8 +657,9 @@ fn dng_rationals(tag: u16, values: &[f64]) -> TagEntry {
 
 /// The IFD0 entries that make a 16-bit, three-sample file a linear DNG 1.4
 /// in `colour`'s camera space: LinearRaw photometric interpretation, black 0
-/// and white 65535, the camera identity, its matrices and as-shot neutral,
-/// and the frame's orientation.
+/// and white 65535, the camera identity, its matrices with their camera
+/// calibrations, analog balance and as-shot neutral, and the frame's
+/// orientation.
 pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
     const TAG_PHOTOMETRIC: u16 = 262;
     const TAG_MAKE: u16 = 271;
@@ -670,6 +671,8 @@ pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
     const TAG_BLACK_LEVEL: u16 = 50714;
     const TAG_WHITE_LEVEL: u16 = 50717;
     const TAG_COLOR_MATRIX_1: u16 = 50721;
+    const TAG_CAMERA_CALIBRATION_1: u16 = 50723;
+    const TAG_ANALOG_BALANCE: u16 = 50727;
     const TAG_AS_SHOT_NEUTRAL: u16 = 50728;
     const TAG_CALIBRATION_ILLUMINANT_1: u16 = 50778;
     const LINEAR_RAW: u16 = 34892;
@@ -708,6 +711,16 @@ pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
             TAG_CALIBRATION_ILLUMINANT_1 + slot as u16,
             &[matrix.illuminant],
         ));
+        if let Some(calibration) = &matrix.calibration {
+            let values: Vec<f64> = calibration.iter().map(|&v| f64::from(v)).collect();
+            entries.push(dng_srationals(
+                TAG_CAMERA_CALIBRATION_1 + slot as u16,
+                &values,
+            ));
+        }
+    }
+    if let Some(balance) = &colour.analog_balance {
+        entries.push(dng_rationals(TAG_ANALOG_BALANCE, balance));
     }
     entries
 }
