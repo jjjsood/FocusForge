@@ -700,8 +700,16 @@ fn calibration(path: &Path) -> Result<Calibration, RawError> {
     let Some(root) = seam(path, || decoder.ifd(WellKnownIFD::Root))? else {
         return Ok(Calibration::default());
     };
-    // Slot 1 and slot 2: (CalibrationIlluminant, CameraCalibration).
-    let by_illuminant = [(50778_u16, 50723_u16), (50779, 50724)]
+    const TAG_CAMERA_CALIBRATION_1: u16 = 50723;
+    const TAG_CAMERA_CALIBRATION_2: u16 = 50724;
+    const TAG_ANALOG_BALANCE: u16 = 50727;
+    const TAG_CALIBRATION_ILLUMINANT_1: u16 = 50778;
+    const TAG_CALIBRATION_ILLUMINANT_2: u16 = 50779;
+    let slots = [
+        (TAG_CALIBRATION_ILLUMINANT_1, TAG_CAMERA_CALIBRATION_1),
+        (TAG_CALIBRATION_ILLUMINANT_2, TAG_CAMERA_CALIBRATION_2),
+    ];
+    let by_illuminant = slots
         .into_iter()
         .filter_map(|(illuminant_tag, calibration_tag)| {
             let illuminant =
@@ -710,7 +718,7 @@ fn calibration(path: &Path) -> Result<Calibration, RawError> {
             Some((illuminant, values.try_into().ok()?))
         })
         .collect();
-    let analog_balance = values_f32(root.get_entry(50727_u16))
+    let analog_balance = values_f32(root.get_entry(TAG_ANALOG_BALANCE))
         .and_then(|values| <[f32; 3]>::try_from(values).ok())
         .map(|values| values.map(f64::from))
         .filter(|values| values.iter().all(|v| v.is_finite() && *v > 0.0));
