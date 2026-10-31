@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::error::TiffError;
-use super::tiff::header::TiffHeader;
+use super::tiff::header::{TAG_DATE_TIME_ORIGINAL, TiffHeader};
 use super::{
     JPEG_EXTENSIONS, RAW_EXTENSIONS, RawStack, all_frame_paths, has_extension, read_source_metadata,
 };
@@ -383,7 +383,10 @@ pub fn capture_time(path: &Path) -> Option<CaptureTime> {
         // The metadata reader lists an IFD0 `DateTimeOriginal` ahead of the
         // EXIF sub-IFD's, so the first entry is the one a TIFF header picks.
         let metadata = read_source_metadata(path);
-        let entry = metadata.exif.iter().find(|entry| entry.tag == 36867)?;
+        let entry = metadata
+            .exif
+            .iter()
+            .find(|entry| entry.tag == TAG_DATE_TIME_ORIGINAL)?;
         let text = entry.value.split(|&byte| byte == 0).next()?;
         return parse_exif_datetime(std::str::from_utf8(text).ok()?);
     }

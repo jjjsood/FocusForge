@@ -46,7 +46,7 @@ pub(crate) const TAG_EXIF_IFD: u16 = 34665;
 /// EXIF `DateTimeOriginal` -- **capture** time, the tag grouping reads.
 /// Never `DateTime` (306), which on the reference data is darktable's
 /// *export* time, thirteen days after the shot.
-const TAG_DATE_TIME_ORIGINAL: u16 = 36867;
+pub(crate) const TAG_DATE_TIME_ORIGINAL: u16 = 36867;
 /// GPS sub-IFD pointer: a `LONG` offset to a second IFD.
 pub(crate) const TAG_GPS_IFD: u16 = 34853;
 pub(crate) const TAG_ICC_PROFILE: u16 = 34675;
