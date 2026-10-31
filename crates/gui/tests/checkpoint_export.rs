@@ -927,27 +927,14 @@ fn metadata_off() -> MetadataOptions {
 }
 
 #[test]
-fn export_modal_formats() {
+fn metadata_switch_is_shared_by_every_format() {
     let (mut controller, _edited) = open_edited_modal("export_modal_formats");
-    let view = controller.export_view().expect("the modal is open");
-    assert_eq!(view.segments, ["TIFF", "PNG", "JPEG", "DNG"]);
-
     controller.export_select_format("DNG");
-    let view = controller.export_view().unwrap();
-    assert_eq!(view.selected, "DNG");
-    assert_eq!(view.heading, "DNG SETTINGS");
-    assert_eq!(view.note, DNG_NOTE);
-    assert!(view.rows.is_empty(), "DNG has no rows");
-    assert!(!view.slider_group);
-    assert!(view.metadata);
-
+    assert!(controller.export_view().unwrap().metadata);
     controller.export_toggle_metadata();
     assert!(!controller.export_view().unwrap().metadata);
     controller.export_select_format("TIFF");
-    assert!(
-        !controller.export_view().unwrap().metadata,
-        "the Metadata switch is shared by every format"
-    );
+    assert!(!controller.export_view().unwrap().metadata);
     controller.export_select_format("DNG");
     assert!(!controller.export_view().unwrap().metadata);
     controller.cancel_export();
@@ -972,6 +959,7 @@ fn format_switch_shows_only_that_formats_settings() {
             "{label}'s note"
         );
         assert_eq!(view.heading, format!("{label} SETTINGS"));
+        assert_eq!(view.rows.is_empty(), format == ExportFormat::Dng);
         assert!(view.metadata, "Metadata is on at first open");
         assert_eq!(view.slider_group, format == ExportFormat::Jpeg);
         let schema = params_for(format);
