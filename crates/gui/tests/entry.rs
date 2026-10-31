@@ -287,14 +287,71 @@ fn a_picked_raw_set_opens_as_one_tab() {
 /// A small RGB JPEG at `dir/name`; `level` makes every frame's bytes (and so
 /// its content hash) differ.
 fn write_jpeg(dir: &Path, name: &str, level: u8) -> PathBuf {
-    let data = vec![level; 16 * 16 * 3];
+    write_jpeg_sized(
+        dir,
+        name,
+        level,
+        (16, 16),
+        jpeg_encoder::ColorType::Rgb,
+        None,
+    )
+}
+
+/// A flat JPEG of `width` x `height` pixels in `color`, carrying the EXIF
+/// blob `exif` when given.
+fn write_jpeg_sized(
+    dir: &Path,
+    name: &str,
+    level: u8,
+    (width, height): (u16, u16),
+    color: jpeg_encoder::ColorType,
+    exif: Option<&[u8]>,
+) -> PathBuf {
+    let components = match color {
+        jpeg_encoder::ColorType::Luma => 1,
+        _ => 3,
+    };
+    let data = vec![level; usize::from(width) * usize::from(height) * components];
     let mut bytes = Vec::new();
-    jpeg_encoder::Encoder::new(&mut bytes, 90)
-        .encode(&data, 16, 16, jpeg_encoder::ColorType::Rgb)
+    let mut encoder = jpeg_encoder::Encoder::new(&mut bytes, 90);
+    if let Some(exif) = exif {
+        encoder.add_exif_metadata(exif).expect("EXIF segment fits");
+    }
+    encoder
+        .encode(&data, width, height, color)
         .expect("frame encodes");
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("frame file");
     path
+}
+
+/// An EXIF TIFF blob whose IFD0 holds one SHORT entry, Orientation = `value`.
+fn orientation_exif(big_endian: bool, value: u16) -> Vec<u8> {
+    let short = |v: u16| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let long = |v: u32| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let mut blob = Vec::from(if big_endian { *b"MM" } else { *b"II" });
+    blob.extend(short(42));
+    blob.extend(long(8));
+    blob.extend(short(1));
+    blob.extend(short(0x0112));
+    blob.extend(short(3));
+    blob.extend(long(1));
+    blob.extend(short(value));
+    blob.extend([0, 0]);
+    blob.extend(long(0));
+    blob
 }
 
 /// A distinct camera RAW file: the fixture DNG with `extra` appended
@@ -923,8 +980,9 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
 // Reopening a saved project through the same picker.
 // ---------------------------------------------------------------------
 
-/// Seals a minimal project into `dir`, returning its `.ffp` path.
-fn seal_test_project(dir: &Path) -> PathBuf {
+/// Seals a minimal project over `sources` into `dir`, returning its `.ffp`
+/// path.
+fn seal_test_project(dir: &Path, sources: &[PathBuf]) -> PathBuf {
     use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
     use focusforge_core::params::ParamValues;
     use focusforge_core::project::{Metrics, SealRequest, seal};
@@ -962,7 +1020,7 @@ fn seal_test_project(dir: &Path) -> PathBuf {
         project_path: &project_path,
         staged_composite: &composite,
         staged_zmap: &zmap,
-        sources: &[],
+        sources,
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
@@ -978,7 +1036,7 @@ fn seal_test_project(dir: &Path) -> PathBuf {
 #[test]
 fn a_saved_project_reopens_through_the_same_picker() {
     let dir = tree("entry_reopen_project");
-    let project_path = seal_test_project(&dir);
+    let project_path = seal_test_project(&dir, &[]);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[project_path]);
@@ -1497,7 +1555,7 @@ fn a_multi_file_drop_spanning_two_parent_directories_adds_to_the_active_tab() {
 #[test]
 fn a_drop_of_a_lone_ffp_onto_an_active_tab_still_opens_its_own_tab() {
     let mut controller = with_one_project("entry_drop_ffp_first");
-    let project_path = seal_test_project(&tree("entry_drop_ffp"));
+    let project_path = seal_test_project(&tree("entry_drop_ffp"), &[]);
 
     let handle = controller
         .drop_paths(&[project_path])
@@ -1910,6 +1968,179 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
             3,
             "case {case}: closing tab {close} with tab {active} active -- one \
              double-click must close exactly one tab"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// A tab's image size and stack context, for every frame kind.
+// ---------------------------------------------------------------------
+
+type TabGeometry = (Option<(u32, u32)>, Option<(usize, u32, u32, u32)>);
+
+fn unsaved(dir: &Path, frames: Vec<PathBuf>) -> focusforge_gui::entry::GuiProject {
+    focusforge_gui::entry::GuiProject::Unsaved(focusforge_core::io::one_group(dir, frames))
+}
+
+/// What both tab helpers report for `project`: the size, and the context as
+/// (frame count, width, height, samples per pixel).
+fn tab_geometry(project: &focusforge_gui::entry::GuiProject) -> TabGeometry {
+    use focusforge_gui::entry::{tab_image_size, tab_stack_context};
+    let context =
+        tab_stack_context(project).map(|c| (c.frame_count, c.width, c.height, c.samples_per_pixel));
+    (tab_image_size(project), context)
+}
+
+#[test]
+fn jpeg_tab_reports_size_and_context() {
+    use jpeg_encoder::ColorType;
+    let dir = tree("entry_tab_jpeg");
+    for (color, spp) in [(ColorType::Rgb, 3), (ColorType::Luma, 1)] {
+        for count in [1usize, 3] {
+            let frames: Vec<PathBuf> = ["a.jpg", "b.JPEG", "c.Jpg"][..count]
+                .iter()
+                .map(|name| write_jpeg_sized(&dir, name, 40, (24, 16), color, None))
+                .collect();
+            assert_eq!(
+                tab_geometry(&unsaved(&dir, frames)),
+                (Some((24, 16)), Some((count, 24, 16, spp))),
+                "{count} frames of {spp} samples"
+            );
+        }
+    }
+}
+
+#[test]
+fn oriented_jpeg_tab_reports_upright_size() {
+    use jpeg_encoder::ColorType;
+    let dir = tree("entry_tab_jpeg_oriented");
+    let cases = [
+        (None, (24, 16)),
+        (Some((false, 1)), (24, 16)),
+        (Some((false, 3)), (24, 16)),
+        (Some((false, 6)), (16, 24)),
+        (Some((true, 6)), (16, 24)),
+        (Some((false, 8)), (16, 24)),
+        (Some((true, 8)), (16, 24)),
+        (Some((true, 1)), (24, 16)),
+        (Some((true, 3)), (24, 16)),
+    ];
+    for (index, (orientation, (width, height))) in cases.into_iter().enumerate() {
+        let exif = orientation.map(|(big, value)| orientation_exif(big, value));
+        let frame = write_jpeg_sized(
+            &dir,
+            &format!("{index}.jpg"),
+            40,
+            (24, 16),
+            ColorType::Rgb,
+            exif.as_deref(),
+        );
+        assert_eq!(
+            tab_geometry(&unsaved(&dir, vec![frame])),
+            (Some((width, height)), Some((1, width, height, 3))),
+            "orientation {orientation:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_tab_reports_size_and_context() {
+    let dir = tree("entry_tab_raw");
+    let frames = vec![write_raw(&dir, "a.dng", 1), write_raw(&dir, "b.dng", 2)];
+    let set = focusforge_core::io::open_frame_set(
+        &frames[..1],
+        focusforge_core::tile::HostBudget::explicit(u64::MAX),
+    )
+    .expect("the fixture DNG opens");
+    let expected = set.reader.frame(0);
+    let (width, height, spp) = (expected.width, expected.height, expected.samples_per_pixel);
+    assert_eq!(
+        tab_geometry(&unsaved(&dir, frames)),
+        (Some((width, height)), Some((2, width, height, spp)))
+    );
+}
+
+#[test]
+fn tiff_tab_size_matches_its_header() {
+    use focusforge_core::io::test_frames::{
+        ByteOrderSpec, FrameMetadata, shorts_bo, write_frame_with_metadata,
+    };
+    use focusforge_core::io::{ByteOrder, TiffHeader};
+
+    let dir = tree("entry_tab_tiff");
+    let oriented = dir.join("oriented.tif");
+    write_frame_with_metadata(
+        &oriented,
+        24,
+        16,
+        &FrameMetadata {
+            byte_order: ByteOrderSpec(ByteOrder::Little),
+            ifd0: vec![(274, 3, shorts_bo(ByteOrder::Little, &[6]))],
+            ..Default::default()
+        },
+    )
+    .expect("oriented TIFF writes");
+    assert_eq!(
+        TiffHeader::open(&oriented).unwrap().upright_dimensions(),
+        (16, 24)
+    );
+    let fixtures = common::workspace_root().join("fixtures");
+    let mut firsts = vec![oriented];
+    for name in ["mantis-64", "mantis8-64", "mantis-64-deflate-p1-strip-ii"] {
+        firsts.push(fixtures.join(name).join("frames/00.tif"));
+    }
+    for first in firsts {
+        let header = TiffHeader::open(&first).expect("fixture header");
+        let (width, height) = header.upright_dimensions();
+        let spp = header.samples_per_pixel;
+        assert_eq!(
+            tab_geometry(&unsaved(&dir, vec![first.clone(), first.clone()])),
+            (Some((width, height)), Some((2, width, height, spp))),
+            "{}",
+            first.display()
+        );
+    }
+}
+
+#[test]
+fn reopened_jpeg_project_reports_source_size() {
+    use jpeg_encoder::ColorType;
+    let dir = tree("entry_tab_reopened_jpeg");
+    let sources: Vec<PathBuf> = ["a.jpg", "b.jpg"]
+        .iter()
+        .map(|name| write_jpeg_sized(&dir, name, 40, (24, 16), ColorType::Rgb, None))
+        .collect();
+    let project_path = seal_test_project(&dir, &sources);
+    let project = focusforge_core::project::Project::open(&project_path).expect("project opens");
+    let project = focusforge_gui::entry::GuiProject::Opened(Box::new(project));
+    assert_eq!(
+        focusforge_gui::entry::tab_image_size(&project),
+        Some((24, 16))
+    );
+}
+
+#[test]
+fn unreadable_first_frame_reports_no_size() {
+    let dir = tree("entry_tab_unreadable");
+    let good = write_jpeg(&dir, "good.jpg", 40);
+    let truncated = dir.join("truncated.jpg");
+    std::fs::write(&truncated, &std::fs::read(good).unwrap()[..20]).unwrap();
+    let mislabelled = dir.join("tiff-bytes.jpg");
+    std::fs::copy(
+        common::workspace_root().join("fixtures/mantis-64/frames/00.tif"),
+        &mislabelled,
+    )
+    .unwrap();
+    for (label, frames) in [
+        ("missing", vec![dir.join("missing.jpg")]),
+        ("truncated", vec![truncated]),
+        ("mislabelled", vec![mislabelled]),
+        ("empty", Vec::new()),
+    ] {
+        assert_eq!(
+            tab_geometry(&unsaved(&dir, frames)),
+            (None, None),
+            "{label}"
         );
     }
 }

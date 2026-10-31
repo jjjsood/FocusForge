@@ -14,14 +14,15 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{
-    Group, GroupSignal, JPEG_EXTENSIONS, TiffError, TiffHeader, all_frame_paths, has_extension,
-    is_frame_path, one_group, propose_with_progress,
+    Group, GroupSignal, JPEG_EXTENSIONS, TiffError, all_frame_paths, has_extension, is_frame_path,
+    one_group, open_frame_set, propose_with_progress,
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{
     Opened as CoreOpened, PROJECT_EXTENSION, PendingProject, Project, ProjectError, SourceRef,
     check_sources, source_hash,
 };
+use focusforge_core::tile::HostBudget;
 // Re-exported so `controller.rs` can carry a `Proposal` in its own
 // pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
@@ -502,24 +503,32 @@ pub fn answer_question(proposal: &Proposal, answer: OpenAs) -> Opened {
     }
 }
 
+/// A frame's upright width, height and samples per pixel from core's
+/// frame-set opener, whatever the frame kind; `None` if unreadable. The
+/// budget is unbounded: no tile is read, and a finite one would make the
+/// opener refuse a large single-strip TIFF at open.
+fn first_frame_geometry(path: &Path) -> Option<(u32, u32, u32)> {
+    let set = open_frame_set(&[path.to_path_buf()], HostBudget::explicit(u64::MAX)).ok()?;
+    let frame = set.reader.frame(0);
+    Some((frame.width, frame.height, frame.samples_per_pixel))
+}
+
 /// A tab's [`StackContext`], without a composite: an [`GuiProject::Unsaved`]
-/// tab reads its first frame's header only ([`TiffHeader::open`], the same
-/// read `grouping::read_capture_time` already does) plus the group's own
-/// frame count; a reopened [`GuiProject::Opened`] reads the sealed
-/// manifest's composite plane instead. Cached once by `ProjectTab::new`,
-/// never re-read on every settings-panel resolve. `None` for an unreadable
-/// or frame-less group, which `propose`/`one_group` never actually produce
-/// but a future caller must not panic on.
+/// tab reads its first frame's geometry (`first_frame_geometry`) plus the
+/// group's own frame count; a reopened [`GuiProject::Opened`] reads the
+/// sealed manifest's composite plane instead. Cached once by
+/// `ProjectTab::new`, never re-read on every settings-panel resolve. `None`
+/// for an unreadable or frame-less group, which `propose`/`one_group` never
+/// actually produce but a future caller must not panic on.
 pub fn tab_stack_context(project: &GuiProject) -> Option<StackContext> {
     match project {
         GuiProject::Unsaved(group) => {
-            let header = TiffHeader::open(group.frames.first()?).ok()?;
-            let (width, height) = header.upright_dimensions();
+            let (width, height, samples_per_pixel) = first_frame_geometry(group.frames.first()?)?;
             Some(StackContext::new(
                 group.frames.len(),
                 width,
                 height,
-                header.samples_per_pixel,
+                samples_per_pixel,
             ))
         }
         GuiProject::Opened(project) => {
@@ -550,13 +559,14 @@ pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
     }
 }
 
-/// A tab's own source-frame size, read from an actual frame's header --
-/// always the frames' own extent, never the sealed composite's (possibly
-/// cropped) one, for a fresh group and for a reopened project alike.
+/// A tab's own source-frame size, upright, read from the first frame
+/// (`first_frame_geometry`, any frame kind) -- always the frames' own
+/// extent, never the sealed composite's (possibly cropped) one, for a fresh
+/// group and for a reopened project alike.
 pub fn tab_image_size(project: &GuiProject) -> Option<(u32, u32)> {
     let frames = project_frames(project);
-    let header = TiffHeader::open(frames.first()?).ok()?;
-    Some(header.upright_dimensions())
+    let (width, height, _) = first_frame_geometry(frames.first()?)?;
+    Some((width, height))
 }
 
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed
