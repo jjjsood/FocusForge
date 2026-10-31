@@ -33,6 +33,19 @@ disk image and drag `FocusForge.app` to `Applications`. Its CLI is
 `/Applications/FocusForge.app/Contents/MacOS/focusforge-cli`, and its shared
 resources are below `/Applications/FocusForge.app/Contents/Resources/share`.
 
+macOS releases are signed ad hoc and are not notarized, so macOS checks a
+downloaded copy with Gatekeeper the first time it opens. If macOS reports that
+“FocusForge” is damaged and can’t be opened, or offers no way to open it, copy
+the app to `Applications`, run this in Terminal and open it normally:
+
+```sh
+xattr -cr /Applications/FocusForge.app
+```
+
+This removes the quarantine flag the browser set on the download and works on
+every macOS version. If macOS instead says it cannot verify the developer, open
+System Settings → Privacy & Security and choose Open Anyway for FocusForge.
+
 A Windows release may provide `FocusForge-<version>-x86_64.msi`. Run the
 installer and follow its prompts. Its CLI is
 `$env:ProgramFiles\FocusForge\focusforge-cli.exe`; the installer does not add
