@@ -1795,6 +1795,7 @@ dependencies = [
  "focusforge-diagnostics",
  "focusforge-gpu",
  "i-slint-backend-testing",
+ "jpeg-encoder",
  "notify-rust",
  "png",
  "rfd",

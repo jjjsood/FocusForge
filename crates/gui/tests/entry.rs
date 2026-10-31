@@ -284,6 +284,90 @@ fn a_picked_raw_set_opens_as_one_tab() {
     );
 }
 
+/// A small RGB JPEG at `dir/name`; `level` makes every frame's bytes (and so
+/// its content hash) differ.
+fn write_jpeg(dir: &Path, name: &str, level: u8) -> PathBuf {
+    let data = vec![level; 16 * 16 * 3];
+    let mut bytes = Vec::new();
+    jpeg_encoder::Encoder::new(&mut bytes, 90)
+        .encode(&data, 16, 16, jpeg_encoder::ColorType::Rgb)
+        .expect("frame encodes");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("frame file");
+    path
+}
+
+/// A distinct camera RAW file: the fixture DNG with `extra` appended
+/// (import hashes files, it never decodes them).
+fn write_raw(dir: &Path, name: &str, extra: u8) -> PathBuf {
+    let mut bytes =
+        std::fs::read(common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng"))
+            .unwrap();
+    bytes.push(extra);
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn picked_jpeg_frames_open_as_one_project() {
+    let root = tree("entry_picked_jpeg");
+    let b = write_jpeg(&root, "b.jpg", 10);
+    let a = write_jpeg(&root, "A.JPG", 20);
+    let c = write_jpeg(&root, "c.Jpeg", 30);
+
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &[c.clone(), b.clone(), a.clone()]);
+    assert!(
+        matches!(outcome, OpenOutcome::Opened(_)),
+        "a JPEG-only set must open"
+    );
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(active_frame_paths(&controller), vec![a, b, c]);
+
+    let single = write_jpeg(&root, "only.jpeg", 40);
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&single));
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(active_frame_paths(&controller), vec![single]);
+}
+
+#[test]
+fn mixed_kinds_name_the_kinds_present() {
+    let root = tree("entry_mixed_kinds");
+    copy_frame(&root, "t.tif", 0);
+    let tiff = root.join("t.tif");
+    let jpeg = write_jpeg(&root, "j.jpg", 10);
+    let raw = write_raw(&root, "r.dng", 1);
+
+    let cases = [
+        (vec![raw.clone(), tiff.clone()], "camera RAW and TIFF"),
+        (vec![tiff.clone(), raw.clone()], "camera RAW and TIFF"),
+        (vec![jpeg.clone(), tiff.clone()], "JPEG and TIFF"),
+        (vec![tiff.clone(), jpeg.clone()], "JPEG and TIFF"),
+        (vec![jpeg.clone(), raw.clone()], "camera RAW and JPEG"),
+        (vec![raw.clone(), jpeg.clone()], "camera RAW and JPEG"),
+        (
+            vec![tiff.clone(), jpeg.clone(), raw.clone()],
+            "camera RAW, JPEG and TIFF",
+        ),
+        (
+            vec![raw.clone(), tiff.clone(), jpeg.clone()],
+            "camera RAW, JPEG and TIFF",
+        ),
+    ];
+    for (set, kinds) in cases {
+        match focusforge_gui::entry::classify(&set) {
+            Err(error @ EntryError::MixedKinds { .. }) => assert_eq!(
+                error.to_string(),
+                format!("These files mix {kinds}. A stack is one kind of file."),
+                "{set:?}"
+            ),
+            other => panic!("{set:?} must be MixedKinds, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn an_upper_case_tif_extension_is_a_frame() {
     let root = tree_of_frames("entry_picked_upper", &["00.TIF", "01.TIF"]);
@@ -307,6 +391,11 @@ fn picked_images_refusals_change_nothing() {
     )
     .unwrap();
 
+    let jpeg_a = write_jpeg(&root, "a.jpg", 10);
+    let jpeg_b = write_jpeg(&other, "b.jpg", 20);
+    let png = root.join("c.png");
+    std::fs::write(&png, b"not decoded").unwrap();
+
     let mut controller = with_one_project("entry_picked_refused_open");
     let tabs = controller.project_tabs();
 
@@ -315,6 +404,8 @@ fn picked_images_refusals_change_nothing() {
         vec![root.join("00.tif"), note.clone()],
         vec![root.join("00.tif"), other.join("00.tif")],
         vec![root.join("00.tif"), raw.clone()],
+        vec![jpeg_a.clone(), png],
+        vec![jpeg_a, jpeg_b],
     ] {
         assert!(
             controller.open_paths(&set).is_none(),
@@ -342,6 +433,11 @@ fn picked_images_refusals_change_nothing() {
         refusals[2],
         "These files mix camera RAW and TIFF. A stack is one kind of file."
     );
+    assert!(refusals[3].ends_with("not a folder of frames or a FocusForge project"));
+    assert_eq!(
+        refusals[4],
+        "These files are in different folders. A stack's frames share one folder."
+    );
 
     // An answer that arrives while a load is in flight opens nothing.
     controller.set_open_hold(Duration::from_millis(300));
@@ -360,7 +456,7 @@ fn picked_images_refusals_change_nothing() {
 
 /// The refusal body for a folder holding nothing the open path reads: it
 /// names every accepted source family (checked against the extension
-/// constants the open path scans with), names no PNG/JPEG, and leaves the
+/// constants the open path scans with), names no PNG, and leaves the
 /// way out to the dialog's button.
 fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutcome) {
     match outcome {
@@ -371,7 +467,7 @@ fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutco
     let body = controller
         .last_refusal()
         .expect("a refusal message must be recorded");
-    for extension in TIFF_EXTENSIONS {
+    for extension in TIFF_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
         assert!(
             body.contains(&format!(".{extension}")),
             "the body must name .{extension}: {body}"
@@ -381,13 +477,14 @@ fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutco
         body.contains("RAW"),
         "the body must name camera RAW: {body}"
     );
-    for extension in PNG_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
+    for extension in PNG_EXTENSIONS {
         assert!(
             !body.to_lowercase().contains(&format!(".{extension}")),
             "the body must not name .{extension}: {body}"
         );
     }
-    assert!(!body.contains("PNG") && !body.contains("JPEG"), "{body}");
+    assert!(!body.contains("PNG"), "{body}");
+    assert!(!body.contains("16-bit"), "{body}");
     assert!(
         !body.contains("Pick another folder"),
         "the button carries the offer, not the body: {body}"
@@ -1513,6 +1610,194 @@ fn a_drop_of_neither_a_folder_nor_a_frame_is_refused_and_changes_nothing() {
     let result = controller.drop_paths(&[bad]);
     assert!(matches!(result, Err(ImportRefused::NoFrames { .. })));
     assert_eq!(controller.frame_count(), before_frames);
+}
+
+#[test]
+fn import_no_frames_text_names_every_kind() {
+    let mut controller = with_one_project("entry_import_no_frames_text");
+    let dir = tree("entry_import_no_frames_text_extra");
+    let png = dir.join("a.png");
+    std::fs::write(&png, b"not decoded").unwrap();
+    let before = active_frame_paths(&controller);
+
+    let Err(refused) = controller.drop_paths(&[png]) else {
+        panic!("a dropped .png must be refused");
+    };
+    assert!(matches!(refused, ImportRefused::NoFrames { .. }));
+    let text = refused.to_string();
+    for extension in TIFF_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
+        assert!(text.contains(&format!(".{extension}")), "{text}");
+    }
+    assert!(text.contains("RAW"), "{text}");
+    assert!(!text.contains("TIFF images"), "{text}");
+    for extension in PNG_EXTENSIONS {
+        assert!(!text.to_lowercase().contains(extension), "{text}");
+    }
+    assert_eq!(active_frame_paths(&controller), before);
+}
+
+/// A controller with a project open over `frames`.
+fn open_set(frames: &[PathBuf]) -> AppController {
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, frames),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+#[test]
+fn import_adds_jpeg_to_a_jpeg_tab() {
+    let root = tree("entry_import_jpeg");
+    let mut controller = open_set(&[write_jpeg(&root, "a.jpg", 10)]);
+
+    let extra = tree("entry_import_jpeg_extra");
+    let lower = write_jpeg(&extra, "b.jpg", 20);
+    let upper = write_jpeg(&extra, "C.JPEG", 30);
+    common::add_and_settle(&mut controller, &[lower, upper])
+        .expect("JPEG onto a JPEG tab is accepted");
+    assert_eq!(
+        active_frame_paths(&controller).len(),
+        3,
+        "both new frames join the tab"
+    );
+
+    let raw_root = tree("entry_import_raw");
+    let mut raws = open_set(&[write_raw(&raw_root, "a.dng", 1)]);
+    let raw_extra = tree("entry_import_raw_extra");
+    common::add_and_settle(
+        &mut raws,
+        &[
+            write_raw(&raw_extra, "b.dng", 2),
+            write_raw(&raw_extra, "c.DNG", 3),
+        ],
+    )
+    .expect("RAW onto a RAW tab is accepted");
+    assert_eq!(active_frame_paths(&raws).len(), 3);
+
+    let tiff_root = tree_of_frames("entry_import_tiff", &["00.tif"]);
+    let mut tiffs = open_set(&[tiff_root.join("00.tif")]);
+    let tiff_extra = tree("entry_import_tiff_extra");
+    copy_frame(&tiff_extra, "01.tif", 1);
+    common::add_and_settle(&mut tiffs, &[tiff_extra.join("01.tif")])
+        .expect("TIFF onto a TIFF tab is accepted");
+    assert_eq!(active_frame_paths(&tiffs).len(), 2);
+
+    let mut emptied = open_set(&[write_jpeg(&root, "e.jpg", 50)]);
+    emptied.remove_frame(0);
+    assert!(active_frame_paths(&emptied).is_empty());
+    common::add_and_settle(&mut emptied, &[write_jpeg(&extra, "f.jpg", 60)])
+        .expect("an emptied tab takes any one kind");
+    assert_eq!(active_frame_paths(&emptied).len(), 1);
+}
+
+#[test]
+fn import_refuses_a_kind_the_tab_does_not_hold() {
+    let root = tree("entry_import_cross");
+    copy_frame(&root, "t.tif", 0);
+    let tiff = root.join("t.tif");
+    let jpeg = write_jpeg(&root, "j.jpg", 10);
+    let raw = write_raw(&root, "r.dng", 1);
+
+    let extra = tree("entry_import_cross_extra");
+    copy_frame(&extra, "t2.tif", 1);
+    let tiff_in = extra.join("t2.tif");
+    let jpeg_in = write_jpeg(&extra, "j2.jpg", 20);
+    let raw_in = write_raw(&extra, "r2.dng", 2);
+
+    let cases = [
+        (
+            &tiff,
+            vec![jpeg_in.clone()],
+            "Cannot mix JPEG and TIFF in one stack",
+        ),
+        (
+            &raw,
+            vec![jpeg_in.clone()],
+            "Cannot mix camera RAW and JPEG in one stack",
+        ),
+        (
+            &tiff,
+            vec![raw_in.clone()],
+            "Cannot mix camera RAW and TIFF in one stack",
+        ),
+        (
+            &jpeg,
+            vec![tiff_in.clone()],
+            "Cannot mix JPEG and TIFF in one stack",
+        ),
+        (
+            &tiff,
+            vec![tiff_in.clone(), jpeg_in.clone(), raw_in.clone()],
+            "Cannot mix camera RAW, JPEG and TIFF in one stack",
+        ),
+        (
+            &tiff,
+            vec![jpeg_in.clone(), raw_in.clone()],
+            "Cannot mix camera RAW, JPEG and TIFF in one stack",
+        ),
+    ];
+    for (tab_frame, incoming, text) in cases {
+        let mut controller = open_set(std::slice::from_ref(tab_frame));
+        let before = active_frame_paths(&controller);
+        let Err(refused) = controller.add_frames(&incoming) else {
+            panic!("{incoming:?} onto {tab_frame:?} must be refused");
+        };
+        assert!(matches!(refused, ImportRefused::MixedKinds { .. }));
+        assert_eq!(refused.to_string(), text);
+        assert_eq!(active_frame_paths(&controller), before, "{text}");
+    }
+}
+
+#[test]
+fn import_expands_a_folder_with_the_open_scan() {
+    let root = tree("entry_import_folder");
+    let mut jpegs = open_set(&[write_jpeg(&root, "a.jpg", 10)]);
+    let folder = tree("entry_import_folder_jpeg");
+    let frames = folder.join("frames");
+    std::fs::create_dir_all(&frames).unwrap();
+    write_jpeg(&frames, "b.jpg", 20);
+    write_jpeg(&frames, "c.JPG", 30);
+    common::add_and_settle(&mut jpegs, &[folder]).expect("a JPEG folder onto a JPEG tab");
+    assert_eq!(active_frame_paths(&jpegs).len(), 3);
+
+    let raw_root = tree("entry_import_folder_raw_tab");
+    let mut raws = open_set(&[write_raw(&raw_root, "a.dng", 1)]);
+    let raw_folder = tree("entry_import_folder_raw");
+    write_raw(&raw_folder, "b.dng", 2);
+    common::add_and_settle(&mut raws, &[raw_folder]).expect("a RAW folder onto a RAW tab");
+    assert_eq!(active_frame_paths(&raws).len(), 2);
+
+    let tiff_root = tree_of_frames("entry_import_folder_tiff_tab", &["00.tif"]);
+    let mut tiffs = open_set(&[tiff_root.join("00.tif")]);
+    let tiff_folder = tree("entry_import_folder_tiff");
+    copy_frame(&tiff_folder, "01.tif", 1);
+    copy_frame(&tiff_folder, "composite.tif", 2);
+    copy_frame(&tiff_folder, "zmap.tif", 3);
+    common::add_and_settle(&mut tiffs, &[tiff_folder]).expect("a TIFF folder onto a TIFF tab");
+    let names: Vec<_> = active_frame_paths(&tiffs)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["00.tif", "01.tif"], "output files are not frames");
+
+    let foreign = tree("entry_import_folder_foreign");
+    write_raw(&foreign, "x.dng", 3);
+    let both = tree("entry_import_folder_both");
+    write_jpeg(&both, "y.jpg", 70);
+    copy_frame(&both, "y.tif", 4);
+    for (folder, text) in [
+        (foreign, "Cannot mix camera RAW and JPEG in one stack"),
+        (both, "Cannot mix JPEG and TIFF in one stack"),
+    ] {
+        let mut tab = open_set(&[write_jpeg(&root, "z.jpg", 80)]);
+        let before = active_frame_paths(&tab);
+        let Err(refused) = tab.add_frames(&[folder]) else {
+            panic!("{text} must be refused");
+        };
+        assert_eq!(refused.to_string(), text);
+        assert_eq!(active_frame_paths(&tab), before);
+    }
 }
 
 // ---------------------------------------------------------------------
