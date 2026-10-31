@@ -251,7 +251,7 @@ pub(super) fn full_blob<'a>(
 use crate::algorithm::StackAlgorithm;
 use crate::equalize::EqualizeSettings;
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
-use crate::tile::Rect;
+use crate::tile::{Rect, Sample, SampleFormat};
 
 /// The alignment switch: `align`. The settings panel's align section renders
 /// exactly this schema, ahead of the algorithm's own parameters.
@@ -502,10 +502,26 @@ impl Project {
             full_blob(&manifest.blobs, &c.zmap_blob, path)?;
             match &c.fuse {
                 Some(fuse) => {
-                    if !manifest.blobs.iter().any(|b| b.hash == fuse.composite.blob) {
+                    let Some(composite) = manifest
+                        .blobs
+                        .iter()
+                        .find(|b| b.hash == fuse.composite.blob)
+                    else {
                         return Err(ProjectError::MissingEntry {
                             path: path.to_path_buf(),
                             entry: format!("blobs/{}.zst", fuse.composite.blob),
+                        });
+                    };
+                    if composite.kind == BlobKind::Full
+                        && fuse.sources.first().is_some_and(|source| {
+                            crate::io::has_extension(
+                                Path::new(&source.path),
+                                crate::io::RAW_EXTENSIONS,
+                            )
+                        })
+                    {
+                        return Err(ProjectError::ClippedRawResult {
+                            path: path.to_path_buf(),
                         });
                     }
                     if c.stack_fingerprint != blob::stack_fingerprint(&fuse.sources) {
@@ -817,14 +833,62 @@ impl Project {
     /// [`Self::read_plane_into`]'s body, over an arbitrary [`PlaneRef`]
     /// rather than one of `self.manifest`'s own two -- what
     /// [`materialize_zmap`] uses to read a non-head checkpoint's own Z-Map
-    /// blob under the manifest's declared shape.
+    /// blob under the manifest's declared shape. A blob of `f32` samples is
+    /// narrowed with `u16::narrow`.
     fn read_plane_ref_into(
         &mut self,
         plane: &PlaneRef,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
-        let expected_len =
-            plane.width as u64 * plane.height as u64 * plane.samples_per_pixel as u64 * 2;
+        match self.plane_format(plane)? {
+            SampleFormat::U16 => self.read_plane_ref_as::<u16>(plane, sink),
+            SampleFormat::F32 => {
+                let mut narrowed: Vec<u16> = Vec::new();
+                self.read_plane_ref_as::<f32>(plane, &mut |band, rect| {
+                    narrowed.clear();
+                    narrowed.extend(band.iter().map(|&v| u16::narrow(v)));
+                    sink(&narrowed, rect);
+                })
+            }
+        }
+    }
+
+    /// The sample type of the blob `plane` names, from its manifest record.
+    pub(super) fn plane_format(&self, plane: &PlaneRef) -> Result<SampleFormat, ProjectError> {
+        self.manifest
+            .blobs
+            .iter()
+            .find(|b| b.hash == plane.blob)
+            .map(|b| b.kind.sample_format())
+            .ok_or_else(|| ProjectError::MissingEntry {
+                path: self.path.clone(),
+                entry: blob_entry(&plane.blob),
+            })
+    }
+
+    /// [`Self::read_plane_ref_into`] in the blob's own sample type `S`;
+    /// a blob that holds the other type is refused.
+    pub(super) fn read_plane_ref_as<S: LeSample>(
+        &mut self,
+        plane: &PlaneRef,
+        sink: &mut impl FnMut(&[S], Rect),
+    ) -> Result<(), ProjectError> {
+        let held = self.plane_format(plane)?;
+        if held != S::FORMAT {
+            return Err(ProjectError::container(
+                &self.path,
+                format!(
+                    "blob {} holds {held:?} samples, not the {:?} asked for",
+                    plane.blob,
+                    S::FORMAT
+                ),
+            ));
+        }
+        let width = S::FORMAT.bytes() as usize;
+        let expected_len = plane.width as u64
+            * plane.height as u64
+            * plane.samples_per_pixel as u64
+            * width as u64;
 
         let file = container::record_reader(
             &self.file,
@@ -836,11 +900,11 @@ impl Project {
             .map_err(|source| ProjectError::io(&self.path, source))?;
 
         let row_samples = plane.width as usize * plane.samples_per_pixel as usize;
-        let rows = (READ_BAND_BYTES / (row_samples * 2)).clamp(1, plane.height as usize) as u32;
+        let rows = (READ_BAND_BYTES / (row_samples * width)).clamp(1, plane.height as usize) as u32;
 
         let mut hasher = blake3::Hasher::new();
-        let mut bytes = vec![0u8; row_samples * rows as usize * 2];
-        let mut samples = vec![0u16; row_samples * rows as usize];
+        let mut bytes = vec![0u8; row_samples * rows as usize * width];
+        let mut samples = vec![S::default(); row_samples * rows as usize];
         let mut total = 0u64;
 
         let mut y = 0;
@@ -848,15 +912,15 @@ impl Project {
             let band_rows = rows.min(plane.height - y);
             let len = row_samples * band_rows as usize;
             decoder
-                .read_exact(&mut bytes[..len * 2])
+                .read_exact(&mut bytes[..len * width])
                 .map_err(|source| ProjectError::io(&self.path, source))?;
-            hasher.update(&bytes[..len * 2]);
-            total += (len * 2) as u64;
+            hasher.update(&bytes[..len * width]);
+            total += (len * width) as u64;
             for (sample, chunk) in samples[..len]
                 .iter_mut()
-                .zip(bytes[..len * 2].chunks_exact(2))
+                .zip(bytes[..len * width].chunks_exact(width))
             {
-                *sample = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *sample = S::from_le(chunk);
             }
             sink(
                 &samples[..len],
@@ -889,6 +953,23 @@ impl Project {
         }
         self.verified.push((plane.blob.clone(), total));
         Ok(())
+    }
+}
+
+/// A sample type a blob stores as little-endian bytes.
+pub(super) trait LeSample: Sample {
+    fn from_le(bytes: &[u8]) -> Self;
+}
+
+impl LeSample for u16 {
+    fn from_le(bytes: &[u8]) -> Self {
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+}
+
+impl LeSample for f32 {
+    fn from_le(bytes: &[u8]) -> Self {
+        f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 }
 

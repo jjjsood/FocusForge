@@ -4727,6 +4727,7 @@ pub fn push_export_view(app: &AppWindow, view: &crate::export_settings::ExportVi
     app.set_export_format_segments(string_model(&view.segments));
     app.set_export_format_selected(view.selected.as_str().into());
     app.set_export_settings_heading(view.heading.as_str().into());
+    app.set_export_settings_note(view.note.as_str().into());
     let rows: Vec<ExportRowView> = view
         .rows
         .iter()

@@ -16,7 +16,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
@@ -36,6 +36,91 @@ fn single_report(dir: &Path) -> (PathBuf, serde_json::Value) {
     let parsed =
         serde_json::from_str(&body).unwrap_or_else(|e| panic!("the report must be JSON: {e}"));
     (reports[0].clone(), parsed)
+}
+
+/// A stdout whose reader is gone before the child starts, so its first write
+/// fails.
+fn closed_stdout() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
+
+/// `dir` holds no report: it is missing or empty.
+fn assert_no_report(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let reports: Vec<PathBuf> = entries.map(|entry| entry.unwrap().path()).collect();
+        assert!(reports.is_empty(), "no report expected, got {reports:?}");
+    }
+}
+
+#[test]
+fn closed_stdout_ends_quietly_without_a_report() {
+    let frame = common::fixtures_dir().join("mantis-64/frames/00.tif");
+    let frame = frame.to_str().unwrap();
+    let cases: [(&str, &[&str]); 3] = [
+        ("crash_cli_closed_stdout_list", &["algorithms"]),
+        (
+            "crash_cli_closed_stdout_list_json",
+            &["algorithms", "--json"],
+        ),
+        (
+            "crash_cli_closed_stdout_info_json",
+            &["info", frame, "--json"],
+        ),
+    ];
+    for (name, args) in cases {
+        let mut cmd = common::cli_bin(name);
+        let output = cmd
+            .args(args)
+            .stdout(closed_stdout())
+            .output()
+            .expect("failed to run the binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert_no_report(&crashes_dir(&cmd));
+    }
+}
+
+/// Output dropped on a closed stdout never skips what the command does after
+/// printing: `diagnostics` still writes its bundle, and a refusal after the
+/// manifest keeps its failure status.
+#[test]
+fn closed_stdout_keeps_the_commands_own_outcome() {
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "crash_cli_closed_stdout_outcome-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let bundle = out_dir.join("bundle.zip");
+
+    let mut cmd = common::cli_bin("crash_cli_closed_stdout_bundle");
+    let output = cmd
+        .args(["diagnostics", "-o", bundle.to_str().unwrap()])
+        .stdout(closed_stdout())
+        .output()
+        .expect("failed to run the binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(bundle.is_file(), "the bundle was not written: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_no_report(&crashes_dir(&cmd));
+
+    // The bundle path is taken now: the command prints its manifest, then refuses.
+    let mut cmd = common::cli_bin("crash_cli_closed_stdout_refusal");
+    let output = cmd
+        .args(["diagnostics", "-o", bundle.to_str().unwrap()])
+        .stdout(closed_stdout())
+        .output()
+        .expect("failed to run the binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("pass --force"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_no_report(&crashes_dir(&cmd));
 }
 
 #[test]

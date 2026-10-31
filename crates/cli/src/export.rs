@@ -50,10 +50,11 @@ const FRAME_BAND_ROWS: u32 = 256;
 /// falls back to its format's own `ParamDesc` default rather than clap's.
 #[derive(Args, Default)]
 pub struct FormatArgs {
-    /// The image format to write: `tiff`, `png` or `jpeg`. Inferred from
-    /// `-o`'s extension when omitted (`.tif`/`.tiff` -> tiff, `.png` -> png,
-    /// `.jpg`/`.jpeg` -> jpeg, no extension -> tiff, the default); refused
-    /// if it names a format other than a recognised extension's.
+    /// The image format to write: `tiff`, `png`, `jpeg` or `dng` (a linear
+    /// DNG of a RAW project). Inferred from `-o`'s extension when omitted
+    /// (`.tif`/`.tiff` -> tiff, `.png` -> png, `.jpg`/`.jpeg` -> jpeg,
+    /// `.dng` -> dng, no extension -> tiff, the default); refused if it
+    /// names a format other than a recognised extension's.
     #[arg(long)]
     format: Option<String>,
     /// TIFF bit depth: `16` (default) or `8`. TIFF only.
@@ -79,7 +80,8 @@ pub struct FormatArgs {
     /// Carry the alignment reference frame's EXIF: `on` (default) or `off`.
     #[arg(long)]
     exif: Option<String>,
-    /// Embed an ICC profile: `on` (default) or `off`.
+    /// Embed an ICC profile: `on` (default) or `off`. Has no effect on a DNG,
+    /// whose colour is defined by its camera matrices.
     #[arg(long)]
     icc: Option<String>,
     /// Carry the source frame's XMP packet verbatim: `on` or `off`
@@ -114,8 +116,9 @@ fn resolve_format(output: &Path, explicit: Option<&str>) -> Result<ExportFormat,
             "tiff" => Ok(ExportFormat::Tiff),
             "png" => Ok(ExportFormat::Png),
             "jpeg" => Ok(ExportFormat::Jpeg),
+            "dng" => Ok(ExportFormat::Dng),
             other => Err(format!(
-                "--format: unknown format {other:?}, expected tiff, png or jpeg"
+                "--format: unknown format {other:?}, expected tiff, png, jpeg or dng"
             )),
         })
         .transpose()?;
@@ -130,7 +133,7 @@ fn resolve_format(output: &Path, explicit: Option<&str>) -> Result<ExportFormat,
         (Some(fmt), _) => Ok(fmt),
         (None, Some(ext_fmt)) => Ok(ext_fmt),
         (None, None) if output.extension().is_some() => Err(format!(
-            "--format: {} has an unrecognised extension; pass --format tiff, png or jpeg",
+            "--format: {} has an unrecognised extension; pass --format tiff, png, jpeg or dng",
             output.display()
         )),
         (None, None) => Ok(ExportFormat::Tiff),
@@ -192,6 +195,7 @@ fn icc_status_str(status: IccStatus) -> &'static str {
         IccStatus::BuiltinSrgb => "builtin-srgb",
         IccStatus::None => "none",
         IccStatus::Skipped => "skipped",
+        IccStatus::Unsupported => "unsupported",
     }
 }
 
@@ -626,9 +630,27 @@ mod tests {
     #[test]
     fn resolve_format_honours_an_explicit_flag_over_an_unrecognised_extension() {
         assert_eq!(
-            resolve_format(Path::new("out.dng"), Some("tiff")),
+            resolve_format(Path::new("out.exr"), Some("tiff")),
             Ok(ExportFormat::Tiff)
         );
+    }
+
+    #[test]
+    fn resolve_format_infers_dng() {
+        assert_eq!(
+            resolve_format(Path::new("out.dng"), None),
+            Ok(ExportFormat::Dng)
+        );
+        assert_eq!(
+            resolve_format(Path::new("out"), Some("dng")),
+            Ok(ExportFormat::Dng)
+        );
+    }
+
+    #[test]
+    fn resolve_format_refuses_tiff_for_a_dng_output() {
+        let err = resolve_format(Path::new("out.dng"), Some("tiff")).unwrap_err();
+        assert!(err.contains("--format") && err.contains("dng"), "{err}");
     }
 
     #[test]

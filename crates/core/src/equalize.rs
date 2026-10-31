@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Opt-in brightness equalization: one gain per source, the same on every
-//! channel, applied to encoded code values (not a linear-light correction).
-//! The gains bring every source's whole-image mean to one shared target and
-//! are fixed before alignment. Gains are Q16 (`65536` is 1.0), so every
-//! reader applies identical integer arithmetic.
+//! channel. The gains bring every source's whole-image mean to one shared
+//! target and are fixed before alignment. Gains are Q16 (`65536` is 1.0).
+//! A reader whose samples are a look of linear light (RAW) is measured and
+//! gained in that linear light; any other reader on its encoded code values,
+//! in integer arithmetic.
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +14,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::tile::Rect;
+use crate::tile::{Rect, SampleFormat};
 
 /// Gain 1.0 in Q16 fixed point.
 pub const UNIT_GAIN: u32 = 1 << 16;
@@ -159,7 +160,7 @@ fn gained(sample: u16, gain: u32) -> u16 {
 }
 
 /// Multiplies each sample by the Q16 `gain`.
-fn apply_gain(samples: &mut [u16], gain: u32) {
+pub(crate) fn apply_gain(samples: &mut [u16], gain: u32) {
     if gain == UNIT_GAIN {
         return;
     }
@@ -169,8 +170,9 @@ fn apply_gain(samples: &mut [u16], gain: u32) {
 }
 
 /// A [`TileReader`] that multiplies every sample of frame `i` by
-/// `gains[i]` (Q16), saturating at 65535. A frame at unit gain, or past the
-/// end of `gains`, is read straight through.
+/// `gains[i]` (Q16) through [`TileReader::read_tile_gained_into`]: encoded
+/// samples saturate at 65535. A frame at unit gain, or past the end of
+/// `gains`, is read straight through.
 pub struct GainReader<'a> {
     inner: &'a dyn TileReader,
     gains: &'a [u32],
@@ -184,18 +186,37 @@ impl<'a> GainReader<'a> {
     fn gain(&self, frame: usize) -> u32 {
         self.gains.get(frame).copied().unwrap_or(UNIT_GAIN)
     }
+
+    /// The frame's gain is not unity and the reader applies it to linear
+    /// light, which only its own gained read does.
+    fn gains_linear_light(&self, frame: usize) -> Result<bool, AlgorithmError> {
+        Ok(self.gain(frame) != UNIT_GAIN && self.inner.linear_means(frame)?.is_some())
+    }
 }
 
 impl TileReader for GainReader<'_> {
+    fn sample_format(&self) -> SampleFormat {
+        self.inner.sample_format()
+    }
+
     fn read_tile_into(
         &self,
         frame: usize,
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
-        self.inner.read_tile_into(frame, rect, out)?;
-        apply_gain(out, self.gain(frame));
-        Ok(())
+        self.inner
+            .read_tile_gained_into(frame, rect, self.gain(frame), out)
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.inner
+            .read_tile_gained_f32_into(frame, rect, self.gain(frame), out)
     }
 
     fn read_tile_coverage_into(
@@ -204,9 +225,31 @@ impl TileReader for GainReader<'_> {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        if self.gains_linear_light(frame)? {
+            self.read_tile_into(frame, rect, out)?;
+            return Ok(None);
+        }
         let coverage = self.inner.read_tile_coverage_into(frame, rect, out)?;
         apply_gain(out, self.gain(frame));
         Ok(coverage)
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        if self.inner.sample_format() == SampleFormat::U16 {
+            return crate::algorithm::widened(out, |scratch| {
+                self.read_tile_coverage_into(frame, rect, scratch)
+            });
+        }
+        if self.gain(frame) == UNIT_GAIN {
+            return self.inner.read_tile_coverage_f32_into(frame, rect, out);
+        }
+        self.read_tile_f32_into(frame, rect, out)?;
+        Ok(None)
     }
 
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
@@ -221,6 +264,16 @@ impl TileReader for GainReader<'_> {
         samples_per_pixel: u32,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
+        if self.gains_linear_light(frame)? {
+            return crate::algorithm::read_tile_step_into(
+                self,
+                frame,
+                rect,
+                step,
+                samples_per_pixel,
+                out,
+            );
+        }
         self.inner
             .read_tile_step_into(frame, rect, step, samples_per_pixel, out)?;
         apply_gain(out, self.gain(frame));
@@ -252,6 +305,9 @@ pub fn estimate(
     frames_done: &AtomicUsize,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<EqualizationReport, AlgorithmError> {
+    if let Some(means) = linear_means_of(reader, frame_count, frames_done, cancelled)? {
+        return Ok(report_from_means(&means, settings));
+    }
     let strip_rows = strip_rows_for(frame, samples_per_pixel);
     estimate_in_strips(
         reader,
@@ -264,6 +320,34 @@ pub fn estimate(
         frames_done,
         cancelled,
     )
+}
+
+/// Every frame's mean in linear light on the 16-bit scale, `None` when the
+/// reader's encoded samples are the linear ones.
+fn linear_means_of(
+    reader: &dyn TileReader,
+    frame_count: usize,
+    frames_done: &AtomicUsize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Vec<f64>>, AlgorithmError> {
+    if reader.linear_means(0)?.is_none() {
+        return Ok(None);
+    }
+    let mut means = Vec::with_capacity(frame_count);
+    for frame in 0..frame_count {
+        if cancelled() {
+            return Err(AlgorithmError::Cancelled);
+        }
+        let channels = reader
+            .linear_means(frame)?
+            .ok_or_else(|| AlgorithmError::Failed {
+                algorithm: "equalize".to_string(),
+                detail: format!("frame {frame} has no linear-light mean"),
+            })?;
+        means.push(channels.iter().sum::<f64>() / 3.0 * f64::from(u16::MAX));
+        frames_done.fetch_add(1, Ordering::SeqCst);
+    }
+    Ok(Some(means))
 }
 
 /// The rows one strip holds: about [`STRIP_SAMPLES`] samples, at least one
@@ -381,7 +465,40 @@ fn report_from_histograms(
     let frames = histograms
         .iter()
         .zip(&means)
-        .map(|(histogram, &mean)| frame_estimate(histogram, mean, target, settings.max_gain))
+        .map(|(histogram, &mean)| {
+            frame_estimate(mean, target, settings.max_gain, |gain| {
+                let clipped = histogram[..BINS - 1]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(value, _)| gained(value as u16, gain) == u16::MAX)
+                    .map(|(_, &n)| n)
+                    .sum();
+                let (sum, count) = histogram_totals(histogram, |v| gained(v, gain));
+                (clipped, mean_of(sum, count))
+            })
+        })
+        .collect();
+    EqualizationReport {
+        max_gain: settings.max_gain,
+        target_stops: settings.target_stops,
+        neutral,
+        target,
+        frames,
+    }
+}
+
+/// The report for linear-light frame `means`: no sample saturates, so the
+/// gained mean is the mean times the gain.
+fn report_from_means(means: &[f64], settings: EqualizeSettings) -> EqualizationReport {
+    let neutral = means.iter().sum::<f64>() / means.len().max(1) as f64;
+    let target = neutral * settings.target_stops.exp2();
+    let frames = means
+        .iter()
+        .map(|&mean| {
+            frame_estimate(mean, target, settings.max_gain, |gain| {
+                (0, mean * f64::from(gain) / f64::from(UNIT_GAIN))
+            })
+        })
         .collect();
     EqualizationReport {
         max_gain: settings.max_gain,
@@ -406,7 +523,14 @@ fn mean_of(sum: u64, count: u64) -> f64 {
     sum as f64 / count.max(1) as f64
 }
 
-fn frame_estimate(histogram: &[u64], mean: f64, target: f64, max_gain: f64) -> FrameEstimate {
+/// `outcome(gain)` is the number of samples the Q16 `gain` saturates and the
+/// mean after it.
+fn frame_estimate(
+    mean: f64,
+    target: f64,
+    max_gain: f64,
+    outcome: impl FnOnce(u32) -> (u64, f64),
+) -> FrameEstimate {
     if mean == 0.0 {
         return FrameEstimate {
             mean,
@@ -423,14 +547,7 @@ fn frame_estimate(histogram: &[u64], mean: f64, target: f64, max_gain: f64) -> F
     let estimated = target / mean;
     let applied = estimated.clamp(1.0 / max_gain, max_gain);
     let gain = to_q16(applied);
-    let clipped_samples = histogram[..BINS - 1]
-        .iter()
-        .enumerate()
-        .filter(|&(value, _)| gained(value as u16, gain) == u16::MAX)
-        .map(|(_, &n)| n)
-        .sum();
-    let (sum, count) = histogram_totals(histogram, |v| gained(v, gain));
-    let output_mean = mean_of(sum, count);
+    let (clipped_samples, output_mean) = outcome(gain);
     FrameEstimate {
         mean,
         estimated,

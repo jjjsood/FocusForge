@@ -847,6 +847,7 @@ export component AppWindow inherits Window {
     in property <[string]> export-format-segments: [];
     in property <string> export-format-selected: "";
     in property <string> export-settings-heading: "";
+    in property <string> export-settings-note: "";
     in property <[ExportRowView]> export-rows: [];
     in property <bool> export-slider-group: false;
     in property <bool> export-metadata-on: true;
@@ -1020,6 +1021,7 @@ export component AppWindow inherits Window {
         format-segments: root.export-format-segments;
         format-selected: root.export-format-selected;
         settings-heading: root.export-settings-heading;
+        settings-note: root.export-settings-note;
         rows: root.export-rows;
         slider-group: root.export-slider-group;
         metadata-on: root.export-metadata-on;

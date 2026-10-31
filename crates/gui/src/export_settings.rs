@@ -14,7 +14,12 @@ use crate::settings::{self, WriteError};
 use crate::settings_panel::{ParamValues, SettingsRow, field_row, validate};
 
 /// The formats the modal offers, in segment order.
-pub const FORMATS: [ExportFormat; 3] = [ExportFormat::Tiff, ExportFormat::Png, ExportFormat::Jpeg];
+pub const FORMATS: [ExportFormat; 4] = [
+    ExportFormat::Tiff,
+    ExportFormat::Png,
+    ExportFormat::Jpeg,
+    ExportFormat::Dng,
+];
 
 /// The selected format, each format's last settings and the one `Metadata`
 /// switch.
@@ -63,6 +68,7 @@ impl ExportChoice {
             ExportFormat::Tiff => &self.tiff,
             ExportFormat::Png => &self.png,
             ExportFormat::Jpeg => &self.jpeg,
+            ExportFormat::Dng => &ExportOptions::Dng,
         }
     }
 
@@ -72,6 +78,7 @@ impl ExportChoice {
             ExportFormat::Tiff => self.tiff = options,
             ExportFormat::Png => self.png = options,
             ExportFormat::Jpeg => self.jpeg = options,
+            ExportFormat::Dng => {}
         }
     }
 
@@ -107,6 +114,11 @@ impl ExportChoice {
             segments: FORMATS.iter().map(|f| label(*f)).collect(),
             selected: label(self.format),
             heading: format!("{} SETTINGS", label(self.format)),
+            note: if self.format == ExportFormat::Dng {
+                "No settings: 16-bit, uncompressed, in the camera's own colour.".into()
+            } else {
+                String::new()
+            },
             rows,
             slider_group: self.format == ExportFormat::Jpeg,
             metadata: self.metadata,
@@ -119,6 +131,8 @@ pub struct ExportView {
     pub segments: Vec<String>,
     pub selected: String,
     pub heading: String,
+    /// One muted line under the heading; empty when the format shows rows.
+    pub note: String,
     /// One row per descriptor of the selected format, in descriptor order.
     pub rows: Vec<SettingsRow>,
     /// The group is a slider row then a segmented row rather than menus.
@@ -311,5 +325,22 @@ mod tests {
         assert_eq!(load(dir.path()), choice);
         let text = settings::read(dir.path()).1.unwrap().unwrap();
         assert!(text.starts_with(original), "{text}");
+    }
+
+    #[test]
+    fn dng_choice_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let choice = ExportChoice {
+            format: ExportFormat::Dng,
+            ..jpeg_choice()
+        };
+        save(dir.path(), &choice).unwrap();
+        assert_eq!(load(dir.path()), choice);
+
+        write_settings(
+            dir.path(),
+            "[export]\nformat = \"dng\"\n[export.dng]\ndng-bits = \"16\"\nnonsense = 3\n",
+        );
+        assert_eq!(load(dir.path()).format, ExportFormat::Dng);
     }
 }

@@ -24,6 +24,24 @@ pub struct DngSpec {
     pub make: String,
     pub model: String,
     pub samples: Vec<u16>,
+    /// DNG AsShotNeutral; the as-shot white balance is its reciprocal.
+    pub as_shot_neutral: Option<[f32; 3]>,
+    /// Row-major ColorMatrix1 (XYZ to camera, D65); the identity when absent.
+    pub color_matrix: Option<[f32; 9]>,
+    /// Row-major ColorMatrix2 and its CalibrationIlluminant2 code.
+    pub color_matrix2: Option<([f32; 9], u16)>,
+    /// Row-major CameraCalibration1 and CameraCalibration2, beside the
+    /// ColorMatrix of the same slot.
+    pub camera_calibration: [Option<[f32; 9]>; 2],
+    /// DNG AnalogBalance.
+    pub analog_balance: Option<[f32; 3]>,
+    /// Write no ColorMatrix1 and no CalibrationIlluminant1.
+    pub omit_color_matrix: bool,
+    /// PhotometricInterpretation 1 (BlackIsZero); rawler's DNG decoder still
+    /// wants the CFA tags.
+    pub monochrome: bool,
+    /// EXIF Orientation of the frame.
+    pub orientation: Option<u16>,
 }
 
 impl DngSpec {
@@ -45,6 +63,14 @@ impl DngSpec {
             make: "FocusForge Test".to_string(),
             model: "Synthetic Bayer".to_string(),
             samples,
+            as_shot_neutral: None,
+            color_matrix: None,
+            color_matrix2: None,
+            camera_calibration: [None, None],
+            analog_balance: None,
+            omit_color_matrix: false,
+            monochrome: false,
+            orientation: None,
         }
     }
 }
@@ -60,24 +86,17 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
     assert_eq!(spec.samples.len(), (spec.width * spec.height) as usize);
     assert!(matches!(spec.bits, 12 | 14));
     let payload = packed_samples(&spec.samples, spec.bits);
-    let matrix = [
-        (1_i32, 1_i32),
-        (0, 1),
-        (0, 1),
-        (0, 1),
-        (1, 1),
-        (0, 1),
-        (0, 1),
-        (0, 1),
-        (1, 1),
-    ];
+    let matrix = spec
+        .color_matrix
+        .unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+        .map(|value| ((value * 10_000.0).round() as i32, 10_000_i32));
     let [header_width, header_height] = spec.header_dimensions.unwrap_or([spec.width, spec.height]);
     let has_exif = spec.capture_time.is_some() || spec.serial_number.is_some();
     let mut entries = vec![
         Entry::long(257, &[spec.height]),
         Entry::short(258, &[spec.bits]),
         Entry::short(259, &[1]),
-        Entry::short(262, &[32803]),
+        Entry::short(262, &[if spec.monochrome { 1 } else { 32803 }]),
         Entry::ascii(271, &spec.make),
         Entry::ascii(272, &spec.model),
         Entry::long(273, &[0]),
@@ -92,11 +111,43 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         Entry::short(50713, &[2, 2]),
         Entry::short(50714, &[spec.black; 4]),
         Entry::long(50717, &[spec.white]),
-        Entry::srational(50721, &matrix),
-        Entry::short(50778, &[21]),
-        Entry::short(33421, &[2, 2]),
-        Entry::byte(33422, &spec.cfa),
     ];
+    if !spec.omit_color_matrix {
+        entries.push(Entry::srational(50721, &matrix));
+        entries.push(Entry::short(50778, &[21]));
+    }
+    if let Some((matrix2, illuminant)) = spec.color_matrix2 {
+        entries.push(Entry::srational(
+            50722,
+            &matrix2.map(|value| ((value * 10_000.0).round() as i32, 10_000_i32)),
+        ));
+        entries.push(Entry::short(50779, &[illuminant]));
+    }
+    for (slot, calibration) in spec.camera_calibration.iter().enumerate() {
+        if let Some(calibration) = calibration {
+            entries.push(Entry::srational(
+                50723 + slot as u16,
+                &calibration.map(|value| ((value * 10_000.0).round() as i32, 10_000_i32)),
+            ));
+        }
+    }
+    if let Some(balance) = spec.analog_balance {
+        entries.push(Entry::rational(
+            50727,
+            &balance.map(|value| ((value * 10_000.0).round() as u32, 10_000_u32)),
+        ));
+    }
+    entries.push(Entry::short(33421, &[2, 2]));
+    entries.push(Entry::byte(33422, &spec.cfa));
+    if let Some(orientation) = spec.orientation {
+        entries.push(Entry::short(274, &[orientation]));
+    }
+    if let Some(neutral) = spec.as_shot_neutral {
+        entries.push(Entry::rational(
+            50728,
+            &neutral.map(|value| ((value * 10_000.0).round() as u32, 10_000_u32)),
+        ));
+    }
     if let Some(modify_time) = &spec.modify_time {
         entries.push(Entry::ascii(306, modify_time));
     }
@@ -194,10 +245,14 @@ pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
         bytes.extend_from_slice(&payload);
     }
 
-    let mut file = Builder::new()
-        .suffix(".dng")
-        .tempfile()
-        .expect("temporary DNG");
+    let mut builder = Builder::new();
+    builder.suffix(".dng");
+    // Only integration tests get a target tmp directory; unit tests fall back to the system one.
+    let mut file = match option_env!("CARGO_TARGET_TMPDIR") {
+        Some(dir) => builder.tempfile_in(dir),
+        None => builder.tempfile(),
+    }
+    .expect("temporary DNG");
     file.write_all(&bytes).expect("write DNG");
     file.flush().expect("flush DNG");
     file.as_file_mut()
@@ -247,6 +302,23 @@ impl Entry {
             value: values
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        }
+    }
+
+    fn rational(tag: u16, values: &[(u32, u32)]) -> Self {
+        Self {
+            tag,
+            kind: 5,
+            count: values.len() as u32,
+            value: values
+                .iter()
+                .flat_map(|(numerator, denominator)| {
+                    numerator
+                        .to_le_bytes()
+                        .into_iter()
+                        .chain(denominator.to_le_bytes())
+                })
                 .collect(),
         }
     }

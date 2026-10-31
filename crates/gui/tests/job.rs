@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
@@ -7168,4 +7169,331 @@ fn stale_dialog_answer_is_dropped_for_saves() {
     assert!(!controller.save_all_and_quit_chosen(&[]));
     assert!(controller.pending_quit_copy().is_none());
     assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+}
+
+// ---------------------------------------------------------------------
+// Edit sessions over a RAW project: an f32 document, three DNG frames.
+// ---------------------------------------------------------------------
+
+#[path = "../../core/tests/common/raw_dng.rs"]
+mod raw_dng;
+
+const RAW_W: u32 = 37;
+const RAW_H: u32 = 23;
+
+fn raw_whole() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: RAW_W,
+        height: RAW_H,
+    }
+}
+
+/// Three DNG frames of `RAW_W` x `RAW_H`, an f32 staged composite holding
+/// samples above 65535, below 0 and inside, and a Z-Map over them.
+struct RawFiles {
+    dir: PathBuf,
+    _frames: Vec<tempfile::NamedTempFile>,
+    sources: Vec<PathBuf>,
+    composite: PathBuf,
+    zmap: PathBuf,
+    stored: Vec<f32>,
+}
+
+fn raw_files(name: &str) -> RawFiles {
+    let dir = common::tree(name);
+    let frames: Vec<_> = (0..3u32)
+        .map(|frame| {
+            let samples = (0..RAW_W * RAW_H)
+                .map(|i| {
+                    let (x, y) = (i % RAW_W, i / RAW_W);
+                    let checker = if (x / 2 + y / 2) % 2 == 0 { 0 } else { 380 };
+                    (2_700 + frame * 40 + checker) as u16
+                })
+                .collect();
+            let mut spec = raw_dng::DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+            spec.width = RAW_W;
+            spec.height = RAW_H;
+            spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
+            raw_dng::write_dng(&spec, false)
+        })
+        .collect();
+    let sources = frames.iter().map(|f| f.path().to_path_buf()).collect();
+    let stored: Vec<f32> = (0..(RAW_W * RAW_H * 3) as usize)
+        .map(|i| (i * 7919 % 120_000) as f32 * 0.9 - 20_000.0)
+        .collect();
+    let composite = dir.join("composite.tif");
+    write_float_composite(&composite, &stored);
+    let zmap = dir.join("zmap.tif");
+    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(RAW_W, RAW_H, 3).unwrap()).unwrap();
+    map.write_tile(raw_whole(), &vec![0u16; (RAW_W * RAW_H) as usize])
+        .unwrap();
+    map.finish().unwrap();
+    RawFiles {
+        dir,
+        _frames: frames,
+        sources,
+        composite,
+        zmap,
+        stored,
+    }
+}
+
+fn write_float_composite(path: &Path, samples: &[f32]) {
+    let mut writer = TiffWriter::create_f32(
+        path,
+        TiffSpec {
+            width: RAW_W,
+            height: RAW_H,
+            samples_per_pixel: 3,
+            description: Some("staged composite".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile_f32(raw_whole(), samples).unwrap();
+    writer.finish().unwrap();
+}
+
+fn open_session(
+    files: &RawFiles,
+    composite: &Path,
+    sources: &[PathBuf],
+) -> Result<job::EditState, job::EditSessionError> {
+    job::open_edit_session(
+        Some(&files.zmap),
+        composite,
+        sources,
+        Registration::default(),
+        16,
+        job::host_budget(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn raw_stroke() -> Op {
+    Op::BrushStroke {
+        source_id: 1,
+        path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
+        radius: 40.0,
+        softness: 0.5,
+    }
+}
+
+/// `region` rendered from the base under `ops` into a fresh session's
+/// resident tiles, and read back as f32.
+fn live_region(session: &mut job::EditState, region: Rect, ops: Vec<Op>) -> Vec<f32> {
+    session
+        .render_region_now(&job::RegionRender {
+            region,
+            pre: job::PreImage::Base,
+            ops,
+            ends_drag: false,
+        })
+        .expect("the region renders");
+    let mut out = vec![0f32; (region.width * region.height * 3) as usize];
+    session.tiles.overlay_into(region, &mut out);
+    out
+}
+
+fn raw_pending(files: &RawFiles, ops: Vec<Op>) -> project::PendingState {
+    project::PendingState {
+        composite: files.composite.clone(),
+        ops,
+        sources: files.sources.clone(),
+        registration: Registration::default(),
+        reference: 0,
+        description: "staged composite".to_string(),
+    }
+}
+
+fn pending_f32(state: &project::PendingState) -> Vec<f32> {
+    let image = project::CheckpointImage::prepare_pending(state).unwrap();
+    let mut out = vec![0f32; (RAW_W * RAW_H * 3) as usize];
+    image
+        .render_f32(None, raw_whole(), &mut |band, rect| {
+            let at = (rect.y * RAW_W * 3) as usize;
+            out[at..at + band.len()].copy_from_slice(band);
+            Ok(())
+        })
+        .unwrap();
+    out
+}
+
+fn bits(samples: &[f32]) -> Vec<u32> {
+    samples.iter().map(|s| s.to_bits()).collect()
+}
+
+fn cut(plane: &[f32], region: Rect) -> Vec<f32> {
+    (region.y..region.y + region.height)
+        .flat_map(|y| {
+            let at = ((y * RAW_W + region.x) * 3) as usize;
+            plane[at..at + region.width as usize * 3].to_vec()
+        })
+        .collect()
+}
+
+#[test]
+fn raw_project_live_retouch_matches_saved_and_export() {
+    use focusforge_core::project::export::{ExportOptions, MetadataOptions};
+    use focusforge_core::tile::Sample;
+
+    let files = raw_files("raw_live_retouch");
+    let whole = raw_whole();
+
+    // Unretouched: the resident samples are the stored ones, unclipped.
+    let mut session = open_session(&files, &files.composite, &files.sources).unwrap();
+    let live = live_region(&mut session, whole, Vec::new());
+    assert!(live.iter().any(|&s| s > 65_535.0) && live.iter().any(|&s| s < 0.0));
+    assert_eq!(bits(&live), bits(&files.stored), "unretouched");
+    assert_eq!(
+        bits(&live),
+        bits(&pending_f32(&raw_pending(&files, Vec::new())))
+    );
+
+    // Stroked: the resident samples are the pending state's f32 render.
+    let stroked = raw_pending(&files, vec![raw_stroke()]);
+    let expected = pending_f32(&stroked);
+    assert_ne!(
+        bits(&expected),
+        bits(&files.stored),
+        "the stroke changes it"
+    );
+    let live = live_region(&mut session, whole, vec![raw_stroke()]);
+    assert_eq!(bits(&live), bits(&expected), "stroked, whole image");
+
+    // A region that spans resident tiles renders the same samples.
+    let part = Rect {
+        x: 5,
+        y: 3,
+        width: 20,
+        height: 11,
+    };
+    let mut fresh = open_session(&files, &files.composite, &files.sources).unwrap();
+    let live_part = live_region(&mut fresh, part, vec![raw_stroke()]);
+    assert_eq!(
+        bits(&live_part),
+        bits(&cut(&expected, part)),
+        "stroked, region"
+    );
+
+    // The 16-bit TIFF export is the narrowing of the same samples.
+    let out = files.dir.join("export.tif");
+    let metadata = MetadataOptions {
+        exif: false,
+        icc: false,
+        xmp: false,
+        iptc: false,
+    };
+    project::export_pending(&stroked, &out, &ExportOptions::default(), &metadata).unwrap();
+    let exported = focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
+    let mut got = vec![0u16; live.len()];
+    exported.read_tile_into(0, whole, &mut got).unwrap();
+    let narrowed: Vec<u16> = live.iter().map(|&s| u16::narrow(s)).collect();
+    assert_eq!(got, narrowed, "16-bit export");
+}
+
+#[test]
+fn raw_staging_composite_mismatch_refused() {
+    let files = raw_files("raw_session_mismatch");
+
+    // A float composite over RAW sources opens.
+    open_session(&files, &files.composite, &files.sources)
+        .expect("a float composite over RAW sources opens");
+
+    // A 16-bit composite over RAW sources is refused, naming the file.
+    let narrow = files.dir.join("narrow.tif");
+    let mut writer = TiffWriter::create(
+        &narrow,
+        TiffSpec {
+            width: RAW_W,
+            height: RAW_H,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .unwrap();
+    writer
+        .write_tile(raw_whole(), &vec![1_000u16; (RAW_W * RAW_H * 3) as usize])
+        .unwrap();
+    writer.finish().unwrap();
+    let error = open_session(&files, &narrow, &files.sources)
+        .err()
+        .expect("a 16-bit composite over RAW sources is refused");
+    assert!(
+        matches!(&error, job::EditSessionError::SampleFormatMismatch { path, .. } if *path == narrow),
+        "{error}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains(narrow.to_str().unwrap())
+            && text.contains("holds 16-bit samples")
+            && text.contains("read as 32-bit float"),
+        "{text}"
+    );
+
+    // A float composite over TIFF sources is refused the same way.
+    let tiffs: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let path = files.dir.join(format!("frame-{i}.tif"));
+            let mut writer = TiffWriter::create(
+                &path,
+                TiffSpec {
+                    width: RAW_W,
+                    height: RAW_H,
+                    samples_per_pixel: 3,
+                    description: None,
+                },
+            )
+            .unwrap();
+            writer
+                .write_tile(raw_whole(), &vec![2_000u16; (RAW_W * RAW_H * 3) as usize])
+                .unwrap();
+            writer.finish().unwrap();
+            path
+        })
+        .collect();
+    let error = open_session(&files, &files.composite, &tiffs)
+        .err()
+        .expect("a float composite over TIFF sources is refused");
+    assert!(
+        matches!(&error, job::EditSessionError::SampleFormatMismatch { path, .. } if *path == files.composite),
+        "{error}"
+    );
+    open_session(&files, &narrow, &tiffs).expect("a 16-bit composite over TIFF sources opens");
+
+    // A missing composite fails with the open error naming it.
+    let missing = files.dir.join("missing.tif");
+    let error = open_session(&files, &missing, &files.sources)
+        .err()
+        .expect("a missing composite is refused");
+    assert!(
+        matches!(error, job::EditSessionError::Composite(_))
+            && error.to_string().contains(missing.to_str().unwrap()),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn raw_session_blends_on_the_cpu() {
+    use focusforge_gpu::blend::Blender;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let files = raw_files("raw_session_cpu_blend");
+    let shown = |blender: Option<Blender>| {
+        let mut session = open_session(&files, &files.composite, &files.sources).unwrap();
+        session.set_blender(blender);
+        live_region(&mut session, raw_whole(), vec![raw_stroke()])
+    };
+    let plain = shown(None);
+    let with_device = shown(Some(Blender::new(shared.device(), shared.queue())));
+    assert!(
+        with_device.iter().any(|&s| s > 65_535.0),
+        "samples above white survive"
+    );
+    assert_eq!(bits(&with_device), bits(&plain));
 }

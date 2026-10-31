@@ -1691,6 +1691,19 @@ fn golden_plane_files() -> (PathBuf, PathBuf) {
     )
 }
 
+/// Copies of the golden planes under `name`'s own tree: planes at other
+/// paths, with the golden bytes.
+fn copied_planes(name: &str) -> (PathBuf, PathBuf) {
+    let (composite, zmap) = golden_plane_files();
+    let dir = common::tree(name);
+    let copy = |from: &Path| {
+        let to = dir.join(from.file_name().expect("a plane file has a name"));
+        fs::copy(from, &to).expect("the plane copies");
+        to
+    };
+    (copy(&composite), copy(&zmap))
+}
+
 /// A warmup draw, then redraws covering every reuse/skip rule: an identical
 /// draw, a `dst`-only shift, a pan, a zoom, a plane switch to Z-Map and
 /// back, and a `set_planes`/`set_frame` on the unchanged draw -- asserting
@@ -1892,11 +1905,12 @@ fn display_resources_are_reused_and_unchanged_content_is_not_reread() {
         "zoom",
     );
 
-    // 5. `set_planes` on the unchanged draw invalidates the composite pane's
-    // coverage; the next draw re-reads exactly it.
+    // 5. `set_planes` with other planes on the unchanged draw invalidates the
+    // composite pane's coverage; the next draw re-reads exactly it.
+    let (other_composite, other_zmap) = copied_planes("display_resources_other_planes");
     renderer
-        .set_planes(&composite_path, Some(&zmap_path))
-        .expect("golden planes re-open");
+        .set_planes(&other_composite, Some(&other_zmap))
+        .expect("other planes open");
     let before = counters();
     renderer
         .redraw_planes(&zoomed, None, None)
@@ -2033,8 +2047,13 @@ mod preparing {
     /// A one-job request whose source width is `width` and whose stamp is
     /// `stamp`, so a completion says which submit it came from.
     pub fn job(reader: &Arc<FakeReader>, width: u32, stamp: u64) -> PaneJob {
+        job_in(Pane::Frame, reader, width, stamp)
+    }
+
+    /// [`job`] for `pane`.
+    pub fn job_in(pane: Pane, reader: &Arc<FakeReader>, width: u32, stamp: u64) -> PaneJob {
         PaneJob {
-            pane: Pane::Frame,
+            pane,
             draw: PaneDraw {
                 src: (0, 0, width, 8),
                 dst: (0.0, 0.0, width as f32, 8.0),
@@ -2452,6 +2471,34 @@ fn preparer_dropped_during_a_slow_read_wakes_nobody() {
 }
 
 #[test]
+fn a_plane_read_is_delivered_while_a_frame_read_is_blocked() {
+    use focusforge_gui::canvas::Pane;
+    use preparing::*;
+    let (frame, release_frame) = FakeReader::new(1);
+    let (plane, release_plane) = FakeReader::new(1);
+    release_plane.send(()).unwrap();
+    let preparer = focusforge_gui::canvas::Preparer::new(|| {});
+
+    preparer.submit(vec![
+        job_in(Pane::Frame, &frame, 8, 1),
+        job_in(Pane::Composite, &plane, 8, 2),
+    ]);
+    let done = take_stamp(&preparer, 2);
+    assert_eq!(
+        frame.finished(),
+        0,
+        "the composite arrives while the frame read is still blocked"
+    );
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].job.pane, Pane::Composite);
+
+    release_frame.send(()).unwrap();
+    let late = take_stamp(&preparer, 1);
+    assert_eq!(late.len(), 1, "the frame lands on its own once released");
+    assert_eq!(late[0].job.pane, Pane::Frame);
+}
+
+#[test]
 fn stale_stamps_are_refused_in_any_arrival_order() {
     use focusforge_gui::canvas::StampFloor;
 
@@ -2692,8 +2739,9 @@ fn stale_results_render_nothing() {
     let before_planes = renderer
         .request_planes(&draw(7), None, None)
         .expect("plane job");
+    let (other_composite, other_zmap) = copied_planes("stale_plane_jobs_other_planes");
     renderer
-        .set_planes(&composite_path, Some(&zmap_path))
+        .set_planes(&other_composite, Some(&other_zmap))
         .unwrap();
     refused(&mut renderer, &before_planes, "set_planes");
     let before_clear = renderer
@@ -2964,6 +3012,54 @@ fn display_ignores_the_zmap() {
     }
 }
 
+/// Re-setting the planes already open keeps a composite job issued before it
+/// valid; planes rewritten under the same paths refuse it.
+#[test]
+fn set_planes_on_the_open_planes_keeps_an_in_flight_job() {
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use std::io::Write;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let (composite, zmap) = copied_planes("set_planes_on_the_open_planes");
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    let job = composite_job(&mut renderer, (&composite, Some(&zmap)), None, None, false);
+
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
+    assert!(
+        renderer
+            .publish_edited(&job, &job_samples(&job), &[], None)
+            .is_some(),
+        "the same planes leave the in-flight composite valid"
+    );
+
+    let wider = focusforge_gui::viewport::PaneDraw {
+        src: (0, 0, 200, 200),
+        dst: (0.0, 0.0, 200.0, 200.0),
+        crop: (0.0, 0.0, 200.0, 200.0),
+        pixelated: false,
+        step: NonZeroU32::MIN,
+    };
+    let job = renderer
+        .request_planes(&wider, None, None)
+        .expect("a composite job issues");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&composite)
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    renderer.set_planes(&composite, Some(&zmap)).unwrap();
+    assert!(
+        renderer
+            .publish_edited(&job, &job_samples(&job), &[], None)
+            .is_none(),
+        "a composite rewritten in place refuses the job issued before it"
+    );
+}
+
 /// The index reader rides a composite job iff the overlay is on: an edit
 /// generation, the exact view and the backdrop alone never attach it.
 #[test]
@@ -3099,8 +3195,9 @@ fn backdrop_from_a_previous_content_is_refused() {
     let old = renderer
         .request_plane_backdrop(&plane_back, None, None)
         .expect("job");
+    let (other_composite, other_zmap) = copied_planes("stale_backdrop_jobs_other_planes");
     renderer
-        .set_planes(&composite_path, Some(&zmap_path))
+        .set_planes(&other_composite, Some(&other_zmap))
         .unwrap();
     refused(&mut renderer, &old, "set_planes");
     let old = renderer
@@ -3712,4 +3809,139 @@ fn scale_factor_change_without_resize_reaches_the_next_draw() {
     let after = controller.lock().unwrap().frame_draw().unwrap();
     assert_eq!(after.step.get(), (before.step.get() / 2).max(1));
     assert_eq!(after.src, before.src);
+}
+
+const RAW_W: u32 = 37;
+const RAW_H: u32 = 23;
+
+/// Float values around both ends of the 16-bit range and its rounding points.
+const RAW_VALUES: [f32; 13] = [
+    -9000.5, -0.25, 0.0, 0.49, 0.5, 1.5, 123.4, 40_000.5, 65_534.5, 65_535.0, 65_535.5, 80_000.0,
+    1.0e9,
+];
+
+fn raw_samples(seed: usize) -> Vec<f32> {
+    (0..(RAW_W * RAW_H * 3) as usize)
+        .map(|i| RAW_VALUES[(i * seed + seed) % RAW_VALUES.len()])
+        .collect()
+}
+
+fn raw_whole() -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: RAW_W,
+        height: RAW_H,
+    }
+}
+
+fn write_float_composite(path: &Path, samples: &[f32]) {
+    let mut writer = TiffWriter::create_f32(
+        path,
+        TiffSpec {
+            width: RAW_W,
+            height: RAW_H,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .unwrap();
+    writer.write_tile_f32(raw_whole(), samples).unwrap();
+    writer.finish().unwrap();
+}
+
+/// `stored` (the whole plane, three samples a pixel) clipped to 16 bits and
+/// decimated at `step`.
+fn clipped_at(stored: &[f32], step: u32) -> Vec<u16> {
+    use focusforge_core::tile::Sample;
+    let mut out = Vec::new();
+    for y in (0..RAW_H).step_by(step as usize) {
+        for x in (0..RAW_W).step_by(step as usize) {
+            let at = ((y * RAW_W + x) * 3) as usize;
+            out.extend(stored[at..at + 3].iter().map(|&v| u16::narrow(v)));
+        }
+    }
+    out
+}
+
+#[test]
+fn raw_project_display_clips_once() {
+    use focusforge_core::tile::Sample;
+    use focusforge_gui::canvas::PaneReader;
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::viewport::PaneDraw;
+
+    let dir = common::tree("raw_project_display_clips_once");
+    let path = dir.join("composite.tif");
+    let stored = raw_samples(7);
+    write_float_composite(&path, &stored);
+
+    // Unedited texels: the composite pane's read narrows the stored floats.
+    let stack = TiffStack::open_staged(&path).expect("a float staged composite opens");
+    for step in [1u32, 2] {
+        let expected = clipped_at(&stored, step);
+        let mut shown = vec![0u16; expected.len()];
+        stack
+            .read_step_into(raw_whole(), NonZeroU32::new(step).unwrap(), &mut shown)
+            .unwrap();
+        assert_eq!(shown, expected, "step {step}");
+    }
+
+    // Edited texels: f32 resident tiles narrow the same way over the composite.
+    let region = Rect {
+        x: 5,
+        y: 3,
+        width: 20,
+        height: 11,
+    };
+    let edited = raw_samples(11);
+    let installed: Vec<f32> = (region.y..region.y + region.height)
+        .flat_map(|y| {
+            let start = ((y * RAW_W + region.x) * 3) as usize;
+            edited[start..start + region.width as usize * 3].to_vec()
+        })
+        .collect();
+    let mut tiles = ResidentTiles::new(16, RAW_W, RAW_H, 3);
+    tiles.install(region, &installed);
+    for step in [1u32, 2] {
+        let mut shown = clipped_at(&stored, step);
+        let nz = NonZeroU32::new(step).unwrap();
+        overlay_edited(&mut shown, raw_whole(), nz, 3, &tiles);
+        let out_w = RAW_W.div_ceil(step);
+        for (t, pixel) in shown.chunks_exact(3).enumerate() {
+            let (x, y) = ((t as u32 % out_w) * step, (t as u32 / out_w) * step);
+            let plane = if contains(region, x, y) {
+                &edited
+            } else {
+                &stored
+            };
+            let at = ((y * RAW_W + x) * 3) as usize;
+            let expected: Vec<u16> = plane[at..at + 3].iter().map(|&v| u16::narrow(v)).collect();
+            assert_eq!(pixel, expected.as_slice(), "step {step} ({x}, {y})");
+        }
+    }
+
+    // The renderer opens the float file and hands the same narrowed samples
+    // to the upload.
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&path, None).unwrap();
+    let draw = PaneDraw {
+        src: (0, 0, RAW_W, RAW_H),
+        dst: (0.0, 0.0, RAW_W as f32, RAW_H as f32),
+        crop: (0.0, 0.0, RAW_W as f32, RAW_H as f32),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+    let job = renderer
+        .request_planes(&draw, None, None)
+        .expect("the float composite needs a read");
+    let mut shown = vec![0u16; (RAW_W * RAW_H * 3) as usize];
+    job.reader
+        .read_step_into(raw_whole(), job.draw.step, &mut shown)
+        .expect("the renderer's reader reads the float composite");
+    assert_eq!(shown, clipped_at(&stored, 1));
 }

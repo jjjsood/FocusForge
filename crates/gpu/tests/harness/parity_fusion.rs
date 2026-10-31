@@ -23,13 +23,7 @@ use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::pack::{packed_len, unpack_samples};
 use focusforge_gpu::transfer::{create_storage_buffer, download_buffer, download_f32, upload_f32};
 
-use crate::common::{open_stack, worst_delta};
-
-/// `128 * f32::EPSILON`: the near-tie bound -- the separable score is 68
-/// `f32` adds per pixel at `radius = 8`, so two independently accumulated
-/// pipelines can differ by at most ~68 ulps of the score, rounded up to a
-/// power of two.
-const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
+use crate::common::{NEAR_TIE_REL, assert_matches_cpu_outside_near_ties, open_stack, worst_delta};
 
 fn read_tile(stack: &TiffStack, frame: usize, rect: Rect, spp: u32) -> Tile {
     let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
@@ -42,6 +36,11 @@ fn read_tile(stack: &TiffStack, frame: usize, rect: Rect, spp: u32) -> Tile {
         samples_per_pixel: spp,
         samples,
     }
+}
+
+/// The sample slices of `tiles`, one per frame.
+fn tile_samples(tiles: &[Tile]) -> Vec<&[u16]> {
+    tiles.iter().map(|t| t.samples.as_slice()).collect()
 }
 
 fn read_all_frames(stack: &TiffStack, rect: Rect, spp: u32) -> Vec<Tile> {
@@ -478,63 +477,6 @@ fn read_in_memory_tiles(reader: &InMemoryFrames, count: usize, rect: Rect, spp: 
         .collect()
 }
 
-/// The unmasked parity contract: the Z-Map equals the CPU's except at proven
-/// near-ties between the two best frames, and every sample outside those
-/// pixels is within 1 LSB.
-fn assert_matches_cpu_outside_near_ties(
-    label: &str,
-    cpu: &TileOutput,
-    gpu: &TileOutput,
-    tiles: &[Tile],
-    spp: u32,
-    levels: u32,
-) {
-    let rect = tiles[0].rect;
-    // Each frame's level-0 score plane, built once for every differing pixel.
-    let radius = score_radius(levels, 0);
-    let scores: Vec<Vec<f32>> = tiles
-        .iter()
-        .map(|tile| {
-            let pyr =
-                pyramid::build(&tile.samples, rect.width, rect.height, spp, levels).expect("build");
-            score_plane(&pyr.levels()[0], radius)
-        })
-        .collect();
-    let mut near_ties = std::collections::HashSet::new();
-    for (pixel, (&c, &g)) in cpu.zmap.iter().zip(&gpu.zmap).enumerate() {
-        if c == g {
-            continue;
-        }
-        let mut at: Vec<f32> = scores.iter().map(|plane| plane[pixel]).collect();
-        at.sort_by(|a, b| b.partial_cmp(a).expect("scores are always finite"));
-        assert!(
-            at[0] - at[1] <= NEAR_TIE_REL * at[0],
-            "pixel {pixel} differs (gpu={g}, cpu={c}) but is not a proven near-tie: {at:?}"
-        );
-        near_ties.insert(pixel);
-    }
-    println!(
-        "{label} z-map parity: {} differing index(es), all proven near-ties",
-        near_ties.len()
-    );
-
-    // A near-tie picks another source, so its own samples may differ by more
-    // than a rounding step; every other sample stays within 1 LSB.
-    let worst = cpu
-        .tile
-        .samples
-        .chunks_exact(spp as usize)
-        .zip(gpu.tile.samples.chunks_exact(spp as usize))
-        .enumerate()
-        .filter(|(pixel, _)| !near_ties.contains(pixel))
-        .flat_map(|(_, (cpu, gpu))| cpu.iter().zip(gpu))
-        .map(|(&c, &g)| (i32::from(c) - i32::from(g)).abs())
-        .max()
-        .expect("a non-empty composite");
-    println!("{label} composite parity: worst |delta|={worst} outside near-tie pixels");
-    assert!(worst <= 1, "composite parity exceeded 1 LSB: worst={worst}");
-}
-
 /// Every sample of `out` equals its channel's constant.
 fn assert_constant_output(out: &TileOutput, triple: [u16; 3], context: &str) {
     for (i, &sample) in out.tile.samples.iter().enumerate() {
@@ -628,7 +570,15 @@ fn residual_large_n_matches_cpu() {
     let gpu = backend
         .fuse_tile(&reader, sources.len(), rect, spp, levels)
         .expect("gpu fuse_tile");
-    assert_matches_cpu_outside_near_ties("large-n", &cpu, &gpu, &tiles, spp, levels);
+    assert_matches_cpu_outside_near_ties(
+        "large-n",
+        &cpu,
+        &gpu,
+        &tile_samples(&tiles),
+        rect,
+        spp,
+        levels,
+    );
 }
 
 #[test]
@@ -660,7 +610,15 @@ fn tile_at_the_dispatch_limit_matches_cpu() {
         .fuse_tile(&reader, 2, rect, spp, levels)
         .expect("gpu fuse_tile at the dispatch limit");
 
-    assert_matches_cpu_outside_near_ties("at-limit", &cpu, &gpu, &tiles, spp, levels);
+    assert_matches_cpu_outside_near_ties(
+        "at-limit",
+        &cpu,
+        &gpu,
+        &tile_samples(&tiles),
+        rect,
+        spp,
+        levels,
+    );
 }
 
 #[test]

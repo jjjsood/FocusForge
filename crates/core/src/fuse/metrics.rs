@@ -29,11 +29,17 @@
 //!   `width`/`height` not a multiple of 8 drops the remainder rather than
 //!   padding it.
 
+use crate::tile::Sample;
+
 /// One pixel's luma: the arithmetic mean of its `spp` samples, in `f64`.
 /// `pixel` must be at least `spp` samples long; only the first `spp` are
 /// read, so a caller may pass a full-row slice starting at the pixel.
-pub fn luma(pixel: &[u16], spp: u32) -> f64 {
-    let sum: f64 = pixel.iter().take(spp as usize).map(|&s| f64::from(s)).sum();
+pub fn luma<S: Sample>(pixel: &[S], spp: u32) -> f64 {
+    let sum: f64 = pixel
+        .iter()
+        .take(spp as usize)
+        .map(|&s| f64::from(s.widen()))
+        .sum();
     sum / f64::from(spp)
 }
 

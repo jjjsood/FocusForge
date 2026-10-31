@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use super::super::error::{Refusal, TiffError};
 use super::super::metadata::{SourceKind, SourceMetadata, TagEntry};
 use crate::io::FrameDesc;
+use crate::tile::SampleFormat;
 
 // --- tags ---------------------------------------------------------------
 
@@ -97,6 +98,15 @@ impl ByteOrder {
         match self {
             ByteOrder::Little => u16::from_le_bytes(bytes),
             ByteOrder::Big => u16::from_be_bytes(bytes),
+        }
+    }
+
+    /// Decode one `f32` stored in this byte order.
+    #[inline(always)]
+    pub(crate) fn f32_from(self, bytes: [u8; 4]) -> f32 {
+        match self {
+            ByteOrder::Little => f32::from_le_bytes(bytes),
+            ByteOrder::Big => f32::from_be_bytes(bytes),
         }
     }
 
@@ -527,6 +537,26 @@ impl TiffHeader {
                 refusal: refusal.clone(),
             }),
         }
+    }
+
+    /// The sample type of a staged composite: this header's, when it is
+    /// uncompressed, chunky, strip-based and holds either 16-bit unsigned or
+    /// 32-bit float samples in every channel. Any other file is refused as
+    /// [`Self::require_fast_path`] refuses it.
+    pub fn require_staged_path(&self) -> Result<SampleFormat, TiffError> {
+        let all = |bits: u16, format: u16| {
+            !self.bits_per_sample.is_empty()
+                && self.bits_per_sample.iter().all(|&b| b == bits)
+                && self.sample_format.iter().all(|&f| f == format)
+        };
+        let layout_ok = !matches!(
+            self.refusal,
+            Some(Refusal::Tiled | Refusal::Compressed(_) | Refusal::Planar(_))
+        );
+        if layout_ok && all(32, 3) {
+            return Ok(SampleFormat::F32);
+        }
+        self.require_fast_path().map(|()| SampleFormat::U16)
     }
 
     /// Header-only probe: parse `path`'s first IFD without requiring the

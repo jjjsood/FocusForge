@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use focusforge_core::params::Provenance;
+use focusforge_core::tile::SampleFormat;
 
 use crate::limits::LimitShortfall;
 use crate::pack::packed_len;
@@ -40,6 +41,15 @@ fn plane(w: u64, h: u64, spp: u64) -> u64 {
 /// samples, exactly [`crate::pack::packed_len`]'s own byte length.
 fn packed(w: u64, h: u64, spp: u64) -> u64 {
     packed_len((w * h * spp) as usize) as u64
+}
+
+/// One transferred frame buffer (upload or warp destination) at `format`:
+/// packed `u16`s, or a plane of `f32`s.
+fn transfer(w: u64, h: u64, spp: u64, format: SampleFormat) -> u64 {
+    match format {
+        SampleFormat::U16 => packed(w, h, spp),
+        SampleFormat::F32 => plane(w, h, spp),
+    }
 }
 
 /// `(w_k, h_k)` for `k = 0..=levels`: `dims[0]` is the tile's own
@@ -63,15 +73,23 @@ fn level_dims(width: u32, height: u32, levels: u32) -> Vec<(u64, u64)> {
 /// single frame's contribution: the warp destination / identity upload, the
 /// warped-only coord array and re-uploaded source, the `f32` base plane, and
 /// every reduce and per-level (expand/laplacian/score) intermediate the
-/// pyramid builds while folding this one frame in.
-fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool) -> u64 {
+/// pyramid builds while folding this one frame in. On [`SampleFormat::F32`]
+/// the upload or warp destination is the base plane itself.
+fn per_frame_bytes(
+    width: u32,
+    height: u32,
+    spp: u32,
+    levels: u32,
+    warped: bool,
+    format: SampleFormat,
+) -> u64 {
     let dims = level_dims(width, height, levels);
     let spp64 = u64::from(spp);
     let (w0, h0) = dims[0];
 
     // Warp destination buffer / identity-transform upload, and the source
     // `crate::transfer::upload_tile` re-uploads when warped.
-    let mut total = packed(w0, h0, spp64);
+    let mut total = transfer(w0, h0, spp64, format);
 
     if warped {
         // Coord array, 24 bytes/destination pixel.
@@ -79,13 +97,15 @@ fn per_frame_bytes(width: u32, height: u32, spp: u32, levels: u32, warped: bool)
         // Re-uploaded source; a model, not a bound, for a large transform
         // whose `Transform::source_footprint` read rect exceeds the
         // destination rect.
-        total += packed(w0, h0, spp64);
+        total += transfer(w0, h0, spp64, format);
         // Eligibility mask (one `u32` per pixel) per level and for the residual.
         total += dims.iter().map(|&(w, h)| 4 * w * h).sum::<u64>();
     }
 
     // The `f32` base plane, via `plane_from_packed`.
-    total += plane(w0, h0, spp64);
+    if format == SampleFormat::U16 {
+        total += plane(w0, h0, spp64);
+    }
 
     // Reduce: `k = 1..=levels`, `plane(w_k,h_{k-1}) + plane(w_k,h_k)`.
     for k in 1..=(levels as usize) {
@@ -162,8 +182,15 @@ fn once_per_tile_bytes(width: u32, height: u32, spp: u32, levels: u32) -> u64 {
 /// sum, and the warped-source term is a model, not a bound,
 /// for the reason named there. Every other term dominates both by orders of
 /// magnitude.
-pub fn device_bytes_per_tile(width: u32, height: u32, spp: u32, levels: u32, warped: bool) -> u64 {
-    let per_frame = per_frame_bytes(width, height, spp, levels, warped);
+pub fn device_bytes_per_tile(
+    width: u32,
+    height: u32,
+    spp: u32,
+    levels: u32,
+    warped: bool,
+    format: SampleFormat,
+) -> u64 {
+    let per_frame = per_frame_bytes(width, height, spp, levels, warped, format);
     let once = once_per_tile_bytes(width, height, spp, levels);
     per_frame + once
 }
@@ -647,13 +674,13 @@ mod tests {
     fn device_bytes_per_tile_at_fixture_scale() {
         // 512x512, 3 spp, 5 levels, warped -- the geometry `budget_gpu.rs`'s
         // serialization and allocator tests drive.
-        let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
+        let bytes = device_bytes_per_tile(512, 512, 3, 5, true, SampleFormat::U16);
         assert_eq!(bytes, 53_101_568);
     }
 
     #[test]
     fn fixture_scale_in_flight_is_an_exact_count_at_least_two() {
-        let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
+        let bytes = device_bytes_per_tile(512, 512, 3, 5, true, SampleFormat::U16);
         let in_flight = tiles_in_flight_for_budget(bytes, DEFAULT_MAX_DEVICE_BYTES_IN_FLIGHT, 32);
         assert_eq!(in_flight, 20);
         assert!(
@@ -668,7 +695,7 @@ mod tests {
 
     #[test]
     fn device_bytes_per_tile_is_about_twice_the_measured_peak() {
-        let bytes = device_bytes_per_tile(512, 512, 3, 5, true);
+        let bytes = device_bytes_per_tile(512, 512, 3, 5, true, SampleFormat::U16);
         let tenths = bytes * 10 / MEASURED_TILE_PEAK_BYTES;
         assert!(
             (18..=22).contains(&tenths),
@@ -678,9 +705,48 @@ mod tests {
 
     #[test]
     fn device_bytes_per_tile_scales_with_the_rect() {
-        assert_eq!(device_bytes_per_tile(704, 704, 3, 5, true), 100_395_152);
-        assert_eq!(device_bytes_per_tile(300, 187, 3, 5, true), 11_384_244);
-        assert_eq!(device_bytes_per_tile(512, 512, 3, 5, false), 43_839_488);
+        assert_eq!(
+            device_bytes_per_tile(704, 704, 3, 5, true, SampleFormat::U16),
+            100_395_152
+        );
+        assert_eq!(
+            device_bytes_per_tile(300, 187, 3, 5, true, SampleFormat::U16),
+            11_384_244
+        );
+        assert_eq!(
+            device_bytes_per_tile(512, 512, 3, 5, false, SampleFormat::U16),
+            43_839_488
+        );
+    }
+
+    #[test]
+    fn f32_tile_bytes_count_four_bytes_per_transfer_sample() {
+        // 301x187x3 is an odd sample count, so the packed form rounds up.
+        for (w, h) in [(512u32, 512u32), (301, 187)] {
+            let samples = u64::from(w) * u64::from(h) * 3;
+            let plane = 4 * samples;
+            let packed = packed_len(samples as usize) as u64;
+            let u16_warped = device_bytes_per_tile(w, h, 3, 5, true, SampleFormat::U16);
+            let f32_warped = device_bytes_per_tile(w, h, 3, 5, true, SampleFormat::F32);
+            // Destination and re-uploaded source are `plane`s; the base plane is the destination.
+            assert_eq!(
+                f32_warped + 2 * packed,
+                u16_warped + plane,
+                "{w}x{h} warped"
+            );
+            let u16_identity = device_bytes_per_tile(w, h, 3, 5, false, SampleFormat::U16);
+            let f32_identity = device_bytes_per_tile(w, h, 3, 5, false, SampleFormat::F32);
+            assert_eq!(f32_identity + packed, u16_identity, "{w}x{h} identity");
+        }
+        // The `f32` tile costs no more than the `u16` one at the fixture geometry.
+        assert_eq!(
+            device_bytes_per_tile(512, 512, 3, 5, true, SampleFormat::F32),
+            53_101_568
+        );
+        assert_eq!(
+            device_bytes_per_tile(512, 512, 3, 5, false, SampleFormat::F32),
+            43_839_488 - 1_572_864
+        );
     }
 
     #[test]
@@ -716,7 +782,8 @@ mod tests {
         // The rect `pipeline::run` asks about; a warped run costs more than
         // an unwarped one, so the warped figure is the one the cap covers.
         let asked = TILE_SIZE.min(512);
-        let asked_bytes = device_bytes_per_tile(asked, asked, 3, LEVELS as u32, true);
+        let asked_bytes =
+            device_bytes_per_tile(asked, asked, 3, LEVELS as u32, true, SampleFormat::U16);
         assert!(asked_bytes <= CAP, "{asked_bytes} B above the cap");
 
         // The cheapest planned read rect is an unwarped one; two of them
@@ -726,7 +793,14 @@ mod tests {
             .iter()
             .map(|t| {
                 let read = t.read();
-                device_bytes_per_tile(read.width, read.height, 3, LEVELS as u32, false)
+                device_bytes_per_tile(
+                    read.width,
+                    read.height,
+                    3,
+                    LEVELS as u32,
+                    false,
+                    SampleFormat::U16,
+                )
             })
             .min()
             .expect("the plan has tiles");

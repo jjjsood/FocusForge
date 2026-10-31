@@ -174,6 +174,7 @@
 //! at two pyramids rather than 61.
 
 use crate::fuse::PyramidError;
+use crate::tile::Sample;
 
 /// The binomial 5-tap Gaussian kernel `[1,4,6,4,1]/16`, applied identically
 /// on both axes of [`reduce`]. Every coefficient is dyadic and therefore
@@ -227,6 +228,17 @@ impl Plane {
         height: u32,
         samples_per_pixel: u32,
     ) -> Result<Self, PyramidError> {
+        Self::from_samples(samples, width, height, samples_per_pixel)
+    }
+
+    /// [`Self::from_u16`] over samples of any [`Sample`] type; `f32` samples
+    /// keep their value above 65535 and below 0.
+    pub fn from_samples<S: Sample>(
+        samples: &[S],
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+    ) -> Result<Self, PyramidError> {
         if width == 0 || height == 0 {
             return Err(PyramidError::EmptyExtent { width, height });
         }
@@ -240,7 +252,7 @@ impl Plane {
                 got: samples.len(),
             });
         }
-        let data = samples.iter().map(|&s| f32::from(s)).collect();
+        let data = samples.iter().map(|&s| s.widen()).collect();
         Ok(Plane {
             width,
             height,
@@ -261,7 +273,7 @@ impl Plane {
             });
         }
         for (o, &v) in out.iter_mut().zip(self.data.iter()) {
-            *o = (v.clamp(0.0, 65535.0) + 0.5).floor() as u16;
+            *o = u16::narrow(v);
         }
         Ok(())
     }
@@ -607,19 +619,19 @@ pub fn build_from_plane(base: Plane, levels: u32) -> Result<Pyramid, PyramidErro
     })
 }
 
-/// Builds a [`Pyramid`] over `width x height` `u16` samples (interleaved,
-/// `samples_per_pixel` channels). Synthetic test buffers and a real
-/// `crate::tile::Tile::samples` slice are both callable with no
-/// conversion -- this takes `&[u16] + dims + spp` rather than a `&Tile` on
+/// Builds a [`Pyramid`] over `width x height` samples of any [`Sample`] type
+/// (interleaved, `samples_per_pixel` channels). Synthetic test buffers and a
+/// real `crate::tile::Tile::samples` slice are both callable with no
+/// conversion -- this takes `&[S] + dims + spp` rather than a `&Tile` on
 /// purpose.
-pub fn build(
-    samples: &[u16],
+pub fn build<S: Sample>(
+    samples: &[S],
     width: u32,
     height: u32,
     samples_per_pixel: u32,
     levels: u32,
 ) -> Result<Pyramid, PyramidError> {
-    let base = Plane::from_u16(samples, width, height, samples_per_pixel)?;
+    let base = Plane::from_samples(samples, width, height, samples_per_pixel)?;
     build_from_plane(base, levels)
 }
 

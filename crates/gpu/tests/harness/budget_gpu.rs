@@ -19,7 +19,9 @@ use focusforge_core::align::Transform;
 use focusforge_core::gpu::TileBackend;
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::StackContext;
-use focusforge_core::tile::{NoopPreprocess, Rect, TileConsumer, TileJob, TileScheduler};
+use focusforge_core::tile::{
+    NoopPreprocess, Rect, SampleFormat, TileConsumer, TileJob, TileScheduler,
+};
 use focusforge_gpu::budget::device_bytes_per_tile;
 use focusforge_gpu::device::SharedDevice;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
@@ -129,7 +131,7 @@ fn tiny_budget_serializes_tiles_and_keeps_the_result() {
     let tiny_result = run_plan(&tiny_backend, "tiny");
 
     // The fixture-scale per-tile byte cost (512x512x3, warped).
-    let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true);
+    let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true, SampleFormat::U16);
     assert_eq!(tiny_backend.budget().peak_in_flight(), 1);
     assert_eq!(tiny_backend.budget().limit_for(bytes), 1);
     assert_eq!(
@@ -147,17 +149,17 @@ fn a_tile_above_the_device_budget_reports_a_shortfall() {
         return;
     }
     let transforms = non_identity_transforms(2);
-    let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true);
+    let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true, SampleFormat::U16);
 
     let at_budget = GpuBackend::with_max_device_bytes(bytes).expect("gpu backend");
     assert_eq!(
-        at_budget.tile_budget_shortfall(512, 512, 3, LEVELS, &transforms),
+        at_budget.tile_budget_shortfall(512, 512, 3, LEVELS, &transforms, SampleFormat::U16),
         None
     );
 
     let below = GpuBackend::with_max_device_bytes(bytes - 1).expect("gpu backend");
     let message = below
-        .tile_budget_shortfall(512, 512, 3, LEVELS, &transforms)
+        .tile_budget_shortfall(512, 512, 3, LEVELS, &transforms, SampleFormat::U16)
         .expect("a budget one byte short is a shortfall");
     assert!(message.contains(&format!("needs {bytes} B")), "{message}");
     assert!(message.contains("CPU path"), "{message}");
@@ -165,7 +167,7 @@ fn a_tile_above_the_device_budget_reports_a_shortfall() {
     // Identity transforms cost less than warped ones.
     let identity = vec![Transform::identity(); 2];
     assert_eq!(
-        below.tile_budget_shortfall(512, 512, 3, LEVELS, &identity),
+        below.tile_budget_shortfall(512, 512, 3, LEVELS, &identity, SampleFormat::U16),
         None
     );
 }
@@ -220,7 +222,7 @@ fn allocator_report_matches_the_prediction() {
         width,
         height,
     };
-    let predicted = device_bytes_per_tile(width, height, spp, LEVELS, true);
+    let predicted = device_bytes_per_tile(width, height, spp, LEVELS, true, SampleFormat::U16);
 
     let (sample, output) = sample_allocator(shared, || {
         backend
@@ -269,16 +271,16 @@ impl TileReader for CyclingReader<'_> {
 
 /// The device allocator's total before a run, its highest value seen while the
 /// run executed, and the run's wall time.
-struct AllocatorSample {
-    baseline: u64,
-    peak: u64,
-    wall: Duration,
+pub(crate) struct AllocatorSample {
+    pub(crate) baseline: u64,
+    pub(crate) peak: u64,
+    pub(crate) wall: Duration,
 }
 
 /// Runs `run` on this thread while a background thread polls the allocator
 /// report, so a mid-run peak is not missed between the last dispatch and the
 /// tail readback. The sample is `None` when the backend has no allocator report.
-fn sample_allocator<T>(
+pub(crate) fn sample_allocator<T>(
     shared: &'static SharedDevice,
     run: impl FnOnce() -> T,
 ) -> (Option<AllocatorSample>, T) {
@@ -341,7 +343,7 @@ fn device_peak_is_flat_in_frame_count() {
         height,
     };
 
-    let predicted = device_bytes_per_tile(width, height, spp, LEVELS, true);
+    let predicted = device_bytes_per_tile(width, height, spp, LEVELS, true, SampleFormat::U16);
     let mut deltas = Vec::new();
     for frame_count in [8, 32, 128] {
         let transforms = non_identity_transforms(frame_count);

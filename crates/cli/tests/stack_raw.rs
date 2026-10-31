@@ -16,6 +16,24 @@ use focusforge_core::algorithm::TileReader;
 use focusforge_core::io::{RawStack, Rect, TiffStack};
 use raw_dng::{DngSpec, write_dng};
 
+/// A little-endian classic TIFF with its `DateTime` value (tag 306, the export
+/// time) zeroed, so two exports made a second apart compare equal.
+fn without_date_time(mut tiff: Vec<u8>) -> Vec<u8> {
+    let u16_at = |b: &[u8], at: usize| u16::from_le_bytes(b[at..at + 2].try_into().expect("u16"));
+    let u32_at =
+        |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().expect("u32")) as usize;
+    let ifd = u32_at(&tiff, 4);
+    for entry in 0..usize::from(u16_at(&tiff, ifd)) {
+        let at = ifd + 2 + entry * 12;
+        if u16_at(&tiff, at) == 306 {
+            let (count, value) = (u32_at(&tiff, at + 4), u32_at(&tiff, at + 8));
+            assert!(count > 4, "DateTime is stored out of line");
+            tiff[value..value + count].fill(0);
+        }
+    }
+    tiff
+}
+
 fn run(dir: &std::path::Path, args: &[String]) -> std::process::Output {
     common::cli_bin("stack_raw")
         .current_dir(dir)
@@ -372,8 +390,8 @@ fn raw_stack_resumes_and_hits_stage_cache() {
         );
     }
     assert_eq!(
-        std::fs::read(reference_tiff).expect("reference TIFF"),
-        std::fs::read(resumed_tiff).expect("resumed TIFF")
+        without_date_time(std::fs::read(reference_tiff).expect("reference TIFF")),
+        without_date_time(std::fs::read(resumed_tiff).expect("resumed TIFF"))
     );
 
     let cache_a = cwd.join("cache-a");

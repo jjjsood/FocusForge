@@ -31,13 +31,15 @@
 //! workers in the gate's own `Condvar`, not by never having been spawned.
 //!
 //! ```text
-//! bytes_per_tile = min(tile_size, extent)^2 * (samples_per_pixel * 2 + 1 + working_bytes_per_pixel)
+//! bytes_per_tile = min(tile_size, extent)^2
+//!                  * (samples_per_pixel * sample_bytes + 1 + working_bytes_per_pixel)
 //!                  + reader scratch
 //! in_flight_limit = clamp(budget_bytes / bytes_per_tile, 1, pool_threads)
 //! pool_threads = available_parallelism()  -- independent of budget_bytes
 //! ```
 //!
-//! The terms are one `u16` frame tile, one coverage byte per pixel, the
+//! The terms are one frame tile at the reader's sample width (`sample_bytes`, 2
+//! for `u16`, 4 for `f32`), one coverage byte per pixel, the
 //! method's live heap per pixel
 //! ([`TileSchedulerOptions::working_bytes_per_pixel`]) and the reader's
 //! per-read allocation. The frame count enters nowhere: 8 and 600 frames
@@ -295,10 +297,11 @@ fn bytes_per_tile(
     width: u32,
     height: u32,
     samples_per_pixel: u32,
+    sample_bytes: u64,
     working_bytes_per_pixel: u64,
 ) -> u64 {
     let pixels = width as u64 * height as u64;
-    pixels * (samples_per_pixel as u64 * 2 + 1 + working_bytes_per_pixel)
+    pixels * (samples_per_pixel as u64 * sample_bytes + 1 + working_bytes_per_pixel)
 }
 
 /// The pure arithmetic behind the budget: how many tiles can be live at
@@ -367,6 +370,7 @@ impl<'a> TileScheduler<'a> {
             read_width,
             read_height,
             samples_per_pixel,
+            reader.sample_format().bytes(),
             options.working_bytes_per_pixel,
         ) + reader.read_scratch_bytes(read_width, read_height);
 
@@ -680,17 +684,17 @@ mod tests {
     fn budget_arithmetic_at_the_reference_scale() {
         // 512x512 read rects, 3 samples/pixel, u16, plus one mask byte per
         // pixel: 7 B/px for the frame tile, whatever the frame count.
-        let bytes = bytes_per_tile(512, 512, 3, 0);
+        let bytes = bytes_per_tile(512, 512, 3, 2, 0);
         assert_eq!(bytes, 1_835_008);
         // A method holding 70 B/px more floors a 1 GiB budget to 53 tiles.
-        let in_flight = in_flight_for_budget(bytes_per_tile(512, 512, 3, 70), 1u64 << 30, 64);
+        let in_flight = in_flight_for_budget(bytes_per_tile(512, 512, 3, 2, 70), 1u64 << 30, 64);
         assert_eq!(in_flight, 53);
         assert_eq!(in_flight_for_budget(bytes, 1u64 << 30, 32), 32);
     }
 
     #[test]
     fn budget_below_one_tile_floors_at_one_never_zero() {
-        let bytes = bytes_per_tile(512, 512, 3, 0);
+        let bytes = bytes_per_tile(512, 512, 3, 2, 0);
         let in_flight = in_flight_for_budget(bytes, 1, 32);
         assert_eq!(in_flight, 1);
     }
@@ -699,7 +703,7 @@ mod tests {
     fn in_flight_never_exceeds_available_parallelism() {
         // A tiny tile (so the budget alone would allow hundreds live)
         // must still be capped by the host's reported parallelism.
-        let bytes = bytes_per_tile(4, 4, 1, 0);
+        let bytes = bytes_per_tile(4, 4, 1, 2, 0);
         let in_flight = in_flight_for_budget(bytes, u64::MAX, 4);
         assert_eq!(in_flight, 4);
     }
