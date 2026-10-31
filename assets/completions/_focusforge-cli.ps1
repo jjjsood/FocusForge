@@ -106,7 +106,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--jpeg-subsampling', '--jpeg-subsampling', [CompletionResultType]::ParameterName, 'JPEG chroma subsampling: `420` (default) or `444`. JPEG only')
             [CompletionResult]::new('--exif', '--exif', [CompletionResultType]::ParameterName, 'Carry the alignment reference frame''s EXIF: `on` (default) or `off`')
             [CompletionResult]::new('--icc', '--icc', [CompletionResultType]::ParameterName, 'Embed an ICC profile: `on` (default) or `off`')
-            [CompletionResult]::new('--xmp', '--xmp', [CompletionResultType]::ParameterName, 'Carry the source frame''s XMP packet verbatim: `on` or `off` (default)')
+            [CompletionResult]::new('--xmp', '--xmp', [CompletionResultType]::ParameterName, 'Carry the source frame''s XMP packet, with any `tiff:Orientation` set to 1: `on` or `off` (default)')
             [CompletionResult]::new('--iptc', '--iptc', [CompletionResultType]::ParameterName, 'Carry the source frame''s IPTC block verbatim: `on` or `off` (default). Never written to PNG')
             [CompletionResult]::new('--frame', '--frame', [CompletionResultType]::ParameterName, 'Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint''s own composite width and height. Requires `--frame-output`')
             [CompletionResult]::new('--frame-output', '--frame-output', [CompletionResultType]::ParameterName, 'Where to write the frame `--frame` names')

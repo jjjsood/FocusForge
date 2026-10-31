@@ -6,8 +6,14 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::io::test_frames::{
+    ByteOrderSpec, FrameMetadata, ascii_entry, rational_bo, shorts_bo,
+    write_frame_with_capture_time, write_frame_with_exif_capture_time,
+    write_frame_with_junk_exif_pointer, write_frame_with_metadata,
+};
 use focusforge_core::io::{
-    FrameError, FrameReader, JpegError, JpegStack, ReaderKind, Rect, open_frame_set,
+    ByteOrder, FrameError, FrameReader, GroupSignal, JpegError, JpegStack, ReaderKind, Rect,
+    SourceKind, SourceMetadata, capture_time, open_frame_set, propose, read_source_metadata,
 };
 use focusforge_core::tile::HostBudget;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
@@ -435,5 +441,205 @@ fn jpeg_orientation_is_applied() {
                 assert_eq!(tile, region, "case {index}, value {value}, tile {x},{y}");
             }
         }
+    }
+}
+
+/// A JPEG at `dir/name` whose Exif payload is `blob`; `None` writes no APP1.
+fn jpeg_with_exif(dir: &Path, name: &str, blob: Option<&[u8]>) -> PathBuf {
+    let bytes = encode(8, 4, 3, SamplingFactor::F_1_1, blob);
+    write(dir, name, &bytes)
+}
+
+/// A JPEG at `dir/name` whose Exif payload is the bytes of `tiff`.
+fn jpeg_carrying(dir: &Path, name: &str, tiff: &Path) -> PathBuf {
+    let blob = std::fs::read(tiff).expect("tiff bytes");
+    jpeg_with_exif(dir, name, Some(&blob))
+}
+
+fn rich_metadata(order: ByteOrder) -> FrameMetadata {
+    let shorts = |v: u16| shorts_bo(order, &[v]);
+    let rational = |n, d| rational_bo(order, n, d);
+    FrameMetadata {
+        byte_order: ByteOrderSpec(order),
+        ifd0: vec![
+            (271, 2, ascii_entry("TestCam Manufacturing")),
+            (272, 2, ascii_entry("Model One")),
+            (274, 3, shorts(6)),
+            (315, 2, ascii_entry("A. Photographer")),
+            (33432, 2, ascii_entry("(c) Someone")),
+        ],
+        exif: vec![
+            (33434, 5, rational(1, 250)),
+            (33437, 5, rational(28, 10)),
+            (34855, 3, shorts(400)),
+            (36867, 2, ascii_entry("2024:03:17 08:00:00")),
+            (42036, 2, ascii_entry("Lens 50mm")),
+        ],
+        gps: vec![(1, 2, ascii_entry("N"))],
+        ..FrameMetadata::default()
+    }
+}
+
+#[test]
+fn jpeg_capture_time() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let ifd0 = dir.path().join("ifd0.tif");
+    write_frame_with_capture_time(&ifd0, 8, 4, Some("2026:08:29 18:42:41")).expect("tiff");
+    let sub_ifd = dir.path().join("sub.tif");
+    write_frame_with_exif_capture_time(&sub_ifd, 8, 4, "2026:08:29 18:42:42").expect("tiff");
+    let big_endian = dir.path().join("mm.tif");
+    let mut meta = FrameMetadata {
+        byte_order: ByteOrderSpec(ByteOrder::Big),
+        ..FrameMetadata::default()
+    };
+    meta.ifd0
+        .push((36867, 2, ascii_entry("2026:08:29 18:42:43")));
+    write_frame_with_metadata(&big_endian, 8, 4, &meta).expect("tiff");
+    for (index, tiff) in [ifd0, sub_ifd, big_endian].iter().enumerate() {
+        let jpeg = jpeg_carrying(dir.path(), &format!("{index}.jpg"), tiff);
+        let time = capture_time(&jpeg);
+        assert!(time.is_some(), "case {index}: JPEG is timed");
+        assert_eq!(time, capture_time(tiff), "case {index}");
+    }
+}
+
+#[test]
+fn jpeg_frames_group_by_capture_time() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let scratch = tempfile::tempdir().expect("temporary directory");
+    let frames = [
+        ("a.jpg", "2026:08:29 10:00:00", ByteOrder::Little),
+        ("b.jpg", "2026:08:29 10:00:05", ByteOrder::Big),
+        ("c.jpg", "2026:08:29 11:00:00", ByteOrder::Little),
+        ("d.jpg", "2026:08:29 11:00:05", ByteOrder::Little),
+    ];
+    for (name, when, order) in frames {
+        let tiff = scratch.path().join("t.tif");
+        let mut meta = FrameMetadata {
+            byte_order: ByteOrderSpec(order),
+            ..FrameMetadata::default()
+        };
+        meta.ifd0.push((36867, 2, ascii_entry(when)));
+        write_frame_with_metadata(&tiff, 8, 4, &meta).expect("tiff");
+        jpeg_carrying(dir.path(), name, &tiff);
+    }
+    let proposal = propose(dir.path()).expect("JPEG frames propose");
+    assert!(proposal.time_signal_available);
+    let grouped: Vec<Vec<String>> = proposal
+        .groups
+        .iter()
+        .map(|group| {
+            group
+                .frames
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        })
+        .collect();
+    assert_eq!(grouped, [["a.jpg", "b.jpg"], ["c.jpg", "d.jpg"]]);
+    assert!(
+        proposal
+            .groups
+            .iter()
+            .all(|g| g.signal == GroupSignal::CaptureTime)
+    );
+}
+
+#[test]
+fn jpeg_without_exif_is_untimed_and_unwarned() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let bare = jpeg_with_exif(dir.path(), "bare.jpg", None);
+    let mut foreign = Vec::new();
+    {
+        let mut encoder = Encoder::new(&mut foreign, 90);
+        encoder
+            .add_app_segment(1, b"http://ns.adobe.com/xap/1.0/\0<x/>".to_vec())
+            .expect("APP1 fits");
+        encoder
+            .encode(&pixels(8, 4, 3), 8, 4, ColorType::Rgb)
+            .expect("frame encodes");
+    }
+    let foreign = write(dir.path(), "foreign.jpg", &foreign);
+    for path in [&bare, &foreign] {
+        assert_eq!(capture_time(path), None, "{}", path.display());
+        assert_eq!(read_source_metadata(path), SourceMetadata::default());
+    }
+    let proposal = propose(dir.path()).expect("untimed JPEG frames propose");
+    assert!(!proposal.time_signal_available);
+}
+
+#[test]
+fn jpeg_damaged_exif_is_untimed_and_warned() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let scratch = tempfile::tempdir().expect("temporary directory");
+    let read = |name: &str| std::fs::read(scratch.path().join(name)).expect("tiff bytes");
+
+    write_frame_with_capture_time(
+        &scratch.path().join("dated.tif"),
+        8,
+        4,
+        Some("2026:08:29 18:42:41"),
+    )
+    .expect("tiff");
+    let cut_in_ifd0 = read("dated.tif")[..24].to_vec();
+
+    write_frame_with_junk_exif_pointer(&scratch.path().join("junk.tif"), 8, 4).expect("tiff");
+    let junk_pointer = read("junk.tif");
+
+    let mut meta = FrameMetadata::default();
+    meta.ifd0.push((271, 2, ascii_entry(&"M".repeat(40))));
+    write_frame_with_metadata(&scratch.path().join("long.tif"), 8, 4, &meta).expect("tiff");
+    let long = read("long.tif");
+    let ifd0_offset = u32::from_le_bytes(long[4..8].try_into().unwrap()) as usize;
+    let entries = 11 + 1;
+    let value_past_end = long[..ifd0_offset + 2 + 12 * entries + 4].to_vec();
+
+    let no_mark = b"XX\x2a\0\x08\0\0\0\0\0\0\0\0\0".to_vec();
+
+    for (index, blob) in [cut_in_ifd0, junk_pointer, value_past_end, no_mark]
+        .iter()
+        .enumerate()
+    {
+        let jpeg = jpeg_with_exif(dir.path(), &format!("{index}.jpg"), Some(blob));
+        assert_eq!(capture_time(&jpeg), None, "case {index}");
+        let metadata = read_source_metadata(&jpeg);
+        let shown = jpeg.display().to_string();
+        assert!(
+            metadata.warnings.iter().any(|w| w.contains(&shown)),
+            "case {index}: warnings {:?}",
+            metadata.warnings
+        );
+    }
+    propose(dir.path()).expect("damaged EXIF never fails grouping");
+
+    let bad_date = dir.path().join("bad-date");
+    std::fs::create_dir(&bad_date).unwrap();
+    let tiff = scratch.path().join("bad.tif");
+    write_frame_with_capture_time(&tiff, 8, 4, Some("not-a-date")).expect("tiff");
+    let jpeg = jpeg_carrying(&bad_date, "bad.jpg", &tiff);
+    assert_eq!(capture_time(&jpeg), None);
+    let metadata = read_source_metadata(&jpeg);
+    assert!(metadata.warnings.is_empty(), "{:?}", metadata.warnings);
+    assert!(metadata.exif.iter().any(|e| e.tag == 36867));
+}
+
+#[test]
+fn jpeg_source_metadata_matches_tiff_reader() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    for (name, order) in [("ii", ByteOrder::Little), ("mm", ByteOrder::Big)] {
+        let tiff = dir.path().join(format!("{name}.tif"));
+        write_frame_with_metadata(&tiff, 8, 4, &rich_metadata(order)).expect("tiff");
+        let jpeg = jpeg_carrying(dir.path(), &format!("{name}.jpg"), &tiff);
+        let from_tiff = read_source_metadata(&tiff);
+        let from_jpeg = read_source_metadata(&jpeg);
+        assert!(
+            !from_tiff.ifd0.is_empty() && !from_tiff.exif.is_empty() && !from_tiff.gps.is_empty()
+        );
+        assert_eq!(from_jpeg.ifd0, from_tiff.ifd0, "{name}");
+        assert_eq!(from_jpeg.exif, from_tiff.exif, "{name}");
+        assert_eq!(from_jpeg.gps, from_tiff.gps, "{name}");
+        assert_eq!(from_jpeg.kind, SourceKind::Tiff);
+        assert!(from_jpeg.icc.is_none() && from_jpeg.xmp.is_none() && from_jpeg.iptc.is_none());
+        assert!(from_jpeg.warnings.is_empty(), "{:?}", from_jpeg.warnings);
     }
 }

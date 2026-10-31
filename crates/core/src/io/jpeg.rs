@@ -287,6 +287,8 @@ struct Header {
     height: u32,
     components: u8,
     orientation: Orientation,
+    /// The first APP1 `Exif` segment's TIFF-structured payload.
+    exif: Option<Vec<u8>>,
     file_size: u64,
 }
 
@@ -431,8 +433,15 @@ fn read_header(path: &Path) -> Result<Header, JpegError> {
         height,
         components,
         orientation,
+        exif,
         file_size,
     })
+}
+
+/// The TIFF-structured payload of a JPEG's first APP1 `Exif` segment, read
+/// from the header without decoding the scan; `None` when the file has none.
+pub(crate) fn read_exif(path: &Path) -> Result<Option<Vec<u8>>, JpegError> {
+    read_header(path).map(|header| header.exif)
 }
 
 fn decode(frame: &JpegFrame) -> Result<DecodedFrame, JpegError> {

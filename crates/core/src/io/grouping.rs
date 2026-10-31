@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use super::error::TiffError;
 use super::tiff::header::TiffHeader;
-use super::{RAW_EXTENSIONS, RawStack, all_frame_paths, has_extension};
+use super::{
+    JPEG_EXTENSIONS, RAW_EXTENSIONS, RawStack, all_frame_paths, has_extension, read_source_metadata,
+};
 
 /// The capture-time gap that starts a new group: frames further apart than
 /// this belong to different stacks.
@@ -376,6 +378,14 @@ pub fn capture_time(path: &Path) -> Option<CaptureTime> {
             .capture_time_original
             .as_deref()
             .and_then(parse_exif_datetime);
+    }
+    if has_extension(path, JPEG_EXTENSIONS) {
+        // The metadata reader lists an IFD0 `DateTimeOriginal` ahead of the
+        // EXIF sub-IFD's, so the first entry is the one a TIFF header picks.
+        let metadata = read_source_metadata(path);
+        let entry = metadata.exif.iter().find(|entry| entry.tag == 36867)?;
+        let text = entry.value.split(|&byte| byte == 0).next()?;
+        return parse_exif_datetime(std::str::from_utf8(text).ok()?);
     }
     let header = TiffHeader::open(path).ok()?;
     parse_exif_datetime(header.date_time_original.as_deref()?)

@@ -103,7 +103,7 @@ _arguments "${_arguments_options[@]}" : \
 '--jpeg-subsampling=[JPEG chroma subsampling\: \`420\` (default) or \`444\`. JPEG only]:SPEC:_default' \
 '--exif=[Carry the alignment reference frame'\''s EXIF\: \`on\` (default) or \`off\`]:EXIF:_default' \
 '--icc=[Embed an ICC profile\: \`on\` (default) or \`off\`]:ICC:_default' \
-'--xmp=[Carry the source frame'\''s XMP packet verbatim\: \`on\` or \`off\` (default)]:XMP:_default' \
+'--xmp=[Carry the source frame'\''s XMP packet, with any \`tiff\:Orientation\` set to 1\: \`on\` or \`off\` (default)]:XMP:_default' \
 '--iptc=[Carry the source frame'\''s IPTC block verbatim\: \`on\` or \`off\` (default). Never written to PNG]:IPTC:_default' \
 '--frame=[Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint'\''s own composite width and height. Requires \`--frame-output\`]:INDEX:_default' \
 '--frame-output=[Where to write the frame \`--frame\` names]:FILE:_files' \

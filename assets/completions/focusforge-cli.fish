@@ -86,7 +86,7 @@ complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l jpeg-subsampling -d 'JPEG chroma subsampling: `420` (default) or `444`. JPEG only' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l exif -d 'Carry the alignment reference frame\'s EXIF: `on` (default) or `off`' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l icc -d 'Embed an ICC profile: `on` (default) or `off`' -r
-complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l xmp -d 'Carry the source frame\'s XMP packet verbatim: `on` or `off` (default)' -r
+complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l xmp -d 'Carry the source frame\'s XMP packet, with any `tiff:Orientation` set to 1: `on` or `off` (default)' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l iptc -d 'Carry the source frame\'s IPTC block verbatim: `on` or `off` (default). Never written to PNG' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l frame -d 'Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint\'s own composite width and height. Requires `--frame-output`' -r
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand export" -l frame-output -d 'Where to write the frame `--frame` names' -r -F

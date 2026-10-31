@@ -231,14 +231,36 @@ fn orientation_value(entries: &[RawEntry], byte_order: ByteOrder) -> Option<u16>
 /// as an EXIF segment carries; `None` when the blob is malformed or has no
 /// such tag.
 pub(crate) fn exif_orientation(blob: &[u8]) -> Option<u16> {
+    let (byte_order, ifd0) = blob_ifd0(blob)?;
+    let entries = read_ifd(&blob, byte_order, ifd0, Path::new("")).ok()?;
+    orientation_value(&entries, byte_order)
+}
+
+/// The descriptive metadata of an in-memory TIFF blob, such as an EXIF
+/// segment carries, read like a TIFF source's. A blob without a byte-order
+/// mark or IFD0 offset yields an empty result with one warning naming `path`.
+pub(crate) fn read_exif_metadata(blob: &[u8], path: &Path) -> SourceMetadata {
+    match blob_ifd0(blob) {
+        Some((byte_order, ifd0)) => read_tiff_metadata(&blob, byte_order, ifd0, path),
+        None => SourceMetadata {
+            warnings: vec![format!(
+                "{}: EXIF segment is not a TIFF structure",
+                path.display()
+            )],
+            ..Default::default()
+        },
+    }
+}
+
+/// A blob's byte order and IFD0 offset, from its 8-byte TIFF header.
+fn blob_ifd0(blob: &[u8]) -> Option<(ByteOrder, u64)> {
     let byte_order = match blob.get(0..2)? {
         b"II" => ByteOrder::Little,
         b"MM" => ByteOrder::Big,
         _ => return None,
     };
     let ifd0 = u64::from(byte_order.u32_at(blob.get(4..8)?)?);
-    let entries = read_ifd(&blob, byte_order, ifd0, Path::new("")).ok()?;
-    orientation_value(&entries, byte_order)
+    Some((byte_order, ifd0))
 }
 
 /// One open header's source, byte order, size and path, bundled so entry

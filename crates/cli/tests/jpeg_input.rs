@@ -6,7 +6,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use focusforge_core::io::TiffStack;
+use focusforge_core::io::test_frames::{
+    FrameMetadata, ascii_entry, rational_bo, shorts_bo, write_frame_with_metadata,
+};
+use focusforge_core::io::{ByteOrder, TiffStack, read_source_metadata};
 use jpeg_encoder::{ColorType, Encoder};
 
 const WIDTH: u16 = 40;
@@ -118,4 +121,123 @@ fn stack_writes_a_sixteen_bit_composite_of_the_frame_geometry() {
     let stack = TiffStack::open_files(&[composite]).expect("exported composite");
     assert_eq!(stack.dimensions(), (u32::from(WIDTH), u32::from(HEIGHT)));
     assert_eq!(stack.header(0).bits_per_sample.as_ref(), &[16, 16, 16]);
+}
+
+/// Frames whose Exif payload is a TIFF carrying orientation 6 and the tags
+/// the export must pass through.
+fn write_frames_with_exif(dir: &Path, count: usize) {
+    let metadata = FrameMetadata {
+        ifd0: vec![
+            (271, 2, ascii_entry("TestCam")),
+            (272, 2, ascii_entry("Model One")),
+            (274, 3, shorts_bo(ByteOrder::Little, &[6])),
+        ],
+        exif: vec![
+            (33434, 5, rational_bo(ByteOrder::Little, 1, 250)),
+            (36867, 2, ascii_entry("2024:03:17 08:00:00")),
+        ],
+        ..FrameMetadata::default()
+    };
+    let tiff = dir.join("exif-source.tif");
+    std::fs::create_dir_all(dir).expect("frame directory");
+    write_frame_with_metadata(&tiff, 8, 4, &metadata).expect("EXIF source");
+    let blob = std::fs::read(&tiff).expect("EXIF bytes");
+    std::fs::remove_file(&tiff).expect("EXIF source removed");
+    for index in 0..count {
+        let data: Vec<u8> = (0..usize::from(WIDTH) * usize::from(HEIGHT) * 3)
+            .map(|i| ((i / 3 * 7 + i % 3 * 60 + index * 5) % 251) as u8)
+            .collect();
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder::new(&mut bytes, 90);
+        encoder.add_exif_metadata(&blob).expect("EXIF segment fits");
+        encoder
+            .encode(&data, WIDTH, HEIGHT, ColorType::Rgb)
+            .expect("frame encodes");
+        std::fs::write(dir.join(format!("{index:02}.jpg")), bytes).expect("frame file");
+    }
+}
+
+#[test]
+fn export_carries_the_jpeg_source_exif() {
+    let cwd = common::tmp_dir("jpeg_input_exif");
+    let input = cwd.join("input");
+    let output = cwd.join("output");
+    write_frames_with_exif(&input, 3);
+    std::fs::create_dir(&output).expect("output directory");
+
+    let mut args = vec![
+        "stack",
+        input.to_str().expect("UTF-8"),
+        "-o",
+        output.to_str().expect("UTF-8"),
+        "--algorithm",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu");
+    }
+    stdout(&run(&cwd, &args));
+    let project = output.join("input.ffp");
+
+    let tif = output.join("out.tif");
+    let jpg = output.join("out.jpg");
+    for (path, extra) in [(&tif, None), (&jpg, Some(["--format", "jpeg"]))] {
+        let mut args = vec![
+            "export",
+            project.to_str().expect("UTF-8"),
+            "-o",
+            path.to_str().expect("UTF-8"),
+        ];
+        args.extend(extra.into_iter().flatten());
+        stdout(&run(&cwd, &args));
+
+        let metadata = read_source_metadata(path);
+        let name = path.display();
+        assert!(
+            metadata.warnings.is_empty(),
+            "{name}: {:?}",
+            metadata.warnings
+        );
+        let ifd0 = |tag: u16| {
+            metadata
+                .ifd0
+                .iter()
+                .find(|e| e.tag == tag)
+                .map(|e| &e.value)
+        };
+        let exif = |tag: u16| {
+            metadata
+                .exif
+                .iter()
+                .find(|e| e.tag == tag)
+                .map(|e| &e.value)
+        };
+        assert_eq!(
+            ifd0(271).map(Vec::as_slice),
+            Some(&b"TestCam\0"[..]),
+            "{name}"
+        );
+        assert_eq!(
+            ifd0(272).map(Vec::as_slice),
+            Some(&b"Model One\0"[..]),
+            "{name}"
+        );
+        assert_eq!(
+            ifd0(274).map(Vec::as_slice),
+            Some(&1u16.to_le_bytes()[..]),
+            "{name}"
+        );
+        let software = ifd0(305).expect("Software");
+        assert!(software.starts_with(b"FocusForge"), "{name}");
+        assert_eq!(
+            exif(36867).map(Vec::as_slice),
+            Some(&b"2024:03:17 08:00:00\0"[..]),
+            "{name}"
+        );
+        assert!(exif(33434).is_some(), "{name}: ExposureTime");
+    }
+    let stack = TiffStack::open_files(&[tif]).expect("exported composite");
+    assert_eq!(stack.dimensions(), (u32::from(HEIGHT), u32::from(WIDTH)));
 }
