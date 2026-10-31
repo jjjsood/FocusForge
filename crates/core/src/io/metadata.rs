@@ -91,7 +91,8 @@ fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
 /// Rewrites `source` for one export: `Software` (305) and `DateTime` (306)
 /// become the export's own identity and moment, `OffsetTime` (36880)
 /// becomes that moment's UTC offset, and the EXIF image-dimension tags
-/// (40962/40963) become `width`/`height`. `now` is read once by the caller,
+/// (40962/40963) become `width`/`height`, and a TIFF source's Orientation
+/// (274) becomes 1. `now` is read once by the caller,
 /// not here: `chrono`'s local-time lookup is not safe to call concurrently
 /// with anything that mutates `TZ`.
 pub(crate) fn rewrite(
@@ -112,6 +113,11 @@ pub(crate) fn rewrite(
         &mut ifd0,
         exif_tag_entry(ExifTag::ModifyDate, &exif_datetime(now)),
     );
+
+    // A TIFF source is read upright, so the export's pixels need no turn.
+    if source.kind == SourceKind::Tiff && ifd0.iter().any(|entry| entry.tag == 274) {
+        set_entry(&mut ifd0, exif_tag_entry(ExifTag::Orientation, &1u16));
+    }
 
     let mut exif = source.exif.clone();
     set_entry(

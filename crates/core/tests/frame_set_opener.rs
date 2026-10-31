@@ -6,8 +6,12 @@ mod raw_dng;
 
 use std::path::PathBuf;
 
+use focusforge_core::io::test_frames::{
+    ByteOrderSpec, FrameMetadata, shorts_bo, write_frame_with_metadata,
+};
 use focusforge_core::io::{
-    FrameError, ReaderKind, TiffError, TiffHeader, classify_header, frame_paths, open_frame_set,
+    ByteOrder, FrameError, ReaderKind, Refusal, TiffError, TiffHeader, TiffStack, classify_header,
+    frame_paths, open_frame_set,
 };
 use focusforge_core::tile::HostBudget;
 use raw_dng::{DngSpec, write_dng};
@@ -292,6 +296,56 @@ fn jpeg_mixed_with_tiff_or_raw_names_both_frames_and_formats() {
                     );
                 }
                 other => panic!("expected MixedFormats, got {other}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn orientation_routes_tagged_frames_to_the_decoded_reader() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    for order in [ByteOrder::Little, ByteOrder::Big] {
+        for (value, oriented) in [(None, false), (Some(1), false), (Some(6), true)] {
+            let path = dir.path().join(format!("{order:?}-{value:?}.tif"));
+            write_frame_with_metadata(
+                &path,
+                24,
+                16,
+                &FrameMetadata {
+                    byte_order: ByteOrderSpec(order),
+                    ifd0: value
+                        .map(|value| (274, 3, shorts_bo(order, &[value])))
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+            )
+            .expect("frame writes");
+            let header = TiffHeader::open(&path).expect("header");
+            let expected = if oriented {
+                ReaderKind::Decoded
+            } else {
+                ReaderKind::Mmap
+            };
+            assert_eq!(
+                classify_header(&header).expect("classifies"),
+                expected,
+                "{order:?} {value:?}"
+            );
+            if oriented {
+                assert_eq!(header.refusal, Some(Refusal::Orientation(6)));
+                assert_eq!(header.upright_dimensions(), (16, 24));
+                assert!(matches!(
+                    TiffStack::open_files(&[path]),
+                    Err(TiffError::Unsupported {
+                        refusal: Refusal::Orientation(6),
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(header.refusal, None);
+                assert_eq!(header.upright_dimensions(), (24, 16));
+                TiffStack::open_files(&[path]).expect("mmap reader opens");
             }
         }
     }

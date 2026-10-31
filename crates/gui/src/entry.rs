@@ -451,10 +451,11 @@ pub fn tab_stack_context(project: &GuiProject) -> Option<StackContext> {
     match project {
         GuiProject::Unsaved(group) => {
             let header = TiffHeader::open(group.frames.first()?).ok()?;
+            let (width, height) = header.upright_dimensions();
             Some(StackContext::new(
                 group.frames.len(),
-                header.width,
-                header.height,
+                width,
+                height,
                 header.samples_per_pixel,
             ))
         }
@@ -492,7 +493,7 @@ pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
 pub fn tab_image_size(project: &GuiProject) -> Option<(u32, u32)> {
     let frames = project_frames(project);
     let header = TiffHeader::open(frames.first()?).ok()?;
-    Some((header.width, header.height))
+    Some(header.upright_dimensions())
 }
 
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed

@@ -548,6 +548,7 @@ fn test_header(
         path: PathBuf::from("generated.tif"),
         width,
         height,
+        orientation: 1,
         byte_order,
         ifd_offset: 0,
         bits_per_sample: vec![16; samples_per_pixel as usize].into_boxed_slice(),

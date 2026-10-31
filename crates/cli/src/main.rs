@@ -713,6 +713,9 @@ struct FileReport {
     path: String,
     width: Option<u32>,
     height: Option<u32>,
+    /// EXIF Orientation of a TIFF frame; `width` and `height` are already
+    /// upright.
+    orientation: Option<u16>,
     bits_per_sample: Option<Vec<u16>>,
     samples_per_pixel: Option<u32>,
     byte_order: Option<String>,
@@ -1048,8 +1051,9 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
             Ok(Probe::Tiff(h)) => FileReport {
                 name: p.name.clone(),
                 path: p.path.display().to_string(),
-                width: Some(h.width),
-                height: Some(h.height),
+                width: Some(h.upright_dimensions().0),
+                height: Some(h.upright_dimensions().1),
+                orientation: Some(h.orientation),
                 bits_per_sample: Some(h.bits_per_sample.to_vec()),
                 samples_per_pixel: Some(h.samples_per_pixel),
                 byte_order: Some(byte_order_str(h.byte_order).to_string()),
@@ -1071,6 +1075,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 path: p.path.display().to_string(),
                 width: None,
                 height: None,
+                orientation: None,
                 bits_per_sample: None,
                 samples_per_pixel: None,
                 byte_order: None,
@@ -1094,6 +1099,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 path: p.path.display().to_string(),
                 width: Some(desc.width),
                 height: Some(desc.height),
+                orientation: None,
                 bits_per_sample: Some(vec![8; desc.samples_per_pixel as usize]),
                 samples_per_pixel: Some(desc.samples_per_pixel),
                 byte_order: None,
@@ -1115,6 +1121,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 path: p.path.display().to_string(),
                 width: None,
                 height: None,
+                orientation: None,
                 bits_per_sample: None,
                 samples_per_pixel: None,
                 byte_order: None,
@@ -1218,6 +1225,9 @@ fn print_human(report: &InfoReport) {
             file.strip_count.unwrap_or(0),
             file.file_size.unwrap_or(0),
         );
+        if let Some(orientation) = file.orientation.filter(|&value| value != 1) {
+            println!("  orientation: {orientation}");
+        }
         if let Some(description) = &file.description {
             println!("  description: {description}");
         }

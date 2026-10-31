@@ -11,6 +11,7 @@ use memmap2::Mmap;
 
 use super::super::error::TiffError;
 use super::super::frame::{FrameDesc, FrameReader};
+use super::super::orientation::Orientation;
 use super::header::TiffHeader;
 use super::segment::{DecodedSegment, SegmentInfo, SegmentOrigin, decode_segment, segment_layout};
 use super::stack::{check_uniform, frame_paths, map_file};
@@ -502,7 +503,7 @@ impl DecodedTiffStack {
 
     /// Shared dimensions of every frame.
     pub fn dimensions(&self) -> (u32, u32) {
-        (self.frames[0].header.width, self.frames[0].header.height)
+        self.frames[0].header.upright_dimensions()
     }
 
     /// Current decoded-segment cache counters.
@@ -540,6 +541,33 @@ impl DecodedTiffStack {
                 got: out.len(),
             });
         }
+        let header = &frame_data.header;
+        let orientation = Orientation::from_exif(header.orientation);
+        if orientation == Orientation::Upright {
+            return self.read_stored_rect(frame, frame_data, rect, out);
+        }
+        let stored_dims = (header.width, header.height);
+        let source = orientation.stored_rect(rect, stored_dims.0, stored_dims.1);
+        let mut stored = vec![0; expected_len(source, header.samples_per_pixel)?];
+        self.read_stored_rect(frame, frame_data, source, &mut stored)?;
+        orientation.fill_upright(
+            &stored,
+            rect,
+            stored_dims,
+            header.samples_per_pixel as usize,
+            out,
+        );
+        Ok(())
+    }
+
+    /// Copies `rect`, in stored coordinates, out of the frame's segments.
+    fn read_stored_rect(
+        &self,
+        frame: usize,
+        frame_data: &Frame,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), TiffError> {
         let spp = frame_data.header.samples_per_pixel as usize;
         for (index, info) in frame_data.segments.iter().copied().enumerate() {
             let (x, y) = segment_xy(info.origin);
@@ -597,8 +625,17 @@ impl FrameReader for DecodedTiffStack {
 }
 
 impl TileReader for DecodedTiffStack {
-    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
-        self.decode_scratch_bytes
+    fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
+        let oriented = self
+            .frames
+            .iter()
+            .any(|frame| frame.header.orientation != 1);
+        if oriented {
+            let samples_per_pixel = u64::from(self.frames[0].header.samples_per_pixel);
+            self.decode_scratch_bytes + u64::from(width) * u64::from(height) * samples_per_pixel * 2
+        } else {
+            self.decode_scratch_bytes
+        }
     }
 
     fn read_tile_into(
@@ -652,23 +689,18 @@ fn expected_len(rect: Rect, spp: u32) -> Result<usize, TiffError> {
 }
 
 fn validate_rect(header: &TiffHeader, rect: Rect) -> Result<(), TiffError> {
+    let (width, height) = header.upright_dimensions();
     let in_bounds = rect.width > 0
         && rect.height > 0
-        && rect
-            .x
-            .checked_add(rect.width)
-            .is_some_and(|x| x <= header.width)
-        && rect
-            .y
-            .checked_add(rect.height)
-            .is_some_and(|y| y <= header.height);
+        && rect.x.checked_add(rect.width).is_some_and(|x| x <= width)
+        && rect.y.checked_add(rect.height).is_some_and(|y| y <= height);
     if in_bounds {
         Ok(())
     } else {
         Err(TiffError::OutOfBounds {
             path: header.path.clone(),
             requested: rect,
-            frame: (header.width, header.height),
+            frame: (width, height),
         })
     }
 }

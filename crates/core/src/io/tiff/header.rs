@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use super::super::error::{Refusal, TiffError};
 use super::super::metadata::{SourceKind, SourceMetadata, TagEntry};
+use super::super::orientation::Orientation;
 use crate::io::FrameDesc;
 
 // --- tags ---------------------------------------------------------------
@@ -138,11 +139,12 @@ impl ByteOrder {
 
 impl From<&TiffHeader> for FrameDesc {
     fn from(header: &TiffHeader) -> Self {
+        let (width, height) = header.upright_dimensions();
         let layout_signature = vec![
             header.byte_order.tag().to_string(),
             format!("rps={}", header.rows_per_strip),
             format!("compression={}", header.compression),
-            format!("{}x{}", header.width, header.height),
+            format!("{width}x{height}"),
             format!("bits={:?}", header.bits_per_sample),
             format!("samples={}", header.samples_per_pixel),
             format!("photometric={}", header.photometric),
@@ -153,8 +155,8 @@ impl From<&TiffHeader> for FrameDesc {
             path: header.path.clone(),
             file_size: header.file_size,
             image_description: header.image_description.clone(),
-            width: header.width,
-            height: header.height,
+            width,
+            height,
             samples_per_pixel: header.samples_per_pixel,
             strip_offsets: header.strip_offsets.clone(),
             strip_byte_counts: header.strip_byte_counts.clone(),
@@ -217,6 +219,14 @@ fn read_ifd<S: ByteSource>(
     Ok(entries)
 }
 
+/// The Orientation value of an IFD's entries: a single SHORT in tag 274.
+fn orientation_value(entries: &[RawEntry], byte_order: ByteOrder) -> Option<u16> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.tag == TAG_ORIENTATION && entry.field_type == 3 && entry.count == 1)?;
+    byte_order.u16_at(&entry.payload)
+}
+
 /// The Orientation value (tag 274) in IFD0 of an in-memory TIFF blob, such
 /// as an EXIF segment carries; `None` when the blob is malformed or has no
 /// such tag.
@@ -227,12 +237,8 @@ pub(crate) fn exif_orientation(blob: &[u8]) -> Option<u16> {
         _ => return None,
     };
     let ifd0 = u64::from(byte_order.u32_at(blob.get(4..8)?)?);
-    let entry = read_ifd(&blob, byte_order, ifd0, Path::new(""))
-        .ok()?
-        .into_iter()
-        .find(|entry| entry.tag == TAG_ORIENTATION && entry.count == 1)?;
-    let value = byte_order.ints_at(entry.field_type, 1, &entry.payload)?;
-    u16::try_from(*value.first()?).ok()
+    let entries = read_ifd(&blob, byte_order, ifd0, Path::new("")).ok()?;
+    orientation_value(&entries, byte_order)
 }
 
 /// One open header's source, byte order, size and path, bundled so entry
@@ -489,6 +495,9 @@ pub struct TiffHeader {
     pub path: PathBuf,
     pub width: u32,
     pub height: u32,
+    /// EXIF Orientation (1-8); an absent, non-SHORT or out-of-range tag reads
+    /// as 1. `width` and `height` stay as stored; see [`Self::upright_dimensions`].
+    pub orientation: u16,
     pub byte_order: ByteOrder,
     /// IFD0's file offset, for a metadata read over the same bytes this
     /// header's own parse already located.
@@ -521,6 +530,12 @@ pub struct TiffHeader {
 }
 
 impl TiffHeader {
+    /// `(width, height)` of the frame once its Orientation is applied:
+    /// swapped for the transposing values 5-8.
+    pub fn upright_dimensions(&self) -> (u32, u32) {
+        Orientation::from_exif(self.orientation).upright_dims(self.width, self.height)
+    }
+
     pub fn strip_count(&self) -> usize {
         self.strip_offsets.len()
     }
@@ -715,9 +730,13 @@ impl TiffHeader {
             rows_per_strip = height;
         }
 
+        let orientation = orientation_value(&entries, byte_order)
+            .filter(|value| (1..=8).contains(value))
+            .unwrap_or(1);
+
         // Refusal priority: tiled first (the strip tables may not apply at
         // all to a tiled file), then compression, planar layout, bit depth,
-        // sample format. At most one refusal is carried.
+        // sample format, orientation. At most one refusal is carried.
         let refusal = if tiled {
             Some(Refusal::Tiled)
         } else if compression != 1 {
@@ -730,6 +749,8 @@ impl TiffHeader {
             ))
         } else if sample_format.iter().any(|&f| f != 1) {
             Some(Refusal::SampleFormat(sample_format[0]))
+        } else if orientation != 1 {
+            Some(Refusal::Orientation(orientation))
         } else {
             None
         };
@@ -753,6 +774,7 @@ impl TiffHeader {
             path: path.to_path_buf(),
             width,
             height,
+            orientation,
             byte_order,
             ifd_offset,
             bits_per_sample: bits_per_sample.into_boxed_slice(),
