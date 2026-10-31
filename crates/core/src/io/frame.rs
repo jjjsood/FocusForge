@@ -15,6 +15,9 @@ pub struct FrameDesc {
     pub path: PathBuf,
     pub file_size: u64,
     pub image_description: Option<String>,
+    /// EXIF Orientation (1-8) the reader applies to serve the frame upright;
+    /// 1 when the frame is served as stored.
+    pub orientation: u16,
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,

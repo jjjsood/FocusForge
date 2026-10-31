@@ -314,6 +314,7 @@ fn open_frame(path: &Path) -> Result<JpegFrame, JpegError> {
             path: path.to_path_buf(),
             file_size: header.file_size,
             image_description: None,
+            orientation: header.orientation.exif(),
             width,
             height,
             samples_per_pixel: u32::from(header.components),

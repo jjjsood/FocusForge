@@ -1304,6 +1304,7 @@ mod tests {
             path: PathBuf::from(label),
             file_size: 0,
             image_description: None,
+            orientation: 1,
             width: 1,
             height: 1,
             samples_per_pixel: 1,

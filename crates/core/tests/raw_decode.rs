@@ -6,7 +6,7 @@ mod raw_dng;
 
 use focusforge_core::algorithm::TileReader;
 use focusforge_core::io::Rect;
-use focusforge_core::io::{FrameError, RawError, RawStack};
+use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
@@ -203,6 +203,7 @@ fn synthetic_dng_metadata_roundtrips() {
         let metadata = reader.metadata(0).expect("DNG metadata");
         let shifted_cfa = [cfa[3], cfa[2], cfa[1], cfa[0]];
         assert_eq!(reader.dimensions(), (4, 3));
+        assert_eq!(FrameReader::frame(&reader, 0).orientation, 1);
         assert_eq!(metadata.storage_bits, Some(bits));
         assert_eq!(metadata.decoder_bits, None);
         assert_eq!(metadata.black_levels.as_deref(), Some(&[128.0; 4][..]));

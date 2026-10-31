@@ -10,8 +10,8 @@ use focusforge_core::io::test_frames::{
     ByteOrderSpec, FrameMetadata, shorts_bo, write_frame_with_metadata,
 };
 use focusforge_core::io::{
-    ByteOrder, FrameError, ReaderKind, Refusal, TiffError, TiffHeader, TiffStack, classify_header,
-    frame_paths, open_frame_set,
+    ByteOrder, FrameDesc, FrameError, ReaderKind, Refusal, TiffError, TiffHeader, TiffStack,
+    classify_header, frame_paths, open_frame_set,
 };
 use focusforge_core::tile::HostBudget;
 use raw_dng::{DngSpec, write_dng};
@@ -322,6 +322,11 @@ fn orientation_routes_tagged_frames_to_the_decoded_reader() {
             )
             .expect("frame writes");
             let header = TiffHeader::open(&path).expect("header");
+            assert_eq!(
+                FrameDesc::from(&header).orientation,
+                value.unwrap_or(1),
+                "{order:?} {value:?}"
+            );
             let expected = if oriented {
                 ReaderKind::Decoded
             } else {

@@ -43,6 +43,20 @@ impl Orientation {
         }
     }
 
+    /// The EXIF tag value (1-8) of this orientation.
+    pub(crate) fn exif(self) -> u16 {
+        match self {
+            Self::Upright => 1,
+            Self::MirrorX => 2,
+            Self::Rotate180 => 3,
+            Self::MirrorY => 4,
+            Self::Transpose => 5,
+            Self::Rotate90 => 6,
+            Self::Transverse => 7,
+            Self::Rotate270 => 8,
+        }
+    }
+
     /// The upright `(width, height)` of a frame stored `stored_w` x `stored_h`.
     pub(crate) fn upright_dims(self, stored_w: u32, stored_h: u32) -> (u32, u32) {
         match self {
@@ -152,6 +166,7 @@ mod tests {
         }
         for (value, orientation) in (1..=8).zip(ALL) {
             assert_eq!(Orientation::from_exif(value), orientation);
+            assert_eq!(orientation.exif(), value);
         }
     }
 

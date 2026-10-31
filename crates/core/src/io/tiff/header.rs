@@ -155,6 +155,7 @@ impl From<&TiffHeader> for FrameDesc {
             path: header.path.clone(),
             file_size: header.file_size,
             image_description: header.image_description.clone(),
+            orientation: header.orientation,
             width,
             height,
             samples_per_pixel: header.samples_per_pixel,

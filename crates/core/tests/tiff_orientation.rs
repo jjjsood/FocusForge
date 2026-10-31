@@ -251,6 +251,7 @@ fn orientation_is_applied() {
             assert_eq!(set.reader.dimensions(), (uw, uh), "{name}, value {value}");
             let desc = set.reader.frame(0);
             assert_eq!((desc.width, desc.height), (uw, uh), "{name}, value {value}");
+            assert_eq!(desc.orientation, value, "{name}, value {value}");
             assert_eq!(
                 read(set.reader.as_ref(), rect_of(set.reader.as_ref())),
                 expected_upright(&stored, value, w, h, spp),
@@ -351,6 +352,7 @@ fn orientation_edge_cases() {
         assert_eq!(header_orientation(&path), 1, "{name}");
         let set = open_frame_set(&[path], HostBudget::explicit(BIG)).expect("opens");
         assert_eq!(set.kind, ReaderKind::Mmap, "{name}");
+        assert_eq!(set.reader.frame(0).orientation, 1, "{name}");
         assert_eq!(
             read(set.reader.as_ref(), rect_of(set.reader.as_ref())),
             plain_samples,

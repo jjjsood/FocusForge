@@ -406,6 +406,11 @@ fn jpeg_orientation_is_applied() {
             (uw, uh),
             "case {index}, value {value}"
         );
+        assert_eq!(
+            set.reader.frame(0).orientation,
+            value,
+            "case {index}, value {value}"
+        );
         let mut expected = vec![0_u16; stored.len()];
         for y in 0..h {
             for x in 0..w {

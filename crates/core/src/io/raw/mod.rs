@@ -650,6 +650,7 @@ fn raw_desc(metadata: &RawMetadata) -> FrameDesc {
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         image_description: None,
+        orientation: 1,
         width: metadata.output_width,
         height: metadata.output_height,
         samples_per_pixel: 3,
