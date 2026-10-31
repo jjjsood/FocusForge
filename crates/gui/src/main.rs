@@ -97,8 +97,8 @@ struct Args {
     toolbar_state: Option<String>,
     /// Opens the export modal at startup with literal preview text, for
     /// inspecting a state no click sequence quickly reaches: `ready`,
-    /// `ready-png`, `ready-jpeg`, `ready-menu`, `writing`, `refused` or
-    /// `refused-format`.
+    /// `ready-png`, `ready-jpeg`, `ready-dng`, `ready-menu`, `writing`,
+    /// `refused` or `refused-format`.
     #[arg(long)]
     export_dialog_preview: Option<String>,
     /// Opens the `Images` panel's sort menu at startup, for inspecting it
@@ -230,14 +230,15 @@ const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "f
 /// sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
-    // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
-    // list open), `writing`, `refused` or `refused-format` (a format cause,
-    // no `Locate frames…`).
+    // `ready`, `ready-png`, `ready-jpeg`, `ready-dng`, `ready-menu` (TIFF
+    // compression list open), `writing`, `refused` or `refused-format` (a
+    // format cause, no `Locate frames…`).
     let (stage, variant) = spec.split_once('-').unwrap_or((spec, ""));
     let choice = focusforge_gui::export_settings::ExportChoice {
         format: match variant {
             "png" => ExportFormat::Png,
             "jpeg" => ExportFormat::Jpeg,
+            "dng" => ExportFormat::Dng,
             _ => ExportFormat::Tiff,
         },
         ..Default::default()

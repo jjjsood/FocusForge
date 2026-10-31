@@ -244,6 +244,8 @@ export component FFExportDialog inherits FFModalPanel {
     in property <[string]> format-segments: [];
     in property <string> format-selected: "";
     in property <string> settings-heading: "";
+    // One muted line in place of the rows; empty when rows show.
+    in property <string> settings-note: "";
     in property <[ExportRowView]> rows: [];
     // The group is a slider row then a segmented row, not menus.
     in property <bool> slider-group: false;
@@ -333,7 +335,7 @@ export component FFExportDialog inherits FFModalPanel {
         FFSegmented {
             x: 128px;
             y: 0px;
-            width: 252px;
+            width: 336px;
             segments: root.format-segments;
             selected: root.format-selected;
             segment-selected(label) => { root.format-chosen(label); }
@@ -356,6 +358,15 @@ export component FFExportDialog inherits FFModalPanel {
             y: settings-heading.y + settings-heading.height + 2px;
             width: 0px;
             height: 0px;
+        }
+
+        if root.settings-note != "": FFRowText {
+            x: 0px;
+            y: rows-top.y;
+            width: 528px;
+            height: 28px;
+            muted: true;
+            text: root.settings-note;
         }
 
         if !root.slider-group: Rectangle {

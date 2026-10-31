@@ -17,7 +17,7 @@ use focusforge_core::align::WarpingReader;
 use focusforge_core::equalize::{EqualizeSettings, GainReader};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
-    COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
+    COMPOSITE_FILENAME, FrameError, FrameReader, RawError, TiffStack, ZMAP_FILENAME, open_frame_set,
 };
 pub use focusforge_core::io::{DNG_EXTENSIONS, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
@@ -1097,6 +1097,17 @@ pub fn export_refusal_lines(err: &ExportError) -> Vec<String> {
             "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
                 .to_string(),
         ],
+        ExportError::Project(ProjectError::ExportDngNeedsRaw { .. }) => vec![
+            "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+                .to_string(),
+        ],
+        ExportError::Project(ProjectError::ExportDngColour { source, .. }) => {
+            let reason = match &**source {
+                RawError::Unsupported { detail, .. } => detail.clone(),
+                other => other.to_string(),
+            };
+            vec![format!("DNG can't describe this image's colour: {reason}.")]
+        }
         ExportError::Project(ProjectError::ExportOptions { source }) => {
             vec![format!("Some export settings aren't valid: {source}.")]
         }
@@ -1993,6 +2004,32 @@ mod export_refusal_tests {
             vec![
                 "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels."
             ]
+        );
+    }
+
+    #[test]
+    fn dng_refusals_name_the_cause() {
+        let needs_raw = ExportError::Project(ProjectError::ExportDngNeedsRaw {
+            path: PathBuf::from("/tmp/out.dng"),
+        });
+        assert_eq!(
+            export_refusal_lines(&needs_raw),
+            vec![
+                "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+            ]
+        );
+        let colour = ExportError::Project(ProjectError::ExportDngColour {
+            path: PathBuf::from("/tmp/out.dng"),
+            source: Box::new(RawError::Unsupported {
+                path: PathBuf::from("a.dng"),
+                make: "Acme".to_string(),
+                model: "M1".to_string(),
+                detail: "monochrome sensor".to_string(),
+            }),
+        });
+        assert_eq!(
+            export_refusal_lines(&colour),
+            vec!["DNG can't describe this image's colour: monochrome sensor."]
         );
     }
 
