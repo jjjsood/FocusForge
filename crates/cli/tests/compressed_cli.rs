@@ -200,6 +200,37 @@ fn stack_output_matches_uncompressed_twin() {
 }
 
 #[test]
+fn eight_bit_sets_stack_like_their_uncompressed_twin() {
+    let fixtures = common::fixtures_dir();
+    let frame = info(&fixtures.join("mantis8-64/frames/00.tif"));
+    assert_eq!(
+        frame["files"][0]["bits_per_sample"],
+        serde_json::json!([8, 8, 8])
+    );
+    assert_eq!(frame["files"][0]["reader"], "DecodedTiffStack");
+
+    let cwd = common::tmp_dir("compressed_cli_eight_bit");
+    let twin = run_stack(&cwd, &fixtures.join("mantis8-64"), &cwd.join("mantis8-64"));
+    let (twin_composite, twin_zmap) = export_planes(&cwd, &twin);
+    let expected = (samples(&twin_composite), samples(&twin_zmap));
+    let reader = TiffStack::open_files(&[twin_composite]).unwrap();
+    assert_eq!(reader.dimensions(), (64, 64));
+    assert_eq!(expected.0.len(), 64 * 64 * 3);
+
+    for set in [
+        "mantis8-64-deflate-p2-strip-ii",
+        "mantis8-64-lzw-p1-tile-mm",
+        "mantis8-64-old-deflate-p1-strip-mm",
+        "mantis8-64-lzw-p2-tile-ii",
+    ] {
+        let project = run_stack(&cwd, &fixtures.join(set), &cwd.join(set));
+        let (composite, zmap) = export_planes(&cwd, &project);
+        assert_eq!(samples(&composite), expected.0, "{set} composite");
+        assert_eq!(samples(&zmap), expected.1, "{set} Z-Map");
+    }
+}
+
+#[test]
 fn compressed_group_resume_and_export() {
     let cwd = common::tmp_dir("compressed_cli_group_export");
     let fixtures = common::fixtures_dir();

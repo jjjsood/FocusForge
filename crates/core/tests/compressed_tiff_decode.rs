@@ -252,7 +252,18 @@ fn refusals_name_the_value_found() {
     for (set, tag, value, name) in [
         ("mantis-64-lzw-p1-strip-ii", 259, 7, "Compression=7"),
         ("mantis-64-lzw-p2-strip-ii", 317, 3, "Predictor=3"),
-        ("mantis-64-lzw-p1-strip-ii", 258, 8, "BitsPerSample"),
+        (
+            "mantis-64-lzw-p1-strip-ii",
+            258,
+            12,
+            "BitsPerSample=[12, 16, 16]",
+        ),
+        (
+            "mantis-64-lzw-p1-strip-ii",
+            262,
+            3,
+            "PhotometricInterpretation=3",
+        ),
         ("mantis-64-lzw-p1-strip-ii", 284, 2, "PlanarConfiguration=2"),
         ("mantis-64-lzw-p1-strip-ii", 339, 3, "SampleFormat"),
     ] {
@@ -263,6 +274,149 @@ fn refusals_name_the_value_found() {
         std::fs::write(&path, bytes).expect("patched fixture");
         let error = TiffSegmentReader::open(&path).expect_err("unsupported value must refuse");
         assert!(error.to_string().contains(name), "{error}");
+    }
+
+    for (bits, name) in [
+        (vec![12], "BitsPerSample=[12]"),
+        (vec![8, 16, 8], "BitsPerSample=[8, 16, 8]"),
+    ] {
+        let mut header = test_header(1, 1, bits.len() as u32, 1, ByteOrder::Little, vec![0]);
+        header.bits_per_sample = bits.into_boxed_slice();
+        let outcome = std::panic::catch_unwind(|| TiffSegmentDecoder::new(&header, &[]));
+        assert!(outcome.is_ok(), "bit-depth refusal must not panic");
+        let error = outcome
+            .expect("caught result")
+            .expect_err("unsupported bit depth must refuse");
+        let text = error.to_string();
+        assert!(text.contains("generated.tif"), "{text}");
+        assert!(text.contains(name), "{text}");
+    }
+}
+
+fn eight_bit_header(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    order: ByteOrder,
+) -> TiffHeader {
+    let mut header = test_header(width, height, samples_per_pixel, 2, order, vec![0]);
+    header.bits_per_sample = vec![8; samples_per_pixel as usize].into_boxed_slice();
+    header.strip_byte_counts = vec![u64::from(width * height * samples_per_pixel)];
+    header
+}
+
+#[test]
+fn eight_bit_predictor_wraps_per_byte() {
+    let widened = |values: &[u8]| {
+        values
+            .iter()
+            .map(|&v| u16::from(v) * 257)
+            .collect::<Vec<_>>()
+    };
+    let cases = [
+        (ByteOrder::Little, 1, vec![255, 2], widened(&[255, 1])),
+        (
+            ByteOrder::Big,
+            3,
+            vec![255, 1, 2, 2, 1, 1],
+            widened(&[255, 1, 2, 1, 2, 3]),
+        ),
+    ];
+    for (order, channels, raw, expected) in cases {
+        let header = eight_bit_header(2, 1, channels, order);
+        let decoder = TiffSegmentDecoder::new(&header, &raw).expect("generated 8-bit layout");
+        assert_eq!(
+            decoder.decode(0).expect("generated 8-bit decode").samples,
+            expected
+        );
+    }
+}
+
+#[test]
+fn eight_bit_predictor_crops_partial_tiles() {
+    let cases = [
+        (ByteOrder::Little, 1, vec![255, 2, 3, 1], vec![255]),
+        (
+            ByteOrder::Big,
+            3,
+            vec![255, 1, 2, 2, 1, 1, 4, 5, 6, 3, 3, 3],
+            vec![255, 1, 2],
+        ),
+    ];
+    for (order, channels, raw, expected) in cases {
+        let mut header = eight_bit_header(1, 1, channels, order);
+        header.tile_width = Some(2);
+        header.tile_length = Some(2);
+        header.tile_offsets = vec![0];
+        header.tile_byte_counts = vec![raw.len() as u64];
+        header.strip_byte_counts.clear();
+        header.strip_offsets.clear();
+        let decoder = TiffSegmentDecoder::new(&header, &raw).expect("partial 8-bit tile layout");
+        let segment = decoder.decode(0).expect("partial 8-bit tile decode");
+        assert_eq!((segment.valid_width, segment.valid_height), (1, 1));
+        let expected: Vec<u16> = expected.iter().map(|&v: &u8| u16::from(v) * 257).collect();
+        assert_eq!(segment.samples, expected);
+    }
+}
+
+#[test]
+fn eight_bit_fixture_segments_decode_to_widened_samples() {
+    let fixtures = common::fixtures_dir();
+    let mut sets = std::fs::read_dir(&fixtures)
+        .expect("fixture root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("mantis8-64"))
+        })
+        .collect::<Vec<_>>();
+    sets.sort();
+    assert_eq!(sets.len(), 5, "one uncompressed twin and four encodings");
+
+    for set in sets {
+        for name in ["00.tif", "01.tif", "02.tif", "reference.tif"] {
+            let (eight, oracle) = if name == "reference.tif" {
+                (set.join(name), fixtures.join("mantis-64").join(name))
+            } else {
+                (
+                    set.join("frames").join(name),
+                    fixtures.join("mantis-64").join("frames").join(name),
+                )
+            };
+            let reader = TiffSegmentReader::open(&eight).expect("8-bit fixture header");
+            let stack = TiffStack::open_files(&[oracle]).expect("16-bit oracle");
+            assert!(reader.segment_count() > 0);
+            for index in 0..reader.segment_count() {
+                let segment = reader.decode(index).expect("8-bit fixture segment");
+                let (x, y) = match segment.origin {
+                    SegmentOrigin::Strip { y } => (0, y),
+                    SegmentOrigin::Tile { x, y } => (x, y),
+                };
+                let expected = stack
+                    .read_tile(
+                        0,
+                        Rect {
+                            x,
+                            y,
+                            width: segment.valid_width,
+                            height: segment.valid_height,
+                        },
+                    )
+                    .expect("oracle samples");
+                let expected: Vec<u16> = expected
+                    .samples
+                    .iter()
+                    .map(|&sample| (sample >> 8) * 257)
+                    .collect();
+                assert_eq!(
+                    segment.samples,
+                    expected,
+                    "{} segment {index}",
+                    eight.display()
+                );
+            }
+        }
     }
 }
 
@@ -394,6 +548,7 @@ fn test_header(
         path: PathBuf::from("generated.tif"),
         width,
         height,
+        orientation: 1,
         byte_order,
         ifd_offset: 0,
         bits_per_sample: vec![16; samples_per_pixel as usize].into_boxed_slice(),

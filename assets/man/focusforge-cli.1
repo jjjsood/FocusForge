@@ -23,13 +23,13 @@ Print version
 .SH SUBCOMMANDS
 .TP
 focusforge\-cli\-info(1)
-Print project, TIFF or RAW metadata for a file, or for every frame in a directory
+Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory
 .TP
 focusforge\-cli\-algorithms(1)
 List every registered algorithm, or print one named algorithm\*(Aqs full parameter schema
 .TP
 focusforge\-cli\-stack(1)
-Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
 .TP
 focusforge\-cli\-export(1)
 Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image

@@ -37,6 +37,7 @@ fn sample_frame(idx: usize) -> FrameFingerprint {
         path: PathBuf::from(format!("frame-{idx}.tif")),
         file_size: 1_000 + idx as u64,
         image_description: None,
+        orientation: 1,
         width: 64,
         height: 64,
         samples_per_pixel: 3,
@@ -141,6 +142,27 @@ fn changed_frame_is_a_miss() {
     changed_strips.frames[0].strip_byte_counts[0] += 1;
     let other_key = StageKey::align(&changed_strips, &identity);
     assert!(cache.get_alignment(&other_key, sample_hash).is_none());
+}
+
+#[test]
+fn orientation_change_is_a_miss() {
+    let identity = sample_identity("ecc", FailurePolicy::Strict);
+    let original = sample_fingerprint(2);
+    let key = StageKey::align(&original, &identity).digest();
+    assert_eq!(
+        key,
+        StageKey::align(&original.clone(), &identity).digest(),
+        "one stack keys identically"
+    );
+    for orientation in [3, 2] {
+        let mut changed = original.clone();
+        changed.frames[1].orientation = orientation;
+        assert_ne!(
+            key,
+            StageKey::align(&changed, &identity).digest(),
+            "orientation {orientation} must separate the stage key"
+        );
+    }
 }
 
 #[test]

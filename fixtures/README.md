@@ -2,7 +2,7 @@
 
 Small crops of the reference focus stack, checked in so `cargo test` has real sensor data to work on without the 16 GB stack being anywhere near the repository.
 
-Generated: 2026-10-18
+Generated: 2026-10-30
 
 ## Sets
 
@@ -34,13 +34,18 @@ Generated: 2026-10-18
 | `mantis-64-old-deflate-p2-strip-mm` | 3 | `4064,2700,64,64` | 64x64 |
 | `mantis-64-old-deflate-p2-tile-ii` | 3 | `4064,2700,64,64` | 64x64 |
 | `mantis-64-old-deflate-p2-tile-mm` | 3 | `4064,2700,64,64` | 64x64 |
+| `mantis8-64` | 3 | `4064,2700,64,64` | 64x64 |
+| `mantis8-64-deflate-p2-strip-ii` | 3 | `4064,2700,64,64` | 64x64 |
+| `mantis8-64-lzw-p1-tile-mm` | 3 | `4064,2700,64,64` | 64x64 |
+| `mantis8-64-old-deflate-p1-strip-mm` | 3 | `4064,2700,64,64` | 64x64 |
+| `mantis8-64-lzw-p2-tile-ii` | 3 | `4064,2700,64,64` | 64x64 |
 | `blackmagic-micro-dng` | 1 | single DNG | 1952x1104 |
 | `open-two-stacks` | 6 | `4064,2700,64,64` | 64x64 |
 | `open-root-and-subfolder` | 3 | `4064,2700,64,64` | 64x64 |
 | `open-rejected` | 3 | `4064,2700,64,64` | 64x64 |
 | `projects` | 3 | `4064,2700,64,64` | 64x64 |
 
-Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a `README.md` naming the source frame behind every `NN`. Outputs are little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` sets add LZW and deflate encodings in both byte orders, with strips or zero-padded tiles and Predictor 1 or 2.
+Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a `README.md` naming the source frame behind every `NN`. Outputs are little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` sets add LZW and deflate encodings in both byte orders, with strips or zero-padded tiles and Predictor 1 or 2. The `mantis8-64` sets hold the same crop as 8-bit RGB: the high byte of each `mantis-64` sample, uncompressed or in one of four encodings.
 
 `blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own README; it has no `frames/` directory or `reference.tif`.
 

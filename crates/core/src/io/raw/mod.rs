@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::imgop::develop::{Intermediate, RawDevelop};
 use rawler::rawsource::RawSource;
 
+use super::frame_cache::{CacheFault, DecodedFrame, FrameCache, TileFault};
 use super::grouping::parse_exif_datetime;
 use super::{FrameDesc, FrameReader, RawIdentity};
 use crate::algorithm::{AlgorithmError, TileReader};
@@ -194,35 +194,11 @@ struct RawFrame {
     desc: FrameDesc,
 }
 
-#[derive(Debug)]
-struct DecodedFrame {
-    width: u32,
-    height: u32,
-    samples: Vec<u16>,
-}
-
-#[derive(Debug, Default)]
-struct Cache {
-    frames: Vec<(usize, Arc<DecodedFrame>, u64)>,
-    bytes: u64,
-}
-
-fn retained_bytes(frame: &DecodedFrame, path: &Path) -> Result<u64, RawError> {
-    u64::try_from(frame.samples.len())
-        .ok()
-        .and_then(|samples| samples.checked_mul(u64::try_from(std::mem::size_of::<u16>()).ok()?))
-        .ok_or_else(|| RawError::BudgetOverflow {
-            path: path.to_path_buf(),
-        })
-}
-
 /// A RAW frame set whose metadata is available before pixel development.
 #[derive(Debug)]
 pub struct RawStack {
     frames: Vec<RawFrame>,
-    cache: Mutex<Cache>,
-    decode_lock: Mutex<()>,
-    cache_bytes: u64,
+    cache: FrameCache,
 }
 
 impl RawStack {
@@ -291,9 +267,7 @@ impl RawStack {
         }
         Ok(Self {
             frames,
-            cache: Mutex::new(Cache::default()),
-            decode_lock: Mutex::new(()),
-            cache_bytes,
+            cache: FrameCache::new(cache_bytes),
         })
     }
 
@@ -311,54 +285,6 @@ impl RawStack {
     /// Description for frame `index`.
     pub fn frame(&self, index: usize) -> Option<&FrameDesc> {
         self.frames.get(index).map(|frame| &frame.desc)
-    }
-
-    fn decoded(&self, index: usize) -> Result<Arc<DecodedFrame>, RawError> {
-        if let Some((_, frame, _)) = self
-            .cache
-            .lock()
-            .expect("RAW cache mutex is not poisoned")
-            .frames
-            .iter()
-            .find(|(cached, _, _)| *cached == index)
-        {
-            return Ok(Arc::clone(frame));
-        }
-        let frame = self.frames.get(index).ok_or(RawError::FrameIndex {
-            index,
-            count: self.frames.len(),
-        })?;
-        let required = reservation_bytes(frame)?;
-        if required > self.cache_bytes {
-            return Err(RawError::CacheTooSmall {
-                path: frame.metadata.path.clone(),
-                bound: self.cache_bytes,
-                required,
-            });
-        }
-        let mut cache = self.cache.lock().expect("RAW cache mutex is not poisoned");
-        while cache.bytes.saturating_add(required) > self.cache_bytes {
-            let (_, _, evicted) = cache.frames.remove(0);
-            cache.bytes -= evicted;
-        }
-        drop(cache);
-        let decoded = Arc::new(develop(&frame.metadata.path)?);
-        if (decoded.width, decoded.height) != (frame.desc.width, frame.desc.height) {
-            return Err(RawError::GeometryChanged {
-                path: frame.metadata.path.clone(),
-                metadata: (frame.desc.width, frame.desc.height),
-                developed: (decoded.width, decoded.height),
-            });
-        }
-        let retained = retained_bytes(&decoded, &frame.metadata.path)?;
-        let mut cache = self.cache.lock().expect("RAW cache mutex is not poisoned");
-        while cache.bytes.saturating_add(retained) > self.cache_bytes {
-            let (_, _, evicted) = cache.frames.remove(0);
-            cache.bytes -= evicted;
-        }
-        cache.frames.push((index, Arc::clone(&decoded), retained));
-        cache.bytes += retained;
-        Ok(decoded)
     }
 }
 
@@ -383,47 +309,51 @@ impl TileReader for RawStack {
         rect: Rect,
         out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
-        let _decode = self
-            .decode_lock
-            .lock()
-            .expect("RAW decode mutex is not poisoned");
-        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
-        let path = self.frames[frame].metadata.path.clone();
-        let in_bounds = rect.width > 0
-            && rect.height > 0
-            && rect
-                .x
-                .checked_add(rect.width)
-                .is_some_and(|right| right <= decoded.width)
-            && rect
-                .y
-                .checked_add(rect.height)
-                .is_some_and(|bottom| bottom <= decoded.height);
-        if !in_bounds {
-            return Err(crate::io::FrameError::from(RawError::OutOfBounds {
-                path,
-                requested: rect,
-                frame: (decoded.width, decoded.height),
+        let entry = self.frames.get(frame).ok_or(RawError::FrameIndex {
+            index: frame,
+            count: self.frames.len(),
+        });
+        let entry = entry.map_err(crate::io::FrameError::from)?;
+        let path = &entry.metadata.path;
+        let required = reservation_bytes(entry).map_err(crate::io::FrameError::from)?;
+        let decoded = self
+            .cache
+            .get_or_decode(frame, required, || {
+                let decoded = develop(path)?;
+                if (decoded.width, decoded.height) != (entry.desc.width, entry.desc.height) {
+                    return Err(RawError::GeometryChanged {
+                        path: path.clone(),
+                        metadata: (entry.desc.width, entry.desc.height),
+                        developed: (decoded.width, decoded.height),
+                    });
+                }
+                Ok(decoded)
             })
-            .into());
-        }
-        let expected = rect.width as usize * rect.height as usize * 3;
-        if out.len() != expected {
-            return Err(crate::io::FrameError::from(RawError::BufferSize {
-                path,
-                expected,
-                got: out.len(),
+            .map_err(|fault| match fault {
+                CacheFault::Decode(error) => error,
+                CacheFault::TooSmall { bound, required } => RawError::CacheTooSmall {
+                    path: path.clone(),
+                    bound,
+                    required,
+                },
+                CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
             })
-            .into());
-        }
-        let stride = decoded.width as usize * 3;
-        let row_len = rect.width as usize * 3;
-        for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
-            let source = source_y as usize * stride + rect.x as usize * 3;
-            let destination = row * row_len;
-            out[destination..destination + row_len]
-                .copy_from_slice(&decoded.samples[source..source + row_len]);
-        }
+            .map_err(crate::io::FrameError::from)?;
+        decoded
+            .copy_tile(rect, out)
+            .map_err(|fault| match fault {
+                TileFault::OutOfBounds { requested, frame } => RawError::OutOfBounds {
+                    path: path.clone(),
+                    requested,
+                    frame,
+                },
+                TileFault::BufferSize { expected, got } => RawError::BufferSize {
+                    path: path.clone(),
+                    expected,
+                    got,
+                },
+            })
+            .map_err(crate::io::FrameError::from)?;
         Ok(())
     }
 }
@@ -452,6 +382,7 @@ fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
         Intermediate::ThreeColor(pixels) => Ok(DecodedFrame {
             width: pixels.width as u32,
             height: pixels.height as u32,
+            samples_per_pixel: 3,
             samples: pixels
                 .into_flatten()
                 .into_iter()
@@ -461,6 +392,7 @@ fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
         Intermediate::Monochrome(pixels) => Ok(DecodedFrame {
             width: pixels.width as u32,
             height: pixels.height as u32,
+            samples_per_pixel: 3,
             samples: pixels
                 .data
                 .into_iter()
@@ -718,6 +650,7 @@ fn raw_desc(metadata: &RawMetadata) -> FrameDesc {
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         image_description: None,
+        orientation: 1,
         width: metadata.output_width,
         height: metadata.output_height,
         samples_per_pixel: 3,
