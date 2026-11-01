@@ -96,7 +96,7 @@ def selected_components(
                 continue
             # A patched copy of a crates.io package under vendor/ keeps its crates.io identity.
             manifest = package.get("manifest_path")
-            if not manifest or not Path(str(manifest)).is_relative_to(root / "vendor"):
+            if not manifest or not Path(str(manifest)).resolve().is_relative_to(root / "vendor"):
                 raise ValueError(f"runtime path dependency lacks a registry or git source: {name} {version}")
             package = {**package, "source": CRATES_IO}
         if not package["license"]:

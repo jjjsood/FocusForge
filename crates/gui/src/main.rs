@@ -447,6 +447,41 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
+/// Indices of `types` ordered GPU-backed first, software (`Cpu`) last; the
+/// enumeration order is kept inside a type.
+fn adapter_order(types: &[wgpu::DeviceType]) -> Vec<usize> {
+    use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other, VirtualGpu};
+    let rank = |device_type: wgpu::DeviceType| match device_type {
+        DiscreteGpu => 0,
+        IntegratedGpu => 1,
+        VirtualGpu => 2,
+        Other => 3,
+        Cpu => 4,
+    };
+    let mut order: Vec<usize> = (0..types.len()).collect();
+    order.sort_by_key(|&index| rank(types[index]));
+    order
+}
+
+/// Returns the first candidate whose `request` succeeds, trying them in
+/// order. When none does, the error names every candidate and its failure.
+fn first_working_adapter<A, D>(
+    candidates: Vec<(String, A)>,
+    mut request: impl FnMut(&A) -> Result<D, String>,
+) -> Result<(A, D), String> {
+    if candidates.is_empty() {
+        return Err("no wgpu adapter for the selected backends".to_string());
+    }
+    let mut failures = Vec::new();
+    for (name, adapter) in candidates {
+        match request(&adapter) {
+            Ok(device) => return Ok((adapter, device)),
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
 /// Builds the one device used by Slint and every imported canvas texture.
 fn manual_wgpu_configuration(
     #[cfg(target_os = "linux")] display_backend: LinuxDisplayBackend,
@@ -458,25 +493,45 @@ fn manual_wgpu_configuration(
         display_backend,
         std::env::var_os("WGPU_VALIDATION").is_some(),
     );
+    let backends = wgpu::Backends::from_env().unwrap_or_default();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().unwrap_or_default(),
+        backends,
         flags,
         backend_options: wgpu::BackendOptions::from_env_or_default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         display: None,
     });
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-        .map_err(|error| format!("no compatible wgpu adapter for the selected display: {error}"))?;
-    let limits = focusforge_gpu::limits::device_limits(&adapter.limits());
-    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("focusforge-gui-device"),
-        required_features: focusforge_gpu::limits::REQUIRED_FEATURES,
-        required_limits: limits,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        memory_hints: wgpu::MemoryHints::default(),
-        trace: wgpu::Trace::default(),
-    }))
+    let adapters = block_on(instance.enumerate_adapters(backends));
+    let types: Vec<_> = adapters
+        .iter()
+        .map(|adapter| adapter.get_info().device_type)
+        .collect();
+    let mut adapters: Vec<_> = adapters.into_iter().map(Some).collect();
+    let candidates = adapter_order(&types)
+        .into_iter()
+        .filter_map(|index| adapters[index].take())
+        .map(|adapter| (adapter.get_info().name, adapter))
+        .collect();
+    let (adapter, (device, queue)) = first_working_adapter(candidates, |adapter| {
+        let limits = focusforge_gpu::limits::device_limits(&adapter.limits());
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("focusforge-gui-device"),
+            required_features: focusforge_gpu::limits::REQUIRED_FEATURES,
+            required_limits: limits,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::default(),
+        }))
+        .map_err(|error| error.to_string())
+    })
     .map_err(|error| format!("could not create FocusForge's shared wgpu device: {error}"))?;
+    let info = adapter.get_info();
+    if info.device_type == wgpu::DeviceType::Cpu {
+        tracing::warn!(
+            "no GPU-backed adapter works; rendering on the software adapter {}",
+            info.name
+        );
+    }
 
     // Slint drops its Manual queue from thread-local backend state at process
     // shutdown, after wgpu's queue lock trace has already been destroyed.
@@ -606,6 +661,26 @@ fn teardown_is_current(generation: &std::cell::Cell<u64>, teardown: u64) -> bool
     generation.get() == teardown
 }
 
+/// Logs why the window could not start and returns the exit code. A Windows
+/// process started without any stderr (Explorer, the Start menu) also shows
+/// the message, since nothing else would; a captured stderr gets no dialog.
+fn startup_failed(message: &str) -> ExitCode {
+    tracing::error!("{message}");
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        if std::io::stderr().as_raw_handle().is_null() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("FocusForge")
+                .set_description(message)
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+        }
+    }
+    ExitCode::from(1)
+}
+
 /// Selects Slint's pinned wgpu 29 backend before any window is created.
 /// Returns whether the session is native Wayland, where dropping files onto
 /// the window does not work.
@@ -623,10 +698,7 @@ fn select_backend(
         display_backend,
     ) {
         Ok(config) => config,
-        Err(error) => {
-            tracing::error!("{error}");
-            return Err(ExitCode::from(1));
-        }
+        Err(error) => return Err(startup_failed(&error)),
     };
     #[cfg(not(target_os = "linux"))]
     let LaunchTokens = launch_tokens;
@@ -660,13 +732,13 @@ fn select_backend(
         ));
     if let Err(e) = selector.select() {
         #[cfg(target_os = "linux")]
-        tracing::error!(
+        let message = format!(
             "cannot open the {} display (check DISPLAY and WAYLAND_DISPLAY): {e}",
             display_backend.label()
         );
         #[cfg(not(target_os = "linux"))]
-        tracing::error!("{e}");
-        return Err(ExitCode::from(1));
+        let message = e.to_string();
+        return Err(startup_failed(&message));
     }
     #[cfg(target_os = "linux")]
     println!(
@@ -1728,9 +1800,21 @@ fn attach_parent_console() {
 #[cfg(not(windows))]
 fn attach_parent_console() {}
 
+/// Lets Slint accept the software adapter `manual_wgpu_configuration` may
+/// choose; a value the user set is kept.
+#[allow(unsafe_code)]
+fn allow_software_adapter() {
+    if std::env::var_os("SLINT_WGPU_CPU").is_none() {
+        // SAFETY: called first in `main`, before any other thread exists.
+        unsafe { std::env::set_var("SLINT_WGPU_CPU", "1") };
+    }
+}
+
 fn main() -> ExitCode {
-    // Before any thread or child process exists, so none inherits the tokens.
+    // Before any thread or child process exists, so none inherits the tokens
+    // and none reads the environment while it changes.
     let launch_tokens = take_launch_tokens();
+    allow_software_adapter();
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
     if let Some(code) = focusforge_diagnostics::run_monitor() {
@@ -2191,5 +2275,69 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn adapter_order_puts_gpu_types_before_cpu_and_keeps_order_within_a_type() {
+        use wgpu::DeviceType::*;
+        let types = [
+            Cpu,
+            IntegratedGpu,
+            Other,
+            Cpu,
+            VirtualGpu,
+            DiscreteGpu,
+            IntegratedGpu,
+        ];
+        assert_eq!(adapter_order(&types), [5, 1, 6, 4, 2, 0, 3]);
+    }
+
+    #[test]
+    fn adapter_order_keeps_a_cpu_only_list_and_an_empty_list() {
+        use wgpu::DeviceType::Cpu;
+        assert_eq!(adapter_order(&[Cpu, Cpu]), [0, 1]);
+        assert!(adapter_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn adapter_fallthrough_takes_the_first_success_and_stops() {
+        let mut calls = 0;
+        let candidates = vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ];
+        let (adapter, device) = first_working_adapter(candidates, |adapter| {
+            calls += 1;
+            if *adapter == 1 {
+                Err("no features".to_string())
+            } else {
+                Ok(adapter * 10)
+            }
+        })
+        .expect("the second candidate works");
+        assert_eq!((adapter, device, calls), (2, 20, 2));
+    }
+
+    #[test]
+    fn adapter_fallthrough_names_every_failure() {
+        let candidates = vec![
+            ("alpha".to_string(), ()),
+            ("beta".to_string(), ()),
+            ("gamma".to_string(), ()),
+        ];
+        let error = first_working_adapter::<_, ()>(candidates, |_| Err("boom".to_string()))
+            .expect_err("every candidate fails");
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(error.contains(name), "{error}");
+        }
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn adapter_fallthrough_errs_on_an_empty_list() {
+        let error =
+            first_working_adapter::<(), ()>(Vec::new(), |_| Ok(())).expect_err("nothing to try");
+        assert!(error.contains("no wgpu adapter"), "{error}");
     }
 }
