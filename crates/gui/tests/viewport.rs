@@ -669,6 +669,8 @@ fn gestures_come_from_the_input_map() {
     let raw_gesture_callback_exceptions = [
         "canvas.slint",
         "comparison_window.slint",
+        "tab_strip.slint",
+        "ff_window_bar.slint",
         "ff_slider.slint",
         "ff_scrollbar.slint",
         "settings_panel.slint",

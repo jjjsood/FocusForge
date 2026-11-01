@@ -34,6 +34,8 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 - `focusforge-cli` no longer exits with a panic and a crash report when the program
   reading its output closes the pipe early (for example `focusforge-cli algorithms | head -1`);
   the command finishes with its own exit status.
+- On macOS, a short drag on the tab strip or on the comparison window's title bar now
+  moves the window, without the delay.
 
 ## [0.1.0] - 2026-10-27
 

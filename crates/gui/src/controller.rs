@@ -216,7 +216,6 @@ pub fn storage_view(
 pub enum ShellEvent {
     ModeChanged(ShellMode),
     DockTabSelected(DockTab),
-    WindowDragRequested,
     WindowMinimizeRequested,
     /// Carries the new maximized state, so the bridge can push it straight
     /// into `AppWindow`'s `window-maximized` property (the glyph binding)
@@ -329,7 +328,6 @@ pub enum WindowTarget {
 /// A drawn chrome control's requested native operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowChromeIntent {
-    Drag,
     Minimize,
     ToggleMaximize,
 }
@@ -1761,6 +1759,10 @@ pub struct AppController {
     /// An `Arc`, not a `Box`, so [`Self::start_bundle_write`]'s thread can
     /// hold its own clone and call it once the write is done.
     sink: Option<Arc<dyn Fn(ShellEvent) + Send + Sync>>,
+    /// Starts the native window move. Called synchronously from the pointer
+    /// press, never through the sink: macOS reads the current event, which is
+    /// the mouse-down only while the press is still being dispatched.
+    native_drag: Option<Arc<dyn Fn(WindowTarget) + Send + Sync>>,
     job: JobSlot,
     /// Test-only override for the window's scratch root: unset, a run's
     /// ledger, staging, held checkpoints and plane cache live under the
@@ -1996,6 +1998,11 @@ impl AppController {
     /// them.
     pub fn set_sink(&mut self, sink: Arc<dyn Fn(ShellEvent) + Send + Sync>) {
         self.sink = Some(sink);
+    }
+
+    /// Installs the hook that starts a native window move for `target`.
+    pub fn set_native_drag(&mut self, drag: Arc<dyn Fn(WindowTarget) + Send + Sync>) {
+        self.native_drag = Some(drag);
     }
 
     fn emit(&self, event: ShellEvent) {
@@ -2517,9 +2524,15 @@ impl AppController {
         self.state.active().is_some_and(|tab| tab.fused().is_some())
     }
 
-    /// The tab strip's pointer-down, forwarded from `window-drag-requested`.
-    pub fn tab_strip_pressed(&self) {
-        self.emit(ShellEvent::WindowDragRequested);
+    /// A pointer event on a window's drag region. Only a left-button press
+    /// starts the native move, and it starts it before this returns.
+    pub fn window_drag_pointer(&self, target: WindowTarget, button: Button, down: bool) {
+        if button == Button::Left
+            && down
+            && let Some(drag) = &self.native_drag
+        {
+            drag(target);
+        }
     }
 
     pub fn window_minimize(&self) {
@@ -2531,7 +2544,6 @@ impl AppController {
     pub fn window_chrome(&mut self, target: WindowTarget, intent: WindowChromeIntent) {
         match target {
             WindowTarget::Main => match intent {
-                WindowChromeIntent::Drag => self.tab_strip_pressed(),
                 WindowChromeIntent::Minimize => self.window_minimize(),
                 WindowChromeIntent::ToggleMaximize => self.window_maximize_toggle(),
             },

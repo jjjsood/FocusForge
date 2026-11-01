@@ -87,12 +87,10 @@ export component FFCanvas inherits Rectangle {
     callback pane-hover-changed();
     callback frame-undock-requested();
     callback composite-undock-requested();
-    // The one input dispatch point's gesture forwards. No other `.slint`
-    // file in the crate declares `scroll-event`, `pointer-event` or
-    // `moved`. The two extra `length`s carry the wheel's own cursor
-    // position (`self.mouse-x`/`mouse-y` are written before `scroll-event`
-    // is invoked), since `moved` only fires while the pointer is pressed
-    // and cannot track a hovering cursor.
+    // Forwards the rebindable canvas gestures. The two extra `length`s carry
+    // the wheel's own cursor position (`self.mouse-x`/`mouse-y` are written
+    // before `scroll-event` is invoked), since `moved` only fires while the
+    // pointer is pressed and cannot track a hovering cursor.
     callback canvas-scrolled(length, length, length, length, bool, bool, bool);
     // The `int` is `event.kind` folded to 0 = Down, 1 = Up or Cancel,
     // 2 = Move -- `PointerEventKind` itself is not publicly nameable from

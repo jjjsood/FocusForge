@@ -1079,6 +1079,9 @@ def hosted_runner_path_cases() -> None:
         (windows, r"C:\Users\runneradmin\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib\rustlib\etc\intrinsic.natvis", "dependency/intrinsic.natvis"),
         (windows, r"\\?\D:\a\FocusForge\FocusForge\crates\cli\src\main.rs", "crates/cli/src/main.rs"),
         (windows, r"\\?\C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
+        (windows, r"minkernel\crts\ucrt\src\appcrt\tran\amd64\fmod.asm", "dependency/fmod.asm"),
+        (windows, r"MinKernel\CRTs\ucrt\inc\corecrt_internal.h", "dependency/corecrt_internal.h"),
+        (windows, r"VCCRT\vcruntime\inc\internal_shared.h", "dependency/internal_shared.h"),
         (macos, f"{macos}/crates/cli/src/main.rs", "crates/cli/src/main.rs"),
         (macos, "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap-4.6.6/src/lib.rs", "dependency/lib.rs"),
         (macos, "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/stdio.h", "dependency/stdio.h"),
@@ -1091,6 +1094,9 @@ def hosted_runner_path_cases() -> None:
         (windows, r"D:\a\FocusForge\FocusForge\..\secret\main.rs"),
         (windows, r"D:\a\FocusForge\FocusForge\private\main.rs"),
         (windows, r"C:\Program Files\Microsoft Visual Studio\..\..\Users\runneradmin\secret.h"),
+        (windows, r"private\notes.h"),
+        (windows, r"minkernel\other\notes.h"),
+        (windows, r"minkernel\crts\..\..\secret.h"),
         (macos, "/Users/runner/Documents/secret.rs"),
         (macos, f"{macos}/../private/main.rs"),
         (macos, "/Users/runner/.cargo/registry/src/../../../private/main.rs"),
@@ -1120,6 +1126,15 @@ def hosted_runner_path_cases() -> None:
             symbol.write_text(f"MODULE windows x86_64 {'A' * 33} app.pdb\nFILE 0 {good}\nFUNC 1 1 0 f\n")
             module.canonicalize_symbol_sources(symbol)
         assert "FILE 0 crates/gui/src/main.rs\n" in symbol.read_text()
+        many = [rf"C:\Users\runneradmin\private\{n}.rs" for n in range(7)]
+        symbol.write_text("MODULE windows x86_64 " + "A" * 33 + " app.pdb\n" + "".join(f"FILE {n} {p}\n" for n, p in enumerate(many)))
+        with hosted_runner(module, windows):
+            try: module.canonicalize_symbol_sources(symbol)
+            except ValueError as error: assert all(p in str(error) for p in many) and "more)" not in str(error), str(error)
+            else: raise AssertionError("private FILE records accepted")
+        try: module.reject_private_native(many)
+        except ValueError as error: assert all(p.replace("\\", "/") in str(error) for p in many) and str(error).startswith("private source path in native symbols: "), str(error)
+        else: raise AssertionError("private native paths accepted")
     pdb_source = r"D:\a\FocusForge\FocusForge\crates\cli\src\main.rs"
     with tempfile.TemporaryDirectory() as temporary:
         pdb = Path(temporary) / "runner.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, pdb_source))

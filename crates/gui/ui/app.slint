@@ -35,7 +35,7 @@ export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView }
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
     // `src/bridge.rs`.
-    callback window-drag-requested();
+    callback window-drag-pointer(PointerEventButton, bool);
     callback window-minimize-requested();
     callback window-maximize-toggled();
     callback window-close-requested();
@@ -151,7 +151,7 @@ export component AppWindow inherits Window {
         can-scroll-right: root.can-scroll-right;
         projects-overlay-open: root.projects-overlay-open;
 
-        window-drag-requested => { root.window-drag-requested(); }
+        window-drag-pointer(button, down) => { root.window-drag-pointer(button, down); }
         window-minimize-requested => { root.window-minimize-requested(); }
         window-maximize-toggled => { root.window-maximize-toggled(); }
         window-close-requested => { root.window-close-requested(); }
