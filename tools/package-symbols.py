@@ -247,8 +247,8 @@ def builder_location(value: str) -> str:
     match = TOOLCHAIN_ROOTS.match(path)
     if match:
         return "/usr/include/" + match.group(1)
-    # The statically linked C runtime's debug info names Microsoft's build tree relatively.
-    if re.match(r"(?i)(?:minkernel/crts|VCCRT|onecore/internal/sdk/inc|OSS/ARM-software/optimized-routines)/.+$", path):
+    # The statically linked C runtime's debug info names Microsoft's build trees relatively.
+    if re.match(r"(?i)(?:minkernel/crts|VCCRT|onecore/internal|onecore/external|OSS/ARM-software/optimized-routines|shared/inc)/.+$", path):
         return "/usr/include/" + path
     return path
 
@@ -281,7 +281,7 @@ def normalized_source(value: str) -> str:
             return "crates/" + source.split("crates/", 1)[1]
     if source.startswith("dependency/"):
         return source
-    if source.startswith(("/rustc/", "/rust/deps/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/out/target/", "/usr/include/")) or re.match(r"^/usr/lib/gcc/[^/]+/[^/]+/include/.+", source):
+    if source.startswith(("/rustc/", "/rust/deps/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/work/vendor/", "C:/work/vendor/", "/out/target/", "/usr/include/")) or re.match(r"^/usr/lib/gcc/[^/]+/[^/]+/include/.+", source):
         return "dependency/" + source.rsplit("/", 1)[-1]
     raise ValueError(f"private or unsupported source path in symbols: {clipped(value)}")
 
@@ -320,7 +320,7 @@ def resolved_native_source(directory: str, value: str) -> str:
 
 def safe_native_source(path: str) -> bool:
     canonical = posixpath.normpath(path.replace("\\", "/"))
-    return canonical == "/work" or canonical.startswith(("/work/crates/", "C:/work/crates/", "/work/.cargo/registry/", "C:/work/.cargo/registry/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/rustc/", "/rust/deps/", "/out/target/", "/usr/", "/lib/", "/lib64/", "/bin/", "/etc/", "/dev/", "/proc/", "/sys/"))
+    return canonical == "/work" or canonical.startswith(("/work/crates/", "C:/work/crates/", "/work/.cargo/registry/", "C:/work/.cargo/registry/", "/work/vendor/", "C:/work/vendor/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/rustc/", "/rust/deps/", "/out/target/", "/usr/", "/lib/", "/lib64/", "/bin/", "/etc/", "/dev/", "/proc/", "/sys/"))
 
 
 def safe_source_less_cu(name: str) -> bool:
@@ -744,15 +744,17 @@ def _inspect_windows_native(path: Path) -> dict:
                     if end < 0: raise ValueError("unterminated C13 source record")
                     value = strings[position:end].decode("utf-8", "strict")
                     if not absolute_native(value):
-                        if len(set(module_directories)) != 1:
+                        # A module with no compilation directory (the static C runtime's) keeps the relative path for mapping and rejection.
+                        if len(set(module_directories)) > 1:
                             raise ValueError("unresolved relative C13 source path")
-                        value = resolved_native_source(module_directories[0], value)
+                        if module_directories: value = resolved_native_source(module_directories[0], value)
                     paths.append(value)
                 c13_records += len(offsets)
         cursor = next_cursor
-    if any(not absolute_native(value) for value in file_paths) and len(set(compilation_directories)) != 1: raise ValueError("unresolved relative PDB source path")
+    # Several compilation directories leave a relative path unresolved for mapping and rejection.
+    single = compilation_directories[0] if len(set(compilation_directories)) == 1 else None
     paths.extend(compilation_directories)
-    paths.extend(resolved_native_source(compilation_directories[0], value) if not absolute_native(value) else value for value in file_paths)
+    paths.extend(resolved_native_source(single, value) if single and not absolute_native(value) else value for value in file_paths)
     paths = [native_source(item) for item in paths]
     reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "pdb-dbi", "native_inspection_sha256": digest(path), "coverage": {"dbi_stream": 3, "file_records": len(file_paths), "module_c13_records": c13_records, "environment_records": environment_records}, "source_paths": sorted(set(paths))}
