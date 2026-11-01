@@ -248,7 +248,7 @@ def builder_location(value: str) -> str:
     if match:
         return "/usr/include/" + match.group(1)
     # The statically linked C runtime's debug info names Microsoft's build tree relatively.
-    if re.match(r"(?i)(?:minkernel/crts|VCCRT)/.+$", path):
+    if re.match(r"(?i)(?:minkernel/crts|VCCRT|onecore/internal/sdk/inc|OSS/ARM-software/optimized-routines)/.+$", path):
         return "/usr/include/" + path
     return path
 
