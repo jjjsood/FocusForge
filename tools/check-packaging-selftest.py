@@ -903,7 +903,8 @@ def source_privacy_cases() -> None:
         else: raise AssertionError(f"private dependency source accepted: {source}")
     assert module.safe_source_less_cu("crates/cli/src/main.rs/@/focusforge_cli.fixture")
     assert module.safe_source_less_cu("/root/.cargo/registry/src/index.crates.io/example/src/lib.rs/@/example.fixture")
-    for value in ("../private/checkout/@/fixture", "private checkout/src/main.rs/@/fixture", "/private/checkout/src/main.rs/@/fixture", "crates/cli/src/main.rs"):
+    assert module.safe_source_less_cu("vendor/minidump-writer/src/lib.rs/@/minidump_writer.fixture")
+    for value in ("../private/checkout/@/fixture", "private checkout/src/main.rs/@/fixture", "/private/checkout/src/main.rs/@/fixture", "crates/cli/src/main.rs", "vendors/x/src/lib.rs/@/fixture", "other/x/src/lib.rs/@/fixture"):
         assert not module.safe_source_less_cu(value)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
