@@ -38,7 +38,8 @@ export component FFToolbar inherits Rectangle {
         y: root.button-y;
         width: ShellGeometry.toolbar-button-width;
         compact: true;
-        glyph: "⏸";
+        has-icon: true;
+        icon-source: @image-url("../../../../assets/icons/pause.svg");
         text: "Pause";
         clicked => { root.pause-or-resume-requested(); }
     }
@@ -47,7 +48,8 @@ export component FFToolbar inherits Rectangle {
         y: root.button-y;
         width: ShellGeometry.toolbar-button-width;
         compact: true;
-        glyph: "▶";
+        has-icon: true;
+        icon-source: @image-url("../../../../assets/icons/play.svg");
         text: "Resume";
         clicked => { root.pause-or-resume-requested(); }
     }
@@ -59,7 +61,8 @@ export component FFToolbar inherits Rectangle {
         y: root.button-y;
         width: ShellGeometry.toolbar-button-width;
         compact: true;
-        glyph: "☐";
+        has-icon: true;
+        icon-source: @image-url("../../../../assets/icons/square.svg");
         text: "Cancel";
         clicked => { root.cancel-requested(); }
     }
@@ -69,7 +72,8 @@ export component FFToolbar inherits Rectangle {
         width: ShellGeometry.toolbar-button-width;
         compact: true;
         kind: "quiet";
-        glyph: "☐";
+        has-icon: true;
+        icon-source: @image-url("../../../../assets/icons/square.svg");
         text: "Cancelling…";
         enabled: false;
     }
@@ -79,7 +83,8 @@ export component FFToolbar inherits Rectangle {
         width: ShellGeometry.toolbar-button-width;
         compact: true;
         kind: "primary";
-        glyph: "↻";
+        has-icon: true;
+        icon-source: @image-url("../../../../assets/icons/rotate-cw.svg");
         text: root.would-queue ? "Queued" : "Retry";
         clicked => { root.retry-requested(); }
     }
@@ -89,7 +94,8 @@ export component FFToolbar inherits Rectangle {
         width: ShellGeometry.toolbar-button-width;
         compact: true;
         kind: "primary";
-        glyph: "▶";
+        has-icon: true;
+        icon-source: @image-url("../../../../assets/icons/play.svg");
         text: root.would-queue ? "Queued" : "Fuse stack";
         enabled: root.fuse-enabled;
         clicked => { root.fuse-requested(); }

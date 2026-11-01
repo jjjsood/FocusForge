@@ -13,7 +13,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`info`](#info) | prints project, TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
-| [`export`](#export) | renders a checkpoint to a TIFF, PNG or JPEG image, and/or writes its Z-Map or one source frame |
+| [`export`](#export) | renders a checkpoint to a TIFF, PNG, JPEG or (for RAW projects) DNG image, and/or writes its Z-Map or one source frame |
 | [`retouch`](#retouch) | appends an op list of brush strokes to a project as new checkpoints |
 | [`history`](#history) | lists, deletes and compacts a project's checkpoints |
 | [`align`](#align) | computes and reports each frame's transform, without fusing |
@@ -229,7 +229,7 @@ The `raw` object contains:
 focusforge-cli stack [OPTIONS] <DIR>
 ```
 
-Fuses every TIFF or supported RAW frame in `<DIR>` (non-recursive, descending into
+Fuses every TIFF, JPEG or supported RAW frame in `<DIR>` (non-recursive, descending into
 `<DIR>/frames` when that subdirectory exists) into one **project** per
 detected stack, through a registered stacking algorithm. A run prepares
 projects for review; it does not write an image file — run
@@ -238,8 +238,10 @@ out-of-core scheduler bounded by a memory budget. RAW decoding develops
 and caches whole frames within the host memory budget.
 
 `stack` accepts mixed uncompressed, LZW-compressed, Deflate-compressed, and
-tiled 16-bit unsigned chunky TIFF frames. RAW files use `rawler`; a stack
-cannot mix TIFF and RAW frames. Unsupported layouts or unreadable RAW files
+tiled 8-bit or 16-bit unsigned chunky TIFF frames (8-bit samples are widened
+to the 16-bit range), and 8-bit JPEG frames. RAW files use `rawler` and are
+fused as unclipped 32-bit float samples that clip once, to 16 bits, at
+export. A stack cannot mix TIFF, JPEG and RAW frames. Unsupported layouts or unreadable RAW files
 stop the run with the frame and reason named.
 
 **Alignment runs first, by default.** Before fusion, `stack` computes each
@@ -757,7 +759,7 @@ opened project. See
 | `-o, --output <FILE>` | write the image to this path |
 | `--zmap <FILE>` | write the Z-Map to this path (as TIFF); needs no source frames |
 | `--checkpoint <ID>` | the checkpoint to export, an id or a unique id prefix; defaults to the head |
-| `--format <FORMAT>` | `tiff`, `png` or `jpeg`. Inferred from `-o`'s extension when omitted: `.tif`/`.tiff`, `.png`, `.jpg`/`.jpeg`; no extension means TIFF. An unrecognised extension needs `--format`; a `--format` that contradicts a recognised extension is refused |
+| `--format <FORMAT>` | `tiff`, `png`, `jpeg` or `dng` (a linear DNG of a RAW project; no format options, `--icc` has no effect). Inferred from `-o`'s extension when omitted: `.tif`/`.tiff`, `.png`, `.jpg`/`.jpeg`, `.dng`; no extension means TIFF. An unrecognised extension needs `--format`; a `--format` that contradicts a recognised extension is refused |
 | `--tiff-bits <BITS>` | TIFF bit depth: `16` (default) or `8` |
 | `--tiff-compression <NAME>` | TIFF compression: `none` (default), `lzw` or `deflate` |
 | `--png-bits <BITS>` | PNG bit depth: `16` (default) or `8` |

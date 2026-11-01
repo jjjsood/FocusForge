@@ -6,6 +6,10 @@ through the log, and a new stroke after an undo discards what redo held. The
 Z-Map is analysis only: it feeds the rainbow overlay and the pipette and
 renders nothing.
 
+On a RAW project the result holds unclipped 32-bit float samples: a live
+stroke blends in 32-bit float, and the canvas, the saved view and every export
+clip the result once, to 16 bits.
+
 ## From the command line
 
 ```bash

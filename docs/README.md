@@ -10,14 +10,15 @@ Using FocusForge: shooting a stack, loading it, choosing an algorithm,
 retouching the result.
 
 - [`getting-started.md`](getting-started.md) — release artifacts when a
-  matching release provides them, or the source-build fallback when they do not
+  matching release provides them, the macOS Gatekeeper prompt, running on a
+  machine without a GPU, or the source-build fallback
 
 - [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
-  window, the dock's `Images` panel and the four-section `Settings` panel, the five-tab settings window, running and controlling
+  window, the dock's `Images` panel and the four-section `Settings` panel, the six-tab settings window, running and controlling
   a fuse, saving the held result, exporting an image, switching between open
   projects and the settings file
-- [`guide/stacking.md`](guide/stacking.md) — stacking TIFF or supported RAW
-  frames, choosing a fusion method, brightness equalization, getting a TIFF, PNG or JPEG image back with
+- [`guide/stacking.md`](guide/stacking.md) — stacking TIFF, JPEG or supported RAW
+  frames, choosing a fusion method, brightness equalization, getting a TIFF, PNG, JPEG or DNG image back with
   `export` and its format options, and getting the Z-Map
 - [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
   align`/`stack` register frames before fusing, choosing a mode, and

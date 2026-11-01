@@ -12,13 +12,13 @@ would and opens each proposed stack as its own tab; a `*.ffp` path reopens a
 project that was already stacked. `--open` is repeatable — each path is
 opened in turn, the next one waiting for the one before it to finish rather
 than racing it. Leaving `--open` off starts with an empty window: click
-**Open…** to choose the TIFF or camera RAW frames of one stack, which start
+**Open…** to choose the TIFF, JPEG or camera RAW frames of one stack, which start
 one new tab (sorted by name), or drop a folder or a set of frames onto the
 window. The empty window's caption reads "Drop a folder or stack", or
 "Dropping is unavailable on native Wayland" where drops do not work.
 Ctrl+N and the Projects rail's **New project** ask for a folder instead. A path that fails to open shows the same refusal dialog a failed
 drop or picker choice would, rather than closing the window. A folder with
-no readable frames is refused naming the formats read, 16-bit TIFF and camera
+no readable frames is refused naming the formats read: TIFF, JPEG and camera
 RAW; Escape closes the dialog. Dialogs with a Cancel button also show an x at
 the top right that acts as Cancel.
 
@@ -176,12 +176,14 @@ or retouched result, and exports the position you are looking at: a saved
 checkpoint, an unsaved fuse result, or your current unsaved edits. The
 dialog offers:
 
-- **Format** — TIFF, PNG or JPEG.
+- **Format** — TIFF, PNG, JPEG or DNG. DNG has no settings: it is a 16-bit,
+  uncompressed linear file in the camera's own colour, and needs a project
+  stacked from camera RAW files.
 - That format's settings, listed from the same descriptors `focusforge-cli
   export` takes: bit depth and compression for TIFF and PNG, quality and
   chroma subsampling for JPEG (4:2:0 by default).
 - **Metadata** — one switch. On carries the EXIF and ICC profile of the
-  reference frame; off carries nothing.
+  reference frame; off carries nothing (a DNG always carries its camera colour).
 
 **Export** then opens the system save dialog and writes the image, with
 progress shown in the dialog. The format and each format's last settings are remembered in

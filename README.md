@@ -28,13 +28,14 @@
 ## Features
 
 **From shoot to sharp image**
-- Drop in a focus bracket straight from the camera, RAW or 16-bit TIFF, and get one image sharp from front to back
+- Drop in a focus bracket straight from the camera, camera RAW, TIFF or JPEG, and get one image sharp from front to back
 - Shot several subjects in one session? FocusForge sorts the card into separate stacks for you; check the split before it runs
 - Long brackets of high-resolution frames run on an ordinary computer, however much memory the stack would need
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
 - Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map when you plan to retouch a lot
-- Fast on a graphics card, the same result without one
+- Fast on a graphics card, the same result without one; the window also starts where only a software renderer is available
+- RAW stacks keep highlights above white until the final image is written
 
 **Fixing what the stack got wrong**
 - Halos, ghosting or a misplaced bristle? Brush in the right frame by hand with a soft brush
@@ -50,6 +51,7 @@
 
 **Delivering the result**
 - Export TIFF, PNG or JPEG with your camera metadata, colour profile and keywords intact
+- Hand a RAW stack's result to a raw converter as a linear DNG, with exposure and white balance adjustable there
 - If something breaks, FocusForge packs a privacy-safe report you can send in
 
 Details for each are in the [guides](docs/README.md).
@@ -58,7 +60,7 @@ Details for each are in the [guides](docs/README.md).
 
 Linux: install the matching `.deb` or run its AppImage from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source.
 macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
-Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source. See [getting started](docs/getting-started.md) for paths.
+Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source; no Visual C++ redistributable is needed. See [getting started](docs/getting-started.md) for paths.
 
 ## Quick start
 

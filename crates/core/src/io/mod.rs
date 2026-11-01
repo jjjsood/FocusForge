@@ -16,9 +16,12 @@
 
 mod error;
 mod frame;
+mod frame_cache;
 mod frame_set;
 mod grouping;
+mod jpeg;
 mod metadata;
+mod orientation;
 mod paths;
 pub mod raw;
 #[cfg(feature = "test-algorithms")]
@@ -33,6 +36,7 @@ pub use grouping::{
     CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
     propose_with_progress,
 };
+pub use jpeg::{JpegError, JpegStack};
 pub(crate) use metadata::{
     IccOrigin, MetadataPlan, XMP_APP1_HEADER, dng_entries, exif_blob, icc_tag_entry,
     iptc_tag_entry, photoshop_iptc_segment, resolve_plan, set_entry, xmp_tag_entry,

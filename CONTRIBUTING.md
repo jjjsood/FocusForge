@@ -42,6 +42,9 @@ tests/ui/      end-to-end window journeys written as numbered steps
 
 ## Tech stack
 
+- The Windows programs link the C runtime statically (`.cargo/config.toml`),
+  and the macOS app bundle is signed ad hoc by `tools/package-macos.sh`.
+
 - Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 - `focusforge-core`: `memmap2`, `thiserror`, `inventory` (algorithm
   registration), `rayon`, `serde`/`serde_json`, `blake3` (project-blob

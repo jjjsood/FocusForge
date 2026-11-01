@@ -323,9 +323,10 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "xmp".to_string(),
             label: "Carry XMP".to_string(),
-            help: "Carries the source frame's XMP packet verbatim. Off by default: the \
-                   reference frames' XMP is the source tool's own edit history, which does not \
-                   describe the fused result."
+            help: "Carries the source frame's XMP packet, with any tiff:Orientation set to 1 \
+                   to match the upright pixels. Off by default: the reference frames' XMP is \
+                   the source tool's own edit history, which does not describe the fused \
+                   result."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(false),

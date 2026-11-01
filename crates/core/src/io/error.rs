@@ -34,6 +34,9 @@ pub enum Refusal {
     /// `SampleFormat` other than 1 (unsigned integer).
     #[error("SampleFormat={0}, only unsigned integer (1) is supported")]
     SampleFormat(u16),
+    /// `Orientation` other than 1: only the decoded reader applies it.
+    #[error("Orientation={0}, only 1 (stored upright) is memory-mapped")]
+    Orientation(u16),
 }
 
 /// Everything that can go wrong opening a stack or reading a tile.

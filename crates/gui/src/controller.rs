@@ -4428,7 +4428,7 @@ impl AppController {
         match &err {
             EntryError::Unreadable { path }
             | EntryError::NoReadableFrames { path }
-            | EntryError::MixedKinds { path }
+            | EntryError::MixedKinds { path, .. }
             | EntryError::SeveralFolders { path } => {
                 self.record_failure(not_a_project_card(path.clone()));
             }
@@ -6083,7 +6083,7 @@ impl AppController {
         if self.state.import.in_flight {
             return Err(ImportRefused::StillChecking);
         }
-        let incoming = entry::expand_import(paths)?;
+        let incoming = entry::expand_import(paths, &tab.frames)?;
         let tab_id = tab.id;
         let frames = tab.frames.clone();
 

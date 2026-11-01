@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use super::super::error::{Refusal, TiffError};
 use super::super::metadata::{SourceKind, SourceMetadata, TagEntry};
+use super::super::orientation::Orientation;
 use crate::io::FrameDesc;
 use crate::tile::SampleFormat;
 
@@ -29,6 +30,7 @@ const TAG_BITS_PER_SAMPLE: u16 = 258;
 const TAG_COMPRESSION: u16 = 259;
 const TAG_PHOTOMETRIC: u16 = 262;
 const TAG_IMAGE_DESCRIPTION: u16 = 270;
+const TAG_ORIENTATION: u16 = 274;
 pub(crate) const TAG_STRIP_OFFSETS: u16 = 273;
 const TAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TAG_ROWS_PER_STRIP: u16 = 278;
@@ -45,7 +47,7 @@ pub(crate) const TAG_EXIF_IFD: u16 = 34665;
 /// EXIF `DateTimeOriginal` -- **capture** time, the tag grouping reads.
 /// Never `DateTime` (306), which on the reference data is darktable's
 /// *export* time, thirteen days after the shot.
-const TAG_DATE_TIME_ORIGINAL: u16 = 36867;
+pub(crate) const TAG_DATE_TIME_ORIGINAL: u16 = 36867;
 /// GPS sub-IFD pointer: a `LONG` offset to a second IFD.
 pub(crate) const TAG_GPS_IFD: u16 = 34853;
 pub(crate) const TAG_ICC_PROFILE: u16 = 34675;
@@ -147,11 +149,12 @@ impl ByteOrder {
 
 impl From<&TiffHeader> for FrameDesc {
     fn from(header: &TiffHeader) -> Self {
+        let (width, height) = header.upright_dimensions();
         let layout_signature = vec![
             header.byte_order.tag().to_string(),
             format!("rps={}", header.rows_per_strip),
             format!("compression={}", header.compression),
-            format!("{}x{}", header.width, header.height),
+            format!("{width}x{height}"),
             format!("bits={:?}", header.bits_per_sample),
             format!("samples={}", header.samples_per_pixel),
             format!("photometric={}", header.photometric),
@@ -162,8 +165,9 @@ impl From<&TiffHeader> for FrameDesc {
             path: header.path.clone(),
             file_size: header.file_size,
             image_description: header.image_description.clone(),
-            width: header.width,
-            height: header.height,
+            orientation: header.orientation,
+            width,
+            height,
             samples_per_pixel: header.samples_per_pixel,
             strip_offsets: header.strip_offsets.clone(),
             strip_byte_counts: header.strip_byte_counts.clone(),
@@ -224,6 +228,50 @@ fn read_ifd<S: ByteSource>(
         });
     }
     Ok(entries)
+}
+
+/// The Orientation value of an IFD's entries: a single SHORT in tag 274.
+fn orientation_value(entries: &[RawEntry], byte_order: ByteOrder) -> Option<u16> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.tag == TAG_ORIENTATION && entry.field_type == 3 && entry.count == 1)?;
+    byte_order.u16_at(&entry.payload)
+}
+
+/// The Orientation value (tag 274) in IFD0 of an in-memory TIFF blob, such
+/// as an EXIF segment carries; `None` when the blob is malformed or has no
+/// such tag.
+pub(crate) fn exif_orientation(blob: &[u8]) -> Option<u16> {
+    let (byte_order, ifd0) = blob_ifd0(blob)?;
+    let entries = read_ifd(&blob, byte_order, ifd0, Path::new("")).ok()?;
+    orientation_value(&entries, byte_order)
+}
+
+/// The descriptive metadata of an in-memory TIFF blob, such as an EXIF
+/// segment carries, read like a TIFF source's. A blob without a byte-order
+/// mark or IFD0 offset yields an empty result with one warning naming `path`.
+pub(crate) fn read_exif_metadata(blob: &[u8], path: &Path) -> SourceMetadata {
+    match blob_ifd0(blob) {
+        Some((byte_order, ifd0)) => read_tiff_metadata(&blob, byte_order, ifd0, path),
+        None => SourceMetadata {
+            warnings: vec![format!(
+                "{}: EXIF segment is not a TIFF structure",
+                path.display()
+            )],
+            ..Default::default()
+        },
+    }
+}
+
+/// A blob's byte order and IFD0 offset, from its 8-byte TIFF header.
+fn blob_ifd0(blob: &[u8]) -> Option<(ByteOrder, u64)> {
+    let byte_order = match blob.get(0..2)? {
+        b"II" => ByteOrder::Little,
+        b"MM" => ByteOrder::Big,
+        _ => return None,
+    };
+    let ifd0 = u64::from(byte_order.u32_at(blob.get(4..8)?)?);
+    Some((byte_order, ifd0))
 }
 
 /// One open header's source, byte order, size and path, bundled so entry
@@ -480,6 +528,9 @@ pub struct TiffHeader {
     pub path: PathBuf,
     pub width: u32,
     pub height: u32,
+    /// EXIF Orientation (1-8); an absent, non-SHORT or out-of-range tag reads
+    /// as 1. `width` and `height` stay as stored; see [`Self::upright_dimensions`].
+    pub orientation: u16,
     pub byte_order: ByteOrder,
     /// IFD0's file offset, for a metadata read over the same bytes this
     /// header's own parse already located.
@@ -512,6 +563,12 @@ pub struct TiffHeader {
 }
 
 impl TiffHeader {
+    /// `(width, height)` of the frame once its Orientation is applied:
+    /// swapped for the transposing values 5-8.
+    pub fn upright_dimensions(&self) -> (u32, u32) {
+        Orientation::from_exif(self.orientation).upright_dims(self.width, self.height)
+    }
+
     pub fn strip_count(&self) -> usize {
         self.strip_offsets.len()
     }
@@ -726,9 +783,13 @@ impl TiffHeader {
             rows_per_strip = height;
         }
 
+        let orientation = orientation_value(&entries, byte_order)
+            .filter(|value| (1..=8).contains(value))
+            .unwrap_or(1);
+
         // Refusal priority: tiled first (the strip tables may not apply at
         // all to a tiled file), then compression, planar layout, bit depth,
-        // sample format. At most one refusal is carried.
+        // sample format, orientation. At most one refusal is carried.
         let refusal = if tiled {
             Some(Refusal::Tiled)
         } else if compression != 1 {
@@ -741,6 +802,8 @@ impl TiffHeader {
             ))
         } else if sample_format.iter().any(|&f| f != 1) {
             Some(Refusal::SampleFormat(sample_format[0]))
+        } else if orientation != 1 {
+            Some(Refusal::Orientation(orientation))
         } else {
             None
         };
@@ -764,6 +827,7 @@ impl TiffHeader {
             path: path.to_path_buf(),
             width,
             height,
+            orientation,
             byte_order,
             ifd_offset,
             bits_per_sample: bits_per_sample.into_boxed_slice(),

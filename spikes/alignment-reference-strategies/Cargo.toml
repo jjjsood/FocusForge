@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "alignment-reference-strategies"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+
+[dependencies]
+focusforge-core = { path = "../../crates/core" }

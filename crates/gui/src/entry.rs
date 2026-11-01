@@ -10,18 +10,19 @@
 //! `--open` all resolve through `classify` and `open` so they cannot
 //! diverge.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{
-    Group, GroupSignal, TiffError, TiffHeader, frame_paths, has_extension, is_frame_path,
-    one_group, propose_with_progress,
+    Group, GroupSignal, JPEG_EXTENSIONS, TiffError, all_frame_paths, has_extension, is_frame_path,
+    one_group, open_frame_set, propose_with_progress,
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{
     Opened as CoreOpened, PROJECT_EXTENSION, PendingProject, Project, ProjectError, SourceRef,
     check_sources, source_hash,
 };
+use focusforge_core::tile::HostBudget;
 // Re-exported so `controller.rs` can carry a `Proposal` in its own
 // pending-question state without naming `focusforge_core` itself.
 pub use focusforge_core::io::Proposal;
@@ -158,7 +159,7 @@ pub enum EntryError {
     /// Names the formats read. This `Display` is the refusal dialog's whole
     /// body; the dialog's button offers the way out.
     #[error(
-        "FocusForge reads 16-bit TIFF (.tif, .tiff) and camera RAW files. This folder holds none."
+        "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none."
     )]
     NoReadableFrames { path: PathBuf },
     /// Any other failure reading the folder's frames.
@@ -179,12 +180,12 @@ pub enum EntryError {
         source: ProjectError,
     },
     /// Nothing this entry path recognises: not a folder, not a `.ffp`, not
-    /// TIFF frames.
+    /// TIFF, JPEG or camera RAW frames.
     #[error("{}: not a folder of frames or a FocusForge project", path.display())]
     Unreadable { path: PathBuf },
-    /// A file set holding both camera RAW and TIFF files.
-    #[error("These files mix camera RAW and TIFF. A stack is one kind of file.")]
-    MixedKinds { path: PathBuf },
+    /// A file set holding more than one kind of frame; `kinds` names them.
+    #[error("These files mix {kinds}. A stack is one kind of file.")]
+    MixedKinds { path: PathBuf, kinds: String },
     /// A file set spread over several folders.
     #[error("These files are in different folders. A stack's frames share one folder.")]
     SeveralFolders { path: PathBuf },
@@ -216,9 +217,14 @@ fn refusal_message(source: &ProjectError) -> String {
 /// or a dialog.
 #[derive(Debug, thiserror::Error)]
 pub enum ImportRefused {
-    /// Nothing in the import resolves to a folder or a TIFF frame.
-    #[error("No TIFF images to add")]
+    /// Nothing in the import resolves to a folder or a TIFF, JPEG or camera
+    /// RAW frame.
+    #[error("No TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) or camera RAW images to add")]
     NoFrames { path: PathBuf },
+    /// The import and the active tab's frames hold more than one kind of
+    /// frame; `kinds` names them.
+    #[error("Cannot mix {kinds} in one stack")]
+    MixedKinds { kinds: String },
     /// The active tab is not in Stacking mode.
     #[error("Switch to Stacking to add images")]
     NotStacking,
@@ -230,14 +236,56 @@ pub enum ImportRefused {
     StillChecking,
 }
 
+/// The kind of a frame file, told by extension alone. Variant order is the
+/// order kinds are named in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FrameKind {
+    Raw,
+    Jpeg,
+    Tiff,
+}
+
+impl FrameKind {
+    /// `None` for anything that is not a frame, including the TIFF files a
+    /// stack writes next to its sources.
+    fn of(path: &Path) -> Option<Self> {
+        if has_extension(path, RAW_EXTENSIONS) {
+            Some(Self::Raw)
+        } else if has_extension(path, JPEG_EXTENSIONS) {
+            Some(Self::Jpeg)
+        } else if is_frame_path(path) {
+            Some(Self::Tiff)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "camera RAW",
+            Self::Jpeg => "JPEG",
+            Self::Tiff => "TIFF",
+        }
+    }
+
+    /// "camera RAW and TIFF", "camera RAW, JPEG and TIFF".
+    fn list(kinds: &BTreeSet<Self>) -> String {
+        let names: Vec<_> = kinds.iter().map(|kind| kind.name()).collect();
+        match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => names.join(""),
+        }
+    }
+}
+
 /// The one place the two entrances and `--open` agree on what a path set
 /// means.
 ///
 /// - Exactly one directory -> [`OpenTarget::Folder`].
 /// - One file whose extension is [`PROJECT_EXTENSION`] -> [`OpenTarget::Project`].
-/// - One or more files that are all TIFF frames ([`is_frame_path`]) or all
-///   camera RAW -> [`OpenTarget::Frames`], sorted by file name as a folder
-///   open sorts, their common parent as `dir`. A set mixing the two is
+/// - One or more files that are all TIFF frames ([`is_frame_path`]), all
+///   JPEG or all camera RAW -> [`OpenTarget::Frames`], sorted by file name as
+///   a folder open sorts, their common parent as `dir`. A set mixing kinds is
 ///   [`EntryError::MixedKinds`]; one without a common parent is
 ///   [`EntryError::SeveralFolders`] -- a project has one directory by
 ///   construction ([`Group::dir`]).
@@ -253,15 +301,16 @@ pub fn classify(paths: &[PathBuf]) -> Result<OpenTarget, EntryError> {
     }
 
     let first = paths.first().cloned().unwrap_or_default();
-    let is_raw = |p: &PathBuf| has_extension(p, RAW_EXTENSIONS);
-    let is_tiff = |p: &PathBuf| is_frame_path(p);
-    if !paths.is_empty()
-        && paths
-            .iter()
-            .all(|p| p.is_file() && (is_tiff(p) || is_raw(p)))
-    {
-        if !(paths.iter().all(is_tiff) || paths.iter().all(is_raw)) {
-            return Err(EntryError::MixedKinds { path: first });
+    let kinds: Option<BTreeSet<FrameKind>> = paths
+        .iter()
+        .map(|p| p.is_file().then(|| FrameKind::of(p)).flatten())
+        .collect();
+    if let Some(kinds) = kinds.filter(|kinds| !kinds.is_empty()) {
+        if kinds.len() > 1 {
+            return Err(EntryError::MixedKinds {
+                path: first,
+                kinds: FrameKind::list(&kinds),
+            });
         }
         let dir = first.parent();
         if paths.iter().any(|p| p.parent() != dir) {
@@ -294,16 +343,21 @@ pub fn is_lone_project(paths: &[PathBuf]) -> bool {
 }
 
 /// Expands an import's paths into frame files: directories through
-/// [`frame_paths`], files through [`is_frame_path`]; parent directories may
-/// differ. Any other path refuses the whole import.
-pub fn expand_import(paths: &[PathBuf]) -> Result<Vec<PathBuf>, ImportRefused> {
+/// [`all_frame_paths`] (the scan a folder open uses), files that are TIFF,
+/// JPEG or camera RAW frames; parent directories may differ. Any other path
+/// refuses the whole import, as does a result that, together with the
+/// active tab's `existing` frames, holds more than one kind of frame.
+pub fn expand_import(
+    paths: &[PathBuf],
+    existing: &[PathBuf],
+) -> Result<Vec<PathBuf>, ImportRefused> {
     let mut frames = Vec::new();
     for path in paths {
         if path.is_dir() {
-            let found =
-                frame_paths(path).map_err(|_| ImportRefused::NoFrames { path: path.clone() })?;
+            let found = all_frame_paths(path)
+                .map_err(|_| ImportRefused::NoFrames { path: path.clone() })?;
             frames.extend(found);
-        } else if path.is_file() && is_frame_path(path) {
+        } else if path.is_file() && FrameKind::of(path).is_some() {
             frames.push(path.clone());
         } else {
             return Err(ImportRefused::NoFrames { path: path.clone() });
@@ -314,6 +368,16 @@ pub fn expand_import(paths: &[PathBuf]) -> Result<Vec<PathBuf>, ImportRefused> {
     if frames.is_empty() {
         return Err(ImportRefused::NoFrames {
             path: paths.first().cloned().unwrap_or_default(),
+        });
+    }
+    let kinds: BTreeSet<FrameKind> = frames
+        .iter()
+        .chain(existing)
+        .filter_map(|p| FrameKind::of(p))
+        .collect();
+    if kinds.len() > 1 {
+        return Err(ImportRefused::MixedKinds {
+            kinds: FrameKind::list(&kinds),
         });
     }
     Ok(frames)
@@ -439,23 +503,32 @@ pub fn answer_question(proposal: &Proposal, answer: OpenAs) -> Opened {
     }
 }
 
+/// A frame's upright width, height and samples per pixel from core's
+/// frame-set opener, whatever the frame kind; `None` if unreadable. The
+/// budget is unbounded: no tile is read, and a finite one would make the
+/// opener refuse a large single-strip TIFF at open.
+fn first_frame_geometry(path: &Path) -> Option<(u32, u32, u32)> {
+    let set = open_frame_set(&[path.to_path_buf()], HostBudget::explicit(u64::MAX)).ok()?;
+    let frame = set.reader.frame(0);
+    Some((frame.width, frame.height, frame.samples_per_pixel))
+}
+
 /// A tab's [`StackContext`], without a composite: an [`GuiProject::Unsaved`]
-/// tab reads its first frame's header only ([`TiffHeader::open`], the same
-/// read `grouping::read_capture_time` already does) plus the group's own
-/// frame count; a reopened [`GuiProject::Opened`] reads the sealed
-/// manifest's composite plane instead. Cached once by `ProjectTab::new`,
-/// never re-read on every settings-panel resolve. `None` for an unreadable
-/// or frame-less group, which `propose`/`one_group` never actually produce
-/// but a future caller must not panic on.
+/// tab reads its first frame's geometry (`first_frame_geometry`) plus the
+/// group's own frame count; a reopened [`GuiProject::Opened`] reads the
+/// sealed manifest's composite plane instead. Cached once by
+/// `ProjectTab::new`, never re-read on every settings-panel resolve. `None`
+/// for an unreadable or frame-less group, which `propose`/`one_group` never
+/// actually produce but a future caller must not panic on.
 pub fn tab_stack_context(project: &GuiProject) -> Option<StackContext> {
     match project {
         GuiProject::Unsaved(group) => {
-            let header = TiffHeader::open(group.frames.first()?).ok()?;
+            let (width, height, samples_per_pixel) = first_frame_geometry(group.frames.first()?)?;
             Some(StackContext::new(
                 group.frames.len(),
-                header.width,
-                header.height,
-                header.samples_per_pixel,
+                width,
+                height,
+                samples_per_pixel,
             ))
         }
         GuiProject::Opened(project) => {
@@ -486,13 +559,14 @@ pub fn project_frames(project: &GuiProject) -> Vec<PathBuf> {
     }
 }
 
-/// A tab's own source-frame size, read from an actual frame's header --
-/// always the frames' own extent, never the sealed composite's (possibly
-/// cropped) one, for a fresh group and for a reopened project alike.
+/// A tab's own source-frame size, upright, read from the first frame
+/// (`first_frame_geometry`, any frame kind) -- always the frames' own
+/// extent, never the sealed composite's (possibly cropped) one, for a fresh
+/// group and for a reopened project alike.
 pub fn tab_image_size(project: &GuiProject) -> Option<(u32, u32)> {
     let frames = project_frames(project);
-    let header = TiffHeader::open(frames.first()?).ok()?;
-    Some((header.width, header.height))
+    let (width, height, _) = first_frame_geometry(frames.first()?)?;
+    Some((width, height))
 }
 
 /// A tab's frame count: the group's own frame count pre-fuse, the sealed

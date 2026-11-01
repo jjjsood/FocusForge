@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{
-    DecodedTiffStack, FrameError, FrameReader, RAW_EXTENSIONS, RawStack, TiffError, TiffHeader,
-    TiffStack, has_extension,
+    DecodedTiffStack, FrameError, FrameReader, JPEG_EXTENSIONS, JpegStack, RAW_EXTENSIONS,
+    RawStack, TiffError, TiffHeader, TiffStack, has_extension,
 };
 use crate::tile::HostBudget;
 
@@ -17,6 +17,8 @@ pub enum ReaderKind {
     Decoded,
     /// On-demand development for RAW frames.
     Raw,
+    /// On-demand decoded reads for 8-bit JPEG frames.
+    Jpeg,
 }
 
 impl ReaderKind {
@@ -26,6 +28,7 @@ impl ReaderKind {
             Self::Mmap => "TiffStack",
             Self::Decoded => "DecodedTiffStack",
             Self::Raw => "RawStack",
+            Self::Jpeg => "JpegStack",
         }
     }
 }
@@ -49,6 +52,16 @@ pub fn classify_header(header: &TiffHeader) -> Result<ReaderKind, TiffError> {
     Ok(ReaderKind::Decoded)
 }
 
+fn format_name(path: &Path) -> &'static str {
+    if has_extension(path, RAW_EXTENSIONS) {
+        "RAW"
+    } else if has_extension(path, JPEG_EXTENSIONS) {
+        "JPEG"
+    } else {
+        "TIFF"
+    }
+}
+
 /// Open `paths` with the reader their headers permit.
 pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet, FrameError> {
     let Some(first_path) = paths.first() else {
@@ -57,19 +70,19 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
         }
         .into());
     };
-    let first_is_raw = has_extension(first_path, RAW_EXTENSIONS);
+    let first_format = format_name(first_path);
     for path in paths.iter().skip(1) {
-        let is_raw = has_extension(path, RAW_EXTENSIONS);
-        if is_raw != first_is_raw {
+        let format = format_name(path);
+        if format != first_format {
             return Err(FrameError::MixedFormats {
                 first_path: first_path.clone(),
-                first: if first_is_raw { "RAW" } else { "TIFF" },
+                first: first_format,
                 path: path.clone(),
-                found: if is_raw { "RAW" } else { "TIFF" },
+                found: format,
             });
         }
     }
-    if first_is_raw {
+    if first_format == "RAW" {
         let shares = budget.partition_for_decoded_cache();
         return Ok(FrameSet {
             reader: Box::new(RawStack::open_files_with_budget(
@@ -77,6 +90,17 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
                 shares.cache.bytes(),
             )?),
             kind: ReaderKind::Raw,
+            scheduler_budget: shares.scheduler,
+        });
+    }
+    if first_format == "JPEG" {
+        let shares = budget.partition_for_decoded_cache();
+        return Ok(FrameSet {
+            reader: Box::new(JpegStack::open_files_with_budget(
+                paths,
+                shares.cache.bytes(),
+            )?),
+            kind: ReaderKind::Jpeg,
             scheduler_budget: shares.scheduler,
         });
     }
@@ -101,6 +125,8 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
                 scheduler_budget: shares.scheduler,
             })
         }
-        ReaderKind::Raw => unreachable!("RAW paths return before TIFF classification"),
+        ReaderKind::Raw | ReaderKind::Jpeg => {
+            unreachable!("RAW and JPEG paths return before TIFF classification")
+        }
     }
 }

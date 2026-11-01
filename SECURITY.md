@@ -2,9 +2,8 @@
 
 ## Supported versions
 
-Before the first release, security fixes are prepared for the current
-unreleased version. After releases begin, fixes are provided for the latest
-release.
+Security fixes are provided for the latest release. Older releases are not
+patched; upgrade to the latest release to receive fixes.
 
 ## Reporting a vulnerability
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
@@ -10,6 +10,7 @@ use rawler::imgop::xyz::Illuminant;
 use rawler::rawimage::RawImage;
 use rawler::rawsource::RawSource;
 
+use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
 use super::{FrameDesc, FrameReader, RawIdentity};
 use crate::algorithm::{AlgorithmError, TileReader};
@@ -202,7 +203,7 @@ struct RawFrame {
 }
 
 #[derive(Debug)]
-struct DecodedFrame {
+struct LinearFrame {
     width: u32,
     height: u32,
     /// Camera-linear RGB: black and white levels applied, no white balance,
@@ -214,28 +215,19 @@ struct DecodedFrame {
     monochrome: bool,
 }
 
-#[derive(Debug, Default)]
-struct Cache {
-    frames: Vec<(usize, Arc<DecodedFrame>, u64)>,
-    bytes: u64,
-}
-
-fn retained_bytes(frame: &DecodedFrame, path: &Path) -> Result<u64, RawError> {
-    u64::try_from(frame.samples.len())
-        .ok()
-        .and_then(|pixels| pixels.checked_mul(u64::try_from(std::mem::size_of::<[f32; 3]>()).ok()?))
-        .ok_or_else(|| RawError::BudgetOverflow {
-            path: path.to_path_buf(),
-        })
+impl CachedFrame for LinearFrame {
+    fn retained_bytes(&self) -> Option<u64> {
+        u64::try_from(self.samples.len())
+            .ok()?
+            .checked_mul(std::mem::size_of::<[f32; 3]>() as u64)
+    }
 }
 
 /// A RAW frame set whose metadata is available before pixel development.
 #[derive(Debug)]
 pub struct RawStack {
     frames: Vec<RawFrame>,
-    cache: Mutex<Cache>,
-    decode_lock: Mutex<()>,
-    cache_bytes: u64,
+    cache: FrameCache<LinearFrame>,
     look: OnceLock<LookTransform>,
 }
 
@@ -305,9 +297,7 @@ impl RawStack {
         }
         Ok(Self {
             frames,
-            cache: Mutex::new(Cache::default()),
-            decode_lock: Mutex::new(()),
-            cache_bytes,
+            cache: FrameCache::new(cache_bytes),
             look: OnceLock::new(),
         })
     }
@@ -337,70 +327,44 @@ impl RawStack {
         Ok(self.look.get_or_init(|| look))
     }
 
-    fn decoded_serialized(&self, index: usize) -> Result<Arc<DecodedFrame>, RawError> {
-        let _decode = self
-            .decode_lock
-            .lock()
-            .expect("RAW decode mutex is not poisoned");
-        self.decoded(index)
-    }
-
-    fn decoded(&self, index: usize) -> Result<Arc<DecodedFrame>, RawError> {
-        if let Some((_, frame, _)) = self
-            .cache
-            .lock()
-            .expect("RAW cache mutex is not poisoned")
-            .frames
-            .iter()
-            .find(|(cached, _, _)| *cached == index)
-        {
-            return Ok(Arc::clone(frame));
-        }
+    /// Frame `index`, developed once and cached; developments are serialised.
+    fn decoded(&self, index: usize) -> Result<Arc<LinearFrame>, RawError> {
         let frame = self.frames.get(index).ok_or(RawError::FrameIndex {
             index,
             count: self.frames.len(),
         })?;
+        let path = &frame.metadata.path;
         let required = reservation_bytes(frame)?;
-        if required > self.cache_bytes {
-            return Err(RawError::CacheTooSmall {
-                path: frame.metadata.path.clone(),
-                bound: self.cache_bytes,
-                required,
-            });
-        }
-        let mut cache = self.cache.lock().expect("RAW cache mutex is not poisoned");
-        while cache.bytes.saturating_add(required) > self.cache_bytes {
-            let (_, _, evicted) = cache.frames.remove(0);
-            cache.bytes -= evicted;
-        }
-        drop(cache);
-        // The decoder runs its own rayon loops. On a pool worker, waiting for
-        // them could pick up another reader's job, which blocks on the decode
-        // lock this call holds; a plain thread waits on the global pool without
-        // taking any work.
-        let developed = std::thread::scope(|scope| {
-            scope
-                .spawn(|| develop(&frame.metadata.path))
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        })?;
-        let decoded = Arc::new(developed);
-        if (decoded.width, decoded.height) != (frame.desc.width, frame.desc.height) {
-            return Err(RawError::GeometryChanged {
-                path: frame.metadata.path.clone(),
-                metadata: (frame.desc.width, frame.desc.height),
-                developed: (decoded.width, decoded.height),
-            });
-        }
-        let retained = retained_bytes(&decoded, &frame.metadata.path)?;
-        let mut cache = self.cache.lock().expect("RAW cache mutex is not poisoned");
-        while cache.bytes.saturating_add(retained) > self.cache_bytes {
-            let (_, _, evicted) = cache.frames.remove(0);
-            cache.bytes -= evicted;
-        }
-        cache.frames.push((index, Arc::clone(&decoded), retained));
-        cache.bytes += retained;
-        Ok(decoded)
+        self.cache
+            .get_or_decode(index, required, || {
+                // The decoder runs its own rayon loops. On a pool worker,
+                // waiting for them could pick up another reader's job, which
+                // blocks on the decode lock this call holds; a plain thread
+                // waits on the global pool without taking any work.
+                let developed = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| develop(path))
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })?;
+                if (developed.width, developed.height) != (frame.desc.width, frame.desc.height) {
+                    return Err(RawError::GeometryChanged {
+                        path: path.clone(),
+                        metadata: (frame.desc.width, frame.desc.height),
+                        developed: (developed.width, developed.height),
+                    });
+                }
+                Ok(developed)
+            })
+            .map_err(|fault| match fault {
+                CacheFault::Decode(error) => error,
+                CacheFault::TooSmall { bound, required } => RawError::CacheTooSmall {
+                    path: path.clone(),
+                    bound,
+                    required,
+                },
+                CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
+            })
     }
 }
 
@@ -429,37 +393,22 @@ impl RawStack {
         gain: u32,
         out: &mut [S],
     ) -> Result<(), AlgorithmError> {
-        let decoded = self
-            .decoded_serialized(frame)
-            .map_err(crate::io::FrameError::from)?;
+        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
         let path = &self.frames[frame].metadata.path;
-        let in_bounds = rect.width > 0
-            && rect.height > 0
-            && rect
-                .x
-                .checked_add(rect.width)
-                .is_some_and(|right| right <= decoded.width)
-            && rect
-                .y
-                .checked_add(rect.height)
-                .is_some_and(|bottom| bottom <= decoded.height);
-        if !in_bounds {
-            return Err(crate::io::FrameError::from(RawError::OutOfBounds {
-                path: path.clone(),
-                requested: rect,
-                frame: (decoded.width, decoded.height),
+        check_tile(rect, (decoded.width, decoded.height), 3, out.len())
+            .map_err(|fault| match fault {
+                TileFault::OutOfBounds { requested, frame } => RawError::OutOfBounds {
+                    path: path.clone(),
+                    requested,
+                    frame,
+                },
+                TileFault::BufferSize { expected, got } => RawError::BufferSize {
+                    path: path.clone(),
+                    expected,
+                    got,
+                },
             })
-            .into());
-        }
-        let expected = rect.width as usize * rect.height as usize * 3;
-        if out.len() != expected {
-            return Err(crate::io::FrameError::from(RawError::BufferSize {
-                path: path.clone(),
-                expected,
-                got: out.len(),
-            })
-            .into());
-        }
+            .map_err(crate::io::FrameError::from)?;
         let grey_look;
         let look = if decoded.monochrome {
             grey_look = LookTransform::new([f32::NAN; 4], IDENTITY_MATRIX);
@@ -532,9 +481,7 @@ impl TileReader for RawStack {
     }
 
     fn linear_means(&self, frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
-        let decoded = self
-            .decoded_serialized(frame)
-            .map_err(crate::io::FrameError::from)?;
+        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
         Ok(Some(decoded.means))
     }
 }
@@ -553,7 +500,7 @@ fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
 
 /// Camera-linear RGB of the file: black and white levels, demosaic and the
 /// sensor's default crop, nothing else.
-fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
+fn develop(path: &Path) -> Result<LinearFrame, RawError> {
     let source = RawSource::new(path).map_err(|source| RawError::Io {
         path: path.to_path_buf(),
         source,
@@ -590,7 +537,7 @@ fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
         }
     };
     let means = channel_means(&samples);
-    Ok(DecodedFrame {
+    Ok(LinearFrame {
         width: width as u32,
         height: height as u32,
         samples,
@@ -1032,6 +979,7 @@ fn raw_desc(metadata: &RawMetadata) -> FrameDesc {
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         image_description: None,
+        orientation: 1,
         width: metadata.output_width,
         height: metadata.output_height,
         samples_per_pixel: 3,

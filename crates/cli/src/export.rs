@@ -84,8 +84,8 @@ pub struct FormatArgs {
     /// whose colour is defined by its camera matrices.
     #[arg(long)]
     icc: Option<String>,
-    /// Carry the source frame's XMP packet verbatim: `on` or `off`
-    /// (default).
+    /// Carry the source frame's XMP packet, with any `tiff:Orientation`
+    /// set to 1: `on` or `off` (default).
     #[arg(long)]
     xmp: Option<String>,
     /// Carry the source frame's IPTC block verbatim: `on` or `off`

@@ -1,6 +1,6 @@
 # Stacking a folder of frames
 
-`focusforge-cli stack` fuses a directory of TIFF or supported RAW frames —
+`focusforge-cli stack` fuses a directory of TIFF, JPEG or supported RAW frames —
 the same shape `focusforge-cli info` inspects — into a **project**, through a chosen
 algorithm. A run prepares a project for review; it does not write an image
 file. `focusforge-cli export` does that, as a separate step.
@@ -27,9 +27,21 @@ turn it off.
 
 RAW input uses `rawler`. Put one compatible RAW format in a directory and run
 the same command as for TIFF; `info` reports camera metadata before a stack
-run. TIFF and RAW frames form separate stacks, and a group that mixes them is
-refused before pixels are developed. A file the decoder cannot read reports an
-error; FocusForge has no alternate RAW decoder.
+run. TIFF, JPEG and RAW frames form separate stacks, and a group that mixes
+them is refused before pixels are developed. A file the decoder cannot read
+reports an error; FocusForge has no alternate RAW decoder.
+
+RAW frames are read in the camera's linear light through the as-shot white
+balance, and aligned and fused as unclipped 32-bit float samples. A highlight
+above white survives blending and clips once, to 16 bits, when the image is
+shown or exported. Brightness equalization of a RAW stack corrects exposure in linear
+light.
+
+## JPEG and 8-bit frames
+
+8-bit TIFF and JPEG frames are widened to the 16-bit range and stacked like
+any other frame; JPEG and TIFF frames are turned upright by their orientation
+tag. CMYK, 12-bit, lossless and truncated JPEG files are refused by name.
 
 ## Getting an image back
 
@@ -46,7 +58,7 @@ one reads them again and checks them against the hashes recorded when the
 project was written, and a missing or changed frame is named with nothing
 written. `export` refuses an output path that names the project itself.
 
-The format follows `-o`'s extension: `.tif`, `.png` or `.jpg`. Each format
+The format follows `-o`'s extension: `.tif`, `.png`, `.jpg` or `.dng`. Each format
 has its own options:
 
 ```bash
@@ -59,7 +71,16 @@ TIFF and PNG default to 16 bits and JPEG to quality 95 with 4:2:0 chroma
 subsampling. EXIF from the alignment reference frame and an ICC profile are
 carried into the image by default; `--xmp on` and `--iptc on` carry those
 too (IPTC is never written to PNG), and `--exif off` / `--icc off` leave
-them out. [`reference/cli.md`](../reference/cli.md#export) lists every flag.
+them out.
+
+A RAW project also exports as a linear DNG: `-o out.dng`, or `--format dng`.
+The DNG is 16-bit and uncompressed, in the camera's own colour space with its
+colour matrices and as-shot white balance, so a raw converter develops it with
+exposure and white balance adjustable. It takes no format options, and
+`--icc` has no effect on it. A project stacked from TIFF or JPEG frames is
+refused with the reason named.
+
+[`reference/cli.md`](../reference/cli.md#export) lists every flag.
 
 ## Choosing an algorithm
 
