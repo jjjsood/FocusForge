@@ -22,6 +22,9 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ### Fixed
 
+- The GUI starts on machines without a GPU, such as virtual machines and Remote Desktop
+  sessions, by rendering on a software adapter, and on Windows shows an error message when it
+  cannot start at all.
 - On Windows, `focusforge-cli` and `focusforge-gui` start on a machine without the Visual C++
   redistributable.
 - The macOS app in the DMG is ad-hoc signed, so a downloaded copy no longer opens as
