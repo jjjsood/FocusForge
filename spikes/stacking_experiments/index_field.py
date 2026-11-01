@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Validity-aware frame-index fields for stack experiments."""
 
 from __future__ import annotations

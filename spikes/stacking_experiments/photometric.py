@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fixed encoded-RGB photometric correction experiment semantics."""
 
 from __future__ import annotations

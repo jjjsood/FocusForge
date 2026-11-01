@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Synthetic scene construction with independent random axes."""
 
 from __future__ import annotations

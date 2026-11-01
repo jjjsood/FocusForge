@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Synchronous source-index consistency rules."""
 
 from __future__ import annotations

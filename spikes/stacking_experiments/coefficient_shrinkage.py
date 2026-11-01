@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Noise-derived shrinkage of immutable selected Laplacian details."""
 
 from __future__ import annotations

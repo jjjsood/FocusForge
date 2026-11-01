@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Dense local focus-score variants used by the comparison command."""
 
 from __future__ import annotations

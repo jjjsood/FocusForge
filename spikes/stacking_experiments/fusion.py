@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Independent NumPy selection twins for current CPU fusion rules."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """CPU baseline records and reproducible input preparation."""
 
 from __future__ import annotations

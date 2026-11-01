@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Metric wrappers with explicit missing-region behavior."""
 
 from __future__ import annotations

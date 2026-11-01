@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Hard finest-selection fusion with streamed coarse mask pyramids."""
 
 from __future__ import annotations

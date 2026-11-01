@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Validation, records, and fixed inputs for alignment-reference measurements."""
 
 from __future__ import annotations

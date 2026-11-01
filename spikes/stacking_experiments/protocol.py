@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fixed experiment controls shared by stack-fusion studies."""
 
 from __future__ import annotations
