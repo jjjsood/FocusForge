@@ -1078,12 +1078,19 @@ def hosted_runner_path_cases() -> None:
         (windows, r"D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_main.cpp", "dependency/exe_main.cpp"),
         (windows, r"C:\Users\runneradmin\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib\rustlib\etc\intrinsic.natvis", "dependency/intrinsic.natvis"),
         (windows, r"\\?\D:\a\FocusForge\FocusForge\crates\cli\src\main.rs", "crates/cli/src/main.rs"),
+        ("C:/src", r"\\?\C:\src\vendor\minidump-writer\src\windows\errors.rs", "dependency/errors.rs"),
+        ("/work", "/work/vendor/minidump-writer/src/lib.rs", "dependency/lib.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\vendor\minidump-writer\src\lib.rs", "dependency/lib.rs"),
         (windows, r"\\?\C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
         (windows, r"minkernel\crts\ucrt\src\appcrt\tran\amd64\fmod.asm", "dependency/fmod.asm"),
         (windows, r"MinKernel\CRTs\ucrt\inc\corecrt_internal.h", "dependency/corecrt_internal.h"),
         (windows, r"VCCRT\vcruntime\inc\internal_shared.h", "dependency/internal_shared.h"),
         (windows, r"OSS\ARM-software\optimized-routines\20.05.00\src\math\pow.c", "dependency/pow.c"),
         (windows, r"onecore\internal\sdk\inc\nxamd64.h", "dependency/nxamd64.h"),
+        (windows, r"OneCore\Internal\MinWin\Priv_Sdk\Inc\ntrtl.h", "dependency/ntrtl.h"),
+        (windows, r"onecore\external\sdk\inc\minwindef.h", "dependency/minwindef.h"),
+        (windows, r"onecore\internal\private\notes.h", "dependency/notes.h"),
+        (windows, r"shared\inc\winapifamily.h", "dependency/winapifamily.h"),
         (macos, f"{macos}/crates/cli/src/main.rs", "crates/cli/src/main.rs"),
         (macos, "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap-4.6.6/src/lib.rs", "dependency/lib.rs"),
         (macos, "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/stdio.h", "dependency/stdio.h"),
@@ -1095,12 +1102,17 @@ def hosted_runner_path_cases() -> None:
         (windows, r"D:\a\FocusForge\FocusForge-other\crates\cli\src\main.rs"),
         (windows, r"D:\a\FocusForge\FocusForge\..\secret\main.rs"),
         (windows, r"D:\a\FocusForge\FocusForge\private\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\other\x.rs"),
+        ("/work", "/work/other/x.rs"),
+        ("/work", "/work/vendors/x.rs"),
         (windows, r"C:\Program Files\Microsoft Visual Studio\..\..\Users\runneradmin\secret.h"),
         (windows, r"private\notes.h"),
         (windows, r"minkernel\other\notes.h"),
         (windows, r"minkernel\crts\..\..\secret.h"),
         (windows, r"OSS\other\notes.h"),
-        (windows, r"onecore\internal\private\notes.h"),
+        (windows, r"onecorex\notes.h"),
+        (windows, r"shared\notes.h"),
+        (windows, r"secret\notes.c"),
         (macos, "/Users/runner/Documents/secret.rs"),
         (macos, f"{macos}/../private/main.rs"),
         (macos, "/Users/runner/.cargo/registry/src/../../../private/main.rs"),
@@ -1150,6 +1162,43 @@ def hosted_runner_path_cases() -> None:
             else: raise AssertionError("builder checkout accepted outside a hosted runner")
         backslash = Path(temporary) / "backslash.pdb"; backslash.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"C:\work\crates\cli\src\main.rs", ("/work", "/work/crates/cli")))
         assert "C:/work/crates/cli/src/main.rs" in module.inspect_windows_native(backslash)["source_paths"]
+        vendored = Path(temporary) / "vendored.pdb"; vendored.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"D:\a\FocusForge\FocusForge\vendor\minidump-writer\src\lib.rs"))
+        with hosted_runner(module, windows):
+            assert "/work/vendor/minidump-writer/src/lib.rs" in module.inspect_windows_native(vendored)["source_paths"]
+        other = Path(temporary) / "other.pdb"; other.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"D:\a\FocusForge\FocusForge\other\x.rs"))
+        with hosted_runner(module, windows):
+            try: module.inspect_windows_native(other)
+            except ValueError as error: assert "D:/a/FocusForge/FocusForge/other/x.rs" in str(error) or "/work/other/x.rs" in str(error), str(error)
+            else: raise AssertionError("checkout path outside crates and vendor accepted")
+        # Modules of the statically linked C runtime name sources relatively and carry no compilation directory.
+        crt = Path(temporary) / "crt.pdb"; crt.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"minkernel\crts\ucrt\src\appcrt\misc\invalid_parameter.cpp", ()))
+        with hosted_runner(module, windows):
+            assert "/usr/include/minkernel/crts/ucrt/src/appcrt/misc/invalid_parameter.cpp" in module.inspect_windows_native(crt)["source_paths"]
+        secret = Path(temporary) / "secret.pdb"; secret.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "secret\\notes.c", ()))
+        with hosted_runner(module, windows):
+            try: module.inspect_windows_native(secret)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "secret/notes.c" in str(error), str(error)
+            else: raise AssertionError("relative source without a compilation directory accepted")
+        relative = Path(temporary) / "relative.pdb"; relative.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"crates\cli\src\main.rs"))
+        with hosted_runner(module, windows):
+            assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(relative)["source_paths"]
+        dbi_only = Path(temporary) / "dbi-only.pdb"; dbi_only.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"VCCRT\vcruntime\inc\internal_shared.h", (), module_sources=False))
+        with hosted_runner(module, windows):
+            assert "/usr/include/VCCRT/vcruntime/inc/internal_shared.h" in module.inspect_windows_native(dbi_only)["source_paths"]
+        dbi_cwds = ("/work", "/work/crates/cli", r"minkernel\crts\ucrt\src\appcrt\string\mt")
+        dbi_ambiguous = Path(temporary) / "dbi-ambiguous.pdb"; dbi_ambiguous.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"OneCore\Internal\MinWin\Priv_Sdk\Inc\ntrtl.h", dbi_cwds, module_sources=False))
+        with hosted_runner(module, windows):
+            found = module.inspect_windows_native(dbi_ambiguous)["source_paths"]
+        assert "/usr/include/OneCore/Internal/MinWin/Priv_Sdk/Inc/ntrtl.h" in found and "/usr/include/minkernel/crts/ucrt/src/appcrt/string/mt" in found, found
+        dbi_private = Path(temporary) / "dbi-private.pdb"; dbi_private.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "secret\\notes.c", dbi_cwds, module_sources=False))
+        with hosted_runner(module, windows):
+            try: module.inspect_windows_native(dbi_private)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "secret/notes.c" in str(error), str(error)
+            else: raise AssertionError("private relative DBI source with several compilation directories accepted")
+        ambiguous = Path(temporary) / "ambiguous.pdb"; ambiguous.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"crates\cli\src\main.rs", ("/work", "/other")))
+        try: module.inspect_windows_native(ambiguous)
+        except ValueError as error: assert "unresolved relative C13 source path" in str(error), str(error)
+        else: raise AssertionError("relative source with several compilation directories accepted")
 
 
 def macos_source_cases() -> None:
