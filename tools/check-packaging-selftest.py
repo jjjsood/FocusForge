@@ -1860,6 +1860,7 @@ def smoke_callers() -> None:
         paths = {line.strip() for line in block.split("path: |\n", 1)[1].split("          include-hidden-files: true", 1)[0].splitlines() if line.strip()}
         expected_paths = {f"{root}/{suffix}" for root in roots for suffix in suffixes}
         if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
+        if name == "package-smoke-receipts-macos": expected_paths |= {".scratch/check-package-macos.*/crashes/*/data/focusforge/crashes/*", ".scratch/check-package-macos.*/crashes/*/stderr"}
         assert paths == expected_paths
     diagnostics_path = ".scratch/package-macos-diagnostics/"
     macos_job = jobs["package-macos"]

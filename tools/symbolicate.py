@@ -62,7 +62,8 @@ def verify_report(report: dict, inventory: dict) -> None:
     )
     raise ValueError(
         f"crashing thread lacks an application source frame (first frames: {seen or 'none'}; "
-        f"crash: {report.get('crash_info')}; modules: {applications or 'none'})"
+        f"crash: {report.get('crash_info')}; modules: {applications or 'none'}; "
+        f"report lists {len(modules)} modules, first: {', '.join(str(item.get('filename')) for item in modules[:10]) or 'none'})"
     )
 
 
