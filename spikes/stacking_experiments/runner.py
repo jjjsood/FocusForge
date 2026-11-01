@@ -55,7 +55,7 @@ def provenance(inputs: Iterable[Path]) -> dict[str, object]:
     """Capture stable local executable and interpreter identifiers."""
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     cli = ROOT / "target" / "debug" / "focusforge-cli"
-    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py")
+    modules = ("__init__.py", "__main__.py", "protocol.py", "scenes.py", "metrics.py", "fusion.py", "runner.py", "focus_score.py", "index_field.py", "consistency.py", "noise_score.py")
     cpu_model = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), platform.processor())
     return {"revision": revision, "cli_sha256": sha256_path(cli) if cli.exists() else None,
             "input_sha256": {path.name: sha256_path(path) for path in inputs},
@@ -96,8 +96,9 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(_json(value), indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
-def _case_dir(root: Path, family: str, member: str, seed: SeedTriple) -> Path:
-    return root / "cases" / f"{family}-{member}-l{seed.layout}-t{seed.texture}-n{seed.noise}"
+def _case_dir(root: Path, family: str, member: str, seed: SeedTriple, frame_count: int = FRAME_COUNT) -> Path:
+    suffix = "" if frame_count == FRAME_COUNT else f"-f{frame_count}"
+    return root / "cases" / f"{family}-{member}-l{seed.layout}-t{seed.texture}-n{seed.noise}{suffix}"
 
 
 def case_split(seed: SeedTriple, allow_holdout: bool = False) -> str:
@@ -105,12 +106,13 @@ def case_split(seed: SeedTriple, allow_holdout: bool = False) -> str:
     return require_seed(seed, allow_holdout)
 
 
-def prepare_case(root: Path, family_name: str, member: str, seed: SeedTriple, allow_holdout: bool = False) -> tuple[Path, SceneData, list[Path]]:
+def prepare_case(root: Path, family_name: str, member: str, seed: SeedTriple, allow_holdout: bool = False,
+                 frame_count: int = FRAME_COUNT) -> tuple[Path, SceneData, list[Path]]:
     """Write one deterministic registered input and return its in-memory truth."""
     case_split(seed, allow_holdout)
     family = next(item for item in FAMILIES if item.name == family_name)
-    data = render_family(family, seed, member)
-    case = _case_dir(root, family_name, member, seed)
+    data = render_family(family, seed, member, frame_count)
+    case = _case_dir(root, family_name, member, seed, frame_count)
     frames = case / "frames"
     frames.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -180,16 +182,24 @@ def _sets(method: str, equalized: bool) -> tuple[str, ...]:
     return tuple(sets)
 
 
+def stack_command(case: Path, method: str, tile: int, output: Path, sets: Iterable[str] = (), align: bool = False) -> list[str]:
+    """Build the CPU `stack` command line: registered input, no crop, one `--set` per entry.
+
+    `align` runs the product's own rotation-scale alignment instead of skipping it.
+    """
+    command = [str(ROOT / "target" / "debug" / "focusforge-cli"), "stack", str(case.resolve()), "--algorithm", method]
+    command += ["--align-algorithm", "pyramidal-ecc", "--align-set", "mode=rotation-scale"] if align else ["--no-align"]
+    command += ["--no-crop", "--cpu", "--json", "--tile-size", str(tile), "--output", str(output.resolve())]
+    for entry in sets:
+        command += ["--set", entry]
+    return command
+
+
 def photometric_stack_command(case: Path, method: str, tile: int, output: Path, equalized: bool = False) -> list[str]:
     """Build the current CPU stack command with photometric correction disabled."""
     if method not in METHODS or tile != 512:
         raise ValueError("photometric runs require a registered method and 512px tile")
-    command = [str(ROOT / "target" / "debug" / "focusforge-cli"), "stack", str(case.resolve()), "--algorithm", method,
-               "--no-align", "--no-crop", "--cpu", "--json", "--tile-size", str(tile), "--set", f"equalize={'true' if equalized else 'false'}",
-               "--output", str(output.resolve())]
-    if method == "laplacian":
-        command.extend(("--set", "levels=5"))
-    return command
+    return stack_command(case, method, tile, output, _sets(method, equalized))
 
 
 def _photometric_native(case: Path, method: str, output: Path, equalized: bool) -> dict[str, object]:
@@ -917,7 +927,7 @@ def _run_current_baseline(case: Path, method: str, tile: int, work: Path, sets: 
     output = work / f"{method}-t{tile}"
     shutil.rmtree(output, ignore_errors=True)
     output.mkdir(parents=True)
-    stack = [str(part) for part in ("/usr/bin/time", "-v", *gff.stack_cmd(str(case), method, tile, str(output), sets, align))]
+    stack = [str(part) for part in ("/usr/bin/time", "-v", *stack_command(case, method, tile, output, sets, align))]
     process = subprocess.run(stack, capture_output=True, text=True)
     if process.returncode:
         raise RuntimeError(f"stack exit {process.returncode}: {process.stderr[-1000:]}")
@@ -936,7 +946,7 @@ def _run_current_baseline(case: Path, method: str, tile: int, work: Path, sets: 
             "accounted_bytes": report["accounted_bytes_in_flight"], "cmd": " ".join(stack[2:]),
             "export_cmd": " ".join(export), "stack_exit": process.returncode, "export_exit": exported.returncode,
             "stack_stdout": process.stdout, "stack_stderr": process.stderr, "export_stdout": exported.stdout, "export_stderr": exported.stderr,
-            "equalization": report["equalization"], "alignment": report["align"]}
+            "equalization": report["equalization"], "alignment": report["align"], "backend": report["backend"]}
 
 
 def _difference(left: Path, right: Path) -> dict[str, object]:
@@ -949,8 +959,9 @@ def _annotate_differences(rows: list[dict[str, object]]) -> None:
     repeats: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
     tiles: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
-        repeats[(row["family"], row["member"], row["seed"], row["method"], row["tile"], row["equalized"])].append(row)
-        tiles[(row["family"], row["member"], row["seed"], row["method"], row["repeat"], row["equalized"])].append(row)
+        frames = row.get("frames", FRAME_COUNT)
+        repeats[(row["family"], row["member"], frames, row["seed"], row["method"], row["tile"], row["equalized"])].append(row)
+        tiles[(row["family"], row["member"], frames, row["seed"], row["method"], row["repeat"], row["equalized"])].append(row)
     for group in repeats.values():
         if len(group) == 2:
             diff = _difference(Path(group[0]["composite"]), Path(group[1]["composite"]))
@@ -966,11 +977,11 @@ def _annotate_differences(rows: list[dict[str, object]]) -> None:
 
 def allowances(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     """Derive per-metric seed and repeat spreads without mixing their sources."""
-    grouped: dict[tuple[str, str, str, int, str], list[dict[str, object]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, int, str, int, str], list[dict[str, object]]] = defaultdict(list)
     for row in rows:
         for metric, value in row["metrics"].items():
             if value is not None:
-                grouped[(row["family"], row["member"], row["method"], row["tile"], metric)].append(row)
+                grouped[(row["family"], row["member"], row.get("frames", FRAME_COUNT), row["method"], row["tile"], metric)].append(row)
     output = []
     for key, records in sorted(grouped.items()):
         by_seed: dict[str, list[float]] = defaultdict(list)
@@ -979,15 +990,21 @@ def allowances(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         seed_values = [values[0] for _, values in sorted(by_seed.items())]
         repeat_spread = max((max(values) - min(values) for values in by_seed.values()), default=0.0)
         seed_spread = max(seed_values) - min(seed_values) if seed_values else 0.0
-        output.append({"family": key[0], "member": key[1], "method": key[2], "tile": key[3], "metric": key[4],
+        output.append({"family": key[0], "member": key[1], "frames": key[2], "method": key[3], "tile": key[4], "metric": key[5],
                        "seed_spread": seed_spread, "repeat_spread": repeat_spread, "allowance": max(seed_spread, repeat_spread)})
     return output
 
 
-def baseline_call_count(seeds: Iterable[SeedTriple]) -> int:
-    """Return the exact number of CPU baseline calls for a seed selection."""
-    members = sum(len(family_members(family)) for family in FAMILIES if family.fusion_baseline)
-    return len(tuple(seeds)) * members * len(METHODS) * len(TILES) * len(REPEATS)
+Member = tuple[str, str, int]
+
+
+def baseline_call_count(seeds: Iterable[SeedTriple], members: tuple[Member, ...] | None = None) -> int:
+    """Return the exact number of CPU baseline calls for a seed selection.
+
+    `members` lists (family, member, frame count); omitted, every fusion-baseline family member runs at the registered frame count.
+    """
+    count = len(members) if members is not None else sum(len(family_members(family)) for family in FAMILIES if family.fusion_baseline)
+    return len(tuple(seeds)) * count * len(METHODS) * len(TILES) * len(REPEATS)
 
 
 def _record_metrics(data: SceneData, family: str, member: str, result: dict[str, object], composite: Path,
@@ -1028,39 +1045,42 @@ def _manifest(root: Path, rows: list[dict[str, object]], record_name: str) -> No
     })
 
 
-def run_baselines(root: Path, seeds: Iterable[SeedTriple], equalized: bool = False) -> list[dict[str, object]]:
-    """Run every registered CPU baseline for the supplied non-sealed seeds."""
+def run_baselines(root: Path, seeds: Iterable[SeedTriple], equalized: bool = False,
+                  members: tuple[Member, ...] | None = None) -> list[dict[str, object]]:
+    """Run every registered CPU baseline for the supplied non-sealed seeds, over `members` when given."""
     cli = ROOT / "target" / "debug" / "focusforge-cli"
     if not cli.exists():
         raise FileNotFoundError(f"missing executable: {cli}")
     selected = tuple(seeds)
-    expected = baseline_call_count(selected)
+    expected = baseline_call_count(selected, members)
     rows: list[dict[str, object]] = []
-    fusion_families = [family for family in FAMILIES if family.fusion_baseline]
-    for family in fusion_families:
-        for member in family_members(family):
-            for seed in selected:
-                if family.name == "invalid-borders" and member == "aligned-coverage":
-                    rows.extend(_aligned_coverage_records(root, family, seed, equalized))
-                    continue
-                case, data, inputs = prepare_case(root, family.name, member, seed)
-                source = _source(case)
-                identity = provenance(inputs)
-                for method in METHODS:
-                    for tile in TILES:
-                        for repeat in REPEATS:
-                            work = root / "runs" / run_key(family.name + "-" + member, seed, method, tile, repeat)
-                            result = _run_current_baseline(case, method, tile, work, _sets(method, equalized))
-                            composite, zmap = Path(result["comp"]), Path(result["zmap"])
-                            boundaries = tile_boundaries(data.truth.shape[1], data.truth.shape[0], tile, int(result["margin"]), int(result["levels"]))
-                            row = {"case": str(case), "family": family.name, "member": member, "seed": seed.text(), "method": method, "tile": tile,
-                                   "repeat": repeat, "equalized": equalized, "composite": str(composite), "zmap": str(zmap),
-                                   "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap), "parameters": _sets(method, equalized),
-                                   "tile_boundaries": boundaries, "attempt": {"repeat": repeat, "tile": tile, "method": method}, **identity, **result}
-                            row["metrics"], record_metadata = _record_metrics(data, family.name, member, row, composite, zmap, source, boundaries)
-                            row.update(record_metadata)
-                            rows.append(row)
-                            _write_json(root / "baseline.partial.json", rows)
+    if members is None:
+        members = tuple((family.name, member, FRAME_COUNT) for family in FAMILIES if family.fusion_baseline for member in family_members(family))
+    for family_name, member, frame_count in members:
+        family = next(item for item in FAMILIES if item.name == family_name)
+        suffix = "" if frame_count == FRAME_COUNT else f"-f{frame_count}"
+        for seed in selected:
+            if family.name == "invalid-borders" and member == "aligned-coverage":
+                rows.extend(_aligned_coverage_records(root, family, seed, equalized))
+                continue
+            case, data, inputs = prepare_case(root, family.name, member, seed, frame_count=frame_count)
+            source = _source(case)
+            identity = provenance(inputs)
+            for method in METHODS:
+                for tile in TILES:
+                    for repeat in REPEATS:
+                        work = root / "runs" / run_key(family.name + "-" + member + suffix, seed, method, tile, repeat)
+                        result = _run_current_baseline(case, method, tile, work, _sets(method, equalized))
+                        composite, zmap = Path(result["comp"]), Path(result["zmap"])
+                        boundaries = tile_boundaries(data.truth.shape[1], data.truth.shape[0], tile, int(result["margin"]), int(result["levels"]))
+                        row = {"case": str(case), "family": family.name, "member": member, "frames": frame_count, "seed": seed.text(), "method": method, "tile": tile,
+                               "repeat": repeat, "equalized": equalized, "composite": str(composite), "zmap": str(zmap),
+                               "composite_sha256": sha256_path(composite), "zmap_sha256": sha256_path(zmap), "parameters": _sets(method, equalized),
+                               "tile_boundaries": boundaries, "attempt": {"repeat": repeat, "tile": tile, "method": method}, **identity, **result}
+                        row["metrics"], record_metadata = _record_metrics(data, family.name, member, row, composite, zmap, source, boundaries)
+                        row.update(record_metadata)
+                        rows.append(row)
+                        _write_json(root / "baseline.partial.json", rows)
     _annotate_differences(rows)
     for row in rows:
         row["metrics"]["tile_difference"] = float(row["tile_difference"]["max_abs"])

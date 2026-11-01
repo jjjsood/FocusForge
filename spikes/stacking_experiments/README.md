@@ -9,6 +9,10 @@ python3 -m spikes.stacking_experiments focus-score --split training --registrati
 python3 -m spikes.stacking_experiments index-field --split training --registration /path/to/index-field-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/index-field/replay
 python3 -m spikes.stacking_experiments selection-consistency --split training --registration /path/to/selection-consistency-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --replay-only --out .scratch/selection-consistency/replay
 python3 -m spikes.stacking_experiments noise-shrinkage --self-check
+python3 -m spikes.stacking_experiments noise-score --self-check
+python3 -m spikes.stacking_experiments noise-score cases --seed 101,201,301 --out .scratch/noise-score-cases
+python3 -m spikes.stacking_experiments noise-score fusion-hashes --out .scratch/noise-score/fusion-hashes.json
+python3 -m spikes.stacking_experiments noise-score baseline --split training --out .scratch/noise-score-baseline
 python3 -m spikes.stacking_experiments photometric --self-check --out .scratch/photometric/controls
 python3 -m spikes.stacking_experiments photometric --source-controls --out .scratch/photometric/source-controls
 python3 -m spikes.stacking_experiments noise-shrinkage --split training --registration /path/to/noise-shrinkage-registration.json --runs .scratch/stacking-controls --allowances .scratch/stacking-controls/allowances.json --out .scratch/noise-shrinkage/training
@@ -44,6 +48,8 @@ The registration command records six scene families, three independent seed axes
 `index-field` validates its own execution registration before writing output. Its replay mode checks the retained current Depth Map rows; a normal training run records the one frozen flat-noise calibration, controls, field arrays, rounded labels, and image measurements. `--family` restricts a focused training run to one registered family.
 
 `selection-consistency` uses immutable raw Details winner maps. Its streamed path reads frame samples twice and reads masks separately; its small all-frame oracle is limited to identity checks.
+
+`noise-score` holds four candidate per-pixel focus measures (a stack noise floor, the Laplacian on a smoothed copy, and two ring differences) with their constants. `--self-check` verifies each against hand-computed values on small planes and checks that short-stack renders are deterministic and that the eight-frame renders keep their recorded frame hashes. `cases` writes the thin-hair and flat-noise members at 3, 5 and 8 frames (`--frames` picks one) with the share of hair pixels whose depth offset the shorter range clips; a sealed seed needs `--allow-holdout`. `baseline` runs the three current methods over those nine members (540 runs). `fusion-hashes` writes composite and winner-map hashes of the unmodified score replays, one eight-frame case per member.
 
 `noise-shrinkage` selects the same Details tuples before applying a global per-level threshold. Its zero multiplier is an exact bypass; nonzero controls are chosen only from the registered finite strength lists.
 
