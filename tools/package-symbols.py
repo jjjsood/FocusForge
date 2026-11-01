@@ -245,7 +245,12 @@ def builder_location(value: str) -> str:
         if match:
             return template.format(match.group(1))
     match = TOOLCHAIN_ROOTS.match(path)
-    return "/usr/include/" + match.group(1) if match else path
+    if match:
+        return "/usr/include/" + match.group(1)
+    # The statically linked C runtime's debug info names Microsoft's build tree relatively.
+    if re.match(r"(?i)(?:minkernel/crts|VCCRT)/.+$", path):
+        return "/usr/include/" + path
+    return path
 
 
 def native_source(path: str) -> str:
@@ -257,7 +262,7 @@ def native_source(path: str) -> str:
 def reject_private_native(paths) -> None:
     rejected = sorted({path.replace("\\", "/") for path in paths if not safe_native_source(path)})
     if rejected:
-        raise ValueError(f"private source path in native symbols: {clipped(rejected[0])}" + (f" (+{len(rejected) - 1} more)" if len(rejected) > 1 else ""))
+        raise ValueError("private source path in native symbols: " + "; ".join(clipped(path) for path in rejected))
 
 
 def absolute_native(value: str) -> bool:
@@ -295,7 +300,7 @@ def canonicalize_symbol_sources(path: Path) -> None:
                 if parts[2] not in rejected: rejected.append(parts[2])
         lines.append(line)
     if rejected:
-        raise ValueError("private or unsupported source path in symbols: " + "; ".join(clipped(value) for value in rejected[:5]) + (f" (+{len(rejected) - 5} more)" if len(rejected) > 5 else ""))
+        raise ValueError("private or unsupported source path in symbols: " + "; ".join(clipped(value) for value in rejected))
     path.write_text("".join(lines), encoding="utf-8")
 
 
