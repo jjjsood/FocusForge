@@ -332,7 +332,7 @@ def safe_source_less_cu(name: str) -> bool:
     source, marker, unit = canonical.partition("/@/")
     if not marker or not source or not unit:
         return False
-    return source.startswith("crates/") or safe_native_source(source)
+    return source.startswith(("crates/", "vendor/")) or safe_native_source(source)
 
 
 def readelf_source_records(path: Path) -> tuple[list[str], int, int, int, int]:
