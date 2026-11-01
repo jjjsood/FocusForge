@@ -47,10 +47,25 @@ every macOS version. If macOS instead says it cannot verify the developer, open
 System Settings → Privacy & Security and choose Open Anyway for FocusForge.
 
 A Windows release may provide `FocusForge-<version>-x86_64.msi`. Run the
-installer and follow its prompts. Its CLI is
+installer and follow its prompts; the programs carry their C runtime, so no
+Visual C++ redistributable is needed. Its CLI is
 `$env:ProgramFiles\FocusForge\focusforge-cli.exe`; the installer does not add
 it to `PATH`. Its shared resources are below
 `$env:ProgramFiles\FocusForge\share`.
+
+## Machines without a GPU
+
+`focusforge-gui` tries GPU-backed graphics adapters first and falls back to a
+software adapter (for example in a virtual machine or a Remote Desktop
+session), logging a warning that names it. It runs there at software speed.
+When no adapter works at all it exits with an error; on Windows, started from
+the Start menu, it shows that error in a message box.
+
+On Windows, `focusforge-gui --help`, `--version` and argument errors print to
+the terminal that started the program, including when its output is
+redirected. PowerShell does not wait for a windowed program, so there pipe
+the output instead: `focusforge-gui --help | Out-File help.txt`, or
+`focusforge-gui --no-such-flag 2>&1 | Out-String` to get `$LASTEXITCODE`.
 
 ## Manuals and completions
 
