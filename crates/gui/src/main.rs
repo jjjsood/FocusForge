@@ -1787,14 +1787,33 @@ fn install_save_folder(args: &Args) {
 /// A windowed Windows process starts without a console, so clap's help,
 /// version and error text would go nowhere. Attaching the starting terminal's
 /// console first lets it print there. Without a parent console (Explorer, the
-/// Start menu) the call fails and nothing opens; handles the parent already
-/// redirected are left alone.
+/// Start menu) the call fails and nothing opens. Attaching resets all three
+/// standard handles to the console, so a handle the parent redirected to a
+/// file or pipe (`--help > help.txt`) is put back afterwards.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn attach_parent_console() {
-    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-    // SAFETY: takes no pointers; the failure case is the one described above.
-    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let streams = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    // SAFETY: no call takes a pointer; `GetFileType` answers an unknown type
+    // for a null or stale handle, which is then left alone.
+    unsafe {
+        let redirected = streams.map(|stream| {
+            Some(GetStdHandle(stream))
+                .filter(|&handle| matches!(GetFileType(handle), FILE_TYPE_DISK | FILE_TYPE_PIPE))
+        });
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            for (stream, handle) in streams.into_iter().zip(redirected) {
+                if let Some(handle) = handle {
+                    SetStdHandle(stream, handle);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
