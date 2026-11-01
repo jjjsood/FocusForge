@@ -18,6 +18,7 @@ use raw_dng::{DngSpec, write_dng};
 
 /// A little-endian classic TIFF with its `DateTime` value (tag 306, the export
 /// time) zeroed, so two exports made a second apart compare equal.
+#[cfg(unix)]
 fn without_date_time(mut tiff: Vec<u8>) -> Vec<u8> {
     let u16_at = |b: &[u8], at: usize| u16::from_le_bytes(b[at..at + 2].try_into().expect("u16"));
     let u32_at =
