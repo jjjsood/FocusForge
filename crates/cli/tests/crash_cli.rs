@@ -444,10 +444,10 @@ fn minidump_module_names(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Crashes `cmd` with a segfault and checks the minidump's module list names
+/// the binary.
 #[cfg(unix)]
-#[test]
-fn native_segfault() {
-    let mut cmd = common::cli_bin("crash_cli_native_segfault");
+fn assert_segfault_dump_names_binary(mut cmd: Command) {
     let (pid, signal) = crash_child(&mut cmd, "segv");
     assert_eq!(signal, 11, "a forced segfault dies from SIGSEGV");
 
@@ -469,6 +469,23 @@ fn native_segfault() {
         "the module list names the crashing binary, got {} modules: {modules:?}",
         modules.len()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_segfault() {
+    assert_segfault_dump_names_binary(common::cli_bin("crash_cli_native_segfault"));
+}
+
+/// A process started with a small environment, as from the Finder, keeps the
+/// executable path near the top of its stack; the dump must still name it.
+#[cfg(unix)]
+#[test]
+fn native_segfault_with_cleared_environment() {
+    let mut cmd = common::cli_bin("crash_cli_native_segfault_cleared_env");
+    let data_dir = common::data_dir_of(&cmd);
+    cmd.env_clear().env("FOCUSFORGE_DATA_DIR", data_dir);
+    assert_segfault_dump_names_binary(cmd);
 }
 
 #[cfg(unix)]

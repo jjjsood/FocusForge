@@ -27,6 +27,8 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 - The macOS app in the DMG is ad-hoc signed, so a downloaded copy no longer opens as
   "damaged"; the getting-started guide explains the Gatekeeper prompt of an app that is
   not notarized.
+- On macOS, a crash report names the crashing program when it was started with a small
+  environment, such as from the Finder.
 - On Windows, `focusforge-gui --help`, `--version` and argument errors print to the
   terminal that started the program.
 - Stacking RAW frames no longer hangs when several threads read tiles while a frame is
