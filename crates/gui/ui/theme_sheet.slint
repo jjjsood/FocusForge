@@ -1339,12 +1339,12 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "Toolbar: transport button"; }
         HorizontalLayout {
             spacing: Theme.space-3;
-            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "▶"; text: "Fuse stack"; }
-            FFButton { width: 116px; compact: true; kind: "default"; glyph: "⏸"; text: "Pause"; }
-            FFButton { width: 116px; compact: true; kind: "default"; glyph: "▶"; text: "Resume"; }
-            FFButton { width: 116px; compact: true; kind: "default"; glyph: "☐"; text: "Cancel"; }
-            FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
-            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
+            FFButton { width: 116px; compact: true; kind: "primary"; has-icon: true; icon-source: @image-url("../../../assets/icons/play.svg"); text: "Fuse stack"; }
+            FFButton { width: 116px; compact: true; kind: "default"; has-icon: true; icon-source: @image-url("../../../assets/icons/pause.svg"); text: "Pause"; }
+            FFButton { width: 116px; compact: true; kind: "default"; has-icon: true; icon-source: @image-url("../../../assets/icons/play.svg"); text: "Resume"; }
+            FFButton { width: 116px; compact: true; kind: "default"; has-icon: true; icon-source: @image-url("../../../assets/icons/square.svg"); text: "Cancel"; }
+            FFButton { width: 116px; compact: true; kind: "quiet"; has-icon: true; icon-source: @image-url("../../../assets/icons/square.svg"); text: "Cancelling…"; enabled: false; }
+            FFButton { width: 116px; compact: true; kind: "primary"; has-icon: true; icon-source: @image-url("../../../assets/icons/rotate-cw.svg"); text: "Retry"; }
             FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
             FFButton {
                 width: 140px;
