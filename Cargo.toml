@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["spikes"]
+exclude = ["spikes", "vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,6 +22,15 @@ debug = false
 debug = "line-tables-only"
 strip = "none"
 split-debuginfo = "off"
+
+# vendor/minidump-writer is minidump-writer 0.13.0 plus upstream commit
+# 70311be21766 ("mach: read_string: don't read unreadable memory"). Without it
+# a macOS crash dump of a process started with a small environment, such as
+# from the Finder, lists the main executable with an empty name. Remove this
+# patch and vendor/minidump-writer as soon as a minidump-writer release
+# contains that commit.
+[patch.crates-io]
+minidump-writer = { path = "vendor/minidump-writer" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
