@@ -41,7 +41,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # Attaching the starting terminal's console for `--help` and argument errors,
 # since the Windows build is a windowed binary.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [build-dependencies]
 slint-build = "~1.17"
