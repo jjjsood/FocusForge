@@ -227,7 +227,7 @@ def _check_stack_command_spelling() -> None:
         if flag not in argv:
             raise AssertionError(f"stack command lacks {flag}")
     if "--no-gpu" in argv or "--algo" in argv or argv.count("--set") != 2:
-        raise AssertionError("stack command uses a retired option or drops a --set")
+        raise AssertionError("stack command uses an unsupported option or drops a --set")
     aligned = stack_command(Path("case"), "depth-map", 1024, Path("out"), (), align=True)
     if "--align-algorithm" not in aligned or "--no-align" in aligned or "mode=rotation-scale" not in aligned:
         raise AssertionError("aligned stack command is wrong")
