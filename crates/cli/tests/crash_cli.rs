@@ -415,6 +415,35 @@ fn assert_metadata(metadata: &serde_json::Value, pid: u32, reason: &str, dump: &
     );
 }
 
+/// File names of the modules listed in a minidump's module stream (type 4),
+/// read straight from the stream directory.
+#[cfg(unix)]
+fn minidump_module_names(bytes: &[u8]) -> Vec<String> {
+    let u32_at = |at: usize| {
+        let field = bytes.get(at..at + 4).expect("minidump field in range");
+        u32::from_le_bytes(field.try_into().expect("four bytes")) as usize
+    };
+    let directory = u32_at(12);
+    let Some(list) = (0..u32_at(8))
+        .map(|i| directory + i * 12)
+        .find(|&entry| u32_at(entry) == 4)
+        .map(|entry| u32_at(entry + 8))
+    else {
+        return Vec::new();
+    };
+    (0..u32_at(list))
+        .map(|i| {
+            // MINIDUMP_MODULE is 108 bytes; its name RVA sits at offset 20.
+            let name = u32_at(list + 4 + i * 108 + 20);
+            let units: Vec<u16> = bytes[name + 4..name + 4 + u32_at(name)]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 #[test]
 fn native_segfault() {
@@ -431,6 +460,14 @@ fn native_segfault() {
             .contains("focusforge-cli"),
         "the dump names the binary: {}",
         dump.display()
+    );
+    let modules = minidump_module_names(&std::fs::read(&dump).expect("the minidump is readable"));
+    assert!(
+        modules
+            .iter()
+            .any(|m| m.rsplit('/').next() == Some("focusforge-cli")),
+        "the module list names the crashing binary, got {} modules: {modules:?}",
+        modules.len()
     );
 }
 

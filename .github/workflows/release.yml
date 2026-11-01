@@ -170,6 +170,8 @@ jobs:
             .scratch/check-package-macos.*/smoke/logs/*.stderr
             .scratch/check-package-macos.*/smoke/logs/*.exit
             .scratch/check-package-macos.*/launch.png
+            .scratch/check-package-macos.*/crashes/*/data/focusforge/crashes/*
+            .scratch/check-package-macos.*/crashes/*/stderr
           include-hidden-files: true
           if-no-files-found: warn
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
