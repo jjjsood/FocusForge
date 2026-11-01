@@ -68,7 +68,10 @@ export component FFCheckpointRow inherits Rectangle {
 
         // Clear of the list's scrollbar track, which sits flush on the row's
         // right edge.
-        if root.deletable && (root.hovered || area.has-hover): TouchArea {
+        if root.deletable && (root.hovered || area.has-hover): trash := TouchArea {
+            accessible-role: button;
+            accessible-enabled: true;
+            accessible-label: "Delete checkpoint";
             width: Theme.icon-sm;
             height: Theme.icon-sm;
             x: parent.width - self.width - Theme.space-1 - ShellGeometry.scrollbar-width;

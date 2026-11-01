@@ -281,10 +281,17 @@ fn validate_class(header: &TiffHeader) -> Result<(), TiffError> {
             header.planar_config.to_string(),
         ));
     }
-    if header.bits_per_sample.iter().any(|&value| value != 16) {
+    let depths = &header.bits_per_sample;
+    if depths.iter().any(|v| !matches!(v, 8 | 16)) || depths.windows(2).any(|w| w[0] != w[1]) {
         return Err(unsupported(
             "BitsPerSample",
             format!("{:?}", header.bits_per_sample),
+        ));
+    }
+    if !matches!(header.photometric, 1 | 2) {
+        return Err(unsupported(
+            "PhotometricInterpretation",
+            header.photometric.to_string(),
         ));
     }
     if header.sample_format.iter().any(|&value| value != 1) {
@@ -315,7 +322,7 @@ fn sample_bytes(header: &TiffHeader, width: u32, height: u32) -> Result<usize, T
         u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|value| value.checked_mul(u64::from(header.samples_per_pixel)))
-            .and_then(|value| value.checked_mul(2))
+            .and_then(|value| value.checked_mul(u64::from(header.bytes_per_sample())))
             .ok_or_else(|| layout_error(header, "segment byte length overflows"))?,
     )
     .map_err(|_| layout_error(header, "segment byte length overflows usize"))
@@ -421,26 +428,53 @@ fn samples_and_crop(
 ) -> Result<Vec<u16>, TiffError> {
     let spp = header.samples_per_pixel as usize;
     let stored_width = info.stored_width as usize;
-    let mut decoded = Vec::with_capacity(raw.len() / 2);
-    for pair in raw.chunks_exact(2) {
-        decoded.push(header.byte_order.u16_from([pair[0], pair[1]]));
-    }
-    if header.predictor == 2 {
-        for row in decoded.chunks_exact_mut(stored_width * spp) {
-            for sample in spp..row.len() {
-                row[sample] = row[sample].wrapping_add(row[sample - spp]);
-            }
+    let row_samples = stored_width * spp;
+    let predictor = header.predictor == 2;
+    let decoded: Vec<u16> = if header.bytes_per_sample() == 1 {
+        let mut bytes = raw.to_vec();
+        if predictor {
+            undo_predictor(&mut bytes, row_samples, spp, u8::wrapping_add);
         }
-    }
+        bytes.into_iter().map(widen_8bit).collect()
+    } else {
+        let mut samples: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|pair| header.byte_order.u16_from([pair[0], pair[1]]))
+            .collect();
+        if predictor {
+            undo_predictor(&mut samples, row_samples, spp, u16::wrapping_add);
+        }
+        samples
+    };
     let mut cropped =
         Vec::with_capacity(info.valid_width as usize * info.valid_height as usize * spp);
     for row in decoded
-        .chunks_exact(stored_width * spp)
+        .chunks_exact(row_samples)
         .take(info.valid_height as usize)
     {
         cropped.extend_from_slice(&row[..info.valid_width as usize * spp]);
     }
     Ok(cropped)
+}
+
+/// Undoes TIFF Predictor 2: each sample is stored as the difference from the
+/// same channel of the previous pixel in its row.
+fn undo_predictor<T: Copy>(
+    samples: &mut [T],
+    row_samples: usize,
+    spp: usize,
+    add: impl Fn(T, T) -> T,
+) {
+    for row in samples.chunks_exact_mut(row_samples) {
+        for i in spp..row.len() {
+            row[i] = add(row[i], row[i - spp]);
+        }
+    }
+}
+
+/// Widens an 8-bit sample to the 16-bit range: 0 stays 0, 255 becomes 65535.
+pub(crate) const fn widen_8bit(value: u8) -> u16 {
+    value as u16 * 257
 }
 
 fn layout_error(header: &TiffHeader, detail: &'static str) -> TiffError {

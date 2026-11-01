@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Keep Fluent's standard widgets. ToolTipImpl is local because Slint's stock
+// implementation puts custom tooltip children outside its sizing layout.
+export {
+    Button,
+    ScrollView,
+    ListItem,
+    LineEdit,
+    MenuBarItem,
+    MenuBar,
+    MenuFrame,
+    MenuItem,
+    StyleMetrics,
+    Palette,
+    TabWidgetImpl,
+    TabImpl,
+    TabBarHorizontalImpl,
+    TabBarVerticalImpl,
+    MenuBarImpl,
+    PopupMenuImpl,
+    RadioButtonImpl,
+    RadioGroupImpl,
+} from "builtin:/fluent/std-widgets-impl.slint";
+
+import { Palette } from "builtin:/fluent/style-base.slint";
+
+export component ToolTipImpl inherits Rectangle {
+    in property <styled-text> text;
+
+    property <bool> has-text: root.text != @markdown("");
+    background: root.has-text ? Palette.alternate-background : transparent;
+    border-radius: 4px;
+    border-width: root.has-text ? 1px : 0px;
+    border-color: Palette.border;
+
+    VerticalLayout {
+        padding-left: root.has-text ? 9px : 0px;
+        padding-right: root.has-text ? 9px : 0px;
+        padding-top: root.has-text ? 6px : 0px;
+        padding-bottom: root.has-text ? 6px : 0px;
+
+        if root.has-text: StyledText {
+            text: root.text;
+            default-color: Palette.foreground;
+        }
+
+        @children
+    }
+}

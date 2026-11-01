@@ -78,6 +78,15 @@ pub fn strip_line_comments(contents: &str) -> String {
         .join("\n")
 }
 
+/// Production Rust before this crate's conventional test-only module. Source
+/// architecture scans enforce shipped code, not fixture identifiers.
+#[allow(dead_code)]
+pub fn production_rust_source(contents: &str) -> &str {
+    contents
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map_or(contents, |(production, _)| production)
+}
+
 fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -316,6 +325,24 @@ pub fn corrupt_blob(path: &Path, hash: &str) {
     std::fs::rename(&rewritten, path).expect("the copy replaces the project");
 }
 
+/// Flips the first byte of `path` in place and moves its modification time a
+/// minute ahead. A project recognises an unchanged source by size and
+/// modification time alone, so an edit that keeps both goes unseen -- and a
+/// fast rewrite on a filesystem with a coarse clock (Windows) can keep the
+/// time.
+#[allow(dead_code)]
+pub fn rewrite_changed(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(path, &bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+}
+
 /// Answers the pending grouping question, blocks until its worker finishes,
 /// and settles it -- `AppController::answer_question` runs off-thread too,
 /// the same as [`open_and_settle`].
@@ -366,12 +393,10 @@ pub fn locate_and_settle(
 /// a filesystem where a mode change actually takes effect. Restores a
 /// writable mode before its own `TempDir` removes it.
 #[allow(dead_code)]
-#[cfg(unix)]
 pub struct ReadOnlyDir {
     dir: tempfile::TempDir,
 }
 
-#[cfg(unix)]
 impl std::ops::Deref for ReadOnlyDir {
     type Target = Path;
 
@@ -427,6 +452,15 @@ pub fn readonly_dir(label: &str, mode: u32, populate: impl FnOnce(&Path)) -> Opt
         return None;
     }
     Some(ReadOnlyDir { dir })
+}
+
+/// Windows has no mode bits to block writes with, so every caller takes its
+/// existing skip path.
+#[allow(dead_code)]
+#[cfg(not(unix))]
+pub fn readonly_dir(label: &str, _mode: u32, _populate: impl FnOnce(&Path)) -> Option<ReadOnlyDir> {
+    eprintln!("skipping {label}: directory permissions are not enforced by mode bits here");
+    None
 }
 
 /// A `<root>/focusforge` data directory holding roughly `total_log_bytes`

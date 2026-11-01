@@ -16,5 +16,12 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Installers retain this same-build information only long enough for the
+# platform packagers to extract native symbols.  Shipping copies are stripped.
+[profile.release]
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "off"
+
 [workspace.lints.rust]
 unsafe_code = "deny"

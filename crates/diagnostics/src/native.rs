@@ -38,8 +38,9 @@ const CAPTURE_OFF: &str = "off";
 /// again in every generation of a re-spawn chain.
 const MONITOR_ARG: &str = "--focusforge-crash-monitor";
 
-/// The monitor ends its loop when no application has connected within this
-/// period, so a monitor whose parent died before connecting cannot linger.
+/// The monitor ends its loop when no application has identified itself
+/// within this period, so a monitor whose parent died before attaching
+/// cannot linger.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the application waits for its freshly spawned monitor to bind,
@@ -115,7 +116,35 @@ fn crash_signal(cc: &CrashContext) -> u32 {
 
 #[cfg(target_os = "macos")]
 fn crash_signal(cc: &CrashContext) -> u32 {
-    cc.exception.as_ref().map_or(0, |e| e.kind)
+    cc.exception
+        .as_ref()
+        .map_or(0, |e| mach_exception_signal(e.kind, e.code, e.subcode))
+}
+
+/// The POSIX signal number a Mach exception stands for. A bad access or
+/// stack-guard hit is a segmentation fault; an abort arrives as a software
+/// exception whose subcode is the signal itself. Numbered as
+/// [`signal_name`] expects.
+#[cfg(any(target_os = "macos", test))]
+fn mach_exception_signal(kind: u32, code: u64, subcode: Option<u64>) -> u32 {
+    const EXC_BAD_ACCESS: u32 = 1;
+    const EXC_BAD_INSTRUCTION: u32 = 2;
+    const EXC_ARITHMETIC: u32 = 3;
+    const EXC_SOFTWARE: u32 = 5;
+    const EXC_BREAKPOINT: u32 = 6;
+    const KERN_INVALID_ADDRESS: u64 = 1;
+    const KERN_PROTECTION_FAILURE: u64 = 2;
+    const EXC_SOFT_SIGNAL: u64 = 0x10003;
+
+    match kind {
+        EXC_BAD_ACCESS if matches!(code, KERN_INVALID_ADDRESS | KERN_PROTECTION_FAILURE) => 11,
+        EXC_BAD_ACCESS => 7,
+        EXC_BAD_INSTRUCTION => 4,
+        EXC_ARITHMETIC => 8,
+        EXC_BREAKPOINT => 5,
+        EXC_SOFTWARE if code == EXC_SOFT_SIGNAL => subcode.map_or(0, |s| s as u32),
+        _ => 0,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -161,17 +190,17 @@ fn serve(socket: &str) -> Result<(), minidumper::Error> {
     let mut server = Server::with_name(socket_name(socket))?;
     let handler = Monitor::default();
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
-    let connected = handler.connected.clone();
+    let attached = handler.attached.clone();
     let watchdog = shutdown.clone();
     std::thread::spawn(move || {
         std::thread::sleep(IDLE_TIMEOUT);
-        if !connected.load(Ordering::SeqCst) {
+        if !attached.load(Ordering::SeqCst) {
             watchdog.store(true, Ordering::SeqCst);
         }
     });
     // `stale_timeout` stays `None`: it drops a client that has sent no
     // message within the period, and an application can work silently for
-    // minutes. The client's disconnect is what ends the loop instead.
+    // minutes. The application's disconnect is what ends the loop instead.
     server.run(Box::new(handler), &shutdown, None)
 }
 
@@ -187,7 +216,13 @@ struct ProcessInfo {
 
 #[derive(Default)]
 struct Monitor {
-    connected: std::sync::Arc<AtomicBool>,
+    /// Set once a client has sent [`MESSAGE_PROCESS_INFO`]: only that client
+    /// is the application. A connection that closes before identifying
+    /// itself is a failed attempt -- on macOS a client connects the socket
+    /// before it looks up the monitor's Mach port, and gives up on the
+    /// socket when that port is not registered yet -- and the application
+    /// is still to come.
+    attached: std::sync::Arc<AtomicBool>,
     process: Mutex<Option<ProcessInfo>>,
     signal: AtomicU32,
     crashed_at: AtomicI64,
@@ -242,6 +277,7 @@ impl ServerHandler for Monitor {
     fn on_message(&self, kind: u32, buffer: Vec<u8>) {
         match kind {
             MESSAGE_PROCESS_INFO => {
+                self.attached.store(true, Ordering::SeqCst);
                 if let Ok(info) = serde_json::from_slice::<serde_json::Value>(&buffer) {
                     *self.process.lock().unwrap_or_else(|e| e.into_inner()) = Some(ProcessInfo {
                         crash_dir: PathBuf::from(info["crash_dir"].as_str().unwrap_or_default()),
@@ -261,13 +297,12 @@ impl ServerHandler for Monitor {
         }
     }
 
-    fn on_client_connected(&self, _num_clients: usize) -> LoopAction {
-        self.connected.store(true, Ordering::SeqCst);
-        LoopAction::Continue
-    }
-
     fn on_client_disconnected(&self, _num_clients: usize) -> LoopAction {
-        LoopAction::Exit
+        if self.attached.load(Ordering::SeqCst) {
+            LoopAction::Exit
+        } else {
+            LoopAction::Continue
+        }
     }
 }
 
@@ -377,5 +412,74 @@ pub(crate) fn raise(kind: &str) {
             "stack-overflow" => sadness_generator::raise_stack_overflow(),
             _ => sadness_generator::raise_abort(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KERN_INVALID_ADDRESS: u64 = 1;
+    const KERN_PROTECTION_FAILURE: u64 = 2;
+    const EXC_SOFT_SIGNAL: u64 = 0x10003;
+
+    #[test]
+    fn a_bad_access_is_a_segfault() {
+        for code in [KERN_INVALID_ADDRESS, KERN_PROTECTION_FAILURE] {
+            let signal = mach_exception_signal(1, code, Some(0x42));
+            assert_eq!(signal_name(signal), "SIGSEGV", "kern_return {code}");
+        }
+        assert_eq!(signal_name(mach_exception_signal(1, 10, None)), "SIGBUS");
+    }
+
+    #[test]
+    fn an_abort_arrives_as_a_software_exception_carrying_the_signal() {
+        let signal = mach_exception_signal(5, EXC_SOFT_SIGNAL, Some(6));
+        assert_eq!(signal_name(signal), "SIGABRT");
+    }
+
+    /// A connection attempt that reaches the socket and then fails -- on
+    /// macOS, one made before the monitor has registered its Mach port --
+    /// closes without identifying itself. The monitor must keep waiting for
+    /// its application instead of taking that close for the application's.
+    #[test]
+    fn a_connection_that_never_identifies_itself_does_not_end_the_monitor() {
+        let socket = format!("{}-unidentified", default_socket());
+        let server = {
+            let socket = socket.clone();
+            std::thread::spawn(move || serve(&socket))
+        };
+        let connect = || {
+            let deadline = Instant::now() + CONNECT_TIMEOUT;
+            loop {
+                match Client::with_name(socket_name(&socket)) {
+                    Ok(client) => return client,
+                    Err(e) if Instant::now() >= deadline => panic!("no monitor to reach: {e}"),
+                    Err(_) => std::thread::sleep(CONNECT_RETRY),
+                }
+            }
+        };
+
+        drop(connect());
+        let application = connect();
+        application
+            .send_message(MESSAGE_PROCESS_INFO, "{}")
+            .expect("process information reaches the monitor");
+        application
+            .ping()
+            .expect("the monitor still serves after an unidentified connection closed");
+
+        drop(application);
+        server
+            .join()
+            .expect("the monitor thread does not panic")
+            .expect("the application's disconnect ends the loop cleanly");
+    }
+
+    #[test]
+    fn the_other_hardware_exceptions_name_their_signals() {
+        assert_eq!(signal_name(mach_exception_signal(2, 1, None)), "SIGILL");
+        assert_eq!(signal_name(mach_exception_signal(3, 1, None)), "SIGFPE");
+        assert_eq!(signal_name(mach_exception_signal(6, 1, None)), "SIGTRAP");
     }
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! All GPU-to-CPU readback for the spike lives here, and nowhere else. `--dump` and
 //! `--verify-pattern` are diagnostic; the display path (`main.rs`) never calls into this module.
 

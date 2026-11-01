@@ -90,19 +90,26 @@ range, and its default.
 
 Frames of one stack often differ slightly in brightness. `stack` equalizes
 them before fusing, on by default for every method: each frame gets one gain,
-the same on every channel, matching the reference frame's mid-tone brightness.
+the same on every channel, bringing each frame's whole-image mean to one
+target shared by all frames.
 
 ```bash
 focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize=false
 focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize-max-gain=1.5
+focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize-target=0.2
 ```
+
+`equalize-target` (-0.5 to 0.5, default 0.0) moves the shared target in stops
+from the frames' average brightness: 0.0 keeps the average, +1 would double it.
 
 `equalize-max-gain` (1.01 to 2.0, default 1.25) bounds the gain both ways: with
 1.25 a frame's gain stays between 0.8 and 1.25. A frame that would need more
 gets the bound, and the run prints a notice naming the frame, the gain it
-needed and the smallest bound that would cover it. The gains are recorded in
+needed, the smallest bound that would cover it and the mean it reached. A
+black frame keeps gain 1, and a frame whose gain clips samples at white and
+misses the target is reported as well. The gains are recorded in
 the project, so `export` writes the equalized result. In the window these are
-the **PREPARE** settings. See
+the **PREPARE** settings, where the target is a signed slider that steps by 0.1. See
 [`reference/cli.md`](../reference/cli.md#stack) for the project settings.
 
 ## Getting the Z-Map
@@ -144,4 +151,4 @@ focusforge-cli stack path/to/frames/ --algorithm laplacian --json
 `--json` reports the frames that were read, the resolved algorithm and
 parameters (with where each value came from), the tile geometry the run
 planned, and the project path written — see
-[`reference/cli.md`](../reference/cli.md#--json-1) for the full schema.
+[`reference/cli.md`](../reference/cli.md#stack) for the full schema.

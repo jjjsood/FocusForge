@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/fixture-e2e.sh
 #
 # Drive the built CLI over the checked-in fixtures. This is the gate that
@@ -26,6 +27,7 @@ cd "$REPO"
 export FOCUSFORGE_DATA_DIR="$REPO/.scratch/fixture-e2e-data"
 
 CLI=target/debug/focusforge-cli
+[ -f "$CLI.exe" ] && CLI="$CLI.exe"
 
 if [ ! -x "$CLI" ]; then
   echo "SKIP: no CLI binary yet ($CLI)"
@@ -67,11 +69,12 @@ echo "OK: fact present -- mmap fast path: yes"
 
 # `align`, cheap: `--algorithm pyramidal-ecc` is explicit because the all-targets
 # debug build also registers a test algorithm, which makes the bare default
-# ambiguous. The default fallback records divergent frames against the
-# middle anchor. Never a `stack` invocation here: that is
-# minutes of debug-profile fusion this cheap gate must not pay for.
-echo "+ $CLI align fixtures/mantis-512 --algorithm pyramidal-ecc --json"
-ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --json)"
+# ambiguous. `reference-policy=anchor` is explicit because the pinned counts
+# below are those of registering every frame against the middle anchor. The
+# default fallback records divergent frames. Never a `stack` invocation here:
+# that is minutes of debug-profile fusion this cheap gate must not pay for.
+echo "+ $CLI align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json"
+ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json)"
 
 printf '%s' "$ALIGN_OUT" | grep -q '"frame_count": 8' \
   || { echo "FAIL: fixture e2e -- align missing fact: frame_count 8" >&2; exit 1; }

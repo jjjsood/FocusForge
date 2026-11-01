@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Run ONE noisy command with bounded stdout: a status line here, the full
 # output in a log file, the tail of it inline if it failed.
 #

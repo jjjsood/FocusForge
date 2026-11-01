@@ -7,9 +7,11 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
+import { FFDragLandingMarker } from "../../components/ff_drag_landing_marker.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFMenuList } from "../../components/ff_menu_list.slint";
 import { FFIconButton } from "../../components/ff_icon_button.slint";
+import { FFPanePlaceholder } from "../../components/ff_pane_placeholder.slint";
 
 /// One row of the panel's flat list -- the `.slint` twin of
 /// `crate::images::ImageRow`.
@@ -17,14 +19,22 @@ export struct ImageRowView {
     chip: color,
     name: string,
     time-text: string,
+    capture-stamp: string,
     excluded: bool,
     unresolved: bool,
     selected: bool,
+    hovered: bool,
+    focused: bool,
+    job-disabled: bool,
+    preview: image,
+    preview-state: string,
 }
 
 export component FFImagesPanel inherits Rectangle {
     in property <[ImageRowView]> rows: [];
     in property <string> header-text: "";
+    in property <string> presentation: "list";
+    in property <length> tooltip-max-width: ShellGeometry.tooltip-width;
     // The list's own `viewport-y` (zero or negative), written directly when
     // the scrollbar or a content change moves it.
     in-out property <length> list-viewport-y <=> list.viewport-y;
@@ -34,6 +44,9 @@ export component FFImagesPanel inherits Rectangle {
     // Whether the panel draws at full strength. False dims the whole panel
     // to the same disabled look `FFSettingsPanel` uses during a job.
     in property <bool> enabled: true;
+    // Job activity disables mutation and dragging while retaining ordinary
+    // selection on resolved rows.
+    in property <bool> job-disabled: false;
     // The editor's read-only legend: every row is a mode of `FFImageRow`
     // rather than the mutable stacking-mode row.
     in property <bool> legend: false;
@@ -47,20 +60,27 @@ export component FFImagesPanel inherits Rectangle {
     // How far the floating copy of `dragging-row` has moved from its own
     // slot since the grip was pressed.
     in property <length> drag-offset: 0px;
+    // A moved drag keeps capture through a zero offset until release.
+    in property <bool> drag-capture-active: false;
     // The row index the drag would land at if released right now, `-1`
     // with no drag in progress. Equal to `dragging-row` itself means
     // releasing now moves nothing, and no landing line is drawn.
     in property <int> drag-target-row: -1;
+    property <length> row-height: root.presentation == "image-list"
+        ? ShellGeometry.image-list-row-height
+        : root.presentation == "large" ? ShellGeometry.large-preview-row-height
+        : ShellGeometry.image-row-height;
 
     callback add-frames-requested();
     callback sort-menu-toggled();
     callback sort-selected(string);
     callback frame-selected(int);
+    callback frame-keyboard-moved(int);
     callback frame-excluded-toggled(int);
     callback frame-remove-requested(int);
-    // The gutter's raw pointer stream: row under the pointer, kind (0 = down,
-    // 1 = up, 2 = move) and `y` in list-content coordinates.
-    callback frame-grip-pointer(int, int, length);
+    // The filename's raw pointer stream: row, kind (0 = down, 1 = up,
+    // 2 = move) and `y` in list-content coordinates.
+    callback frame-drag-pointer(int, int, length);
     // The list's own scroll offset after it moved.
     callback viewport-scrolled(length);
     // A plain wheel over a list row -- steps the selected/brush-source frame,
@@ -71,9 +91,7 @@ export component FFImagesPanel inherits Rectangle {
     callback scrollbar-dragged(length);
     callback viewport-height-changed(length);
 
-    // The row under the pointer in the grip gutter.
-    property <int> gutter-row: floor((grip-overlay.mouse-y - list.viewport-y) / ShellGeometry.image-row-height);
-
+    forward-focus: keyboard;
     opacity: root.enabled ? 1.0 : 0.5;
 
     VerticalLayout {
@@ -91,15 +109,17 @@ export component FFImagesPanel inherits Rectangle {
                 vertical-alignment: center;
             }
 
-            if root.mutable: HorizontalLayout {
+            if root.mutable && !root.job-disabled: HorizontalLayout {
                 spacing: Theme.space-1;
                 add-button := FFIconButton {
+                    name: "Add images";
                     icon: @image-url("../../../../../assets/icons/folder-plus.svg");
                     glyph-size: Theme.icon-sm;
                     pad: Theme.space-1;
                     triggered => { root.add-frames-requested(); }
                 }
                 sort-button := FFIconButton {
+                    name: "Sort";
                     icon: @image-url("../../../../../assets/icons/arrow-up-down.svg");
                     glyph-size: Theme.icon-sm;
                     pad: Theme.space-1;
@@ -120,36 +140,42 @@ export component FFImagesPanel inherits Rectangle {
                 chip: row.chip;
                 name: row.name;
                 time-text: row.time-text;
+                capture-stamp: row.capture-stamp;
+                presentation: root.presentation;
+                tooltip-max-width: root.tooltip-max-width;
+                preview: row.preview;
+                preview-state: row.preview-state;
                 excluded: row.excluded;
                 unresolved: row.unresolved;
                 selected: row.selected;
+                hovered: row.hovered;
+                focused: row.focused || (keyboard.has-focus && row.selected);
+                job-disabled: row.job-disabled || root.job-disabled;
                 mutable: root.mutable;
                 legend: root.legend;
-                dragging: root.mutable && i == root.dragging-row;
-                hovered: grip-overlay.has-hover && i == root.gutter-row;
-                clicked => { root.frame-selected(i); }
+                dragging: root.mutable && !root.job-disabled && i == root.dragging-row;
+                clicked => {
+                    keyboard.focus();
+                    root.frame-selected(i);
+                }
                 exclude-toggled => { root.frame-excluded-toggled(i); }
                 remove-requested => { root.frame-remove-requested(i); }
+                drag-pointer(kind, local-y) => {
+                    root.frame-drag-pointer(i, kind, i * root.row-height + local-y);
+                }
                 wheel(delta) => { root.frame-wheel(delta); }
             }
         }
     }
 
-    // Owns a grip drag for its whole gesture, so the release still lands
-    // after the pointer leaves the list or the origin row scrolls away.
-    grip-overlay := TouchArea {
-        enabled: root.mutable;
+    if root.rows.length == 0: FFPanePlaceholder {
         x: 0px;
         y: list.y;
-        width: ShellGeometry.image-row-content-inset;
-        height: list.visible-height;
-        scroll-event(event) => {
-            root.frame-wheel(event.delta-y);
-            accept
-        }
-        pointer-event(event) => {
-            root.frame-grip-pointer(root.gutter-row, event.kind == PointerEventKind.down ? 0 : (event.kind == PointerEventKind.move ? 2 : 1), self.mouse-y - list.viewport-y);
-        }
+        width: ShellGeometry.image-row-band-width;
+        title: "No source images";
+        body: "Add images to begin.";
+        action-label: root.mutable && !root.job-disabled ? "Add images" : "";
+        action-requested => { root.add-frames-requested(); }
     }
 
     scrollbar := FFScrollbar {
@@ -168,31 +194,67 @@ export component FFImagesPanel inherits Rectangle {
     // the list, below when later, matching the remove-then-insert
     // semantics `move_frame` applies on release. Hidden when the target is
     // the row's own slot, since releasing then moves nothing.
-    if root.dragging-row >= 0 && root.drag-target-row >= 0 && root.drag-target-row != root.dragging-row: landing-line := Rectangle {
+    if root.dragging-row >= 0 && root.drag-target-row >= 0 && root.drag-target-row != root.dragging-row: landing-line := FFDragLandingMarker {
         x: 0px;
         y: list.y + list.viewport-y
-            + (root.drag-target-row > root.dragging-row ? root.drag-target-row + 1 : root.drag-target-row) * ShellGeometry.image-row-height
+            + (root.drag-target-row > root.dragging-row ? root.drag-target-row + 1 : root.drag-target-row) * root.row-height
             - ShellGeometry.pane-divider / 2;
-        width: ShellGeometry.image-row-band-width;
-        height: ShellGeometry.pane-divider;
-        background: Theme.accent-default;
     }
 
-    // A floating copy of the row being dragged, outside the list's clipping
-    // so it can pass over the rows on either side of it. The row it was
-    // grabbed from stays in place underneath.
-    if root.dragging-row >= 0 && root.dragging-row < root.rows.length: drag-ghost := FFImageRow {
+    // A moved source gets a floating copy outside the list's clipping so it
+    // can pass over adjacent rows. Its origin remains underneath.
+    if root.dragging-row >= 0 && root.drag-offset != 0px && root.dragging-row < root.rows.length: drag-ghost := FFImageRow {
         x: 0px;
-        y: list.y + root.dragging-row * ShellGeometry.image-row-height + list.viewport-y + root.drag-offset;
+        y: list.y + root.dragging-row * root.row-height + list.viewport-y + root.drag-offset;
         width: ShellGeometry.image-row-band-width;
         chip: root.rows[root.dragging-row].chip;
         name: root.rows[root.dragging-row].name;
         time-text: root.rows[root.dragging-row].time-text;
+        capture-stamp: root.rows[root.dragging-row].capture-stamp;
+        presentation: root.presentation;
+        tooltip-max-width: root.tooltip-max-width;
+        preview: root.rows[root.dragging-row].preview;
+        preview-state: root.rows[root.dragging-row].preview-state;
         excluded: root.rows[root.dragging-row].excluded;
         unresolved: root.rows[root.dragging-row].unresolved;
+        job-disabled: root.rows[root.dragging-row].job-disabled || root.job-disabled;
         mutable: false;
         dragging: true;
         floating: true;
+    }
+
+    if root.dragging-row >= 0 && root.drag-capture-active: drag-capture := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: ShellGeometry.image-row-band-width;
+        height: parent.height;
+        pointer-event(event) => {
+            root.frame-drag-pointer(root.dragging-row,
+                event.kind == PointerEventKind.move ? 2 : 1,
+                self.mouse-y - list.y - list.viewport-y);
+        }
+        moved => {
+            root.frame-drag-pointer(root.dragging-row, 2,
+                self.mouse-y - list.y - list.viewport-y);
+        }
+    }
+
+    keyboard := FocusScope {
+        x: 0px;
+        y: list.y;
+        width: 0px;
+        height: list.height;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if event.text == Key.UpArrow {
+                root.frame-keyboard-moved(-1);
+                return accept;
+            } else if event.text == Key.DownArrow {
+                root.frame-keyboard-moved(1);
+                return accept;
+            }
+            return reject;
+        }
     }
 
     // Drawn last, over the row list -- the sort button's own two-entry
@@ -208,4 +270,5 @@ export component FFImagesPanel inherits Rectangle {
         selected: root.sort;
         option-selected(picked) => { root.sort-selected(picked); }
     }
+
 }

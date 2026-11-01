@@ -22,7 +22,9 @@ use focusforge_gui::canvas::CanvasFeed;
 use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
 use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
-use focusforge_gui::{AppController, ChromeKey, OpenOutcome, ShellEvent, ShellMode};
+use focusforge_gui::{
+    AppController, ChromeKey, GuardSecondary, OpenOutcome, SaveAsk, ShellEvent, ShellMode,
+};
 
 use common::copy_frame;
 
@@ -326,6 +328,153 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
     }
 }
 
+/// Forwards to a [`job::GuiObserver`] and records the phase the bar would
+/// read the moment the brightness preparation is announced, and the step text
+/// it would read the moment the align stage is announced.
+struct PhaseAtStage {
+    inner: job::GuiObserver,
+    at_prepare: Mutex<Option<job::Phase>>,
+    at_align: Mutex<Option<String>>,
+}
+
+impl PhaseAtStage {
+    fn new() -> Self {
+        Self {
+            inner: job::GuiObserver::new(),
+            at_prepare: Mutex::new(None),
+            at_align: Mutex::new(None),
+        }
+    }
+}
+
+impl StageObserver for PhaseAtStage {
+    fn stage(&self, stage: pipeline::RunStage) {
+        let prepares = matches!(stage, pipeline::RunStage::Prepare { .. });
+        let aligns = matches!(stage, pipeline::RunStage::Align { .. });
+        StageObserver::stage(&self.inner, stage);
+        if prepares {
+            let phase = job::progress_phase(self.inner.last_progress().as_ref());
+            *self.at_prepare.lock().unwrap() = Some(phase);
+        }
+        if aligns {
+            let progress = self.inner.last_progress();
+            let text = job::progress_text(&job::RunState::Running, progress.as_ref());
+            *self.at_align.lock().unwrap() = Some(text);
+        }
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        StageObserver::tick(&self.inner, progress);
+    }
+}
+
+#[test]
+fn the_bar_reads_preparing_from_the_moment_equalization_starts() {
+    let mut request = no_align_request("preparing_phase", 3);
+    request.equalize = Some(focusforge_core::equalize::EqualizeSettings {
+        max_gain: 1.25,
+        target_stops: 0.0,
+    });
+    let observer = PhaseAtStage::new();
+    let control = focusforge_core::job::JobControl::new();
+    pipeline::run(&request, &observer, control, None).expect("an equalized run completes");
+    let at_prepare = observer
+        .at_prepare
+        .lock()
+        .unwrap()
+        .expect("an equalized run announces its preparation");
+    assert_eq!(
+        at_prepare,
+        job::Phase::Preparing,
+        "the bar must not read Fusing while the brightness gains are estimated"
+    );
+}
+
+/// One `pipeline::run` of `request` through the stage cache under its
+/// scratch root: the step text the bar reads when the align stage is
+/// announced, and the report's alignment source.
+fn align_stage_text(request: &FuseRequest) -> (String, String) {
+    let observer = PhaseAtStage::new();
+    let cache = focusforge_core::job::StageCache::open(&request.scratch_root)
+        .expect("the stage cache opens under the scratch root");
+    let outcome = pipeline::run(
+        request,
+        &observer,
+        focusforge_core::job::JobControl::new(),
+        Some(&cache),
+    )
+    .expect("the run completes");
+    let FuseOutcome::Completed(report) = outcome else {
+        panic!("the run was not cancelled");
+    };
+    let text = observer
+        .at_align
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("an aligned run announces its align stage");
+    (text, report.align_source.clone())
+}
+
+/// `no_align_request` with `dummy-align`, sealing to `name` so a repeat run
+/// of the same frames never meets a previous seal.
+fn dummy_align_request(label: &str, name: &str) -> FuseRequest {
+    let mut request = no_align_request(label, 3);
+    request.output = FuseOutput::Seal(request.scratch_root.join(name));
+    request.align = Some(pipeline::AlignRequest {
+        algorithm: registry::find_align("dummy-align").expect("dummy-align must be registered"),
+        explicit: ParamValues::new(),
+        lax: false,
+    });
+    request
+}
+
+#[test]
+fn a_fusion_only_change_reads_from_cache_while_aligning() {
+    let mut request = dummy_align_request("align_hint_cache", "first.ffp");
+    assert_eq!(
+        align_stage_text(&request),
+        (String::new(), "computed".to_string())
+    );
+
+    request.output = FuseOutput::Seal(request.scratch_root.join("second.ffp"));
+    request
+        .explicit
+        .insert("levels".to_string(), ParamValue::Int(5));
+    assert_eq!(
+        align_stage_text(&request),
+        ("from cache".to_string(), "cached".to_string()),
+        "a fusion parameter is not part of the alignment identity"
+    );
+
+    request.output = FuseOutput::Seal(request.scratch_root.join("third.ffp"));
+    request
+        .align
+        .as_mut()
+        .expect("an aligned request")
+        .explicit
+        .insert("max-shift".to_string(), ParamValue::Int(8));
+    assert_eq!(
+        align_stage_text(&request),
+        (String::new(), "computed".to_string()),
+        "an alignment parameter is"
+    );
+}
+
+#[test]
+fn clearing_the_stage_cache_drops_the_reuse_hint() {
+    let mut request = dummy_align_request("align_hint_cleared", "first.ffp");
+    assert_eq!(align_stage_text(&request).1, "computed");
+
+    job::clear_stage_cache(&request.scratch_root).expect("the cache clears");
+    request.output = FuseOutput::Seal(request.scratch_root.join("second.ffp"));
+    assert_eq!(
+        align_stage_text(&request),
+        (String::new(), "computed".to_string()),
+        "a cleared cache leaves nothing to reuse"
+    );
+}
+
 #[test]
 fn pause_then_resume_continues() {
     let request = no_align_request("pause_then_resume", 2);
@@ -384,7 +533,7 @@ fn settings_journey_pause_resume_and_cancel() {
         );
         assert_eq!(newest_composite(&controller), reference, "{id}: resumed");
 
-        controller.dismiss_notice();
+        let reported = controller.notifications().len();
         // Paused straight after the start, not after a progress tick: the
         // worker parks at its first boundary, so a short run cannot finish
         // while the test thread waits for a tick and the cancel lands on it.
@@ -394,8 +543,8 @@ fn settings_journey_pause_resume_and_cancel() {
         controller.cancel_fuse();
         common::wait_for_settle(&mut controller, timeout);
         assert_eq!(
-            controller.notice(),
-            None,
+            controller.notifications().len(),
+            reported,
             "{id}: a cancelled run reports nothing"
         );
         assert_eq!(controller.job_view().state, job::RunState::Idle, "{id}");
@@ -421,6 +570,114 @@ fn settings_journey_pause_resume_and_cancel() {
             "{id}: after cancel"
         );
     }
+}
+
+/// Waits until the bar reads "Fusing" after the preparation and alignment
+/// stages, which hold no pause. A freshly started run reads "Fusing" before
+/// its first stage report, so the wait first gives the worker a moment to
+/// leave that state.
+fn wait_until_fusing(controller: &AppController) {
+    let start = Instant::now();
+    let mut left_fusing = false;
+    loop {
+        let fusing = controller.job_view().stage_word == "Fusing";
+        left_fusing |= !fusing;
+        if fusing && (left_fusing || start.elapsed() > Duration::from_secs(1)) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the run never reached Fusing"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_slowed_run_holds_its_floor_and_matches_an_unslowed_run() {
+    let timeout = Duration::from_secs(120);
+    let mut controller = controller_with_frames("slow_run_floor", 3);
+    controller.set_slow_run(2, Duration::from_secs(2));
+    let newest_composite = |c: &AppController| {
+        std::fs::read(&c.held_checkpoints().last().expect("a held run").composite)
+            .expect("the held composite reads")
+    };
+
+    assert!(controller.start_fuse(), "run 1 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    let unslowed = newest_composite(&controller);
+
+    let started = Instant::now();
+    assert!(controller.start_fuse(), "run 2 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the slowed run settled after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(controller.held_checkpoints().len(), 2);
+    assert_eq!(
+        newest_composite(&controller),
+        unslowed,
+        "a slowed run must produce the unslowed run's composite"
+    );
+}
+
+#[test]
+fn pause_and_cancel_act_inside_a_slowed_run_and_siblings_keep_their_speed() {
+    let timeout = Duration::from_secs(120);
+    let floor = Duration::from_secs(20);
+    let mut controller = controller_with_frames("slow_run_control", 3);
+    controller.set_slow_run(2, floor);
+
+    assert!(controller.start_fuse(), "run 1 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    let held = controller.held_checkpoints().len();
+
+    let run_2 = Instant::now();
+    assert!(controller.start_fuse(), "run 2 starts");
+    wait_until_fusing(&controller);
+    controller.pause_or_resume();
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        held,
+        "a run paused inside its hold must not complete"
+    );
+    assert_eq!(controller.job_view().state, job::RunState::Paused);
+
+    // Run 2 has run for at most `ran` -- less if the pause held it -- so
+    // its floor still owes at least `floor - ran` after the resume. A cancel
+    // that waited out the hold settles no earlier than that, however slow
+    // the host; one that acts inside it settles long before.
+    let resumed = Instant::now();
+    let ran = resumed - run_2;
+    controller.pause_or_resume();
+    controller.cancel_fuse();
+    common::wait_for_settle(&mut controller, timeout);
+    let cancelled = resumed.elapsed();
+    assert!(
+        cancelled < floor.saturating_sub(ran),
+        "the cancel waited out the hold: settled {cancelled:?} after the resume, \
+         {ran:?} into the {floor:?} floor"
+    );
+    assert_eq!(controller.job_view().state, job::RunState::Idle);
+    assert_eq!(controller.held_checkpoints().len(), held);
+
+    let run_3 = Instant::now();
+    assert!(controller.start_fuse(), "run 3 starts");
+    common::wait_for_settle(&mut controller, timeout);
+    assert!(
+        run_3.elapsed() < floor,
+        "run 3 took {:?}, as long as the slowed run's floor",
+        run_3.elapsed()
+    );
+    assert_eq!(
+        controller.held_checkpoints().len(),
+        held + 1,
+        "the run after the slowed one is not slowed"
+    );
 }
 
 #[test]
@@ -827,7 +1084,6 @@ fn failure_summary_names_the_failed_operation() {
         assert_eq!(alignment_operation, job::FailedOperation::Alignment);
     }
 
-    let setup_operation;
     let setup_summary;
     {
         let root = common::tree("summary_setup_frames");
@@ -853,12 +1109,10 @@ fn failure_summary_names_the_failed_operation() {
             .last()
             .expect("the failed run must append a notification");
         assert_eq!(notification.message, message);
-        setup_operation = notification.operation;
-        setup_summary = notification.operation.summary();
-        assert_eq!(setup_operation, job::FailedOperation::Setup);
+        assert_eq!(notification.title, job::FailedOperation::Setup.summary());
+        setup_summary = job::FailedOperation::Setup.summary();
     }
 
-    let fusion_operation;
     let fusion_summary;
     {
         let mut controller = controller_with_frames("summary_fusion", 2);
@@ -877,9 +1131,8 @@ fn failure_summary_names_the_failed_operation() {
             .last()
             .expect("the failed run must append a notification");
         assert_eq!(notification.message, message);
-        fusion_operation = notification.operation;
-        fusion_summary = notification.operation.summary();
-        assert_eq!(fusion_operation, job::FailedOperation::Fusion);
+        assert_eq!(notification.title, job::FailedOperation::Fusion.summary());
+        fusion_summary = job::FailedOperation::Fusion.summary();
     }
 
     let mut summaries = vec![alignment_summary, setup_summary, fusion_summary];
@@ -927,6 +1180,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&aligning)),
@@ -944,6 +1199,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&fusing)),
@@ -960,6 +1217,8 @@ fn phases_map_onto_engine_stages() {
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&sealing)),
@@ -990,6 +1249,8 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         eta: None,
         align_done,
         align_total,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -1005,6 +1266,8 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         eta: None,
         align_done: 0,
         align_total: 0,
+        prepare_done: 0,
+        prepare_total: 0,
     }
 }
 
@@ -1047,6 +1310,170 @@ fn write_progress_text_is_the_name_only() {
 }
 
 #[test]
+fn progress_phase_names_the_preparation_pass() {
+    use focusforge_core::job::{JobProgress, JobStage};
+    use focusforge_gui::job::{Phase, RunState, phase_line, progress_phase, progress_text};
+
+    // A finished-looking unit count must not read as `Writing`.
+    for (done, total) in [(0, 0), (3, 3), (7, 7)] {
+        let preparing = JobProgress {
+            stage: JobStage::Prepare,
+            units_done: done,
+            unit_total: total,
+            ..fuse_progress(0, 0)
+        };
+        assert_eq!(progress_phase(Some(&preparing)), Phase::Preparing);
+        assert_eq!(progress_text(&RunState::Running, Some(&preparing)), "");
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&preparing)).as_deref(),
+            Some("preparing")
+        );
+    }
+}
+
+fn prepare_progress(
+    prepare_done: usize,
+    prepare_total: usize,
+) -> focusforge_core::job::JobProgress {
+    focusforge_core::job::JobProgress {
+        stage: focusforge_core::job::JobStage::Prepare,
+        prepare_done,
+        prepare_total,
+        ..fuse_progress(0, 0)
+    }
+}
+
+#[test]
+fn prepare_progress_names_the_frame_count_and_fills_the_bar() {
+    use focusforge_gui::job::{Phase, RunState, bar_fraction, phase_line, progress_text};
+
+    for (done, total) in [(3, 8), (42, 61), (0, 5)] {
+        let snapshot = prepare_progress(done, total);
+        assert_eq!(
+            progress_text(&RunState::Running, Some(&snapshot)),
+            format!("{done} of {total}")
+        );
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&snapshot)).as_deref(),
+            Some(format!("preparing, {done} of {total}").as_str())
+        );
+        assert_eq!(bar_fraction(Some(&snapshot)), done as f32 / total as f32);
+        assert_eq!(Phase::Preparing.frames(&snapshot), Some((done, total)));
+    }
+}
+
+#[test]
+fn prepare_eta_text_follows_the_engine_estimate() {
+    use focusforge_gui::job::{RunState, eta_text};
+
+    let mut snapshot = prepare_progress(0, 8);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.prepare_done = 2;
+    snapshot.eta = Some(Duration::from_secs(95));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 1:35");
+}
+
+#[test]
+fn align_eta_text_follows_the_engine_estimate() {
+    use focusforge_gui::job::{RunState, bar_fraction, eta_text, progress_text};
+
+    let mut snapshot = align_progress(3, 61);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.eta = Some(Duration::from_secs(125));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 2:05");
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&snapshot)),
+        "3 of 61"
+    );
+    assert_eq!(bar_fraction(Some(&snapshot)), 3.0 / 61.0);
+    assert_eq!(eta_text(&RunState::Paused, Some(&snapshot)), "ETA —");
+
+    // Every frame done, the stage not yet moved on: the engine reports no
+    // estimate, never a rendered zero.
+    assert_eq!(
+        eta_text(&RunState::Running, Some(&align_progress(61, 61))),
+        "estimating"
+    );
+}
+
+#[test]
+fn prepare_stage_announcement_records_the_frame_total() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{RunStage, StageObserver};
+
+    let observer = job::GuiObserver::new();
+    observer.stage(RunStage::Prepare { frames: 7 });
+    let recorded = observer.last_progress().expect("a Prepare snapshot");
+    assert_eq!(recorded.stage, JobStage::Prepare);
+    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 7));
+}
+
+#[test]
+fn a_cached_alignment_reads_as_reused() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{AlignSource, RunStage, StageObserver};
+    use focusforge_gui::job::{
+        RunState, bar_fraction, eta_text, phase_line, progress_text, stage_word,
+    };
+
+    let cached = || RunStage::Align {
+        frames: 9,
+        source: AlignSource::Cached,
+    };
+    let alone = job::GuiObserver::new();
+    alone.stage(cached());
+    let after_prepare = job::GuiObserver::new();
+    after_prepare.stage(RunStage::Prepare { frames: 5 });
+    after_prepare.stage(cached());
+
+    for observer in [&alone, &after_prepare] {
+        let snapshot = observer.last_progress().expect("an Align snapshot");
+        assert_eq!(snapshot.stage, JobStage::Align);
+        assert_eq!(snapshot.align_total, 0);
+        let running = RunState::Running;
+        assert_eq!(stage_word(&running, Some(&snapshot)), "Aligning");
+        assert_eq!(progress_text(&running, Some(&snapshot)), "from cache");
+        assert_eq!(bar_fraction(Some(&snapshot)), 0.0);
+        assert_eq!(eta_text(&running, Some(&snapshot)), "estimating");
+        assert_eq!(
+            phase_line(&running, Some(&snapshot)).as_deref(),
+            Some("aligning, from cache")
+        );
+        for held in [RunState::Paused, RunState::Cancelling] {
+            assert_eq!(progress_text(&held, Some(&snapshot)), "");
+        }
+    }
+}
+
+#[test]
+fn a_computed_alignment_shows_no_reuse_text() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{AlignSource, RunStage, StageObserver};
+    use focusforge_gui::job::{RunState, progress_text};
+
+    let observer = job::GuiObserver::new();
+    observer.stage(RunStage::Prepare { frames: 8 });
+    observer.stage(RunStage::Align {
+        frames: 8,
+        source: AlignSource::Computed,
+    });
+    let last = observer
+        .last_progress()
+        .expect("the Prepare snapshot stays");
+    assert_eq!(last.stage, JobStage::Prepare);
+
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&align_progress(3, 8))),
+        "3 of 8"
+    );
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&fuse_progress(2, 10))),
+        ""
+    );
+    assert_eq!(progress_text(&RunState::Running, None), "");
+}
+
+#[test]
 fn align_bar_fraction_follows_the_frame_count() {
     use focusforge_gui::job::bar_fraction;
 
@@ -1064,10 +1491,13 @@ fn progress_text_without_a_total_is_the_name_only() {
     use focusforge_gui::job::{RunState, bar_fraction, progress_text};
 
     // A cached alignment: `stage == Align`, but `align_total == 0` (no
-    // computed stage set a total) -- never `0 of <n>`, and never a rendered
-    // `0 of 0`.
+    // computed stage set a total) -- the reuse text, never `0 of <n>`, and
+    // never a rendered `0 of 0`.
     let cached = align_progress(0, 0);
-    assert_eq!(progress_text(&RunState::Running, Some(&cached)), "");
+    assert_eq!(
+        progress_text(&RunState::Running, Some(&cached)),
+        "from cache"
+    );
     assert_eq!(bar_fraction(Some(&cached)), 0.0);
 
     // A fuse snapshot with no total yet -- the plan's totals not credited --
@@ -1364,6 +1794,83 @@ fn fuse_is_enabled_from_two_frames_and_disabled_below() {
 }
 
 #[test]
+fn toolbar_preview_holds_until_a_run_starts() {
+    for (state, stage_word, eta) in [
+        ("idle", "", ""),
+        ("running", "Aligning", "ETA 1:12"),
+        ("paused", "Paused", "ETA —"),
+        ("cancelling", "Cancelling", "ETA —"),
+        ("failed", "Failed", "ETA —"),
+    ] {
+        let mut controller = controller_with_frames(&format!("preview_{state}"), 3);
+        controller.set_toolbar_preview(state);
+        let preview = controller.job_view();
+        assert_eq!(preview.toolbar_run_state, state);
+        assert_eq!(preview.stage_word, stage_word, "{state}");
+        assert_eq!(preview.eta_text, eta, "{state}");
+        assert!(preview.fuse_enabled, "{state}: a 3-frame tab can fuse");
+
+        // A completed open adds a 1-frame tab: the preview stays, only
+        // `fuse_enabled` follows the active tab.
+        let single = common::tree(&format!("preview_{state}_single_frames"));
+        copy_frame(&single, "00.tif", 0);
+        assert!(matches!(
+            common::open_and_settle(&mut controller, &[single]),
+            OpenOutcome::Opened(_)
+        ));
+        let view = controller.job_view();
+        assert!(!view.fuse_enabled, "{state}: a 1-frame tab cannot fuse");
+        assert_eq!(
+            JobViewHeld(&view),
+            JobViewHeld(&preview),
+            "{state}: held across a completed open"
+        );
+
+        controller.select_project(0);
+        let view = controller.job_view();
+        assert!(view.fuse_enabled, "{state}: back on the 3-frame tab");
+        assert_eq!(
+            JobViewHeld(&view),
+            JobViewHeld(&preview),
+            "{state}: held across a tab switch"
+        );
+
+        assert!(controller.start_fuse());
+        assert_ne!(
+            JobViewHeld(&controller.job_view()),
+            JobViewHeld(&preview),
+            "{state}: a started run replaces the preview"
+        );
+        controller.cancel_fuse();
+        common::wait_for_settle(&mut controller, Duration::from_secs(120));
+        // An idle preview legitimately equals the idle view a cancelled run
+        // leaves behind.
+        assert!(
+            state == "idle" || JobViewHeld(&controller.job_view()) != JobViewHeld(&preview),
+            "{state}: the preview does not return after the run"
+        );
+    }
+}
+
+/// A [`job::JobView`] compared without `fuse_enabled`, which follows the
+/// active tab rather than the held preview.
+#[derive(Debug)]
+struct JobViewHeld<'a>(&'a focusforge_gui::JobView);
+
+impl PartialEq for JobViewHeld<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let (a, b) = (self.0, other.0);
+        a.state == b.state
+            && a.toolbar_run_state == b.toolbar_run_state
+            && a.stage_word == b.stage_word
+            && a.step_text == b.step_text
+            && a.eta_text == b.eta_text
+            && a.bar_tone == b.bar_tone
+            && a.fraction == b.fraction
+    }
+}
+
+#[test]
 fn the_plus_tab_offers_no_fuse_control() {
     let controller = AppController::new();
     assert!(controller.plus_selected());
@@ -1639,10 +2146,10 @@ fn two_failures_keep_their_own_messages_and_requests() {
     );
 }
 
-/// Notification records outlive the single-slot toast they came from: a
-/// second failure replaces the first, still-unread toast, a retry appends
-/// its own record, and switching tabs afterwards drops nothing. Every
-/// record keeps its own tab's title, path and full message.
+/// Notification records outlive the toast queue they came from: a second
+/// failure queues its toast behind the first, each retry appends its own
+/// record, and switching tabs afterwards drops nothing. Every record keeps
+/// its own tab's title, path and full message.
 #[test]
 fn failure_notifications_outlive_the_toast() {
     let mut controller = AppController::new();
@@ -1668,47 +2175,54 @@ fn failure_notifications_outlive_the_toast() {
         .expect("tab B must fail")
         .to_string();
 
-    // The second failure replaces the first, still-unread toast slot.
-    let taken = controller
-        .take_settled_failure()
-        .expect("the most recent failure must still be pending");
-    assert_eq!(taken.message, message_b);
-    assert!(
-        controller.take_settled_failure().is_none(),
-        "a taken failure does not reappear"
-    );
+    // The second failure queues its toast behind the first; both records stay.
+    let latest = controller
+        .notifications()
+        .last()
+        .cloned()
+        .expect("the most recent failure must be recorded");
+    assert_eq!(latest.message, message_b);
 
-    assert!(
-        controller.retry_fuse(),
-        "retry on the active tab must start a run"
-    );
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
-    let retry_message = controller
-        .job_failure_message()
-        .expect("the retried tab must fail the same way")
-        .to_string();
+    let mut retry_messages = Vec::new();
+    for _ in 0..2 {
+        assert!(
+            controller.retry_fuse(),
+            "retry on the active tab must start a run"
+        );
+        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        retry_messages.push(
+            controller
+                .job_failure_message()
+                .expect("the retried tab must fail the same way")
+                .to_string(),
+        );
+    }
 
     controller.select_project(0);
 
     let notifications = controller.notifications();
     assert_eq!(
         notifications.len(),
-        3,
+        4,
         "every failure must be recorded, in order"
     );
 
     assert_eq!(notifications[0].message, message_a);
-    assert_eq!(notifications[0].operation, job::FailedOperation::Setup);
+    assert_eq!(
+        notifications[0].title,
+        job::FailedOperation::Setup.summary()
+    );
     assert_eq!(notifications[0].project_title, Some(title_a));
     assert_eq!(notifications[0].project_path, Some(path_a));
     assert_eq!(notifications[0].target, None);
 
     for (notification, message) in [
         (&notifications[1], &message_b),
-        (&notifications[2], &retry_message),
+        (&notifications[2], &retry_messages[0]),
+        (&notifications[3], &retry_messages[1]),
     ] {
         assert_eq!(notification.message, *message);
-        assert_eq!(notification.operation, job::FailedOperation::Setup);
+        assert_eq!(notification.title, job::FailedOperation::Setup.summary());
         assert_eq!(notification.project_title, Some(title_b.clone()));
         assert_eq!(notification.project_path, Some(path_b.clone()));
         assert_eq!(notification.target, None);
@@ -1729,13 +2243,12 @@ fn init_window_backend() {
     });
 }
 
-/// A failure that settles while the Projects overview is open is announced
-/// through the failure toast regardless of which tab is active: the run
-/// starts on the tab that will fail, a different tab is then selected, and
-/// the toast still opens once the overview is up.
+/// A failure that settles while the Projects overview is open raises no
+/// toast regardless of which tab is active: the run starts on the tab that
+/// will fail, a different tab is then selected, and the failure is recorded
+/// while the overview stays open.
 #[test]
-fn failure_while_the_overview_is_open_is_announced() {
-    use i_slint_backend_testing::ElementQuery;
+fn failure_while_the_overview_is_open_raises_no_toast() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
@@ -1764,35 +2277,21 @@ fn failure_while_the_overview_is_open_is_announced() {
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
 
     assert!(
-        app.get_job_toast_open(),
-        "a failure settling under the open overview must open the toast, \
-         regardless of which tab is active"
+        !app.get_toast_open(),
+        "Projects shows no toast, regardless of which tab is active"
     );
-    assert_eq!(app.get_job_toast_message(), "Setup failed");
+    assert_eq!(controller.lock().unwrap().notifications().len(), 1);
     assert!(
         app.get_projects_overlay_open(),
         "the overview must stay open"
     );
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
-    let opacity = ElementQuery::from_root(&app)
-        .match_id("AppWindow::job-toast")
-        .find_first()
-        .expect("the toast is always in the tree")
-        .computed_opacity();
-    assert!(
-        opacity > 0.99,
-        "the toast must fade in to fully visible, got opacity {opacity}"
-    );
 }
 
-/// Display time counts only visible time: the toast's 6 s auto-dismiss runs
-/// from the moment it opens, so a failure settling under the open overview
-/// stays visible for its whole display time once shown, and closing the
-/// overview afterwards never brings a stale, already-expired toast back.
+/// A failure settling under the open overview raises no toast, and closing
+/// the overview afterwards replays nothing: the record stays unread and is
+/// the only trace of the failure.
 #[test]
-fn a_failure_toast_is_not_spent_while_hidden() {
-    use i_slint_backend_testing::ElementQuery;
+fn projects_suppresses_a_failure_toast_without_replay() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
@@ -1801,13 +2300,14 @@ fn a_failure_toast_is_not_spent_while_hidden() {
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let controller = Arc::new(Mutex::new(controller_with_an_unreadable_frame(
-        "toast_not_spent_while_hidden",
+        "toast_suppressed_by_projects",
     )));
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
         common::empty_canvas(),
-        std::rc::Rc::new(std::cell::RefCell::new(None)),
+        slot.clone(),
     );
     app.set_project_loaded(true);
 
@@ -1817,48 +2317,21 @@ fn a_failure_toast_is_not_spent_while_hidden() {
     app.invoke_fuse_requested();
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
     assert!(
-        app.get_job_toast_open(),
-        "the toast must open the moment the run settles, whether or not the overview is open"
+        !app.get_toast_open(),
+        "Projects shows no toast for a failure settling under it"
     );
-
-    let toast_opacity = || {
-        ElementQuery::from_root(&app)
-            .match_id("AppWindow::job-toast")
-            .find_first()
-            .expect("the toast is always in the tree")
-            .computed_opacity()
-    };
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
-    assert!(
-        toast_opacity() > 0.99,
-        "the toast must be fully visible once its fade-in completes"
-    );
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(5100));
-    assert!(
-        app.get_job_toast_open(),
-        "the toast must still be open at 5.5 s, not expired unseen"
-    );
-    assert!(
-        toast_opacity() > 0.99,
-        "the toast must still be fully visible at 5.5 s"
-    );
-
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
-    assert!(
-        !app.get_job_toast_open(),
-        "the toast must have auto-dismissed by 6.1 s"
-    );
+    assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
 
     controller.lock().unwrap().toggle_projects_overlay();
-    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
-    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    focusforge_gui::bridge::push_toast(&app, &controller, &slot);
+    assert!(!app.get_toast_open(), "closing Projects replays nothing");
+    let controller = controller.lock().unwrap();
     assert_eq!(
-        toast_opacity(),
-        0.0,
-        "closing the overview after the toast expired must not bring a stale toast back"
+        controller.unread_notifications(),
+        1,
+        "the record stays unread"
     );
+    assert_eq!(controller.notifications().len(), 1);
 }
 
 #[test]
@@ -2562,7 +3035,7 @@ fn retry_queues_while_another_run_is_live() {
     controller.set_scratch_root_for_test(common::tree("retry_queues_scratch"));
     add_unreadable_tab(&mut controller, "retry_queues_a", 2);
     assert!(controller.start_fuse());
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
     match controller.job_view().state {
         job::RunState::Failed(_) => {}
         other => panic!("expected the first tab to fail, got {other:?}"),
@@ -2592,8 +3065,8 @@ fn retry_queues_while_another_run_is_live() {
 
     controller.select_project(1);
     controller.pause_or_resume();
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
-    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
 
     controller.select_project(0);
     match controller.job_view().state {
@@ -2992,12 +3465,14 @@ fn wheel_actions_are_blocked_under_the_settings_modal() {
             y: 0.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 566.0,
             y: 0.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
     );
     controller.fit_if_unfitted();
@@ -3158,7 +3633,7 @@ fn a_failed_save_keeps_the_project_in_memory() {
 
     assert!(!controller.save_active_project(|_| None));
     assert!(
-        controller.take_settled_failure().is_none(),
+        controller.notifications().is_empty(),
         "a cancelled dialog is not a failure"
     );
     assert!(
@@ -3176,9 +3651,11 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert!(!saved);
     assert!(left.is_empty(), "nothing was left behind: {left:?}");
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("a failed save says why");
-    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.title, job::FailedOperation::Save.summary());
     assert_eq!(notification.target, Some(target.clone()));
     assert!(
         notification.message.contains(&target.display().to_string()),
@@ -3205,9 +3682,11 @@ fn a_failed_save_keeps_the_project_in_memory() {
     assert_eq!(left, [PathBuf::from("existing.ffp")]);
     assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier project");
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("a failed save says why");
-    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.title, job::FailedOperation::Save.summary());
     assert_eq!(notification.target, Some(existing.clone()));
     assert!(
         notification
@@ -4263,7 +4742,11 @@ fn a_failed_save_keeps_the_tab_and_its_ops() {
     c.request_close(0);
     assert!(!c.save_and_close(|_| Some(missing.clone())));
     assert_eq!(c.project_tabs().len(), 1);
-    let note = c.take_settled_failure().expect("the failure is reported");
+    let note = c
+        .notifications()
+        .last()
+        .cloned()
+        .expect("the failure is reported");
     assert!(
         note.message.contains(&missing.display().to_string()),
         "{}",
@@ -4347,12 +4830,14 @@ fn the_unsaved_mark_follows_unsealed_ops() {
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     let right = PaneRect {
         x: w + 8.0,
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     c.set_pane_geometry(left, right);
     let events = record_events(&mut c);
@@ -4773,6 +5258,16 @@ fn a_fusion_only_change_reuses_the_alignment() {
     let align_source = |controller: &mut AppController| {
         assert!(controller.start_fuse());
         common::wait_for_settle(controller, Duration::from_secs(120));
+        let view = controller.job_view();
+        assert_eq!(
+            view.step_text, "",
+            "nothing about the cache stays on the bar"
+        );
+        assert!(
+            view.stage_word.starts_with("fused"),
+            "a settled run reads fused HH:MM: {}",
+            view.stage_word
+        );
         controller
             .last_alignment()
             .expect("a completed run")
@@ -5571,6 +6066,10 @@ fn the_bridge_never_calls_the_blocking_save_entries() {
         ".close_guard_secondary_pressed(",
         ".join_save(",
         ".finish_saves(",
+        ".start_save_active_project(",
+        ".start_close_guard_secondary(",
+        ".export_confirmed(",
+        "picker::pick_",
     ] {
         assert!(!code.contains(blocking), "bridge.rs calls {blocking}");
     }
@@ -5766,9 +6265,11 @@ fn a_failed_save_under_a_file_keeps_everything_held() {
         target.clone()
     )));
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("a failed save says why");
-    assert_eq!(notification.operation, job::FailedOperation::Save);
+    assert_eq!(notification.title, job::FailedOperation::Save.summary());
     assert_eq!(notification.target, Some(target.clone()));
     assert!(
         notification.message.contains(&target.display().to_string()),
@@ -5792,7 +6293,9 @@ fn a_failed_save_under_a_file_keeps_everything_held() {
     assert_eq!(held_paths(&controller), held_before);
     assert_eq!(controller.checkpoints_panel().row_count, rows);
     let notification = controller
-        .take_settled_failure()
+        .notifications()
+        .last()
+        .cloned()
         .expect("Save and close says why too");
     assert_eq!(notification.target, Some(target));
 }
@@ -6094,6 +6597,7 @@ fn set_fitted_panes(controller: &mut AppController) {
         y: 0.0,
         width: 566.0,
         height: 748.0,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane(0.0), pane(566.0));
     controller.fit_if_unfitted();
@@ -6118,6 +6622,7 @@ fn a_canvas_action_caps_the_live_run_until_the_view_settles() {
         y: 0.0,
         width: w,
         height: h,
+        scale_factor: 1.0,
     };
     controller.set_pane_geometry(pane(0.0), pane(w + 8.0));
 
@@ -6289,6 +6794,41 @@ fn assert_recent_persisted(controller: &AppController, config: &Path, paths: &[&
     assert_eq!(fresh.recent_rows(0), controller.recent_rows(0));
 }
 
+/// The only test in this binary that reaches the real save picker: the save
+/// folder is process-wide and set once.
+#[test]
+fn a_save_folder_receives_the_project_save_and_its_recent_row() {
+    let folder = common::tree("save_folder_out");
+    let config = common::tree("save_folder_config");
+    focusforge_gui::picker::set_save_folder(folder.clone());
+    let mut c = controller_with_two_tabs("save_folder");
+    c.install_recent(vec![], config);
+    fuse_and_settle(&mut c);
+    let current = |c: &AppController| c.project_cards().into_iter().find(|card| card.current);
+    assert!(current(&c).expect("a current card").unsaved);
+
+    let mut proposed = None;
+    assert!(common::save_and_settle(&mut c, |p| {
+        proposed = Some(p.to_path_buf());
+        focusforge_gui::picker::pick_save_project(p)
+    }));
+    let proposed = proposed.expect("a never-saved tab asks where to save");
+    let saved = folder.join(proposed.file_name().unwrap());
+    assert!(saved.is_file(), "{} must be written", saved.display());
+    assert_eq!(saved.extension().unwrap(), "ffp");
+    let frames = proposed.parent().unwrap();
+    assert!(
+        std::fs::read_dir(frames).unwrap().all(|e| e
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|x| x != "ffp")),
+        "nothing may be saved beside the frames"
+    );
+    assert_eq!(recent_pairs(&c), [saved_row(&saved)]);
+    assert!(!current(&c).expect("a current card").unsaved);
+}
+
 #[test]
 fn a_saved_project_is_recorded_in_recent() {
     let out = common::tree("saved_recent_out");
@@ -6402,4 +6942,230 @@ fn a_project_saved_outside_its_frames_reopens_without_a_missing_card() {
     common::open_and_settle(&mut short, std::slice::from_ref(&target));
     assert!(short.sources_notice().is_some());
     assert_eq!(short.gallery_failure_kind(0), Some("sources-missing"));
+}
+
+/// Three tabs in order: never saved, opened (saved once, then fused again so
+/// it holds an unsaved checkpoint), never saved. Tab 0 is selected.
+fn controller_with_an_opened_tab_between(outer: &str) -> AppController {
+    let mut controller = controller_with_two_tabs(outer);
+    let root_c = common::tree(&format!("{outer}_c_frames"));
+    for i in 0..2 {
+        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root_c]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    controller.select_project(1);
+    fuse_and_settle(&mut controller);
+    save_to_proposed(&mut controller);
+    fuse_and_settle(&mut controller);
+    for index in [0, 2] {
+        controller.select_project(index);
+        fuse_and_settle(&mut controller);
+    }
+    controller.select_project(0);
+    controller
+}
+
+#[test]
+fn save_and_export_dialogs_run_unlocked_for_saves() {
+    use std::sync::Arc;
+
+    // Save project on a never-saved tab.
+    let mut controller = controller_with_frames("dialog_unlocked_save", 2);
+    fuse_and_settle(&mut controller);
+    let controller = Arc::new(Mutex::new(controller));
+    let Some(SaveAsk::Ask(id, proposed)) = controller.lock().unwrap().save_active_request() else {
+        panic!("a never-saved tab asks where to save");
+    };
+    assert!(controller.try_lock().is_ok(), "the dialog runs unlocked");
+    let chosen = common::tree("dialog_unlocked_save_elsewhere").join("renamed.ffp");
+    assert_ne!(chosen.file_name(), proposed.file_name());
+    {
+        let mut c = controller.lock().unwrap();
+        assert!(c.save_project_chosen(id, chosen.clone()));
+        assert!(c.finish_saves());
+    }
+    assert!(chosen.is_file());
+    assert!(!proposed.exists(), "nothing is written at the proposal");
+
+    // The close guard's "Save and close".
+    let mut controller = controller_with_two_tabs("dialog_unlocked_close");
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let controller = Arc::new(Mutex::new(controller));
+    let GuardSecondary::Close(SaveAsk::Ask(id, proposed)) =
+        controller.lock().unwrap().close_guard_secondary_request()
+    else {
+        panic!("the close question asks where the never-saved tab saves");
+    };
+    assert!(controller.try_lock().is_ok(), "the dialog runs unlocked");
+    let chosen = common::tree("dialog_unlocked_close_elsewhere").join("renamed.ffp");
+    {
+        let mut c = controller.lock().unwrap();
+        assert!(c.save_and_close_chosen(id, Some(chosen.clone())));
+        assert!(c.finish_saves());
+        assert_eq!(c.project_tabs().len(), 1, "the saved tab closed");
+    }
+    assert!(chosen.is_file());
+    assert!(!proposed.exists());
+
+    // Save all and quit: one request per never-saved tab, all unlocked.
+    let controller = Arc::new(Mutex::new(controller_with_an_opened_tab_between(
+        "dialog_unlocked_all",
+    )));
+    controller.lock().unwrap().window_close();
+    let GuardSecondary::Quit(requests) = controller.lock().unwrap().close_guard_secondary_request()
+    else {
+        panic!("the quit question asks for the never-saved tabs");
+    };
+    assert_eq!(requests.len(), 2);
+    let elsewhere = common::tree("dialog_unlocked_all_elsewhere");
+    let mut chosen = Vec::new();
+    for (n, (id, proposed)) in requests.iter().enumerate() {
+        assert!(controller.try_lock().is_ok(), "each dialog runs unlocked");
+        let path = elsewhere.join(format!("renamed-{n}.ffp"));
+        assert_ne!(path.file_name(), proposed.file_name());
+        chosen.push((*id, path));
+    }
+    {
+        let mut c = controller.lock().unwrap();
+        assert!(c.save_all_and_quit_chosen(&chosen));
+        assert!(c.finish_saves());
+    }
+    for (_, path) in &chosen {
+        assert!(path.is_file(), "{} must be written", path.display());
+    }
+}
+
+#[test]
+fn save_all_and_quit_chains_its_dialogs() {
+    let outer = "save_all_chain";
+    let mut controller = controller_with_an_opened_tab_between(outer);
+    let events = record_events(&mut controller);
+    let elsewhere = common::tree(&format!("{outer}_elsewhere"));
+    controller.window_close();
+    let requests = controller.save_all_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the opened tab between them asks nothing: {requests:?}"
+    );
+    assert!(
+        requests[0].1.starts_with(frames_dir(&format!("{outer}_a")))
+            && requests[1].1.starts_with(frames_dir(&format!("{outer}_c"))),
+        "tab order: {requests:?}"
+    );
+    let ids = [requests[0].0, requests[1].0];
+    assert!(controller.project_tabs()[1].unsaved);
+    let (a, c) = (elsewhere.join("a.ffp"), elsewhere.join("c.ffp"));
+    assert!(controller.save_all_and_quit_chosen(&[(ids[0], a.clone()), (ids[1], c.clone())]));
+    assert!(controller.finish_saves());
+    assert!(a.is_file() && c.is_file());
+    assert!(
+        !controller.project_tabs()[1].unsaved,
+        "the opened tab appended to its own file"
+    );
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 1);
+
+    // Declined on the second dialog: the tabs before it are saved, the
+    // window stays open and the quit is cancelled.
+    let outer = "save_all_chain_declined";
+    let mut controller = controller_with_an_opened_tab_between(outer);
+    let events = record_events(&mut controller);
+    let elsewhere = common::tree(&format!("{outer}_elsewhere"));
+    controller.window_close();
+    let requests = controller.save_all_requests();
+    let a = elsewhere.join("a.ffp");
+    assert!(!controller.save_all_and_quit_chosen(&[(requests[0].0, a.clone())]));
+    controller.finish_saves();
+    assert!(a.is_file(), "the first tab saved");
+    assert!(
+        !controller.project_tabs()[1].unsaved,
+        "the opened tab before the declined one saved"
+    );
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+    assert!(controller.pending_quit_copy().is_none());
+    assert_eq!(controller.project_tabs().len(), 3);
+}
+
+#[test]
+fn stale_dialog_answer_is_dropped_for_saves() {
+    let outer = "stale_dialog_saves";
+    let elsewhere = common::tree(&format!("{outer}_elsewhere"));
+    let target = |name: &str| elsewhere.join(name);
+
+    // Tab closed while the save dialog was up.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_tab"));
+    fuse_and_settle(&mut controller);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_active_request() else {
+        panic!("a never-saved tab asks");
+    };
+    controller.request_close(0);
+    controller.close_without_saving();
+    assert!(!controller.save_project_chosen(id, target("closed-tab.ffp")));
+    assert!(!controller.save_in_flight());
+    assert!(!target("closed-tab.ffp").exists());
+
+    // Close question answered "Close without saving" while the dialog was up.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_without"));
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_and_close_request() else {
+        panic!("the close question asks");
+    };
+    controller.close_without_saving();
+    assert!(!controller.save_and_close_chosen(id, Some(target("without.ffp"))));
+    assert!(!controller.save_in_flight());
+    assert!(!target("without.ffp").exists());
+
+    // Close question cancelled while the dialog was up: the tab stays.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_cancel"));
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_and_close_request() else {
+        panic!("the close question asks");
+    };
+    controller.cancel_close();
+    assert!(!controller.save_and_close_chosen(id, Some(target("cancelled.ffp"))));
+    assert!(!controller.save_in_flight());
+    assert!(!target("cancelled.ffp").exists());
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    // Quit question cancelled while the dialogs were up: no queue, no quit.
+    let mut controller = controller_with_an_opened_tab_between(&format!("{outer}_quit"));
+    let events = record_events(&mut controller);
+    controller.window_close();
+    let requests = controller.save_all_requests();
+    controller.close_guard_cancelled();
+    let chosen: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .map(|(n, (id, _))| (*id, target(&format!("quit-{n}.ffp"))))
+        .collect();
+    assert!(!controller.save_all_and_quit_chosen(&chosen));
+    assert!(!controller.save_in_flight());
+    assert!(chosen.iter().all(|(_, path)| !path.exists()));
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
+
+    // A cancelled close dialog clears the question and keeps the tab open.
+    let mut controller = controller_with_two_tabs(&format!("{outer}_none"));
+    fuse_and_settle(&mut controller);
+    controller.request_close(0);
+    let Some(SaveAsk::Ask(id, _)) = controller.save_and_close_request() else {
+        panic!("the close question asks");
+    };
+    assert!(!controller.save_and_close_chosen(id, None));
+    assert!(controller.pending_close().is_none());
+    assert_eq!(controller.project_tabs().len(), 2);
+
+    // A cancelled quit dialog cancels the quit, without any save.
+    let mut controller = controller_with_an_opened_tab_between(&format!("{outer}_quit_none"));
+    let events = record_events(&mut controller);
+    controller.window_close();
+    assert!(!controller.save_all_and_quit_chosen(&[]));
+    assert!(controller.pending_quit_copy().is_none());
+    assert_eq!(count_of(&events, ShellEvent::WindowCloseRequested), 0);
 }

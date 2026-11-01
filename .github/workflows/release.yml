@@ -1,0 +1,327 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Builds the installers and the command-line archives, assembles exactly the files a
+# release publishes, and on a version tag creates the GitHub Release.
+#
+# A pull request runs everything except the check-run gate and the publish job, so the
+# assemble step that decides the release contents is rehearsed before any tag exists.
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+# Every job states the rights it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The version comes from Cargo.toml, so no workflow file names it.
+  meta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The gate lists the check workflow's runs.
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          [ -n "$version" ] || { echo "missing workspace version" >&2; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac >> "$GITHUB_OUTPUT"
+      - name: Require exact check run
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/check-release-gate.py --sha "$GITHUB_SHA" --repository "$GITHUB_REPOSITORY"
+
+  package-linux:
+    needs: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+      - name: Build Linux package
+        run: tools/package-linux.sh
+      - name: Check Linux package
+        run: tools/check-package-linux.sh .scratch/package-linux
+      - name: Collect release files
+        run: |
+          package=.scratch/package-linux
+          python3 tools/release-assets.py cli-archive --binary "$package/target/release/focusforge-cli" --target x86_64-unknown-linux-gnu --out dist
+          cp "$package/FocusForge-$VERSION-x86_64.AppImage" "$package/focusforge_${VERSION}_amd64.deb" dist/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: files-linux
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: symbols-linux
+          path: .scratch/package-linux/symbols/FocusForge-*-symbols.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-smoke-receipts-linux
+          path: |
+            .scratch/package-linux/check/result/appimage/smoke/commands.log
+            .scratch/package-linux/check/result/appimage/smoke/exit-status
+            .scratch/package-linux/check/result/appimage/smoke/installed-cli.sha256
+            .scratch/package-linux/check/result/appimage/smoke/source-os
+            .scratch/package-linux/check/result/appimage/smoke/logs/*.stdout
+            .scratch/package-linux/check/result/appimage/smoke/logs/*.stderr
+            .scratch/package-linux/check/result/appimage/smoke/logs/*.exit
+            .scratch/package-linux/check/result/deb-smoke/commands.log
+            .scratch/package-linux/check/result/deb-smoke/exit-status
+            .scratch/package-linux/check/result/deb-smoke/installed-cli.sha256
+            .scratch/package-linux/check/result/deb-smoke/source-os
+            .scratch/package-linux/check/result/deb-smoke/logs/*.stdout
+            .scratch/package-linux/check/result/deb-smoke/logs/*.stderr
+            .scratch/package-linux/check/result/deb-smoke/logs/*.exit
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  package-macos:
+    needs: meta
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+      - name: Select Xcode 16.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app
+          xcodebuild -version | grep -Fx 'Xcode 16.2'
+      - name: Install Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add --toolchain 1.95.0 aarch64-apple-darwin
+          rustup default 1.95.0
+      - name: Build native package
+        run: tools/package-macos.sh --output target/distrib/native/macos
+      - name: Upload package build diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-build-diagnostics-macos
+          path: .scratch/package-macos-diagnostics/
+          include-hidden-files: true
+          if-no-files-found: warn
+      - name: Check native package
+        run: tools/check-package-macos.sh "target/distrib/native/macos/FocusForge-$VERSION-aarch64.dmg"
+      - name: Archive the command-line tool
+        run: |
+          strip -S -o "$RUNNER_TEMP/focusforge-cli" target/aarch64-apple-darwin/release/focusforge-cli
+          python3 tools/release-assets.py cli-archive --binary "$RUNNER_TEMP/focusforge-cli" --target aarch64-apple-darwin --out dist
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-smoke-receipts-macos
+          path: |
+            .scratch/check-package-macos.*/smoke/commands.log
+            .scratch/check-package-macos.*/smoke/exit-status
+            .scratch/check-package-macos.*/smoke/installed-cli.sha256
+            .scratch/check-package-macos.*/smoke/source-os
+            .scratch/check-package-macos.*/smoke/logs/*.stdout
+            .scratch/check-package-macos.*/smoke/logs/*.stderr
+            .scratch/check-package-macos.*/smoke/logs/*.exit
+            .scratch/check-package-macos.*/launch.png
+          include-hidden-files: true
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: files-macos
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+      # The disk image and its symbols reach the release through the receipt check in assemble.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-macos
+          path: target/distrib/native
+          retention-days: 7
+          if-no-files-found: error
+
+  package-windows:
+    needs: meta
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: git config --global core.longpaths true
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+      - name: Install Rust 1.95.0
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.95.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Parse PowerShell packaging scripts
+        run: |
+          $allErrors = @()
+          foreach ($script in 'tools/package-windows.ps1', 'tools/check-package-windows.ps1') {
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+            $allErrors += $errors
+          }
+          if ($allErrors.Count -gt 0) { $allErrors | Format-List | Out-String | Write-Error; exit 1 }
+      - name: Build native package
+        run: tools/package-windows.ps1 -OutputDirectory target/distrib/native/windows
+      - name: Check native package
+        run: tools/check-package-windows.ps1 -Msi "target/distrib/native/windows/FocusForge-$env:VERSION-x86_64.msi"
+      - name: Archive the command-line tool
+        run: python tools/release-assets.py cli-archive --binary target/x86_64-pc-windows-msvc/release/focusforge-cli.exe --target x86_64-pc-windows-msvc --out dist
+      - name: Upload package smoke receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-smoke-receipts-windows
+          path: |
+            .scratch/check-package-windows/*/smoke/commands.log
+            .scratch/check-package-windows/*/smoke/exit-status
+            .scratch/check-package-windows/*/smoke/installed-cli.sha256
+            .scratch/check-package-windows/*/smoke/source-os
+            .scratch/check-package-windows/*/smoke/logs/*.stdout
+            .scratch/check-package-windows/*/smoke/logs/*.stderr
+            .scratch/check-package-windows/*/smoke/logs/*.exit
+            .scratch/check-package-windows/*/launch.png
+          include-hidden-files: true
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: files-windows
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: native-windows
+          path: target/distrib/native
+          retention-days: 7
+          if-no-files-found: error
+
+  # Decides the release contents. A pull request ends here.
+  assemble:
+    needs: [meta, package-linux, package-macos, package-windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: files-*
+          path: release-in
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: native-*
+          path: target/distrib
+          merge-multiple: true
+      - name: Check the macOS and Windows receipts
+        run: |
+          python3 tools/collect-native-artifacts.py
+          cp .scratch/native-artifacts/FocusForge-"$VERSION"-aarch64.dmg .scratch/native-artifacts/FocusForge-"$VERSION"-x86_64.msi release-in/
+      - name: Assemble the release
+        run: python3 tools/release-assets.py assemble release-in --out release-assets --version "$VERSION" --repo "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-assets
+          path: release-assets/
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: symbols-native
+          path: .scratch/native-artifacts/*-symbols.tar.gz
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [meta, assemble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          flags=()
+          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" release-assets/files/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "FocusForge $VERSION" --notes-file release-assets/notes.md "${flags[@]}"

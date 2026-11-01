@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! CPU twin of `pattern.wgsl`. Every constant and every arithmetic step here must mirror the
 //! shader exactly, so `--verify-pattern` is a real parity check and not a tautology.
 

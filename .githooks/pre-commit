@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Pre-commit hook: the static gate set. Enable with
 # `git config core.hooksPath .githooks`.
 #

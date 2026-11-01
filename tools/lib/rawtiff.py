@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Classic-TIFF header reader, rect reader and writer -- stdlib only.
 
 Why this exists rather than PIL or tifffile: the reference stack is 61 frames

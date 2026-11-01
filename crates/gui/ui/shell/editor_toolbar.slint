@@ -60,7 +60,8 @@ export component FFEditorToolbar inherits Rectangle {
         value-text: root.soft-text;
         fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
     }
-    FFIconButton {
+    pipette := FFIconButton {
+        name: "Pipette";
         x: ShellGeometry.editor-toolbar-pipette-x;
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
@@ -70,7 +71,8 @@ export component FFEditorToolbar inherits Rectangle {
         selected: root.picking;
         triggered => { root.pipette-toggled(); }
     }
-    FFIconButton {
+    undo := FFIconButton {
+        name: "Undo";
         x: ShellGeometry.editor-toolbar-undo-x;
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
@@ -80,7 +82,8 @@ export component FFEditorToolbar inherits Rectangle {
         enabled: root.can-undo;
         triggered => { root.undo-requested(); }
     }
-    FFIconButton {
+    redo := FFIconButton {
+        name: "Redo";
         x: ShellGeometry.editor-toolbar-redo-x;
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;

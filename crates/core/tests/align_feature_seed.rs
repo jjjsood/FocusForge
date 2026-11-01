@@ -8,7 +8,7 @@ mod common;
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus};
 use focusforge_core::align::{FailurePolicy, PyramidalEcc, align_stack};
 use focusforge_core::io::TiffStack;
-use focusforge_core::params::{self, ParamValues, StackContext};
+use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
 
 /// Frames 00, 01, 06 and 07 diverge from an identity start and are the only
@@ -28,7 +28,11 @@ fn only_the_diverged_fixture_frames_run_the_detector() {
     );
     let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), &ctx)
         .expect("defaults resolve cleanly");
-    let cfg = params::resolved_values(&resolved);
+    let mut cfg = params::resolved_values(&resolved);
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
 
     let result = align_stack(
         &PyramidalEcc,

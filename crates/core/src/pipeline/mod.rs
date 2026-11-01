@@ -22,7 +22,7 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
-use crate::equalize::{self, EqualizationReport, GainReader};
+use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
@@ -70,9 +70,9 @@ pub struct FuseRequest {
     pub explicit: ParamValues,
     pub align: Option<AlignRequest>,
     pub crop: bool,
-    /// The bound of the brightness equalization (gains stay within
-    /// `1/bound..=bound`); `None` leaves the frames as delivered.
-    pub equalize: Option<f64>,
+    /// The brightness equalization to run before alignment; `None` leaves the
+    /// frames as delivered.
+    pub equalize: Option<EqualizeSettings>,
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
@@ -179,12 +179,12 @@ pub struct FuseReport {
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
-/// are developed to sRGB-encoded values; TIFF frames are 16-bit unsigned
+/// are developed to sRGB-encoded values; TIFF and JPEG frames are unsigned
 /// samples whose transfer function is not read from the file.
 pub fn working_space(kind: ReaderKind) -> &'static str {
     match kind {
         ReaderKind::Raw => "encoded-srgb",
-        ReaderKind::Mmap | ReaderKind::Decoded => "encoded-unknown-transfer",
+        ReaderKind::Mmap | ReaderKind::Decoded | ReaderKind::Jpeg => "encoded-unknown-transfer",
     }
 }
 
@@ -194,7 +194,14 @@ pub fn working_space(kind: ReaderKind) -> &'static str {
 /// [`StageObserver::tick`] afterwards, on [`JobProgress`]'s `align_done`/
 /// `align_total`.
 pub enum RunStage {
-    Align { frames: usize, source: AlignSource },
+    /// Brightness preparation of `frames` sources, before alignment.
+    Prepare {
+        frames: usize,
+    },
+    Align {
+        frames: usize,
+        source: AlignSource,
+    },
     Fuse,
     Seal,
     Finished,
@@ -228,6 +235,12 @@ pub trait StageObserver: Sync {
     /// it into the diagnostics log; `core` itself never depends on that
     /// crate and never decides how (or whether) a message is displayed.
     fn notice(&self, _message: &str) {}
+    /// A [`Self::notice`] about one source frame, `frame` being its position
+    /// in the request's frame list. Defaults to the plain notice, so an
+    /// observer that ignores the index prints the same text.
+    fn frame_notice(&self, _frame: usize, message: &str) {
+        self.notice(message);
+    }
 }
 
 /// The tail of the [`StageObserver::notice`] raised when the align stage
@@ -328,6 +341,72 @@ pub fn run(
         options.tile_size = options.tile_size.min(backend.max_tile_size(spp));
     }
 
+    let equalization = match request.equalize {
+        Some(settings) => {
+            let frames_done = control.begin_prepare(frame_reader.len());
+            control.set_stage(JobStage::Prepare);
+            observer.stage(RunStage::Prepare {
+                frames: frame_reader.len(),
+            });
+            let workers = std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(frame_reader.len())
+                .min(control.admission_cap())
+                .max(1);
+            let done = AtomicBool::new(false);
+            let poll = request.poll;
+            // The stage span is re-entered on the watcher thread, which does
+            // not inherit it.
+            let parent = tracing::Span::current();
+            let estimated = std::thread::scope(|scope| {
+                let watcher = scope.spawn(|| {
+                    let _parent = parent.enter();
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(poll);
+                        observer.tick(&control.progress());
+                    }
+                });
+                let result = {
+                    let _prepare = equalize_scope();
+                    equalize::estimate(
+                        frame_reader,
+                        frame_reader.len(),
+                        (width, height),
+                        spp,
+                        settings,
+                        workers,
+                        &frames_done,
+                        &|| control.state() == ControlState::CancelRequested,
+                    )
+                };
+                done.store(true, Ordering::SeqCst);
+                watcher
+                    .join()
+                    .expect("prepare watcher thread must not panic");
+                result
+            });
+            let report = match estimated {
+                Err(AlgorithmError::Cancelled) => {
+                    return Ok(FuseOutcome::Cancelled {
+                        units_done: 0,
+                        unit_total: 0,
+                    });
+                }
+                other => other?,
+            };
+            for (frame, notice) in report.notices() {
+                observer.frame_notice(frame, &notice);
+            }
+            Some(report)
+        }
+        None => None,
+    };
+    let recorded = equalization.as_ref().map(EqualizationReport::recorded);
+    let prepared_gains: &[u32] = recorded.as_ref().map_or(&[], |e| e.gains.as_slice());
+    // Every reader of a frame beneath this point -- alignment, host fuse,
+    // device upload and the device-loss fallback -- sees the gained samples.
+    let gain_reader = GainReader::new(frame_reader, prepared_gains);
+
     timer.mark(Stage::Setup);
 
     let mut alignment_result: Option<(
@@ -363,7 +442,12 @@ pub fn run(
         } else {
             FailurePolicy::Strict
         };
-        let identity = AlignIdentity::new(align_req.algorithm.id(), align_values.clone(), policy);
+        let identity = AlignIdentity::new(
+            align_req.algorithm.id(),
+            align_values.clone(),
+            policy,
+            prepared_gains.to_vec(),
+        );
 
         let peeked = if request.resume {
             peek_resumable_alignment(
@@ -385,8 +469,16 @@ pub fn run(
             alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
         } else {
             let stage_key = StageKey::align(&fingerprint, &identity);
+            // The sources' content hashes, one frame at a time through the
+            // memo the background hash thread fills; a frame that cannot be
+            // hashed is a miss, and the seal reports the failure itself.
+            let frame_hash = |i: usize| {
+                project::source_hash_change_checked(&request.frames[i])
+                    .ok()
+                    .map(|(_, hash)| hash)
+            };
             let cache_hit = if request.cache {
-                stage_cache.and_then(|cache| cache.get_alignment(&stage_key))
+                stage_cache.and_then(|cache| cache.get_alignment(&stage_key, frame_hash))
             } else {
                 None
             };
@@ -440,14 +532,18 @@ pub fn run(
                     let result = align_stack_with(
                         align_req.algorithm,
                         stack_ctx,
-                        frame_reader,
+                        &gain_reader,
                         &align_values,
                         policy,
                         &AlignDriverOptions {
                             budget: options.budget,
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
-                            on_pause: Some(&|control| observer.paused(control)),
+                            on_pause: Some(&|control| {
+                                let held = Instant::now();
+                                observer.paused(control);
+                                control.add_align_hold(held.elapsed());
+                            }),
                             align_backend: request.align_backend,
                         },
                     );
@@ -486,7 +582,11 @@ pub fn run(
                 // alignment into a failed run.
                 if request.cache
                     && let Some(cache) = stage_cache
-                    && let Err(err) = cache.put_alignment(&stage_key, &request.frames, &alignment)
+                    && let Some(content) = (0..request.frames.len())
+                        .map(frame_hash)
+                        .collect::<Option<Vec<_>>>()
+                    && let Err(err) =
+                        cache.put_alignment(&stage_key, &request.frames, &content, &alignment)
                 {
                     observer.notice(&format!("warning: {err}"));
                 }
@@ -535,48 +635,11 @@ pub fn run(
         .iter()
         .map(|f| f.transform)
         .collect();
-    let equalization = match request.equalize {
-        Some(max_gain) => {
-            let reference = alignment_result
-                .as_ref()
-                .map_or((frame_reader.len() - 1) / 2, |(_, _, _, a)| a.reference);
-            let warped = WarpingReader::new(frame_reader, (width, height), spp, transforms.clone());
-            let frames = {
-                let _equalize = equalize_scope();
-                equalize::estimate(
-                    &warped,
-                    frame_reader.len(),
-                    (width, height),
-                    spp,
-                    reference,
-                    max_gain,
-                )?
-            };
-            for (index, estimate) in frames.iter().enumerate() {
-                if let Some(message) = estimate.notice(index, max_gain) {
-                    observer.notice(&message);
-                }
-            }
-            Some(EqualizationReport {
-                max_gain,
-                reference,
-                frames,
-            })
-        }
-        None => None,
-    };
-    let recorded = equalization.as_ref().map(EqualizationReport::recorded);
     let registration = Registration {
         transforms: transforms.clone(),
         crop: applied_crop,
         equalization: recorded.clone(),
     };
-    // Every reader of a frame beneath this point -- host fuse, device
-    // upload and the device-loss fallback -- sees the gained samples.
-    let gain_reader = GainReader::new(
-        frame_reader,
-        recorded.as_ref().map_or(&[], |e| e.gains.as_slice()),
-    );
     let warping_reader = WarpingReader::new(&gain_reader, (width, height), spp, transforms.clone());
 
     // The scheduler's own per-tile rect: the largest read rect it plans.
@@ -642,6 +705,7 @@ pub fn run(
                     align_algo.id(),
                     params::resolved_values(align_resolved),
                     *policy,
+                    prepared_gains.to_vec(),
                 )
             }),
         crop: applied_crop,
@@ -1260,6 +1324,7 @@ mod tests {
                 path: PathBuf::from("frame.tif"),
                 file_size: 1,
                 image_description: None,
+                orientation: 1,
                 width: 1,
                 height: 1,
                 samples_per_pixel: 3,
@@ -1337,6 +1402,7 @@ mod tests {
             (ReaderKind::Raw, "encoded-srgb"),
             (ReaderKind::Mmap, "encoded-unknown-transfer"),
             (ReaderKind::Decoded, "encoded-unknown-transfer"),
+            (ReaderKind::Jpeg, "encoded-unknown-transfer"),
         ] {
             assert_eq!(working_space(kind), expected, "{kind:?}");
         }
@@ -1372,6 +1438,7 @@ mod tests {
             path: label.into(),
             file_size: 0,
             image_description: None,
+            orientation: 1,
             width: 1,
             height: 1,
             samples_per_pixel: 1,

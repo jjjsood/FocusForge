@@ -8,7 +8,7 @@
 //! (`TilePlan::new(512,512,200,3)`, tile 5), both derived from
 //! `TilePlan::new` rather than guessed.
 
-use focusforge_core::algorithm::{StackAlgorithm, TileCtx, TileReader};
+use focusforge_core::algorithm::{StackAlgorithm, TileCtx, TileOutput, TileReader};
 use focusforge_core::fuse::laplacian::{EligibleMasks, Laplacian, score_plane, score_radius};
 use focusforge_core::fuse::pyramid::{self, Plane};
 use focusforge_core::gpu::TileBackend;
@@ -461,25 +461,9 @@ impl TileReader for InMemoryFrames {
     }
 }
 
-#[test]
-fn tile_at_the_dispatch_limit_matches_cpu() {
-    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
-        return;
-    };
-    let backend = gpu_backend().expect("gpu backend");
-    let spp = 3;
-    let levels = 5;
-    // The widest square read rect the device accepts, one row short so the
-    // height is odd at the full-resolution level.
-    let side = backend.max_tile_size(spp);
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width: side,
-        height: side - 1,
-    };
-    let reader = InMemoryFrames::repeating_mantis(&[0, 2], side, side);
-    let tiles: Vec<Tile> = (0..2)
+/// The first `count` frames of `reader` over `rect`, as CPU tiles.
+fn read_in_memory_tiles(reader: &InMemoryFrames, count: usize, rect: Rect, spp: u32) -> Vec<Tile> {
+    (0..count)
         .map(|frame| {
             let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
             reader
@@ -491,17 +475,21 @@ fn tile_at_the_dispatch_limit_matches_cpu() {
                 samples,
             }
         })
-        .collect();
+        .collect()
+}
 
-    let mut cfg = ParamValues::new();
-    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
-    let cpu = Laplacian
-        .fuse(&TileCtx::new(rect, &tiles), &cfg)
-        .expect("cpu fuse");
-    let gpu = backend
-        .fuse_tile(&reader, 2, rect, spp, levels)
-        .expect("gpu fuse_tile at the dispatch limit");
-
+/// The unmasked parity contract: the Z-Map equals the CPU's except at proven
+/// near-ties between the two best frames, and every sample outside those
+/// pixels is within 1 LSB.
+fn assert_matches_cpu_outside_near_ties(
+    label: &str,
+    cpu: &TileOutput,
+    gpu: &TileOutput,
+    tiles: &[Tile],
+    spp: u32,
+    levels: u32,
+) {
+    let rect = tiles[0].rect;
     // Each frame's level-0 score plane, built once for every differing pixel.
     let radius = score_radius(levels, 0);
     let scores: Vec<Vec<f32>> = tiles
@@ -526,7 +514,7 @@ fn tile_at_the_dispatch_limit_matches_cpu() {
         near_ties.insert(pixel);
     }
     println!(
-        "at-limit z-map parity: {} differing index(es), all proven near-ties",
+        "{label} z-map parity: {} differing index(es), all proven near-ties",
         near_ties.len()
     );
 
@@ -543,8 +531,136 @@ fn tile_at_the_dispatch_limit_matches_cpu() {
         .map(|(&c, &g)| (i32::from(c) - i32::from(g)).abs())
         .max()
         .expect("a non-empty composite");
-    println!("at-limit composite parity: worst |delta|={worst} outside near-tie pixels");
+    println!("{label} composite parity: worst |delta|={worst} outside near-tie pixels");
     assert!(worst <= 1, "composite parity exceeded 1 LSB: worst={worst}");
+}
+
+/// Every sample of `out` equals its channel's constant.
+fn assert_constant_output(out: &TileOutput, triple: [u16; 3], context: &str) {
+    for (i, &sample) in out.tile.samples.iter().enumerate() {
+        assert_eq!(sample, triple[i % 3], "{context}: sample {i}");
+    }
+}
+
+const CONSTANT_TRIPLES: [[u16; 3]; 3] = [[40001; 3], [39835, 49858, 60138], [73, 3073, 5001]];
+
+/// 999 frames of one constant triple on a 128x128 canvas.
+fn constant_frames(triple: [u16; 3]) -> InMemoryFrames {
+    let (width, height, count) = (128u32, 128u32, 999usize);
+    let samples: Vec<u16> = triple
+        .iter()
+        .copied()
+        .cycle()
+        .take((width * height * 3) as usize)
+        .collect();
+    InMemoryFrames {
+        frames: vec![samples; count],
+        width,
+        spp: 3,
+    }
+}
+
+#[test]
+fn residual_large_n_constant_stacks_export_the_constant() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let backend = gpu_backend().expect("gpu backend");
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 128,
+        height: 128,
+    };
+    let (levels, spp) = (5u32, 3u32);
+    let pipelines = FusionPipelines::new();
+    // Frame 0 is unmasked and every odd frame excludes the left 16 columns, so
+    // the eligible count differs between residual pixels.
+    let uncovered_left = Some(
+        (0..128u32)
+            .flat_map(|_| (0..128u32).map(|x| x >= 16))
+            .collect::<Vec<bool>>(),
+    );
+    let coverage: Vec<Option<Vec<bool>>> = (0..999)
+        .map(|f| {
+            if f % 2 == 1 {
+                uncovered_left.clone()
+            } else {
+                Some(vec![true; 128 * 128])
+            }
+        })
+        .collect();
+    for triple in CONSTANT_TRIPLES {
+        let reader = constant_frames(triple);
+        let unmasked = backend
+            .fuse_tile(&reader, 999, rect, spp, levels)
+            .expect("gpu fuse_tile");
+        assert_constant_output(&unmasked, triple, &format!("{triple:?} unmasked"));
+        let masked = fuse_tile_gpu(
+            shared, &reader, &pipelines, 999, rect, spp, levels, &coverage,
+        )
+        .expect("gpu fuse_tile_gpu");
+        assert_constant_output(&masked, triple, &format!("{triple:?} masked"));
+    }
+}
+
+#[test]
+fn residual_large_n_matches_cpu() {
+    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let backend = gpu_backend().expect("gpu backend");
+    let (spp, levels) = (3u32, 5u32);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 128,
+        height: 128,
+    };
+    let sources: Vec<usize> = (0..999).map(|i| i % 8).collect();
+    let reader = InMemoryFrames::repeating_mantis(&sources, 128, 128);
+    let tiles = read_in_memory_tiles(&reader, sources.len(), rect, spp);
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let cpu = Laplacian
+        .fuse(&TileCtx::new(rect, &tiles), &cfg)
+        .expect("cpu fuse");
+    let gpu = backend
+        .fuse_tile(&reader, sources.len(), rect, spp, levels)
+        .expect("gpu fuse_tile");
+    assert_matches_cpu_outside_near_ties("large-n", &cpu, &gpu, &tiles, spp, levels);
+}
+
+#[test]
+fn tile_at_the_dispatch_limit_matches_cpu() {
+    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let backend = gpu_backend().expect("gpu backend");
+    let spp = 3;
+    let levels = 5;
+    // The widest square read rect the device accepts, one row short so the
+    // height is odd at the full-resolution level.
+    let side = backend.max_tile_size(spp);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: side,
+        height: side - 1,
+    };
+    let reader = InMemoryFrames::repeating_mantis(&[0, 2], side, side);
+    let tiles = read_in_memory_tiles(&reader, 2, rect, spp);
+
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let cpu = Laplacian
+        .fuse(&TileCtx::new(rect, &tiles), &cfg)
+        .expect("cpu fuse");
+    let gpu = backend
+        .fuse_tile(&reader, 2, rect, spp, levels)
+        .expect("gpu fuse_tile at the dispatch limit");
+
+    assert_matches_cpu_outside_near_ties("at-limit", &cpu, &gpu, &tiles, spp, levels);
 }
 
 #[test]
@@ -609,19 +725,7 @@ fn masked_fuse_matches_cpu() {
     };
     let (reader, rect, coverage) = masked_case();
     let (spp, levels, frame_count) = (reader.spp, 5u32, reader.frames.len());
-    let tiles: Vec<Tile> = (0..frame_count)
-        .map(|frame| {
-            let mut samples = vec![0u16; (rect.width * rect.height * spp) as usize];
-            reader
-                .read_tile_into(frame, rect, &mut samples)
-                .expect("read in-memory tile");
-            Tile {
-                rect,
-                samples_per_pixel: spp,
-                samples,
-            }
-        })
-        .collect();
+    let tiles = read_in_memory_tiles(&reader, frame_count, rect, spp);
     let mut cfg = ParamValues::new();
     cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
     let cpu = Laplacian

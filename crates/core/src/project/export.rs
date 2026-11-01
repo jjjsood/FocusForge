@@ -312,9 +312,10 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "xmp".to_string(),
             label: "Carry XMP".to_string(),
-            help: "Carries the source frame's XMP packet verbatim. Off by default: the \
-                   reference frames' XMP is the source tool's own edit history, which does not \
-                   describe the fused result."
+            help: "Carries the source frame's XMP packet, with any tiff:Orientation set to 1 \
+                   to match the upright pixels. Off by default: the reference frames' XMP is \
+                   the source tool's own edit history, which does not describe the fused \
+                   result."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(false),
@@ -1212,6 +1213,9 @@ impl ImageBuffer for JpegRowSource {
         let row_bytes = self.row_bytes();
         let mut state = self.state.borrow_mut();
         while !state.closed && y >= state.band_start_row + state.rows_in_band {
+            // Free the consumed band first: the sender may already be
+            // converting the band after the one this `recv` returns.
+            state.band = Vec::new();
             match state.rx.recv() {
                 Ok(band) => {
                     state.band_start_row += state.rows_in_band;

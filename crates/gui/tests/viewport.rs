@@ -20,20 +20,17 @@ fn image(width: u32, height: u32) -> ImageSize {
 }
 
 fn pane(width: f32, height: f32) -> PaneRect {
+    pane_at(width, height, 1.0)
+}
+
+fn pane_at(width: f32, height: f32, scale_factor: f32) -> PaneRect {
     PaneRect {
         x: 0.0,
         y: 0.0,
         width,
         height,
+        scale_factor,
     }
-}
-
-fn source_point(vp: &focusforge_gui::viewport::Viewport, anchor: (f32, f32)) -> (f64, f64) {
-    let (ox, oy) = vp.origin();
-    (
-        ox + anchor.0 as f64 / vp.scale(),
-        oy + anchor.1 as f64 / vp.scale(),
-    )
 }
 
 #[test]
@@ -63,29 +60,35 @@ fn unequal_panes_share_centre_scale_and_bounds() {
 }
 
 #[test]
-fn unequal_panes_show_the_same_cropped_source_with_black_margins() {
+fn unequal_panes_each_fill_their_own_area() {
     let image = image(1000, 1000);
     let narrow = pane(400.0, 800.0);
     let wide = pane(900.0, 500.0);
-    let mut viewport = fit_two(image, narrow, wide);
-    viewport.zoom_steps_in(3, (200.0, 400.0), image, narrow, wide);
+    for (left, right) in [(narrow, wide), (wide, narrow)] {
+        let mut viewport = fit_two(image, left, right);
+        viewport.zoom_steps_in(3, (left.width / 2.0, left.height / 2.0), image, left, right);
+        assert!((viewport.scale() - 1.0).abs() < 1e-9);
 
-    let narrow_draw = viewport.draw(image, narrow).unwrap();
-    let wide_draw = viewport.draw(image, wide).unwrap();
-    assert_eq!(narrow_draw.src, wide_draw.src);
-    assert_eq!(narrow_draw.src, (300, 250, 400, 500));
-    assert_eq!(narrow_draw.dst, (0.0, 150.0, 400.0, 500.0));
-    assert_eq!(wide_draw.dst, (250.0, 0.0, 400.0, 500.0));
+        let centred = |pane: PaneRect| viewport.draw(image, pane).unwrap();
+        let narrow_draw = centred(narrow);
+        let wide_draw = centred(wide);
+        assert_eq!(narrow_draw.src, (300, 100, 400, 800));
+        assert_eq!(narrow_draw.dst, (0.0, 0.0, 400.0, 800.0));
+        assert_eq!(narrow_draw.crop, narrow_draw.dst);
+        assert_eq!(wide_draw.src, (50, 250, 900, 500));
+        assert_eq!(wide_draw.dst, (0.0, 0.0, 900.0, 500.0));
+        assert_eq!(wide_draw.crop, wide_draw.dst);
 
-    viewport.pan_by_two(-100_000.0, -100_000.0, image, narrow, wide);
-    assert_eq!(
-        viewport.draw(image, narrow).unwrap().src,
-        (600, 500, 400, 500)
-    );
-    assert_eq!(
-        viewport.draw(image, wide).unwrap().src,
-        (600, 500, 400, 500)
-    );
+        viewport.pan_by_two(-100_000.0, -100_000.0, image, left, right);
+        let narrow_draw = viewport.draw(image, narrow).unwrap();
+        let wide_draw = viewport.draw(image, wide).unwrap();
+        assert_eq!(narrow_draw.src, (600, 350, 400, 650));
+        assert_eq!(wide_draw.src, (350, 500, 650, 500));
+        for draw in [narrow_draw, wide_draw] {
+            assert_eq!((draw.dst.0, draw.dst.1), (0.0, 0.0));
+            assert_eq!((draw.crop.0, draw.crop.1), (0.0, 0.0));
+        }
+    }
 }
 
 #[test]
@@ -103,9 +106,9 @@ fn subpixel_pan_keeps_the_visible_crop_stable_when_sample_rect_changes() {
     viewport.pan_by_two(0.5, 0.0, image, small, large);
     let after = viewport.draw(image, large).expect("the subpixel pan draws");
 
-    assert_eq!(before.src.0, 176);
-    assert_eq!(after.src.0, 175, "the read rect expands left by one pixel");
-    assert_eq!(before.crop, (140.0, 140.0, 320.0, 320.0));
+    assert_eq!(before.src.0, 106);
+    assert_eq!(after.src.0, 105, "the read rect expands left by one pixel");
+    assert_eq!(before.crop, (0.0, 0.0, 600.0, 600.0));
     assert_ne!(
         before.dst, after.dst,
         "sample placement follows its rounded rect"
@@ -133,6 +136,33 @@ fn unequal_projection_roundtrips_and_boundary_zoom_uses_both_bounds() {
             upper.zoom_steps_in(3, (gesture.width, gesture.height), image, gesture, other);
             let upper_centre = upper.to_source_in((right.width / 2.0, right.height / 2.0), right);
             assert_eq!(upper_centre, (800.0, 750.0));
+
+            for viewport in [&lower, &upper] {
+                let shared = viewport.to_source_in((left.width / 2.0, left.height / 2.0), left);
+                for pane in [left, right] {
+                    let centre = viewport.to_source_in((pane.width / 2.0, pane.height / 2.0), pane);
+                    assert_eq!(
+                        centre, shared,
+                        "{pane:?}: the pane centre is the shared centre"
+                    );
+                    let points = [
+                        (0.0, 0.0),
+                        (pane.width, 0.0),
+                        (0.0, pane.height),
+                        (pane.width, pane.height),
+                        (pane.width / 2.0, pane.height / 2.0),
+                        (0.37 * pane.width, 0.81 * pane.height),
+                    ];
+                    for local in points {
+                        let back =
+                            viewport.from_source_in(viewport.to_source_in(local, pane), pane);
+                        assert!(
+                            (back.0 - local.0).abs() < 1e-3 && (back.1 - local.1).abs() < 1e-3,
+                            "{pane:?}: {local:?} -> {back:?}"
+                        );
+                    }
+                }
+            }
 
             for pane in [left, right] {
                 let draw = upper.draw(image, pane).unwrap();
@@ -254,12 +284,14 @@ fn opened_controller() -> AppController {
             y: 92.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
         PaneRect {
             x: 598.0,
             y: 92.0,
             width: 566.0,
             height: 748.0,
+            scale_factor: 1.0,
         },
     );
     controller
@@ -299,9 +331,9 @@ fn zoom_anchors_at_the_cursor() {
 
     for anchor in anchors {
         let mut vp = fit(img, p);
-        let src_before = source_point(&vp, anchor);
+        let src_before = vp.to_source_in(anchor, p);
         vp.zoom_steps(1, anchor, img, p);
-        let src_after = source_point(&vp, anchor);
+        let src_after = vp.to_source_in(anchor, p);
         let drift_x = ((src_after.0 - src_before.0) * vp.scale()).abs();
         let drift_y = ((src_after.1 - src_before.1) * vp.scale()).abs();
         assert!(
@@ -314,14 +346,14 @@ fn zoom_anchors_at_the_cursor() {
     // anchor, returns to the original viewport.
     let anchor = (128.0, 384.0);
     let mut vp = fit(img, p);
-    let start = (vp.scale(), vp.origin());
+    let start = (vp.scale(), vp.to_source_in((0.0, 0.0), p));
     vp.zoom_steps(2, anchor, img, p);
     vp.zoom_steps(-2, anchor, img, p);
     assert!((vp.scale() - start.0).abs() < 1e-9, "scale must round-trip");
+    let origin = vp.to_source_in((0.0, 0.0), p);
     assert!(
-        (vp.origin().0 - start.1.0).abs() < 1e-6 && (vp.origin().1 - start.1.1).abs() < 1e-6,
-        "origin must round-trip: got {:?}, expected {:?}",
-        vp.origin(),
+        (origin.0 - start.1.0).abs() < 1e-6 && (origin.1 - start.1.1).abs() < 1e-6,
+        "origin must round-trip: got {origin:?}, expected {:?}",
         start.1
     );
 }
@@ -495,10 +527,10 @@ fn pan_is_clamped() {
     // Below fit: pinned centred, does not move at all.
     let mut vp = fit(img, p);
     vp.zoom_steps(-1, (256.0, 256.0), img, p);
-    let before = vp.origin();
+    let before = vp.to_source_in((0.0, 0.0), p);
     vp.pan_by(1000.0, 1000.0, img, p);
     assert_eq!(
-        vp.origin(),
+        vp.to_source_in((0.0, 0.0), p),
         before,
         "below fit the image must not move at all"
     );
@@ -512,7 +544,7 @@ fn pan_is_clamped() {
     let visible_h = p.height as f64 / scale;
 
     vp.pan_by(-100_000.0, -100_000.0, img, p);
-    let (ox, oy) = vp.origin();
+    let (ox, oy) = vp.to_source_in((0.0, 0.0), p);
     assert!(
         ox >= -1e-6 && oy >= -1e-6,
         "origin must stay non-negative: {ox}, {oy}"
@@ -521,7 +553,7 @@ fn pan_is_clamped() {
     assert!(oy + visible_h <= img.height as f64 + 1e-6);
 
     vp.pan_by(100_000.0, 100_000.0, img, p);
-    let (ox2, oy2) = vp.origin();
+    let (ox2, oy2) = vp.to_source_in((0.0, 0.0), p);
     assert!(ox2 + visible_w <= img.width as f64 + 1e-6);
     assert!(oy2 + visible_h <= img.height as f64 + 1e-6);
     assert!(ox2 >= -1e-6 && oy2 >= -1e-6);
@@ -588,9 +620,9 @@ fn two_pane_sizes_share_one_viewport() {
     let anchor = (233.0, 177.0);
 
     let mut vp = fit(frame_size, p);
-    let src_before = source_point(&vp, anchor);
+    let src_before = vp.to_source_in(anchor, p);
     vp.zoom_steps(2, anchor, frame_size, p);
-    let src_after = source_point(&vp, anchor);
+    let src_after = vp.to_source_in(anchor, p);
     let drift_x = ((src_after.0 - src_before.0) * vp.scale()).abs();
     let drift_y = ((src_after.1 - src_before.1) * vp.scale()).abs();
     assert!(
@@ -715,7 +747,10 @@ fn resize_is_sticky_at_fit() {
     vp.resize(img, min_pane);
     let refit = fit(img, min_pane);
     assert!((vp.scale() - refit.scale()).abs() < 1e-9);
-    assert_eq!(vp.origin(), refit.origin());
+    assert_eq!(
+        vp.to_source_in((0.0, 0.0), min_pane),
+        refit.to_source_in((0.0, 0.0), min_pane)
+    );
 
     // Not at fit: scale kept, offset re-clamped.
     let mut vp2 = fit(img, base);
@@ -835,7 +870,7 @@ fn step_leaves_the_rect_as_it_is_at_and_above_one_to_one() {
         let draw = vp.draw(img, p).unwrap();
         assert_eq!(draw.step.get(), 1);
         assert_eq!(draw.extent(), (draw.src.2, draw.src.3));
-        let (ox, oy) = vp.origin();
+        let (ox, oy) = vp.to_source_in((0.0, 0.0), p);
         let s = vp.scale();
         let x1 = (ox + p.width as f64 / s).min(8192.0).ceil();
         let y1 = (oy + p.height as f64 / s).min(5464.0).ceil();
@@ -1031,7 +1066,7 @@ fn backdrop_covers_the_visible_image_at_every_stop() {
             let draw = vp.draw(img, p).expect("a fitted viewport draws");
             assert_eq!(draw.place(draw.src), draw.dst, "the exact placement holds");
             let placed = draw.place(back.src);
-            let (ox, oy) = vp.origin();
+            let (ox, oy) = vp.to_source_in((0.0, 0.0), p);
             let s = vp.scale();
             close(
                 placed,
@@ -1078,7 +1113,7 @@ fn place_follows_a_pan_by_whole_pixels() {
 
     vp.zoom_steps(1, (100.0, 100.0), img, p);
     let zoomed = vp.draw(img, p).expect("draws after a ladder step");
-    let (ox, oy) = vp.origin();
+    let (ox, oy) = vp.to_source_in((0.0, 0.0), p);
     let scale = vp.scale();
     let (sx, sy, sw, sh) = before.src;
     close(
@@ -1182,4 +1217,94 @@ fn guarded_coverage_refuses_empty_or_outside_visible_draws() {
             "invalid visible draw {src:?} must not be clamped into guarded coverage"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// The pane's device scale factor.
+// ---------------------------------------------------------------------
+
+/// A viewport at `scale` logical px per source px: `fit` lands on it in a
+/// pane of `image * scale`, so the ladder needs no walking.
+fn viewport_at(image: ImageSize, scale: f64) -> focusforge_gui::viewport::Viewport {
+    let side = |len: u32| (f64::from(len) * scale) as f32;
+    fit(image, pane(side(image.width), side(image.height)))
+}
+
+#[test]
+fn step_follows_the_pane_scale_factor() {
+    let img = image(1000, 1000);
+    // (logical scale, factor, expected step)
+    for (scale, factor, step) in [
+        (0.5, 1.0, 2),
+        (0.5, 2.0, 1),
+        (0.5, 1.5, 1),
+        (0.25, 1.0, 4),
+        (0.25, 2.0, 2),
+    ] {
+        let viewport = viewport_at(img, scale);
+        let at_one = viewport.draw(img, pane(500.0, 500.0)).unwrap();
+        let draw = viewport.draw(img, pane_at(500.0, 500.0, factor)).unwrap();
+        assert_eq!(draw.step.get(), step, "scale {scale}, factor {factor}");
+        assert_eq!(draw.src, at_one.src);
+        assert_eq!(draw.dst, at_one.dst);
+        assert_eq!(draw.crop, at_one.crop);
+        assert_eq!(draw.pixelated, at_one.pixelated);
+    }
+}
+
+#[test]
+fn backdrop_step_follows_the_pane_scale_factor() {
+    let img = image(6000, 4000);
+    let step = |factor| {
+        backdrop_draw(img, pane_at(600.0, 400.0, factor))
+            .unwrap()
+            .step
+            .get()
+    };
+    assert_eq!(step(1.0), 10);
+    assert_eq!(step(2.0), 5);
+}
+
+#[test]
+fn invalid_scale_factor_draws_as_one() {
+    let img = image(1000, 1000);
+    let viewport = viewport_at(img, 0.5);
+    let exact = viewport.draw(img, pane(500.0, 500.0)).unwrap();
+    let backdrop = backdrop_draw(image(6000, 4000), pane(600.0, 400.0)).unwrap();
+    for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let draw = viewport.draw(img, pane_at(500.0, 500.0, bad)).unwrap();
+        assert_eq!(draw, exact, "exact draw at factor {bad}");
+        let back = backdrop_draw(image(6000, 4000), pane_at(600.0, 400.0, bad)).unwrap();
+        assert_eq!(back, backdrop, "backdrop at factor {bad}");
+    }
+}
+
+#[test]
+fn panes_with_different_scale_factors_draw_at_their_own_step() {
+    let img = image(1000, 1000);
+    let viewport = viewport_at(img, 0.5);
+    let (left, right) = (pane_at(500.0, 500.0, 1.0), pane_at(500.0, 500.0, 2.0));
+    let (left_draw, right_draw) = (
+        viewport.draw(img, left).unwrap(),
+        viewport.draw(img, right).unwrap(),
+    );
+    assert_eq!((left_draw.step.get(), right_draw.step.get()), (2, 1));
+
+    let equal = viewport.draw(img, pane_at(500.0, 500.0, 2.0)).unwrap();
+    assert_eq!(left_draw.src, equal.src);
+    assert_eq!(right_draw.src, equal.src);
+}
+
+#[test]
+fn guarded_refuses_a_physical_step_past_the_texture_limit() {
+    let img = image(1000, 1000);
+    let viewport = fit(img, pane(400.0, 400.0));
+
+    let logical = viewport.draw(img, pane_at(400.0, 400.0, 1.0)).unwrap();
+    assert_eq!((logical.step.get(), logical.extent()), (2, (500, 500)));
+    assert!(logical.guarded(img, 600).is_some());
+
+    let physical = viewport.draw(img, pane_at(400.0, 400.0, 2.0)).unwrap();
+    assert_eq!((physical.step.get(), physical.extent()), (1, (1000, 1000)));
+    assert!(physical.guarded(img, 600).is_none());
 }

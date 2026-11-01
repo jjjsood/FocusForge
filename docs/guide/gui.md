@@ -11,15 +11,40 @@ A folder argument proposes a grouping the same way `focusforge-cli stack`
 would and opens each proposed stack as its own tab; a `*.ffp` path reopens a
 project that was already stacked. `--open` is repeatable — each path is
 opened in turn, the next one waiting for the one before it to finish rather
-than racing it. Leaving `--open` off starts with no project open — use
-**Open project…** (below) or drop a folder or a set of frames onto the
-window. A path that fails to open shows the same refusal dialog a failed
-drop or picker choice would, rather than closing the window.
+than racing it. Leaving `--open` off starts with an empty window: click
+**Open…** to choose the TIFF or camera RAW frames of one stack, which start
+one new tab (sorted by name), or drop a folder or a set of frames onto the
+window. The empty window's caption reads "Drop a folder or stack", or
+"Dropping is unavailable on native Wayland" where drops do not work.
+Ctrl+N and the Projects rail's **New project** ask for a folder instead. A path that fails to open shows the same refusal dialog a failed
+drop or picker choice would, rather than closing the window. A folder with
+no readable frames is refused naming the formats read, 16-bit TIFF and camera
+RAW; Escape closes the dialog. Dialogs with a Cancel button also show an x at
+the top right that acts as Cancel.
 
 Opening a folder, a project or a picker/drop result reads its frame headers
 and decodes a thumbnail off the window's own thread, so the window keeps
-responding while a large folder is scanned; a loading indicator appears over
+responding while a large folder is scanned, and while an open, save or
+export file dialog is up; a loading indicator appears over
 the canvas once a load has been running for half a second.
+
+On Linux, a launch that carries a startup-notification token
+(`DESKTOP_STARTUP_ID` or `XDG_ACTIVATION_TOKEN`) tells the desktop once the
+window has appeared, so the launcher's busy cursor ends.
+
+## Launch options
+
+Other `focusforge-gui` flags start the window in a chosen state; `--help`
+lists them all.
+
+| flag | effect |
+|---|---|
+| `--fuse-tabs 0,1` | selects those tabs in turn and presses **Fuse stack** on each once `--open` has loaded, so give one `--open <folder>` per stack (a folder that reads as several stacks first asks how to group them, and until that is answered no tab exists for the flag to select); an index repeated, as in `0,0`, waits until the earlier run has settled and its **Keep** or **Discard** question is answered |
+| `--projects-overlay` | opens the projects overlay; with `--open` it stays open after the load lands, with `--fuse-tabs` it opens once the last run settles |
+| `--toolbar-state idle\|running\|paused\|cancelling\|failed` | shows that transport state until a real run starts |
+| `--save-folder <DIR>` | writes every project save and image export into this existing folder under its proposed name, with no save dialog |
+| `--settings-section <TAB>` | opens the settings window on that tab (see below) |
+| `--config-dir <DIR>` | reads and writes `<DIR>/focusforge/settings.toml` (see below) |
 
 ## The window
 
@@ -37,7 +62,9 @@ between two tabs of its own:
   project adds them to it the same way, rather than opening a second project;
   a frame that would replace one already in the stack asks before doing so.
   The panel dims while its own tab's fuse is running, the same as
-  **Settings**.
+  **Settings**. The Appearance tab of the settings window sets whether the panel shows each frame as a
+  plain row, a row with a preview, or a large preview. The editor's source
+  list follows the same choice.
 - **Settings** holds every setting of the next fuse on this tab, in four
   sections; see [Settings](#settings) below. A value outside its declared
   range is flagged before the run starts.
@@ -51,7 +78,8 @@ window included, shows a coarse whole-image backdrop under the sharp view, so
 zooming out or panning past the loaded region shows no blank edge while the
 sharp pixels catch up. Drag the second window by
 its title bar; its dock icon or close button returns the image to the main
-window. It can also be minimized or maximized. On Linux, the second window
+window. It can also be minimized or maximized. It draws sharply over its
+whole area and follows the display's scale factor. On Linux, the second window
 currently uses X11 or XWayland when `DISPLAY` is available, otherwise native
 Wayland when `WAYLAND_DISPLAY` is available. Starting with neither display
 reports a clear error instead of choosing a different backend.
@@ -70,7 +98,10 @@ The toolbar's transport button reads **Fuse stack** on a tab with two or
 more frames still to fuse; while a run is going it becomes **Pause**,
 **Cancel** and, once paused, **Resume**. A failed run offers **Retry**,
 which starts the same request again. Progress, the current stage and an ETA
-show along the bottom of the window while a run is live. A failed run raises
+show along the bottom of the window while a run is live. Brightness
+preparation and a computed alignment each show frames done and an estimated
+time remaining; time spent paused is left out of the estimate. When alignment
+is reused from an earlier run, the bar reads "from cache" for that stage. A failed run raises
 a toast naming which step it failed at — setup, alignment or fusion —
 rather than a generic failure message.
 
@@ -84,9 +115,14 @@ moment later rather than hanging; see
 The **Settings** tab is generated from the same parameter schema
 `focusforge-cli algorithms` prints. It has four sections, top to bottom:
 
-- **PREPARE** — **Equalize brightness** (on by default) and **Max brightness
-  gain** (1.01 to 2.0, default 1.25). Every frame gets one gain, matching the
-  reference frame's mid-tone brightness, bounded by the max gain.
+- **PREPARE** — **Equalize brightness** (on by default), **Max brightness
+  gain** (1.01 to 2.0, default 1.25) and **Target brightness (stops)**, a
+  signed slider from -0.5 to 0.5 in steps of 0.1 (Left and Right step it from
+  the keyboard). Every frame gets one gain, bringing its mean to one target
+  shared by all frames, bounded by the max gain; the target sits at the
+  frames' average brightness at 0.0 and a stop higher or lower doubles or
+  halves it. While the gains are measured the bottom bar reads **Preparing** with the number of frames done and an
+  estimated time remaining.
 - **FUSE** — the fusion method and the parameters it declares. The picker
   lists every method: **Details** (the default), **Soft transitions** and
   **Focus map**. Each method remembers its own settings while the tab is open.
@@ -96,7 +132,9 @@ The **Settings** tab is generated from the same parameter schema
 - **FINISH** — **Auto-crop**, which trims the result to the area every
   aligned frame covers.
 
-Rarely changed parameters sit behind a **More...** strip at the foot of a
+A section's heading carries a **DEFAULT** badge while nothing in it differs
+from the defaults; in **ALIGN** the **Enabled** switch counts, so switching
+alignment off or on removes the badge. Rarely changed parameters sit behind a **More...** strip at the foot of a
 section; click it to open the strip and click again to collapse it. Choosing a
 different method or editing a value changes what the next fuse on this tab
 runs with.
@@ -181,6 +219,8 @@ window, not only with the overlay open: Ctrl+N (**New project**), Ctrl+O
 (**Open project…**), Ctrl+S (**Save project**) and Ctrl+W (**Close
 project**). They are not part of the rebindable input map, and they do
 nothing while the settings panel or a close or quit question is open.
+Escape is fixed the same way: it closes a refusal dialog first, otherwise the
+projects overlay, and closes the settings window from any of its tabs.
 
 Closing a tab that holds unsaved checkpoints or strokes asks **Save this
 state first?** and offers **Save and close** or **Close anyway**. Quitting the
@@ -188,10 +228,51 @@ window with unsaved work — including through the window manager, e.g.
 Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
 **Quit without saving**. Dismissing either question leaves everything open.
 
+## Notifications
+
+Everything the window has to tell you outside a dialog is kept as a
+notification for the rest of the session: a failed run or save, a processing
+notice such as a held brightness gain, skipped subfolders on an open and a
+notice about crash reports left by an earlier session. Nothing is written to
+disk, so closing the window ends the history.
+
+A bell sits in the icon bar down the left edge, just above the **Settings** icon. Its badge
+counts the notifications you have not read and disappears at zero. Clicking
+the bell opens the **Notifications** center beside the bar; opening it marks
+every notification read, and it stays reachable with no project open and over
+the projects overlay (which it closes first). Each row shows a title, a
+context line with the source, project, file and time; select a row to read
+its full message.
+
+A new notification that arrives while the window is in front also appears as a
+toast: six seconds for most, ten for a crash notice, one at a time with the
+rest queued. Hovering a toast or focusing it from the keyboard pauses its
+timer, and clicking it opens the center on that notification. While the center
+or the projects overlay is open no toast is shown; what arrives meanwhile is
+kept, counted on the badge and never replayed as a toast.
+
+### Banners while the window is in the background
+
+When every FocusForge window is behind other applications, a new notification
+also appears once as a banner from your operating system, carrying only its
+title and a one-line context. The full message and any file paths stay in the
+center, which marks them read when you return to it. Switching between the
+main window and the detached pane does not count as leaving, no banner repeats
+when you come back, and none is shown while the projects overlay is open.
+Dismissing a banner, or the system refusing it, changes nothing in the app: the
+notification stays in the center and on the badge, and a send that fails is
+logged once and not retried.
+
+Banners use the identity `org.focusforge.FocusForge`. On Linux they go through
+the desktop's notification service, which attributes them to FocusForge when
+`assets/focusforge.desktop` is installed as
+`~/.local/share/applications/focusforge.desktop`. Without a running
+notification service there is no banner and everything else works as usual.
+
 ## The settings window
 
-The gear at the bottom of the window opens the settings window, which has
-five tabs:
+The **Settings** icon at the foot of the icon bar opens the settings window,
+which has six tabs:
 
 - **Performance** switches GPU processing on or off, shows the backend the
   last run resolved, and takes an optional **Host memory cap** and **VRAM
@@ -199,6 +280,10 @@ five tabs:
   example `8GiB`). A cap only lowers a budget; the **Host budget** and
   **VRAM budget** rows show the budgets in effect. A field holding an
   unparsable size is flagged. A changed VRAM cap applies from the next start.
+- **Appearance** chooses how the **Images** panel presents the source frames:
+  **List**, **Image list** (the default) or **Large previews**. The latter two
+  show a preview of each original source image beside its name. The choice is
+  saved in the `[appearance]` table of `settings.toml`.
 - **Storage** lists where the settings file, the logs, the crash reports and
   the scratch directory live, and marks one that does not exist yet. **Clear
   cache** deletes the cached fuse stages.
@@ -210,8 +295,9 @@ five tabs:
 - **About** shows the version, the licence (GPL-3.0), the copyright and
   warranty notice, and the source repository.
 
-`focusforge-gui --settings-section performance|storage|input-map|diagnostics|about`
-opens the window on that tab at startup.
+`focusforge-gui --settings-section performance` opens the window on that tab
+at startup. The other accepted sections are `appearance`, `storage`,
+`input-map`, `diagnostics` and `about`.
 
 ## Keyboard and mouse bindings
 
@@ -226,7 +312,8 @@ such as `alt+wheel`. Alt is not a wheel modifier; it is only the pipette.
 
 `settings.toml` in the platform's per-user config directory holds
 everything the window remembers, one table per concern: `[recent]` (the
-rail's recent projects, up to five, each row needing its `path`), `[input]`
+rail's recent projects, up to five, each row needing its `path`), `[appearance]`
+(`presentation = "list"|"image-list"|"large"`), `[input]`
 (the bindings above), `[export]` (the export dialog's last choice) and
 `[performance]` (`gpu = true|false`, and optional `max-host-memory` and
 `max-vram` size strings, as set on the Performance tab). The

@@ -80,6 +80,35 @@ fn wait_export(controller: &mut AppController) {
     }
 }
 
+/// The only test in this binary that reaches the real save picker: the save
+/// folder is process-wide and set once.
+#[test]
+fn save_folder_receives_the_export_under_its_proposed_name() {
+    let folder = common::tree("save_folder_export_out");
+    focusforge_gui::picker::set_save_folder(folder.clone());
+    let mut controller = scratch_controller("save_folder_export");
+    open_fused_tab(&mut controller, "save_folder_export", 3);
+    controller.checkpoint_export_requested();
+    controller.export_select_format("PNG");
+
+    let mut proposed = None;
+    controller.export_confirmed(|p| {
+        proposed = Some(p.to_path_buf());
+        focusforge_gui::picker::pick_save_image(p, ExportFormat::Png)
+    });
+    assert!(controller.take_export_started(), "the export must start");
+    wait_export(&mut controller);
+
+    let proposed = proposed.expect("the picker is asked for a destination");
+    assert_eq!(proposed.extension().unwrap(), "png");
+    let exported = folder.join(proposed.file_name().unwrap());
+    assert!(exported.is_file(), "{} must be written", exported.display());
+    assert!(
+        !proposed.exists(),
+        "nothing may be exported beside the frames"
+    );
+}
+
 fn dab() -> Op {
     Op::BrushStroke {
         source_id: 0,
@@ -324,6 +353,59 @@ fn export_button_opens_the_modal_for_the_current_position() {
         .expect("the modal must open for unsealed edits");
     assert!(context.contains("unsaved edits on"), "{context}");
     assert_eq!(what, "Exporting your current unsaved retouch edits.");
+}
+
+/// One dab, then **Save checkpoint**: the tab's selected row is a held
+/// retouch entry with no unsealed edits after it. Checks the dialog's copy,
+/// then that a further dab brings the live-edits copy back.
+fn assert_held_retouch_export_copy(controller: &mut AppController) {
+    controller
+        .edit_session_mut()
+        .expect("editor mode opens a session")
+        .append(dab())
+        .expect("a dab inside the map applies");
+    assert!(controller.save_checkpoint(), "the edit seals a checkpoint");
+    assert!(controller.export_enabled());
+    controller.checkpoint_export_requested();
+    let (context, what) = controller
+        .export_copy()
+        .expect("the modal must open for a held retouch checkpoint");
+    assert!(context.contains(" · retouch checkpoint on "), "{context}");
+    assert_eq!(
+        what,
+        "Exporting the unsaved retouch checkpoint held in this tab."
+    );
+    controller.cancel_export();
+
+    controller
+        .edit_session_mut()
+        .expect("the session stays open")
+        .append(dab())
+        .expect("a second dab applies");
+    controller.checkpoint_export_requested();
+    let (context, what) = controller
+        .export_copy()
+        .expect("the modal must open for unsealed edits");
+    assert!(context.contains("unsaved edits on"), "{context}");
+    assert_eq!(what, "Exporting your current unsaved retouch edits.");
+}
+
+#[test]
+fn held_retouch_checkpoint_export_line() {
+    // A never-saved tab.
+    let mut controller = scratch_controller("export_held_retouch_unsaved");
+    open_fused_tab(&mut controller, "export_held_retouch_unsaved", 2);
+    common::enter_editor(&mut controller);
+    assert_held_retouch_export_copy(&mut controller);
+
+    // A tab opened from a project file.
+    let edited = build_edited("export_held_retouch_opened");
+    let mut controller = scratch_controller("export_held_retouch_opened");
+    common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
+    let root_row = row_index(&controller, &edited.root);
+    controller.select_checkpoint_row(root_row);
+    common::enter_editor(&mut controller);
+    assert_held_retouch_export_copy(&mut controller);
 }
 
 #[test]
@@ -1203,4 +1285,82 @@ fn a_format_refusal_names_its_cause_and_offers_close_only() {
     );
     assert!(!out.exists());
     controller.cancel_export();
+}
+
+#[test]
+fn save_and_export_dialogs_run_unlocked_for_export() {
+    use std::sync::{Arc, Mutex};
+
+    let mut controller = scratch_controller("export_dialog_unlocked");
+    open_fused_tab(&mut controller, "export_dialog_unlocked", 3);
+    controller.checkpoint_export_requested();
+    controller.export_select_format("TIFF");
+    let controller = Arc::new(Mutex::new(controller));
+
+    let (tab_id, format, proposed) = controller
+        .lock()
+        .unwrap()
+        .export_destination_request()
+        .expect("a ready modal proposes a destination");
+    assert_eq!(format, ExportFormat::Tiff);
+    assert!(
+        controller.try_lock().is_ok(),
+        "the save dialog runs with the controller free"
+    );
+
+    let chosen = common::tree("export_dialog_unlocked_elsewhere").join("renamed.tif");
+    assert_ne!(chosen.file_name(), proposed.file_name());
+    let mut controller = controller.lock().unwrap();
+    controller.export_destination_chosen(tab_id, format, chosen.clone());
+    assert!(controller.take_export_started());
+    wait_export(&mut controller);
+    assert!(chosen.is_file(), "{} must be written", chosen.display());
+    assert!(!proposed.exists(), "nothing is written at the proposal");
+}
+
+#[test]
+fn stale_dialog_answer_is_dropped_for_export() {
+    let mut controller = scratch_controller("export_dialog_stale");
+    open_fused_tab(&mut controller, "export_dialog_stale", 3);
+    let out = common::tree("export_dialog_stale_out");
+    let target = |name: &str| out.join(name);
+
+    // The modal was cancelled while the dialog was up.
+    controller.checkpoint_export_requested();
+    controller.export_select_format("TIFF");
+    let (tab_id, format, _) = controller.export_destination_request().unwrap();
+    controller.cancel_export();
+    controller.export_destination_chosen(tab_id, format, target("cancelled.tif"));
+    assert!(!controller.take_export_started());
+    assert!(!target("cancelled.tif").exists());
+
+    // The format changed while the dialog was up: the path was chosen for
+    // another format, and the modal stays as the user left it.
+    controller.checkpoint_export_requested();
+    controller.export_select_format("TIFF");
+    let (tab_id, format, _) = controller.export_destination_request().unwrap();
+    controller.export_select_format("PNG");
+    controller.export_destination_chosen(tab_id, format, target("switched.tif"));
+    assert!(!controller.take_export_started());
+    assert!(!target("switched.tif").exists());
+    assert_eq!(controller.export_format(), ExportFormat::Png);
+    assert_eq!(controller.export_stage(), "ready");
+
+    // The modal already moved to writing: a second answer starts nothing.
+    controller.export_select_format("TIFF");
+    let (tab_id, format, _) = controller.export_destination_request().unwrap();
+    controller.export_destination_chosen(tab_id, format, target("first.tif"));
+    assert!(controller.take_export_started());
+    controller.export_destination_chosen(tab_id, format, target("second.tif"));
+    assert!(!controller.take_export_started());
+    wait_export(&mut controller);
+    assert!(target("first.tif").is_file());
+    assert!(!target("second.tif").exists());
+
+    // A cancelled dialog leaves the modal open on `Ready`.
+    controller.checkpoint_export_requested();
+    controller.export_confirmed(|_| None);
+    assert_eq!(controller.export_stage(), "ready");
+    assert!(!controller.take_export_started());
+    assert!(controller.export_destination_request().is_some());
 }

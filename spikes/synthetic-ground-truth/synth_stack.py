@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Renders a focus stack whose true Z-Map is known, then scores the fusion against it.
 
 With `--warp`, it renders a known misregistration instead; that path is used
@@ -30,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 
@@ -38,7 +40,7 @@ SPP = 3
 NFRAMES = 8
 SIGMA_QUANT = 0.2  # blur-bank resolution, in sigma
 OUT = ".scratch/spike-synth"
-CLI = "./target/debug/focusforge-cli"
+CLI = os.path.join("target", "debug", "focusforge-cli" + (".exe" if os.name == "nt" else ""))
 HARNESS_LIB = "tools/lib"  # from the repository root; override with --harness
 
 ZMAP_UNSET = 0xFFFF  # core::zmap reserves u16::MAX
@@ -531,7 +533,8 @@ def direction_check_impulse(verbose=True):
 
 
 def run_align(out_dir, algo, mode, lax):
-    cmd = [CLI, "align", out_dir, "--json", "--algorithm", algo, "--set", f"mode={mode}"]
+    cmd = [CLI, "align", out_dir, "--json", "--algorithm", algo, "--set", f"mode={mode}",
+           "--set", "reference-policy=anchor"]
     if not lax:
         cmd.append("--strict")
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -681,8 +684,8 @@ def run_synthetic_alignment(args):
         "runs": {"rotation-scale": rs_report, "translation": tr_report},
     }
 
-    tmp_path = os.path.join(out_dir, ".tmp")
-    with open(tmp_path, "w") as fh:
+    with tempfile.NamedTemporaryFile("w", dir=out_dir, delete=False, encoding="utf-8") as fh:
+        tmp_path = fh.name
         json.dump(measurement, fh, indent=2, sort_keys=True)
     os.replace(tmp_path, os.path.join(out_dir, "measurement.json"))
     print(

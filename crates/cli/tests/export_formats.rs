@@ -811,33 +811,30 @@ fn refused_format_options_leave_nothing() {
         &out,
     );
 
-    // An unwritable destination.
+    // An unwritable destination. A read-only directory is a Unix permission; Windows has no
+    // mode to refuse with.
     let synth = build_synth("export_formats_refused_unwritable", 3);
-    let readonly_dir = dir.join("readonly");
-    std::fs::create_dir_all(&readonly_dir).unwrap();
     #[cfg(unix)]
     {
+        let readonly_dir = dir.join("readonly");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    }
-    let out = readonly_dir.join("out.tif");
-    let result = run_cli_in(
-        synth.project_path.parent().unwrap(),
-        &[
-            "export",
-            synth.project_path.to_str().unwrap(),
-            "-o",
-            out.to_str().unwrap(),
-        ],
-    );
-    assert!(!result.success);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+        let out = readonly_dir.join("out.tif");
+        let result = run_cli_in(
+            synth.project_path.parent().unwrap(),
+            &[
+                "export",
+                synth.project_path.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ],
+        );
+        assert!(!result.success);
         std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.exists());
+        assert!(!partial_of(&out).exists());
     }
-    assert!(!out.exists());
-    assert!(!partial_of(&out).exists());
 
     // `--zmap` alongside any `--format` still writes the plain 16-bit map.
     let plain_zmap = dir.join("plain-zmap.tif");

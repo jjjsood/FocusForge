@@ -74,7 +74,10 @@ pub fn fuse_held(
             lax: true,
         }),
         crop,
-        equalize: project::equalization_bound(&project::params_for(algorithm), &ParamValues::new()),
+        equalize: project::equalization_settings(
+            &project::params_for(algorithm),
+            &ParamValues::new(),
+        ),
         tile_size: None,
         max_host_memory: None,
         backend: None,

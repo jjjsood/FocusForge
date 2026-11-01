@@ -321,6 +321,13 @@ fn export_growths_at(height: u32) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// How much two exports of different heights may differ in peak growth.
+/// JPEG converts each 4 MiB band to 8 bits (2 MiB) and encodes on a second
+/// thread, so whether two such bands are alive at the peak depends on thread
+/// timing: one 8-bit band of jitter at the same height. Growth that scales
+/// with height is 8.6 MiB per 2800 rows for the 8-bit plane alone.
+const EXPORT_BUDGET: usize = 3 << 20;
+
 // One test, so the two measurements never overlap under the process-wide
 // allocator count.
 #[test]
@@ -333,9 +340,9 @@ fn peak_growth_is_independent_of_height() {
     for ((label, short_growth), (_, tall_growth)) in short.iter().zip(tall.iter()) {
         let diff = short_growth.abs_diff(*tall_growth);
         assert!(
-            diff < 1 << 20,
+            diff < EXPORT_BUDGET,
             "{label}: peak growth differs by {diff} B between heights 2800 ({short_growth} B) \
-             and 5600 ({tall_growth} B) -- more than the 1 MiB budget, so the export is not \
+             and 5600 ({tall_growth} B) -- more than the 3 MiB budget, so the export is not \
              staying band-bounded"
         );
     }

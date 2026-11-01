@@ -233,6 +233,51 @@ fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
 }
 
+/// A file made unreadable (mode `000`) for the guard's lifetime. Dropping it,
+/// on success or while a failed assertion unwinds, restores a readable mode so
+/// nothing unreadable outlives the test.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub struct UnreadableFile {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnreadableFile {
+    #[allow(dead_code)]
+    pub fn lock(path: &Path) -> std::io::Result<Self> {
+        set_mode(path, 0o000)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnreadableFile {
+    fn drop(&mut self) {
+        let _ = set_mode(&self.path, 0o644);
+    }
+}
+
+/// Rewrites `path` in place with `edit` applied to its bytes and moves its
+/// modification time a minute ahead. A project recognises an unchanged
+/// source by size and modification time alone, so an edit that keeps both
+/// goes unseen -- and a fast rewrite on a filesystem with a coarse clock
+/// (Windows) can keep the time.
+#[allow(dead_code)]
+pub fn rewrite_changed(path: &Path, edit: impl FnOnce(&mut Vec<u8>)) {
+    let mut bytes = std::fs::read(path).unwrap();
+    edit(&mut bytes);
+    std::fs::write(path, &bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+}
+
 /// Tries to create and remove a marker file in `dir`; `true` means the
 /// directory is still writable, so a mode change meant to block that either
 /// failed or has no effect on this filesystem.

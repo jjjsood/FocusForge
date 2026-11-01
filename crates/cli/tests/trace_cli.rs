@@ -123,6 +123,10 @@ fn chrome_trace_nesting() {
         "laplacian",
         "--align-algorithm",
         "pyramidal-ecc",
+        // The anchor policy's parallel solve is the one that records the
+        // prepare boundary; the default chain policy solves serially.
+        "--align-set",
+        "reference-policy=anchor",
         "--no-cache",
         "--quiet",
         // Not the default tile, which covers this fixture whole: the
@@ -307,7 +311,7 @@ fn chrome_trace_nesting() {
         "cpu_submissions",
         "buffer_creations",
         "readback_bytes",
-        "fuse_equalize_ns",
+        "prepare_equalize_ns",
     ] {
         let _ = summary_u64(summary[0], field);
     }
@@ -329,8 +333,8 @@ fn chrome_trace_nesting() {
         );
     }
     assert!(
-        summary_u64(summary[0], "fuse_equalize_ns") > 0,
-        "the default brightness equalization is charged to fuse_equalize_ns: {summary:?}"
+        summary_u64(summary[0], "prepare_equalize_ns") > 0,
+        "the default brightness equalization is charged to prepare_equalize_ns: {summary:?}"
     );
     for capability in [
         "gpu_execution_available",
@@ -415,6 +419,10 @@ fn level_iterations() {
         "pyramidal-ecc",
         "--set",
         "pyramid-depth=2",
+        // Frame spans wrap the level records under the anchor policy's
+        // parallel solve; the default chain policy records none.
+        "--set",
+        "reference-policy=anchor",
         "--quiet",
         "--json",
     ]);

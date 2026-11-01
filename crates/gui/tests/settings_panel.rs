@@ -195,17 +195,62 @@ fn the_enabled_switch_writes_only_the_project_values() {
 
     let panel = controller.settings_panel();
     assert_eq!(field_rows(&panel.rows, "align")[0].selected, "false");
-    assert_eq!(
-        heading(&panel.rows, "align").heading_state,
-        HeadingState::Default,
-        "the switch is not an align parameter"
-    );
     assert!(
-        !panel
+        panel
             .rows
             .iter()
-            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true")
+            .any(|r| r.kind == RowKind::ResetAll && r.selected == "true"),
+        "the switch alone enables Reset All"
     );
+    assert_eq!(
+        heading(&panel.rows, "finish").heading_state,
+        HeadingState::Default,
+        "no other section reads the switch"
+    );
+}
+
+#[test]
+fn enabled_switches_drive_their_heading() {
+    // (section whose switch is written, the switch's section, its id)
+    for (heading_section, switch_section, id) in [
+        ("align", "align-switch", "align"),
+        ("prepare", "prepare", "equalize"),
+    ] {
+        let mut controller = AppController::new();
+        open_mantis_512(&mut controller);
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Default,
+            "{id}: untouched"
+        );
+        assert!(
+            !reset_all_enabled(&controller),
+            "{id}: nothing to reset yet"
+        );
+
+        controller.set_param_value(switch_section, id, ParamValue::Bool(false));
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Explicit,
+            "{id}: writing the switch makes the heading explicit"
+        );
+        assert!(reset_all_enabled(&controller), "{id}: Reset All follows");
+
+        controller.set_param_value(switch_section, id, ParamValue::Bool(true));
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Explicit,
+            "{id}: provenance is key presence, so writing the default back keeps it"
+        );
+
+        controller.reset_all_sections();
+        assert_eq!(
+            heading(&controller.settings_panel().rows, heading_section).heading_state,
+            HeadingState::Default,
+            "{id}: Reset All restores the badge"
+        );
+        assert!(!reset_all_enabled(&controller), "{id}: Reset All disarms");
+    }
 }
 
 #[test]
@@ -343,6 +388,33 @@ fn a_loaded_stack_resolves_its_auto_hooks() {
         depth_row.value_text, "4",
         "pyramid-depth must resolve against the loaded stack's own dimensions, not the descriptor default"
     );
+}
+
+/// The Pyramid Depth row reads what `stack --dry-run` prints for the same
+/// frames: 0 for a 64 px frame, 3 for a 512 px frame, neither an explicit
+/// choice.
+#[test]
+fn pyramid_depth_matches_dry_run() {
+    let mantis_64 = common::workspace_root().join("fixtures").join("mantis-64");
+    for (frames, expected) in [(mantis_64, "0"), (mantis_512(), "3")] {
+        let mut controller = AppController::new();
+        assert!(matches!(
+            common::open_and_settle(&mut controller, std::slice::from_ref(&frames)),
+            OpenOutcome::Opened(_)
+        ));
+        controller.toggle_section_more("align");
+        controller.set_align_algorithm("pyramidal-ecc");
+        let panel = controller.settings_panel();
+        let depth_row = field_rows(&panel.rows, "align")
+            .into_iter()
+            .find(|r| r.id == "pyramid-depth")
+            .expect("pyramid-depth row must be present");
+        assert_eq!(depth_row.value_text, expected, "{}", frames.display());
+        assert_ne!(
+            heading(&panel.rows, "align").heading_state,
+            HeadingState::Explicit
+        );
+    }
 }
 
 #[test]
@@ -531,6 +603,20 @@ fn reopened_uncropped_project_shows_auto_crop_off() {
 }
 
 #[test]
+fn a_reopened_project_without_an_align_record_opens_with_align_explicit() {
+    let mut controller = AppController::new();
+    let project = seal_without_align("reopened_unaligned_heading", "laplacian");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    assert_eq!(
+        heading(&controller.settings_panel().rows, "align").heading_state,
+        HeadingState::Explicit
+    );
+}
+
+#[test]
 fn reopened_cropped_project_shows_auto_crop_on() {
     use focusforge_core::align::Registration;
     use focusforge_core::io::Rect;
@@ -585,6 +671,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
         &ParamValues::new(),
         registration(Some(Equalization {
             max_gain: 1.5,
+            target_stops: 0.3,
             gains: vec![65536, 66000],
         })),
     );
@@ -595,6 +682,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     controller.toggle_section_more("prepare");
     assert_eq!(row(&controller, "equalize").selected, "true");
     assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
+    assert_eq!(row(&controller, "equalize-target").value_text, "+0.3");
 
     let mut plain = AppController::new();
     let project = seal_with_registration(
@@ -610,6 +698,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     plain.toggle_section_more("prepare");
     assert_eq!(row(&plain, "equalize").selected, "false");
     assert_eq!(row(&plain, "equalize-max-gain").value_text, "1.25");
+    assert_eq!(row(&plain, "equalize-target").value_text, "0.0");
 }
 
 fn equalize_selected(controller: &AppController) -> String {
@@ -676,6 +765,7 @@ fn a_reopened_focus_map_project_shows_how_its_run_was_equalized() {
         &ParamValues::new(),
         registration(Some(Equalization {
             max_gain: 1.5,
+            target_stops: 0.0,
             gains: vec![65536, 66000],
         })),
     );
@@ -737,6 +827,38 @@ fn seeded_ids_are_never_test_only() {
 }
 
 #[test]
+fn pickers_hide_test_only() {
+    assert!(
+        registry::find_stack("dummy-stack").unwrap().test_only(),
+        "the test build registers the dummy stack method"
+    );
+    assert!(registry::find_align("dummy-align").unwrap().test_only());
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    let rows = controller.settings_panel().rows;
+    for section in ["fuse", "align"] {
+        let ids = picker_ids(&rows, section);
+        assert!(!ids.is_empty(), "{section} picker lists something");
+        for id in ids {
+            let algorithm = registry::find(&id).unwrap();
+            assert!(!algorithm.test_only(), "{section} picker lists {id}");
+        }
+    }
+
+    // A tab that holds a test-only algorithm keeps its closed-row label but
+    // does not offer it.
+    controller.set_align_algorithm("dummy-align");
+    let rows = controller.settings_panel().rows;
+    let picker = rows
+        .iter()
+        .find(|r| r.kind == RowKind::Picker && r.section == "align")
+        .expect("align picker row must exist");
+    assert_eq!(picker.value_text, "Dummy Align (test-only)");
+    assert!(!picker.choice_ids.contains(&"dummy-align".to_string()));
+}
+
+#[test]
 fn pickers_list_the_registry() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
@@ -744,8 +866,8 @@ fn pickers_list_the_registry() {
 
     assert_eq!(
         picker_ids(&panel.rows, "fuse"),
-        every_fuse_id(),
-        "the collapsed fuse picker lists every registered method, the default first"
+        listed_fuse_ids(),
+        "the collapsed fuse picker lists every non-test method, the default first"
     );
 
     let align_picker = panel
@@ -755,6 +877,7 @@ fn pickers_list_the_registry() {
         .expect("align picker row must exist");
     let mut expected_align: Vec<String> = registry::align_algorithms()
         .iter()
+        .filter(|a| !a.test_only())
         .map(|a| a.id().to_string())
         .collect();
     expected_align.sort();
@@ -1306,10 +1429,23 @@ fn no_algorithm_id_in_the_gui() {
         .collect();
     assert!(!ids.is_empty());
 
+    let boundary = "const SHIPPED: &str = \"laplacian\";\n#[cfg(test)]\nmod tests {\nconst FIXTURE: &str = \"dummy-align\";\n}";
+    let production = common::production_rust_source(boundary);
+    assert!(production.contains("laplacian"));
+    assert!(
+        !production.contains("dummy-align"),
+        "only cfg(test) fixture identifiers may leave the production scan"
+    );
+    assert!(
+        common::production_rust_source("const SHIPPED: &str = \"laplacian\";")
+            .contains("laplacian"),
+        "files without a cfg(test) tail stay fully scanned"
+    );
+
     let mut offenders = Vec::new();
     for path in common::find_rust_files(&common::src_dir()) {
         let contents = fs::read_to_string(&path).unwrap();
-        let code = common::strip_line_comments(&contents);
+        let code = common::strip_line_comments(common::production_rust_source(&contents));
         for id in &ids {
             if code.contains(id.as_str()) {
                 offenders.push(format!("{}: {id}", path.display()));
@@ -1550,12 +1686,21 @@ fn picker_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
         .clone()
 }
 
-/// Every stack method's id, the default first and the advanced ones last --
-/// what the Fuse picker lists, `More...` open or not.
+/// Every registered stack method's id, test-only ones included, the default
+/// first and the advanced ones last.
 fn every_fuse_id() -> Vec<String> {
     let mut methods = registry::stack_algorithms();
     methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
     methods.iter().map(|a| a.id().to_string()).collect()
+}
+
+/// What the Fuse picker lists, `More...` open or not: [`every_fuse_id`]
+/// without the test-only methods.
+fn listed_fuse_ids() -> Vec<String> {
+    every_fuse_id()
+        .into_iter()
+        .filter(|id| !registry::find_stack(id).unwrap().test_only())
+        .collect()
 }
 
 fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow> {
@@ -1655,7 +1800,7 @@ fn sections_start_collapsed_with_one_adjustment_at_most() {
 
     controller.set_fuse_algorithm("laplacian");
     let fuse_picker = picker_ids(&controller.settings_panel().rows, "fuse");
-    assert_eq!(fuse_picker, every_fuse_id());
+    assert_eq!(fuse_picker, listed_fuse_ids());
     assert_eq!(fuse_picker[0], "laplacian", "the default comes first");
     assert!(fuse_picker.contains(&"weighted-average".to_string()));
     assert!(fuse_picker.contains(&"depth-map".to_string()));
@@ -1704,7 +1849,7 @@ fn more_reveals_that_sections_advanced_rows() {
     let rows = controller.settings_panel().rows;
     assert_eq!(
         field_ids(&rows, "prepare"),
-        ["equalize", "equalize-max-gain"]
+        ["equalize", "equalize-max-gain", "equalize-target"]
     );
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
@@ -1718,6 +1863,41 @@ fn more_reveals_that_sections_advanced_rows() {
         rows[row_index(&rows, "prepare", "equalize")].selected,
         "true",
         "Details equalizes by default"
+    );
+}
+
+#[test]
+fn the_target_row_follows_max_gain_under_more() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    let rows = controller.settings_panel().rows;
+    let target = &rows[row_index(&rows, "prepare", "equalize-target")];
+    assert_eq!(
+        row_index(&rows, "prepare", "equalize-target"),
+        row_index(&rows, "prepare", "equalize-max-gain") + 1,
+        "the target row follows Max brightness gain"
+    );
+    assert_eq!(target.label, "Target brightness (stops)");
+    assert_eq!(
+        target.value_text, "0.0",
+        "the default is the neutral target"
+    );
+    assert!(
+        row_index(&rows, "prepare", "equalize-target")
+            > rows
+                .iter()
+                .position(|r| r.kind == RowKind::More && r.section == "prepare")
+                .unwrap(),
+        "the target is advanced, so it sits under More"
+    );
+
+    controller.toggle_section_more("prepare");
+    let rows = controller.settings_panel().rows;
+    assert!(
+        rows.iter()
+            .all(|r| !(r.section == "prepare" && r.id == "equalize-target")),
+        "More closed hides the target row"
     );
 }
 
@@ -1825,7 +2005,7 @@ fn fuse_picker_lists_every_method_in_both_more_states() {
     let collapsed = picker_ids(&controller.settings_panel().rows, "fuse");
     assert_eq!(
         collapsed,
-        every_fuse_id(),
+        listed_fuse_ids(),
         "More... closed lists every method"
     );
     assert_eq!(collapsed.last().map(String::as_str), Some("depth-map"));
@@ -2002,7 +2182,7 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
         let rows = controller.settings_panel().rows;
         assert_eq!(
             field_ids(&rows, "prepare"),
-            ["equalize", "equalize-max-gain"],
+            ["equalize", "equalize-max-gain", "equalize-target"],
             "{method}"
         );
         assert_eq!(
@@ -2138,7 +2318,10 @@ impl MountedPanel {
 
         init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
-        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        // Tall enough that every strip stays inside the panel's viewport with
+        // the Prepare and Fuse sections open: a strip below the viewport's edge
+        // is not mounted.
+        app.window().set_size(slint::PhysicalSize::new(1440, 1200));
         let mut controller = AppController::new();
         open_mantis_512(&mut controller);
         let controller = Arc::new(Mutex::new(controller));
@@ -2349,4 +2532,317 @@ fn more_strip_is_disabled_while_running() {
         panel.click_strip(section);
         assert!(panel.is_open(section), "{section} opens once enabled again");
     }
+}
+
+/// The panel's controls are found by role: Reset All carries its enabled
+/// state, each switch its row label and on state, each menu its row label and
+/// shown value, each fold-out header its label.
+#[test]
+fn reset_all_and_switches_report_their_state() {
+    use focusforge_gui::AppWindow;
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::{ComponentHandle, Model as _};
+
+    init_window_backend();
+    let app = AppWindow::new().unwrap();
+    // Tall enough that no row is clipped out of the panel's viewport, where
+    // an element query does not look.
+    app.window().set_size(slint::PhysicalSize::new(1440, 2400));
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("align");
+    controller.toggle_section_more("fuse");
+    controller.set_align_algorithm("pyramidal-ecc");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+
+    let find = |id: &str| {
+        ElementQuery::from_root(&app)
+            .match_id("FFDock::settings-panel")
+            .match_descendants()
+            .match_id(id)
+            .find_all()
+    };
+    let reset_enabled = || {
+        let reset = find("FFResetAll::area");
+        assert_eq!(reset.len(), 1, "one Reset All in the panel");
+        assert_eq!(reset[0].accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(
+            reset[0].accessible_label().as_deref(),
+            Some("Reset All to Default")
+        );
+        reset[0].accessible_enabled()
+    };
+    assert_eq!(reset_enabled(), Some(false), "disabled while at defaults");
+
+    controller.set_param_text("finish", "auto-crop", "false");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(reset_enabled(), Some(true), "enabled once a value is set");
+
+    let rows = app.get_settings_rows();
+    let of_kind = |kinds: &[&str]| {
+        (0..rows.row_count())
+            .map(|i| rows.row_data(i).unwrap())
+            .filter(|r| kinds.contains(&r.kind.as_str()))
+            .collect::<Vec<_>>()
+    };
+
+    let switches = find("FFToggle::area");
+    let bools = of_kind(&["bool"]);
+    assert!(!bools.is_empty(), "the registry has bool rows");
+    assert_eq!(switches.len(), bools.len());
+    for (switch, row) in switches.iter().zip(&bools) {
+        assert_eq!(switch.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(
+            switch.accessible_label().as_deref(),
+            Some(row.label.as_str())
+        );
+        assert_eq!(switch.accessible_checked(), Some(row.selected == "true"));
+    }
+    let crop = bools.iter().position(|r| r.id == "auto-crop").unwrap();
+    assert_eq!(switches[crop].accessible_checked(), Some(false));
+    controller.set_param_text("finish", "auto-crop", "true");
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(
+        find("FFToggle::area")[crop].accessible_checked(),
+        Some(true),
+        "checked follows the value"
+    );
+
+    assert!(
+        find("FFMenu::area")
+            .iter()
+            .all(|area| area.accessible_role() == Some(AccessibleRole::None)),
+        "a menu is one accessible node, its root"
+    );
+    let menus = find("FFMenu::root");
+    let fields = of_kind(&["picker", "enum"]);
+    assert!(!fields.is_empty(), "the registry has picker and enum rows");
+    assert_eq!(menus.len(), fields.len());
+    for (menu, row) in menus.iter().zip(&fields) {
+        assert_eq!(menu.accessible_role(), Some(AccessibleRole::Combobox));
+        assert_eq!(menu.accessible_enabled(), Some(true));
+        assert_eq!(menu.accessible_label().as_deref(), Some(row.label.as_str()));
+        assert_eq!(
+            menu.accessible_value().as_deref(),
+            Some(row.value_text.as_str())
+        );
+    }
+
+    let mores = find("FFMoreToggle::header-area");
+    assert!(!of_kind(&["more"]).is_empty(), "the registry has fold-outs");
+    assert_eq!(mores.len(), of_kind(&["more"]).len());
+    for more in &mores {
+        assert_eq!(more.accessible_role(), Some(AccessibleRole::Button));
+        assert_eq!(more.accessible_label().as_deref(), Some("More..."));
+    }
+
+    controller.reset_all_sections();
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert_eq!(reset_enabled(), Some(false), "disabled again after a reset");
+}
+
+fn prepare_row(controller: &AppController, id: &str) -> SettingsRow {
+    controller
+        .settings_panel()
+        .rows
+        .into_iter()
+        .find(|r| r.section == "prepare" && r.id == id && r.kind != RowKind::Error)
+        .unwrap_or_else(|| panic!("the prepare section has a {id} row"))
+}
+
+#[test]
+fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.3));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
+    let disabled_prepare_rows = |controller: &AppController| -> Vec<String> {
+        controller
+            .settings_panel()
+            .rows
+            .iter()
+            .filter(|r| r.section == "prepare" && r.disabled)
+            .map(|r| r.id.clone())
+            .collect()
+    };
+
+    assert!(disabled_prepare_rows(&controller).is_empty());
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
+    assert_eq!(
+        disabled_prepare_rows(&controller),
+        ["equalize-max-gain", "equalize-target"],
+        "exactly the two dependent rows grey; the switch stays enabled"
+    );
+    assert!(!prepare_row(&controller, "equalize").disabled);
+    assert_eq!(
+        prepare_row(&controller, "equalize-target").value_text,
+        "+0.3"
+    );
+    assert_eq!(
+        prepare_row(&controller, "equalize-max-gain").value_text,
+        "1.5"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    assert!(disabled_prepare_rows(&controller).is_empty());
+    assert_eq!(
+        prepare_row(&controller, "equalize-target").value_text,
+        "+0.3"
+    );
+    assert_eq!(
+        prepare_row(&controller, "equalize-max-gain").value_text,
+        "1.5"
+    );
+}
+
+#[test]
+fn target_slider_snaps_to_its_step() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+
+    for (fraction, shown) in [(0.0, "\u{2212}0.5"), (0.37, "\u{2212}0.1"), (1.0, "+0.5")] {
+        controller.set_param_fraction("prepare", "equalize-target", fraction);
+        assert_eq!(
+            prepare_row(&controller, "equalize-target").value_text,
+            shown,
+            "target at fraction {fraction}"
+        );
+    }
+
+    // The other step (0.01) and the unsigned format: 1.01 + 0.37 * 0.99 snaps
+    // to 1.38, written without residue.
+    controller.set_param_fraction("prepare", "equalize-max-gain", 0.37);
+    assert_eq!(
+        prepare_row(&controller, "equalize-max-gain").value_text,
+        "1.38"
+    );
+}
+
+#[test]
+fn signed_readout_formats_negative_zero_and_positive() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+
+    for (value, shown) in [
+        (-0.5, "\u{2212}0.5"),
+        (0.0, "0.0"),
+        (0.2, "+0.2"),
+        (-0.0, "0.0"),
+    ] {
+        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(value));
+        assert_eq!(
+            prepare_row(&controller, "equalize-target").value_text,
+            shown,
+            "target {value:?}"
+        );
+    }
+
+    // A range that stays non-negative keeps the plain number.
+    controller.toggle_section_more("fuse");
+    controller.set_fuse_algorithm("weighted-average");
+    controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
+}
+
+#[test]
+fn keyboard_step_moves_the_target_by_one_step_and_clamps() {
+    use slint::ComponentHandle;
+    use slint::platform::{Key, WindowEvent};
+
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    let shown = |controller: &AppController| prepare_row(controller, "equalize-target").value_text;
+
+    controller.step_param("prepare", "equalize-target", 1);
+    assert_eq!(shown(&controller), "+0.1");
+
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(-0.5));
+    controller.step_param("prepare", "equalize-target", -1);
+    assert_eq!(
+        shown(&controller),
+        "\u{2212}0.5",
+        "Left at the minimum stays"
+    );
+
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.0));
+    for _ in 0..7 {
+        controller.step_param("prepare", "equalize-target", 1);
+    }
+    assert_eq!(shown(&controller), "+0.5", "Right at the maximum stays");
+
+    // The same press through the mounted window: a pointer press at the
+    // track's left end sets -0.5 and focuses the slider, Right then steps it.
+    let panel = MountedPanel::open();
+    panel.click_strip("prepare");
+    let rows = panel.rows();
+    let target_at = row_index(&rows, "prepare", "equalize-target");
+    let slider_position = rows[..target_at]
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                RowKind::LinearFloat | RowKind::LogFloat | RowKind::Int
+            )
+        })
+        .count();
+    let track = panel
+        .elements("FFSlider::drag-area")
+        .remove(slider_position);
+    let (origin, size) = (track.absolute_position(), track.size());
+    panel.click(slint::LogicalPosition::new(
+        origin.x + 1.0,
+        origin.y + size.height / 2.0,
+    ));
+    assert_eq!(
+        prepare_row(&panel.controller.lock().unwrap(), "equalize-target").value_text,
+        "\u{2212}0.5"
+    );
+
+    for key in [Key::RightArrow, Key::RightArrow] {
+        panel
+            .app
+            .window()
+            .dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+        panel
+            .app
+            .window()
+            .dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+        panel.perform();
+    }
+    assert_eq!(
+        prepare_row(&panel.controller.lock().unwrap(), "equalize-target").value_text,
+        "\u{2212}0.3",
+        "two Right presses move the stored target two steps"
+    );
+}
+
+#[test]
+fn the_panel_is_disabled_without_a_project() {
+    init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    let mut controller = AppController::new();
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert!(!app.get_settings_enabled(), "no project open");
+
+    open_mantis_512(&mut controller);
+    focusforge_gui::bridge::push_settings_panel(&app, &controller);
+    assert!(app.get_settings_enabled(), "a project is open");
+}
+
+#[test]
+fn settings_opens_from_the_icon_bar() {
+    let panel = MountedPanel::open();
+    assert!(!panel.app.get_settings_open());
+
+    // The bar's lower control, 8 px above the window's bottom edge.
+    panel.click(slint::LogicalPosition::new(24.0, 1200.0 - 24.0));
+    assert!(panel.app.get_settings_open());
 }

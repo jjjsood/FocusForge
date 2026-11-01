@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Cut the checked-in fixture crops out of the reference stack.
 
 Driven by tools/make-fixtures.sh; see that script for the flags. The whole job
@@ -78,6 +79,7 @@ class CompressedFixtureSet:
     predictor: int
     layout: str
     byte_order: str
+    bits: int = 16
 
 
 def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
@@ -98,9 +100,26 @@ def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
     )
 
 
-COMPRESSED_SETS = _compressed_sets()
+# 8-bit RGB re-encodings of mantis-64 (high byte of each sample): the
+# uncompressed twin plus four sets that between them cover every codec,
+# predictor, layout and byte order once. Names avoid the `mantis-64-` prefix
+# that counts the 16-bit matrix.
+EIGHT_BIT_SETS = (
+    CompressedFixtureSet("mantis8-64", 1, "none", 1, "strip", "II", bits=8),
+    CompressedFixtureSet("mantis8-64-deflate-p2-strip-ii", 8, "deflate", 2, "strip", "II", bits=8),
+    CompressedFixtureSet("mantis8-64-lzw-p1-tile-mm", 5, "lzw", 1, "tile", "MM", bits=8),
+    CompressedFixtureSet("mantis8-64-old-deflate-p1-strip-mm", 32946, "old-deflate", 1, "strip", "MM", bits=8),
+    CompressedFixtureSet("mantis8-64-lzw-p2-tile-ii", 5, "lzw", 2, "tile", "II", bits=8),
+)
+COMPRESSED_SETS = _compressed_sets() + EIGHT_BIT_SETS
 COMPRESSED_ROWS_PER_STRIP = 11
 COMPRESSED_TILE = (48, 48)
+
+# Folder-shaped inputs for the open paths, copied byte for byte from the
+# committed mantis-64 frames. `open-rejected/frames/02.tif` is cut inside its
+# strip data: the header still reads, the pixel data does not.
+FOLDER_SET_NAMES = ("open-two-stacks", "open-root-and-subfolder", "open-rejected")
+FOLDER_SET_FRAMES = 3
 
 
 SETS = (
@@ -161,16 +180,23 @@ def _crop(
     compression: int = 1,
     predictor: int = 1,
     tile: tuple[int, int] | None = None,
+    bits: int | None = None,
 ) -> None:
     x, y, w, h = rect
     info = rawtiff.read_info(src)
     pixels = rawtiff.read_rect(src, x, y, w, h, info=info)
+    source_bits = info.bits_per_sample[0]
+    bits = bits or source_bits
+    if (source_bits, bits) == (16, 8):
+        pixels = pixels[1::2]  # high byte of each native little-endian sample
+    elif bits != source_bits:
+        raise FixtureError(f"cannot derive {bits}-bit samples from {source_bits}-bit {src}")
     rawtiff.write_tiff(
         dst,
         w,
         h,
         pixels,
-        bits=info.bits_per_sample[0],
+        bits=bits,
         spp=info.samples_per_pixel,
         description=description,
         byte_order=byte_order,
@@ -269,16 +295,61 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
     for fset in COMPRESSED_SETS:
         lines.append(f"| `{fset.name}` | 3 | `4064,2700,64,64` | 64x64 |")
     lines.append("| `blackmagic-micro-dng` | 1 | single DNG | 1952x1104 |")
+    lines.append("| `open-two-stacks` | 6 | `4064,2700,64,64` | 64x64 |")
+    lines.append("| `open-root-and-subfolder` | 3 | `4064,2700,64,64` | 64x64 |")
+    lines.append("| `open-rejected` | 3 | `4064,2700,64,64` | 64x64 |")
+    lines.append("| `projects` | 3 | `4064,2700,64,64` | 64x64 |")
     lines += [
         "",
         "Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a "
         "`README.md` naming the source frame behind every `NN`. Outputs are "
         "little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` "
         "sets add LZW and deflate encodings in both byte orders, with strips or "
-        "zero-padded tiles and Predictor 1 or 2.",
+        "zero-padded tiles and Predictor 1 or 2. The `mantis8-64` sets hold the "
+        "same crop as 8-bit RGB: the high byte of each `mantis-64` sample, "
+        "uncompressed or in one of four encodings.",
         "",
         "`blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own "
         "README; it has no `frames/` directory or `reference.tif`.",
+        "",
+        "`open-two-stacks`, `open-root-and-subfolder` and `open-rejected` are folder "
+        "shapes for the open paths, copied byte for byte from `mantis-64/frames` "
+        "(`open-rejected/frames/02.tif` is then cut in half inside its strip data). "
+        "They have their own READMEs and no `reference.tif`.",
+        "",
+        "## Project files",
+        "",
+        "`projects/` holds four project files over one shared `projects/frames/` "
+        "(copies of `mantis-64/frames`). They are not regenerated: each records its "
+        "frames' modified time and device/inode, so a rerun writes different bytes. "
+        "They are registered in `MANIFEST.sha256` as they stand. Each opens to a "
+        "different outcome:",
+        "",
+        "| file | opens as |",
+        "|---|---|",
+        "| `valid.ffp` | one project over the 3 frames |",
+        "| `mismatch.ffp` | the fingerprint-mismatch question: its frames `01` and `02` were swapped when it was written |",
+        "| `missing.ffp` | a project whose frames (`gone/NN.tif`) are not there |",
+        "| `corrupt.ffp` | a refusal: the file is not a project |",
+        "",
+        "Produced in a scratch directory `S`, with the output directory set to the "
+        "frames' parent so the recorded paths are relative:",
+        "",
+        "```",
+        "mkdir -p S/projects/frames && cp mantis-64/frames/*.tif S/projects/frames/",
+        "focusforge-cli stack S/projects/frames -o S/projects --algorithm laplacian",
+        "    # S/projects/frames.ffp -> projects/valid.ffp",
+        "# swap 01.tif and 02.tif in S/projects/frames, then the same stack command",
+        "    # -> projects/mismatch.ffp",
+        "mkdir -p S/projects/gone && cp mantis-64/frames/*.tif S/projects/gone/",
+        "focusforge-cli stack S/projects/gone -o S/projects --algorithm laplacian",
+        "    # S/projects/gone.ffp -> projects/missing.ffp; gone/ is not kept",
+        "printf 'not a project\\n' > projects/corrupt.ffp",
+        "```",
+        "",
+        "Then `tools/make-fixtures.sh --manifest-only` lists the files. `frames/` "
+        "holds only the three `.tif` files: the stack command writes its report "
+        "beside the frames it reads, so it is never run over `projects/frames/`.",
         "",
         f"With one deliberate exception: `mantis-64/{MM_VARIANT_NAME}` is the "
         f"reference crop left in `{REFERENCE_NAME}`'s own layout (big-endian "
@@ -336,12 +407,14 @@ def _compressed_readme(fset: CompressedFixtureSet) -> str:
                 "Re-encoding of `mantis-64`: `frames/00.tif`, `frames/01.tif`, and "
                 "`frames/02.tif` map directly to the same source files; `reference.tif` maps "
                 "to `mantis-64/reference.tif`."
+                + (" Samples are the high byte of each 16-bit source sample." if fset.bits == 8 else "")
             ),
             "",
             (
                 f"TIFF Compression tag: **{fset.compression}** ({fset.codec}). Predictor: "
                 f"**{fset.predictor}**. Byte order: **{fset.byte_order}**. Layout: "
                 f"**{fset.layout}**."
+                + (f" Bit depth: **{fset.bits}**." if fset.bits != 16 else "")
             ),
             "",
             layout,
@@ -376,6 +449,7 @@ def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
                 compression=fset.compression,
                 predictor=fset.predictor,
                 tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+                bits=fset.bits,
             )
             produced.append(rel)
         rel = f"{fset.name}/reference.tif"
@@ -389,11 +463,90 @@ def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
             compression=fset.compression,
             predictor=fset.predictor,
             tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+            bits=fset.bits,
         )
         produced.append(rel)
         rel = f"{fset.name}/README.md"
         with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
             fh.write(_compressed_readme(fset))
+        produced.append(rel)
+    return produced
+
+
+def _folder_set_files() -> dict:
+    """Relative path -> source frame index (None for a text file), per folder set."""
+    files = {}
+    for sub in ("a", "b"):
+        for index in range(FOLDER_SET_FRAMES):
+            files[f"open-two-stacks/{sub}/{index:02d}.tif"] = index
+    for index in range(FOLDER_SET_FRAMES):
+        files[f"open-root-and-subfolder/{index:02d}.tif"] = index
+        files[f"open-rejected/frames/{index:02d}.tif"] = index
+    return files
+
+
+def _folder_set_readme(name: str) -> str:
+    if name == "open-two-stacks":
+        body = (
+            "Two folders, `a/` and `b/`, each holding the three frames of `mantis-64` "
+            "as `00.tif` to `02.tif`; the root holds no frames. Opening the root asks "
+            "whether the six frames are one project or two."
+        )
+    elif name == "open-root-and-subfolder":
+        body = (
+            "The three frames of `mantis-64` as `00.tif` to `02.tif` in the root, plus "
+            "`notes/readme.txt`, a subfolder with no frames. Opening the root gives one "
+            "stack and skips `notes/`."
+        )
+    else:
+        body = (
+            "`frames/00.tif` and `frames/01.tif` are the first two frames of `mantis-64`. "
+            "`frames/02.tif` is the third frame cut in half inside its strip data: the "
+            "header and thumbnail path read, the pixel data does not. Opening the folder "
+            "succeeds and fusing it fails."
+        )
+    return f"# Fixture set `{name}`\n\n{body}\n"
+
+
+def _generate_folder_sets(source_fixtures: str, out_dir: str) -> list:
+    source_frames = os.path.join(source_fixtures, "mantis-64", "frames")
+    missing = [
+        path
+        for path in (os.path.join(source_frames, f"{i:02d}.tif") for i in range(FOLDER_SET_FRAMES))
+        if not os.path.isfile(path)
+    ]
+    if missing:
+        raise FixtureError("folder fixtures need committed mantis-64 files: " + ", ".join(missing))
+
+    produced = []
+    for rel, index in _folder_set_files().items():
+        source = os.path.join(source_frames, f"{index:02d}.tif")
+        dest = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(source, dest)
+        produced.append(rel)
+
+    rejected = os.path.join(out_dir, "open-rejected", "frames", f"{FOLDER_SET_FRAMES - 1:02d}.tif")
+    info = rawtiff.read_info(rejected)
+    with open(rejected, "rb") as fh:
+        ifd_offset = int.from_bytes(fh.read(8)[4:8], "little" if info.byte_order == "II" else "big")
+    first_strip = min(info.strip_offsets)
+    cut = (first_strip + info.file_size) // 2
+    if not ifd_offset < first_strip < cut:
+        raise FixtureError(f"{rejected}: no strip data to cut inside")
+    with open(rejected, "r+b") as fh:
+        fh.truncate(cut)
+
+    skipped_dir_file = os.path.join(out_dir, "open-root-and-subfolder", "notes", "readme.txt")
+    os.makedirs(os.path.dirname(skipped_dir_file), exist_ok=True)
+    with open(skipped_dir_file, "w", encoding="utf-8") as fh:
+        fh.write("Not a frame: a folder with no TIFF images.\n")
+    produced.append("open-root-and-subfolder/notes/readme.txt")
+
+    for name in FOLDER_SET_NAMES:
+        rel = f"{name}/README.md"
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+            fh.write(_folder_set_readme(name))
         produced.append(rel)
     return produced
 
@@ -462,6 +615,7 @@ def generate(stack_dir: str, out_dir: str, date: str) -> list:
         produced.append(rel)
 
     produced += _generate_compressed(out_dir, out_dir)
+    produced += _generate_folder_sets(out_dir, out_dir)
 
     rel = "README.md"
     with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
@@ -477,6 +631,7 @@ def generate_compressed(source_fixtures: str, out_dir: str, date: str) -> list:
     """Write compressed mantis-64 variants from committed source fixtures."""
     os.makedirs(out_dir, exist_ok=True)
     produced = _generate_compressed(source_fixtures, out_dir)
+    produced += _generate_folder_sets(source_fixtures, out_dir)
     frame_names = ["00.tif", "01.tif", "02.tif"]
     with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as fh:
         fh.write(_root_readme(source_fixtures, frame_names, date))
@@ -545,8 +700,14 @@ def _check_generated(produced: list, out_dir: str, tmp: str) -> list:
     return differences
 
 
-def _find_orphans(out_dir: str, expected: set, fixture_sets: tuple) -> list:
+def _find_orphans(out_dir: str, expected: set, fixture_sets: tuple, folder_sets: tuple = ()) -> list:
     differences = []
+    for name in folder_sets:
+        for root, _dirs, files in os.walk(os.path.join(out_dir, name)):
+            for file in sorted(files):
+                rel = os.path.relpath(os.path.join(root, file), out_dir).replace(os.sep, "/")
+                if rel not in expected:
+                    differences.append(f"orphan: {rel} is not produced by the generator")
     for fset in fixture_sets:
         frames_dir = os.path.join(out_dir, fset.name, "frames")
         if not os.path.isdir(frames_dir):
@@ -566,7 +727,7 @@ def check(stack_dir: str, out_dir: str) -> int:
     with tempfile.TemporaryDirectory(prefix="focusforge-fixtures-") as tmp:
         produced = generate(stack_dir, tmp, date="<date>")
         differences = _check_generated(produced, out_dir, tmp)
-        differences += _find_orphans(out_dir, set(produced), (*SETS, *COMPRESSED_SETS))
+        differences += _find_orphans(out_dir, set(produced), (*SETS, *COMPRESSED_SETS), FOLDER_SET_NAMES)
 
     if differences:
         print(f"FAIL: {out_dir} does not match the generator")
@@ -585,7 +746,7 @@ def check_compressed(source_fixtures: str, out_dir: str) -> int:
         shutil.copytree(source_fixtures, tmp, dirs_exist_ok=True)
         produced = generate_compressed(source_fixtures, tmp, date="<date>")
         differences = _check_generated(produced, out_dir, tmp)
-        differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS)
+        differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS, FOLDER_SET_NAMES)
     if differences:
         print(f"FAIL: {out_dir} compressed fixtures do not match the generator")
         for line in differences:

@@ -22,12 +22,16 @@ pub const ROW_HEIGHT: f32 = 26.0;
 /// *is* that position.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageRow {
+    /// Stable source identity for background preview lookup.
+    pub path: PathBuf,
     pub chip: [u8; 3],
     pub name: String,
     /// The recorded capture time in stacking mode, or the row's 1-based
     /// position in legend mode -- verbatim, or empty when a capture time is
     /// absent or the source is unresolved.
     pub trailing_text: String,
+    /// The complete recorded capture timestamp, or empty when unavailable.
+    pub capture_stamp: String,
     pub excluded: bool,
     /// The recorded source is no longer a file on disk.
     pub unresolved: bool,
@@ -87,11 +91,16 @@ fn build_rows(
         .map(|(i, path)| {
             let resolved = meta.get(path).filter(|m| !m.unresolved);
             ImageRow {
+                path: path.clone(),
                 chip: source_color(i as u16, total),
                 name: file_name(path),
                 trailing_text: resolved
                     .and_then(|m| m.time.as_ref())
                     .map(|t| time_of_day(&t.text))
+                    .unwrap_or_default(),
+                capture_stamp: resolved
+                    .and_then(|m| m.time.as_ref())
+                    .map(|t| t.text.clone())
                     .unwrap_or_default(),
                 excluded: excluded.get(i).copied().unwrap_or(false),
                 unresolved: resolved.is_none(),
@@ -117,9 +126,11 @@ fn build_legend_rows(
         .iter()
         .enumerate()
         .map(|(i, path)| ImageRow {
+            path: path.clone(),
             chip: table[i],
             name: file_name(path),
             trailing_text: (i + 1).to_string(),
+            capture_stamp: String::new(),
             excluded: false,
             unresolved: meta.get(path).is_none_or(|m| m.unresolved),
             selected: selected == Some(i),

@@ -78,8 +78,27 @@ pub struct JobControl {
     /// The frame count a computed align stage started with; `0` until
     /// [`Self::begin_align`] is called.
     align_total: AtomicUsize,
+    /// Offset from [`Self::epoch`] at which the align stage began (or last
+    /// restarted); like prepare, align runs before the running clock ticks.
+    align_start_nanos: AtomicU64,
+    /// Nanoseconds the align stage spent held by a pause since its start;
+    /// kept out of the align ETA's rate.
+    align_paused_nanos: AtomicU64,
+    /// How many frames' equalization histogram is complete during the
+    /// prepare stage -- shared through [`Self::begin_prepare`].
+    prepare_done: Arc<AtomicUsize>,
+    /// The frame count the prepare stage started with; `0` until
+    /// [`Self::begin_prepare`] is called.
+    prepare_total: AtomicUsize,
+    /// Offset from [`Self::epoch`] at which the prepare stage began; the
+    /// running clock does not tick before fuse, so the prepare ETA needs its
+    /// own origin.
+    prepare_start_nanos: AtomicU64,
     /// The live admission cap; [`NO_CAP`] when none is set.
     admission_cap: AtomicUsize,
+    /// Nanoseconds of running time every fuse-stage admission check waits
+    /// for; `0` means none.
+    min_running_nanos: AtomicU64,
 }
 
 impl JobControl {
@@ -101,7 +120,13 @@ impl JobControl {
             segment_start_nanos: AtomicU64::new(NO_SEGMENT),
             align_done: Arc::new(AtomicUsize::new(0)),
             align_total: AtomicUsize::new(0),
+            align_start_nanos: AtomicU64::new(0),
+            align_paused_nanos: AtomicU64::new(0),
+            prepare_done: Arc::new(AtomicUsize::new(0)),
+            prepare_total: AtomicUsize::new(0),
+            prepare_start_nanos: AtomicU64::new(0),
             admission_cap: AtomicUsize::new(NO_CAP),
+            min_running_nanos: AtomicU64::new(0),
         })
     }
 
@@ -112,6 +137,15 @@ impl JobControl {
     pub fn set_admission_cap(&self, cap: Option<usize>) {
         self.admission_cap
             .store(cap.map_or(NO_CAP, |c| c.max(1)), Ordering::SeqCst);
+    }
+
+    /// Holds the fuse stage until this job's running time (pauses excluded)
+    /// reaches `floor`: [`TileControl::should_stop`] waits in short slices
+    /// while the job is running and below it, and returns at once on a
+    /// pause or cancel. The output is unchanged. `Duration::ZERO` lifts it.
+    pub fn set_min_running(&self, floor: Duration) {
+        let nanos = u64::try_from(floor.as_nanos()).unwrap_or(u64::MAX);
+        self.min_running_nanos.store(nanos, Ordering::SeqCst);
     }
 
     /// The live admission cap; `usize::MAX` when none is set.
@@ -168,12 +202,41 @@ impl JobControl {
         self.stage.store(stage.to_u8(), Ordering::SeqCst);
     }
 
-    /// Starts a computed align stage: stores `frames` as its total and hands
-    /// back the shared counter the alignment driver credits as each frame's
-    /// registration completes.
+    /// Starts a computed align stage: stores `frames` as its total, restarts
+    /// the counter and clock, and hands back the shared counter the
+    /// alignment driver credits as each frame's registration completes.
     pub(crate) fn begin_align(&self, frames: usize) -> Arc<AtomicUsize> {
         self.align_total.store(frames, Ordering::SeqCst);
+        self.restart_align();
         Arc::clone(&self.align_done)
+    }
+
+    /// Zeroes the align counter and the paused total and stamps the stage's
+    /// start, so the align ETA measures only what follows; used when the
+    /// whole stage reruns.
+    pub(crate) fn restart_align(&self) {
+        self.align_done.store(0, Ordering::SeqCst);
+        self.align_paused_nanos.store(0, Ordering::SeqCst);
+        self.align_start_nanos
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::SeqCst);
+    }
+
+    /// Records time the align stage spent held by a pause, so the align ETA
+    /// does not count it.
+    pub(crate) fn add_align_hold(&self, held: Duration) {
+        let nanos = u64::try_from(held.as_nanos()).unwrap_or(u64::MAX);
+        self.align_paused_nanos.fetch_add(nanos, Ordering::SeqCst);
+    }
+
+    /// Starts the prepare stage: stores `frames` as its total, zeroes the
+    /// counter, stamps the stage's start and hands back the shared counter
+    /// the equalization credits as each frame's histogram completes.
+    pub(crate) fn begin_prepare(&self, frames: usize) -> Arc<AtomicUsize> {
+        self.prepare_done.store(0, Ordering::SeqCst);
+        self.prepare_total.store(frames, Ordering::SeqCst);
+        self.prepare_start_nanos
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::SeqCst);
+        Arc::clone(&self.prepare_done)
     }
 
     /// A plain snapshot, returned by value -- polled, never pushed.
@@ -183,22 +246,59 @@ impl JobControl {
     /// adds the executing segment's elapsed time to the accumulated total,
     /// so a caller polling from another thread watches the counters climb
     /// during the run rather than seeing them jump at the end of it.
+    ///
+    /// `eta` follows the stage: the per-frame rate (pauses excluded) during
+    /// Prepare and a computed Align, `None` once every align frame is done,
+    /// and the pixel rate otherwise.
     pub fn progress(&self) -> JobProgress {
         let units_done = self.units_done.load(Ordering::SeqCst);
         let unit_total = self.unit_total.load(Ordering::SeqCst);
         let pixels_done = self.pixels_done.load(Ordering::SeqCst);
         let pixel_total = self.pixel_total.load(Ordering::SeqCst);
         let running = self.running_now();
+        let stage = JobStage::from_u8(self.stage.load(Ordering::SeqCst));
+        let prepare_done = self.prepare_done.load(Ordering::SeqCst);
+        let prepare_total = self.prepare_total.load(Ordering::SeqCst);
+        let align_done = self.align_done.load(Ordering::SeqCst);
+        let align_total = self.align_total.load(Ordering::SeqCst);
+        let eta = if stage == JobStage::Align {
+            // Once every frame is done the stage has nothing left to
+            // estimate: `None`, never a zero.
+            if align_done < align_total {
+                let started = self.align_start_nanos.load(Ordering::SeqCst);
+                let paused = self.align_paused_nanos.load(Ordering::SeqCst);
+                let elapsed = self.epoch.elapsed().as_nanos() as u64;
+                eta(
+                    align_done as u64,
+                    align_total as u64,
+                    Duration::from_nanos(elapsed.saturating_sub(started).saturating_sub(paused)),
+                )
+            } else {
+                None
+            }
+        } else if stage == JobStage::Prepare {
+            let started = self.prepare_start_nanos.load(Ordering::SeqCst);
+            let elapsed = self.epoch.elapsed().as_nanos() as u64;
+            eta(
+                prepare_done as u64,
+                prepare_total as u64,
+                Duration::from_nanos(elapsed.saturating_sub(started)),
+            )
+        } else {
+            eta(pixels_done, pixel_total, running)
+        };
         JobProgress {
-            stage: JobStage::from_u8(self.stage.load(Ordering::SeqCst)),
+            stage,
             units_done,
             unit_total,
             pixels_done,
             pixel_total,
             running,
-            eta: eta(pixels_done, pixel_total, running),
-            align_done: self.align_done.load(Ordering::SeqCst),
-            align_total: self.align_total.load(Ordering::SeqCst),
+            eta,
+            align_done,
+            align_total,
+            prepare_done,
+            prepare_total,
         }
     }
 
@@ -258,7 +358,18 @@ impl JobControl {
 
 impl TileControl for JobControl {
     fn should_stop(&self) -> bool {
-        self.state() != ControlState::Running
+        const SLICE: Duration = Duration::from_millis(50);
+        let floor = Duration::from_nanos(self.min_running_nanos.load(Ordering::SeqCst));
+        loop {
+            if self.state() != ControlState::Running {
+                return true;
+            }
+            let short = floor.saturating_sub(self.running_now());
+            if short.is_zero() {
+                return false;
+            }
+            std::thread::sleep(short.min(SLICE));
+        }
     }
 
     /// Credits one finished unit, from the rayon worker that finished it.
@@ -401,6 +512,124 @@ mod tests {
     }
 
     #[test]
+    fn prepare_eta_follows_the_frame_rate() {
+        let control = JobControl::new();
+        assert_eq!(control.progress().prepare_total, 0);
+
+        let counter = control.begin_prepare(4);
+        control.set_stage(JobStage::Prepare);
+        let p = control.progress();
+        assert_eq!((p.prepare_done, p.prepare_total), (0, 4));
+        assert_eq!(p.eta, None, "no frame has completed");
+
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let p = control.progress();
+        assert_eq!(p.prepare_done, 1);
+        assert!(p.eta.is_some_and(|d| d > Duration::ZERO), "{:?}", p.eta);
+
+        control.set_stage(JobStage::Fuse);
+        assert_eq!(
+            control.progress().eta,
+            None,
+            "outside Prepare the ETA is the pixel one"
+        );
+    }
+
+    #[test]
+    fn align_eta_follows_the_frame_rate() {
+        let control = JobControl::new();
+        control.begin_align(3).fetch_add(3, Ordering::SeqCst);
+        let counter = control.begin_align(4);
+        control.set_stage(JobStage::Align);
+        let p = control.progress();
+        assert_eq!((p.align_done, p.align_total), (0, 4));
+        assert_eq!(p.eta, None, "no frame has completed");
+
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let p = control.progress();
+        assert!(p.eta.is_some_and(|d| d > Duration::ZERO), "{:?}", p.eta);
+    }
+
+    #[test]
+    fn align_eta_excludes_a_pause() {
+        let control = JobControl::new();
+        let counter = control.begin_align(4);
+        control.set_stage(JobStage::Align);
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let span = Instant::now();
+        let before = control.progress().eta.expect("one frame is done");
+
+        let held = Instant::now();
+        std::thread::sleep(Duration::from_millis(50));
+        let hold = held.elapsed();
+        control.add_align_hold(hold);
+        let after = control.progress().eta.expect("one frame is done");
+        let span = span.elapsed();
+        // With one of four frames done the ETA is three times the counted
+        // time, and between the two reads at most `span - hold` of it was
+        // not held. A clock that ignored the hold grows by at least
+        // `3 * hold` instead, however long the sleep overran.
+        let unheld = span.saturating_sub(hold);
+        assert!(
+            after <= before + unheld * 3 + Duration::from_micros(1),
+            "{after:?} vs {before:?}, hold {hold:?}, span {span:?}"
+        );
+    }
+
+    #[test]
+    fn align_eta_is_none_when_every_frame_is_done() {
+        let control = JobControl::new();
+        let counter = control.begin_align(4);
+        control.set_stage(JobStage::Align);
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(4, Ordering::SeqCst);
+        assert_eq!(control.progress().eta, None);
+    }
+
+    #[test]
+    fn align_eta_restarts_with_the_counter() {
+        let control = JobControl::new();
+        let counter = control.begin_align(4);
+        control.set_stage(JobStage::Align);
+        std::thread::sleep(Duration::from_millis(100));
+        control.add_align_hold(Duration::from_millis(30));
+        counter.fetch_add(2, Ordering::SeqCst);
+        assert!(control.progress().eta.is_some());
+
+        let before_restart = Instant::now();
+        control.restart_align();
+        let after_restart = Instant::now();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(control.progress().eta, None);
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let at_least = after_restart.elapsed();
+        let eta = control.progress().eta.expect("one frame is done");
+        let at_most = before_restart.elapsed();
+        // With one of four frames done the ETA is three times the time
+        // counted since the restart, which lies between the two bounds. A
+        // clock that kept the 100 ms lands above them; one that still
+        // subtracted the 30 ms hold lands below them, or gives no ETA.
+        let slack = Duration::from_micros(1);
+        assert!(
+            eta + slack >= at_least * 3 && eta <= at_most * 3 + slack,
+            "{eta:?} outside 3 * [{at_least:?}, {at_most:?}]"
+        );
+    }
+
+    #[test]
+    fn begin_prepare_restarts_the_counter() {
+        let control = JobControl::new();
+        control.begin_prepare(3).fetch_add(3, Ordering::SeqCst);
+        let counter = control.begin_prepare(5);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(control.progress().prepare_total, 5);
+    }
+
+    #[test]
     fn unit_completed_credits_one_unit_and_its_pixels_immediately() {
         let control = JobControl::new();
         control.set_unit_total(4);
@@ -440,6 +669,78 @@ mod tests {
             control.progress().running,
             frozen,
             "a closed segment's clock must not keep running -- that is the time spent paused"
+        );
+    }
+
+    #[test]
+    fn a_running_floor_holds_should_stop_until_the_segment_has_run_that_long() {
+        for floor_ms in [100u64, 300] {
+            let control = JobControl::new();
+            control.set_min_running(Duration::from_millis(floor_ms));
+            control.begin_segment();
+            let started = Instant::now();
+            assert!(!control.should_stop());
+            let held = started.elapsed();
+            assert!(
+                held >= Duration::from_millis(floor_ms),
+                "floor {floor_ms} ms released after {held:?}"
+            );
+            assert!(
+                held < Duration::from_millis(floor_ms + 200),
+                "floor {floor_ms} ms held for {held:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pause_and_cancel_end_a_floor_hold_promptly() {
+        for cancel in [false, true] {
+            let control = JobControl::new();
+            control.set_min_running(Duration::from_secs(30));
+            control.begin_segment();
+            let held = Arc::clone(&control);
+            let waiter = std::thread::spawn(move || {
+                let started = Instant::now();
+                (held.should_stop(), started.elapsed())
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            let signalled = Instant::now();
+            if cancel {
+                control.cancel();
+            } else {
+                control.pause();
+            }
+            let (stopped, _) = waiter.join().unwrap();
+            let lag = signalled.elapsed();
+            assert!(stopped, "a pause or cancel must make should_stop true");
+            assert!(lag < Duration::from_secs(1), "released after {lag:?}");
+        }
+    }
+
+    #[test]
+    fn a_floor_counts_running_time_only_not_the_time_between_segments() {
+        let control = JobControl::new();
+        let floor = Duration::from_millis(150);
+        control.set_min_running(floor);
+        control.begin_segment();
+        std::thread::sleep(Duration::from_millis(20));
+        control.end_segment();
+        // A sleep can overrun on a loaded host; the figure the floor still
+        // owes is what the control itself measured.
+        let ran = control.running_now();
+        if ran >= floor {
+            eprintln!("the first segment overran the floor ({ran:?}); nothing left to observe");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        control.begin_segment();
+        let started = Instant::now();
+        assert!(!control.should_stop());
+        let held = started.elapsed();
+        let owed = floor - ran;
+        assert!(
+            held >= owed.saturating_sub(Duration::from_millis(20)),
+            "the paused gap counted toward the floor: held {held:?}, owed {owed:?}"
         );
     }
 

@@ -79,7 +79,8 @@ fn write_report(
     let report = serde_json::json!({
         "timestamp": rfc3339(seconds),
         "payload": crate::panic_payload(info.payload()),
-        "file": location.map(|l| l.file()),
+        // `file!()` carries the build host's separators; a report reads the same everywhere.
+        "file": location.map(|l| l.file().replace('\\', "/")),
         "line": location.map(|l| l.line()),
         "column": location.map(|l| l.column()),
         "thread": std::thread::current().name().unwrap_or("unnamed"),

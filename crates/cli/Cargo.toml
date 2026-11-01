@@ -31,6 +31,9 @@ toml = "1"
 tracing = "0.1.44"
 
 [dev-dependencies]
+clap_complete = "=4.6.11"
+jpeg-encoder = "0.7.1"
+clap_mangen = "=0.3.3"
 focusforge-core = { path = "../core", features = ["test-algorithms"] }
 tempfile = "3"
 # An independent TIFF reader for `export_formats.rs`'s 8-bit round trip:
@@ -41,4 +44,4 @@ tiff = { version = "0.11.3", default-features = false, features = ["lzw", "defla
 zune-jpeg = "0.5.15"
 # Reading a written bundle back, with the same pinned feature set the
 # writer uses.
-zip = { version = "8.6.0", default-features = false }
+zip = { version = "9.0.4", default-features = false }

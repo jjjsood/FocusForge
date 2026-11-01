@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // stores on a project tab and passes to a mutator -- `ParamDesc`'s own
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
+use focusforge_core::equalize::EqualizeSettings;
 use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, resolve_in};
 pub(crate) use focusforge_core::params::{
     ParamValue, ParamValues, ParamViolation, StackContext, validate,
@@ -73,7 +74,7 @@ pub(crate) fn seed_algorithm_state(
             }
             let equalization = manifest.registration.equalization.as_ref();
             let equalized_by_default =
-                equalization_bound(&manifest.algorithm, &ParamValues::new()).is_some();
+                equalization_settings(&manifest.algorithm, &ParamValues::new()).is_some();
             if equalization.is_some() != equalized_by_default {
                 project_values.insert(
                     "equalize".to_string(),
@@ -84,6 +85,10 @@ pub(crate) fn seed_algorithm_state(
                 project_values.insert(
                     "equalize-max-gain".to_string(),
                     ParamValue::Float(equalization.max_gain),
+                );
+                project_values.insert(
+                    "equalize-target".to_string(),
+                    ParamValue::Float(equalization.target_stops),
                 );
             }
             (
@@ -121,10 +126,13 @@ fn project_schema(group: &[ParamDesc], fuse_id: &str) -> Vec<ParamDesc> {
     )
 }
 
-/// The gain bound a run fused by `fuse_id` equalizes with, `None` while the
+/// The settings a run fused by `fuse_id` equalizes with, `None` while the
 /// `equalize` switch is off.
-pub(crate) fn equalization_bound(fuse_id: &str, project_values: &ParamValues) -> Option<f64> {
-    focusforge_core::project::equalization_bound(
+pub(crate) fn equalization_settings(
+    fuse_id: &str,
+    project_values: &ParamValues,
+) -> Option<EqualizeSettings> {
+    focusforge_core::project::equalization_settings(
         &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
         project_values,
     )
@@ -422,20 +430,85 @@ pub fn slider_value(fraction: f32, kind: &ParamKind) -> ParamValue {
     if let &ParamKind::Float {
         min,
         max,
+        step,
         logarithmic,
-        ..
     } = kind
     {
         if logarithmic && min > 0.0 {
             return ParamValue::Float((min.ln() + fraction * (max.ln() - min.ln())).exp());
         }
-        return ParamValue::Float(min + fraction * (max - min));
+        let raw = min + fraction * (max - min);
+        return ParamValue::Float(snap_to_step(raw, min, max, step));
     }
     if let &ParamKind::Int { min, max } = kind {
         let v = min as f64 + fraction * (max as f64 - min as f64);
         return ParamValue::Int(v.round() as i64);
     }
     ParamValue::Float(fraction)
+}
+
+/// The value one Left (`direction < 0`) or Right (`> 0`) key press moves a
+/// slider to: a linear `Float` by its declared step (snapped), an `Int` by
+/// one, both clamped to the bounds. `None` for a logarithmic `Float`, whose
+/// one declared step is invisible on its scale, and for every other kind.
+pub fn stepped_value(current: f64, direction: i32, kind: &ParamKind) -> Option<ParamValue> {
+    let direction = f64::from(direction.signum());
+    if let &ParamKind::Float {
+        min,
+        max,
+        step,
+        logarithmic: false,
+    } = kind
+    {
+        let moved = snap_to_step(current, min, max, step) + direction * step;
+        return Some(ParamValue::Float(snap_to_step(moved, min, max, step)));
+    }
+    if let &ParamKind::Int { min, max } = kind {
+        let moved = (current + direction).round() as i64;
+        return Some(ParamValue::Int(moved.clamp(min, max)));
+    }
+    None
+}
+
+/// Decimal places in `step`'s own written form (`0.1` -> 1, `0.01` -> 2).
+fn step_decimals(step: f64) -> usize {
+    format!("{step}")
+        .split_once('.')
+        .map_or(0, |(_, f)| f.len())
+}
+
+/// `value` on the grid `min + k * step`, rounded to the step's decimals (no
+/// float residue) and clamped to `[min, max]`. A non-positive step leaves
+/// `value` as it is, clamped.
+fn snap_to_step(value: f64, min: f64, max: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return value.clamp(min, max);
+    }
+    let on_grid = min + ((value - min) / step).round() * step;
+    let scale = 10f64.powi(step_decimals(step) as i32);
+    // `+ 0.0` turns a rounded `-0.0` into `0.0`.
+    ((on_grid * scale).round() / scale).clamp(min, max) + 0.0
+}
+
+/// A linear `Float` slider's readout. A range that dips below zero reads
+/// signed: step decimals, an explicit `+`, U+2212 for negatives, `0.0` at
+/// zero. Every other range keeps the plain number.
+fn float_text(value: f64, kind: &ParamKind) -> String {
+    let &ParamKind::Float { min, step, .. } = kind else {
+        return format!("{value}");
+    };
+    if min >= 0.0 {
+        return format!("{value}");
+    }
+    let decimals = step_decimals(step);
+    let text = format!("{:.decimals$}", value.abs());
+    if text.chars().all(|c| matches!(c, '0' | '.')) {
+        text
+    } else if value < 0.0 {
+        format!("\u{2212}{text}")
+    } else {
+        format!("+{text}")
+    }
 }
 
 /// A [`ParamViolation`]'s message with its leading `<id>: ` dropped, so a
@@ -580,12 +653,24 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         &section_ctx,
         None,
     );
+    // Every row after the `equalize` switch greys while it is off; the
+    // stored values stay.
+    let equalize_on = project_flag(project_values, "equalize");
+    for row in rows
+        .iter_mut()
+        .skip_while(|r| r.id != "equalize")
+        .skip(1)
+        .take_while(|r| r.kind != RowKind::MoreEnd)
+    {
+        row.disabled = !equalize_on;
+    }
 
     if let Ok(fuse) = registry::find_stack(fuse_id) {
         let mut methods = registry::stack_algorithms();
         methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
         let picker = methods
             .iter()
+            .filter(|a| !a.test_only())
             .map(|a| PickerOption {
                 id: a.id().to_string(),
                 label: a.display_name().to_string(),
@@ -597,12 +682,13 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             fuse.params(),
             fuse_values,
             &section_ctx,
-            Some((fuse_id, picker)),
+            Some((fuse_id, fuse.display_name(), picker)),
         ));
     }
     if let Ok(align) = registry::find_align(align_id) {
         let picker = registry::align_algorithms()
             .iter()
+            .filter(|a| !a.test_only())
             .map(|a| PickerOption {
                 id: a.id().to_string(),
                 label: a.display_name().to_string(),
@@ -614,12 +700,12 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             align.params(),
             align_values,
             &section_ctx,
-            Some((align_id, picker)),
+            Some((align_id, align.display_name(), picker)),
         );
         // The on/off switch is the project-level `align` value, written to
         // the project map, and is the section's first row after its heading;
         // every row below it greys while the switch is off. The heading's
-        // provenance reads the algorithm's own values only.
+        // provenance reads the algorithm's own values and the switch.
         let align_on = project_flag(project_values, "align");
         for row in align_rows.iter_mut().skip(1) {
             row.disabled = !align_on;
@@ -630,6 +716,9 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             field_row(ALIGN_SWITCH_SECTION, desc, value, false)
         });
         align_rows.splice(1..1, switch_rows);
+        if project_values.contains_key("align") {
+            align_rows[0].heading_state = HeadingState::Explicit;
+        }
         rows.extend(align_rows);
     }
     rows.extend(section_rows(
@@ -666,7 +755,7 @@ fn section_rows(
     schema: &[ParamDesc],
     values: &ParamValues,
     section_ctx: &SectionContext<'_>,
-    picker: Option<(&str, Vec<PickerOption>)>,
+    picker: Option<(&str, &str, Vec<PickerOption>)>,
 ) -> Vec<SettingsRow> {
     let SectionContext {
         ctx,
@@ -694,18 +783,13 @@ fn section_rows(
 
     let mut rows = vec![SettingsRow::heading(section, heading_label, heading_state)];
 
-    if let Some((selected_id, options)) = picker {
+    if let Some((selected_id, selected_label, options)) = picker {
         let key = menu_key(section, "algorithm");
-        let value_text = options
-            .iter()
-            .find(|o| o.id == selected_id)
-            .map(|o| o.label.clone())
-            .unwrap_or_default();
         let (choice_ids, choices): (Vec<String>, Vec<String>) =
             options.into_iter().map(|o| (o.id, o.label)).unzip();
         rows.push(SettingsRow {
             label: "Algorithm".to_string(),
-            value_text,
+            value_text: selected_label.to_string(),
             choices,
             choice_ids,
             selected: selected_id.to_string(),
@@ -785,7 +869,7 @@ pub(crate) fn field_row(
     match kind {
         RowKind::LinearFloat | RowKind::LogFloat => {
             let v = value.as_f64().unwrap_or_default();
-            row.value_text = format!("{v}");
+            row.value_text = float_text(v, &desc.kind);
             row.fraction = slider_fraction(v, &desc.kind);
         }
         RowKind::Int => {
@@ -1004,6 +1088,58 @@ mod tests {
         let int_kind = ParamKind::Int { min: 0, max: 6 };
         assert_eq!(slider_value(1.0, &int_kind), ParamValue::Int(6));
         assert_eq!(slider_value(0.0, &int_kind), ParamValue::Int(0));
+
+        // A linear Float lands exactly on its step grid: no residue, ends
+        // reached, the fraction of a grid value round-trips to that value.
+        let target = ParamKind::Float {
+            min: -0.5,
+            max: 0.5,
+            step: 0.1,
+            logarithmic: false,
+        };
+        for (fraction, expected) in [(0.0, -0.5), (0.37, -0.1), (0.5, 0.0), (1.0, 0.5)] {
+            assert_eq!(slider_value(fraction, &target), ParamValue::Float(expected));
+        }
+        let gain = ParamKind::Float {
+            min: 1.01,
+            max: 2.0,
+            step: 0.01,
+            logarithmic: false,
+        };
+        assert_eq!(slider_value(0.37, &gain), ParamValue::Float(1.38));
+        for value in [-0.3, 0.0, 0.2] {
+            let round_trip = slider_value(slider_fraction(value, &target), &target);
+            assert_eq!(round_trip, ParamValue::Float(value));
+        }
+    }
+
+    #[test]
+    fn stepped_value_moves_linear_and_int_sliders_and_skips_log() {
+        let linear = ParamKind::Float {
+            min: -0.5,
+            max: 0.5,
+            step: 0.1,
+            logarithmic: false,
+        };
+        assert_eq!(stepped_value(0.2, 1, &linear), Some(ParamValue::Float(0.3)));
+        assert_eq!(
+            stepped_value(0.5, 1, &linear),
+            Some(ParamValue::Float(0.5)),
+            "clamped at the maximum"
+        );
+        assert_eq!(
+            stepped_value(-0.5, -1, &linear),
+            Some(ParamValue::Float(-0.5)),
+            "clamped at the minimum"
+        );
+
+        let int_kind = ParamKind::Int { min: 0, max: 6 };
+        assert_eq!(stepped_value(3.0, 1, &int_kind), Some(ParamValue::Int(4)));
+        assert_eq!(stepped_value(6.0, 1, &int_kind), Some(ParamValue::Int(6)));
+        assert_eq!(stepped_value(0.0, -1, &int_kind), Some(ParamValue::Int(0)));
+
+        assert_eq!(stepped_value(1e-4, 1, &float_desc(1e-9, 1.0, true)), None);
+        assert_eq!(stepped_value(1.0, 1, &ParamKind::Bool), None);
     }
 
     #[test]

@@ -56,6 +56,7 @@ export component FFPerformanceTab inherits Rectangle {
                 align-end: true;
 
                 FFToggle {
+                    name: "GPU processing";
                     on: root.performance.gpu;
                     disabled: !root.performance.gpu-enabled;
                     toggled => { root.gpu-toggled(!root.performance.gpu); }

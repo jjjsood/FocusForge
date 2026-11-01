@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/check-all.sh [--static|--quick] [--verbose] [--tail N] [--log-dir DIR]
 #
 # Every gate this repository has, in one command, with a pass/fail summary at
-# the end. There is no hosted CI and no remote, so this script *is* the build:
-# what it reports is the whole of what is enforced.
+# the end. This script is the canonical build gate: local runs remain required
+# for acceptance and merges, while hosted CI calls this same command for
+# additional native-platform evidence.
 #
 #   --static     only the fast, read-only checks -- no builds, no test suites.
 #                This is the set .githooks/pre-commit runs, so running it by
@@ -70,7 +72,23 @@ RUNLOG_VERBOSE="$VERBOSE"
 RUNLOG_TAIL="$TAIL_LINES"
 # shellcheck source=lib/run-logged.sh
 . "$REPO/tools/lib/run-logged.sh"
-runlog_init run
+runlog_init run || exit $?
+
+# A hosted runner that is lost takes its step logs with it. With FF_GATE_HEARTBEAT=<seconds> a
+# resource line is printed on that interval, and the streamed job log keeps the last ones.
+if [ -n "${FF_GATE_HEARTBEAT:-}" ]; then
+  (
+    while sleep "$FF_GATE_HEARTBEAT"; do
+      echo "heartbeat $(date +%H:%M:%S)" \
+        "$(free -m 2>/dev/null | awk '/^Mem/ {print "mem_used_mb=" $3 " mem_avail_mb=" $7}')" \
+        "$(df -Pm "$REPO" | awk 'NR==2 {print "disk_avail_mb=" $4}')" \
+        "target_mb=$(du -sm "$REPO/target" 2>/dev/null | cut -f1)" \
+        "top_rss_kb=$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -1)"
+    done
+  ) &
+  heartbeat_pid=$!
+  trap 'kill "$heartbeat_pid" 2>/dev/null' EXIT
+fi
 
 # A failing gate must not stop the run: every gate reports, then the summary.
 run_gate() { run_logged "$@" || true; }
@@ -92,6 +110,14 @@ test_tmp_residue() {
 # --- static checks: seconds each, no side effects ---------------------------
 run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
+run_gate "source headers"   tools/check-headers.sh
+run_gate "source headers selftest" tools/check-headers-selftest.sh
+run_gate "NOTICE"           tools/with-lock.sh build -- tools/check-notice.sh
+run_gate "NOTICE selftest"  tools/check-notice-selftest.sh
+run_gate "logging selftest" tools/check-logging-selftest.sh
+run_gate "workflow selftest" python3 tools/check-workflow-selftest.py
+run_gate "release assets selftest" python3 tools/check-release-assets-selftest.py
+run_gate "release smoke selftest" tools/smoke-release-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 run_gate "fixture manifest selftest" tools/check-fixtures-selftest.sh
 run_gate "lock directory selftest" tools/with-lock-selftest.sh
@@ -150,7 +176,7 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   NEXTEST_PROFILE=default
   [ "$QUICK" -eq 1 ] && NEXTEST_PROFILE=quick
   run_gate "cargo nextest"  tools/with-lock.sh build -- \
-                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" TMPDIR="$TEST_TMP" \
+                              env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" TMPDIR="$TEST_TMP" TMP="$TEST_TMP" TEMP="$TEST_TMP" \
                               cargo nextest run --workspace --no-fail-fast \
                               --profile "$NEXTEST_PROFILE"
   run_gate "test tmp residue" test_tmp_residue "$TEST_TMP"

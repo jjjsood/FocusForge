@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
-use focusforge_core::equalize::GainReader;
+use focusforge_core::equalize::{EqualizeSettings, GainReader};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     COMPOSITE_FILENAME, FrameError, FrameReader, TiffStack, ZMAP_FILENAME, open_frame_set,
@@ -23,7 +23,8 @@ pub use focusforge_core::io::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_core::job::StageCache;
 use focusforge_core::params::ParamValues;
 use focusforge_core::pipeline::{
-    self, AlignRequest, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage, StageObserver,
+    self, AlignRequest, AlignSource, FuseOutput, FuseProduct, FuseReport, FuseRequest, RunStage,
+    StageObserver,
 };
 pub use focusforge_core::project::PendingState;
 pub use focusforge_core::project::export::{
@@ -87,21 +88,6 @@ impl From<&PipelineError> for FailedOperation {
     }
 }
 
-/// One failure's durable record: the complete text a toast never shows in
-/// full, plus the context to identify which project and (for a save) which
-/// target it belongs to. Appended, never edited or removed, so a later
-/// failure, a retry or a tab switch never drops what an earlier one
-/// recorded.
-#[derive(Debug, Clone)]
-pub struct Notification {
-    pub operation: FailedOperation,
-    pub message: String,
-    pub project_title: Option<String>,
-    pub project_path: Option<PathBuf>,
-    /// The save target, `None` for a run failure.
-    pub target: Option<PathBuf>,
-}
-
 /// The shell's own view of a fuse run -- the surface's six reachable
 /// states.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,8 +127,8 @@ pub struct JobRequest {
     pub align_values: ParamValues,
     pub align_lax: bool,
     pub crop: bool,
-    /// The gain bound brightness equalization runs with, `None` when off.
-    pub equalize: Option<f64>,
+    /// What brightness equalization runs with, `None` when off.
+    pub equalize: Option<EqualizeSettings>,
     /// Whether this run may use the headless GPU backend at all -- resolved
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
@@ -258,7 +244,20 @@ pub fn spawn(
     control: Arc<JobControl>,
     observer: Arc<GuiObserver>,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
+    spawn_after(request, algorithms, control, observer, || {})
+}
+
+/// [`spawn`] after a caller-owned background barrier. The barrier runs on
+/// this worker before backend probing and never blocks the UI thread.
+pub fn spawn_after(
+    request: JobRequest,
+    algorithms: Algorithms,
+    control: Arc<JobControl>,
+    observer: Arc<GuiObserver>,
+    before: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
     std::thread::spawn(move || {
+        before();
         let (backend, backend_line) =
             resolve_backend(&request.fuse_id, request.gpu, request.max_vram);
         tracing::info!("{backend_line}");
@@ -279,6 +278,65 @@ pub fn spawn(
             stage_cache.as_ref(),
         )
     })
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use std::sync::{Arc, mpsc};
+
+    use super::{GuiObserver, JobControl, JobRequest, PipelineError, resolve_request, spawn_after};
+
+    #[test]
+    fn spawn_after_keeps_backend_and_cache_work_behind_the_background_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch_root = directory.path().join("cache");
+        let request = JobRequest {
+            frames: Vec::new(),
+            hold_dir: directory.path().join("held"),
+            scratch_root: scratch_root.clone(),
+            staging_key: "source-previews".into(),
+            fuse_id: focusforge_core::registry::default_stack()
+                .unwrap()
+                .id()
+                .to_string(),
+            fuse_values: Default::default(),
+            align_id: None,
+            align_values: Default::default(),
+            align_lax: false,
+            crop: false,
+            equalize: None,
+            gpu: false,
+            max_host_memory: Some(1024 * 1024),
+            max_vram: None,
+        };
+        let algorithms = resolve_request(&request).unwrap();
+        let observer = Arc::new(GuiObserver::new());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let caller = std::thread::current().id();
+        let worker = spawn_after(
+            request,
+            algorithms,
+            JobControl::new(),
+            Arc::clone(&observer),
+            move || {
+                entered_tx.send(std::thread::current().id()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        );
+        let barrier_thread = entered_rx.recv().unwrap();
+        let backend_before_release = observer.backend_line();
+        let cache_before_release = scratch_root.exists();
+        release_tx.send(()).unwrap();
+        let result = worker.join().unwrap();
+
+        assert_ne!(barrier_thread, caller);
+        assert_eq!(backend_before_release, None);
+        assert!(!cache_before_release);
+        assert!(observer.backend_line().is_some());
+        assert!(scratch_root.exists());
+        assert!(matches!(result, Err(PipelineError::Input(_))));
+    }
 }
 
 /// Empties the stage cache under `scratch_root` and returns how many entries
@@ -357,8 +415,9 @@ pub struct GuiObserver {
     /// [`resolve_backend`]'s own account of this run's processing backend,
     /// set once from the worker thread before the pipeline starts.
     backend_line: Mutex<Option<String>>,
-    /// Every [`StageObserver::notice`] the run raised, in order.
-    notices: Mutex<Vec<String>>,
+    /// Every [`StageObserver::notice`] and [`StageObserver::frame_notice`]
+    /// the run raised, in order, with the frame index a frame notice names.
+    notices: Mutex<Vec<(Option<usize>, String)>>,
     /// Where the align backend names the adapter once a level opens it; unset
     /// for a run with no accelerator on offer.
     align_adapter: OnceLock<&'static OnceLock<String>>,
@@ -379,8 +438,26 @@ impl GuiObserver {
         }
     }
 
+    fn record_notice(&self, frame: Option<usize>, message: &str) {
+        tracing::warn!("{message}");
+        // The CPU rerun reaches the user through the alignment toast, so it
+        // stays out of the run's own notice list.
+        if let Some(reason) = message.strip_suffix(pipeline::ALIGN_RERUN_NOTICE) {
+            *self
+                .rerun_reason
+                .lock()
+                .expect("no thread panicked while holding the rerun lock") =
+                Some(reason.to_string());
+            return;
+        }
+        self.notices
+            .lock()
+            .expect("no thread panicked while holding the notices lock")
+            .push((frame, message.to_string()));
+    }
+
     /// The notices the pipeline raised so far, in order.
-    pub fn notices(&self) -> Vec<String> {
+    pub fn notices(&self) -> Vec<(Option<usize>, String)> {
         self.notices
             .lock()
             .expect("no thread panicked while holding the notices lock")
@@ -444,24 +521,40 @@ impl Default for GuiObserver {
 }
 
 impl StageObserver for GuiObserver {
-    fn stage(&self, _stage: RunStage) {}
+    fn stage(&self, stage: RunStage) {
+        // The first Prepare snapshot is recorded here, so the bar shows the
+        // frame total before the engine's first tick. A cached alignment
+        // never ticks, so its stage is recorded here too; a computed one
+        // ticks on its own, with a real total.
+        let snapshot = |stage, prepare_total| JobProgress {
+            stage,
+            units_done: 0,
+            unit_total: 0,
+            pixels_done: 0,
+            pixel_total: 0,
+            running: Duration::ZERO,
+            eta: None,
+            align_done: 0,
+            align_total: 0,
+            prepare_done: 0,
+            prepare_total,
+        };
+        match stage {
+            RunStage::Prepare { frames } => self.tick(&snapshot(JobStage::Prepare, frames)),
+            RunStage::Align {
+                source: AlignSource::Cached,
+                ..
+            } => self.tick(&snapshot(JobStage::Align, 0)),
+            _ => {}
+        }
+    }
 
     fn notice(&self, message: &str) {
-        tracing::warn!("{message}");
-        // The CPU rerun reaches the user through the alignment toast, so it
-        // stays out of the run's own notice list.
-        if let Some(reason) = message.strip_suffix(pipeline::ALIGN_RERUN_NOTICE) {
-            *self
-                .rerun_reason
-                .lock()
-                .expect("no thread panicked while holding the rerun lock") =
-                Some(reason.to_string());
-            return;
-        }
-        self.notices
-            .lock()
-            .expect("no thread panicked while holding the notices lock")
-            .push(message.to_string());
+        self.record_notice(None, message);
+    }
+
+    fn frame_notice(&self, frame: usize, message: &str) {
+        self.record_notice(Some(frame), message);
     }
 
     fn tick(&self, progress: &JobProgress) {
@@ -499,6 +592,7 @@ impl StageObserver for GuiObserver {
 /// phase added later needs only an arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    Preparing,
     Aligning,
     Fusing,
     Writing,
@@ -507,6 +601,7 @@ pub enum Phase {
 impl Phase {
     pub fn name(self) -> &'static str {
         match self {
+            Phase::Preparing => "Preparing",
             Phase::Aligning => "Aligning",
             Phase::Fusing => "Fusing",
             Phase::Writing => "Writing",
@@ -515,10 +610,13 @@ impl Phase {
 
     /// `Some((done, total))` while `self` works per frame and `progress`
     /// carries a non-zero total for it, `None` otherwise -- a cached or
-    /// resumed alignment included, since its total is `0`. `Aligning` is the
-    /// only phase with a frame total.
+    /// resumed alignment included, since its total is `0`. `Preparing` and
+    /// `Aligning` are the phases with a frame total.
     pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
         match self {
+            Phase::Preparing if progress.prepare_total > 0 => {
+                Some((progress.prepare_done, progress.prepare_total))
+            }
             Phase::Aligning if progress.align_total > 0 => {
                 Some((progress.align_done, progress.align_total))
             }
@@ -527,22 +625,24 @@ impl Phase {
     }
 }
 
-/// Which [`Phase`] `progress` is on: `Aligning` while the engine reports that
-/// stage, `Writing` once every unit of the fuse stage is done (the seal, which
-/// the engine reports as no stage of its own -- `JobStage` has only
-/// `Align`/`Fuse`), `Fusing` otherwise -- including no progress at all yet.
+/// Which [`Phase`] `progress` is on: `Preparing` while the engine reports the
+/// brightness preparation, `Aligning` while it reports the align stage,
+/// `Writing` once every unit of the fuse stage is done (the seal, which the
+/// engine reports as no stage of its own -- `JobStage` has no seal stage),
+/// `Fusing` otherwise -- including no progress at all yet.
 pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     match progress {
+        Some(p) if p.stage == JobStage::Prepare => Phase::Preparing,
         Some(p) if p.stage == JobStage::Align => Phase::Aligning,
         Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Phase::Writing,
         _ => Phase::Fusing,
     }
 }
 
-/// The stage word the bar shows for `state`/`progress` -- `Aligning`,
-/// `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a completed run's
-/// own `fused HH:MM`. `progress` picks between `Aligning`/`Fusing`/`Writing`
-/// while running, via `progress_phase`.
+/// The stage word the bar shows for `state`/`progress` -- `Preparing`,
+/// `Aligning`, `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a
+/// completed run's own `fused HH:MM`. `progress` picks the phase word while
+/// running, via `progress_phase`.
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused => "Paused".to_string(),
@@ -616,22 +716,25 @@ pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option
 
 /// The bottom bar's step-text slot: `"<done> of <total>"` while the current
 /// phase works per frame and `progress` carries a total for it
-/// ([`Phase::frames`]), empty for a name-only phase, outside a running state,
-/// or with no progress to derive a phase from.
+/// ([`Phase::frames`]), `"from cache"` while the align stage has no total
+/// (the alignment is served from the stage cache), empty for any other
+/// name-only phase, outside a running state, or with no progress to derive a
+/// phase from.
 pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     let (Some(phase), Some(p)) = (current_phase(state, progress), progress) else {
         return String::new();
     };
-    phase
-        .frames(p)
-        .map(|(done, total)| format!("{done} of {total}"))
-        .unwrap_or_default()
+    match (phase, phase.frames(p)) {
+        (_, Some((done, total))) => format!("{done} of {total}"),
+        (Phase::Aligning, None) => "from cache".to_string(),
+        _ => String::new(),
+    }
 }
 
 /// The run's phase line for a card or overlay meta text: the lower-cased
-/// phase name, plus `, <k> of <N>` when [`progress_text`] has a frame count
-/// to show. `None` outside `Running` -- a name-only phase still returns
-/// `Some`, so it never falls back to some other line.
+/// phase name, plus `, <k> of <N>` or `, from cache` when [`progress_text`]
+/// has a step text to show. `None` outside `Running` -- a name-only phase
+/// still returns `Some`, so it never falls back to some other line.
 pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
     if !matches!(state, RunState::Running) {
         return None;
@@ -662,12 +765,16 @@ pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     }
 }
 
-/// The bar's fill fraction: during a computed align stage,
+/// The bar's fill fraction: during the prepare stage,
+/// `prepare_done / prepare_total`; during a computed align stage,
 /// `align_done / align_total`, restarting from zero once the fuse stage
 /// begins; otherwise `units_done / unit_total` of the fuse job. `0.0` before
 /// the first unit, during a cached align stage, or with no run at all.
 pub fn bar_fraction(progress: Option<&JobProgress>) -> f32 {
     match progress {
+        Some(p) if p.stage == JobStage::Prepare && p.prepare_total > 0 => {
+            p.prepare_done as f32 / p.prepare_total as f32
+        }
         Some(p) if p.stage == JobStage::Align && p.align_total > 0 => {
             p.align_done as f32 / p.align_total as f32
         }

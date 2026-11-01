@@ -180,7 +180,7 @@ fn ragged_result() -> &'static FusionResult {
 }
 
 /// `pyramidal-ecc` under its own defaults (`mode=rotation-scale`,
-/// `reference-policy=anchor`, `reference-frame=middle`) and
+/// `reference-frame=middle`) with `reference-policy=anchor`, and
 /// `FailurePolicy::IdentityFallback` (frame 0 diverges against the middle
 /// anchor), run once and shared between [`aligned_result`] and the
 /// self-consistency test below.
@@ -192,7 +192,11 @@ fn alignment() -> &'static StackAlignment {
             registry::find_align("pyramidal-ecc").expect("pyramidal-ecc must be registered");
         let resolved = params::resolve(align_algo.params(), &ParamValues::new(), &stack_ctx)
             .expect("resolve must succeed with align defaults");
-        let align_values = params::resolved_values(&resolved);
+        let mut align_values = params::resolved_values(&resolved);
+        align_values.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum("anchor".to_string()),
+        );
         align_stack(
             align_algo,
             stack_ctx,

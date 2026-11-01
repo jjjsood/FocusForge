@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Assemble the FocusForge lockup: the mark plus the wordmark, text baked to paths.
 
 This is an authoring step, not part of the asset build — it needs Inter

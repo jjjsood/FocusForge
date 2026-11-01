@@ -121,9 +121,9 @@ pub enum TimingCounter {
     GpuTileWaitNs,
     /// Nanoseconds of GPU tile time outside every other stage.
     GpuTileOtherNs,
-    /// Nanoseconds the fuse stage spent estimating per-frame brightness gains
-    /// before any tile is fused.
-    FuseEqualizeNs,
+    /// Nanoseconds the setup stage spent measuring per-source brightness and
+    /// fixing the gains, before alignment reads any source.
+    PrepareEqualizeNs,
 }
 
 impl TimingCounter {
@@ -163,7 +163,7 @@ impl TimingCounter {
             Self::GpuTileReadbackNs => "gpu_tile_readback_ns",
             Self::GpuTileWaitNs => "gpu_tile_wait_ns",
             Self::GpuTileOtherNs => "gpu_tile_other_ns",
-            Self::FuseEqualizeNs => "fuse_equalize_ns",
+            Self::PrepareEqualizeNs => "prepare_equalize_ns",
         }
     }
 }
@@ -209,7 +209,7 @@ pub struct TimingSnapshot {
     pub gpu_tile_readback_ns: u64,
     pub gpu_tile_wait_ns: u64,
     pub gpu_tile_other_ns: u64,
-    pub fuse_equalize_ns: u64,
+    pub prepare_equalize_ns: u64,
     pub gpu_execution_available: bool,
     pub presentation_available: bool,
     pub saturated: bool,
@@ -284,7 +284,7 @@ struct TimingState {
     gpu_tile_readback_ns: AtomicU64,
     gpu_tile_wait_ns: AtomicU64,
     gpu_tile_other_ns: AtomicU64,
-    fuse_equalize_ns: AtomicU64,
+    prepare_equalize_ns: AtomicU64,
     saturated: AtomicBool,
     summary_emitted: AtomicBool,
 }
@@ -328,7 +328,7 @@ impl TimingState {
             gpu_tile_readback_ns: AtomicU64::new(0),
             gpu_tile_wait_ns: AtomicU64::new(0),
             gpu_tile_other_ns: AtomicU64::new(0),
-            fuse_equalize_ns: AtomicU64::new(0),
+            prepare_equalize_ns: AtomicU64::new(0),
             saturated: AtomicBool::new(false),
             summary_emitted: AtomicBool::new(false),
         }
@@ -384,7 +384,7 @@ impl TimingState {
             TimingCounter::GpuTileReadbackNs => &self.gpu_tile_readback_ns,
             TimingCounter::GpuTileWaitNs => &self.gpu_tile_wait_ns,
             TimingCounter::GpuTileOtherNs => &self.gpu_tile_other_ns,
-            TimingCounter::FuseEqualizeNs => &self.fuse_equalize_ns,
+            TimingCounter::PrepareEqualizeNs => &self.prepare_equalize_ns,
         };
         saturating_add(slot, value, &self.saturated);
     }
@@ -441,7 +441,7 @@ impl TimingState {
             gpu_tile_readback_ns: self.gpu_tile_readback_ns.load(Ordering::Relaxed),
             gpu_tile_wait_ns: self.gpu_tile_wait_ns.load(Ordering::Relaxed),
             gpu_tile_other_ns: self.gpu_tile_other_ns.load(Ordering::Relaxed),
-            fuse_equalize_ns: self.fuse_equalize_ns.load(Ordering::Relaxed),
+            prepare_equalize_ns: self.prepare_equalize_ns.load(Ordering::Relaxed),
             gpu_execution_available: false,
             presentation_available: false,
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -636,10 +636,10 @@ fn elapsed_guard(state: Option<&'static TimingState>, counter: TimingCounter) ->
     }
 }
 
-/// Charges the time until the guard drops to [`TimingCounter::FuseEqualizeNs`].
+/// Charges the time until the guard drops to [`TimingCounter::PrepareEqualizeNs`].
 /// Admits no span and reads the clock only when trace accounting is active.
 pub(crate) fn equalize_scope() -> ElapsedGuard {
-    elapsed_guard(timing(), TimingCounter::FuseEqualizeNs)
+    elapsed_guard(timing(), TimingCounter::PrepareEqualizeNs)
 }
 
 /// Adds an actual count at a named processing boundary.
@@ -740,7 +740,7 @@ pub fn emit_timing_summary() {
         gpu_tile_readback_ns = snapshot.gpu_tile_readback_ns,
         gpu_tile_wait_ns = snapshot.gpu_tile_wait_ns,
         gpu_tile_other_ns = snapshot.gpu_tile_other_ns,
-        fuse_equalize_ns = snapshot.fuse_equalize_ns,
+        prepare_equalize_ns = snapshot.prepare_equalize_ns,
         gpu_execution_available = snapshot.gpu_execution_available,
         presentation_available = snapshot.presentation_available,
         saturated = snapshot.saturated,
@@ -755,7 +755,8 @@ pub fn emit_timing_summary() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// Everything before alignment: opening the stack, resolving
-    /// parameters, the fingerprint and stage-cache lookups.
+    /// parameters, the fingerprint, brightness preparation and stage-cache
+    /// lookups.
     Setup,
     /// Producing this run's [`crate::align::StackAlignment`] -- computed,
     /// reused from `--resume`'s ledger peek, reused from the stage cache,
@@ -1060,12 +1061,15 @@ mod accounting_tests {
         assert!(state.admit());
         assert!(!state.admit());
 
-        assert_eq!(TimingCounter::FuseEqualizeNs.name(), "fuse_equalize_ns");
-        state.add(TimingCounter::FuseEqualizeNs, 7);
+        assert_eq!(
+            TimingCounter::PrepareEqualizeNs.name(),
+            "prepare_equalize_ns"
+        );
+        state.add(TimingCounter::PrepareEqualizeNs, 7);
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.exhausted, 1);
-        assert_eq!(snapshot.fuse_equalize_ns, 7);
+        assert_eq!(snapshot.prepare_equalize_ns, 7);
     }
 
     #[test]
@@ -1074,19 +1078,19 @@ mod accounting_tests {
         let nap = std::time::Duration::from_millis(5);
 
         let started = std::time::Instant::now();
-        drop(elapsed_guard(Some(state), TimingCounter::FuseEqualizeNs));
-        let guard = elapsed_guard(Some(state), TimingCounter::FuseEqualizeNs);
+        drop(elapsed_guard(Some(state), TimingCounter::PrepareEqualizeNs));
+        let guard = elapsed_guard(Some(state), TimingCounter::PrepareEqualizeNs);
         std::thread::sleep(nap);
         drop(guard);
         let measured = started.elapsed().as_nanos() as u64;
-        drop(elapsed_guard(None, TimingCounter::FuseEqualizeNs));
+        drop(elapsed_guard(None, TimingCounter::PrepareEqualizeNs));
 
         let snapshot = state.snapshot();
         assert!(
-            snapshot.fuse_equalize_ns >= nap.as_nanos() as u64,
+            snapshot.prepare_equalize_ns >= nap.as_nanos() as u64,
             "{snapshot:?}"
         );
-        assert!(snapshot.fuse_equalize_ns <= measured, "{snapshot:?}");
+        assert!(snapshot.prepare_equalize_ns <= measured, "{snapshot:?}");
         assert_eq!(snapshot.admitted, 0);
     }
 

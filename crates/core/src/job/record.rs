@@ -59,7 +59,7 @@ pub struct JobRecord {
 ///
 /// This is also the align stage cache key's algorithm half:
 /// **`AlignAlgorithm::params()` plus the named driver fields, and nothing
-/// else** -- `failure_policy` and `solver_version`, named in
+/// else** -- `failure_policy`, `solver_version` and `gains`, named in
 /// [`DRIVER_POLICY_FIELDS`]. A field added here without a matching addition
 /// to `DRIVER_POLICY_FIELDS` widens the cache key silently;
 /// `crates/core/tests/stage_cache.rs`'s
@@ -74,17 +74,26 @@ pub struct AlignIdentity {
     pub params: ParamValues,
     pub failure_policy: FailurePolicy,
     pub solver_version: u32,
+    /// The Q16 brightness gains the alignment read its sources through,
+    /// index == frame index; empty when the sources were read as delivered.
+    pub gains: Vec<u32>,
 }
 
 impl AlignIdentity {
     /// The identity of an alignment this build computes: `solver_version` is
     /// [`ALIGN_SOLVER_VERSION`].
-    pub fn new(algorithm: &str, params: ParamValues, failure_policy: FailurePolicy) -> Self {
+    pub fn new(
+        algorithm: &str,
+        params: ParamValues,
+        failure_policy: FailurePolicy,
+        gains: Vec<u32>,
+    ) -> Self {
         AlignIdentity {
             algorithm: algorithm.to_string(),
             params,
             failure_policy,
             solver_version: ALIGN_SOLVER_VERSION,
+            gains,
         }
     }
 }
@@ -92,12 +101,12 @@ impl AlignIdentity {
 /// The alignment solver's revision. Bump it on any change that can move an
 /// aligned transform or a frame's status, so alignments computed before the
 /// change are neither reused from the stage cache nor resumed.
-pub const ALIGN_SOLVER_VERSION: u32 = 5;
+pub const ALIGN_SOLVER_VERSION: u32 = 6;
 
 /// The field names on [`AlignIdentity`] that are **not** one of
 /// `AlignAlgorithm::params()`'s declared parameters -- the named exceptions
 /// the stage cache key's completeness test checks against.
-pub const DRIVER_POLICY_FIELDS: &[&str] = &["failure_policy", "solver_version"];
+pub const DRIVER_POLICY_FIELDS: &[&str] = &["failure_policy", "solver_version", "gains"];
 
 #[cfg(test)]
 mod tests {

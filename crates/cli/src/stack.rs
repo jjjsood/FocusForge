@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
-use focusforge_core::equalize::EqualizationReport;
+use focusforge_core::equalize::{EqualizationReport, EqualizeSettings};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
 use focusforge_core::job::{JobControl, StageCache};
@@ -502,7 +502,7 @@ pub fn run(
         device_peak,
         align_choice,
         explicit,
-        equalize: project::equalization_bound(&project_schema, &project_values),
+        equalize: project::equalization_settings(&project_schema, &project_values),
         project_values,
         file,
         align_opts,
@@ -619,9 +619,9 @@ struct RunSetup<'a> {
     explicit: ParamValues,
     /// The explicitly set project parameters (`PROJECT_PARAMS`).
     project_values: ParamValues,
-    /// The gain bound brightness equalization runs with, `None` when off:
-    /// resolved against the fusion method's own project defaults.
-    equalize: Option<f64>,
+    /// What brightness equalization runs with, `None` when off: resolved
+    /// against the fusion method's own project defaults.
+    equalize: Option<EqualizeSettings>,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
     job_opts: &'a JobOptions,
@@ -1287,6 +1287,10 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             .lock()
             .expect("no thread panicked while rendering");
         match stage {
+            RunStage::Prepare { frames } => {
+                renderer.stage(&format!("prepare {frames} frames (brightness)"));
+                renderer.start(&self.control.progress());
+            }
             // A peeked (resumed) alignment prints nothing -- it cost no
             // wall time and is not a stage a viewer is waiting through.
             RunStage::Align {
@@ -1328,10 +1332,12 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 _ => self.control.pause(),
             }
         }
-        // A tick outside the fuse stage and a cached or absent alignment
-        // (`align_total == 0`) carries a stale or zeroed total and must not
-        // render.
-        if progress.stage == focusforge_core::job::JobStage::Fuse || progress.align_total > 0 {
+        // Only the stage that is counting renders: a tick outside fuse,
+        // outside a counted prepare stage, and with a cached or absent
+        // alignment (`align_total == 0`) carries a stale or zeroed total.
+        use focusforge_core::job::JobStage;
+        let preparing = progress.stage == JobStage::Prepare && progress.prepare_total > 0;
+        if progress.stage == JobStage::Fuse || preparing || progress.align_total > 0 {
             self.renderer
                 .lock()
                 .expect("no thread panicked while rendering")
@@ -1560,11 +1566,14 @@ fn render(report: &StackReport) -> String {
     lines.push(match &report.equalization {
         None => "equalization=off".to_string(),
         Some(eq) => format!(
-            "equalization=on max_gain={} reference={} clamped={} thin={} (scales encoded code values, not a linear-light correction)",
+            "equalization=on max_gain={} target_stops={} neutral={:.1} target={:.1} clamped={} black={} clipped={} (scales encoded code values, not a linear-light correction)",
             eq.max_gain,
-            eq.reference,
+            eq.target_stops,
+            eq.neutral,
+            eq.target,
             eq.frames.iter().filter(|f| f.clamped).count(),
-            eq.frames.iter().filter(|f| f.thin).count(),
+            eq.frames.iter().filter(|f| f.black).count(),
+            eq.frames.iter().filter(|f| f.clipped_samples > 0).count(),
         ),
     });
     lines.push(format!("backend: {}", report.backend));

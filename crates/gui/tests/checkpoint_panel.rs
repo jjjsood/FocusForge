@@ -842,7 +842,7 @@ fn restore_asks_only_when_live_is_modified() {
     paint(&mut controller, stroke(1, 1, 0));
     click(&mut controller, &project.root);
     assert!(!controller.close_guard_secondary_pressed(|_| None));
-    assert!(controller.take_settled_failure().is_none(), "no toast");
+    assert!(controller.notifications().is_empty(), "no toast");
     assert_eq!(controller.checkpoints_panel().row_count, 3);
     assert_eq!(
         current_row(&controller).as_deref(),
@@ -1757,9 +1757,38 @@ fn a_confirmed_delete_removes_exactly_that_row() {
     wait_for_render(&mut controller);
 }
 
-/// A delete is not an edit: the canvas, the session and its ops stay put at
-/// the answer and across the save that writes it, and the row live stands on
-/// stays usable as a parent.
+/// With live holding no ops, deleting the current row makes the newest
+/// remaining row current, so the panel draws it selected without a click;
+/// deleting any other row leaves the selection where it was.
+#[test]
+fn deleting_the_newest_row_selects_the_new_current() {
+    let mut held = fused_tab("checkpoint_panel_delete_newest_held", 3);
+    assert_eq!(current_row(&held).as_deref(), Some("held:2"));
+    confirm(&mut held, "held:0");
+    assert_eq!(current_row(&held).as_deref(), Some("held:2"), "not current");
+    confirm(&mut held, "held:2");
+    assert_eq!(current_row(&held).as_deref(), Some("held:1"));
+    assert_eq!(selected_rows(&held).len(), 1);
+    request(&mut held, "held:1");
+    assert!(
+        held.pending_checkpoint_delete_copy().is_none(),
+        "the last row stays undeletable"
+    );
+    assert_eq!(current_row(&held).as_deref(), Some("held:1"));
+
+    let (_, _, mut saved) = open_three("checkpoint_panel_delete_newest_saved");
+    let current = current_row(&saved).expect("a row is current on open");
+    confirm(&mut saved, &current);
+    wait_for_render(&mut saved);
+    let rows = row_ids(&saved.checkpoints_panel());
+    assert!(!rows.contains(&current));
+    assert_eq!(current_row(&saved), rows.first().cloned());
+}
+
+/// A delete is not an edit: while live holds ops, the canvas, the session and
+/// its ops stay put at the answer and across the save that writes it, and the
+/// row live stands on stays usable as a parent. With no ops, deleting the
+/// current row restores the newest remaining one.
 #[test]
 fn deleting_never_changes_live_or_the_canvas() {
     let name = "checkpoint_panel_delete_live";
@@ -1821,23 +1850,19 @@ fn deleting_never_changes_live_or_the_canvas() {
     assert_eq!(checkpoint.ops.last(), Some(&stroke(2, 2, 1)));
     assert_eq!(checkpoint.parent.as_deref(), Some(current.as_str()));
 
-    // Stacking mode over an in-memory fused current row.
+    // Stacking mode over an in-memory fused current row: live holds no ops,
+    // so the newest remaining row becomes current and the canvas follows.
     let mut stacking = fused_tab("checkpoint_panel_delete_live_stacking", 2);
     assert!(stacking.set_mode(ShellMode::Stacking));
-    let events = record_events(&mut stacking);
     loaded_composite(&mut stacking, None);
     stacking.take_render_started();
     confirm(&mut stacking, "held:1");
-    assert!(matches!(stacking.canvas_feed(Some(0)), CanvasFeed::Keep));
-    assert!(!stacking.take_render_started());
+    assert_eq!(current_row(&stacking).as_deref(), Some("held:0"));
+    assert!(matches!(
+        stacking.canvas_feed(Some(0)),
+        CanvasFeed::Load { .. }
+    ));
     assert_eq!(live_ops(&stacking), 0);
-    assert!(
-        !events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|event| matches!(event, ShellEvent::EditorChanged))
-    );
 }
 
 #[test]
@@ -1913,15 +1938,14 @@ fn deletes_and_views_leave_no_files_behind() {
     confirm(&mut controller, "held:1");
     assert_eq!(cache_dirs(name, "held"), ["fused-0"]);
 
-    // A listed row built on it, then live standing on it, keep the files
-    // until a restore elsewhere.
+    // A listed row built on it keeps the files; deleting the current row
+    // moves live to the newest remaining row, which frees them.
     let name = "checkpoint_panel_files_keep";
     let mut controller = fused_tab(name, 3);
     confirm(&mut controller, "held:1");
     assert_eq!(cache_dirs(name, "held").len(), 3, "held:2 is built on it");
     confirm(&mut controller, "held:2");
-    assert_eq!(cache_dirs(name, "held").len(), 3, "live stands on held:2");
-    click(&mut controller, "held:0");
+    assert_eq!(current_row(&controller).as_deref(), Some("held:0"));
     assert_eq!(cache_dirs(name, "held"), ["fused-0"]);
 
     // Six viewed saved rows leave four directories; a deleted viewed row's

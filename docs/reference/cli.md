@@ -5,12 +5,12 @@ and every batch-run control (grouping, presets, resume, review, the stage
 cache), is reachable here.
 
 ```
-focusforge-cli <COMMAND>
+focusforge-cli [OPTIONS] <COMMAND>
 ```
 
 | command | does |
 |---|---|
-| [`info`](#info) | prints TIFF or RAW metadata for a file or a directory of frames |
+| [`info`](#info) | prints project, TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
 | [`export`](#export) | renders a checkpoint to a TIFF, PNG or JPEG image, and/or writes its Z-Map or one source frame |
@@ -21,6 +21,10 @@ focusforge-cli <COMMAND>
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
 | [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
 
+Root help groups `stack`, `align`, `retouch` and `export` under Processing;
+`info`, `review` and `algorithms` under Inspection; and `history`, `cache`
+and `diagnostics` under Maintenance.
+
 ## Global options
 
 `-v` and `-q` apply to every command and control how much a run says on
@@ -29,6 +33,11 @@ stderr:
 ```
 focusforge-cli [-v]... [-q] <COMMAND>
 ```
+
+| flag | meaning |
+|---|---|
+| `-v` | increase log detail; repeat it for more detail |
+| `-q, --quiet` | log errors only |
 
 - Repeat `-v` for more detail: once for informational messages, twice for
   debug detail. Omit it for warnings and errors only.
@@ -52,8 +61,12 @@ next run prints a one-line notice before doing anything else — see
 ## `info`
 
 ```
-focusforge-cli info [--json] <PATH>
+focusforge-cli info [OPTIONS] <PATH>
 ```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
 
 Prints saved-project facts, TIFF metadata or RAW metadata for a single file, or for every matching file directly inside a
 directory (or inside a `frames/` subdirectory of it, when that exists).
@@ -243,8 +256,8 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | flag | meaning |
 |---|---|
 | `-o, --output <DIR>` | directory to collect this run's projects into; omit to write each project beside its own frames |
-| `--algorithm <ALGO>` | registered stacking algorithm id (required; see `algorithms` below for the list) |
-| `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`align`, `auto-crop`, `equalize`, `equalize-max-gain`; see below), repeatable; a repeated key keeps the last value |
+| `--algorithm <ALGO>` | registered stacking algorithm id; required unless a `--preset` supplies `algo` (see `algorithms` below for the list) |
+| `--set <KEY=VALUE>` | set one algorithm parameter or one project setting (`align`, `auto-crop`, `equalize`, `equalize-max-gain`, `equalize-target`; see below), repeatable; a repeated key keeps the last value |
 | `--json` | emit a JSON report instead of human-readable text |
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
@@ -275,17 +288,19 @@ preset's `[stack]` table accept the settings that belong to the whole run
 |---|---|---|---|
 | `align` | bool | `true` | register every frame onto the reference before fusing; `--no-align` or `align=false` fuses the frames as read |
 | `auto-crop` | bool | `true` | trim the result to the area every aligned frame covers; `--no-crop` or `auto-crop=false` keeps the full frame |
-| `equalize` | bool | `true` | brightness equalization: one gain per frame, the same on every channel, matching the reference frame's (the alignment's, otherwise the middle one) mid-tone brightness |
+| `equalize` | bool | `true` | brightness equalization: one gain per frame, the same on every channel, bringing each frame's whole-image mean to one target shared by all frames |
 | `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
+| `equalize-target` | float, -0.5 to 0.5 | `0.0` | the shared target in stops from the frames' average brightness; 0.0 keeps that average, +1 would double it |
 
 Equalization scales the encoded code values as delivered and is not a
 linear-light correction; it is on for every algorithm and every kind of input unless
 `equalize=false` is set; `algorithms --json` lists each fusion method's
-defaults under `project_defaults`. A frame that would need a gain
-beyond the bound gets the bound and the run prints a notice naming the
-frame, the gain it needed and the
-smallest bound that would cover it; a frame with fewer than 1000 usable
-mid-tone samples keeps gain 1 and says so. The applied gains are recorded in
+defaults under `project_defaults`. The gains are fixed before alignment. A
+frame that would need a gain beyond the bound gets the bound and the run
+prints a notice naming the frame, the gain it needed, the smallest bound that
+would cover it and the mean it reached against the target; a black frame keeps
+gain 1 and says so, and a frame whose gain pushes samples past white and
+leaves its mean more than one code value from the target is reported too. The applied gains are recorded in
 the project, so `export --frame` writes the gained frame, and a `--resume`
 with a different equalization is refused naming `equalization`.
 `--write-preset` writes the project settings back into `[stack]`.
@@ -355,7 +370,7 @@ because this example passes `--cpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
 `--no-progress` suppresses only the ticking progress line — per-frame while
-alignment runs, per-tile once fusion starts. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+brightness is prepared and alignment runs, per-tile once fusion starts. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
 entered the alignment stage at all — a real run reports numbers instead
 (see below).
 
@@ -377,11 +392,12 @@ otherwise the alignment algorithm's id, display name, parameters,
 reference frame, reference policy, failure policy, failure count and every
 frame's transform, in the same shape `align --json` reports (see below).
 Brightness equalization field: `equalization` — `null` unless
-`equalize` is on, otherwise `{max_gain, reference, frames}`, where
-`reference` is the frame the others are matched to and `frames` holds, per
-frame, `estimated` (the gain that would match the reference), `applied` (the
-gain used, after the bound), `clamped`, `thin` and `samples` (the number of
-samples the estimate used).
+`equalize` is on, otherwise `{max_gain, target_stops, neutral, target, frames}`, where
+`neutral` is the mean of the frames' means, `target` is `neutral` times
+2^`target_stops`, and `frames` holds, per frame, `mean`, `estimated` (the gain
+that would reach the target), `applied` (the gain used, after the bound),
+`clamped`, `black`, `clipped_samples` (samples the gain saturates at white),
+`output_mean` and `residual` (`output_mean` minus `target`).
 GPU field: `backend` — `"cpu"`, or the selected
 adapter's name and driver info.
 
@@ -465,7 +481,7 @@ prevent.
     "display_name": "Pyramidal ECC",
     "params": [{ "id": "mode", "value": "rotation-scale", "provenance": "Default" }],
     "reference": 3,
-    "reference_policy": "anchor",
+    "reference_policy": "chain",
     "failure_policy": "lax",
     "failure_count": 3,
     "alignments": [
@@ -536,7 +552,7 @@ exit 1, naming every failed frame.
 ```
 $ focusforge-cli align path/to/frames --algorithm pyramidal-ecc
 path/to/frames (8 frames)
-pyramidal-ecc - Pyramidal ECC (reference=3 policy=Anchor failure_policy=lax failures=0)
+pyramidal-ecc - Pyramidal ECC (reference=3 policy=Chain failure_policy=lax failures=0)
 rho = ECC correlation in [-1, 1], not a pixel distance
 00.tif    tx=+12.41 ty=-3.07 scale=1.000842 rot=+0.0131deg  converged iters=12 rho=0.9814
 ...
@@ -581,7 +597,7 @@ by construction) -- always numbers here, since every `align` run computes.
   "display_name": "Pyramidal ECC",
   "params": [{ "id": "mode", "value": "rotation-scale", "provenance": "Default" }],
   "reference": 3,
-  "reference_policy": "anchor",
+  "reference_policy": "chain",
   "failure_policy": "lax",
   "failure_count": 1,
   "alignments": [
@@ -641,8 +657,13 @@ inspect an alignment result visually before running `stack`.
 ## `algorithms`
 
 ```
-focusforge-cli algorithms [--json] [--set KEY=VALUE]... [ID]
+focusforge-cli algorithms [OPTIONS] [ID]
 ```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
+| `--set <KEY=VALUE>` | set a parameter; repeat it to replace a prior value for the same key |
 
 Lists every algorithm registered with `focusforge-core`, or — given `ID` —
 prints that one algorithm's full parameter schema. Every algorithm, stacking
@@ -689,7 +710,11 @@ Prints `<ID>`'s id, display name and family, then one block per declared
 parameter: its kind (a float or int range and step, a bool, or an enum's
 variant ids and labels), its default, the value that resolved for this
 invocation, where that value came from, and whether the parameter has an
-`auto` hook. Resolution here is explicit → `auto` (stack) → host-derived
+`auto` hook. A parameter with an `auto` hook prints `default from the loaded
+frames` in place of a default, and no value line until one is set with
+`--set`; `pyramid-depth`, for example, derives its depth from the frames, the
+deepest whose coarsest level keeps the shorter side at 64 px or more (0 for
+frames shorter than 127 px, 3 for 512 px). Resolution here is explicit → `auto` (stack) → host-derived
 default → plain default — but an `auto` hook needs a loaded stack to run
 against, and this subcommand loads no image, so a *stack* `auto` hook is
 always shown as present but not evaluated, never run. A parameter with a
@@ -780,7 +805,7 @@ for the `-o` image: `exif`, `icc`, `xmp`, `iptc` each a status string, plus
 ## `history`
 
 ```
-focusforge-cli history <COMMAND>
+focusforge-cli history [OPTIONS] <COMMAND>
 ```
 
 Reads and changes a project's checkpoint tree without a window. Every
@@ -802,6 +827,42 @@ cannot be found only produce a warning: the history is intact.
 | `list <PROJECT> [--json] [--accept-changed-sources]` | prints every visible checkpoint, newest first: id, parent, algorithm and creation time. `--json` emits `{"checkpoints": [{"id", "parent", "algorithm", "created_at"}]}`, `created_at` in Unix seconds |
 | `delete <PROJECT> --checkpoint <ID> [--json] [--accept-changed-sources]` | hides a checkpoint and removes it from the file once no visible checkpoint is built on it. Refuses the last visible checkpoint |
 | `compact <PROJECT> [--json]` | rewrites the project to its live checkpoints only and reports the bytes reclaimed |
+
+| flag | meaning |
+|---|---|
+
+### `history list`
+
+```
+focusforge-cli history list [OPTIONS] <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
+| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |
+
+### `history delete`
+
+```
+focusforge-cli history delete [OPTIONS] --checkpoint <CHECKPOINT> <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--checkpoint <CHECKPOINT>` | checkpoint id or unique id prefix to delete |
+| `--json` | emit the JSON document instead of human-readable text |
+| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |
+
+### `history compact`
+
+```
+focusforge-cli history compact [OPTIONS] <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
 
 ```
 focusforge-cli history list mantis-64.ffp
@@ -854,8 +915,12 @@ the op's 0-based position in the list.
 ## `review`
 
 ```
-focusforge-cli review [--json] <DIR>
+focusforge-cli review [OPTIONS] <DIR>
 ```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit one wrapped JSON document instead of a human-readable table |
 
 Reports one record per stack found under `<DIR>` — a `stack` run's `-o`
 output directory, or a plain directory of `.ffp` files — without
@@ -890,8 +955,26 @@ resolved).
 ## `cache`
 
 ```
-focusforge-cli cache clear [--json]
+focusforge-cli cache [OPTIONS] <COMMAND>
 ```
+
+| subcommand | does |
+|---|---|
+| `clear` | removes every entry from the stage cache |
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
+
+### `cache clear`
+
+```
+focusforge-cli cache clear [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
 
 Removes every entry from the stage cache under `.scratch/stage-cache/`, the
 store `stack` reads and writes to skip a repeated alignment solve — see
@@ -909,8 +992,14 @@ removed 1 stage cache entry
 ## `diagnostics`
 
 ```
-focusforge-cli diagnostics [-o FILE] [--include-minidumps] [--force]
+focusforge-cli diagnostics [OPTIONS]
 ```
+
+| flag | meaning |
+|---|---|
+| `-o, --output <FILE>` | where to write the ZIP; omit it for a dated name in the current directory |
+| `--include-minidumps` | include the minidump binaries alongside their JSON metadata |
+| `--force` | overwrite an existing output path |
 
 Packages this installation's log files, any crash reports, a system
 summary, the graphics adapter record, the configuration a new run would

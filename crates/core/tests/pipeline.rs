@@ -11,19 +11,22 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, StackAlgorithm,
     TileCtx, TileOutput, TileReader,
 };
 use focusforge_core::align::warp::WarpedTile;
-use focusforge_core::align::{AlignError, Transform};
-use focusforge_core::equalize::UNIT_GAIN;
+use focusforge_core::align::{AlignError, FailurePolicy, Transform};
+use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
-use focusforge_core::io::{TiffSpec, TiffWriter};
-use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCache};
+use focusforge_core::io::{FrameDesc, TiffHeader, TiffSpec, TiffWriter};
+use focusforge_core::job::{
+    AlignIdentity, ControlState, FrameFingerprint, JobControl, JobProgress, JobStage,
+    StackFingerprint, StageCache, StageKey,
+};
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
     AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest, PipelineError,
@@ -142,6 +145,7 @@ struct StageLog {
 impl StageObserver for StageLog {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
             RunStage::Seal => "seal",
@@ -326,6 +330,13 @@ struct PausingAlign {
     control: Arc<JobControl>,
     pause_on: usize,
     calls: Arc<AtomicUsize>,
+    /// Slept in every `align_frame`, so a watcher tick can land mid-stage.
+    delay: Duration,
+    /// An observer's tick count. When set, each `align_frame` returns only
+    /// once a tick has landed during it, or the job stops running, or 10 s
+    /// pass: a short stage on a loaded machine can otherwise end before the
+    /// watcher thread is first scheduled.
+    tick_count: Option<Arc<AtomicUsize>>,
 }
 
 impl AlignAlgorithm for PausingAlign {
@@ -346,8 +357,19 @@ impl AlignAlgorithm for PausingAlign {
         _frame: usize,
         _cfg: &ParamValues,
     ) -> Result<AlignOutcome, AlgorithmError> {
+        let entry = self.tick_count.as_ref().map(|t| t.load(Ordering::SeqCst));
         if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.pause_on {
             self.control.pause();
+        }
+        std::thread::sleep(self.delay);
+        if let Some((ticks, entry)) = self.tick_count.as_ref().zip(entry) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while ticks.load(Ordering::SeqCst) == entry
+                && self.control.state() == ControlState::Running
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         Ok(AlignOutcome {
             transform: Transform::identity(),
@@ -432,6 +454,8 @@ fn pause_during_alignment_stops_registering_frames() {
             control: Arc::clone(&control),
             pause_on: PAUSE_ON,
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
+            tick_count: None,
         }));
         let mut explicit = ParamValues::new();
         explicit.insert(
@@ -489,6 +513,8 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
             control: Arc::clone(&control),
             pause_on: PAUSE_ON,
             calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
+            tick_count: None,
         }));
         let mut explicit = ParamValues::new();
         explicit.insert(
@@ -658,6 +684,260 @@ fn align_progress_counts_every_frame() {
     assert_eq!(progress.align_total, 0);
 }
 
+/// Logs the stage, align tally and ETA of every tick, and the tally and ETA
+/// at the moment a hold begins; holds for 500 ms, then resumes.
+#[derive(Default)]
+struct AlignEtaLog {
+    ticks: Mutex<Vec<(JobStage, usize, Option<Duration>)>>,
+    tick_count: Arc<AtomicUsize>,
+    hold_entry: Mutex<Option<(usize, Option<Duration>)>>,
+}
+
+impl StageObserver for AlignEtaLog {
+    fn tick(&self, progress: &JobProgress) {
+        self.ticks.lock().expect("no panic while logging").push((
+            progress.stage,
+            progress.align_done,
+            progress.eta,
+        ));
+        self.tick_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn paused(&self, control: &JobControl) {
+        let progress = control.progress();
+        *self.hold_entry.lock().expect("no panic while logging") =
+            Some((progress.align_done, progress.eta));
+        std::thread::sleep(Duration::from_millis(500));
+        control.clear();
+    }
+}
+
+/// A chain-policy request over `count` mantis frames through a
+/// [`PausingAlign`] that sleeps `delay` per frame, holds each frame until
+/// `observer` has ticked during it, and pauses on call `pause_on`.
+fn timed_align_request(
+    label: &str,
+    count: usize,
+    control: &Arc<JobControl>,
+    pause_on: usize,
+    delay: Duration,
+    observer: &AlignEtaLog,
+) -> FuseRequest {
+    let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
+        control: Arc::clone(control),
+        pause_on,
+        calls: Arc::new(AtomicUsize::new(0)),
+        delay,
+        tick_count: Some(Arc::clone(&observer.tick_count)),
+    }));
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("chain".to_string()),
+    );
+    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    request.align = Some(AlignRequest {
+        algorithm,
+        explicit,
+        lax: false,
+    });
+    request.poll = Duration::from_millis(1);
+    request
+}
+
+#[test]
+fn align_progress_carries_an_eta() {
+    let control = JobControl::new();
+    let observer = AlignEtaLog::default();
+    let request = timed_align_request(
+        "align_eta",
+        5,
+        &control,
+        usize::MAX,
+        Duration::from_millis(20),
+        &observer,
+    );
+    let cache = StageCache::open(&request.scratch_root).expect("stage cache must open");
+
+    let outcome = focusforge_core::pipeline::run(&request, &observer, control, Some(&cache))
+        .expect("a computed alignment must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    let align: Vec<_> = ticks.iter().filter(|t| t.0 == JobStage::Align).collect();
+    assert!(
+        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_none()),
+        "no ETA before a frame completes: {align:?}"
+    );
+    assert!(
+        align.iter().any(|t| 0 < t.1 && t.1 < 5 && t.2.is_some()),
+        "a mid-stage tick must carry an ETA: {align:?}"
+    );
+    drop(ticks);
+
+    // The same request against the same cache is served from it.
+    let observer = AlignEtaLog::default();
+    let outcome =
+        focusforge_core::pipeline::run(&request, &observer, JobControl::new(), Some(&cache))
+            .expect("a cached alignment must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    assert!(
+        !ticks
+            .iter()
+            .any(|t| t.0 == JobStage::Align && t.2.is_some()),
+        "a cached alignment has no per-frame work to estimate: {ticks:?}"
+    );
+}
+
+#[test]
+fn align_eta_excludes_a_pause() {
+    let control = JobControl::new();
+    let observer = AlignEtaLog::default();
+    let request = timed_align_request(
+        "align_eta_pause",
+        8,
+        &control,
+        2,
+        Duration::from_millis(20),
+        &observer,
+    );
+    let outcome = focusforge_core::pipeline::run(&request, &observer, control, None)
+        .expect("a paused-then-resumed alignment must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let (done_at_hold, eta_at_hold) = observer
+        .hold_entry
+        .lock()
+        .expect("no panic while logging")
+        .expect("the hold must be entered");
+    let eta_at_hold = eta_at_hold.expect("frames were done when the hold began");
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    let after: Vec<_> = ticks
+        .iter()
+        .filter(|t| t.0 == JobStage::Align && t.1 > done_at_hold)
+        .filter_map(|t| t.2)
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "ticks after the resume must carry an ETA"
+    );
+    for eta in after {
+        assert!(
+            eta <= eta_at_hold + Duration::from_millis(250),
+            "{eta:?} after the hold vs {eta_at_hold:?} before it"
+        );
+    }
+}
+
+/// Logs the Prepare-stage tally of every tick, and the control's tally at
+/// the moment the align stage is announced.
+struct PrepareTickLog {
+    control: Arc<JobControl>,
+    prepare_ticks: Mutex<Vec<(usize, usize)>>,
+    all_ticks: Mutex<Vec<(usize, usize)>>,
+    at_align: Mutex<Option<(usize, usize)>>,
+}
+
+impl PrepareTickLog {
+    fn new(control: &Arc<JobControl>) -> Self {
+        PrepareTickLog {
+            control: Arc::clone(control),
+            prepare_ticks: Mutex::default(),
+            all_ticks: Mutex::default(),
+            at_align: Mutex::default(),
+        }
+    }
+}
+
+impl StageObserver for PrepareTickLog {
+    fn stage(&self, stage: RunStage) {
+        if matches!(stage, RunStage::Align { .. }) {
+            let p = self.control.progress();
+            *self.at_align.lock().expect("no panic while logging") =
+                Some((p.prepare_done, p.prepare_total));
+        }
+    }
+
+    fn tick(&self, progress: &JobProgress) {
+        let tally = (progress.prepare_done, progress.prepare_total);
+        self.all_ticks
+            .lock()
+            .expect("no panic while logging")
+            .push(tally);
+        if progress.stage == JobStage::Prepare {
+            self.prepare_ticks
+                .lock()
+                .expect("no panic while logging")
+                .push(tally);
+        }
+    }
+}
+
+fn prepare_request(label: &str, count: usize, equalize: Option<EqualizeSettings>) -> FuseRequest {
+    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    request.align = Some(dummy_align_request());
+    request.equalize = equalize;
+    request.poll = Duration::from_millis(1);
+    request
+}
+
+#[test]
+fn prepare_progress_counts_every_frame() {
+    for count in [2, 5] {
+        let request = prepare_request(
+            &format!("prepare_progress_{count}"),
+            count,
+            eq_settings(1.25, 0.0),
+        );
+        let control = JobControl::new();
+        let observer = PrepareTickLog::new(&control);
+        let outcome =
+            focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+                .unwrap_or_else(|err| panic!("a {count}-frame run must complete: {err}"));
+        assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+        assert_eq!(
+            *observer.at_align.lock().expect("no panic while logging"),
+            Some((count, count)),
+            "Prepare is complete when Align is announced"
+        );
+        let ticks = observer
+            .prepare_ticks
+            .lock()
+            .expect("no panic while logging");
+        let mut previous = 0;
+        for &(done, total) in ticks.iter() {
+            assert_eq!(total, count, "the total is the frame count on every tick");
+            assert!(done <= total, "done must never exceed total");
+            assert!(done >= previous, "done must never decrease");
+            previous = done;
+        }
+    }
+}
+
+#[test]
+fn prepare_progress_is_zero_without_equalization() {
+    let request = prepare_request("prepare_progress_off", 3, None);
+    let control = JobControl::new();
+    let observer = PrepareTickLog::new(&control);
+    let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+        .expect("a run without equalization must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let all = observer.all_ticks.lock().expect("no panic while logging");
+    assert!(all.iter().all(|&tally| tally == (0, 0)), "{all:?}");
+    assert!(
+        observer
+            .prepare_ticks
+            .lock()
+            .expect("no panic while logging")
+            .is_empty()
+    );
+    let progress = control.progress();
+    assert_eq!((progress.prepare_done, progress.prepare_total), (0, 0));
+    assert_eq!((progress.align_done, progress.align_total), (3, 3));
+}
+
 /// Frame 06 of the fixture solves with an 11% zoom against frame 03 that the
 /// off-centre check rejects. The strict default refuses the run and names that
 /// frame with the check's own wording; frames 03..=06 leave it the only failure.
@@ -667,6 +947,10 @@ fn the_strict_default_refuses_a_frame_the_off_centre_check_rejects() {
     explicit.insert(
         "reference-frame".to_string(),
         ParamValue::Enum("first".to_string()),
+    );
+    explicit.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
     );
     let mut request = base_request(
         "strict_off_centre",
@@ -1017,6 +1301,10 @@ fn the_host_cap_sets_the_alignment_workers_but_not_the_alignment() {
     let run_with_cap = |label: &str, cap: u64| {
         let mut explicit = ParamValues::new();
         explicit.insert("max-iterations".to_string(), ParamValue::Int(20));
+        explicit.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum("anchor".to_string()),
+        );
         let mut request = base_request(label, mantis_frames(4), ParamValues::new());
         request.align = Some(AlignRequest {
             algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc registered"),
@@ -1199,6 +1487,21 @@ struct NoticeObserver {
 impl StageObserver for NoticeObserver {
     fn notice(&self, message: &str) {
         self.notices.lock().unwrap().push(message.to_string());
+    }
+}
+
+/// Collects the frame index each frame notice names.
+#[derive(Default)]
+struct FrameNoticeObserver {
+    notices: Mutex<Vec<(usize, String)>>,
+}
+
+impl StageObserver for FrameNoticeObserver {
+    fn frame_notice(&self, frame: usize, message: &str) {
+        self.notices
+            .lock()
+            .unwrap()
+            .push((frame, message.to_string()));
     }
 }
 
@@ -1469,7 +1772,7 @@ fn eq_run(
     label: &str,
     frames: &[PathBuf],
     algorithm: &str,
-    equalize: Option<f64>,
+    equalize: Option<EqualizeSettings>,
     backend: Option<&'static dyn TileBackend>,
     observer: &dyn StageObserver,
 ) -> HeldRun {
@@ -1501,11 +1804,11 @@ fn eq_run(
     }
 }
 
-fn q16(gains: impl IntoIterator<Item = f64>) -> Vec<u32> {
-    gains
-        .into_iter()
-        .map(|g| (g * f64::from(UNIT_GAIN)).round() as u32)
-        .collect()
+fn eq_settings(max_gain: f64, target_stops: f64) -> Option<EqualizeSettings> {
+    Some(EqualizeSettings {
+        max_gain,
+        target_stops,
+    })
 }
 
 #[test]
@@ -1542,7 +1845,7 @@ fn equalizing_repeated_frames_changes_nothing() {
             &format!("eq_repeat_on_{spp}"),
             &frames,
             "laplacian",
-            Some(1.25),
+            eq_settings(1.25, 0.0),
             None,
             &NoopObserver,
         );
@@ -1568,26 +1871,45 @@ fn equalizing_repeated_frames_changes_nothing() {
 }
 
 #[test]
-fn equalization_matches_the_reference_frames_brightness() {
-    let frames = brightness_stack("eq_levels", 3, &[0.9, 1.0, 1.1]);
+fn equalization_converges_every_frame_on_the_stack_mean() {
+    for spp in [1, 3] {
+        let frames = brightness_stack(&format!("eq_levels_{spp}"), spp, &[0.9, 1.0, 1.1]);
+        for stops in [0.0, 0.3] {
+            let on = eq_run(
+                &format!("eq_levels_run_{spp}_{stops}"),
+                &frames,
+                "laplacian",
+                eq_settings(2.0, stops),
+                None,
+                &NoopObserver,
+            );
+            let estimate = on.report.equalization.as_ref().unwrap();
+            assert_eq!((estimate.max_gain, estimate.target_stops), (2.0, stops));
+            let mean_of_means = estimate.frames.iter().map(|f| f.mean).sum::<f64>() / 3.0;
+            assert!((estimate.neutral - mean_of_means).abs() < 1e-6);
+            assert!((estimate.target - estimate.neutral * f64::powf(2.0, stops)).abs() < 1e-9);
+            for (i, frame) in estimate.frames.iter().enumerate() {
+                assert!(
+                    !frame.clamped && frame.clipped_samples == 0,
+                    "spp {spp} stops {stops} frame {i}: {frame:?}"
+                );
+                assert!(
+                    (frame.output_mean - estimate.target).abs() <= 1.0,
+                    "spp {spp} stops {stops} frame {i}: {frame:?} target {}",
+                    estimate.target
+                );
+            }
+        }
+    }
+    let frames = brightness_stack("eq_levels_off_frames", 3, &[0.9, 1.0, 1.1]);
     let on = eq_run(
-        "eq_levels_run",
+        "eq_levels_on",
         &frames,
         "laplacian",
-        Some(1.25),
+        eq_settings(1.25, 0.0),
         None,
         &NoopObserver,
     );
-    let estimate = on.report.equalization.as_ref().unwrap();
-    assert_eq!(estimate.max_gain, 1.25);
-    assert_eq!(estimate.reference, 1, "the middle frame of three");
-    for (frame, want) in estimate.frames.iter().zip([1.0 / 0.9, 1.0, 1.0 / 1.1]) {
-        assert!(
-            (frame.applied - want).abs() < 5e-4,
-            "gain {} vs {want}",
-            frame.applied
-        );
-    }
     let off = eq_run(
         "eq_levels_off",
         &frames,
@@ -1597,6 +1919,196 @@ fn equalization_matches_the_reference_frames_brightness() {
         &NoopObserver,
     );
     assert!(on.composite != off.composite, "the gains reach the fuse");
+}
+
+/// Records the whole-frame mean its reader delivers, for every frame it
+/// aligns and for the reference.
+struct MeanRecorder {
+    means: Mutex<std::collections::BTreeMap<usize, f64>>,
+    calls: AtomicUsize,
+}
+
+impl MeanRecorder {
+    fn leaked() -> &'static MeanRecorder {
+        Box::leak(Box::new(MeanRecorder {
+            means: Mutex::default(),
+            calls: AtomicUsize::new(0),
+        }))
+    }
+}
+
+impl AlignAlgorithm for MeanRecorder {
+    fn id(&self) -> &str {
+        "mean-recorder"
+    }
+    fn display_name(&self) -> &str {
+        "Mean Recorder"
+    }
+    fn params(&self) -> &[ParamDesc] {
+        registry::find_align("dummy-align")
+            .expect("dummy-align must be registered")
+            .params()
+    }
+    fn align_frame(
+        &self,
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        _cfg: &ParamValues,
+    ) -> Result<AlignOutcome, AlgorithmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let stack = ctx.stack();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: stack.width,
+            height: stack.height,
+        };
+        for index in [frame, ctx.reference()] {
+            let mut samples =
+                vec![0u16; (stack.width * stack.height * stack.samples_per_pixel) as usize];
+            ctx.read_tile_into(index, rect, &mut samples)?;
+            let mean = samples.iter().map(|&v| f64::from(v)).sum::<f64>() / samples.len() as f64;
+            self.means.lock().unwrap().insert(index, mean);
+        }
+        Ok(AlignOutcome {
+            transform: Transform::identity(),
+            status: AlignStatus::Converged,
+            iterations: 1,
+            residual: 1.0,
+        })
+    }
+}
+
+fn recorder_request(
+    label: &str,
+    frames: &[PathBuf],
+    recorder: &'static MeanRecorder,
+) -> FuseRequest {
+    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
+    request.align = Some(AlignRequest {
+        algorithm: recorder,
+        explicit: ParamValues::new(),
+        lax: false,
+    });
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request
+}
+
+#[test]
+fn alignment_reads_the_equalized_frames() {
+    let frames = brightness_stack("eq_align_reads", 3, &[0.9, 1.0, 1.1]);
+    let raw = MeanRecorder::leaked();
+    let request = recorder_request("eq_align_reads_off", &frames, raw);
+    focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+        .expect("an unprepared run completes");
+    let raw_means = raw.means.lock().unwrap().clone();
+    assert_eq!(raw_means.len(), 3);
+    let spread = raw_means.values().cloned().fold(f64::MIN, f64::max)
+        - raw_means.values().cloned().fold(f64::MAX, f64::min);
+    assert!(spread > 1_000.0, "the sources differ: {raw_means:?}");
+
+    let prepared = MeanRecorder::leaked();
+    let mut request = recorder_request("eq_align_reads_on", &frames, prepared);
+    request.equalize = eq_settings(2.0, 0.0);
+    let FuseOutcome::Completed(report) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+            .expect("a prepared run completes")
+    else {
+        panic!("expected a completed run");
+    };
+    let target = report.equalization.as_ref().expect("prepared").target;
+    let means = prepared.means.lock().unwrap().clone();
+    assert_eq!(means.len(), 3);
+    for (frame, mean) in means {
+        assert!(
+            (mean - target).abs() <= 1.0,
+            "frame {frame}: alignment read mean {mean}, target {target}"
+        );
+    }
+}
+
+/// Logs each stage with the job stage the control reports at that moment,
+/// and can cancel as preparation is announced.
+struct StageProbe {
+    control: Arc<JobControl>,
+    cancel_on_prepare: bool,
+    seen: Mutex<Vec<(&'static str, JobStage)>>,
+}
+
+impl StageObserver for StageProbe {
+    fn stage(&self, stage: RunStage) {
+        let label = match stage {
+            RunStage::Prepare { .. } => "prepare",
+            RunStage::Align { .. } => "align",
+            RunStage::Fuse => "fuse",
+            RunStage::Seal => "seal",
+            RunStage::Finished => "finished",
+        };
+        self.seen
+            .lock()
+            .unwrap()
+            .push((label, self.control.progress().stage));
+        if self.cancel_on_prepare && label == "prepare" {
+            self.control.cancel();
+        }
+    }
+}
+
+#[test]
+fn prepare_stage_is_reported_before_align() {
+    let frames = brightness_stack("eq_prepare_stage", 1, &[0.9, 1.0, 1.1]);
+    for (equalize, first) in [(eq_settings(1.25, 0.0), "prepare"), (None, "align")] {
+        let control = JobControl::new();
+        let probe = StageProbe {
+            control: Arc::clone(&control),
+            cancel_on_prepare: false,
+            seen: Mutex::default(),
+        };
+        let mut request = base_request("eq_prepare_stage_run", frames.clone(), ParamValues::new());
+        request.align = Some(dummy_align_request());
+        request.equalize = equalize;
+        request.output = FuseOutput::Hold(scratch("eq_prepare_stage_hold"));
+        focusforge_core::pipeline::run(&request, &probe, control, None).expect("the run completes");
+        let seen = probe.seen.lock().unwrap();
+        assert_eq!(seen[0].0, first);
+        if first == "prepare" {
+            assert_eq!(seen[0], ("prepare", JobStage::Prepare));
+            assert_eq!(seen[1], ("align", JobStage::Align));
+        } else {
+            assert!(seen.iter().all(|(label, _)| *label != "prepare"));
+        }
+    }
+}
+
+#[test]
+fn equalization_cancel_during_prepare_publishes_nothing() {
+    let frames = brightness_stack("eq_prepare_cancel", 1, &[0.9, 1.0, 1.1]);
+    let control = JobControl::new();
+    let probe = StageProbe {
+        control: Arc::clone(&control),
+        cancel_on_prepare: true,
+        seen: Mutex::default(),
+    };
+    let recorder = MeanRecorder::leaked();
+    let mut request = recorder_request("eq_prepare_cancel_run", &frames, recorder);
+    request.equalize = eq_settings(1.25, 0.0);
+    let outcome = focusforge_core::pipeline::run(&request, &probe, control, None)
+        .expect("a cancel is not an error");
+    assert!(matches!(
+        outcome,
+        FuseOutcome::Cancelled {
+            units_done: 0,
+            unit_total: 0
+        }
+    ));
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 0, "nothing aligned");
+    assert_eq!(
+        files_under(&request.scratch_root),
+        Vec::<PathBuf>::new(),
+        "nothing staged, cached or recorded"
+    );
+    let seen = probe.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "no stage past preparation: {seen:?}");
 }
 
 #[test]
@@ -1610,7 +2122,7 @@ fn equalized_run_measures_its_input_sharpness_on_the_gained_frames() {
             .expect("the sharpness window fits the frames")
     };
     let off = run("eq_metrics_off", None);
-    let on = run("eq_metrics_on", Some(1.25));
+    let on = run("eq_metrics_on", eq_settings(1.25, 0.0));
     // Variance scales with the square of brightness: the brightest frame is
     // 1.15x the reference raw and the reference once gained.
     let want = off / (1.15 * 1.15);
@@ -1628,7 +2140,7 @@ fn equalization_clamps_a_frame_beyond_the_bound_with_a_notice() {
         "eq_clamp_run",
         &frames,
         "laplacian",
-        Some(1.25),
+        eq_settings(1.25, 0.0),
         None,
         &observer,
     );
@@ -1642,9 +2154,29 @@ fn equalization_clamps_a_frame_beyond_the_bound_with_a_notice() {
         1,
         "one notice for the one clamped frame: {notices:?}"
     );
-    for part in ["1.667", "1.25", "1.67"] {
+    for part in ["1.444", "1.25", "1.45"] {
         assert!(clamp[0].contains(part), "{part} in {:?}", clamp[0]);
     }
+}
+
+#[test]
+fn equalization_frame_notice_carries_the_frame_index() {
+    let frames = brightness_stack("eq_frame_notice", 3, &[1.0, 1.0, 0.6]);
+    let observer = FrameNoticeObserver::default();
+    let run = eq_run(
+        "eq_frame_notice_run",
+        &frames,
+        "laplacian",
+        eq_settings(1.25, 0.0),
+        None,
+        &observer,
+    );
+    let estimate = run.report.equalization.as_ref().unwrap();
+    assert!(estimate.frames[2].clamped && !estimate.frames[0].clamped);
+    let notices = observer.notices.lock().unwrap();
+    assert_eq!(notices.len(), 1, "one clamped frame: {notices:?}");
+    assert_eq!(notices[0].0, 2, "the clamped frame sits at index 2");
+    assert!(notices[0].1.contains("frame 2"), "{:?}", notices[0].1);
 }
 
 #[test]
@@ -1654,7 +2186,7 @@ fn equalization_keeps_the_depth_map_on_source_frames() {
         "eq_depth_run",
         &frames,
         "depth-map",
-        Some(1.25),
+        eq_settings(1.25, 0.0),
         None,
         &NoopObserver,
     );
@@ -1671,7 +2203,7 @@ fn equalization_keeps_the_depth_map_on_source_frames() {
 fn equalization_is_recorded_on_seal_and_hold() {
     let frames = brightness_stack("eq_record", 3, &[0.9, 1.0, 1.1]);
     let mut request = base_request("eq_record_seal", frames, ParamValues::new());
-    request.equalize = Some(1.25);
+    request.equalize = eq_settings(1.25, 0.1);
     let FuseOutcome::Completed(report) =
         focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
             .expect("a sealed equalized run must complete")
@@ -1679,7 +2211,7 @@ fn equalization_is_recorded_on_seal_and_hold() {
         panic!("expected a completed run");
     };
     let estimate = report.equalization.as_ref().expect("estimate reported");
-    let want = q16(estimate.frames.iter().map(|f| f.applied));
+    let want: Vec<u32> = estimate.frames.iter().map(|f| f.gain).collect();
     assert_ne!(want, vec![UNIT_GAIN; 3]);
     let FuseProduct::Sealed(sealed) = &report.product else {
         panic!("expected a sealed project");
@@ -1692,6 +2224,7 @@ fn equalization_is_recorded_on_seal_and_hold() {
         .clone()
         .expect("the manifest records the equalization");
     assert_eq!(recorded.max_gain, 1.25);
+    assert_eq!(recorded.target_stops, 0.1);
     assert_eq!(recorded.gains, want);
 
     request.output = FuseOutput::Hold(scratch("eq_record_hold"));
@@ -1721,7 +2254,7 @@ fn equalization_reaches_every_fusion_path() {
         "eq_backend_host",
         &frames,
         "laplacian",
-        Some(1.25),
+        eq_settings(1.25, 0.0),
         None,
         &NoopObserver,
     );
@@ -1752,7 +2285,7 @@ fn equalization_reaches_every_fusion_path() {
             &format!("eq_backend_{}", name.replace(' ', "_")),
             &frames,
             "laplacian",
-            Some(1.25),
+            eq_settings(1.25, 0.0),
             Some(backend),
             &NoopObserver,
         );
@@ -1762,11 +2295,11 @@ fn equalization_reaches_every_fusion_path() {
 }
 
 #[test]
-fn toggling_equalization_reuses_the_cached_alignment() {
+fn equalization_change_misses_the_cached_alignment() {
     let frames = brightness_stack("eq_cache", 3, &[0.9, 1.0, 1.1]);
     let root = scratch("eq_cache_root");
     let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
-    let run_once = |label: &str, equalize: Option<f64>| {
+    let run_once = |label: &str, equalize: Option<EqualizeSettings>| {
         let mut request = base_request(label, frames.clone(), ParamValues::new());
         request.scratch_root = root.join("scratch");
         request.align = Some(dummy_align_request());
@@ -1783,10 +2316,227 @@ fn toggling_equalization_reuses_the_cached_alignment() {
         };
         report
     };
-    let first = run_once("eq_cache_off", None);
-    assert!(!first.align_cached);
-    let second = run_once("eq_cache_on", Some(1.25));
-    assert!(second.align_cached, "an equalized run reuses the alignment");
-    assert_eq!(second.align_source, "cached");
-    assert!(second.equalization.is_some());
+    assert!(!run_once("eq_cache_off", None).align_cached);
+    assert!(
+        run_once("eq_cache_off_again", None).align_cached,
+        "unchanged: a hit"
+    );
+    let on = run_once("eq_cache_on", eq_settings(1.25, 0.0));
+    assert!(!on.align_cached, "preparing the sources is another input");
+    assert!(on.equalization.is_some());
+    assert!(run_once("eq_cache_on_again", eq_settings(1.25, 0.0)).align_cached);
+    assert!(
+        !run_once("eq_cache_target", eq_settings(1.25, 0.1)).align_cached,
+        "another target changes the gains"
+    );
+    assert!(
+        run_once("eq_cache_bound", eq_settings(1.5, 0.0)).align_cached,
+        "a bound that leaves every gain identical still hits"
+    );
+}
+
+/// One held run over `frames` with alignment and the stage cache, scratch
+/// shared under `root`.
+fn cached_run(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    equalize: Option<EqualizeSettings>,
+    observer: &dyn StageObserver,
+    cache: &StageCache,
+) -> Result<FuseOutcome, PipelineError> {
+    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
+    request.scratch_root = root.join("scratch");
+    request.align = Some(dummy_align_request());
+    request.equalize = equalize;
+    request.output = FuseOutput::Hold(root.join(label));
+    focusforge_core::pipeline::run(&request, observer, JobControl::new(), Some(cache))
+}
+
+fn completed(outcome: Result<FuseOutcome, PipelineError>) -> FuseReport {
+    let FuseOutcome::Completed(report) = outcome.expect("the run must complete") else {
+        panic!("expected a completed run");
+    };
+    *report
+}
+
+/// The align-stage key digest of the stack at `frames`, built from the TIFF
+/// headers alone.
+fn header_key_digest(frames: &[PathBuf]) -> String {
+    let fingerprint = StackFingerprint {
+        frames: frames
+            .iter()
+            .map(|p| FrameFingerprint::from(&FrameDesc::from(&TiffHeader::open(p).unwrap())))
+            .collect(),
+    };
+    let identity = AlignIdentity::new(
+        "dummy-align",
+        ParamValues::new(),
+        FailurePolicy::Strict,
+        Vec::new(),
+    );
+    StageKey::align(&fingerprint, &identity).digest()
+}
+
+#[test]
+fn same_headers_different_pixels_miss_the_stage_cache() {
+    let first = brightness_stack("ci_miss_a", 3, &[0.9, 1.0, 1.1]);
+    let second = brightness_stack("ci_miss_b", 3, &[1.1, 0.8, 1.0]);
+    assert_eq!(
+        header_key_digest(&first),
+        header_key_digest(&second),
+        "the two stacks must be indistinguishable by their headers"
+    );
+    assert_ne!(
+        std::fs::read(&first[0]).unwrap(),
+        std::fs::read(&second[0]).unwrap(),
+        "the two stacks must differ in pixels"
+    );
+
+    let root = scratch("ci_miss_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let run = |label: &str, frames: &[PathBuf]| {
+        completed(cached_run(
+            label,
+            frames,
+            &root,
+            None,
+            &NoopObserver,
+            &cache,
+        ))
+    };
+    assert!(!run("first", &first).align_cached);
+    assert!(
+        !run("second", &second).align_cached,
+        "other pixels under the same headers must not reuse the alignment"
+    );
+}
+
+#[test]
+fn identical_content_at_another_path_hits_the_stage_cache() {
+    let first = brightness_stack("ci_hit_a", 3, &[0.9, 1.0, 1.1]);
+    let other_dir = scratch("ci_hit_copy");
+    let copies: Vec<PathBuf> = first
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let copy = other_dir.join(format!("renamed-{}.tif", 9 - i));
+            std::fs::copy(p, &copy).unwrap();
+            copy
+        })
+        .collect();
+
+    let root = scratch("ci_hit_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let run = |label: &str, frames: &[PathBuf]| {
+        completed(cached_run(
+            label,
+            frames,
+            &root,
+            None,
+            &NoopObserver,
+            &cache,
+        ))
+    };
+    let computed = run("first", &first);
+    assert!(!computed.align_cached);
+    let reused = run("second", &copies);
+    assert!(
+        reused.align_cached,
+        "the same bytes under other names must hit"
+    );
+    let transforms = |report: &FuseReport| -> Vec<Transform> {
+        report
+            .align
+            .as_ref()
+            .expect("an aligned run reports its alignment")
+            .alignment
+            .frames
+            .iter()
+            .map(|f| f.transform)
+            .collect()
+    };
+    assert_transforms_bit_eq(&transforms(&reused), &transforms(&computed), "cached");
+}
+
+/// Removes every permission from `path` at the first frame notice, the one
+/// observer call after the equalization pass has mapped every frame and
+/// before the stage-cache lookup; the open mappings keep working.
+#[cfg(unix)]
+struct LockFrame {
+    path: PathBuf,
+    still_readable: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+impl StageObserver for LockFrame {
+    fn frame_notice(&self, _frame: usize, _message: &str) {
+        set_mode(&self.path, 0o000);
+        self.still_readable
+            .store(std::fs::File::open(&self.path).is_ok(), Ordering::SeqCst);
+    }
+}
+
+/// Puts a frame's mode back when the test ends, panic or not.
+#[cfg(unix)]
+struct RestoreMode(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        set_mode(&self.0, 0o644);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unhashable_frame_is_a_stage_cache_miss() {
+    // The dim last frame is clamped by the equalization bound, which raises
+    // the frame notice that locks the file.
+    let frames = brightness_stack("ci_unhash", 3, &[1.0, 1.0, 0.6]);
+    let root = scratch("ci_unhash_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let entries = root.join("scratch").join("stage-cache").join("align");
+    let entry_count = || std::fs::read_dir(&entries).map_or(0, Iterator::count);
+    let _restore = RestoreMode(frames[1].clone());
+    let equalize = eq_settings(1.25, 0.0);
+    // `None` when the frame stays readable at mode 000 (a privileged user).
+    let locked_run = |label: &str| -> Option<FuseReport> {
+        let observer = LockFrame {
+            path: frames[1].clone(),
+            still_readable: std::sync::atomic::AtomicBool::new(true),
+        };
+        let outcome = cached_run(label, &frames, &root, equalize, &observer, &cache);
+        set_mode(&frames[1], 0o644);
+        (!observer.still_readable.load(Ordering::SeqCst)).then(|| completed(outcome))
+    };
+
+    let Some(report) = locked_run("first") else {
+        eprintln!("skipped: the frame stays readable at mode 000 for this user");
+        return;
+    };
+    assert!(!report.align_cached);
+    assert_eq!(entry_count(), 0, "an unhashable frame must leave no entry");
+
+    let populated = completed(cached_run(
+        "populate",
+        &frames,
+        &root,
+        equalize,
+        &NoopObserver,
+        &cache,
+    ));
+    assert!(!populated.align_cached);
+    assert_eq!(entry_count(), 1, "the readable run populates the cache");
+    let report = locked_run("second").expect("the frame is still unreadable");
+    assert!(
+        !report.align_cached,
+        "a frame that cannot be hashed must not hit"
+    );
 }

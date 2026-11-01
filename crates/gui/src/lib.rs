@@ -41,7 +41,7 @@ pub mod brush;
 /// `src/main.rs`/`src/picker.rs`/`src/bridge.rs` reach its types directly.
 pub mod entry;
 
-/// The native folder/file picker -- blocking, never `AsyncFileDialog`.
+/// The native folder/file picker, opened without blocking the event loop.
 /// `pub` so `src/bridge.rs` can call it.
 pub mod picker;
 
@@ -95,6 +95,14 @@ pub mod screenshot;
 /// reaches its types directly.
 pub mod job;
 
+/// The session's retained notifications, toast queue and read/routing rules.
+/// No `use slint::` anywhere in it. `pub` so the integration tests reach its
+/// types directly.
+pub mod notifications;
+
+/// The boundary to the operating system's notification service.
+pub mod native_notify;
+
 /// The `Images` dock panel model, and the frame-set-change warnings' copy --
 /// no `use slint::` anywhere in it. `pub` so `tests/images.rs` reaches its
 /// types directly.
@@ -109,6 +117,9 @@ pub mod overlay;
 pub mod export_settings;
 
 pub mod performance_settings;
+
+pub mod appearance_settings;
+pub mod source_previews;
 
 /// The `Recent` list's own file format, mirroring `crate::input_config`. No
 /// `use slint::` anywhere in it. `pub` so `src/main.rs` and
