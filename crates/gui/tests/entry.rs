@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use focusforge_gui::entry::ImportRefused;
+use focusforge_gui::entry::{GuiProject, ImportRefused};
 use focusforge_gui::job::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome, ShellMode};
@@ -1978,13 +1978,13 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
 
 type TabGeometry = (Option<(u32, u32)>, Option<(usize, u32, u32, u32)>);
 
-fn unsaved(dir: &Path, frames: Vec<PathBuf>) -> focusforge_gui::entry::GuiProject {
-    focusforge_gui::entry::GuiProject::Unsaved(focusforge_core::io::one_group(dir, frames))
+fn unsaved(dir: &Path, frames: Vec<PathBuf>) -> GuiProject {
+    GuiProject::Unsaved(focusforge_core::io::one_group(dir, frames))
 }
 
 /// What both tab helpers report for `project`: the size, and the context as
 /// (frame count, width, height, samples per pixel).
-fn tab_geometry(project: &focusforge_gui::entry::GuiProject) -> TabGeometry {
+fn tab_geometry(project: &GuiProject) -> TabGeometry {
     use focusforge_gui::entry::{tab_image_size, tab_stack_context};
     let context =
         tab_stack_context(project).map(|c| (c.frame_count, c.width, c.height, c.samples_per_pixel));
@@ -2112,7 +2112,7 @@ fn reopened_jpeg_project_reports_source_size() {
         .collect();
     let project_path = seal_test_project(&dir, &sources);
     let project = focusforge_core::project::Project::open(&project_path).expect("project opens");
-    let project = focusforge_gui::entry::GuiProject::Opened(Box::new(project));
+    let project = GuiProject::Opened(Box::new(project));
     assert_eq!(
         focusforge_gui::entry::tab_image_size(&project),
         Some((24, 16))
