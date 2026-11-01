@@ -831,8 +831,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         ShellEvent::SettingsChanged | ShellEvent::SettingsScrolled => InputSurface::Settings,
         ShellEvent::ImagesChanged | ShellEvent::ImagesScrolled => InputSurface::Images,
         ShellEvent::EditorChanged => InputSurface::Other,
-        ShellEvent::WindowDragRequested
-        | ShellEvent::WindowMinimizeRequested
+        ShellEvent::WindowMinimizeRequested
         | ShellEvent::WindowCloseRequested
         | ShellEvent::WindowChrome { .. }
         | ShellEvent::DetachedWindowCloseRequested
@@ -1128,11 +1127,15 @@ fn open_comparison(
         }
     });
     let controller_for_chrome = controller.clone();
-    window.on_window_drag_requested(move || {
-        controller_for_chrome
-            .lock()
-            .unwrap()
-            .window_chrome(WindowTarget::Comparison, WindowChromeIntent::Drag);
+    window.on_window_drag_pointer(move |pointer_button, down| {
+        if down {
+            record_direct_input();
+        }
+        controller_for_chrome.lock().unwrap().window_drag_pointer(
+            WindowTarget::Comparison,
+            button(pointer_button),
+            down,
+        );
     });
     let controller_for_chrome = controller.clone();
     window.on_window_minimize_requested(move || {
@@ -1213,6 +1216,17 @@ fn hide_comparison() {
     }
 }
 
+/// Starts the compositor's window move for `window`. Both results are
+/// discarded: `with_winit_window` returns `None` off the winit backend or
+/// an inactive event loop, and a refused move is a no-op, not an error to
+/// surface. macOS starts the move from the current event, which is the
+/// mouse-down only while the press is being dispatched.
+fn drag_native(window: &slint::Window) {
+    window.with_winit_window(|native| {
+        let _ = native.drag_window();
+    });
+}
+
 /// Applies native chrome to the currently visible detached window only.
 fn perform_comparison_chrome(intent: WindowChromeIntent) {
     COMPARISON_WINDOW.with(|slot| {
@@ -1220,11 +1234,6 @@ fn perform_comparison_chrome(intent: WindowChromeIntent) {
             return;
         };
         match intent {
-            WindowChromeIntent::Drag => {
-                window.window().with_winit_window(|native| {
-                    let _ = native.drag_window();
-                });
-            }
             WindowChromeIntent::Minimize => window.window().set_minimized(true),
             WindowChromeIntent::ToggleMaximize => {
                 let maximized = window
@@ -2818,6 +2827,26 @@ pub fn install(
 
     {
         let app_weak = app.as_weak();
+        controller
+            .lock()
+            .unwrap()
+            .set_native_drag(Arc::new(move |target| match target {
+                WindowTarget::Main => {
+                    if let Some(app) = app_weak.upgrade() {
+                        drag_native(app.window());
+                    }
+                }
+                WindowTarget::Comparison => {
+                    let window = COMPARISON_WINDOW.with(|slot| slot.borrow().as_ref().cloned());
+                    if let Some(window) = window {
+                        drag_native(window.window());
+                    }
+                }
+            }));
+    }
+
+    {
+        let app_weak = app.as_weak();
         let controller_for_sink = controller.clone();
         controller.lock().unwrap().set_sink(Arc::new(move |event| {
             let app_weak = app_weak.clone();
@@ -2883,11 +2912,17 @@ pub fn install(
         });
     }
 
-    app.on_window_drag_requested({
+    app.on_window_drag_pointer({
         let controller = controller.clone();
-        move || {
-            record_direct_input();
-            controller.lock().unwrap().tab_strip_pressed()
+        move |pointer_button, down| {
+            if down {
+                record_direct_input();
+            }
+            controller.lock().unwrap().window_drag_pointer(
+                WindowTarget::Main,
+                button(pointer_button),
+                down,
+            )
         }
     });
     app.on_window_minimize_requested({
@@ -4754,20 +4789,10 @@ pub fn push_export_view(app: &AppWindow, view: &crate::export_settings::ExportVi
     app.set_export_metadata_on(view.metadata);
 }
 
-/// Performs one [`ShellEvent`] against the window. The only function in the
-/// crate that names `winit`.
+/// Performs one [`ShellEvent`] against the window.
 fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: ShellEvent) {
     let _publication = model_publication_scope(&event);
     match event {
-        ShellEvent::WindowDragRequested => {
-            // Both results discarded deliberately: `with_winit_window`
-            // returns `None` off the winit backend or an inactive event
-            // loop, and a refused compositor move is a no-op, not an error
-            // to surface. Never `unwrap` either.
-            app.window().with_winit_window(|w| {
-                let _ = w.drag_window();
-            });
-        }
         // `minimized`/`maximized` are native-window state, reached through
         // the runtime `Window` API rather than as generated root-property
         // accessors (`i-slint-core` 1.17.1's `Window` runtime API).
@@ -4985,14 +5010,18 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
 
 #[cfg(test)]
 mod tests {
+    use slint::ComponentHandle as _;
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use crate::diagnostics::{enable_trace_accounting, timing_snapshot};
 
     use super::{
-        AppController, DockTab, ShellEvent, finish_input_trace, model_publication_scope,
-        record_frame_rendered, record_gallery_input, record_images_input, record_settings_input,
-        record_surface_input,
+        AppController, DockTab, PaneSource, ProjectTabView, ShellEvent, ShellMode, WindowTarget,
+        finish_input_trace, model_publication_scope, record_frame_rendered, record_gallery_input,
+        record_images_input, record_settings_input, record_surface_input,
     };
     use crate::diagnostics::{
         InputSurface, finish_input_batches, record_coalesced_input, record_destroyed_window,
@@ -5281,5 +5310,229 @@ mod tests {
             batches[..4].iter().all(Option::is_none),
             "no checkpoint scroll callback records under another surface: {batches:?}"
         );
+    }
+
+    /// Re-runs the named test alone in a child process and reports `true`
+    /// when the caller is the parent and has nothing left to do. The window
+    /// tests install the testing backend, and the other tests here assert on
+    /// process-wide trace accounting that a stray input would disturb.
+    fn runs_in_child(name: &str) -> bool {
+        const CHILD: &str = "FOCUSFORGE_GUI_WINDOW_DRAG_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test binary has a path"),
+        )
+        .args(["--exact", name, "--test-threads=1"])
+        .env(CHILD, "1")
+        .status()
+        .expect("the isolated window test starts");
+        assert!(
+            status.success(),
+            "the isolated window test passes: {status}"
+        );
+        true
+    }
+
+    /// The element's `(x, y, width, height)` in window coordinates.
+    fn rect_of(root: &impl slint::ComponentHandle, id: &str) -> (f32, f32, f32, f32) {
+        let element = i_slint_backend_testing::ElementQuery::from_root(root)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("no element matched id {id:?}"));
+        let (position, size) = (element.absolute_position(), element.size());
+        (position.x, position.y, size.width, size.height)
+    }
+
+    fn centre_of(root: &impl slint::ComponentHandle, id: &str) -> (f32, f32) {
+        let (x, y, w, h) = rect_of(root, id);
+        (x + w / 2.0, y + h / 2.0)
+    }
+
+    /// One press, a move with the button held and the release. `at_press` is
+    /// what the hook must hold by the time the press returns; the move and
+    /// the release must add nothing.
+    fn press_cycle(
+        window: &slint::Window,
+        calls: &Mutex<Vec<WindowTarget>>,
+        at: (f32, f32),
+        button: slint::platform::PointerEventButton,
+        at_press: &[WindowTarget],
+    ) {
+        use slint::platform::WindowEvent;
+        let position = slint::LogicalPosition::new(at.0, at.1);
+        let before = calls.lock().unwrap().len();
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        assert_eq!(calls.lock().unwrap().len(), before, "a move at {at:?}");
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        assert_eq!(
+            calls.lock().unwrap()[before..],
+            *at_press,
+            "{button:?} press at {at:?}"
+        );
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(at.0 + 7.0, at.1),
+        });
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        assert_eq!(
+            calls.lock().unwrap().len() - before,
+            at_press.len(),
+            "{button:?} move and release at {at:?}"
+        );
+    }
+
+    /// An installed bridge on the testing backend, with a counting hook to
+    /// swap in for the bridge's own.
+    struct DragRig {
+        app: super::AppWindow,
+        controller: Arc<Mutex<AppController>>,
+        canvas: Rc<RefCell<super::Canvas>>,
+        calls: Arc<Mutex<Vec<WindowTarget>>>,
+        _installed: super::Installed,
+    }
+
+    impl DragRig {
+        fn new() -> Self {
+            i_slint_backend_testing::init_no_event_loop();
+            let app = super::AppWindow::new().unwrap();
+            let controller = Arc::new(Mutex::new(AppController::new()));
+            let canvas = Rc::new(RefCell::new(super::Canvas::default()));
+            let installed = super::install(
+                &app,
+                controller.clone(),
+                canvas.clone(),
+                Rc::new(RefCell::new(None)),
+            );
+            // No event loop runs here, so a sink that drops events replaces
+            // the one that defers them.
+            controller.lock().unwrap().set_sink(Arc::new(|_| {}));
+            Self {
+                app,
+                controller,
+                canvas,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                _installed: installed,
+            }
+        }
+
+        fn count_calls(&self) {
+            let calls = self.calls.clone();
+            self.controller
+                .lock()
+                .unwrap()
+                .set_native_drag(Arc::new(move |target| calls.lock().unwrap().push(target)));
+        }
+
+        fn shell_state(&self) -> (bool, ShellMode, Option<PaneSource>) {
+            let controller = self.controller.lock().unwrap();
+            (
+                controller.maximized(),
+                controller.mode(),
+                controller.detached_pane(),
+            )
+        }
+    }
+
+    #[test]
+    fn window_drag_starts_once_per_left_press_on_the_tab_strip() {
+        use slint::platform::PointerEventButton::{Left, Middle, Right};
+
+        const NAME: &str = "bridge::tests::window_drag_starts_once_per_left_press_on_the_tab_strip";
+        if runs_in_child(NAME) {
+            return;
+        }
+        let rig = DragRig::new();
+        let window = rig.app.window();
+        window.set_size(slint::PhysicalSize::new(1440, 900));
+        // The empty strip between the "+" box and the window controls.
+        let empty = || {
+            let (x, y, w, h) = rect_of(&rig.app, "FFTabStrip::plus-button");
+            let (glyphs_x, ..) = rect_of(&rig.app, "FFTabStrip::window-glyphs");
+            ((x + w + glyphs_x) / 2.0, y + h / 2.0)
+        };
+
+        // The bridge's own hook finds no native window on the testing
+        // backend and leaves the shell as it was.
+        let state = rig.shell_state();
+        press_cycle(window, &Mutex::new(Vec::new()), empty(), Left, &[]);
+        assert_eq!(rig.shell_state(), state);
+
+        rig.count_calls();
+        for (width, height) in [(1440, 900), (1024, 700)] {
+            window.set_size(slint::PhysicalSize::new(width, height));
+            press_cycle(window, &rig.calls, empty(), Left, &[WindowTarget::Main]);
+            press_cycle(window, &rig.calls, empty(), Right, &[]);
+            press_cycle(window, &rig.calls, empty(), Middle, &[]);
+        }
+
+        rig.app.set_project_tabs(
+            Rc::new(slint::VecModel::from(vec![ProjectTabView {
+                title: "tab".into(),
+                unsaved: false,
+                selected: true,
+                run_mark_icon: "".into(),
+            }]))
+            .into(),
+        );
+        for id in [
+            "FFTabStrip::tab-instance",
+            "FFTabStrip::projects-button",
+            "FFTabStrip::window-minimize",
+        ] {
+            press_cycle(window, &rig.calls, centre_of(&rig.app, id), Left, &[]);
+        }
+        assert_eq!(rig.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn window_drag_starts_once_per_left_press_on_the_comparison_bar() {
+        use slint::platform::PointerEventButton::{Left, Middle, Right};
+
+        const NAME: &str =
+            "bridge::tests::window_drag_starts_once_per_left_press_on_the_comparison_bar";
+        if runs_in_child(NAME) {
+            return;
+        }
+        let rig = DragRig::new();
+        let frames = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames");
+        {
+            let mut controller = rig.controller.lock().unwrap();
+            if let Some(load) = controller.open_paths(&[frames]) {
+                load.join().expect("the load worker did not panic");
+            }
+            controller.settle_open().expect("the fixture load settles");
+            controller.undock_requested(PaneSource::Frame);
+        }
+        super::open_comparison(&rig.app, PaneSource::Frame, &rig.controller, &rig.canvas)
+            .expect("the detached window opens on the testing backend");
+        let detached = super::COMPARISON_WINDOW
+            .with(|slot| slot.borrow().as_ref().cloned())
+            .expect("the detached window is kept");
+        let window = detached.window();
+        // The bar's title area, left of its three controls.
+        let title = || centre_of(&*detached, "FFWindowBar::drag-area");
+
+        let state = rig.shell_state();
+        press_cycle(window, &Mutex::new(Vec::new()), title(), Left, &[]);
+        assert_eq!(rig.shell_state(), state);
+
+        rig.count_calls();
+        for (width, height) in [(820, 600), (600, 400)] {
+            window.set_size(slint::PhysicalSize::new(width, height));
+            press_cycle(
+                window,
+                &rig.calls,
+                title(),
+                Left,
+                &[WindowTarget::Comparison],
+            );
+            press_cycle(window, &rig.calls, title(), Right, &[]);
+            press_cycle(window, &rig.calls, title(), Middle, &[]);
+            for id in ["FFWindowBar::minimize", "FFWindowBar::maximize"] {
+                press_cycle(window, &rig.calls, centre_of(&*detached, id), Left, &[]);
+            }
+        }
+        super::hide_comparison();
     }
 }
