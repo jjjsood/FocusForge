@@ -12,8 +12,9 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use focusforge_core::io::{
-    ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
-    all_frame_paths, classify_header, has_extension, is_frame_path,
+    ByteOrder, FrameDesc, FrameReader, JPEG_EXTENSIONS, JpegStack, RAW_EXTENSIONS, RawMetadata,
+    RawStack, ReaderKind, TiffError, TiffHeader, all_frame_paths, classify_header, has_extension,
+    is_frame_path,
 };
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::Project;
@@ -133,7 +134,7 @@ fn verbosity(cli: &Cli) -> i8 {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print project, TIFF or RAW metadata for a file, or for every frame in a directory.
+    /// Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory.
     Info {
         /// Path to a file or directory.
         path: PathBuf,
@@ -152,12 +153,12 @@ enum Command {
         #[command(flatten)]
         set: set::SetArgs,
     },
-    /// Fuse supported TIFF or RAW frames of a directory into one **project** per
+    /// Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per
     /// detected stack, through a registered stacking algorithm. A run
     /// prepares projects for review; it does not export images -- run
     /// `focusforge-cli export` for that.
     Stack {
-        /// Directory of TIFF or supported RAW frames to fuse (non-recursive, descending into
+        /// Directory of TIFF, 8-bit JPEG or supported RAW frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
         /// Directory to collect this run's projects into. Omit to write
@@ -736,6 +737,9 @@ struct FileReport {
     path: String,
     width: Option<u32>,
     height: Option<u32>,
+    /// EXIF Orientation of a TIFF frame; `width` and `height` are already
+    /// upright.
+    orientation: Option<u16>,
     bits_per_sample: Option<Vec<u16>>,
     samples_per_pixel: Option<u32>,
     byte_order: Option<String>,
@@ -871,6 +875,10 @@ fn info(path: &Path, json: bool) -> ExitCode {
             if let Err(err) = RawStack::open_files(&[path.to_path_buf()]) {
                 return fail(err);
             }
+        } else if is_jpeg_path(path) {
+            if let Err(err) = JpegStack::open_files(&[path.to_path_buf()]) {
+                return fail(err);
+            }
         } else if let Err(err) = TiffHeader::open(path) {
             return fail(err);
         }
@@ -965,11 +973,15 @@ fn is_raw_path(path: &Path) -> bool {
     has_extension(path, RAW_EXTENSIONS)
 }
 
+fn is_jpeg_path(path: &Path) -> bool {
+    has_extension(path, JPEG_EXTENSIONS)
+}
+
 fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
     let paths = all_frame_paths(dir)?;
     let paths: Vec<_> = paths
         .into_iter()
-        .filter(|path| is_raw_path(path) || is_frame_path(path))
+        .filter(|path| is_raw_path(path) || is_jpeg_path(path) || is_frame_path(path))
         .collect();
     if paths.is_empty() {
         return Err(TiffError::NoFrames {
@@ -986,13 +998,14 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
     enum Probe {
         Tiff(Box<TiffHeader>),
         Raw(Box<RawMetadata>, Box<FrameDesc>),
+        Jpeg(Box<FrameDesc>),
     }
 
     impl Probe {
         fn desc(&self) -> FrameDesc {
             match self {
                 Self::Tiff(header) => FrameDesc::from(header.as_ref()),
-                Self::Raw(_, desc) => (**desc).clone(),
+                Self::Raw(_, desc) | Self::Jpeg(desc) => (**desc).clone(),
             }
         }
     }
@@ -1022,6 +1035,10 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                         )?;
                         Ok(Probe::Raw(Box::new(metadata), Box::new(desc)))
                     })
+                    .map_err(|error| error.to_string())
+            } else if is_jpeg_path(p) {
+                JpegStack::open_files(std::slice::from_ref(p))
+                    .map(|stack| Probe::Jpeg(Box::new(stack.frame(0).clone())))
                     .map_err(|error| error.to_string())
             } else {
                 TiffHeader::open(p)
@@ -1058,8 +1075,9 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
             Ok(Probe::Tiff(h)) => FileReport {
                 name: p.name.clone(),
                 path: p.path.display().to_string(),
-                width: Some(h.width),
-                height: Some(h.height),
+                width: Some(h.upright_dimensions().0),
+                height: Some(h.upright_dimensions().1),
+                orientation: Some(h.orientation),
                 bits_per_sample: Some(h.bits_per_sample.to_vec()),
                 samples_per_pixel: Some(h.samples_per_pixel),
                 byte_order: Some(byte_order_str(h.byte_order).to_string()),
@@ -1081,6 +1099,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 path: p.path.display().to_string(),
                 width: None,
                 height: None,
+                orientation: None,
                 bits_per_sample: None,
                 samples_per_pixel: None,
                 byte_order: None,
@@ -1099,11 +1118,34 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 raw: Some(RawRecord::from(metadata.as_ref())),
                 error: None,
             },
+            Ok(Probe::Jpeg(desc)) => FileReport {
+                name: p.name.clone(),
+                path: p.path.display().to_string(),
+                width: Some(desc.width),
+                height: Some(desc.height),
+                orientation: None,
+                bits_per_sample: Some(vec![8; desc.samples_per_pixel as usize]),
+                samples_per_pixel: Some(desc.samples_per_pixel),
+                byte_order: None,
+                compression: None,
+                photometric: None,
+                planar_config: None,
+                rows_per_strip: None,
+                strip_count: None,
+                file_size: Some(desc.file_size),
+                description: None,
+                mmap_fast_path: None,
+                reader: Some(ReaderKind::Jpeg.name().to_string()),
+                refusal: None,
+                raw: None,
+                error: None,
+            },
             Err(e) => FileReport {
                 name: p.name.clone(),
                 path: p.path.display().to_string(),
                 width: None,
                 height: None,
+                orientation: None,
                 bits_per_sample: None,
                 samples_per_pixel: None,
                 byte_order: None,
@@ -1176,6 +1218,17 @@ fn print_human(report: &InfoReport) {
             println!("  decoder: {}", raw.decoder);
             continue;
         }
+        if file.reader.as_deref() == Some(ReaderKind::Jpeg.name()) {
+            println!(
+                "  {}x{} {}ch 8-bit JPEG file_size={}",
+                file.width.unwrap_or(0),
+                file.height.unwrap_or(0),
+                file.samples_per_pixel.unwrap_or(0),
+                file.file_size.unwrap_or(0),
+            );
+            println!("  reader: {}", ReaderKind::Jpeg.name());
+            continue;
+        }
         println!(
             "  {}x{} {}ch {}-bit {} compression={} planar={} photometric={}",
             file.width.unwrap_or(0),
@@ -1196,6 +1249,9 @@ fn print_human(report: &InfoReport) {
             file.strip_count.unwrap_or(0),
             file.file_size.unwrap_or(0),
         );
+        if let Some(orientation) = file.orientation.filter(|&value| value != 1) {
+            println!("  orientation: {orientation}");
+        }
         if let Some(description) = &file.description {
             println!("  description: {description}");
         }
@@ -1210,22 +1266,34 @@ fn print_human(report: &InfoReport) {
 
     if report.is_directory {
         println!();
-        let raw_count = report
-            .files
-            .iter()
-            .filter(|file| is_raw_path(Path::new(&file.path)))
-            .count();
-        if raw_count == 0 {
+        let count = |is_format: fn(&Path) -> bool| {
+            report
+                .files
+                .iter()
+                .filter(|file| is_format(Path::new(&file.path)))
+                .count()
+        };
+        let (raw_count, jpeg_count) = (count(is_raw_path), count(is_jpeg_path));
+        if raw_count + jpeg_count == 0 {
             println!(
                 "{} TIFFs, {} bytes total",
                 report.frame_count, report.total_bytes
             );
         } else {
+            let mut formats = vec![format!(
+                "{} TIFF",
+                report.frame_count - raw_count - jpeg_count
+            )];
+            if jpeg_count > 0 {
+                formats.push(format!("{jpeg_count} JPEG"));
+            }
+            if raw_count > 0 {
+                formats.push(format!("{raw_count} RAW"));
+            }
             println!(
-                "{} frames ({} TIFF, {} RAW), {} bytes total",
+                "{} frames ({}), {} bytes total",
                 report.frame_count,
-                report.frame_count - raw_count,
-                raw_count,
+                formats.join(", "),
                 report.total_bytes
             );
         }
@@ -1260,6 +1328,7 @@ mod tests {
             path: PathBuf::from(label),
             file_size: 0,
             image_description: None,
+            orientation: 1,
             width: 1,
             height: 1,
             samples_per_pixel: 1,

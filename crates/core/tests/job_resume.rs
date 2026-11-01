@@ -23,14 +23,17 @@ use focusforge_core::align::{
 };
 use focusforge_core::equalize::{Equalization, UNIT_GAIN};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-use focusforge_core::io::{FrameReader, TiffStack};
+use focusforge_core::io::test_frames::{
+    ByteOrderSpec, FrameMetadata, shorts_bo, write_frame_with_metadata,
+};
+use focusforge_core::io::{ByteOrder, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::job::fingerprint::{FrameFingerprint, StackFingerprint};
 use focusforge_core::job::record::JobRecord;
 use focusforge_core::job::{AlignIdentity, Job, JobOutcome, Resumable, ResumeStore};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
 use focusforge_core::tile::{
-    NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
+    HostBudget, NoopPreprocess, TileConsumer, TileJob, TileScheduler, TileSchedulerOptions,
 };
 
 fn scratch_base(label: &str) -> PathBuf {
@@ -75,16 +78,16 @@ fn geometry(stack_ctx: StackContext) -> FusionGeometry {
     }
 }
 
-fn stack_fingerprint(stack: &TiffStack) -> StackFingerprint {
+fn stack_fingerprint(stack: &dyn FrameReader) -> StackFingerprint {
     StackFingerprint {
         frames: (0..stack.len())
-            .map(|i| FrameFingerprint::from(FrameReader::frame(stack, i)))
+            .map(|i| FrameFingerprint::from(stack.frame(i)))
             .collect(),
     }
 }
 
 fn job_record(
-    stack: &TiffStack,
+    stack: &dyn FrameReader,
     values: &ParamValues,
     composite_path: &std::path::Path,
     zmap_path: Option<&std::path::Path>,
@@ -146,6 +149,149 @@ fn resume_store_rejects_a_ledger_missing_raw_identity() {
         store.find(&record).expect("find must succeed"),
         Resumable::None
     ));
+}
+
+const ORIENTATION_BYTE_ORDER: ByteOrder = ByteOrder::Big;
+
+fn write_tagged_tiff(path: &std::path::Path, orientation: u16) {
+    write_frame_with_metadata(
+        path,
+        24,
+        16,
+        &FrameMetadata {
+            byte_order: ByteOrderSpec(ORIENTATION_BYTE_ORDER),
+            ifd0: vec![(274, 3, shorts_bo(ORIENTATION_BYTE_ORDER, &[orientation]))],
+            ..Default::default()
+        },
+    )
+    .expect("tagged frame writes");
+}
+
+/// An 8x4 RGB JPEG whose little-endian EXIF segment holds one Orientation entry.
+fn write_tagged_jpeg(path: &std::path::Path, orientation: u16) {
+    let mut exif = b"II".to_vec();
+    exif.extend(42_u16.to_le_bytes());
+    exif.extend(8_u32.to_le_bytes());
+    exif.extend(1_u16.to_le_bytes());
+    exif.extend(274_u16.to_le_bytes());
+    exif.extend(3_u16.to_le_bytes());
+    exif.extend(1_u32.to_le_bytes());
+    exif.extend(orientation.to_le_bytes());
+    exif.extend([0, 0]);
+    exif.extend(0_u32.to_le_bytes());
+    let pixels: Vec<u8> = (0..8 * 4 * 3).map(|i| (i * 7 % 251) as u8).collect();
+    let mut out = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut out, 90);
+    encoder.add_exif_metadata(&exif).expect("EXIF segment fits");
+    encoder
+        .encode(&pixels, 8, 4, jpeg_encoder::ColorType::Rgb)
+        .expect("frame encodes");
+    std::fs::write(path, out).expect("frame writes");
+}
+
+/// Two frames named `a` and `b` under a fresh scratch directory, both written
+/// by `write` with orientation 1.
+fn tagged_pair(
+    label: &str,
+    extension: &str,
+    write: fn(&std::path::Path, u16),
+) -> (PathBuf, [PathBuf; 2]) {
+    let scratch = scratch_base(label);
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch must exist");
+    let paths = ["a", "b"].map(|name| scratch.join(format!("{name}.{extension}")));
+    for path in &paths {
+        write(path, 1);
+    }
+    (scratch, paths)
+}
+
+fn record_for(paths: &[PathBuf; 2], scratch: &std::path::Path) -> JobRecord {
+    let set = open_frame_set(paths, HostBudget::explicit(1 << 30)).expect("frames open");
+    let composite = scratch.join("composite.tif");
+    std::fs::write(&composite, []).expect("output marker must exist");
+    job_record(set.reader.as_ref(), &ParamValues::new(), &composite, None)
+}
+
+fn assert_retag_refused(label: &str, extension: &str, write: fn(&std::path::Path, u16)) {
+    let (scratch, paths) = tagged_pair(label, extension, write);
+    let store = ResumeStore::open(&scratch).expect("resume store must open");
+    store
+        .begin(&record_for(&paths, &scratch))
+        .expect("ledger must begin");
+    let length = std::fs::metadata(&paths[1]).expect("frame metadata").len();
+
+    write(&paths[1], 3);
+    assert_eq!(
+        std::fs::metadata(&paths[1]).expect("frame metadata").len(),
+        length,
+        "a retag keeps the file size"
+    );
+    match store
+        .find(&record_for(&paths, &scratch))
+        .expect("find must succeed")
+    {
+        Resumable::Mismatch(mismatch) => {
+            assert_eq!(mismatch.field, "orientation");
+            assert_eq!(mismatch.frame, 1);
+            assert_eq!(
+                (mismatch.expected.as_str(), mismatch.found.as_str()),
+                ("1", "3")
+            );
+        }
+        Resumable::None => panic!("a retagged frame must be refused, found no ledger"),
+        Resumable::Ledger(_) => panic!("a retagged frame must be refused, found a ledger"),
+    }
+}
+
+#[test]
+fn resume_refuses_a_retagged_tiff() {
+    assert_retag_refused("retagged-tiff", "tif", write_tagged_tiff);
+}
+
+#[test]
+fn resume_refuses_a_retagged_jpeg() {
+    assert_retag_refused("retagged-jpeg", "jpg", write_tagged_jpeg);
+}
+
+#[test]
+fn resume_reads_a_ledger_without_orientation() {
+    let (scratch, paths) = tagged_pair("ledger-without-orientation", "tif", write_tagged_tiff);
+    let record = record_for(&paths, &scratch);
+    let mut legacy = serde_json::to_value(&record).expect("record must serialize");
+    for frame in legacy["fingerprint"]["frames"]
+        .as_array_mut()
+        .expect("fingerprint holds frames")
+    {
+        frame
+            .as_object_mut()
+            .expect("frame is an object")
+            .remove("orientation")
+            .expect("frame was recorded with orientation");
+    }
+    let ledger_dir = scratch.join("resume").join("legacy");
+    std::fs::create_dir_all(&ledger_dir).expect("ledger directory must exist");
+    std::fs::write(
+        ledger_dir.join("job.json"),
+        serde_json::to_vec(&legacy).expect("record must serialize"),
+    )
+    .expect("job must write");
+    let store = ResumeStore::open(&scratch).expect("resume store must open");
+    assert!(matches!(
+        store.find(&record).expect("find must succeed"),
+        Resumable::Ledger(_)
+    ));
+
+    write_tagged_tiff(&paths[0], 3);
+    match store
+        .find(&record_for(&paths, &scratch))
+        .expect("find must succeed")
+    {
+        Resumable::Mismatch(mismatch) => {
+            assert_eq!((mismatch.field, mismatch.frame), ("orientation", 0));
+        }
+        _ => panic!("a retagged frame must be refused"),
+    }
 }
 
 /// Blocks each `consume` call until [`Gate::release`] is called, and

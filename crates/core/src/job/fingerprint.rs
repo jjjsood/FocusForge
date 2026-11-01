@@ -31,6 +31,10 @@ pub struct FrameFingerprint {
     pub path: PathBuf,
     pub file_size: u64,
     pub image_description: Option<String>,
+    /// The EXIF Orientation (1-8) the reader applies. A record without this
+    /// key reads as 1, pixels served as stored.
+    #[serde(default = "upright")]
+    pub orientation: u16,
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
@@ -40,12 +44,17 @@ pub struct FrameFingerprint {
     pub raw_identity: Option<RawIdentity>,
 }
 
+fn upright() -> u16 {
+    1
+}
+
 impl From<&FrameDesc> for FrameFingerprint {
     fn from(header: &FrameDesc) -> Self {
         FrameFingerprint {
             path: header.path.clone(),
             file_size: header.file_size,
             image_description: header.image_description.clone(),
+            orientation: header.orientation,
             width: header.width,
             height: header.height,
             samples_per_pixel: header.samples_per_pixel,
@@ -129,6 +138,7 @@ impl StackFingerprint {
                 a.image_description,
                 b.image_description
             );
+            check_field!(i, b.path, "orientation", a.orientation, b.orientation);
             check_field!(i, b.path, "width", a.width, b.width);
             check_field!(i, b.path, "height", a.height, b.height);
             check_field!(
@@ -162,6 +172,7 @@ mod tests {
             path: PathBuf::from(path),
             file_size: 100,
             image_description: None,
+            orientation: 1,
             width,
             height: 10,
             samples_per_pixel: 3,
@@ -198,6 +209,49 @@ mod tests {
         assert_eq!(err.found, "20");
         assert!(err.to_string().contains("a.tif"));
         assert!(err.to_string().contains("width"));
+    }
+
+    #[test]
+    fn compare_names_a_changed_orientation() {
+        let a = StackFingerprint {
+            frames: vec![frame("a.tif", 10), frame("b.tif", 10)],
+        };
+        let mut retagged = a.clone();
+        retagged.frames[1].orientation = 3;
+        let err = a.compare(&retagged).unwrap_err();
+        assert_eq!(err.frame, 1);
+        assert_eq!(err.field, "orientation");
+        assert_eq!(err.expected, "1");
+        assert_eq!(err.found, "3");
+
+        // A quarter turn swaps the upright size of a non-square frame; the
+        // orientation is still the field named.
+        let mut landscape = a.clone();
+        landscape.frames[0].width = 20;
+        let mut quarter = landscape.clone();
+        quarter.frames[0].orientation = 6;
+        (quarter.frames[0].width, quarter.frames[0].height) = (10, 20);
+        let err = landscape.compare(&quarter).unwrap_err();
+        assert_eq!(err.field, "orientation");
+    }
+
+    #[test]
+    fn a_fingerprint_without_orientation_reads_as_upright() {
+        let mut tagged = frame("a.tif", 10);
+        tagged.orientation = 3;
+        let json = serde_json::to_value(&tagged).expect("fingerprint serializes");
+        assert_eq!(json["orientation"], 3);
+        assert_eq!(
+            serde_json::from_value::<FrameFingerprint>(json.clone())
+                .expect("fingerprint deserializes")
+                .orientation,
+            3
+        );
+        let mut object = json.as_object().expect("fingerprint is an object").clone();
+        object.remove("orientation");
+        let old = serde_json::from_value::<FrameFingerprint>(serde_json::Value::Object(object))
+            .expect("a record without orientation deserializes");
+        assert_eq!(old.orientation, 1);
     }
 
     #[test]
@@ -270,8 +324,9 @@ mod tests {
     fn from_frame_desc_reads_exactly_the_named_fields() {
         let header = TiffHeader {
             path: PathBuf::from("frame.tif"),
-            width: 4,
+            width: 6,
             height: 4,
+            orientation: 6,
             byte_order: crate::io::ByteOrder::Little,
             ifd_offset: 0,
             bits_per_sample: Box::new([16, 16, 16]),
@@ -299,8 +354,8 @@ mod tests {
         assert_eq!(fp.path, PathBuf::from("frame.tif"));
         assert_eq!(fp.file_size, 12345);
         assert_eq!(fp.image_description, Some("hello".to_string()));
-        assert_eq!(fp.width, 4);
-        assert_eq!(fp.height, 4);
+        assert_eq!(fp.orientation, 6);
+        assert_eq!((fp.width, fp.height), (4, 6));
         assert_eq!(fp.samples_per_pixel, 3);
         assert_eq!(fp.strip_offsets, vec![10, 20, 30, 40]);
         assert_eq!(fp.strip_byte_counts, vec![1, 2, 3, 4]);

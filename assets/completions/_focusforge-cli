@@ -85,7 +85,7 @@ _arguments "${_arguments_options[@]}" : \
 '--quiet[Log errors only]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':dir -- Directory of TIFF or supported RAW frames to fuse (non-recursive, descending into `<dir>/frames` when that subdirectory exists):_files' \
+':dir -- Directory of TIFF, 8-bit JPEG or supported RAW frames to fuse (non-recursive, descending into `<dir>/frames` when that subdirectory exists):_files' \
 && ret=0
 ;;
 (export)
@@ -103,7 +103,7 @@ _arguments "${_arguments_options[@]}" : \
 '--jpeg-subsampling=[JPEG chroma subsampling\: \`420\` (default) or \`444\`. JPEG only]:SPEC:_default' \
 '--exif=[Carry the alignment reference frame'\''s EXIF\: \`on\` (default) or \`off\`]:EXIF:_default' \
 '--icc=[Embed an ICC profile\: \`on\` (default) or \`off\`. Has no effect on a DNG, whose colour is defined by its camera matrices]:ICC:_default' \
-'--xmp=[Carry the source frame'\''s XMP packet verbatim\: \`on\` or \`off\` (default)]:XMP:_default' \
+'--xmp=[Carry the source frame'\''s XMP packet, with any \`tiff\:Orientation\` set to 1\: \`on\` or \`off\` (default)]:XMP:_default' \
 '--iptc=[Carry the source frame'\''s IPTC block verbatim\: \`on\` or \`off\` (default). Never written to PNG]:IPTC:_default' \
 '--frame=[Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint'\''s own composite width and height. Requires \`--frame-output\`]:INDEX:_default' \
 '--frame-output=[Where to write the frame \`--frame\` names]:FILE:_files' \
@@ -429,9 +429,9 @@ esac
 (( $+functions[_focusforge-cli_commands] )) ||
 _focusforge-cli_commands() {
     local commands; commands=(
-'info:Print project, TIFF or RAW metadata for a file, or for every frame in a directory' \
+'info:Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory' \
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
-'stack:Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
+'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
 'history:List, delete or compact a project'\''s checkpoints. Every history operation is reachable through this command, headless' \
@@ -497,9 +497,9 @@ _focusforge-cli__subcmd__export_commands() {
 (( $+functions[_focusforge-cli__subcmd__help_commands] )) ||
 _focusforge-cli__subcmd__help_commands() {
     local commands; commands=(
-'info:Print project, TIFF or RAW metadata for a file, or for every frame in a directory' \
+'info:Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory' \
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
-'stack:Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
+'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
 'history:List, delete or compact a project'\''s checkpoints. Every history operation is reachable through this command, headless' \

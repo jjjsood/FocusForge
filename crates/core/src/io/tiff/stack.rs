@@ -398,10 +398,11 @@ pub fn is_frame_path(path: &Path) -> bool {
 /// and `RowsPerStrip` are deliberately not compared.
 pub(crate) fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError> {
     let mut detail = Vec::new();
-    if first.width != other.width || first.height != other.height {
+    let (first_width, first_height) = first.upright_dimensions();
+    let (other_width, other_height) = other.upright_dimensions();
+    if (first_width, first_height) != (other_width, other_height) {
         detail.push(format!(
-            "{}x{} vs first frame's {}x{}",
-            other.width, other.height, first.width, first.height
+            "{other_width}x{other_height} vs first frame's {first_width}x{first_height}"
         ));
     }
     if first.bits_per_sample != other.bits_per_sample {

@@ -50,6 +50,7 @@ impl MemoryReader {
                 path: PathBuf::from(format!("memory-{index}.tif")),
                 file_size: 0,
                 image_description: None,
+                orientation: 1,
                 width: 40,
                 height: 24,
                 samples_per_pixel: 3,

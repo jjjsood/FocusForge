@@ -1659,6 +1659,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT/Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64
+- Package: unicode-width 0.1.14
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: Linux x86_64, Windows x86_64, macOS arm64
 - Package: unicode-width 0.2.2
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0

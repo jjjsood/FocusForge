@@ -79,6 +79,7 @@ class CompressedFixtureSet:
     predictor: int
     layout: str
     byte_order: str
+    bits: int = 16
 
 
 def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
@@ -99,7 +100,18 @@ def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
     )
 
 
-COMPRESSED_SETS = _compressed_sets()
+# 8-bit RGB re-encodings of mantis-64 (high byte of each sample): the
+# uncompressed twin plus four sets that between them cover every codec,
+# predictor, layout and byte order once. Names avoid the `mantis-64-` prefix
+# that counts the 16-bit matrix.
+EIGHT_BIT_SETS = (
+    CompressedFixtureSet("mantis8-64", 1, "none", 1, "strip", "II", bits=8),
+    CompressedFixtureSet("mantis8-64-deflate-p2-strip-ii", 8, "deflate", 2, "strip", "II", bits=8),
+    CompressedFixtureSet("mantis8-64-lzw-p1-tile-mm", 5, "lzw", 1, "tile", "MM", bits=8),
+    CompressedFixtureSet("mantis8-64-old-deflate-p1-strip-mm", 32946, "old-deflate", 1, "strip", "MM", bits=8),
+    CompressedFixtureSet("mantis8-64-lzw-p2-tile-ii", 5, "lzw", 2, "tile", "II", bits=8),
+)
+COMPRESSED_SETS = _compressed_sets() + EIGHT_BIT_SETS
 COMPRESSED_ROWS_PER_STRIP = 11
 COMPRESSED_TILE = (48, 48)
 
@@ -168,16 +180,23 @@ def _crop(
     compression: int = 1,
     predictor: int = 1,
     tile: tuple[int, int] | None = None,
+    bits: int | None = None,
 ) -> None:
     x, y, w, h = rect
     info = rawtiff.read_info(src)
     pixels = rawtiff.read_rect(src, x, y, w, h, info=info)
+    source_bits = info.bits_per_sample[0]
+    bits = bits or source_bits
+    if (source_bits, bits) == (16, 8):
+        pixels = pixels[1::2]  # high byte of each native little-endian sample
+    elif bits != source_bits:
+        raise FixtureError(f"cannot derive {bits}-bit samples from {source_bits}-bit {src}")
     rawtiff.write_tiff(
         dst,
         w,
         h,
         pixels,
-        bits=info.bits_per_sample[0],
+        bits=bits,
         spp=info.samples_per_pixel,
         description=description,
         byte_order=byte_order,
@@ -286,7 +305,9 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "`README.md` naming the source frame behind every `NN`. Outputs are "
         "little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` "
         "sets add LZW and deflate encodings in both byte orders, with strips or "
-        "zero-padded tiles and Predictor 1 or 2.",
+        "zero-padded tiles and Predictor 1 or 2. The `mantis8-64` sets hold the "
+        "same crop as 8-bit RGB: the high byte of each `mantis-64` sample, "
+        "uncompressed or in one of four encodings.",
         "",
         "`blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own "
         "README; it has no `frames/` directory or `reference.tif`.",
@@ -386,12 +407,14 @@ def _compressed_readme(fset: CompressedFixtureSet) -> str:
                 "Re-encoding of `mantis-64`: `frames/00.tif`, `frames/01.tif`, and "
                 "`frames/02.tif` map directly to the same source files; `reference.tif` maps "
                 "to `mantis-64/reference.tif`."
+                + (" Samples are the high byte of each 16-bit source sample." if fset.bits == 8 else "")
             ),
             "",
             (
                 f"TIFF Compression tag: **{fset.compression}** ({fset.codec}). Predictor: "
                 f"**{fset.predictor}**. Byte order: **{fset.byte_order}**. Layout: "
                 f"**{fset.layout}**."
+                + (f" Bit depth: **{fset.bits}**." if fset.bits != 16 else "")
             ),
             "",
             layout,
@@ -426,6 +449,7 @@ def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
                 compression=fset.compression,
                 predictor=fset.predictor,
                 tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+                bits=fset.bits,
             )
             produced.append(rel)
         rel = f"{fset.name}/reference.tif"
@@ -439,6 +463,7 @@ def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
             compression=fset.compression,
             predictor=fset.predictor,
             tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+            bits=fset.bits,
         )
         produced.append(rel)
         rel = f"{fset.name}/README.md"

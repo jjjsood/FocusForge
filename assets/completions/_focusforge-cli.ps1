@@ -28,9 +28,9 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('-V', '-V ', [CompletionResultType]::ParameterName, 'Print version')
             [CompletionResult]::new('--version', '--version', [CompletionResultType]::ParameterName, 'Print version')
-            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF or RAW metadata for a file, or for every frame in a directory')
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory')
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
-            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
+            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
             [CompletionResult]::new('retouch', 'retouch', [CompletionResultType]::ParameterValue, 'Append an op list to a project as new states, one per op, each the previous one''s child: on the current head, or on `--from` as a branch. `export --checkpoint` writes any of them')
             [CompletionResult]::new('history', 'history', [CompletionResultType]::ParameterValue, 'List, delete or compact a project''s checkpoints. Every history operation is reachable through this command, headless')
@@ -106,7 +106,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--jpeg-subsampling', '--jpeg-subsampling', [CompletionResultType]::ParameterName, 'JPEG chroma subsampling: `420` (default) or `444`. JPEG only')
             [CompletionResult]::new('--exif', '--exif', [CompletionResultType]::ParameterName, 'Carry the alignment reference frame''s EXIF: `on` (default) or `off`')
             [CompletionResult]::new('--icc', '--icc', [CompletionResultType]::ParameterName, 'Embed an ICC profile: `on` (default) or `off`. Has no effect on a DNG, whose colour is defined by its camera matrices')
-            [CompletionResult]::new('--xmp', '--xmp', [CompletionResultType]::ParameterName, 'Carry the source frame''s XMP packet verbatim: `on` or `off` (default)')
+            [CompletionResult]::new('--xmp', '--xmp', [CompletionResultType]::ParameterName, 'Carry the source frame''s XMP packet, with any `tiff:Orientation` set to 1: `on` or `off` (default)')
             [CompletionResult]::new('--iptc', '--iptc', [CompletionResultType]::ParameterName, 'Carry the source frame''s IPTC block verbatim: `on` or `off` (default). Never written to PNG')
             [CompletionResult]::new('--frame', '--frame', [CompletionResultType]::ParameterName, 'Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint''s own composite width and height. Requires `--frame-output`')
             [CompletionResult]::new('--frame-output', '--frame-output', [CompletionResultType]::ParameterName, 'Where to write the frame `--frame` names')
@@ -264,9 +264,9 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;help' {
-            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF or RAW metadata for a file, or for every frame in a directory')
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory')
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
-            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
+            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
             [CompletionResult]::new('retouch', 'retouch', [CompletionResultType]::ParameterValue, 'Append an op list to a project as new states, one per op, each the previous one''s child: on the current head, or on `--from` as a branch. `export --checkpoint` writes any of them')
             [CompletionResult]::new('history', 'history', [CompletionResultType]::ParameterValue, 'List, delete or compact a project''s checkpoints. Every history operation is reachable through this command, headless')

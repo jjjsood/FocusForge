@@ -944,7 +944,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -1709,6 +1709,7 @@ dependencies = [
  "focusforge-core",
  "focusforge-diagnostics",
  "focusforge-gpu",
+ "jpeg-encoder",
  "png",
  "serde",
  "serde_json",
@@ -1748,6 +1749,7 @@ dependencies = [
  "tracing-subscriber",
  "weezl",
  "zstd",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1793,6 +1795,7 @@ dependencies = [
  "focusforge-diagnostics",
  "focusforge-gpu",
  "i-slint-backend-testing",
+ "jpeg-encoder",
  "notify-rust",
  "png",
  "rfd",
