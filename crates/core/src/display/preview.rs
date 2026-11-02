@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Small progress images of a running stack: the frame whose registration
-//! just finished and the composite growing tile by tile. A front end opts in
-//! per kind through [`PreviewKinds`]; a run builds the state of each
-//! requested kind only, and a run that requests none builds nothing.
-//!
-//! Worker threads only write into the shared state, under a short lock. The
-//! run's poll thread calls [`PreviewFeed::deliver`], which hands out at most
-//! one image per kind and only when something changed since the last one, so
-//! no caller code ever runs on a worker thread. Every image is built from
-//! data the run already holds in memory; the 16-to-8-bit step is a plain
-//! display reduction, not the document's render.
+//! just finished and the composite growing tile by tile, requested per kind
+//! through [`PreviewKinds`]. Workers only write shared state under a short
+//! lock; the poll thread's [`PreviewFeed::deliver`] hands out at most one
+//! changed image per kind.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
