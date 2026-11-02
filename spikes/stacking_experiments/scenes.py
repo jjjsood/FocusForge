@@ -46,7 +46,7 @@ def _rect(seed: int, h: int, w: int) -> tuple[int, int, int, int]:
     return y, y + h, x, x + w
 
 
-def _layout(seed: int) -> tuple[np.ndarray, dict[str, object]]:
+def _layout(seed: int, frame_count: int = FRAME_COUNT) -> tuple[np.ndarray, dict[str, object]]:
     height, width = IMAGE_SIZE
     yy, xx = np.mgrid[:height, :width]
     plane = 0.33 * xx / (width - 1) + 0.19 * yy / (height - 1)
@@ -55,7 +55,7 @@ def _layout(seed: int) -> tuple[np.ndarray, dict[str, object]]:
     cy, cx, radius = height * 0.64, width * 0.36, 0.25 * width
     cap = np.maximum(0.0, 1.0 - ((xx - cx) ** 2 + (yy - cy) ** 2) / radius**2)
     plane += 0.31 * np.sqrt(cap)
-    depth = (plane - plane.min()) / (plane.max() - plane.min()) * (FRAME_COUNT - 1)
+    depth = (plane - plane.min()) / (plane.max() - plane.min()) * (frame_count - 1)
     hair_y = int(np.random.default_rng(seed + 3).integers(290, 370))
     hair_x = int(np.random.default_rng(seed + 4).integers(48, 120))
     hairs = [("h", (hair_y, hair_y + 1), (hair_y - 3, hair_y - 1), (hair_y + 2, hair_y + 4), (hair_x, hair_x + 180)),
@@ -63,15 +63,15 @@ def _layout(seed: int) -> tuple[np.ndarray, dict[str, object]]:
     return depth, {"step": list(step), "halo": list(step), "flat": list(_rect(seed + 2, 60, 70)), "hairs": hairs}
 
 
-def _apply_hairs(truth: np.ndarray, depth: np.ndarray, hairs: list[tuple[object, ...]]) -> None:
+def _apply_hairs(truth: np.ndarray, depth: np.ndarray, hairs: list[tuple[object, ...]], frame_count: int = FRAME_COUNT) -> None:
     for kind, line, _, _, extent in hairs:
         line_slice = slice(*line)
         if kind == "h":
             truth[line_slice, extent[0]:extent[1]] = np.clip(truth[line_slice, extent[0]:extent[1]].astype(np.int32) - 9000, 0, 65535)
-            depth[line_slice, extent[0]:extent[1]] = np.clip(depth[line_slice, extent[0]:extent[1]] + 1.1, 0, FRAME_COUNT - 1)
+            depth[line_slice, extent[0]:extent[1]] = np.clip(depth[line_slice, extent[0]:extent[1]] + 1.1, 0, frame_count - 1)
         else:
             truth[extent[0]:extent[1], line_slice] = np.clip(truth[extent[0]:extent[1], line_slice].astype(np.int32) + 7500, 0, 65535)
-            depth[extent[0]:extent[1], line_slice] = np.clip(depth[extent[0]:extent[1], line_slice] - 1.0, 0, FRAME_COUNT - 1)
+            depth[extent[0]:extent[1], line_slice] = np.clip(depth[extent[0]:extent[1], line_slice] - 1.0, 0, frame_count - 1)
 
 
 def _apply_colour_boundary(truth: np.ndarray, step: list[int]) -> int:
@@ -101,26 +101,31 @@ def _render_independent_sources(sources: np.ndarray, depth: np.ndarray, noise_se
     return np.stack(output)
 
 
-def render_family(family: Family, seed: SeedTriple, member: str | None = None) -> SceneData:
-    """Render one family member without mixing layout, texture, or noise seeds."""
+def render_family(family: Family, seed: SeedTriple, member: str | None = None, frame_count: int = FRAME_COUNT) -> SceneData:
+    """Render one family member without mixing layout, texture, or noise seeds.
+
+    Only `thin-hairs` and `flat-noise` render at other frame counts; the depth range scales to `frame_count`.
+    """
+    if frame_count != FRAME_COUNT and family.name not in ("thin-hairs", "flat-noise"):
+        raise ValueError(f"{family.name} renders at {FRAME_COUNT} frames only")
     if IMAGE_SIZE != (ss.H, ss.W):
         raise ValueError("synthetic renderer geometry differs from registered geometry")
     member = member or family_members(family)[0]
     if member not in family_members(family):
         raise ValueError(f"unknown {family.name} member: {member}")
-    depth, metadata = _layout(seed.layout)
+    depth, metadata = _layout(seed.layout, frame_count)
     truth = ss.scene_hard(seed.texture).astype(np.float64)
     if family.name == "thin-hairs":
-        _apply_hairs(truth, depth, metadata["hairs"])
+        _apply_hairs(truth, depth, metadata["hairs"], frame_count)
     if family.name == "flat-noise":
         y0, y1, x0, x1 = metadata["flat"]
         truth[y0:y1, x0:x1] = 32768
     if family.name == "colour-edges":
         metadata["colour_boundary_y"] = _apply_colour_boundary(truth, metadata["step"])
     noise = 1000 if member == "noise-1000" else 250
-    frames = np.stack(ss.render(truth, depth, SIGMA_STEP, noise, seed.noise, FRAME_COUNT))
+    frames = np.stack(ss.render(truth, depth, SIGMA_STEP, noise, seed.noise, frame_count))
     metadata.update({"family": family.name, "member": member, "layout_seed": seed.layout, "texture_seed": seed.texture,
-                     "noise_seed": seed.noise, "noise_counts": noise, "frames": FRAME_COUNT, "sigma_step": SIGMA_STEP})
+                     "noise_seed": seed.noise, "noise_counts": noise, "frames": frame_count, "sigma_step": SIGMA_STEP})
     if family.name == "invalid-borders":
         if member == "zero-strip":
             masks = np.ones((FRAME_COUNT, *IMAGE_SIZE), dtype=bool)
