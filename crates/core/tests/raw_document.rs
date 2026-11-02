@@ -988,7 +988,7 @@ fn dng_identical_frames_round_trip() {
     assert_within(
         &read_dng(&out).samples(),
         &expected,
-        2,
+        16,
         "camera-linear samples",
     );
 

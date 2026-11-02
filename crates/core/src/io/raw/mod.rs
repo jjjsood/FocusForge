@@ -236,14 +236,16 @@ impl CachedFrame for LinearFrame {
     }
 }
 
-/// Bytes one developed pixel takes in a scratch file.
-const PIXEL_BYTES: usize = std::mem::size_of::<[f32; 3]>();
+/// Bytes one developed pixel takes in a scratch file: three half-precision
+/// channels.
+const PIXEL_BYTES: usize = std::mem::size_of::<[half::f16; 3]>();
 
 /// Pixels per `write` call when a developed frame goes to scratch.
 const WRITE_PIXELS: usize = 1 << 16;
 
 /// A frame developed into a scratch file and mapped read-only: its
-/// `width * height` samples as native-endian `[f32; 3]`, no header.
+/// `width * height` samples as native-endian half-precision `[f16; 3]`, no
+/// header.
 #[derive(Debug)]
 struct MappedFrame {
     map: Mmap,
@@ -260,10 +262,10 @@ impl MappedFrame {
             .chunks_exact(PIXEL_BYTES)
             .map(|pixel| {
                 std::array::from_fn(|channel| {
-                    let bytes = pixel[channel * 4..(channel + 1) * 4]
+                    let bytes = pixel[channel * 2..(channel + 1) * 2]
                         .try_into()
-                        .expect("a channel is four bytes");
-                    f32::from_ne_bytes(bytes)
+                        .expect("a channel is two bytes");
+                    half::f16::from_ne_bytes(bytes).to_f32()
                 })
             })
     }
@@ -390,6 +392,12 @@ impl RawStack {
         (frame.width, frame.height)
     }
 
+    /// Bytes one developed frame occupies in its scratch file.
+    pub fn scratch_frame_bytes(&self) -> u64 {
+        let (width, height) = self.dimensions();
+        u64::from(width) * u64::from(height) * PIXEL_BYTES as u64
+    }
+
     /// Metadata for frame `index`.
     pub fn metadata(&self, index: usize) -> Option<&RawMetadata> {
         self.frames.get(index).map(|frame| &frame.metadata)
@@ -473,10 +481,10 @@ impl RawStack {
         }
     }
 
-    /// Develops frame `index` into `<dir>/<index>.f32` and maps the file.
+    /// Develops frame `index` into `<dir>/<index>.f16` and maps the file.
     fn develop_to_scratch(&self, index: usize, dir: &Path) -> Result<MappedFrame, RawError> {
         let developed = self.develop_frame(index)?;
-        let path = dir.join(format!("{index}.f32"));
+        let path = dir.join(format!("{index}.f16"));
         let fault = |source| RawError::Scratch {
             path: path.clone(),
             source,
@@ -490,7 +498,8 @@ impl RawStack {
     }
 }
 
-/// Writes `samples` to a new file at `path` as native-endian `f32`s.
+/// Writes `samples` to a new file at `path` as native-endian `f16`s, each
+/// rounded to nearest.
 fn write_samples(path: &Path, samples: &[[f32; 3]]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     let mut chunk = Vec::with_capacity(WRITE_PIXELS * PIXEL_BYTES);
@@ -500,7 +509,7 @@ fn write_samples(path: &Path, samples: &[[f32; 3]]) -> std::io::Result<()> {
             pixels
                 .iter()
                 .flatten()
-                .flat_map(|value| value.to_ne_bytes()),
+                .flat_map(|value| half::f16::from_f32(*value).to_ne_bytes()),
         );
         file.write_all(&chunk)?;
     }

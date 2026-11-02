@@ -1731,6 +1731,7 @@ dependencies = [
  "chrono",
  "flate2",
  "focusforge-core",
+ "half",
  "inventory",
  "jpeg-encoder",
  "libc",

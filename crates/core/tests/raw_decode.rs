@@ -602,6 +602,90 @@ fn sigma_pin_rejects_a_replaced_fixture() {
     );
 }
 
+/// Prints how far scratch reads of whole corpus frames fall from cached reads.
+#[test]
+#[ignore]
+fn raw_scratch_error_on_corpus_frames() {
+    let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
+        eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
+        return;
+    };
+    for name in ["panasonic-dmc-lx7.rw2", "fujifilm-x-s10.raf"] {
+        let path = PathBuf::from(&samples).join(name);
+        if !path.is_file() {
+            eprintln!("skip: {} is missing", path.display());
+            continue;
+        }
+        let cached = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
+        let developed = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
+        let root = target_tmp();
+        developed
+            .develop_once(root.path(), u64::MAX, 1, &|| false)
+            .expect("the pass develops the frame");
+        let (width, height) = cached.dimensions();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let count = width as usize * height as usize * 3;
+
+        let (mut want16, mut got16) = (vec![0u16; count], vec![0u16; count]);
+        cached
+            .read_tile_into(0, rect, &mut want16)
+            .expect("cached u16 read");
+        developed
+            .read_tile_into(0, rect, &mut got16)
+            .expect("mapped u16 read");
+        let differing16 = want16.iter().zip(&got16).filter(|(w, g)| w != g).count();
+        let worst16 = want16.iter().zip(&got16).map(|(w, g)| w.abs_diff(*g)).max();
+        let over = |limit: u16| {
+            want16
+                .iter()
+                .zip(&got16)
+                .filter(|(w, g)| w.abs_diff(**g) > limit)
+                .count()
+        };
+
+        let (mut want, mut got) = (vec![0f32; count], vec![0f32; count]);
+        cached
+            .read_tile_f32_into(0, rect, &mut want)
+            .expect("cached f32 read");
+        developed
+            .read_tile_f32_into(0, rect, &mut got)
+            .expect("mapped f32 read");
+        let differing = want.iter().zip(&got).filter(|(w, g)| w != g).count();
+        let worst = want
+            .iter()
+            .zip(&got)
+            .map(|(w, g)| (w - g).abs())
+            .fold(0.0f32, f32::max);
+        let worst_relative = want
+            .iter()
+            .zip(&got)
+            .map(|(w, g)| (w - g).abs() / (w.abs() / 65_535.0).max(1.0))
+            .fold(0.0f32, f32::max);
+        let (low, high) = got.iter().fold((f32::MAX, f32::MIN), |(low, high), v| {
+            (low.min(*v), high.max(*v))
+        });
+        eprintln!(
+            "{name}: {width}x{height} u16 max diff {worst16:?} LSB, {differing16} differ; \
+             u16 diff over 8/16/32/64 LSB: {}/{}/{}/{}; \
+             f32 max diff {worst} (relative bound {worst_relative}) LSB, {differing} differ; \
+             mapped f32 min {low} max {high}",
+            over(8),
+            over(16),
+            over(32),
+            over(64),
+        );
+        assert!(
+            got.iter().all(|value| value.is_finite()),
+            "{name}: a mapped read is not finite"
+        );
+    }
+}
+
 #[test]
 #[ignore]
 fn canon_dummy_metadata_has_no_pixel_buffer() {
@@ -1923,8 +2007,36 @@ fn raw_stack_develops_each_frame_once() {
     }
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
-    values.iter().map(|value| value.to_bits()).collect()
+/// Largest read difference, in 16-bit output LSB, a frame read through the
+/// scratch file may show against the same read through the in-memory cache:
+/// half-precision storage reaches 86 LSB on the Panasonic and 42 on the
+/// Fujifilm bench frame, a few samples in a million above 32.
+const SCRATCH_TOLERANCE: f32 = 96.0;
+
+/// Whether a scratch read `got` is within [`SCRATCH_TOLERANCE`] of the cached
+/// read `want`; the bound grows relative to `want` above white.
+fn within_scratch_bound(want: f32, got: f32) -> bool {
+    (got - want).abs() <= SCRATCH_TOLERANCE * (want.abs() / 65_535.0).max(1.0)
+}
+
+fn assert_scratch_f32_reads(want: &[f32], got: &[f32], what: &str) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    for (index, (want, got)) in want.iter().zip(got).enumerate() {
+        assert!(
+            within_scratch_bound(*want, *got),
+            "{what}: sample {index} read {got} against {want}"
+        );
+    }
+}
+
+fn assert_scratch_u16_reads(want: &[u16], got: &[u16], what: &str) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    for (index, (want, got)) in want.iter().zip(got).enumerate() {
+        assert!(
+            f32::from(want.abs_diff(*got)) <= SCRATCH_TOLERANCE,
+            "{what}: sample {index} read {got} against {want}"
+        );
+    }
 }
 
 #[test]
@@ -1972,7 +2084,11 @@ fn raw_develop_pass_reads_match_cached_reads() {
                 developed
                     .read_tile_gained_into(frame, rect, gain, &mut got)
                     .expect("mapped read");
-                assert_eq!(want, got, "u16 frame {frame} {rect:?} gain {gain}");
+                assert_scratch_u16_reads(
+                    &want,
+                    &got,
+                    &format!("u16 frame {frame} {rect:?} gain {gain}"),
+                );
 
                 let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
                 cached
@@ -1981,10 +2097,10 @@ fn raw_develop_pass_reads_match_cached_reads() {
                 developed
                     .read_tile_gained_f32_into(frame, rect, gain, &mut got)
                     .expect("mapped read");
-                assert_eq!(
-                    bits(&want),
-                    bits(&got),
-                    "f32 frame {frame} {rect:?} gain {gain}"
+                assert_scratch_f32_reads(
+                    &want,
+                    &got,
+                    &format!("f32 frame {frame} {rect:?} gain {gain}"),
                 );
             }
             let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
@@ -1994,7 +2110,7 @@ fn raw_develop_pass_reads_match_cached_reads() {
             developed
                 .read_tile_into(frame, rect, &mut got)
                 .expect("mapped read");
-            assert_eq!(want, got, "unit gain frame {frame} {rect:?}");
+            assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
             let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
             cached
                 .read_tile_f32_into(frame, rect, &mut want)
@@ -2002,10 +2118,10 @@ fn raw_develop_pass_reads_match_cached_reads() {
             developed
                 .read_tile_f32_into(frame, rect, &mut got)
                 .expect("mapped read");
-            assert_eq!(
-                bits(&want),
-                bits(&got),
-                "unit gain f32 frame {frame} {rect:?}"
+            assert_scratch_f32_reads(
+                &want,
+                &got,
+                &format!("unit gain f32 frame {frame} {rect:?}"),
             );
         }
         assert_eq!(
@@ -2015,6 +2131,69 @@ fn raw_develop_pass_reads_match_cached_reads() {
         );
     }
     assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+}
+
+fn scratch_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("scratch directory lists") {
+            let path = entry.expect("scratch entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn raw_scratch_file_size_matches_encoding() {
+    let dng = gradient_dng(48, 20, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 8, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).expect("scratch root");
+    stack
+        .develop_once(&scratch, u64::MAX, 2, &|| false)
+        .expect("the pass develops every frame");
+    assert_eq!(stack.scratch_frame_bytes(), 48 * 20 * 6);
+    let files = scratch_files(&scratch);
+    assert_eq!(files.len(), 8, "{files:?}");
+    for file in files {
+        let length = std::fs::metadata(&file).expect("scratch file").len();
+        assert_eq!(length, stack.scratch_frame_bytes(), "{}", file.display());
+    }
+}
+
+#[test]
+fn raw_scratch_keeps_values_above_white() {
+    let files = [textured_dng(2600), textured_dng(1500)];
+    let cached = open_pair(&files);
+    let developed = open_pair(&files);
+    let root = target_tmp();
+    developed
+        .develop_once(root.path(), u64::MAX, 2, &|| false)
+        .expect("the pass develops every frame");
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: SIDE,
+    };
+    let samples = SIDE as usize * SIDE as usize * 3;
+    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+    cached
+        .read_tile_f32_into(0, rect, &mut want)
+        .expect("cached read");
+    developed
+        .read_tile_f32_into(0, rect, &mut got)
+        .expect("mapped read");
+    assert!(got.iter().any(|value| *value > 65_535.0 + 100.0));
+    assert_scratch_f32_reads(&want, &got, "highlight frame");
 }
 
 #[test]
