@@ -11,6 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use focusforge_core::algorithm::{
@@ -19,6 +20,7 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, FailurePolicy, Transform};
+use focusforge_core::display::{PreviewKind, PreviewKinds, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
@@ -2539,4 +2541,435 @@ fn an_unhashable_frame_is_a_stage_cache_miss() {
         !report.align_cached,
         "a frame that cannot be hashed must not hit"
     );
+}
+
+// ---------------------------------------------------------------------
+// The opt-in preview feed.
+// ---------------------------------------------------------------------
+
+/// One preview as the observer saw it, with the thread it arrived on.
+#[derive(Clone)]
+struct Shown {
+    kind: PreviewKind,
+    width: u32,
+    height: u32,
+    extent: Rect,
+    covered: usize,
+    thread: ThreadId,
+    thread_name: String,
+}
+
+enum Event {
+    Stage(&'static str),
+    Tick(ThreadId),
+    Shown(Shown),
+}
+
+/// Subscribes to `kinds` and logs stages, ticks and previews in arrival order.
+struct PreviewLog {
+    kinds: PreviewKinds,
+    events: Mutex<Vec<Event>>,
+    /// How long each `preview` call takes, so the job outlives a delivery.
+    delay: Duration,
+}
+
+impl PreviewLog {
+    fn new(aligned_frame: bool, composite: bool) -> Self {
+        PreviewLog {
+            kinds: PreviewKinds {
+                aligned_frame,
+                composite,
+            },
+            events: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn slow(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    fn shown(&self, wanted: impl Fn(PreviewKind) -> bool) -> Vec<Shown> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Shown(s) if wanted(s.kind) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn aligned(&self) -> Vec<Shown> {
+        self.shown(|kind| matches!(kind, PreviewKind::AlignedFrame { .. }))
+    }
+
+    fn composites(&self) -> Vec<Shown> {
+        self.shown(|kind| kind == PreviewKind::Composite)
+    }
+
+    /// Position of the first stage marker named `name`.
+    fn stage_at(&self, name: &str) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|event| matches!(event, Event::Stage(n) if *n == name))
+            .unwrap_or_else(|| panic!("the run never reported the {name} stage"))
+    }
+}
+
+impl StageObserver for PreviewLog {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Prepare { .. } => "prepare",
+            RunStage::Align { .. } => "align",
+            RunStage::Fuse => "fuse",
+            RunStage::Seal => "seal",
+            RunStage::Finished => "finished",
+        };
+        self.events.lock().unwrap().push(Event::Stage(name));
+    }
+
+    fn tick(&self, _progress: &JobProgress) {
+        let id = std::thread::current().id();
+        self.events.lock().unwrap().push(Event::Tick(id));
+    }
+
+    fn preview_kinds(&self) -> PreviewKinds {
+        self.kinds
+    }
+
+    fn preview(&self, preview: &StagePreview) {
+        let current = std::thread::current();
+        let covered = preview.rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        self.events.lock().unwrap().push(Event::Shown(Shown {
+            kind: preview.kind,
+            width: preview.width,
+            height: preview.height,
+            extent: preview.extent,
+            covered,
+            thread: current.id(),
+            thread_name: current.name().unwrap_or_default().to_string(),
+        }));
+        std::thread::sleep(self.delay);
+    }
+}
+
+/// A held `pyramidal-ecc` run over `count` mantis frames.
+fn ecc_request(label: &str, count: usize, policy: &str) -> FuseRequest {
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum(policy.to_string()),
+    );
+    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    request.align = Some(AlignRequest {
+        algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc is registered"),
+        explicit,
+        lax: true,
+    });
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request
+}
+
+fn run_observed(request: &FuseRequest, observer: &dyn StageObserver) -> FuseReport {
+    completed(focusforge_core::pipeline::run(
+        request,
+        observer,
+        JobControl::new(),
+        None,
+    ))
+}
+
+fn whole_frame(size: u32) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: size,
+        height: size,
+    }
+}
+
+#[test]
+fn preview_feed_delivers_aligned_frames() {
+    for policy in ["anchor", "chain"] {
+        let log = PreviewLog::new(true, false);
+        let request = ecc_request(&format!("pf_aligned_{policy}"), 4, policy);
+        let report = run_observed(&request, &log);
+        let reference = report.align.as_ref().unwrap().alignment.reference;
+
+        let aligned = log.aligned();
+        assert!(!aligned.is_empty(), "{policy}: no aligned-frame preview");
+        let (start, end) = (log.stage_at("align"), log.stage_at("fuse"));
+        let events = log.events.lock().unwrap();
+        for (at, event) in events.iter().enumerate() {
+            if matches!(event, Event::Shown(_)) {
+                assert!(start < at && at < end, "{policy}: preview outside align");
+            }
+        }
+        for preview in &aligned {
+            let PreviewKind::AlignedFrame { frame } = preview.kind else {
+                unreachable!("filtered to aligned frames")
+            };
+            assert_ne!(frame, reference, "{policy}: the reference was previewed");
+            assert!(preview.width.max(preview.height) <= 512);
+            assert_eq!(preview.width, preview.height, "{policy}: aspect");
+            assert_eq!(preview.extent, whole_frame(512), "{policy}: extent");
+        }
+    }
+}
+
+#[test]
+fn preview_feed_composite_grows_tile_by_tile() {
+    for (tile_size, crop) in [(480u32, false), (448, true)] {
+        // A slow delivery lets the job finish while the poll thread is inside
+        // it, so only the closing flush can show the last tiles.
+        let log = PreviewLog::new(false, true).slow(Duration::from_millis(400));
+        let mut explicit = ParamValues::new();
+        explicit.insert("levels".to_string(), ParamValue::Int(3));
+        let mut request = base_request(&format!("pf_grow_{tile_size}"), mantis_frames(3), explicit);
+        request.output = FuseOutput::Hold(scratch(&format!("pf_grow_{tile_size}_hold")));
+        request.tile_size = Some(tile_size);
+        request.crop = crop;
+        let report = run_observed(&request, &log);
+
+        let extent = report.crop.unwrap_or(whole_frame(512));
+        assert_eq!(report.crop.is_some(), crop);
+        let composites = log.composites();
+        assert!(!composites.is_empty(), "tile {tile_size}: no preview");
+        let mut previous = 0;
+        for preview in &composites {
+            assert!(preview.covered >= previous, "coverage must never shrink");
+            previous = preview.covered;
+            assert_eq!(preview.extent, extent);
+            assert_eq!(
+                (preview.width, preview.height),
+                (extent.width, extent.height)
+            );
+        }
+        let last = composites.last().unwrap();
+        assert_eq!(last.covered, (extent.width * extent.height) as usize);
+        let seal = log.stage_at("seal");
+        let events = log.events.lock().unwrap();
+        let last_shown = events
+            .iter()
+            .rposition(|e| matches!(e, Event::Shown(_)))
+            .unwrap();
+        assert!(last_shown < seal, "the full image arrives before the seal");
+    }
+}
+
+#[test]
+fn preview_feed_is_throttled_to_the_poll() {
+    let log = PreviewLog::new(true, true);
+    let mut request = ecc_request("pf_throttle", 4, "anchor");
+    request.tile_size = Some(256);
+    request
+        .explicit
+        .insert("levels".to_string(), ParamValue::Int(3));
+    run_observed(&request, &log);
+
+    let (align_at, fuse_at) = (log.stage_at("align"), log.stage_at("fuse"));
+    let events = log.events.lock().unwrap();
+    let tick_threads: Vec<ThreadId> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Tick(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(!tick_threads.is_empty());
+    let shown: Vec<&Shown> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Shown(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    for s in &shown {
+        assert!(tick_threads.contains(&s.thread), "not a poll thread");
+        assert!(!s.thread_name.starts_with("focusforge-align"));
+    }
+    // Per stage: the polls deliver at most one image per kind each, plus the
+    // one closing flush.
+    let ticks = |from: usize, to: usize| {
+        events[from..to]
+            .iter()
+            .filter(|e| matches!(e, Event::Tick(_)))
+            .count()
+    };
+    let aligned = shown
+        .iter()
+        .filter(|s| matches!(s.kind, PreviewKind::AlignedFrame { .. }))
+        .count();
+    let composites = shown.len() - aligned;
+    assert!(aligned <= ticks(align_at, fuse_at) + 1, "{aligned} aligned");
+    assert!(
+        composites <= ticks(fuse_at, events.len()) + 1,
+        "{composites} composite"
+    );
+}
+
+/// Overrides `preview` but never subscribes.
+#[derive(Default)]
+struct DeafSubscriber {
+    calls: AtomicUsize,
+}
+
+impl StageObserver for DeafSubscriber {
+    fn preview(&self, _preview: &StagePreview) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn preview_feed_absent_without_subscriber() {
+    let observer = DeafSubscriber::default();
+    let request = ecc_request("pf_absent", 3, "anchor");
+    run_observed(&request, &observer);
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 0);
+}
+
+fn mantis8_frames(count: usize) -> Vec<PathBuf> {
+    let dir = common::fixtures_dir().join("mantis8-64").join("frames");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("frames dir must exist")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    entries.truncate(count);
+    entries
+}
+
+#[test]
+fn preview_feed_leaves_output_bit_identical() {
+    let requests = |label: &str| {
+        let aligned = ecc_request(&format!("{label}_16"), 3, "anchor");
+        let mut eight = base_request(&format!("{label}_8"), mantis8_frames(3), ParamValues::new());
+        eight.output = FuseOutput::Hold(scratch(&format!("{label}_8_hold")));
+        [aligned, eight]
+    };
+    let plain = requests("pf_bits_plain");
+    let subscribed = requests("pf_bits_sub");
+    for (plain, subscribed) in plain.iter().zip(&subscribed) {
+        let log = PreviewLog::new(true, true);
+        let with = held_run_of(Box::new(run_observed(subscribed, &log)));
+        let without = held_run_of(Box::new(run_observed(plain, &NoopObserver)));
+        assert!(!log.composites().is_empty(), "the subscribed run previews");
+        assert!(with.composite == without.composite, "composite differs");
+        assert!(with.zmap == without.zmap, "Z-Map differs");
+    }
+}
+
+#[test]
+fn preview_feed_cached_and_resumed_runs() {
+    // A cached alignment registers nothing, so nothing is previewed.
+    let root = scratch("pf_cache_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let cached = |label: &str, log: &PreviewLog| {
+        let mut request = ecc_request(label, 3, "anchor");
+        request.scratch_root = root.join("scratch");
+        completed(focusforge_core::pipeline::run(
+            &request,
+            log,
+            JobControl::new(),
+            Some(&cache),
+        ))
+    };
+    let first = PreviewLog::new(true, true);
+    assert!(!cached("pf_cache_a", &first).align_cached);
+    assert!(!first.aligned().is_empty());
+    let second = PreviewLog::new(true, true);
+    assert!(cached("pf_cache_b", &second).align_cached);
+    assert!(
+        second.aligned().is_empty(),
+        "a cached alignment previews nothing"
+    );
+    assert!(!second.composites().is_empty());
+
+    // A resumed fuse previews only the tiles it fuses itself, and an
+    // alignment read back from the resume ledger previews no frames.
+    for aligned in [false, true] {
+        let label = format!("pf_resume_{aligned}");
+        let mut request = if aligned {
+            ecc_request(&label, 3, "anchor")
+        } else {
+            base_request(&label, mantis_frames(3), ParamValues::new())
+        };
+        request
+            .explicit
+            .insert("levels".to_string(), ParamValue::Int(3));
+        request.tile_size = Some(256);
+        request.max_host_memory = Some(1);
+        request.poll = Duration::from_millis(1);
+        request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+        let control = JobControl::new();
+        let outcome = focusforge_core::pipeline::run(
+            &request,
+            &CancelAfterFirstUnit(Arc::clone(&control)),
+            control,
+            None,
+        )
+        .expect("a cancel is not an error");
+        assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+        request.resume = true;
+        let log = PreviewLog::new(aligned, true);
+        let report = run_observed(&request, &log);
+        assert_eq!(
+            report.align_source,
+            if aligned { "resumed" } else { "skipped" },
+            "aligned={aligned}"
+        );
+        assert!(
+            log.aligned().is_empty(),
+            "aligned={aligned}: a resumed alignment previews no frames"
+        );
+        let composites = log.composites();
+        let last = composites.last().expect("the resumed run previews");
+        assert!(last.covered > 0, "aligned={aligned}");
+        assert!(
+            last.covered < 512 * 512,
+            "aligned={aligned}: tiles fused before the cancel must not appear"
+        );
+    }
+}
+
+#[test]
+fn preview_feed_gpu_path() {
+    for lost in [false, true] {
+        let backend = || -> &'static dyn TileBackend {
+            Box::leak(Box::new(CappedBackend {
+                cap: u32::MAX,
+                shortfall: None,
+                asked: Mutex::new(Vec::new()),
+                lost,
+            }))
+        };
+        let plain = held_run_observed("pf_gpu_plain", 256, 3, Some(backend()), &NoopObserver)
+            .expect("an unsubscribed backend run");
+        let log = PreviewLog::new(false, true);
+        let run = held_run_observed("pf_gpu_sub", 256, 3, Some(backend()), &log)
+            .expect("a subscribed backend run");
+        assert!(run.composite == plain.composite, "lost={lost}: composite");
+        assert!(run.zmap == plain.zmap, "lost={lost}: Z-Map");
+        let last = log.composites().pop().expect("the backend path previews");
+        assert_eq!(last.covered, 512 * 512, "lost={lost}");
+    }
+}
+
+#[test]
+fn preview_feed_subscribes_per_kind() {
+    let only_composite = PreviewLog::new(false, true);
+    run_observed(&ecc_request("pf_kind_c", 3, "anchor"), &only_composite);
+    assert!(only_composite.aligned().is_empty());
+    assert!(!only_composite.composites().is_empty());
+
+    let only_aligned = PreviewLog::new(true, false);
+    run_observed(&ecc_request("pf_kind_a", 3, "anchor"), &only_aligned);
+    assert!(only_aligned.composites().is_empty());
+    assert!(!only_aligned.aligned().is_empty());
 }

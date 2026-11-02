@@ -19,6 +19,7 @@ mod error;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::display::preview::AlignedFrameSink;
 use crate::gpu::AlignBackend;
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
@@ -352,6 +353,7 @@ pub struct AlignContext<'a> {
     reader: &'a dyn TileReader,
     prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
     align_backend: Option<&'a dyn AlignBackend>,
+    preview: Option<&'a AlignedFrameSink>,
 }
 
 impl<'a> AlignContext<'a> {
@@ -362,6 +364,7 @@ impl<'a> AlignContext<'a> {
             reader,
             prepared: None,
             align_backend: None,
+            preview: None,
         }
     }
 
@@ -370,6 +373,18 @@ impl<'a> AlignContext<'a> {
     pub fn with_align_backend(mut self, backend: Option<&'a dyn AlignBackend>) -> Self {
         self.align_backend = backend;
         self
+    }
+
+    /// Attaches the sink a registration offers its frame image to; `None`
+    /// offers nothing.
+    pub fn with_preview(mut self, preview: Option<&'a AlignedFrameSink>) -> Self {
+        self.preview = preview;
+        self
+    }
+
+    /// The sink attached with [`Self::with_preview`], if any.
+    pub fn preview(&self) -> Option<&'a AlignedFrameSink> {
+        self.preview
     }
 
     /// The accelerator attached with [`Self::with_align_backend`], if any.

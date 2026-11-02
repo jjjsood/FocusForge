@@ -663,6 +663,9 @@ impl PyramidalEcc {
         traced: bool,
     ) -> Result<(Attempt, Escalation), AlgorithmError> {
         let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+        if let Some(sink) = ctx.preview() {
+            sink.offer(frame, &frame_pyramid);
+        }
         let first = Self::solve_from(
             ctx,
             frame,

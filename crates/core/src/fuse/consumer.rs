@@ -8,9 +8,10 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::algorithm::{AlgorithmError, StackAlgorithm};
+use crate::display::preview::CompositeMosaic;
 use crate::fuse::error::algorithm_error;
 use crate::io::{TiffSpec, TiffWriter};
 use crate::params::ParamValues;
@@ -48,6 +49,9 @@ pub struct FusionConsumer {
     /// every written tile is clipped to `rect` and translated by
     /// `-(rect.x, rect.y)` before it reaches either writer.
     crop: Option<Rect>,
+    /// Folded each written tile when a front end subscribed to the
+    /// composite preview.
+    preview: Option<Arc<CompositeMosaic>>,
 }
 
 /// The frame extent and count [`FusionConsumer::create`] needs to size both
@@ -129,6 +133,7 @@ impl FusionConsumer {
             composite: Mutex::new(Some(composite)),
             zmap: Mutex::new(zmap),
             crop,
+            preview: None,
         })
     }
 
@@ -191,6 +196,7 @@ impl FusionConsumer {
             composite: Mutex::new(Some(composite)),
             zmap: Mutex::new(zmap),
             crop,
+            preview: None,
         })
     }
 
@@ -267,6 +273,13 @@ impl FusionConsumer {
         Ok((consumer, surviving_indices))
     }
 
+    /// Folds every tile this consumer writes into `mosaic`; `None` keeps the
+    /// consumer free of any preview work.
+    pub fn with_preview(mut self, mosaic: Option<Arc<CompositeMosaic>>) -> Self {
+        self.preview = mosaic;
+        self
+    }
+
     /// The write tail: clips `output` against this consumer's crop (if any)
     /// and writes both the composite and, when one was created, the Z-Map.
     /// Extracted so a consumer that supplies its own pixels (never calling
@@ -313,6 +326,9 @@ impl FusionConsumer {
             .as_mut()
             .expect("composite writer present")
             .write_tile(target_written, &cropped_composite)?;
+        if let Some(mosaic) = &self.preview {
+            mosaic.fold(target_written, &cropped_composite);
+        }
 
         if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
             let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
