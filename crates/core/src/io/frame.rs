@@ -87,6 +87,12 @@ pub trait FrameReader: TileReader + Send + Sync {
     /// Frame `index`'s description.
     fn frame(&self, index: usize) -> &FrameDesc;
 
+    /// Full-frame develops per frame since this reader opened, in frame
+    /// order; `None` for readers that keep no count.
+    fn develop_counts(&self) -> Option<Vec<u64>> {
+        None
+    }
+
     /// Facts used to resolve stack-dependent parameters.
     fn stack_context(&self) -> StackContext {
         let (width, height) = self.dimensions();

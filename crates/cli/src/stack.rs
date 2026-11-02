@@ -120,6 +120,9 @@ pub struct StackReport {
     /// [`focusforge_core::timing::StageTimings`]'s own rustdoc for the full
     /// contract, including what a parallel stage's number means.
     pub stages: focusforge_core::timing::StageTimings,
+    /// Full-frame RAW develops per frame, in frame order, across every stage
+    /// of this group; `null` for TIFF and JPEG stacks.
+    pub develop_counts: Option<Vec<u64>>,
     /// How this run's `align` stage was satisfied: `"computed"` (a real
     /// `align_stack` solve), `"cached"` (the stage cache),
     /// `"resumed"` (a `--resume` ledger peek), or `"skipped"`
@@ -1479,6 +1482,7 @@ fn build_stack_report(
         gpu_fallback: report.gpu_fallback,
         align_cached: report.align_cached,
         stages: report.stages,
+        develop_counts: report.develop_counts,
         align_source: report.align_source,
         align_workers: report.align_workers,
         peak_align_workers: report.peak_align_workers,
@@ -1577,6 +1581,15 @@ fn render(report: &StackReport) -> String {
         ),
     });
     lines.push(format!("backend: {}", report.backend));
+    if let Some(counts) = report.develop_counts.as_deref().filter(|c| !c.is_empty()) {
+        let sum: u64 = counts.iter().sum();
+        lines.push(format!(
+            "develops per frame: min={} mean={:.2} max={}",
+            counts.iter().min().expect("non-empty"),
+            sum as f64 / counts.len() as f64,
+            counts.iter().max().expect("non-empty"),
+        ));
+    }
     if let (
         Some(max_device_bytes_in_flight),
         Some(device_budget_provenance),
@@ -1732,6 +1745,7 @@ mod tests {
                 warp_write: None,
                 finalize: Some(0.038),
             },
+            develop_counts: None,
             align_source: "computed".to_string(),
             align_workers: Some(3),
             peak_align_workers: Some(3),
@@ -1772,6 +1786,21 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    #[test]
+    fn render_names_develop_counts() {
+        let mut sample = sample_report();
+        sample.develop_counts = Some(vec![1, 3, 2]);
+        let text = render(&sample);
+        assert!(
+            text.contains("develops per frame: min=1 mean=2.00 max=3"),
+            "missing develops line in: {text}"
+        );
+        assert!(
+            !render(&sample_report()).contains("develops"),
+            "a reader without counts prints no develops line"
+        );
     }
 
     #[test]

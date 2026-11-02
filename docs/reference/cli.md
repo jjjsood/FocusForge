@@ -451,6 +451,15 @@ worker count of its own; reporting one from a previous run's cache entry
 would be a fabricated number, exactly the confusion `align_source` exists to
 prevent.
 
+The `develop_counts` field counts full-frame RAW develops: one count per frame,
+in frame order, across every stage of this group (preparation, alignment,
+fusion and metrics together). It is more than 1 for a frame when the
+developed-frame cache, a quarter of the host budget, holds fewer frames than
+the stack and the frame is fused in several tiles, because every tile
+develops an evicted frame again. It is `null` for TIFF and JPEG stacks, and
+the human summary prints a `develops per frame: min= mean= max=` line only
+when the field is present.
+
 ```json
 {
   "input": "fixtures/mantis-512",
@@ -509,6 +518,7 @@ prevent.
   "device_peak_in_flight": null,
   "align_cached": false,
   "stages": { "setup": 0.001, "align": 9.918, "fuse": 2.712, "warp_write": null, "finalize": 0.379 },
+  "develop_counts": null,
   "align_source": "computed",
   "align_workers": 7,
   "peak_align_workers": 7

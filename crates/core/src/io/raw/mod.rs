@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
@@ -228,6 +229,8 @@ impl CachedFrame for LinearFrame {
 pub struct RawStack {
     frames: Vec<RawFrame>,
     cache: FrameCache<LinearFrame>,
+    /// Develops started per frame, counting failed ones.
+    develops: Vec<AtomicU64>,
     look: OnceLock<LookTransform>,
 }
 
@@ -296,6 +299,7 @@ impl RawStack {
             frames.push(frame);
         }
         Ok(Self {
+            develops: frames.iter().map(|_| AtomicU64::new(0)).collect(),
             frames,
             cache: FrameCache::new(cache_bytes),
             look: OnceLock::new(),
@@ -337,6 +341,7 @@ impl RawStack {
         let required = reservation_bytes(frame)?;
         self.cache
             .get_or_decode(index, required, || {
+                self.develops[index].fetch_add(1, Ordering::Relaxed);
                 // The decoder runs its own rayon loops. On a pool worker,
                 // waiting for them could pick up another reader's job, which
                 // blocks on the decode lock this call holds; a plain thread
@@ -379,6 +384,15 @@ impl FrameReader for RawStack {
 
     fn frame(&self, index: usize) -> &FrameDesc {
         &self.frames[index].desc
+    }
+
+    fn develop_counts(&self) -> Option<Vec<u64>> {
+        Some(
+            self.develops
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect(),
+        )
     }
 }
 

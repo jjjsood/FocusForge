@@ -285,6 +285,145 @@ fn info_and_stack_refuse_a_directory_with_only_prior_tiff_outputs() {
     assert!(String::from_utf8_lossy(&stacked.stderr).contains("frames found"));
 }
 
+/// `stack --json --no-align --no-crop --algorithm laplacian` over `input`.
+fn stack_json_args(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    extra: &[&str],
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "stack",
+        input.to_str().expect("UTF-8 input"),
+        "-o",
+        output.to_str().expect("UTF-8 output"),
+        "--json",
+        "--no-align",
+        "--no-crop",
+        "--algorithm",
+        "laplacian",
+    ]
+    .into_iter()
+    .chain(extra.iter().copied())
+    .map(str::to_string)
+    .collect();
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    args
+}
+
+fn develop_counts_of(output: &std::process::Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "stack stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    report
+        .get("develop_counts")
+        .expect("develop_counts is always present")
+        .clone()
+}
+
+#[test]
+fn raw_develop_counts_follow_the_cache() {
+    let cwd = common::tmp_dir("stack_raw_develop_counts");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = 256;
+    spec.height = 256;
+    spec.samples = (0..256u32 * 256)
+        .map(|i| (((i % 256) + (i / 256)) * 8 % 4000) as u16)
+        .collect();
+    let source = write_dng(&spec, false);
+    for count in [3usize, 6] {
+        let input = cwd.join(format!("input-{count}"));
+        std::fs::create_dir(&input).expect("input directory");
+        for index in 0..count {
+            std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+                .expect("copy RAW frame");
+        }
+        let output = cwd.join(format!("roomy-{count}"));
+        std::fs::create_dir(&output).expect("output directory");
+        let roomy = run(&cwd, &stack_json_args(&input, &output, &[]));
+        let counts = develop_counts_of(&roomy);
+        assert_eq!(counts, serde_json::json!(vec![1; count]), "no ceiling");
+
+        let output = cwd.join(format!("tight-{count}"));
+        std::fs::create_dir(&output).expect("output directory");
+        let tight = run(
+            &cwd,
+            &stack_json_args(
+                &input,
+                &output,
+                &[
+                    "--tile-size",
+                    "160",
+                    "--set",
+                    "levels=3",
+                    "--max-host-memory",
+                    "12582912",
+                ],
+            ),
+        );
+        let counts: Vec<u64> = develop_counts_of(&tight)
+            .as_array()
+            .expect("one count per frame")
+            .iter()
+            .map(|n| n.as_u64().expect("count"))
+            .collect();
+        assert_eq!(counts.len(), count);
+        assert!(counts.iter().all(|&n| n >= 1), "counts: {counts:?}");
+        assert!(
+            counts.iter().sum::<u64>() > count as u64,
+            "a cache smaller than the stack re-develops frames: {counts:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_develop_counts_absent_for_tiff() {
+    let cwd = common::tmp_dir("stack_raw_develop_counts_tiff");
+    for (name, input) in [
+        (
+            "mantis-64",
+            common::fixtures_dir().join("mantis-64").join("frames"),
+        ),
+        ("mantis-512", common::mantis_512_dir()),
+    ] {
+        let output = cwd.join(name);
+        std::fs::create_dir(&output).expect("output directory");
+        let stacked = run(&cwd, &stack_json_args(&input, &output, &[]));
+        assert_eq!(
+            develop_counts_of(&stacked),
+            serde_json::Value::Null,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn raw_develop_counts_survive_a_failed_develop() {
+    let cwd = common::tmp_dir("stack_raw_develop_failure");
+    let input = cwd.join("input");
+    let output = cwd.join("output");
+    std::fs::create_dir(&input).expect("input directory");
+    std::fs::create_dir(&output).expect("output directory");
+    let spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]);
+    let good = write_dng(&spec, false);
+    let bad = write_dng(&spec, true);
+    std::fs::copy(good.path(), input.join("00.dng")).expect("copy RAW frame");
+    std::fs::copy(bad.path(), input.join("01.dng")).expect("copy header-only RAW frame");
+    std::fs::copy(good.path(), input.join("02.dng")).expect("copy RAW frame");
+    let stacked = run(&cwd, &stack_json_args(&input, &output, &[]));
+    let stderr = String::from_utf8_lossy(&stacked.stderr).into_owned();
+    assert!(
+        !stacked.status.success(),
+        "a header-only frame cannot be developed"
+    );
+    assert!(stderr.contains("01.dng"), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "requires a long RAW decode run"]

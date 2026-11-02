@@ -174,6 +174,9 @@ pub struct FuseReport {
     /// for a stage that reran on the CPU.
     pub align_backend_used: bool,
     pub stages: StageTimings,
+    /// Full-frame RAW develops per frame across every stage of the run;
+    /// `None` when the reader keeps no count.
+    pub develop_counts: Option<Vec<u64>>,
     pub wall_seconds: f64,
     pub metrics: Metrics,
 }
@@ -984,6 +987,7 @@ pub fn run(
         align_accounted_bytes,
         align_backend_used,
         stages,
+        develop_counts: frame_reader.develop_counts(),
         wall_seconds,
         metrics,
     })))
