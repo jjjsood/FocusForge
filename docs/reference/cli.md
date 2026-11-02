@@ -453,10 +453,10 @@ prevent.
 
 The `develop_counts` field counts full-frame RAW develops: one count per frame,
 in frame order, across every stage of this group (preparation, alignment,
-fusion and metrics together). It is more than 1 for a frame when the
-developed-frame cache, a quarter of the host budget, holds fewer frames than
-the stack and the frame is fused in several tiles, because every tile
-develops an evicted frame again. It is `null` for TIFF and JPEG stacks, and
+fusion and metrics together). A `stack` run develops every frame once, in a
+parallel pass before preparation, into scratch files that later reads map, so
+every count is 1 whatever the tile size or host-memory ceiling. It is `null`
+for TIFF and JPEG stacks, and
 the human summary prints a `develops per frame: min= mean= max=` line only
 when the field is present.
 

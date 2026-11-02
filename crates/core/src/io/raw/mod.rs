@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
+use memmap2::Mmap;
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::xyz::Illuminant;
@@ -13,10 +15,10 @@ use rawler::rawsource::RawSource;
 
 use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
-use super::{FrameDesc, FrameReader, RawIdentity};
+use super::{FrameDesc, FrameError, FrameReader, RawIdentity, map_read_only};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
-use crate::tile::{Rect, Sample, SampleFormat};
+use crate::tile::{Rect, Sample, SampleFormat, ScratchDir, TileError};
 
 mod look;
 pub use look::LookTransform;
@@ -195,6 +197,16 @@ pub enum RawError {
         /// Geometry produced by development.
         developed: (u32, u32),
     },
+    /// A developed-frame scratch directory or file could not be created,
+    /// written or mapped.
+    #[error("{}: RAW scratch I/O failed: {source}", path.display())]
+    Scratch {
+        /// Directory or file that failed.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -224,6 +236,69 @@ impl CachedFrame for LinearFrame {
     }
 }
 
+/// Bytes one developed pixel takes in a scratch file.
+const PIXEL_BYTES: usize = std::mem::size_of::<[f32; 3]>();
+
+/// Pixels per `write` call when a developed frame goes to scratch.
+const WRITE_PIXELS: usize = 1 << 16;
+
+/// A frame developed into a scratch file and mapped read-only: its
+/// `width * height` samples as native-endian `[f32; 3]`, no header.
+#[derive(Debug)]
+struct MappedFrame {
+    map: Mmap,
+    /// Each channel's mean over the frame.
+    means: [f64; 3],
+    /// Grey replicated to three channels, so no colour transform applies.
+    monochrome: bool,
+}
+
+impl MappedFrame {
+    /// `count` pixels starting at pixel `first`.
+    fn pixels(&self, first: usize, count: usize) -> impl Iterator<Item = [f32; 3]> + '_ {
+        self.map[first * PIXEL_BYTES..(first + count) * PIXEL_BYTES]
+            .chunks_exact(PIXEL_BYTES)
+            .map(|pixel| {
+                std::array::from_fn(|channel| {
+                    let bytes = pixel[channel * 4..(channel + 1) * 4]
+                        .try_into()
+                        .expect("a channel is four bytes");
+                    f32::from_ne_bytes(bytes)
+                })
+            })
+    }
+}
+
+/// Every frame developed into scratch. The mappings drop before the
+/// directory that holds their files.
+#[derive(Debug)]
+struct DevelopedFrames {
+    frames: Vec<MappedFrame>,
+    _dir: ScratchDir,
+}
+
+/// Where a frame's developed samples are read from.
+enum Developed<'a> {
+    Cached(Arc<LinearFrame>),
+    Mapped(&'a MappedFrame),
+}
+
+impl Developed<'_> {
+    fn monochrome(&self) -> bool {
+        match self {
+            Self::Cached(frame) => frame.monochrome,
+            Self::Mapped(frame) => frame.monochrome,
+        }
+    }
+
+    fn means(&self) -> [f64; 3] {
+        match self {
+            Self::Cached(frame) => frame.means,
+            Self::Mapped(frame) => frame.means,
+        }
+    }
+}
+
 /// A RAW frame set whose metadata is available before pixel development.
 #[derive(Debug)]
 pub struct RawStack {
@@ -232,6 +307,8 @@ pub struct RawStack {
     /// Develops started per frame, counting failed ones.
     develops: Vec<AtomicU64>,
     look: OnceLock<LookTransform>,
+    /// Set by [`FrameReader::develop_once`]; reads are served from it.
+    scratch: OnceLock<DevelopedFrames>,
 }
 
 impl RawStack {
@@ -303,6 +380,7 @@ impl RawStack {
             frames,
             cache: FrameCache::new(cache_bytes),
             look: OnceLock::new(),
+            scratch: OnceLock::new(),
         })
     }
 
@@ -340,27 +418,7 @@ impl RawStack {
         let path = &frame.metadata.path;
         let required = reservation_bytes(frame)?;
         self.cache
-            .get_or_decode(index, required, || {
-                self.develops[index].fetch_add(1, Ordering::Relaxed);
-                // The decoder runs its own rayon loops. On a pool worker,
-                // waiting for them could pick up another reader's job, which
-                // blocks on the decode lock this call holds; a plain thread
-                // waits on the global pool without taking any work.
-                let developed = std::thread::scope(|scope| {
-                    scope
-                        .spawn(|| develop(path))
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                })?;
-                if (developed.width, developed.height) != (frame.desc.width, frame.desc.height) {
-                    return Err(RawError::GeometryChanged {
-                        path: path.clone(),
-                        metadata: (frame.desc.width, frame.desc.height),
-                        developed: (developed.width, developed.height),
-                    });
-                }
-                Ok(developed)
-            })
+            .get_or_decode(index, required, || self.develop_frame(index))
             .map_err(|fault| match fault {
                 CacheFault::Decode(error) => error,
                 CacheFault::TooSmall { bound, required } => RawError::CacheTooSmall {
@@ -371,6 +429,82 @@ impl RawStack {
                 CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
             })
     }
+
+    /// One full-frame develop of frame `index`, counted. `index` is in range.
+    fn develop_frame(&self, index: usize) -> Result<LinearFrame, RawError> {
+        let frame = &self.frames[index];
+        let path = &frame.metadata.path;
+        self.develops[index].fetch_add(1, Ordering::Relaxed);
+        // The decoder runs its own rayon loops. On a pool worker, waiting for
+        // them could pick up another reader's job, which blocks on the decode
+        // lock this call holds; a plain thread waits on the global pool
+        // without taking any work.
+        let developed = std::thread::scope(|scope| {
+            scope
+                .spawn(|| develop(path))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })?;
+        if (developed.width, developed.height) != (frame.desc.width, frame.desc.height) {
+            return Err(RawError::GeometryChanged {
+                path: path.clone(),
+                metadata: (frame.desc.width, frame.desc.height),
+                developed: (developed.width, developed.height),
+            });
+        }
+        Ok(developed)
+    }
+
+    /// Frame `index`'s developed samples: its mapped scratch file when the
+    /// pass has run, else the cache.
+    fn developed(&self, index: usize) -> Result<Developed<'_>, RawError> {
+        match self.scratch.get() {
+            Some(scratch) => {
+                scratch
+                    .frames
+                    .get(index)
+                    .map(Developed::Mapped)
+                    .ok_or(RawError::FrameIndex {
+                        index,
+                        count: self.frames.len(),
+                    })
+            }
+            None => self.decoded(index).map(Developed::Cached),
+        }
+    }
+
+    /// Develops frame `index` into `<dir>/<index>.f32` and maps the file.
+    fn develop_to_scratch(&self, index: usize, dir: &Path) -> Result<MappedFrame, RawError> {
+        let developed = self.develop_frame(index)?;
+        let path = dir.join(format!("{index}.f32"));
+        let fault = |source| RawError::Scratch {
+            path: path.clone(),
+            source,
+        };
+        write_samples(&path, &developed.samples).map_err(fault)?;
+        Ok(MappedFrame {
+            map: map_read_only(&path).map_err(fault)?,
+            means: developed.means,
+            monochrome: developed.monochrome,
+        })
+    }
+}
+
+/// Writes `samples` to a new file at `path` as native-endian `f32`s.
+fn write_samples(path: &Path, samples: &[[f32; 3]]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    let mut chunk = Vec::with_capacity(WRITE_PIXELS * PIXEL_BYTES);
+    for pixels in samples.chunks(WRITE_PIXELS) {
+        chunk.clear();
+        chunk.extend(
+            pixels
+                .iter()
+                .flatten()
+                .flat_map(|value| value.to_ne_bytes()),
+        );
+        file.write_all(&chunk)?;
+    }
+    Ok(())
 }
 
 impl FrameReader for RawStack {
@@ -394,6 +528,99 @@ impl FrameReader for RawStack {
                 .collect(),
         )
     }
+
+    /// Develops every frame once, in parallel, into mapped scratch files in a
+    /// directory under `scratch_root` that lives as long as this reader. At
+    /// most `workers` develops overlap, and no more than `budget` holds
+    /// decode reservations for.
+    fn develop_once(
+        &self,
+        scratch_root: &Path,
+        budget: u64,
+        workers: usize,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<usize, AlgorithmError> {
+        if self.scratch.get().is_some() {
+            return Ok(0);
+        }
+        let mut largest = None;
+        for frame in &self.frames {
+            let required = reservation_bytes(frame).map_err(FrameError::from)?;
+            if largest.is_none_or(|(_, most)| required > most) {
+                largest = Some((frame, required));
+            }
+        }
+        let (frame, required) = largest.expect("a RAW stack holds at least one frame");
+        if budget < required {
+            return Err(FrameError::from(RawError::CacheTooSmall {
+                path: frame.metadata.path.clone(),
+                bound: budget,
+                required,
+            })
+            .into());
+        }
+        let threads = workers
+            .min(usize::try_from(budget / required.max(1)).unwrap_or(usize::MAX))
+            .min(self.frames.len())
+            .max(1);
+
+        let dir = ScratchDir::create_in(scratch_root)
+            .map_err(|error| match error {
+                TileError::Scratch { path, source } => RawError::Scratch { path, source },
+                other => RawError::Scratch {
+                    path: scratch_root.to_path_buf(),
+                    source: std::io::Error::other(other),
+                },
+            })
+            .map_err(FrameError::from)?;
+        let slots: Vec<OnceLock<MappedFrame>> =
+            self.frames.iter().map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+        let failure = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= slots.len() {
+                            break;
+                        }
+                        let mapped = if cancelled() {
+                            Err(AlgorithmError::Cancelled)
+                        } else {
+                            self.develop_to_scratch(index, dir.path())
+                                .map_err(|error| AlgorithmError::from(FrameError::from(error)))
+                        };
+                        match mapped {
+                            Ok(frame) => {
+                                slots[index]
+                                    .set(frame)
+                                    .expect("each frame is taken by one worker");
+                            }
+                            Err(error) => {
+                                next.store(slots.len(), Ordering::Relaxed);
+                                failure
+                                    .lock()
+                                    .expect("no worker panics holding the failure slot")
+                                    .get_or_insert(error);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = failure.into_inner().expect("no worker panicked") {
+            return Err(error);
+        }
+        let frames = slots
+            .into_iter()
+            .map(|slot| slot.into_inner().expect("every frame developed"))
+            .collect();
+        self.scratch
+            .get_or_init(|| DevelopedFrames { frames, _dir: dir });
+        Ok(threads)
+    }
 }
 
 impl RawStack {
@@ -407,9 +634,10 @@ impl RawStack {
         gain: u32,
         out: &mut [S],
     ) -> Result<(), AlgorithmError> {
-        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
+        let developed = self.developed(frame).map_err(crate::io::FrameError::from)?;
+        let desc = &self.frames[frame].desc;
         let path = &self.frames[frame].metadata.path;
-        check_tile(rect, (decoded.width, decoded.height), 3, out.len())
+        check_tile(rect, (desc.width, desc.height), 3, out.len())
             .map_err(|fault| match fault {
                 TileFault::OutOfBounds { requested, frame } => RawError::OutOfBounds {
                     path: path.clone(),
@@ -424,27 +652,47 @@ impl RawStack {
             })
             .map_err(crate::io::FrameError::from)?;
         let grey_look;
-        let look = if decoded.monochrome {
+        let look = if developed.monochrome() {
             grey_look = LookTransform::new([f32::NAN; 4], IDENTITY_MATRIX);
             &grey_look
         } else {
             self.look().map_err(crate::io::FrameError::from)?
         };
         let scale = gain as f32 / UNIT_GAIN as f32;
-        let stride = decoded.width as usize;
-        let row_len = rect.width as usize * 3;
+        let stride = desc.width as usize;
+        let width = rect.width as usize;
+        let row_len = width * 3;
         for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
             let source = source_y as usize * stride + rect.x as usize;
-            let pixels = &decoded.samples[source..source + rect.width as usize];
             let destination = &mut out[row * row_len..(row + 1) * row_len];
-            for (pixel, target) in pixels.iter().zip(destination.chunks_exact_mut(3)) {
-                let looked = look.forward_f32(pixel.map(|value| value * scale));
-                for (sample, value) in target.iter_mut().zip(looked) {
-                    *sample = S::narrow(value * WHITE);
+            match &developed {
+                Developed::Cached(frame) => look_row(
+                    frame.samples[source..source + width].iter().copied(),
+                    look,
+                    scale,
+                    destination,
+                ),
+                Developed::Mapped(frame) => {
+                    look_row(frame.pixels(source, width), look, scale, destination);
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Applies `scale`, then the look, to `pixels`, narrowing into `target`.
+fn look_row<S: Sample>(
+    pixels: impl Iterator<Item = [f32; 3]>,
+    look: &LookTransform,
+    scale: f32,
+    target: &mut [S],
+) {
+    for (pixel, target) in pixels.zip(target.chunks_exact_mut(3)) {
+        let looked = look.forward_f32(pixel.map(|value| value * scale));
+        for (sample, value) in target.iter_mut().zip(looked) {
+            *sample = S::narrow(value * WHITE);
+        }
     }
 }
 
@@ -495,8 +743,8 @@ impl TileReader for RawStack {
     }
 
     fn linear_means(&self, frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
-        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
-        Ok(Some(decoded.means))
+        let developed = self.developed(frame).map_err(crate::io::FrameError::from)?;
+        Ok(Some(developed.means()))
     }
 }
 

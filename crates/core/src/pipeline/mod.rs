@@ -310,6 +310,7 @@ pub fn run(
             }
         })
     };
+    let develop_budget = options.budget.bytes();
     options.budget = opened.scheduler_budget;
     let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = request
@@ -347,6 +348,30 @@ pub fn run(
         options.tile_size = options.tile_size.min(backend.max_tile_size(spp));
     }
 
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(frame_reader.len())
+        .min(control.admission_cap())
+        .max(1);
+    let cancel_requested = || control.state() == ControlState::CancelRequested;
+    // A RAW stack develops every frame here, once, so no later read does.
+    match frame_reader.develop_once(
+        &request.scratch_root,
+        develop_budget,
+        workers,
+        &cancel_requested,
+    ) {
+        Err(AlgorithmError::Cancelled) => {
+            return Ok(FuseOutcome::Cancelled {
+                units_done: 0,
+                unit_total: 0,
+            });
+        }
+        other => {
+            other?;
+        }
+    }
+
     let equalization = match request.equalize {
         Some(settings) => {
             let frames_done = control.begin_prepare(frame_reader.len());
@@ -354,11 +379,6 @@ pub fn run(
             observer.stage(RunStage::Prepare {
                 frames: frame_reader.len(),
             });
-            let workers = std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get)
-                .min(frame_reader.len())
-                .min(control.admission_cap())
-                .max(1);
             let done = AtomicBool::new(false);
             let poll = request.poll;
             // The stage span is re-entered on the watcher thread, which does
@@ -382,7 +402,7 @@ pub fn run(
                         settings,
                         workers,
                         &frames_done,
-                        &|| control.state() == ControlState::CancelRequested,
+                        &cancel_requested,
                     )
                 };
                 done.store(true, Ordering::SeqCst);

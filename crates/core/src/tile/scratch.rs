@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! A run-scoped scratch directory, RAII-created and RAII-removed. No
-//! mapping: no intermediate here outlives a single tile, and `MmapMut`
-//! would need a second `unsafe` site, which the workspace denies. No
-//! `tempfile` dependency either: the uniqueness rule below is small enough
+//! A run-scoped scratch directory, RAII-created and RAII-removed. A reader
+//! may map a closed file read-only and drops its mappings before the
+//! directory; never `MmapMut`, a second `unsafe` site the workspace denies.
+//! No `tempfile` dependency either: the uniqueness rule below is small enough
 //! to own outright and avoids a licensing decision for one directory.
 
 use std::fs;

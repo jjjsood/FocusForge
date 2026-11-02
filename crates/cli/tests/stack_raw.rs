@@ -326,7 +326,7 @@ fn develop_counts_of(output: &std::process::Output) -> serde_json::Value {
 }
 
 #[test]
-fn raw_develop_counts_follow_the_cache() {
+fn raw_develop_counts_are_one_per_frame() {
     let cwd = common::tmp_dir("stack_raw_develop_counts");
     let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
     spec.width = 256;
@@ -365,17 +365,11 @@ fn raw_develop_counts_follow_the_cache() {
                 ],
             ),
         );
-        let counts: Vec<u64> = develop_counts_of(&tight)
-            .as_array()
-            .expect("one count per frame")
-            .iter()
-            .map(|n| n.as_u64().expect("count"))
-            .collect();
-        assert_eq!(counts.len(), count);
-        assert!(counts.iter().all(|&n| n >= 1), "counts: {counts:?}");
-        assert!(
-            counts.iter().sum::<u64>() > count as u64,
-            "a cache smaller than the stack re-develops frames: {counts:?}"
+        let counts = develop_counts_of(&tight);
+        assert_eq!(
+            counts,
+            serde_json::json!(vec![1; count]),
+            "a ceiling below the stack develops each frame once"
         );
     }
 }

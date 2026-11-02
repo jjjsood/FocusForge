@@ -52,3 +52,17 @@ pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::segment::{DecodedSegment, SegmentOrigin, TiffSegmentDecoder, TiffSegmentReader};
 pub use tiff::stack::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME, frame_paths, is_frame_path};
 pub use tiff::writer::{StripCompression, StripSpec, StripWriter, TiffSpec, TiffWriter};
+
+/// Map `path` read-only for the lifetime of the returned [`memmap2::Mmap`].
+///
+/// The crate's one `unsafe` site: mapping a file that changes while mapped is
+/// undefined behavior (memmap2 0.9.11, <https://docs.rs/memmap2/0.9.11/memmap2/struct.Mmap.html>).
+/// Callers map only files nothing writes again: a TIFF frame, or a
+/// developed-frame file this process wrote once and closed.
+#[allow(unsafe_code)]
+pub(crate) fn map_read_only(path: &std::path::Path) -> std::io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: every caller maps a file that nothing writes while a mapping
+    // of it is alive, as the doc comment above requires.
+    unsafe { memmap2::Mmap::map(&file) }
+}

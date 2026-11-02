@@ -21,7 +21,9 @@ develops per frame (min/mean/max, empty for TIFF), non-null stage wall times,
 wall seconds, user+system CPU seconds, CPU % and peak RSS.
 
 Arguments after `--` reach every stack run, e.g. `-- --cpu --max-host-memory
-822083584` to shrink the developed-frame cache for both formats alike.
+822083584` to cap host memory for both formats alike. A RAW run also writes
+its developed frames (width x height x 12 bytes each) to scratch for the
+length of the run, and the free-space check counts the largest run's share.
 A 180-frame sweep of a large frame takes hours: run it once, through
 tools/with-lock.sh gpu when the stack uses the GPU.
 
@@ -117,7 +119,8 @@ if command -v tiffinfo >/dev/null 2>&1 \
   exit 1
 fi
 
-# Σ N·(raw bytes + twin bytes) plus one f32 project per run.
+# Σ N·(raw bytes + twin bytes) plus one f32 project per run, plus the largest
+# run's developed frames (N·width·height·12 bytes, removed when its run ends).
 read -r need < <(python3 - "$OUT/probe.json" "$FRAME" "$OUT/twin.tif" "$FRAMES" <<'PY'
 import json
 import os
@@ -127,7 +130,7 @@ report = json.load(open(sys.argv[1]))
 project = report["width"] * report["height"] * 3 * 4
 per_frame = os.path.getsize(sys.argv[2]) + os.path.getsize(sys.argv[3])
 counts = [int(n) for n in sys.argv[4].split(",")]
-print(sum(n * per_frame + 2 * project for n in counts))
+print(sum(n * per_frame + 2 * project for n in counts) + max(counts) * project)
 PY
 )
 avail=$(df -B1 --output=avail "$OUT" | tail -n 1 | tr -d ' ')

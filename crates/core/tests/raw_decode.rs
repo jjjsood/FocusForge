@@ -4,13 +4,17 @@ mod common;
 #[path = "common/raw_dng.rs"]
 mod raw_dng;
 
-use focusforge_core::algorithm::TileReader;
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::io::Rect;
 use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
+use focusforge_core::job::JobControl;
+use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::pipeline::{FuseOutcome, FuseOutput, FuseRequest, StageObserver};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::raw_dng::{DngSpec, write_dng};
 
@@ -1835,4 +1839,282 @@ fn raw_f32_stack_agrees_with_the_u16_stack_below_white() {
         (0..3).all(|c| fused.wide[c].abs_diff(fused.narrow[c]) <= 1),
         "{fused:?}"
     );
+}
+
+/// A gradient frame in the tinted camera, its pixels moving with `shift`.
+fn gradient_dng(width: u32, height: u32, shift: u32) -> tempfile::NamedTempFile {
+    let samples = (0..width * height)
+        .map(|i| ((((i % width) + (i / width)) * 8 + shift) % 4000) as u16)
+        .collect();
+    write_dng(&tinted_spec(samples, width, height, [0, 1, 1, 2]), false)
+}
+
+fn copies_of(dng: &tempfile::NamedTempFile, count: usize, dir: &Path) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let path = dir.join(format!("{index:02}.dng"));
+            std::fs::copy(dng.path(), &path).expect("copy the DNG frame");
+            path
+        })
+        .collect()
+}
+
+fn target_tmp() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temporary directory")
+}
+
+struct NoopObserver;
+impl StageObserver for NoopObserver {}
+
+fn raw_request(
+    frames: Vec<PathBuf>,
+    root: &Path,
+    equalize: Option<EqualizeSettings>,
+    max_host_memory: Option<u64>,
+) -> FuseRequest {
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(3));
+    FuseRequest {
+        frames,
+        output: FuseOutput::Seal(root.join("project.ffp")),
+        scratch_root: root.join("scratch"),
+        staging_key: "raw-develop".to_string(),
+        algorithm: focusforge_core::registry::find_stack("laplacian")
+            .expect("laplacian is registered"),
+        explicit,
+        align: None,
+        crop: false,
+        equalize,
+        tile_size: Some(160),
+        max_host_memory,
+        backend: None,
+        align_backend: None,
+        resume: false,
+        cache: false,
+        poll: std::time::Duration::from_millis(5),
+    }
+}
+
+#[test]
+fn raw_stack_develops_each_frame_once() {
+    let dng = gradient_dng(256, 256, 0);
+    for equalize in [
+        None,
+        Some(EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        }),
+    ] {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 8, root.path());
+        // Room for two developed frames and a decode, far below the stack.
+        let request = raw_request(frames, root.path(), equalize, Some(12 * 1024 * 1024));
+        let outcome =
+            focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+                .expect("the RAW run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(
+            report.develop_counts,
+            Some(vec![1; 8]),
+            "equalize: {equalize:?}"
+        );
+    }
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+#[test]
+fn raw_develop_pass_reads_match_cached_reads() {
+    const SIDE: (u32, u32) = (40, 30);
+    let files: Vec<_> = (0..3)
+        .map(|i| gradient_dng(SIDE.0, SIDE.1, i * 700))
+        .collect();
+    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+    let cached = RawStack::open_files(&paths).expect("DNG stack opens");
+    let developed = RawStack::open_files(&paths).expect("DNG stack opens");
+    let root = target_tmp();
+    developed
+        .develop_once(root.path(), u64::MAX, 2, &|| false)
+        .expect("the pass develops every frame");
+    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+    let rects = [
+        Rect {
+            x: 0,
+            y: 0,
+            width: SIDE.0,
+            height: SIDE.1,
+        },
+        Rect {
+            x: SIDE.0 - 5,
+            y: SIDE.1 - 3,
+            width: 5,
+            height: 3,
+        },
+        Rect {
+            x: SIDE.0 - 1,
+            y: SIDE.1 - 1,
+            width: 1,
+            height: 1,
+        },
+    ];
+    for frame in 0..3 {
+        for rect in rects {
+            let samples = rect.width as usize * rect.height as usize * 3;
+            for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                cached
+                    .read_tile_gained_into(frame, rect, gain, &mut want)
+                    .expect("cached read");
+                developed
+                    .read_tile_gained_into(frame, rect, gain, &mut got)
+                    .expect("mapped read");
+                assert_eq!(want, got, "u16 frame {frame} {rect:?} gain {gain}");
+
+                let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                cached
+                    .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                    .expect("cached read");
+                developed
+                    .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                    .expect("mapped read");
+                assert_eq!(
+                    bits(&want),
+                    bits(&got),
+                    "f32 frame {frame} {rect:?} gain {gain}"
+                );
+            }
+            let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+            cached
+                .read_tile_into(frame, rect, &mut want)
+                .expect("cached read");
+            developed
+                .read_tile_into(frame, rect, &mut got)
+                .expect("mapped read");
+            assert_eq!(want, got, "unit gain frame {frame} {rect:?}");
+            let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+            cached
+                .read_tile_f32_into(frame, rect, &mut want)
+                .expect("cached read");
+            developed
+                .read_tile_f32_into(frame, rect, &mut got)
+                .expect("mapped read");
+            assert_eq!(
+                bits(&want),
+                bits(&got),
+                "unit gain f32 frame {frame} {rect:?}"
+            );
+        }
+        assert_eq!(
+            cached.linear_means(frame).expect("cached means"),
+            developed.linear_means(frame).expect("mapped means"),
+            "means of frame {frame}"
+        );
+    }
+    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+}
+
+#[test]
+fn raw_develops_overlap() {
+    let dng = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let one = 8 * 8 * 30 + std::fs::metadata(dng.path()).expect("DNG size").len();
+    let paths = vec![PathBuf::from(dng.path()); 4];
+    let root = target_tmp();
+    let pass = |budget: u64, workers: usize| {
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        let result = stack.develop_once(root.path(), budget, workers, &|| false);
+        (stack, result)
+    };
+
+    let (stack, result) = pass(4 * one, 4);
+    assert_eq!(result.expect("four reservations fit"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    let (stack, result) = pass(one + one / 2, 4);
+    assert_eq!(result.expect("one and a half reservations fit one"), 1);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    let (stack, result) = pass(100 * one, 8);
+    assert_eq!(result.expect("workers beyond the frames idle"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+
+    let (stack, result) = pass(one - 1, 4);
+    let error = result.expect_err("a budget below one reservation refuses");
+    assert!(
+        matches!(
+            error,
+            AlgorithmError::Frame(FrameError::Raw(RawError::CacheTooSmall { required, .. }))
+                if required == one
+        ),
+        "{error}"
+    );
+    assert_eq!(stack.develop_counts(), Some(vec![0; 4]));
+}
+
+/// `root` holds no file or directory.
+fn assert_scratch_empty(root: &Path) {
+    let left: Vec<_> = match std::fs::read_dir(root) {
+        Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+        Err(_) => Vec::new(),
+    };
+    assert!(left.is_empty(), "scratch left behind: {left:?}");
+}
+
+#[test]
+fn raw_develop_failure_leaves_no_scratch() {
+    let good = gradient_dng(256, 256, 0);
+    let withheld = write_dng(
+        &tinted_spec(vec![64; 256 * 256], 256, 256, [0, 1, 1, 2]),
+        true,
+    );
+    let root = target_tmp();
+    let frames = vec![
+        PathBuf::from(good.path()),
+        PathBuf::from(withheld.path()),
+        PathBuf::from(good.path()),
+    ];
+    let request = raw_request(frames, root.path(), None, None);
+    let Err(error) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+    else {
+        panic!("a frame without pixels must end the run");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&withheld.path().display().to_string()),
+        "{error}"
+    );
+    assert_scratch_empty(&request.scratch_root);
+
+    let request = raw_request(copies_of(&good, 3, root.path()), root.path(), None, None);
+    let control = JobControl::new();
+    control.cancel();
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, control, None)
+        .expect("a pre-cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_scratch_empty(&request.scratch_root);
+}
+
+#[test]
+fn raw_scratch_unwritable_is_a_named_error() {
+    let dng = gradient_dng(8, 8, 0);
+    let paths = vec![PathBuf::from(dng.path()); 2];
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let blocker = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("a regular file at the scratch root");
+    let error = stack
+        .develop_once(blocker.path(), u64::MAX, 2, &|| false)
+        .expect_err("a scratch root that is a file cannot hold a directory");
+    assert!(
+        error
+            .to_string()
+            .contains(&blocker.path().display().to_string()),
+        "{error}"
+    );
+    assert_eq!(stack.develop_counts(), Some(vec![0; 2]));
 }

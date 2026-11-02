@@ -2,11 +2,11 @@
 
 //! Format-neutral facts and tile access for an opened set of frames.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::algorithm::TileReader;
+use crate::algorithm::{AlgorithmError, TileReader};
 use crate::params::StackContext;
 
 /// One frame's identity for resume comparison, geometry, and layout facts.
@@ -91,6 +91,22 @@ pub trait FrameReader: TileReader + Send + Sync {
     /// order; `None` for readers that keep no count.
     fn develop_counts(&self) -> Option<Vec<u64>> {
         None
+    }
+
+    /// Develops every frame once into files under `scratch_root`, which later
+    /// reads are served from: up to `workers` at a time, within `budget` bytes
+    /// of decode reservations. Returns how many develop at once, `0` for a
+    /// reader with nothing to develop. `cancelled` is polled before each frame
+    /// ([`AlgorithmError::Cancelled`]); a failed or cancelled pass leaves
+    /// nothing under `scratch_root`.
+    fn develop_once(
+        &self,
+        _scratch_root: &Path,
+        _budget: u64,
+        _workers: usize,
+        _cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<usize, AlgorithmError> {
+        Ok(0)
     }
 
     /// Facts used to resolve stack-dependent parameters.
