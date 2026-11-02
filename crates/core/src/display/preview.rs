@@ -2,9 +2,9 @@
 
 //! Small progress images of a running stack: the frame whose registration
 //! just finished, the composite growing tile by tile and its sharpness
-//! heatmap, requested per kind through [`PreviewKinds`]. Workers only write shared state under a short
-//! lock; the poll thread's [`PreviewFeed::deliver`] hands out at most one
-//! changed image per kind.
+//! heatmap, requested per kind through [`PreviewKinds`]. Workers only write
+//! shared state under a short lock; the poll thread's
+//! [`PreviewFeed::deliver`] hands out at most one changed image per kind.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
