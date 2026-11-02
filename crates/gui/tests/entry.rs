@@ -456,13 +456,17 @@ fn picked_images_refusals_change_nothing() {
     let mut controller = with_one_project("entry_picked_refused_open");
     let tabs = controller.project_tabs();
 
+    let not_one_stack = Some("These images are not one stack");
     let mut refusals = Vec::new();
-    for set in [
-        vec![root.join("00.tif"), note.clone()],
-        vec![root.join("00.tif"), other.join("00.tif")],
-        vec![root.join("00.tif"), raw.clone()],
-        vec![jpeg_a.clone(), png],
-        vec![jpeg_a, jpeg_b],
+    for (set, title) in [
+        (vec![root.join("00.tif"), note.clone()], None),
+        (
+            vec![root.join("00.tif"), other.join("00.tif")],
+            not_one_stack,
+        ),
+        (vec![root.join("00.tif"), raw.clone()], not_one_stack),
+        (vec![jpeg_a.clone(), png], None),
+        (vec![jpeg_a, jpeg_b], not_one_stack),
     ] {
         assert!(
             controller.open_paths(&set).is_none(),
@@ -471,8 +475,8 @@ fn picked_images_refusals_change_nothing() {
         assert_eq!(controller.project_tabs(), tabs, "{set:?} changes nothing");
         assert_eq!(
             controller.refusal_title(),
-            None,
-            "the dialog keeps its own title"
+            title,
+            "{set:?}: a set that is not one stack says so; an unreadable file keeps the dialog's own title"
         );
         refusals.push(
             controller

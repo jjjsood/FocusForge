@@ -4435,9 +4435,13 @@ impl AppController {
             _ => {}
         }
         self.refuse_message(message);
-        if matches!(&err, EntryError::ProjectRefused { .. }) {
-            self.state.refusal_title = Some("This project cannot be opened".to_string());
-        }
+        self.state.refusal_title = match &err {
+            EntryError::ProjectRefused { .. } => Some("This project cannot be opened".to_string()),
+            EntryError::MixedKinds { .. } | EntryError::SeveralFolders { .. } => {
+                Some("These images are not one stack".to_string())
+            }
+            _ => None,
+        };
         OpenOutcome::Refused(err)
     }
 
