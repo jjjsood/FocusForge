@@ -402,8 +402,8 @@ fn raw_develop_counts_absent_for_tiff() {
 }
 
 #[test]
-fn raw_develop_counts_survive_a_failed_develop() {
-    let cwd = common::tmp_dir("stack_raw_develop_failure");
+fn a_header_only_raw_frame_fails_the_run_by_name_without_panicking() {
+    let cwd = common::tmp_dir("stack_raw_header_only_frame");
     let input = cwd.join("input");
     let output = cwd.join("output");
     std::fs::create_dir(&input).expect("input directory");
