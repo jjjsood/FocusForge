@@ -10,8 +10,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::algorithm::{AlgorithmError, StackAlgorithm};
-use crate::display::preview::CompositeMosaic;
+use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm};
+use crate::display::preview::{PreviewMosaic, heat16};
 use crate::fuse::error::algorithm_error;
 use crate::io::{TiffSpec, TiffWriter};
 use crate::params::ParamValues;
@@ -51,7 +51,10 @@ pub struct FusionConsumer {
     crop: Option<Rect>,
     /// Folded each written tile when a front end subscribed to the
     /// composite preview.
-    preview: Option<Arc<CompositeMosaic>>,
+    preview: Option<Arc<PreviewMosaic>>,
+    /// Folded each written tile when a front end subscribed to the heat
+    /// preview, with the score that maps to the hottest value.
+    heat: Option<(Arc<PreviewMosaic>, f64)>,
 }
 
 /// The frame extent and count [`FusionConsumer::create`] needs to size both
@@ -134,6 +137,7 @@ impl FusionConsumer {
             zmap: Mutex::new(zmap),
             crop,
             preview: None,
+            heat: None,
         })
     }
 
@@ -197,6 +201,7 @@ impl FusionConsumer {
             zmap: Mutex::new(zmap),
             crop,
             preview: None,
+            heat: None,
         })
     }
 
@@ -273,10 +278,16 @@ impl FusionConsumer {
         Ok((consumer, surviving_indices))
     }
 
-    /// Folds every tile this consumer writes into `mosaic`; `None` keeps the
-    /// consumer free of any preview work.
-    pub fn with_preview(mut self, mosaic: Option<Arc<CompositeMosaic>>) -> Self {
-        self.preview = mosaic;
+    /// Folds every tile this consumer writes into `composite`, and its
+    /// sharpness into `heat` (with the score that maps to the hottest value);
+    /// `None` keeps the consumer free of that preview work.
+    pub fn with_preview(
+        mut self,
+        composite: Option<Arc<PreviewMosaic>>,
+        heat: Option<(Arc<PreviewMosaic>, f64)>,
+    ) -> Self {
+        self.preview = composite;
+        self.heat = heat;
         self
     }
 
@@ -329,6 +340,12 @@ impl FusionConsumer {
         if let Some(mosaic) = &self.preview {
             mosaic.fold(target_written, &cropped_composite);
         }
+        if let Some((mosaic, max_score)) = &self.heat
+            && let Some(sharpness) = &output.sharpness
+        {
+            let heat = heat_window(sharpness, job.read_rect(), target, *max_score);
+            mosaic.fold(target_written, &heat);
+        }
 
         if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
             let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
@@ -374,6 +391,23 @@ fn crop_zmap_into(zmap: &[u16], read_rect: Rect, interior: Rect, out: &mut [u16]
         let dst_start = row * row_len;
         out[dst_start..dst_start + row_len].copy_from_slice(&zmap[src_start..src_start + row_len]);
     }
+}
+
+/// The heat of the per-pixel window `interior` (in absolute frame
+/// coordinates) of a read-rect-sized sharpness plane.
+fn heat_window(sharpness: &Sharpness, read_rect: Rect, interior: Rect, max_score: f64) -> Vec<u16> {
+    let x_off = (interior.x - read_rect.x) as usize;
+    let y_off = (interior.y - read_rect.y) as usize;
+    let stride = read_rect.width as usize;
+    let mut heat = Vec::with_capacity(interior.width as usize * interior.height as usize);
+    for row in 0..interior.height as usize {
+        let start = (y_off + row) * stride + x_off;
+        heat.extend(
+            (start..start + interior.width as usize)
+                .map(|pixel| heat16(sharpness.score(pixel), max_score)),
+        );
+    }
+    heat
 }
 
 /// `rect`, translated by `-(crop.x, crop.y)` when `crop` is `Some` --

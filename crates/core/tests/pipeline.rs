@@ -2555,6 +2555,7 @@ struct Shown {
     height: u32,
     extent: Rect,
     covered: usize,
+    rgba: Vec<u8>,
     thread: ThreadId,
     thread_name: String,
 }
@@ -2563,6 +2564,7 @@ enum Event {
     Stage(&'static str),
     Tick(ThreadId),
     Shown(Shown),
+    Unavailable(PreviewKinds),
 }
 
 /// Subscribes to `kinds` and logs stages, ticks and previews in arrival order.
@@ -2579,10 +2581,20 @@ impl PreviewLog {
             kinds: PreviewKinds {
                 aligned_frame,
                 composite,
+                heat: false,
             },
             events: Mutex::new(Vec::new()),
             delay: Duration::ZERO,
         }
+    }
+
+    fn with_heat(mut self) -> Self {
+        self.kinds.heat = true;
+        self
+    }
+
+    fn heat_only() -> Self {
+        PreviewLog::new(false, false).with_heat()
     }
 
     fn slow(mut self, delay: Duration) -> Self {
@@ -2608,6 +2620,35 @@ impl PreviewLog {
 
     fn composites(&self) -> Vec<Shown> {
         self.shown(|kind| kind == PreviewKind::Composite)
+    }
+
+    fn heats(&self) -> Vec<Shown> {
+        self.shown(|kind| kind == PreviewKind::Heat)
+    }
+
+    /// The kinds of every `preview_unavailable` call, with the position of
+    /// each in the event order.
+    fn unavailable(&self) -> Vec<(usize, PreviewKinds)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::Unavailable(kinds) => Some((at, *kinds)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Position of the first composite preview.
+    fn first_composite_at(&self) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|event| matches!(event, Event::Shown(s) if s.kind == PreviewKind::Composite))
+            .expect("the run delivered a composite preview")
     }
 
     /// Position of the first stage marker named `name`.
@@ -2642,6 +2683,10 @@ impl StageObserver for PreviewLog {
         self.kinds
     }
 
+    fn preview_unavailable(&self, kinds: PreviewKinds) {
+        self.events.lock().unwrap().push(Event::Unavailable(kinds));
+    }
+
     fn preview(&self, preview: &StagePreview) {
         let current = std::thread::current();
         let covered = preview.rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
@@ -2651,6 +2696,7 @@ impl StageObserver for PreviewLog {
             height: preview.height,
             extent: preview.extent,
             covered,
+            rgba: preview.rgba.clone(),
             thread: current.id(),
             thread_name: current.name().unwrap_or_default().to_string(),
         }));
@@ -2972,4 +3018,192 @@ fn preview_feed_subscribes_per_kind() {
     run_observed(&ecc_request("pf_kind_a", 3, "anchor"), &only_aligned);
     assert!(only_aligned.composites().is_empty());
     assert!(!only_aligned.aligned().is_empty());
+}
+
+const STACK_ALGORITHMS: [&str; 3] = ["laplacian", "depth-map", "weighted-average"];
+
+/// A held run over three mantis frames with `algorithm`, observed by `observer`.
+fn heat_run(
+    label: &str,
+    algorithm: &str,
+    tile_size: u32,
+    crop: bool,
+    observer: &dyn StageObserver,
+) -> FuseReport {
+    let mut explicit = ParamValues::new();
+    if algorithm == "laplacian" {
+        explicit.insert("levels".to_string(), ParamValue::Int(3));
+    }
+    let mut request = base_request(label, mantis_frames(3), explicit);
+    request.algorithm = registry::find_stack(algorithm).expect("a registered algorithm");
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request.tile_size = Some(tile_size);
+    request.crop = crop;
+    run_observed(&request, observer)
+}
+
+#[test]
+fn sharpness_heatmap_covers_every_tile() {
+    for algorithm in STACK_ALGORITHMS {
+        for (tile_size, crop) in [(256u32, false), (448, true)] {
+            let label = format!("hm_cover_{algorithm}_{tile_size}");
+            let log = PreviewLog::new(false, true).with_heat();
+            let report = heat_run(&label, algorithm, tile_size, crop, &log);
+            let context = format!("{algorithm} tile {tile_size} crop {crop}");
+
+            assert!(report.tiles >= 2, "{context}: {} tiles", report.tiles);
+            let (heats, composites) = (log.heats(), log.composites());
+            assert!(!heats.is_empty(), "{context}: no heat preview");
+            let mut previous = 0;
+            for heat in &heats {
+                assert!(heat.covered >= previous, "{context}: coverage shrank");
+                previous = heat.covered;
+                assert_eq!(heat.extent, composites[0].extent, "{context}: extent");
+                assert_eq!(
+                    (heat.width, heat.height),
+                    (composites[0].width, composites[0].height),
+                    "{context}: size"
+                );
+            }
+            let last = heats.last().unwrap();
+            assert_eq!(
+                last.covered,
+                (last.width * last.height) as usize,
+                "{context}"
+            );
+            let events = log.events.lock().unwrap();
+            let last_shown = events
+                .iter()
+                .rposition(|e| matches!(e, Event::Shown(s) if s.kind == PreviewKind::Heat))
+                .unwrap();
+            drop(events);
+            assert!(
+                last_shown < log.stage_at("seal"),
+                "{context}: arrives before the seal"
+            );
+        }
+    }
+}
+
+#[test]
+fn sharpness_heatmap_scale_is_run_wide() {
+    for algorithm in STACK_ALGORITHMS {
+        let last_heat = |tile_size: u32| {
+            let log = PreviewLog::heat_only();
+            let label = format!("hm_scale_{algorithm}_{tile_size}");
+            heat_run(&label, algorithm, tile_size, false, &log);
+            log.heats().pop().expect("a heat preview").rgba
+        };
+        let whole = last_heat(512);
+        assert!(
+            whole.chunks_exact(4).any(|p| p[0] > 0),
+            "{algorithm}: all cold"
+        );
+        for tile_size in [256, 480] {
+            assert!(
+                last_heat(tile_size) == whole,
+                "{algorithm}: tile {tile_size} differs from one 512 tile"
+            );
+        }
+    }
+}
+
+#[test]
+fn sharpness_heatmap_absent_for_algorithm_without_plane() {
+    let all = PreviewLog::new(true, true).with_heat();
+    let mut request = base_request("hm_absent", mantis_frames(3), ParamValues::new());
+    request.algorithm = registry::find_stack("dummy-stack").expect("dummy-stack is registered");
+    request.output = FuseOutput::Hold(scratch("hm_absent_hold"));
+    run_observed(&request, &all);
+
+    let calls = all.unavailable();
+    assert_eq!(calls.len(), 1, "one call");
+    let heat_only = PreviewKinds {
+        heat: true,
+        ..PreviewKinds::default()
+    };
+    assert_eq!(calls[0].1, heat_only);
+    assert!(all.stage_at("fuse") < calls[0].0);
+    assert!(calls[0].0 < all.first_composite_at());
+    assert!(all.heats().is_empty(), "no heat without a plane");
+    assert!(!all.composites().is_empty(), "the composite still grows");
+
+    let no_heat = PreviewLog::new(true, true);
+    request.output = FuseOutput::Hold(scratch("hm_absent_off_hold"));
+    run_observed(&request, &no_heat);
+    assert!(no_heat.unavailable().is_empty(), "heat was not asked for");
+
+    let supported = PreviewLog::heat_only();
+    heat_run("hm_absent_supported", "laplacian", 448, false, &supported);
+    assert!(
+        supported.unavailable().is_empty(),
+        "laplacian supplies heat"
+    );
+}
+
+#[test]
+fn sharpness_heatmap_output_identical_with_and_without_subscriber() {
+    use focusforge_core::display::PreviewFeed;
+
+    let heat_only = PreviewKinds {
+        heat: true,
+        ..PreviewKinds::default()
+    };
+    assert!(PreviewFeed::new(heat_only, (64, 64)).is_some());
+    assert!(PreviewFeed::new(PreviewKinds::default(), (64, 64)).is_none());
+
+    for algorithm in STACK_ALGORITHMS {
+        let run = |label: &str, observer: &dyn StageObserver| {
+            held_run_of(Box::new(heat_run(
+                &format!("hm_bits_{algorithm}_{label}"),
+                algorithm,
+                256,
+                false,
+                observer,
+            )))
+        };
+        let plain = run("plain", &NoopObserver);
+        let without_heat = run("no_heat", &PreviewLog::new(true, true));
+        let log = PreviewLog::new(true, true).with_heat();
+        let with_heat = run("heat", &log);
+        assert!(!log.heats().is_empty(), "{algorithm}: heat was delivered");
+        for (label, other) in [("without heat", &without_heat), ("with heat", &with_heat)] {
+            assert!(
+                other.composite == plain.composite,
+                "{algorithm} {label}: composite"
+            );
+            assert!(other.zmap == plain.zmap, "{algorithm} {label}: Z-Map");
+        }
+
+        let only_heat = PreviewLog::heat_only();
+        run("heat_only", &only_heat);
+        assert!(!only_heat.heats().is_empty());
+        assert!(only_heat.composites().is_empty(), "{algorithm}: per-kind");
+    }
+}
+
+#[test]
+fn sharpness_heatmap_backend_path() {
+    let cpu = PreviewLog::heat_only();
+    held_run_observed("hm_backend_cpu", 256, 3, None, &cpu).expect("a plain CPU run");
+    let expected = cpu.heats().pop().expect("the CPU path previews heat");
+    assert_eq!(expected.covered, 512 * 512);
+
+    for lost in [false, true] {
+        let backend: &'static dyn TileBackend = Box::leak(Box::new(CappedBackend {
+            cap: u32::MAX,
+            shortfall: None,
+            asked: Mutex::new(Vec::new()),
+            lost,
+        }));
+        let log = PreviewLog::heat_only();
+        held_run_observed(&format!("hm_backend_{lost}"), 256, 3, Some(backend), &log)
+            .expect("a subscribed backend run");
+        let last = log.heats().pop().expect("the backend path previews heat");
+        assert_eq!(last.covered, 512 * 512, "lost={lost}");
+        assert!(
+            last.rgba == expected.rgba,
+            "lost={lost}: differs from the CPU run"
+        );
+    }
 }

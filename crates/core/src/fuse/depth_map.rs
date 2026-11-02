@@ -60,9 +60,9 @@
 
 use std::sync::LazyLock;
 
-use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
+use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
-use crate::fuse::laplacian::score_plane;
+use crate::fuse::laplacian::{score_plane, window_score_ceiling};
 use crate::fuse::pyramid::Plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
@@ -216,6 +216,7 @@ impl StackAlgorithm for DepthMap {
                 samples: out,
             },
             zmap: winner,
+            sharpness: Some(Sharpness::Score(best)),
         })
     }
 
@@ -226,6 +227,16 @@ impl StackAlgorithm for DepthMap {
     /// its erosion scratch (14 B).
     fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
         11 * u64::from(samples_per_pixel) + 20
+    }
+
+    /// The raw score sums `|L|` (at most 65535) over a `(2r + 1)`-square
+    /// window of every channel, and the smoothing pass sums that over a
+    /// second window.
+    fn heat_scale(&self, cfg: &ParamValues, samples_per_pixel: u32) -> Option<f64> {
+        Some(window_score_ceiling(
+            samples_per_pixel,
+            &[Self::score_radius(cfg), Self::smoothing_radius(cfg)],
+        ))
     }
 
     /// `4 + score-radius + smoothing-radius` on the one-level decimation
@@ -566,6 +577,93 @@ mod tests {
                     + SMOOTHING_RADIUS_DEFAULT as u32,
                 decimation_levels: 1,
             }
+        );
+    }
+
+    fn textured(w: u32, h: u32, seed: u32) -> Tile {
+        masked_tile(w, h, move |x, y| {
+            ((x * 7 + y * 13 + seed).wrapping_mul(2654435761u32) >> 16) as u16
+        })
+    }
+
+    fn fuse_with_radii(tiles: &[Tile], w: u32, h: u32) -> TileOutput {
+        let mut cfg = ParamValues::new();
+        cfg.insert("score-radius".to_string(), ParamValue::Int(2));
+        cfg.insert("smoothing-radius".to_string(), ParamValue::Int(3));
+        DepthMap
+            .fuse(&TileCtx::new(rect(w, h), tiles), &cfg)
+            .unwrap()
+    }
+
+    #[test]
+    fn sharpness_heatmap_matches_running_best() {
+        let (w, h) = (45u32, 28u32);
+        let tiles: Vec<Tile> = (1..=3).map(|seed| textured(w, h, seed)).collect();
+        let out = fuse_with_radii(&tiles, w, h);
+        let sharpness = out
+            .sharpness
+            .as_ref()
+            .expect("depth-map hands over its scores");
+        let planes: Vec<Vec<f32>> = tiles
+            .iter()
+            .map(|t| {
+                let detail = detail_plane(&t.samples, w, h, 1).unwrap();
+                box_smooth(&score_plane(&detail, 2), w, h, 3)
+            })
+            .collect();
+        for p in 0..(w * h) as usize {
+            let expected = planes
+                .iter()
+                .map(|plane| plane[p])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let actual = sharpness.score(p);
+            assert!(
+                (actual - f64::from(expected)).abs() <= 1e-6 * f64::from(expected).abs(),
+                "pixel {p}: {actual} against {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_ineligible_and_flat() {
+        let (w, h) = (16u32, 16u32);
+        let tiles = [
+            masked_tile(w, h, |x, _| (x * 900) as u16),
+            masked_tile(w, h, |_, _| 7),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], w, h);
+        let sharpness = out.sharpness.as_ref().unwrap();
+        for p in 0..(w * h) as usize {
+            assert_eq!(sharpness.score(p), f64::NEG_INFINITY);
+            assert_eq!(
+                crate::display::preview::heat16(sharpness.score(p), 1.0e6),
+                0
+            );
+        }
+
+        let flat = [
+            masked_tile(w, h, |_, _| 5000),
+            masked_tile(w, h, |_, _| 5000),
+        ];
+        let out = fuse_with_radii(&flat, w, h);
+        let sharpness = out.sharpness.as_ref().unwrap();
+        for p in 0..(w * h) as usize {
+            assert_eq!(
+                crate::display::preview::heat16(sharpness.score(p), 1.0e6),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_scale_covers_both_windows() {
+        let mut cfg = ParamValues::new();
+        cfg.insert("score-radius".to_string(), ParamValue::Int(2));
+        cfg.insert("smoothing-radius".to_string(), ParamValue::Int(3));
+        assert_eq!(
+            DepthMap.heat_scale(&cfg, 3),
+            Some((65535u64 * 3 * 25 * 49) as f64)
         );
     }
 }

@@ -20,7 +20,7 @@ pub mod select;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
+use focusforge_core::algorithm::{AlgorithmError, Sharpness, TileOutput, TileReader};
 use focusforge_core::fuse::laplacian::{EligibleMasks, score_radius};
 use focusforge_core::tile::{Rect, Tile};
 use focusforge_core::timing::{
@@ -677,7 +677,9 @@ pub(crate) fn fuse_planes_gpu(
     let winner_count = ww as usize * wh as usize;
     let raw = download_buffer(device, queue, &winner_best, (winner_count * 8) as u64)?;
     let mut zmap = vec![0u16; winner_count];
+    let mut scores = vec![0f32; winner_count];
     for (i, chunk) in raw.chunks_exact(8).enumerate() {
+        scores[i] = f32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
         let winner = u32::from_le_bytes(chunk[4..8].try_into().expect("4 bytes"));
         zmap[i] = winner as u16;
     }
@@ -695,6 +697,7 @@ pub(crate) fn fuse_planes_gpu(
             samples,
         },
         zmap,
+        sharpness: Some(Sharpness::Score(scores)),
     })
 }
 

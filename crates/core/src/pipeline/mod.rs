@@ -251,6 +251,11 @@ pub trait StageObserver: Sync {
     /// one per kind per poll interval, from the same poll thread as
     /// [`Self::tick`], never from a worker thread.
     fn preview(&self, _preview: &StagePreview) {}
+    /// Called once, right after the fuse stage starts, with the kinds
+    /// [`Self::preview_kinds`] asked for that the run cannot supply (the
+    /// stacking algorithm offers no sharpness plane), so a front end can drop
+    /// that view before the first tile.
+    fn preview_unavailable(&self, _kinds: PreviewKinds) {}
 }
 
 /// The tail of the [`StageObserver::notice`] raised when the align stage
@@ -419,7 +424,8 @@ pub fn run(
 
     timer.mark(Stage::Setup);
 
-    let feed = PreviewFeed::new(observer.preview_kinds(), (width, height));
+    let wanted_kinds = observer.preview_kinds();
+    let feed = PreviewFeed::new(wanted_kinds, (width, height));
     let mut alignment_result: Option<(
         &'static dyn AlignAlgorithm,
         ResolvedParams,
@@ -630,17 +636,24 @@ pub fn run(
         ));
     }
     let applied_crop = if request.crop { crop_rect_value } else { None };
-    let mosaic = feed.as_ref().and_then(|feed| {
-        feed.begin_composite(
-            applied_crop.unwrap_or(Rect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            }),
-            spp,
-        )
+    let output_extent = applied_crop.unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
     });
+    let mosaic = feed
+        .as_ref()
+        .and_then(|feed| feed.begin_composite(output_extent, spp));
+    let heat_scale = wanted_kinds
+        .heat
+        .then(|| request.algorithm.heat_scale(&values, spp))
+        .flatten();
+    let heat = heat_scale.and_then(|max_score| {
+        let mosaic = feed.as_ref()?.begin_heat(output_extent)?;
+        Some((mosaic, max_score))
+    });
+    let heat_unavailable = wanted_kinds.heat && heat_scale.is_none();
 
     let description =
         alignment_result
@@ -809,7 +822,7 @@ pub fn run(
         }
     };
 
-    let sink = sink.with_preview(mosaic);
+    let sink = sink.with_preview(mosaic, heat);
 
     control.set_stage(JobStage::Fuse);
     // `Job::with_control` is what credits `control` with the plan's real
@@ -823,6 +836,12 @@ pub fn run(
         Arc::clone(&control),
     );
     observer.stage(RunStage::Fuse);
+    if heat_unavailable {
+        observer.preview_unavailable(PreviewKinds {
+            heat: true,
+            ..PreviewKinds::default()
+        });
+    }
 
     let backend_consumer = backend.map(|b| {
         BackendFusionConsumer::new(

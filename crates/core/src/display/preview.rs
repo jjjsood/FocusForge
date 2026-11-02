@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Small progress images of a running stack: the frame whose registration
-//! just finished and the composite growing tile by tile, requested per kind
-//! through [`PreviewKinds`]. Workers only write shared state under a short
+//! just finished, the composite growing tile by tile and its sharpness
+//! heatmap, requested per kind through [`PreviewKinds`]. Workers only write shared state under a short
 //! lock; the poll thread's [`PreviewFeed::deliver`] hands out at most one
 //! changed image per kind.
 
@@ -22,6 +22,7 @@ const PREVIEW_LONG_EDGE: u32 = 512;
 pub struct PreviewKinds {
     pub aligned_frame: bool,
     pub composite: bool,
+    pub heat: bool,
 }
 
 /// What a [`StagePreview`] shows.
@@ -31,6 +32,9 @@ pub enum PreviewKind {
     AlignedFrame { frame: usize },
     /// The composite fused so far.
     Composite,
+    /// The winning sharpness of the tiles fused so far, as grey heat values
+    /// (R = G = B), on the composite's extent and cell grid.
+    Heat,
 }
 
 /// One preview image: `width * height` RGBA8 pixels, alpha 0 where the image
@@ -63,14 +67,16 @@ fn fit_long_edge(width: u32, height: u32) -> (u32, u32) {
 pub struct PreviewFeed {
     aligned: Option<AlignedFrameSink>,
     want_composite: bool,
-    composite: OnceLock<Arc<CompositeMosaic>>,
+    composite: OnceLock<Arc<PreviewMosaic>>,
+    want_heat: bool,
+    heat: OnceLock<Arc<PreviewMosaic>>,
 }
 
 impl PreviewFeed {
     /// `None` when `kinds` requests nothing, so an unsubscribed run holds no
     /// feed at all.
     pub fn new(kinds: PreviewKinds, frame_size: (u32, u32)) -> Option<Self> {
-        if !kinds.aligned_frame && !kinds.composite {
+        if !kinds.aligned_frame && !kinds.composite && !kinds.heat {
             return None;
         }
         Some(PreviewFeed {
@@ -79,6 +85,8 @@ impl PreviewFeed {
                 .then(|| AlignedFrameSink::new(frame_size)),
             want_composite: kinds.composite,
             composite: OnceLock::new(),
+            want_heat: kinds.heat,
+            heat: OnceLock::new(),
         })
     }
 
@@ -94,11 +102,26 @@ impl PreviewFeed {
         &self,
         extent: Rect,
         samples_per_pixel: u32,
-    ) -> Option<Arc<CompositeMosaic>> {
+    ) -> Option<Arc<PreviewMosaic>> {
         self.want_composite.then(|| {
+            Arc::clone(self.composite.get_or_init(|| {
+                Arc::new(PreviewMosaic::new(
+                    PreviewKind::Composite,
+                    extent,
+                    samples_per_pixel,
+                ))
+            }))
+        })
+    }
+
+    /// Creates the heat mosaic for an output of `extent`, when that kind was
+    /// requested; the same extent as [`Self::begin_composite`] gives the same
+    /// cell grid. A second call returns the mosaic the first one made.
+    pub fn begin_heat(&self, extent: Rect) -> Option<Arc<PreviewMosaic>> {
+        self.want_heat.then(|| {
             Arc::clone(
-                self.composite
-                    .get_or_init(|| Arc::new(CompositeMosaic::new(extent, samples_per_pixel))),
+                self.heat
+                    .get_or_init(|| Arc::new(PreviewMosaic::new(PreviewKind::Heat, extent, 1))),
             )
         })
     }
@@ -110,6 +133,9 @@ impl PreviewFeed {
             send(&preview);
         }
         if let Some(preview) = self.composite.get().and_then(|m| m.take_new()) {
+            send(&preview);
+        }
+        if let Some(preview) = self.heat.get().and_then(|m| m.take_new()) {
             send(&preview);
         }
     }
@@ -261,9 +287,27 @@ impl AlignedFrameSink {
     }
 }
 
-/// The composite as fused so far, reduced to preview size. Tiles fold in as
-/// they are written; cells no tile has reached stay uncovered.
-pub struct CompositeMosaic {
+/// The heat of `score` on a logarithmic scale that reaches 65535 at
+/// `max_score` and clamps beyond it. A score of zero or below, `-inf` and NaN
+/// are 0, the coldest value.
+pub fn heat16(score: f64, max_score: f64) -> u16 {
+    if !(score > 0.0 && max_score > 0.0) {
+        return 0;
+    }
+    let heat = score.ln_1p() / max_score.ln_1p() * f64::from(u16::MAX);
+    heat.round().clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
+/// A 16-bit heat value rounded to 8 bits.
+pub fn heat8(heat: u16) -> u8 {
+    ((u32::from(heat) + 128) / 257) as u8
+}
+
+/// One kind of image as fused so far, reduced to preview size: the composite
+/// or its heat. Tiles fold in as they are written; cells no tile has reached
+/// stay uncovered.
+pub struct PreviewMosaic {
+    kind: PreviewKind,
     extent: Rect,
     samples_per_pixel: u32,
     size: (u32, u32),
@@ -276,10 +320,11 @@ struct MosaicState {
     delivered: u64,
 }
 
-impl CompositeMosaic {
-    fn new(extent: Rect, samples_per_pixel: u32) -> Self {
+impl PreviewMosaic {
+    fn new(kind: PreviewKind, extent: Rect, samples_per_pixel: u32) -> Self {
         let size = fit_long_edge(extent.width, extent.height);
-        CompositeMosaic {
+        PreviewMosaic {
+            kind,
             extent,
             samples_per_pixel,
             size,
@@ -298,7 +343,8 @@ impl CompositeMosaic {
     }
 
     /// Folds one written tile in: `rect` in output coordinates (the origin is
-    /// the output's own corner), `samples` its composite samples.
+    /// the output's own corner), `samples` its samples (16-bit heat values
+    /// for the heat kind).
     pub(crate) fn fold(&self, rect: Rect, samples: &[u16]) {
         let mut state = self.state.lock().unwrap();
         state.reducer.add_band(samples, rect);
@@ -321,12 +367,17 @@ impl CompositeMosaic {
             if !covered[cell] {
                 continue;
             }
+            if self.kind == PreviewKind::Heat {
+                let heat = heat8(samples[cell]);
+                pixel.copy_from_slice(&[heat, heat, heat, 255]);
+                continue;
+            }
             let (x, y) = (cell as u32 % width, cell as u32 / width);
             let channel = |c: usize| reduce16to8(samples[cell * spp + c.min(spp - 1)], x, y);
             pixel.copy_from_slice(&[channel(0), channel(1), channel(2), 255]);
         }
         Some(StagePreview {
-            kind: PreviewKind::Composite,
+            kind: self.kind,
             width,
             height,
             rgba,
@@ -358,6 +409,107 @@ mod tests {
         let feed = PreviewFeed::new(only_composite, (64, 64)).expect("one kind requested");
         assert!(feed.aligned_sink().is_none());
         assert!(feed.begin_composite(rect(0, 0, 64, 64), 3).is_some());
+        assert!(feed.begin_heat(rect(0, 0, 64, 64)).is_none());
+    }
+
+    #[test]
+    fn a_heat_only_subscription_builds_a_feed() {
+        let only_heat = PreviewKinds {
+            heat: true,
+            ..Default::default()
+        };
+        let feed = PreviewFeed::new(only_heat, (64, 64)).expect("heat alone is a subscription");
+        assert!(feed.begin_composite(rect(0, 0, 64, 64), 1).is_none());
+        let mosaic = feed.begin_heat(rect(0, 0, 64, 64)).expect("heat requested");
+        let again = feed.begin_heat(rect(0, 0, 64, 64)).unwrap();
+        assert!(Arc::ptr_eq(&mosaic, &again), "one mosaic per run");
+    }
+
+    #[test]
+    fn heat_follows_the_composite_in_a_delivery() {
+        let all = PreviewKinds {
+            aligned_frame: false,
+            composite: true,
+            heat: true,
+        };
+        let feed = PreviewFeed::new(all, (2, 1)).unwrap();
+        let composite = feed.begin_composite(rect(0, 0, 2, 1), 1).unwrap();
+        let heat = feed.begin_heat(rect(0, 0, 2, 1)).unwrap();
+        composite.fold(rect(0, 0, 2, 1), &[1, 2]);
+        heat.fold(rect(0, 0, 2, 1), &[3, 4]);
+        let mut kinds = Vec::new();
+        feed.deliver(|p| kinds.push(p.kind));
+        assert_eq!(kinds, [PreviewKind::Composite, PreviewKind::Heat]);
+    }
+
+    #[test]
+    fn sharpness_heatmap_scale_is_run_wide_heat16_is_monotone_and_pinned() {
+        let max = 5.0e7;
+        assert_eq!(heat16(0.0, max), 0);
+        assert_eq!(heat16(max, max), 65535);
+        let mut previous = 0;
+        for i in 0..=400 {
+            let score = max * (f64::from(i) / 400.0).powi(4);
+            let heat = heat16(score, max);
+            assert!(
+                heat >= previous,
+                "score {score} fell from {previous} to {heat}"
+            );
+            previous = heat;
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_heat16_sends_ineligible_scores_to_cold() {
+        for score in [f64::NEG_INFINITY, f64::NAN, -1.0, -0.0] {
+            assert_eq!(heat16(score, 1.0e6), 0, "score {score}");
+        }
+        assert_eq!(heat16(f64::INFINITY, 1.0e6), 65535);
+        assert_eq!(
+            heat16(1.0e12, 1.0e6),
+            65535,
+            "a score past the scale clamps"
+        );
+        assert_eq!(heat16(5.0, 0.0), 0, "a degenerate scale stays cold");
+        assert_eq!(heat16(5.0, f64::NAN), 0);
+    }
+
+    #[test]
+    fn sharpness_heatmap_heat8_rounds_the_16_bit_range_onto_8_bits() {
+        assert_eq!(heat8(0), 0);
+        assert_eq!(heat8(128), 0);
+        assert_eq!(heat8(129), 1);
+        assert_eq!(heat8(32767), 127);
+        assert_eq!(heat8(32768), 128);
+        assert_eq!(heat8(65535), 255);
+    }
+
+    #[test]
+    fn heat_mosaic_is_grey_and_transparent_where_unfused() {
+        let mosaic = PreviewMosaic::new(PreviewKind::Heat, rect(5, 6, 4, 1), 1);
+        mosaic.fold(rect(0, 0, 2, 1), &[0, 65535]);
+        let preview = mosaic.take_new().expect("a tile was folded");
+        assert_eq!(preview.kind, PreviewKind::Heat);
+        assert_eq!(preview.extent, rect(5, 6, 4, 1));
+        assert_eq!(
+            preview.rgba,
+            [0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(mosaic.take_new().is_none(), "nothing changed since");
+    }
+
+    #[test]
+    fn heat_mosaic_rounds_each_cell_without_dither() {
+        let mosaic = PreviewMosaic::new(PreviewKind::Heat, rect(0, 0, 2, 1), 1);
+        mosaic.fold(rect(0, 0, 2, 1), &[129, 128]);
+        let grey: Vec<u8> = mosaic
+            .take_new()
+            .unwrap()
+            .rgba
+            .chunks_exact(4)
+            .map(|p| p[0])
+            .collect();
+        assert_eq!(grey, [1, 0]);
     }
 
     #[test]
@@ -370,7 +522,7 @@ mod tests {
 
     #[test]
     fn mono_composite_replicates_to_rgb() {
-        let mosaic = CompositeMosaic::new(rect(0, 0, 2, 1), 1);
+        let mosaic = PreviewMosaic::new(PreviewKind::Composite, rect(0, 0, 2, 1), 1);
         mosaic.fold(rect(0, 0, 2, 1), &[0x8000, 0x4000]);
         let preview = mosaic.take_new().expect("a tile was folded");
         assert_eq!(preview.rgba, [128, 128, 128, 255, 64, 64, 64, 255]);
@@ -378,14 +530,14 @@ mod tests {
 
     #[test]
     fn colour_composite_keeps_its_channels() {
-        let mosaic = CompositeMosaic::new(rect(0, 0, 1, 1), 3);
+        let mosaic = PreviewMosaic::new(PreviewKind::Composite, rect(0, 0, 1, 1), 3);
         mosaic.fold(rect(0, 0, 1, 1), &[0x1000, 0x2000, 0x3000]);
         assert_eq!(mosaic.take_new().unwrap().rgba, [16, 32, 48, 255]);
     }
 
     #[test]
     fn unfused_cells_are_transparent_and_a_repeat_delivers_nothing() {
-        let mosaic = CompositeMosaic::new(rect(10, 20, 4, 2), 1);
+        let mosaic = PreviewMosaic::new(PreviewKind::Composite, rect(10, 20, 4, 2), 1);
         mosaic.fold(rect(0, 0, 2, 2), &[0x8000; 4]);
         let preview = mosaic.take_new().expect("a tile was folded");
         let alpha: Vec<u8> = preview.rgba.chunks_exact(4).map(|p| p[3]).collect();
@@ -398,7 +550,7 @@ mod tests {
 
     #[test]
     fn mosaic_of_a_large_output_is_capped() {
-        let mosaic = CompositeMosaic::new(rect(0, 0, 1000, 600), 1);
+        let mosaic = PreviewMosaic::new(PreviewKind::Composite, rect(0, 0, 1000, 600), 1);
         mosaic.fold(rect(0, 0, 1000, 600), &vec![0u16; 1000 * 600]);
         let preview = mosaic.take_new().unwrap();
         assert_eq!((preview.width, preview.height), (512, 307));

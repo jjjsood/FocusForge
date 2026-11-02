@@ -105,7 +105,11 @@ impl StackAlgorithm for DummyStack {
         })?;
         let tile = first.expect("a context with a frame 0 visits it");
         let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
-        Ok(TileOutput { tile, zmap })
+        Ok(TileOutput {
+            tile,
+            zmap,
+            sharpness: None,
+        })
     }
 }
 

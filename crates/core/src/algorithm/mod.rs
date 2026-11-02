@@ -45,6 +45,39 @@ pub use error::AlgorithmError;
 pub struct TileOutput {
     pub tile: Tile,
     pub zmap: Vec<u16>,
+    /// The winning sharpness of every pixel, when the algorithm holds one.
+    pub sharpness: Option<Sharpness>,
+}
+
+/// The per-pixel winning sharpness of one tile, over the same read rect as
+/// [`TileOutput::tile`]: one value per pixel, `-inf` where no frame was
+/// eligible.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sharpness {
+    /// The best windowed score itself.
+    Score(Vec<f32>),
+    /// The best of `score ^ exponent`, the weight a blending algorithm keeps.
+    Weight { weights: Vec<f64>, exponent: f64 },
+}
+
+impl Sharpness {
+    /// The winning score of `pixel`; `-inf` for a pixel with no eligible
+    /// frame. A weight is mapped back to score scale.
+    pub fn score(&self, pixel: usize) -> f64 {
+        match self {
+            Sharpness::Score(scores) => f64::from(scores[pixel]),
+            Sharpness::Weight { weights, exponent } => {
+                let weight = weights[pixel];
+                // `powf(-inf, 1 / exponent)` is `+inf`, so the ineligible
+                // marker is tested before the map-back.
+                if weight >= 0.0 {
+                    weight.powf(exponent.recip())
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+        }
+    }
 }
 
 /// The per-tile view across every frame of a stack that
@@ -508,6 +541,13 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     fn working_bytes_per_pixel(&self, _cfg: &ParamValues, _samples_per_pixel: u32) -> u64 {
         0
     }
+
+    /// The largest score [`Sharpness::score`] can return for the resolved
+    /// `cfg` and `samples_per_pixel`, which fixes the heat scale of a whole
+    /// run. `None`, the default, means the algorithm offers no sharpness view.
+    fn heat_scale(&self, _cfg: &ParamValues, _samples_per_pixel: u32) -> Option<f64> {
+        None
+    }
 }
 
 /// How one [`AlignAlgorithm::align_frame`] call ended.
@@ -762,7 +802,11 @@ mod tests {
             })?;
             let tile = first.expect("a context with a frame 0 visits it");
             let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
-            Ok(TileOutput { tile, zmap })
+            Ok(TileOutput {
+                tile,
+                zmap,
+                sharpness: None,
+            })
         }
     }
 
@@ -1293,5 +1337,23 @@ mod tests {
             vec![0u16; 3],
             "a rejected buffer must not be partially written"
         );
+    }
+
+    #[test]
+    fn sharpness_heatmap_score_maps_weights_back_and_guards_the_ineligible() {
+        let score = Sharpness::Score(vec![3.5, f32::NEG_INFINITY]);
+        assert_eq!(score.score(0), 3.5);
+        assert_eq!(score.score(1), f64::NEG_INFINITY);
+
+        let weight = Sharpness::Weight {
+            weights: vec![81.0, 0.0, f64::NEG_INFINITY, f64::NAN, -2.0],
+            exponent: 4.0,
+        };
+        assert!((weight.score(0) - 3.0).abs() < 1e-12);
+        assert_eq!(weight.score(1), 0.0);
+        // `powf(-inf, 1/e)` is `+inf`; an uncovered pixel must stay cold.
+        assert_eq!(weight.score(2), f64::NEG_INFINITY);
+        assert_eq!(weight.score(3), f64::NEG_INFINITY);
+        assert_eq!(weight.score(4), f64::NEG_INFINITY);
     }
 }

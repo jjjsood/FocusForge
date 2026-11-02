@@ -110,9 +110,9 @@
 
 use std::sync::LazyLock;
 
-use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
+use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
-use crate::fuse::laplacian::score_plane;
+use crate::fuse::laplacian::{score_plane, window_score_ceiling};
 use crate::fuse::pyramid::Plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
@@ -309,6 +309,10 @@ impl StackAlgorithm for WeightedAverage {
                 samples,
             },
             zmap: winner,
+            sharpness: Some(Sharpness::Weight {
+                weights: best,
+                exponent: f64::from(weight_exponent),
+            }),
         })
     }
 
@@ -318,6 +322,15 @@ impl StackAlgorithm for WeightedAverage {
     /// seed and the `u16` output (12 B per sample).
     fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
         28 * u64::from(samples_per_pixel) + 22
+    }
+
+    /// The score sums `|L|` (at most 65535) over a `(2r + 1)`-square window of
+    /// every channel.
+    fn heat_scale(&self, cfg: &ParamValues, samples_per_pixel: u32) -> Option<f64> {
+        Some(window_score_ceiling(
+            samples_per_pixel,
+            &[Self::radius(cfg)],
+        ))
     }
 
     /// The windowed weight's reach (`crate::fuse::sharpness::DETAIL_REACH +
@@ -820,6 +833,92 @@ mod tests {
                 reach_px: DETAIL_REACH + RADIUS_DEFAULT as u32,
                 decimation_levels: 1,
             }
+        );
+    }
+
+    fn fuse_exponent(
+        tiles: &[Tile],
+        coverage: &[Option<Vec<bool>>],
+        w: u32,
+        h: u32,
+        exponent: f64,
+    ) -> TileOutput {
+        let mut cfg = ParamValues::new();
+        cfg.insert("radius".to_string(), ParamValue::Int(2));
+        cfg.insert("weight-exponent".to_string(), ParamValue::Float(exponent));
+        let ctx = TileCtx::new(rect(w, h), tiles).with_coverage(coverage);
+        WeightedAverage.fuse(&ctx, &cfg).unwrap()
+    }
+
+    #[test]
+    fn sharpness_heatmap_matches_running_best() {
+        let (w, h) = (37u32, 24u32);
+        for (spp, exponent) in [(1u32, 2.0), (3, 4.0), (3, 1.0)] {
+            let tiles: Vec<Tile> = (1..=3)
+                .map(|seed| masked_tile(w, h, spp, texture(seed)))
+                .collect();
+            let out = fuse_exponent(&tiles, &[], w, h, exponent);
+            let sharpness = out
+                .sharpness
+                .as_ref()
+                .expect("weighted-average hands over its weights");
+            let planes: Vec<Vec<f32>> = tiles
+                .iter()
+                .map(|t| score_plane(&detail_plane(&t.samples, w, h, spp).unwrap(), 2))
+                .collect();
+            for p in 0..(w * h) as usize {
+                let expected = planes
+                    .iter()
+                    .map(|plane| plane[p])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let actual = sharpness.score(p);
+                assert!(
+                    (actual - f64::from(expected)).abs() <= 1e-6 * f64::from(expected).abs(),
+                    "spp {spp} exponent {exponent} pixel {p}: {actual} against {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_ineligible_and_flat() {
+        let (w, h) = (16u32, 16u32);
+        let tiles = [
+            masked_tile(w, h, 1, |x, _, _| (x * 900) as u16),
+            masked_tile(w, h, 1, |_, _, _| 7),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], w, h);
+        let sharpness = out.sharpness.as_ref().unwrap();
+        for p in 0..(w * h) as usize {
+            assert_eq!(sharpness.score(p), f64::NEG_INFINITY, "pixel {p}");
+            assert_eq!(
+                crate::display::preview::heat16(sharpness.score(p), 1.0e6),
+                0
+            );
+        }
+
+        let flat = [
+            masked_tile(w, h, 1, |_, _, _| 5000),
+            masked_tile(w, h, 1, |_, _, _| 5000),
+        ];
+        let out = fuse_exponent(&flat, &[], w, h, 4.0);
+        let sharpness = out.sharpness.as_ref().unwrap();
+        for p in 0..(w * h) as usize {
+            assert_eq!(
+                crate::display::preview::heat16(sharpness.score(p), 1.0e6),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_scale_covers_the_window() {
+        let mut cfg = ParamValues::new();
+        cfg.insert("radius".to_string(), ParamValue::Int(16));
+        assert_eq!(
+            WeightedAverage.heat_scale(&cfg, 3),
+            Some((65535u64 * 3 * 33 * 33) as f64)
         );
     }
 }
