@@ -1402,6 +1402,17 @@ def main(argv: list[str] | None = None, *, alignment_executor: object | None = N
     noise_baseline.add_argument("--out", required=True)
     noise_hashes = noise_score_sub.add_parser("fusion-hashes")
     noise_hashes.add_argument("--out", required=True)
+    noise_checkpoint = noise_score_sub.add_parser("checkpoint")
+    noise_checkpoint.add_argument("--registration", required=True)
+    noise_checkpoint.add_argument("--runs", required=True)
+    noise_checkpoint.add_argument("--out", required=True)
+    noise_arms = noise_score_sub.add_parser("arms")
+    noise_arms.add_argument("--split", choices=("training",), required=True)
+    noise_arms.add_argument("--registration", required=True)
+    noise_arms.add_argument("--checkpoint", required=True)
+    noise_arms.add_argument("--runs", required=True)
+    noise_arms.add_argument("--out", required=True)
+    noise_arms.add_argument("--replay-only", action="store_true")
     shrinkage = sub.add_parser("noise-shrinkage")
     shrinkage.add_argument("--self-check", dest="shrinkage_self_check", action="store_true")
     shrinkage.add_argument("--split", choices=("training",), default="training")
@@ -1487,6 +1498,22 @@ def main(argv: list[str] | None = None, *, alignment_executor: object | None = N
             out = Path(args.out)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(noise_score.fusion_reference_hashes(), indent=2, sort_keys=True) + "\n")
+            return 0
+        if args.noise_score_command == "checkpoint":
+            try:
+                document = noise_score.write_checkpoint(Path(args.registration), Path(args.runs), Path(args.out))
+            except ValueError as error:
+                parser.error(str(error))
+            print(f"checkpoint configurations: {len(document['configurations'])}")
+            return 0
+        if args.noise_score_command == "arms":
+            try:
+                comparison = noise_score.run_arms(Path(args.registration), Path(args.checkpoint), Path(args.runs), Path(args.out),
+                                                  args.replay_only, sys.argv if argv is None else [sys.argv[0], *argv])
+            except ValueError as error:
+                parser.error(str(error))
+            print(f"replay records: {len(comparison['replay'])}")
+            print(f"candidate rows: {len(comparison['candidate_rows'])}")
             return 0
         noise_score_command.print_help()
         return 2

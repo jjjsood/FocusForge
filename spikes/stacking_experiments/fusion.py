@@ -53,6 +53,7 @@ class FusionResult:
 
 
 Score = Callable[[np.ndarray, np.ndarray, int], np.ndarray]
+ScoreAdjust = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 
 def _f32(value: np.ndarray | float) -> np.ndarray | np.float32:
@@ -165,8 +166,11 @@ def per_level_eligible(coverage: np.ndarray, level: int, radius: int) -> np.ndar
 
 
 def pyramid_views(frames: np.ndarray, levels: int, radius: int = 8, coverage: np.ndarray | None = None,
-                  score: Score | None = None) -> PyramidView:
-    """Build Gaussian/detail levels and independent score winners without collapse."""
+                  score: Score | None = None, adjust: ScoreAdjust | None = None) -> PyramidView:
+    """Build Gaussian/detail levels and independent score winners without collapse.
+
+    `adjust` receives each level's N,H,W scores and eligibility and returns the scores selection reads.
+    """
     if frames.ndim != 4 or frames.shape[0] == 0:
         raise ValueError("frames must be nonempty N,H,W,C")
     if levels < 1:
@@ -184,6 +188,8 @@ def pyramid_views(frames: np.ndarray, levels: int, radius: int = 8, coverage: np
         scores = np.stack([score_plane(detail_plane, score_radius) if score is None else score(plane, detail_plane, score_radius)
                            for plane, detail_plane in zip(gaussian, details)])
         eligible_masks = np.ones(scores.shape, dtype=bool) if coverage is None else per_level_eligible(coverage, level, radius)
+        if adjust is not None:
+            scores = adjust(scores, eligible_masks)
         result.append(PyramidLevel(gaussian, details, current_coverage, score_radius, level_reach(level, radius), scores,
                                    eligible_masks, select(scores, eligible_masks)))
         gaussian = reduced
@@ -313,12 +319,7 @@ def quantize_u16(plane: np.ndarray) -> np.ndarray:
 
 
 def _eligible_mean(inputs: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    total = np.zeros_like(inputs[0], dtype=np.float32)
-    count = np.zeros(inputs.shape[1:3], dtype=np.uint16)
-    for frame, mask in zip(inputs, masks):
-        total = np.float32(total + np.where(mask[..., None], frame, 0.0).astype(np.float32))
-        count += mask
-    return np.divide(total, count[..., None], out=np.zeros_like(total), where=count[..., None] != 0).astype(np.float32)
+    return _eligible_mean_f64(inputs, masks).astype(np.float32)
 
 
 def _eligible_mean_f64(inputs: np.ndarray, masks: np.ndarray) -> np.ndarray:
@@ -331,9 +332,9 @@ def _eligible_mean_f64(inputs: np.ndarray, masks: np.ndarray) -> np.ndarray:
 
 
 def details(frames: np.ndarray, coverage: np.ndarray | None = None, levels: int = 5, radius: int = 8,
-            score: Score | None = None) -> FusionResult:
+            score: Score | None = None, adjust: ScoreAdjust | None = None) -> FusionResult:
     """Replay Details selection, residual averaging, and reverse collapse."""
-    view = pyramid_views(frames, levels, radius, coverage, score)
+    view = pyramid_views(frames, levels, radius, coverage, score, adjust)
     selected = [gather(level.details, level.winners).astype(np.float32) for level in view.levels]
     residual_masks = np.ones(view.residual_inputs.shape[:3], dtype=bool) if coverage is None else np.stack(
         [eligible(mask, view.residual_reach) for mask in coverage])[..., ::2**levels, ::2**levels]
@@ -344,12 +345,14 @@ def details(frames: np.ndarray, coverage: np.ndarray | None = None, levels: int 
 
 
 def weighted_average(frames: np.ndarray, coverage: np.ndarray | None = None, radius: int = 16,
-                     score: Score | None = None) -> FusionResult:
+                     score: Score | None = None, adjust: ScoreAdjust | None = None) -> FusionResult:
     """Replay Weighted Average with f64 score-power accumulators."""
     details = np.stack([detail(frame) for frame in frames])
     scores = np.stack([score_plane(value, radius) if score is None else score(frame, value, radius)
                        for frame, value in zip(frames, details)])
     masks = np.ones(scores.shape, dtype=bool) if coverage is None else np.stack([eligible(mask, radius + 4) for mask in coverage])
+    if adjust is not None:
+        scores = adjust(scores, masks)
     numerator = np.zeros_like(frames[0], dtype=np.float64)
     denominator = np.zeros(scores.shape[1:], dtype=np.float64)
     for frame, values, mask in zip(frames, scores, masks):
@@ -363,13 +366,15 @@ def weighted_average(frames: np.ndarray, coverage: np.ndarray | None = None, rad
 
 def depth_map_replay(frames: np.ndarray, coverage: np.ndarray | None = None, score_radius: int = 4,
                      smooth_radius: int = 8, eligibility_reach: int | None = None,
-                     score: Score | None = None) -> FusionResult:
+                     score: Score | None = None, adjust: ScoreAdjust | None = None) -> FusionResult:
     """Replay Depth Map smoothing and exact winner-copy composition."""
     details = np.stack([detail(frame) for frame in frames])
     raw = np.stack([score_plane(value, score_radius) if score is None else score(frame, value, score_radius)
                     for frame, value in zip(frames, details)])
-    scores = np.stack([score_plane(value[..., None], smooth_radius) for value in raw])
     reach = 2 * score_radius + smooth_radius if eligibility_reach is None else eligibility_reach
-    masks = np.ones(scores.shape, dtype=bool) if coverage is None else np.stack([eligible(mask, reach) for mask in coverage])
+    masks = np.ones(raw.shape, dtype=bool) if coverage is None else np.stack([eligible(mask, reach) for mask in coverage])
+    if adjust is not None:
+        raw = adjust(raw, masks)
+    scores = np.stack([score_plane(value[..., None], smooth_radius) for value in raw])
     winners = select(scores, masks)
     return FusionResult(gather(frames, winners), winners, masks)
