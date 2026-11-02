@@ -54,9 +54,9 @@ Start: --open fixtures/mantis-512/frames --settings-section appearance
    Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; row 1 shows the eye icon and the red trash icon.
 24. Click **Exclude**, the eye icon (`FFImageRow::list-exclude-button` 0).
    Expect: no dialog opens and the dock header ends with "· 1 excluded".
-25. Click **Include**, the crossed-out eye icon (`FFImageRow::list-exclude-button` 0).
+25. Click **Include**, the crossed-out eye icon (`FFImageRow::list-exclude-button` 0). The icons show only while the pointer is on row 1: when they are gone, hover the row (`FFImageRow::area` 1) first.
    Expect: no dialog opens and the dock header ends with "· 0 excluded".
-26. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row.
+26. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row, hovering the row first (`FFImageRow::area` 1) when its icons are gone.
    Expect: a dialog titled "Remove and fuse again?" opens with the line "The whole stack is fused from scratch. This project already holds 1 checkpoint, and confirming keeps every one of them." and the buttons **Cancel**, **Exclude instead** and **Remove and re-fuse**, beside a **Close dialog** icon button at its top-right corner.
 27. Click **Cancel** (`AppWindow::frame-warning`).
    Expect: Must not: the "01.tif" row is removed or a second checkpoint is added; the dialog is gone, the row "01.tif" is still listed and the CHECKPOINTS list shows 1 row.
