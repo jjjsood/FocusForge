@@ -1481,7 +1481,7 @@ fn dng_refused_for_a_tiff_project() {
     assert_eq!(controller.export_stage(), "refused");
     assert_eq!(
         controller.export_refusal_lines(),
-        &["DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+        &["DNG needs a project stacked from camera RAW files; this one was stacked from TIFF or JPEG images."
             .to_string()]
     );
     assert!(!controller.export_can_locate(), "Close only");

@@ -1098,7 +1098,7 @@ pub fn export_refusal_lines(err: &ExportError) -> Vec<String> {
                 .to_string(),
         ],
         ExportError::Project(ProjectError::ExportDngNeedsRaw { .. }) => vec![
-            "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+            "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF or JPEG images."
                 .to_string(),
         ],
         ExportError::Project(ProjectError::ExportDngColour { source, .. }) => {
@@ -2015,7 +2015,7 @@ mod export_refusal_tests {
         assert_eq!(
             export_refusal_lines(&needs_raw),
             vec![
-                "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF images."
+                "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF or JPEG images."
             ]
         );
         let colour = ExportError::Project(ProjectError::ExportDngColour {
