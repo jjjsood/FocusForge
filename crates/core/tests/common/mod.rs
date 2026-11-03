@@ -85,6 +85,7 @@ pub fn fuse_held(
         resume: false,
         cache: true,
         poll: Duration::from_millis(50),
+        free_space: None,
     };
     let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
         .expect("the fusion must complete");

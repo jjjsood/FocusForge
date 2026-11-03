@@ -812,6 +812,64 @@ fn validate_reopen(
     Ok((pixel_start, row_bytes))
 }
 
+/// Offsets of the out-of-line values (each over 4 bytes, word-aligned) that
+/// follow the IFD for entries whose data have these lengths, and the offset
+/// of the first pixel.
+fn header_layout(data_lens: impl ExactSizeIterator<Item = u64>) -> (Vec<u64>, u64) {
+    let mut cursor: u64 = 8 + 2 + 12 * data_lens.len() as u64 + 4;
+    cursor += cursor % 2;
+    let offsets = data_lens
+        .map(|len| {
+            if len > 4 {
+                let at = cursor;
+                cursor += len;
+                cursor += cursor % 2;
+                at
+            } else {
+                0
+            }
+        })
+        .collect();
+    (offsets, cursor)
+}
+
+/// The length of a finished `TiffWriter` file: header, IFD and out-of-line
+/// values, then `height` uncompressed rows. `description_len` counts the
+/// `ImageDescription` bytes including their terminating NUL. `None` when the
+/// pixel area overflows a byte count.
+pub(crate) fn file_len(
+    width: u32,
+    height: u32,
+    spp: u32,
+    format: SampleFormat,
+    description_len: usize,
+) -> Option<u64> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(spp))?
+        .checked_mul(format.bytes())?
+        .checked_mul(u64::from(height))?;
+    let (strips, samples) = (4 * u64::from(height), 2 * u64::from(spp));
+    // Width, length, bits per sample, compression, photometric, description,
+    // strip offsets, samples per pixel, rows per strip, strip byte counts,
+    // planar configuration, sample format.
+    let lens = [
+        4,
+        4,
+        samples,
+        2,
+        2,
+        description_len as u64,
+        strips,
+        2,
+        4,
+        strips,
+        2,
+        samples,
+    ];
+    let (_, pixel_start) = header_layout(lens.into_iter());
+    pixel_start.checked_add(pixels)
+}
+
 impl<W: Write + Seek> TiffWriter<W> {
     /// Build the header and both strip-offset tables now: 12 IFD entries
     /// in tag order, header -> IFD -> out-of-line values ->
@@ -881,17 +939,7 @@ impl<W: Write + Seek> TiffWriter<W> {
         ];
 
         let n = entries.len() as u32;
-        let mut cursor: u64 = 8 + 2 + 12 * u64::from(n) + 4;
-        cursor += cursor % 2;
-        let mut offsets: Vec<u64> = vec![0; entries.len()];
-        for (i, (_, _, _, data)) in entries.iter().enumerate() {
-            if data.len() > 4 {
-                offsets[i] = cursor;
-                cursor += data.len() as u64;
-                cursor += cursor % 2;
-            }
-        }
-        let pixel_start = cursor;
+        let (offsets, pixel_start) = header_layout(entries.iter().map(|e| e.3.len() as u64));
 
         // Patch StripOffsets with the now-computable real values. The patch
         // is length-preserving (n_strips LONGs either way), so the layout
@@ -1153,6 +1201,52 @@ mod tests {
     fn parse_cursor(cursor: &Cursor<Vec<u8>>) -> TiffHeader {
         let bytes: &[u8] = cursor.get_ref();
         TiffHeader::parse(Path::new("test.tif"), &bytes).expect("written bytes must parse")
+    }
+
+    #[test]
+    fn file_len_matches_the_written_file() {
+        for width in [1u32, 5, 8] {
+            for height in [1u32, 3] {
+                for spp in [1u32, 3, 4] {
+                    for format in [SampleFormat::U16, SampleFormat::F32] {
+                        for description in ["", "abc", "FocusForge 1.2.3 align=x"] {
+                            let mut writer = TiffWriter::new_as(
+                                Cursor::new(Vec::new()),
+                                TiffSpec {
+                                    width,
+                                    height,
+                                    samples_per_pixel: spp,
+                                    description: Some(description.to_string()),
+                                },
+                                format,
+                            )
+                            .unwrap();
+                            let rect = Rect {
+                                x: 0,
+                                y: 0,
+                                width,
+                                height,
+                            };
+                            let samples = (width * height * spp) as usize;
+                            match format {
+                                SampleFormat::U16 => {
+                                    writer.write_tile(rect, &vec![7u16; samples]).unwrap();
+                                }
+                                SampleFormat::F32 => {
+                                    writer.write_tile_f32(rect, &vec![0.5f32; samples]).unwrap();
+                                }
+                            }
+                            let written = writer.sink.get_ref().len() as u64;
+                            assert_eq!(
+                                file_len(width, height, spp, format, description.len() + 1),
+                                Some(written),
+                                "{width}x{height} spp {spp} {format:?} description {description:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

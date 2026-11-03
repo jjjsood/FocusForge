@@ -441,35 +441,13 @@ pub(crate) fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<()
     }
 }
 
-/// Map `path` read-only for the lifetime of the returned [`Mmap`].
-///
-/// # Safety
-///
-/// This is the one place in the crate that touches `unsafe`
-/// (`memmap2::Mmap::map` is itself `unsafe fn`): mapping a file is
-/// undefined behavior if the file is modified while the mapping is alive
-/// (memmap2 0.9.11 docs, <https://docs.rs/memmap2/0.9.11/memmap2/struct.Mmap.html>).
-/// This reader never writes through a mapping it holds, and every caller in
-/// this crate opens a frame read-only for the mapping's whole lifetime;
-/// nothing here mutates a TIFF frame while any process might be mapping it.
-/// The `File`
-/// used to create the mapping is dropped as soon as this function returns;
-/// the mapping keeps the underlying pages alive on its own.
-// SAFETY: contract above; the only `unsafe` call this crate makes.
-#[allow(unsafe_code)]
+/// Map the TIFF frame at `path` read-only for the lifetime of the returned
+/// [`Mmap`].
 pub(crate) fn map_file(path: &Path) -> Result<Mmap, TiffError> {
-    let file = File::open(path).map_err(|source| TiffError::Io {
+    crate::io::map_read_only(path).map_err(|source| TiffError::Io {
         path: path.to_path_buf(),
         source,
-    })?;
-    // SAFETY: see this function's doc comment above -- every workflow in
-    // this repository treats a mapped TIFF file as read-only for as long as
-    // any mapping of it might be alive.
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|source| TiffError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(mmap)
+    })
 }
 
 #[cfg(test)]

@@ -37,6 +37,14 @@ above white survives blending and clips once, to 16 bits, when the image is
 shown or exported. Brightness equalization of a RAW stack corrects exposure in linear
 light.
 
+Every RAW frame is developed once, in parallel, before alignment and fusion.
+The developed frames are kept as 16-bit float scratch files of 6 bytes per
+pixel per frame, so a large stack needs that much free space under `.scratch`.
+The CLI prints `develop k/N frames eta …` while this pass runs and the GUI
+shows it as "Developing". A run refuses to start, naming each short directory
+with the bytes needed and free, when the scratch or output volume cannot hold
+the run.
+
 ## JPEG and 8-bit frames
 
 8-bit TIFF and JPEG frames are widened to the 16-bit range and stacked like

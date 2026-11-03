@@ -77,8 +77,9 @@ pub struct AlignReport {
     pub warped_dir: Option<String>,
     pub wall_seconds: f64,
     /// Wall-clock stage breakdown -- `setup`/`align`/`finalize` as seconds,
-    /// `warp_write` a number only when `--write-warped` ran, `fuse`
-    /// always `null` (`align` never fuses). Every figure is wall clock,
+    /// `warp_write` a number only when `--write-warped` ran, `fuse` and
+    /// `develop` always `null` (`align` never fuses and never develops RAW
+    /// frames up front). Every figure is wall clock,
     /// never CPU time; the non-null stages sum exactly to `wall_seconds` --
     /// see [`focusforge_core::timing::StageTimings`]'s own rustdoc for the
     /// full contract. Fields are only ever added.

@@ -78,6 +78,9 @@ use crate::tile::{FramePreprocess, TileConsumer, TileError, TileScheduler};
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStage {
+    /// The up-front develop of RAW frames into scratch, before anything
+    /// else reads them: reported, never controlled.
+    Develop,
     /// Brightness preparation of the sources, before alignment: reported,
     /// never controlled.
     Prepare,
@@ -93,6 +96,7 @@ impl JobStage {
             JobStage::Align => 0,
             JobStage::Fuse => 1,
             JobStage::Prepare => 2,
+            JobStage::Develop => 3,
         }
     }
 
@@ -101,6 +105,7 @@ impl JobStage {
             0 => JobStage::Align,
             1 => JobStage::Fuse,
             2 => JobStage::Prepare,
+            3 => JobStage::Develop,
             _ => unreachable!("JobStage is only ever written through JobControl::set_stage"),
         }
     }
