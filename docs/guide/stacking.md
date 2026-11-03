@@ -58,7 +58,8 @@ focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 
 `export` reads a project and writes the image (`-o`), the Z-Map
-(`--zmap`), or both in one invocation — at least one of the two is required.
+(`--zmap`), or both in one invocation. `--frame`/`--frame-output` also count;
+at least one output is required.
 The image is rendered from the project's stored composite, so it always
 reflects the checkpoint you ask for (the head by default; `--checkpoint <id>`
 picks another). An unretouched checkpoint needs no source frames; a retouched
@@ -107,8 +108,8 @@ Three are available. The window shows the display name; the CLI takes the id.
   sharpest frame is preferred.
 - **Focus map** (`depth-map`) — builds a smoothed sharpness surface across the
   stack and selects, per pixel, the frame that surface names. Produces the
-  most coherent Z-Map of the three, useful when the map itself will be
-  retouched. `score-radius` (default 4) and `smoothing-radius` (default 8)
+  most coherent Z-Map of the three, which makes the pipette and the overlay
+  more dependable when you retouch. `score-radius` (default 4) and `smoothing-radius` (default 8)
   take 0 to 16.
 
 Every algorithm accepts `--set key=value` to override a declared parameter;
@@ -151,6 +152,10 @@ to write it out:
 focusforge-cli stack path/to/frames/ --algorithm depth-map
 focusforge-cli export path/to/frames/frames.ffp --zmap zmap.tif
 ```
+
+The exported Z-Map is the one fusion produced. Retouch strokes are not
+included, so on a retouched checkpoint it does not match the exported image;
+the overlay and pipette in the window do count the strokes.
 
 ## Using the GPU
 

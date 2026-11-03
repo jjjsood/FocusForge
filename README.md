@@ -33,7 +33,7 @@
 - Long brackets of high-resolution frames run on an ordinary computer, however much memory the stack would need
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
-- Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map when you plan to retouch a lot
+- Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
 - Fast on a graphics card, the same result without one; the window also starts where only a software renderer is available
 - RAW stacks keep highlights above white until the final image is written
 
