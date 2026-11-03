@@ -99,8 +99,7 @@ more frames still to fuse; while a run is going it becomes **Pause**,
 **Cancel** and, once paused, **Resume**. A failed run offers **Retry**,
 which starts the same request again. Progress, the current stage and an ETA
 show along the bottom of the window while a run is live. RAW development,
-brightness
-preparation and a computed alignment each show frames done and an estimated
+brightness preparation and a computed alignment each show frames done and an estimated
 time remaining; time spent paused is left out of the estimate. When alignment
 is reused from an earlier run, the bar reads "from cache" for that stage. A failed run raises
 a toast naming which step it failed at — setup, alignment or fusion —
