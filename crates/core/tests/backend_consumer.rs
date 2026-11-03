@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::align::CallCountingReader;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,25 +29,6 @@ use focusforge_core::tile::{
 
 fn scratch_base(label: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("backend_consumer_scratch_{label}"))
-}
-
-/// A [`TileReader`] that counts every call, wrapping another reader that is
-/// never actually reached by this file's probe tests.
-struct CountingReader<'a> {
-    inner: &'a dyn TileReader,
-    calls: AtomicUsize,
-}
-
-impl TileReader for CountingReader<'_> {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.read_tile_into(frame, rect, out)
-    }
 }
 
 /// A consumer that declares it supplies its own pixels but never reads
@@ -192,7 +175,7 @@ fn supplies_own_pixels_causes_zero_reads_and_zero_frame_tiles_read() {
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let stack_ctx = StackContext::new(stack.len(), width, height, spp);
-    let counting = CountingReader {
+    let counting = CallCountingReader {
         inner: &stack,
         calls: AtomicUsize::new(0),
     };

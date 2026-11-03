@@ -12,6 +12,8 @@
 
 mod common;
 
+use common::align::{CountingReader, anchor_defaults, lowered_max_iterations, open_fixture};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -22,13 +24,9 @@ use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
 };
 use focusforge_core::io::TiffStack;
-use focusforge_core::params::{self, ParamDesc, ParamValue, ParamValues, StackContext};
+use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, StackContext};
+use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
-use focusforge_core::tile::{HostBudget, Rect};
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
 
 fn stack_context(stack: &TiffStack) -> StackContext {
     let (width, height) = stack.dimensions();
@@ -38,26 +36,6 @@ fn stack_context(stack: &TiffStack) -> StackContext {
         height,
         stack.header(0).samples_per_pixel,
     )
-}
-
-/// Fully resolved defaults for `PyramidalEcc`, `max-iterations` then lowered
-/// to 40 by every caller here (see the module docs), under the anchor policy
-/// these tests exercise.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    let mut cfg = params::resolved_values(&resolved);
-    cfg.insert(
-        "reference-policy".to_string(),
-        ParamValue::Enum("anchor".to_string()),
-    );
-    cfg
-}
-
-fn lowered_max_iterations(ctx: &StackContext) -> ParamValues {
-    let mut cfg = resolved_defaults(ctx);
-    cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
-    cfg
 }
 
 fn ceil_div(a: u32, b: u32) -> usize {
@@ -84,39 +62,6 @@ fn reference_reads(stack: &StackContext) -> usize {
 /// proxy: the whole frame at level 0. The reference's is made by the first
 /// escalation of a run and shared by every later one.
 const ESCALATION_READS: usize = 1;
-
-/// Wraps another [`TileReader`], counting `read_tile_into` calls per frame
-/// index. One `AtomicUsize` per frame, so concurrent registrations (the
-/// rayon anchor sub-arm) count correctly with no lock.
-struct CountingReader<'a> {
-    inner: &'a dyn TileReader,
-    reads: Vec<AtomicUsize>,
-}
-
-impl<'a> CountingReader<'a> {
-    fn new(inner: &'a dyn TileReader, frame_count: usize) -> Self {
-        CountingReader {
-            inner,
-            reads: (0..frame_count).map(|_| AtomicUsize::new(0)).collect(),
-        }
-    }
-
-    fn reads_for(&self, frame: usize) -> usize {
-        self.reads[frame].load(Ordering::SeqCst)
-    }
-}
-
-impl TileReader for CountingReader<'_> {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        self.reads[frame].fetch_add(1, Ordering::SeqCst);
-        self.inner.read_tile_into(frame, rect, out)
-    }
-}
 
 /// A stub [`AlignAlgorithm`] that counts its own `prepare_run` calls and
 /// otherwise produces a trivial, always-converged outcome -- identity for
@@ -315,7 +260,7 @@ const MIDDLE_FRAME: usize = 4;
 fn recorded_fingerprints(mode: &str) -> Vec<String> {
     let stack = open_fixture();
     let stack_ctx = stack_context(&stack);
-    let mut cfg = resolved_defaults(&stack_ctx);
+    let mut cfg = anchor_defaults(&stack_ctx);
     cfg.insert("mode".to_string(), ParamValue::Enum(mode.to_string()));
     uncached_outcomes(stack_ctx, &stack, MIDDLE_FRAME, &cfg)
         .iter()

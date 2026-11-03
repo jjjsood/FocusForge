@@ -10,7 +10,10 @@
 
 mod common;
 
-use std::path::PathBuf;
+use common::align::{
+    FramesReader, XorShift32, corner_error, default_region, frame_3_tile, full_rect, open_fixture,
+    resolved_defaults, two_frame_reader,
+};
 
 use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader,
@@ -20,74 +23,9 @@ use focusforge_core::align::{
     DivergenceReason, EccLevelRecord, EccStatus, FailurePolicy, PyramidalEcc, StackAlignment,
     Transform, align_stack,
 };
-use focusforge_core::io::{FrameError, TiffError, TiffStack};
-use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::{Rect, Tile};
-
-const FRAME_3: usize = 3;
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
-/// Opens `fixtures/mantis-512` and reads frame 3's full tile.
-fn frame_3_tile() -> (Tile, u32, u32, u32) {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(FRAME_3).samples_per_pixel;
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
-    (tile, width, height, spp)
-}
-
-/// The region every ground-truth test here solves over -- identical to the
-/// region `crates/core/tests/ecc_solver.rs` measures and to what
-/// `PyramidalEcc::solve_region` itself computes for a 512px level, so these
-/// tests measure against the same rect the driver actually uses.
-fn default_region() -> Rect {
-    Rect {
-        x: 64,
-        y: 64,
-        width: 384,
-        height: 384,
-    }
-}
-
-/// The maximum, over `region`'s four corners, of the Euclidean distance
-/// between where `a` and `b` map that corner -- the same "corner
-/// displacement" measure the solver's own termination criterion uses.
-fn corner_error(a: &Transform, b: &Transform, region: Rect) -> f64 {
-    let corners = [
-        (region.x as f64, region.y as f64),
-        ((region.x + region.width - 1) as f64, region.y as f64),
-        (region.x as f64, (region.y + region.height - 1) as f64),
-        (
-            (region.x + region.width - 1) as f64,
-            (region.y + region.height - 1) as f64,
-        ),
-    ];
-    corners
-        .iter()
-        .map(|&(x, y)| {
-            let (ax, ay) = a.map_point(x, y).expect("ground truth stays in domain");
-            let (bx, by) = b
-                .map_point(x, y)
-                .expect("recovered transform stays in domain");
-            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
-        })
-        .fold(0.0f64, f64::max)
-}
+use focusforge_core::io::TiffStack;
+use focusforge_core::params::{ParamValue, ParamValues, StackContext};
+use focusforge_core::tile::Rect;
 
 /// A rotation+scale [`Transform`] about `(cx, cy)`.
 fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
@@ -95,81 +33,6 @@ fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
     let rot_scale = Transform::similarity(scale, radians, 0.0, 0.0);
     let back = Transform::translation(cx, cy);
     back.compose(&rot_scale).compose(&to_origin)
-}
-
-/// Deterministic xorshift32 PRNG.
-struct XorShift32(u32);
-
-impl XorShift32 {
-    fn next(&mut self) -> u32 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.0 = x;
-        x
-    }
-}
-
-/// A synthetic in-memory [`TileReader`] over an arbitrary number of
-/// same-sized frames, honouring the same exact-length and in-bounds
-/// contracts as [`focusforge_core::io::TiffStack::read_tile_into`].
-struct FramesReader {
-    width: u32,
-    height: u32,
-    spp: u32,
-    frames: Vec<Vec<u16>>,
-}
-
-impl TileReader for FramesReader {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        let Some(src) = self.frames.get(frame) else {
-            return Err(AlgorithmError::FrameOutOfRange {
-                frame,
-                frame_count: self.frames.len(),
-            });
-        };
-        let expected = rect.width as usize * rect.height as usize * self.spp as usize;
-        if out.len() != expected {
-            return Err(AlgorithmError::Frame(FrameError::Tiff(
-                TiffError::BufferSize {
-                    expected,
-                    got: out.len(),
-                },
-            )));
-        }
-        let in_bounds = rect
-            .x
-            .checked_add(rect.width)
-            .is_some_and(|xw| xw <= self.width)
-            && rect
-                .y
-                .checked_add(rect.height)
-                .is_some_and(|yh| yh <= self.height);
-        if !in_bounds {
-            return Err(AlgorithmError::Frame(FrameError::Tiff(
-                TiffError::OutOfBounds {
-                    path: PathBuf::from("<memory>"),
-                    requested: rect,
-                    frame: (self.width, self.height),
-                },
-            )));
-        }
-        let stride = self.width as usize * self.spp as usize;
-        let row_len = rect.width as usize * self.spp as usize;
-        let mut off = 0;
-        for r in rect.y..(rect.y + rect.height) {
-            let row_start = r as usize * stride + rect.x as usize * self.spp as usize;
-            out[off..off + row_len].copy_from_slice(&src[row_start..row_start + row_len]);
-            off += row_len;
-        }
-        Ok(())
-    }
 }
 
 /// A reader that must never be asked for a pixel -- proves a rejection
@@ -184,22 +47,6 @@ impl TileReader for PanicReader {
         _out: &mut [u16],
     ) -> Result<(), AlgorithmError> {
         panic!("no pixel should be read once the schema has rejected the parameters")
-    }
-}
-
-/// A two-frame reader: frame 0 is `reference`, frame 1 is `moving`.
-fn two_frame_reader(
-    width: u32,
-    height: u32,
-    spp: u32,
-    reference: Vec<u16>,
-    moving: Vec<u16>,
-) -> FramesReader {
-    FramesReader {
-        width,
-        height,
-        spp,
-        frames: vec![reference, moving],
     }
 }
 
@@ -221,16 +68,6 @@ fn cfg_with(mode: &str, pyramid_depth: i64, max_iterations: i64) -> ParamValues 
         ParamValue::Enum("first".to_string()),
     );
     cfg
-}
-
-/// Fully resolved defaults for `PyramidalEcc` against `ctx` -- what a real
-/// caller (`align_stack`'s own caller) is expected to hand `align_frame`,
-/// per the same "`fuse` receives a fully resolved `ParamValues`" contract
-/// `StackAlgorithm::fuse` documents.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    params::resolved_values(&resolved)
 }
 
 /// Measured 2026-10-05: corner error `3.10e-5` px through the four-level

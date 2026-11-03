@@ -6,24 +6,13 @@
 
 mod common;
 
-use focusforge_core::algorithm::AlignAlgorithm;
+use common::align::{open_fixture, resolved_defaults};
+
 use focusforge_core::align::{
     FailurePolicy, KERNEL_RADIUS, PyramidalEcc, Transform, align_stack, auto_crop,
 };
-use focusforge_core::io::TiffStack;
-use focusforge_core::params::{self, ParamValues, StackContext};
+use focusforge_core::params::StackContext;
 use focusforge_core::tile::Rect;
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-/// Fully resolved defaults for `PyramidalEcc` against `ctx`.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    params::resolved_values(&resolved)
-}
 
 /// Every corner of `rect`, mapped forward through every one of
 /// `transforms`, lands inside that frame's kernel-inset interior -- the

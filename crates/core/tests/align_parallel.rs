@@ -14,137 +14,16 @@
 
 mod common;
 
-use std::path::PathBuf;
+use common::align::{
+    FramesReader, XorShift32, frame_3_tile, full_rect, lowered_max_iterations, open_fixture,
+};
 
-use focusforge_core::algorithm::{AlgorithmError, AlignAlgorithm, TileReader};
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
 };
-use focusforge_core::io::{FrameError, TiffError, TiffStack};
-use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::{HostBudget, Rect, Tile};
-
-const FRAME_3: usize = 3;
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
-fn frame_3_tile() -> (Tile, u32, u32, u32) {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(FRAME_3).samples_per_pixel;
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
-    (tile, width, height, spp)
-}
-
-/// Fully resolved defaults for `PyramidalEcc` against `ctx`, `max-iterations`
-/// then lowered to 40 by every caller here (see the module docs), under the
-/// anchor policy these tests exercise.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    let mut cfg = params::resolved_values(&resolved);
-    cfg.insert(
-        "reference-policy".to_string(),
-        ParamValue::Enum("anchor".to_string()),
-    );
-    cfg
-}
-
-fn lowered_max_iterations(ctx: &StackContext) -> ParamValues {
-    let mut cfg = resolved_defaults(ctx);
-    cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
-    cfg
-}
-
-/// A deterministic xorshift32 PRNG, seeded with a fixed constant, local to
-/// this test file.
-struct XorShift32(u32);
-
-impl XorShift32 {
-    fn next(&mut self) -> u32 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.0 = x;
-        x
-    }
-}
-
-/// A synthetic in-memory [`TileReader`] over an arbitrary number of
-/// same-sized frames.
-struct FramesReader {
-    width: u32,
-    height: u32,
-    spp: u32,
-    frames: Vec<Vec<u16>>,
-}
-
-impl TileReader for FramesReader {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        let Some(src) = self.frames.get(frame) else {
-            return Err(AlgorithmError::FrameOutOfRange {
-                frame,
-                frame_count: self.frames.len(),
-            });
-        };
-        let expected = rect.width as usize * rect.height as usize * self.spp as usize;
-        if out.len() != expected {
-            return Err(AlgorithmError::Frame(FrameError::Tiff(
-                TiffError::BufferSize {
-                    expected,
-                    got: out.len(),
-                },
-            )));
-        }
-        let in_bounds = rect
-            .x
-            .checked_add(rect.width)
-            .is_some_and(|xw| xw <= self.width)
-            && rect
-                .y
-                .checked_add(rect.height)
-                .is_some_and(|yh| yh <= self.height);
-        if !in_bounds {
-            return Err(AlgorithmError::Frame(FrameError::Tiff(
-                TiffError::OutOfBounds {
-                    path: PathBuf::from("<memory>"),
-                    requested: rect,
-                    frame: (self.width, self.height),
-                },
-            )));
-        }
-        let stride = self.width as usize * self.spp as usize;
-        let row_len = rect.width as usize * self.spp as usize;
-        let mut off = 0;
-        for r in rect.y..(rect.y + rect.height) {
-            let row_start = r as usize * stride + rect.x as usize * self.spp as usize;
-            out[off..off + row_len].copy_from_slice(&src[row_start..row_start + row_len]);
-            off += row_len;
-        }
-        Ok(())
-    }
-}
+use focusforge_core::params::{ParamValue, StackContext};
+use focusforge_core::tile::HostBudget;
 
 #[test]
 fn parallel_anchor_matches_serial_transforms() {

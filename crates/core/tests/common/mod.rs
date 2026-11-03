@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod align;
+
 #[path = "reference_stack.rs"]
 mod reference_stack;
 #[allow(unused_imports)]
