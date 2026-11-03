@@ -8078,8 +8078,12 @@ impl AppController {
 
     /// Records that the Composite pane shows the active tab's landed
     /// composite at `now`, so the mosaic standing in for it can fade out.
+    /// While the tab's run waits on Keep or Discard the mosaic stays, however
+    /// the pane redraws.
     pub fn composite_drawn(&mut self, now: Instant) {
-        if self.on_landing_tab()
+        let parked = self.state.active().is_some_and(|tab| tab.parked.is_some());
+        if !parked
+            && self.on_landing_tab()
             && let Some(landing) = self.landing.as_mut()
         {
             landing.drawn.get_or_insert(now);
@@ -8497,10 +8501,17 @@ impl AppController {
         if self.active_history_frozen() {
             return;
         }
-        let Some(parked) = self.state.active_mut().and_then(|tab| tab.parked.take()) else {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let Some(parked) = tab.parked.take() else {
             return;
         };
         remove_held(std::slice::from_ref(&parked.held));
+        if self.landing.as_ref().is_some_and(|l| l.tab_id == tab_id) {
+            self.landing = None;
+        }
         self.emit(ShellEvent::JobChanged);
     }
 

@@ -7786,6 +7786,117 @@ fn stage_view_clears_on_cancel_and_failure() {
     assert!(!controller.composite_ready());
 }
 
+/// The mosaic of a parked run, taken from the pane at `now`.
+fn parked_mosaic(controller: &AppController, now: Instant) -> job::StageImage {
+    match controller.stage_view(now) {
+        Some(job::StageView::Picture(image)) => image,
+        other => panic!(
+            "the parked run's mosaic is in the pane: {}",
+            describe(&other)
+        ),
+    }
+}
+
+#[test]
+fn stage_view_clears_on_discard() {
+    let far = || Instant::now() + job::INSET_AFTER_FUSION + job::LANDING_FADE * 4;
+
+    let (mut controller, _) = parked_controller("stage_discard");
+    let pixels = Arc::clone(&parked_mosaic(&controller, Instant::now()).pixels);
+    controller.discard_fused();
+    let view = controller.stage_view(Instant::now());
+    assert!(
+        view.is_none(),
+        "the discarded run left {} in the pane",
+        describe(&view)
+    );
+    assert!(controller.stage_view(far()).is_none());
+    assert!(!controller.inset_pending(Instant::now()));
+    assert_eq!(
+        Arc::strong_count(&pixels),
+        1,
+        "a preview buffer outlived the discard"
+    );
+    // Nothing left to discard, and no landing to clear.
+    controller.discard_fused();
+
+    // Another tab's landing is not this run's to clear.
+    let (mut controller, _) = parked_controller("stage_discard_other_tab");
+    let other = common::tree("stage_discard_other_tab_second_frames");
+    write_synthetic_frame(&other.join("00.tif"), 64, false);
+    write_synthetic_frame(&other.join("01.tif"), 64, false);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[other]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the second tab's run lands its planes");
+    controller.select_project(0);
+    controller.discard_fused();
+    controller.select_project(1);
+    let view = controller.stage_view(Instant::now());
+    assert!(
+        matches!(view, Some(job::StageView::Picture(_))),
+        "discarding tab 0's run cleared tab 1's landing: {}",
+        describe(&view)
+    );
+}
+
+#[test]
+fn stage_view_while_a_run_is_parked() {
+    let drawn = |controller: &mut AppController| {
+        let at = Instant::now();
+        controller.composite_drawn(at);
+        at
+    };
+    let long_after = |at: Instant| at + job::INSET_AFTER_FUSION + job::LANDING_FADE * 4;
+
+    // A first fuse: the mosaic stays whatever the canvas draws, until Keep.
+    let (mut controller, _) = parked_controller("stage_parked_first");
+    let at = drawn(&mut controller);
+    let held = parked_mosaic(&controller, long_after(at));
+    assert!(
+        !held.fading,
+        "a parked run's mosaic fades before the decision"
+    );
+    drop(held);
+    controller
+        .keep_fused()
+        .expect("a parked run is there to keep");
+    let at = drawn(&mut controller);
+    assert!(
+        matches!(
+            controller.stage_view(at + job::LANDING_FADE / 2),
+            Some(job::StageView::Picture(image)) if image.fading
+        ),
+        "after Keep the mosaic fades over the kept composite"
+    );
+    assert!(controller.stage_view(long_after(at)).is_none());
+    assert!(!controller.inset_pending(long_after(at)));
+
+    // A re-fuse: the old composite redrawing underneath changes nothing.
+    let mut controller = controller_with_unalignable_frames("stage_parked_refuse");
+    controller.set_align_algorithm("dummy-align");
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60))
+        .expect("the first run lands its planes");
+    assert_eq!(controller.checkpoint_count(), Some(1));
+    controller.set_align_algorithm("pyramidal-ecc");
+    assert!(controller.start_fuse());
+    assert!(common::wait_for_settle(&mut controller, Duration::from_secs(60)).is_none());
+    assert!(controller.pending_divergence().is_some());
+    assert!(controller.composite_ready(), "the old composite is there");
+    let at = drawn(&mut controller);
+    assert!(!parked_mosaic(&controller, long_after(at)).fading);
+    controller
+        .keep_fused()
+        .expect("a parked run is there to keep");
+    let at = drawn(&mut controller);
+    assert!(controller.stage_view(long_after(at)).is_none());
+}
+
 #[test]
 fn stage_view_shows_no_stale_image() {
     use focusforge_core::display::PreviewKind;
