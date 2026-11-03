@@ -471,18 +471,14 @@ pub fn run(
         timer.enter(Stage::Setup);
         // Workers that claimed their frame before a cancel finish it, so the
         // pass can return Ok with the cancel already raised.
-        match result {
-            Err(AlgorithmError::Cancelled) => {
-                return Ok(FuseOutcome::Cancelled {
-                    units_done: 0,
-                    unit_total: 0,
-                });
-            }
+        let cancelled = match result {
+            Err(AlgorithmError::Cancelled) => true,
             other => {
                 other?;
+                cancel_requested()
             }
-        }
-        if cancel_requested() {
+        };
+        if cancelled {
             return Ok(FuseOutcome::Cancelled {
                 units_done: 0,
                 unit_total: 0,
