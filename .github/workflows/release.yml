@@ -406,8 +406,10 @@ jobs:
             --title "FocusForge $VERSION" --notes-file release-assets/notes.md "${flags[@]}"
 
   # A stable release only: the PKGBUILD and .SRCINFO that check-aur built, installed and removed.
+  # Off until the repository variable AUR_PUBLISH is 'true', so a release does not fail
+  # while there is no AUR account; check-aur keeps checking the recipe either way.
   aur:
-    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'
+    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false' && vars.AUR_PUBLISH == 'true'
     needs: [meta, publish, check-aur]
     runs-on: ubuntu-24.04
     timeout-minutes: 10

@@ -502,6 +502,8 @@ def job_steps(job: str) -> list[str]:
 # Package-manager check job -> its command; push job -> (the check whose output it pushes, its push command).
 PACKAGE_MANAGER_JOBS = {"check-aur": "bash tools/check-package-aur.sh", "check-winget": "python tools/check-package-winget.py"}
 PACKAGE_MANAGER_PUSHES = {"aur": ("check-aur", "tools/push-package-repo.sh"), "winget": ("check-winget", "python tools/push-winget.py")}
+# Extra conditions a push job's `if:` carries after the stable-release test: the AUR push is switched on by a variable.
+PACKAGE_MANAGER_SWITCHES = {"aur": " && vars.AUR_PUBLISH == 'true'", "winget": ""}
 PUSH_TOOLS = ("push-package-repo.sh", "push-winget.py")
 
 
@@ -516,7 +518,7 @@ def package_managers_valid(jobs: dict[str, str]) -> bool:
     stable = "    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'"
     for name, (check, command) in PACKAGE_MANAGER_PUSHES.items():
         job = jobs[name]
-        if not re.search(rf"^{re.escape(stable)}$", job, re.MULTILINE): return False
+        if not re.search(rf"^{re.escape(stable + PACKAGE_MANAGER_SWITCHES[name])}$", job, re.MULTILINE): return False
         if not re.search(rf"^    needs: \[meta, publish, {re.escape(check)}\]$", job, re.MULTILINE): return False
         if not re.search(r"^    environment: package-managers$", job, re.MULTILINE) or f"run: {command} " not in job: return False
     others = "".join(job for name, job in jobs.items() if name not in PACKAGE_MANAGER_PUSHES)
@@ -592,7 +594,9 @@ def graph() -> None:
         "AUR check only on tags": release.replace("  check-aur:\n    needs: [meta, assemble]\n", "  check-aur:\n    needs: [meta, assemble]\n    if: github.ref_type == 'tag'\n", 1),
         "winget check skipped": release.replace("      - name: Check the winget manifests\n", "      - name: Check the winget manifests\n        if: false\n", 1),
         "no Flatpak crate sources": release.replace("        run: python3 tools/flatpak-cargo-sources.py dist/cargo-sources.json\n", "        run: echo skipped\n", 1),
-        "AUR push on pull requests": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-aur]", "    needs: [meta, publish, check-aur]", 1),
+        "AUR push on pull requests": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false' && vars.AUR_PUBLISH == 'true'\n    needs: [meta, publish, check-aur]", "    needs: [meta, publish, check-aur]", 1),
+        "AUR push without its switch": release.replace(" && vars.AUR_PUBLISH == 'true'\n", "\n", 1),
+        "AUR push on a prerelease": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false' && vars.AUR_PUBLISH == 'true'", "    if: github.ref_type == 'tag' && vars.AUR_PUBLISH == 'true'", 1),
         "winget submit on a prerelease": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-winget]", "    if: github.ref_type == 'tag'\n    needs: [meta, publish, check-winget]", 1),
         "AUR push skips its check": release.replace("    needs: [meta, publish, check-aur]", "    needs: [meta, publish]", 1),
         "winget submit ahead of the release": release.replace("    needs: [meta, publish, check-winget]", "    needs: [meta, check-winget]", 1),

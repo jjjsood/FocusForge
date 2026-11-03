@@ -287,8 +287,9 @@ To change a recipe, edit `tools/package-managers.py`, never the submitted
 files: the next release overwrites them. A new library that the binaries link
 or `dlopen` makes `check-aur` fail until its Arch package is in `AUR_DEPENDS`.
 
-Until a secret is set, its job fails with a message that names the missing
-secret. The GitHub Release itself is published before either job runs and is
+The `aur` job runs only while the repository variable `AUR_PUBLISH` is `true`;
+`check-aur` runs either way. Until a secret is set, its job fails with a
+message that names the missing secret. The GitHub Release itself is published before either job runs and is
 unaffected.
 
 ### Release smoke checklist
