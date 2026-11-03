@@ -17,7 +17,7 @@ use focusforge_core::tile::{Rect, Tile};
 
 /// The sharpest `fixtures/mantis-512` frame, the one the ground-truth tests
 /// warp.
-pub const FRAME_3: usize = 3;
+const FRAME_3: usize = 3;
 
 pub fn open_fixture() -> TiffStack {
     TiffStack::open(super::mantis_512_dir()).expect("opening fixtures/mantis-512")
