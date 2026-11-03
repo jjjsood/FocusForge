@@ -850,33 +850,38 @@ mod tests {
 
     #[test]
     fn mask_a_long_stroke_over_a_large_map_is_not_quadratic() {
-        let info = info(4000, 4000);
-        let map = rect(0, 0, 4000, 4000);
-        // 20 sweeps of 50 points: a 1000-point path whose bounding box is the
-        // whole map.
-        let jitter = walk(11, 1000, (0, 0), 6);
-        let path: Vec<Point> = (0..1000)
-            .map(|i| {
-                let sweep = i / 50;
-                let along = (i % 50) * 4000 / 49;
-                let x = if sweep % 2 == 0 { along } else { 4000 - along };
-                pt(
-                    x + jitter[i as usize].x % 6,
-                    sweep * 200 + 10 + jitter[i as usize].y % 6,
-                )
-            })
-            .collect();
-        let op = stroke_op(2, path, 16.0, 0.3);
-        let mut out = vec![0u16; 4000 * 4000];
-        let src = vec![60_000u16; 4000 * 4000];
-        let start = std::time::Instant::now();
-        apply(&op, info, map, &mut out, map, &src, 1).unwrap();
-        let elapsed = start.elapsed();
-        assert!(out.iter().filter(|&&s| s != 0).count() > 1_000_000);
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "a 1000-point stroke took {elapsed:?}"
-        );
+        const SIDE: u32 = 1280;
+        let map = rect(0, 0, SIDE, SIDE);
+        // Serpentine sweeps of 50 points, 64 px apart, across the whole map.
+        let serpentine = |sweeps: i32| -> Vec<Point> {
+            (0..sweeps * 50)
+                .map(|i| {
+                    let along = (i % 50) * SIDE as i32 / 49;
+                    let x = if (i / 50) % 2 == 0 {
+                        along
+                    } else {
+                        SIDE as i32 - along
+                    };
+                    pt(x, (i / 50) * 64 + 10)
+                })
+                .collect()
+        };
+        // Segments the grid walk hands the blend, summed over the pixels it visits.
+        let work = |path: &[Point]| -> u64 {
+            let stroke = Stroke {
+                path,
+                radius: 16.0,
+                softness: 0.3,
+            };
+            let mut total = 0;
+            SegmentGrid::new(&stroke, map).walk(|_, _, segments| total += segments.len() as u64);
+            total
+        };
+        let short = work(&serpentine(5));
+        let long = work(&serpentine(20));
+        assert!(short > 0, "the short stroke reaches no pixel");
+        // 4x the points cost about 4x the work if linear, about 16x if quadratic.
+        assert!(long < 8 * short, "250 points: {short}, 1000 points: {long}");
     }
 
     /// Frames of a `width`-wide plane, one sample a pixel, each a distinct

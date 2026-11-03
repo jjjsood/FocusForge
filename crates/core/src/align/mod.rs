@@ -34,6 +34,7 @@ pub use ecc::{
     CpuMomentSession, DivergenceReason, EccIteration, EccMode, EccParams, EccResult, EccStatus,
     solve_level, solve_level_traced,
 };
+pub(crate) use ecc_algorithm::ECC_BACKEND_MIN_REGION_PX;
 pub use ecc_algorithm::{EccLevelRecord, PyramidalEcc};
 pub use error::AlignError;
 pub use feature_seed::{

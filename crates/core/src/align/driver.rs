@@ -580,6 +580,10 @@ struct CountingBackend<'a> {
 }
 
 impl AlignBackend for CountingBackend<'_> {
+    fn min_ecc_region_px(&self) -> u64 {
+        self.inner.min_ecc_region_px()
+    }
+
     fn open_ecc(
         &self,
         request: &EccSessionRequest<'_>,
@@ -1247,7 +1251,7 @@ mod tests {
             budget: HostBudget::host_derived(&facts),
             ..Default::default()
         };
-        align_stack_with(
+        let run = align_stack_with(
             &ConstAlign,
             anchor_stack(),
             &NullReader,
@@ -1256,6 +1260,8 @@ mod tests {
             &options,
         )
         .expect("the budget covers the shared term and one registration");
+        assert_eq!(run.alignment.frames.len(), 4);
+        assert_eq!(run.alignment.failure_count(), 0);
     }
 
     #[test]
