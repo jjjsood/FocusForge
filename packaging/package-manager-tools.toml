@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Third-party tools the release workflow downloads for the package managers.
+# Every download is checked against the SHA-256 here before it runs.
+
+# Submits the winget manifests to microsoft/winget-pkgs (MIT).
+[wingetcreate]
+version = "1.12.13.0"
+url = "https://github.com/microsoft/winget-create/releases/download/v1.12.13.0/wingetcreate.exe"
+sha256 = "24042bd37915805615e6cf969ac57c6439124c3fe85823327f5f3fb24bd9ffea"
+
+# Writes cargo-sources.json, the offline crate sources of a Flatpak build (MIT).
+[flatpak_cargo_generator]
+commit = "9d86d336a39b9af38b86f114b6ce5820fe260f91"
+url = "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/9d86d336a39b9af38b86f114b6ce5820fe260f91/cargo/flatpak-cargo-generator.py"
+sha256 = "0a2db6be87d75910facef28ab46d4d6460802e8419ab850d0caa6a364d26b380"
+requirements = ["aiohttp==3.14.5", "PyYAML==6.0.3", "tomlkit==0.15.2"]

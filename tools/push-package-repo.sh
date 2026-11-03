@@ -3,7 +3,7 @@
 # Usage: tools/push-package-repo.sh REMOTE BRANCH FILES_DIR MESSAGE
 #
 # Copies every file below FILES_DIR into BRANCH of the git repository REMOTE
-# (the AUR package, the Homebrew tap) at the same relative path, commits and
+# (the AUR package) at the same relative path, commits and
 # pushes. Files of the repository that FILES_DIR does not name stay as they
 # are. An unchanged result pushes nothing, so re-running a release is safe. An
 # empty repository gets BRANCH as its first commit -- the first push to an AUR

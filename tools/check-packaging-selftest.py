@@ -499,9 +499,10 @@ def job_steps(job: str) -> list[str]:
     return re.split(r"^      - ", job[job.index("    steps:\n"):], flags=re.MULTILINE)[1:]
 
 
-# Package-manager check job -> its command; push job -> the check whose output it pushes.
-PACKAGE_MANAGER_JOBS = {"check-aur": "bash tools/check-package-aur.sh", "check-homebrew": "tools/check-package-homebrew.sh"}
-PACKAGE_MANAGER_PUSHES = {"aur": "check-aur", "homebrew": "check-homebrew"}
+# Package-manager check job -> its command; push job -> (the check whose output it pushes, its push command).
+PACKAGE_MANAGER_JOBS = {"check-aur": "bash tools/check-package-aur.sh", "check-winget": "python tools/check-package-winget.py"}
+PACKAGE_MANAGER_PUSHES = {"aur": ("check-aur", "tools/push-package-repo.sh"), "winget": ("check-winget", "python tools/push-winget.py")}
+PUSH_TOOLS = ("push-package-repo.sh", "push-winget.py")
 
 
 def package_managers_valid(jobs: dict[str, str]) -> bool:
@@ -513,14 +514,16 @@ def package_managers_valid(jobs: dict[str, str]) -> bool:
         checked = [step for step in job_steps(job) if f"run: {command} " in step]
         if len(checked) != 1 or "if:" in checked[0]: return False
     stable = "    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'"
-    for name, check in PACKAGE_MANAGER_PUSHES.items():
+    for name, (check, command) in PACKAGE_MANAGER_PUSHES.items():
         job = jobs[name]
         if not re.search(rf"^{re.escape(stable)}$", job, re.MULTILINE): return False
         if not re.search(rf"^    needs: \[meta, publish, {re.escape(check)}\]$", job, re.MULTILINE): return False
-        if not re.search(r"^    environment: package-managers$", job, re.MULTILINE) or "run: tools/push-package-repo.sh " not in job: return False
+        if not re.search(r"^    environment: package-managers$", job, re.MULTILINE) or f"run: {command} " not in job: return False
     others = "".join(job for name, job in jobs.items() if name not in PACKAGE_MANAGER_PUSHES)
     # Secrets and pushes stay in the two jobs a pull request never runs.
-    if "secrets." in others or "push-package-repo.sh" in others: return False
+    if "secrets." in others or any(tool in others for tool in PUSH_TOOLS): return False
+    linux = [step for step in job_steps(jobs["package-linux"]) if "run: python3 tools/flatpak-cargo-sources.py dist/cargo-sources.json" in step]
+    if len(linux) != 1 or "if:" in linux[0]: return False
     if not re.search(r"^          PACKAGE_REPO_SSH_FINGERPRINT: SHA256:[A-Za-z0-9+/]{43}$", jobs["aur"], re.MULTILINE): return False
     return True
 
@@ -587,11 +590,13 @@ def graph() -> None:
         "release created outside publish": release.replace("      - name: Assemble the release\n", "      - name: Assemble the release\n        run: gh release create x\n", 1),
         "recipes not rendered": release.replace("python3 tools/package-managers.py render", "python3 tools/package-managers.py", 1),
         "AUR check only on tags": release.replace("  check-aur:\n    needs: [meta, assemble]\n", "  check-aur:\n    needs: [meta, assemble]\n    if: github.ref_type == 'tag'\n", 1),
-        "cask check skipped": release.replace("      - name: Check the Homebrew cask\n", "      - name: Check the Homebrew cask\n        if: false\n", 1),
+        "winget check skipped": release.replace("      - name: Check the winget manifests\n", "      - name: Check the winget manifests\n        if: false\n", 1),
+        "no Flatpak crate sources": release.replace("        run: python3 tools/flatpak-cargo-sources.py dist/cargo-sources.json\n", "        run: echo skipped\n", 1),
         "AUR push on pull requests": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-aur]", "    needs: [meta, publish, check-aur]", 1),
-        "tap push on a prerelease": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-homebrew]", "    if: github.ref_type == 'tag'\n    needs: [meta, publish, check-homebrew]", 1),
+        "winget submit on a prerelease": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-winget]", "    if: github.ref_type == 'tag'\n    needs: [meta, publish, check-winget]", 1),
         "AUR push skips its check": release.replace("    needs: [meta, publish, check-aur]", "    needs: [meta, publish]", 1),
-        "tap push ahead of the release": release.replace("    needs: [meta, publish, check-homebrew]", "    needs: [meta, check-homebrew]", 1),
+        "winget submit ahead of the release": release.replace("    needs: [meta, publish, check-winget]", "    needs: [meta, check-winget]", 1),
+        "winget submit from a pull request job": release.replace("        run: python tools/check-package-winget.py", "        run: python tools/push-winget.py x 1 && python tools/check-package-winget.py", 1),
         "push outside its environment": release.replace("    environment: package-managers\n", "", 1),
         "push may write here": release.replace("    environment: package-managers\n    permissions:\n      contents: read", "    environment: package-managers\n    permissions:\n      contents: write", 1),
         "secret in a pull request job": release.replace("      - name: Check the AUR package\n", "      - name: Check the AUR package\n        env:\n          KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}\n", 1),

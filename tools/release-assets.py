@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Build, assemble and check the files a FocusForge release publishes.
 
-A release holds the installers, one command-line archive per platform and a
-single SHA256SUMS. Symbols and build receipts stay workflow artifacts.
+A release holds the installers, one command-line archive per platform,
+cargo-sources.json (the crate sources of a Flatpak build) and a single
+SHA256SUMS. Symbols and build receipts stay workflow artifacts.
 """
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ PLATFORMS = (
     ("linux", "Linux (x64)"),
 )
 SUMS = "SHA256SUMS"
+# Written by tools/flatpak-cargo-sources.py in the Linux package job.
+FLATPAK_SOURCES = "cargo-sources.json"
 
 
 def installers(version: str) -> dict[str, list[str]]:
@@ -45,7 +48,7 @@ def cli_archives(version: str) -> dict[str, str]:
 def payload(version: str) -> list[str]:
     """The files a release uploads, SHA256SUMS excluded."""
     names = [name for group in installers(version).values() for name in group]
-    return sorted(names + list(cli_archives(version).values()))
+    return sorted(names + list(cli_archives(version).values()) + [FLATPAK_SOURCES])
 
 
 def sha256(path: Path) -> str:
@@ -117,6 +120,7 @@ def notes(version: str, changelog: str, repo: str | None) -> str:
     return (
         f"## What's new\n\n{changelog_section(changelog, version)}\n\n"
         f"## Download\n\n{table}\n\n"
+        f"{link(FLATPAK_SOURCES)} lists the Rust crate sources of this version for an offline Flatpak build.\n\n"
         f"`{SUMS}` lists the SHA-256 of every file here: `sha256sum -c {SUMS} --ignore-missing`.\n"
     )
 

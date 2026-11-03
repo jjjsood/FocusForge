@@ -6,9 +6,9 @@
 # A pull request runs everything except the check-run gate and the publish jobs, so the
 # assemble step that decides the release contents is rehearsed before any tag exists.
 #
-# The package-manager recipes (the AUR package focusforge-bin, the Homebrew cask in
-# <owner>/homebrew-tap) are rendered from the same SHA256SUMS, built and installed on
-# Arch Linux and macOS on every run, and pushed only after a stable release is published.
+# The package-manager recipes (the AUR package focusforge-bin, the winget package
+# FocusForge.FocusForge) are rendered from the same SHA256SUMS and checked on Arch Linux
+# and Windows on every run, and submitted only after a stable release is published.
 name: Release
 
 on:
@@ -84,6 +84,8 @@ jobs:
           package=.scratch/package-linux
           python3 tools/release-assets.py cli-archive --binary "$package/target/release/focusforge-cli" --target x86_64-unknown-linux-gnu --out dist
           cp "$package/FocusForge-$VERSION-x86_64.AppImage" "$package/focusforge_${VERSION}_amd64.deb" dist/
+      - name: Write the Flatpak crate sources
+        run: python3 tools/flatpak-cargo-sources.py dist/cargo-sources.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: files-linux
@@ -349,15 +351,19 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
-  # Installs the cask from the release disk image through a local tap and uninstalls it again.
-  check-homebrew:
+  # Checks the winget manifests against the MSI this run built and runs winget validate on them.
+  check-winget:
     needs: [meta, assemble]
-    runs-on: macos-14
-    timeout-minutes: 20
+    # The 2025 image ships winget; the 2022 image does not.
+    runs-on: windows-2025
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -373,8 +379,8 @@ jobs:
         with:
           name: release-assets
           path: release-assets
-      - name: Check the Homebrew cask
-        run: tools/check-package-homebrew.sh package-managers/homebrew/Casks/focusforge.rb "release-assets/files/FocusForge-$VERSION-aarch64.dmg" "$VERSION"
+      - name: Check the winget manifests
+        run: python tools/check-package-winget.py package-managers/winget "release-assets/files/FocusForge-$env:VERSION-x86_64.msi" "$env:VERSION"
 
   publish:
     if: github.ref_type == 'tag'
@@ -425,27 +431,32 @@ jobs:
           PACKAGE_REPO_SSH_FINGERPRINT: SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
         run: tools/push-package-repo.sh ssh://aur@aur.archlinux.org/focusforge-bin.git master aur-package "Update to $VERSION"
 
-  # A stable release only: the cask that check-homebrew installed, into <owner>/homebrew-tap.
-  homebrew:
+  # A stable release only: the manifests that check-winget validated, as a pull request to microsoft/winget-pkgs.
+  winget:
     if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'
-    needs: [meta, publish, check-homebrew]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    needs: [meta, publish, check-winget]
+    runs-on: windows-2025
+    timeout-minutes: 15
     environment: package-managers
     permissions:
       contents: read
     env:
       VERSION: ${{ needs.meta.outputs.version }}
-      TAP: ${{ github.repository_owner }}/homebrew-tap
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: package-managers
           path: package-managers
-      - name: Push to the Homebrew tap
+      - name: Submit to winget
         env:
-          PACKAGE_REPO_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: tools/push-package-repo.sh "https://github.com/$TAP.git" main package-managers/homebrew "focusforge $VERSION"
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: python tools/push-winget.py package-managers/winget "$env:VERSION"

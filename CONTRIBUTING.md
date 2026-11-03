@@ -229,7 +229,8 @@ A human starts a release by pushing a version tag such as `v0.1.0`;
 `.github/workflows/release.yml` builds the Linux, macOS and Windows packages and
 creates the release only after its same-commit checks pass. The release holds
 the installers (AppImage, `.deb`, DMG, MSI), one command-line archive per
-platform and a single `SHA256SUMS`; the release text puts the changelog entries
+platform, the Flatpak crate sources `cargo-sources.json` and a single
+`SHA256SUMS`; the release text puts the changelog entries
 above a download table. `tools/release-assets.py` decides that file list and fails on
 any extra or missing file. Before creating or pushing a tag, run the documented
 Linux package recipe and inspect its two artifacts locally.
@@ -258,22 +259,33 @@ at 240 minutes.
 
 ### Package managers
 
-The release also feeds two package repositories outside this one: the AUR
-package `focusforge-bin`, which repackages the release `.deb`, and the cask
-`focusforge` in `<owner>/homebrew-tap`, which installs the release DMG.
-`tools/package-managers.py render` writes both recipes from the release's
-`SHA256SUMS` in the assemble job. On every run, pull requests included,
-`check-aur` builds, installs and removes the package with `makepkg` and
-`pacman` in a current Arch Linux container, and `check-homebrew` installs the
-cask from the DMG through a local tap and uninstalls it with `--zap`. Neither
-check downloads the release, so a pull request checks exactly what a tag would
-push. After a stable release (not a `-rc` candidate) is published, the `aur` and
-`homebrew` jobs push the checked files with `tools/push-package-repo.sh`. An
-unchanged recipe pushes nothing, so re-running a release is safe.
+Each release also feeds two package repositories outside this one: the AUR
+package `focusforge-bin`, which repackages the release `.deb`, and the winget
+package `FocusForge.FocusForge`, which installs the release MSI.
+`tools/package-managers.py render` writes both from the release's `SHA256SUMS`
+in the assemble job. On every run, pull requests included, `check-aur` builds,
+installs and removes the package with `makepkg` and `pacman` in a current Arch
+Linux container, and `check-winget` compares the manifests with the MSI the run
+built and runs `winget validate` on them. Neither check downloads the release,
+so a pull request checks exactly what a tag would submit. After a stable release
+(not a `-rc` candidate) is published, the `aur` job pushes the checked
+`PKGBUILD` and `.SRCINFO` with `tools/push-package-repo.sh`, and the `winget` job
+opens a pull request on `microsoft/winget-pkgs` with the pinned wingetcreate
+through `tools/push-winget.py`. An unchanged AUR recipe pushes nothing. A
+winget version that winget-pkgs already holds is not submitted again, but a
+pull request that is still open from an earlier run is not detected.
 
-To change a recipe, edit `tools/package-managers.py`, never the pushed files:
-the next release overwrites them. A new library that the binaries link or
-`dlopen` makes `check-aur` fail until its Arch package is in `AUR_DEPENDS`.
+Flathub, Homebrew and Scoop take new versions from their own bots, so nothing
+here pushes to them. For Flathub, the release carries `cargo-sources.json`.
+`tools/flatpak-cargo-sources.py` writes it in the Linux package job with the
+`flatpak-cargo-generator` pinned in `packaging/package-manager-tools.toml`, and
+checks that it covers every crates.io and git package of `Cargo.lock`. When
+Flathub's bot proposes a new version, put that release's `cargo-sources.json`
+into the same pull request.
+
+To change a recipe, edit `tools/package-managers.py`, never the submitted
+files: the next release overwrites them. A new library that the binaries link
+or `dlopen` makes `check-aur` fail until its Arch package is in `AUR_DEPENDS`.
 
 One-time setup, before the first stable tag that should reach them:
 
@@ -283,19 +295,20 @@ One-time setup, before the first stable tag that should reach them:
    needs no reservation. The job checks the host's Ed25519 key against the
    fingerprint pinned in `release.yml`, which is the one the AUR home page
    publishes.
-2. **Homebrew tap.** Create the public repository `<owner>/homebrew-tap` with
-   a `main` branch, for example with a README. Create a fine-grained personal
-   access token with *Contents: read and write* on that repository only, and
-   store it as `HOMEBREW_TAP_TOKEN`. Users then install with
-   `brew install <owner>/tap/focusforge`.
+2. **winget.** Create a classic personal access token with the `public_repo`
+   scope and store it as `WINGET_TOKEN`. A fine-grained token cannot open a
+   pull request on a repository it does not own. wingetcreate forks
+   `microsoft/winget-pkgs` into the token owner's account. The first pull
+   request adds the package, and winget-pkgs' reviewers check it before
+   merging.
 3. **Environment.** Create the environment `package-managers` under
    *Settings → Environments*. Put both secrets there, not in the repository
    secrets, and allow only tags matching `v*` to deploy to it. That way no
    branch or pull request run can read them.
 
-Until a secret is set, its push job fails with a message that names the
-missing secret. The GitHub Release itself is published before either push
-runs and is unaffected.
+Until a secret is set, its job fails with a message that names the missing
+secret. The GitHub Release itself is published before either job runs and is
+unaffected.
 
 ### Release smoke checklist
 
