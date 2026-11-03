@@ -69,7 +69,7 @@ the output instead: `focusforge-gui --help | Out-File help.txt`, or
 
 ## Manuals and completions
 
-Every package contains 16 manual pages, including `focusforge-cli-stack(1)`,
+Every package contains 17 manual pages, including `focusforge-cli-stack(1)`,
 and completion scripts for Bash, Zsh, Fish and PowerShell. On Linux their
 paths are:
 

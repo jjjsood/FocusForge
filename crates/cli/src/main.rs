@@ -59,6 +59,7 @@ mod progress;
 mod retouch;
 mod review;
 mod set;
+mod sharp_areas;
 mod signals;
 mod stack;
 mod status;
@@ -159,11 +160,27 @@ enum Command {
     /// Depth of field is DOF = 0.55 µm / NA². A lens has NA = 1 / (2 · N · (1 + m))
     /// from its marked f-number N and the magnification m; an objective states its
     /// NA. The step is DOF · (1 − overlap).
-    #[command(after_help = step_plan::parameter_help(&focusforge_core::step_plan::PLAN_PARAMS))]
+    #[command(after_help = set::parameter_help(&focusforge_core::step_plan::PLAN_PARAMS))]
     StepPlan {
         #[command(flatten)]
         set: set::SetArgs,
         /// Print the plan as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count the areas of the image that are sharpest in each frame of a stack.
+    ///
+    /// The image is divided into square cells. A cell is counted in the frame where
+    /// its mean focus score peaks, when that peak exceeds the contrast times the cell's
+    /// lowest score over the stack; a cell without that contrast is counted in no frame.
+    /// Frames are counted as read, without alignment.
+    #[command(after_help = set::parameter_help(&focusforge_core::sharp_areas::SHARP_AREA_PARAMS))]
+    SharpAreas {
+        /// Directory of frames to count (non-recursive, descending into a `frames` subdirectory).
+        dir: PathBuf,
+        #[command(flatten)]
+        set: set::SetArgs,
+        /// Print the counts as one JSON object.
         #[arg(long)]
         json: bool,
     },
@@ -473,6 +490,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Info { .. } => "info",
         Command::Algorithms { .. } => "algorithms",
         Command::StepPlan { .. } => "step-plan",
+        Command::SharpAreas { .. } => "sharp-areas",
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
         Command::Retouch { .. } => "retouch",
@@ -486,7 +504,10 @@ fn command_name(command: &Command) -> &'static str {
 
 const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
     ("Processing", &["stack", "align", "retouch", "export"]),
-    ("Inspection", &["info", "review", "algorithms", "step-plan"]),
+    (
+        "Inspection",
+        &["info", "review", "algorithms", "step-plan", "sharp-areas"],
+    ),
     ("Maintenance", &["history", "cache", "diagnostics"]),
 ];
 
@@ -568,6 +589,7 @@ fn main() -> ExitCode {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
         Command::StepPlan { set, json } => step_plan::run(&set, json),
+        Command::SharpAreas { dir, set, json } => sharp_areas::run(&dir, &set, json),
         Command::Stack {
             dir,
             output,
@@ -2287,7 +2309,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            16
+            17
         );
         let manuals = first
             .keys()
@@ -2301,6 +2323,7 @@ mod tests {
                 std::path::Path::new("man/focusforge-cli-info.1"),
                 std::path::Path::new("man/focusforge-cli-algorithms.1"),
                 std::path::Path::new("man/focusforge-cli-step-plan.1"),
+                std::path::Path::new("man/focusforge-cli-sharp-areas.1"),
                 std::path::Path::new("man/focusforge-cli-stack.1"),
                 std::path::Path::new("man/focusforge-cli-export.1"),
                 std::path::Path::new("man/focusforge-cli-retouch.1"),
@@ -2399,7 +2422,7 @@ mod tests {
             .keys()
             .filter(|path| path.starts_with("man"))
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 17);
+        assert_eq!(manuals.len(), 18);
         assert!(assets.contains_key(std::path::Path::new("man/focusforge-cli-visible-test.1")));
         assert!(!assets.contains_key(std::path::Path::new("man/focusforge-cli-hidden-test.1")));
         assert!(manuals.iter().all(|path| {
@@ -2446,7 +2469,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            16
+            17
         );
         assert!(first.contains_key(std::path::Path::new("completions/_focusforge-cli.ps1")));
         #[cfg(not(feature = "gpu"))]
