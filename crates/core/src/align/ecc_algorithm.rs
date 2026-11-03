@@ -1181,10 +1181,10 @@ fn luma_window<S: Sample>(
 }
 
 /// Solves one pyramid level. A template region of at least
-/// [`min_ecc_region_px`](crate::gpu::AlignBackend::min_ecc_region_px) pixels is offered to the context's align
-/// backend; a level with no backend, a declined one or a smaller region runs on
-/// the CPU. The off-centre patch checks call [`solve_prepared`] directly and
-/// are never offered.
+/// [`min_ecc_region_px`](crate::gpu::AlignBackend::min_ecc_region_px) pixels
+/// is offered to the context's align backend; a level with no backend, a
+/// declined one or a smaller region runs on the CPU. The off-centre patch
+/// checks call [`solve_prepared`] directly and are never offered.
 fn solve_routed(
     ctx: &AlignContext<'_>,
     template: &EccTemplate,
