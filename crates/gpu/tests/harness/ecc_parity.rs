@@ -19,6 +19,8 @@ use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
 
+use crate::common::{texture, worst_ecc_sample_delta};
+
 /// One level's solve inputs, owned: a template and Jacobian over the region
 /// and a moving window whose top-left pixel is `origin`.
 struct Level {
@@ -30,15 +32,6 @@ struct Level {
     window: (u32, u32),
     origin: (u32, u32),
     shift: f64,
-}
-
-/// A smooth scene on the 16-bit scale: gradients of a few thousand levels per
-/// pixel at most, so a sub-hundredth-pixel position error stays well under a
-/// level.
-fn texture(x: f64, y: f64, phase: f64) -> f32 {
-    (30_000.0
-        + 12_000.0 * (0.093 * x + 0.071 * y + phase).sin()
-        + 8_000.0 * (0.047 * x - 0.113 * y + 2.0 * phase).cos()) as f32
 }
 
 const ORIGIN: (u32, u32) = (10, 7);
@@ -154,15 +147,7 @@ fn ecc_samples_match_cpu_within_one_lsb() {
             let got = backend
                 .ecc_sample_values(&request, &warp)
                 .expect("gpu samples");
-            assert_eq!(got.len(), expected.len());
-            let mut worst = 0.0f32;
-            for (i, (g, c)) in got.iter().zip(&expected).enumerate() {
-                match (g, c) {
-                    (Some(g), Some(c)) => worst = worst.max((g - c).abs()),
-                    (None, None) => {}
-                    _ => panic!("sample {i}: gpu {g:?} against cpu {c:?}"),
-                }
-            }
+            let worst = worst_ecc_sample_delta(&got, &expected);
             println!("ecc sample parity: worst |delta| {worst} levels");
             assert!(worst <= 1.0, "worst sample delta {worst} levels");
         }

@@ -36,7 +36,9 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 # The GPU parity suite: one test at a time (they share one device), a SLOW
 # line every minute so a long test is told apart from a hung one, and a
 # per-test kill so a hang ends as a named TIMEOUT instead of a silent wait.
-# The forced one-tile and probed budget stacks alone run well over an hour.
+# The longest test, the whole-pipeline stack parity (CPU and GPU pipelines
+# over two label plans, then the near-tie proof), takes about 5 minutes, so
+# the 20-minute kill leaves it a fourfold margin.
 [profile.gpu]
 test-threads = 1
 fail-fast = false
@@ -44,10 +46,6 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 
 [profile.gpu.junit]
 path = "junit.xml"
-
-[[profile.gpu.overrides]]
-filter = 'binary(harness) & test(/_budget$/)'
-slow-timeout = { period = "60s", terminate-after = 120 }
 
 # The fast workspace run `tools/check-all.sh --quick` uses: everything except
 # the binaries that measure memory peaks, the hit cap and the reference cache

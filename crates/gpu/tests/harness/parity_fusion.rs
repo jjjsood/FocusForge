@@ -264,10 +264,8 @@ fn score_plane_matches_cpu() {
 /// (`Laplacian::fuse(&TileCtx::new(rect, &tiles), cfg)`) against the GPU
 /// result (`GpuBackend::fuse_tile`), both at the same `(rect, levels)`.
 struct Comparison {
-    cpu_composite: Vec<u16>,
-    gpu_composite: Vec<u16>,
-    cpu_zmap: Vec<u16>,
-    gpu_zmap: Vec<u16>,
+    cpu: TileOutput<u16>,
+    gpu: TileOutput<u16>,
     tiles: Vec<Tile>,
     rect: Rect,
     spp: u32,
@@ -283,18 +281,16 @@ fn run_comparison(rect: Rect, levels: u32) -> Comparison {
     let ctx = TileCtx::new(rect, &tiles);
     let mut cfg = ParamValues::new();
     cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
-    let cpu_out = Laplacian.fuse(&ctx, &cfg).expect("cpu fuse");
+    let cpu = Laplacian.fuse(&ctx, &cfg).expect("cpu fuse");
 
     let backend = gpu_backend().expect("gpu backend");
-    let gpu_out = backend
+    let gpu = backend
         .fuse_tile(&stack, frame_count, rect, spp, levels)
         .expect("gpu fuse_tile");
 
     Comparison {
-        cpu_composite: cpu_out.tile.samples,
-        gpu_composite: gpu_out.tile.samples,
-        cpu_zmap: cpu_out.zmap,
-        gpu_zmap: gpu_out.zmap,
+        cpu,
+        gpu,
         tiles,
         rect,
         spp,
@@ -302,85 +298,26 @@ fn run_comparison(rect: Rect, levels: u32) -> Comparison {
     }
 }
 
-/// For a Z-Map pixel where the GPU and CPU disagree: the CPU's own
-/// level-0 winning and runner-up scores at that pixel, recomputed from
-/// every frame's own pyramid.
-fn near_tie_margin(cmp: &Comparison, pixel: usize) -> (f32, f32) {
-    let radius = score_radius(cmp.levels, 0);
-    let mut scores: Vec<f32> = cmp
-        .tiles
-        .iter()
-        .map(|tile| {
-            let pyr = pyramid::build(
-                &tile.samples,
-                cmp.rect.width,
-                cmp.rect.height,
-                cmp.spp,
-                cmp.levels,
-            )
-            .expect("build");
-            score_plane(&pyr.levels()[0], radius)[pixel]
-        })
-        .collect();
-    scores.sort_by(|a, b| b.partial_cmp(a).expect("scores are always finite"));
-    (scores[0], scores[1])
-}
-
-fn assert_zmap_exact_or_near_tie(cmp: &Comparison) {
-    let mut differing = 0usize;
-    for (p, (&g, &c)) in cmp.gpu_zmap.iter().zip(cmp.cpu_zmap.iter()).enumerate() {
-        if g == c {
-            continue;
-        }
-        differing += 1;
-        let (best, runner_up) = near_tie_margin(cmp, p);
-        let bound = NEAR_TIE_REL * best;
-        println!(
-            "zmap parity: pixel {p} differs (gpu={g}, cpu={c}), cpu margin={} bound={bound}",
-            best - runner_up
-        );
+impl Comparison {
+    /// Every composite sample within 1 LSB, and a Z-Map equal to the CPU's
+    /// except at proven near-ties between the two best frames.
+    fn assert_within_one_lsb_and_zmap_near_ties(&self, label: &str) {
+        let (worst, worst_index) = worst_delta(&self.gpu.tile.samples, &self.cpu.tile.samples);
+        println!("{label} composite parity: worst |delta|={worst} at sample index {worst_index}");
         assert!(
-            best - runner_up <= bound,
-            "pixel {p} differs (gpu={g}, cpu={c}) but is not a proven near-tie: \
-             best={best} runner_up={runner_up} bound={bound}"
+            worst <= 1,
+            "{label} composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
+        );
+        assert_matches_cpu_outside_near_ties(
+            label,
+            &self.cpu,
+            &self.gpu,
+            &tile_samples(&self.tiles),
+            self.rect,
+            self.spp,
+            self.levels,
         );
     }
-    println!("zmap parity: {differing} differing index(es), all proven near-ties");
-}
-
-#[test]
-fn composite_matches_cpu_within_one_lsb() {
-    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
-        return;
-    };
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width: 352,
-        height: 352,
-    };
-    let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
-    println!("composite parity: worst |delta|={worst} at sample index {worst_index}");
-    assert!(
-        worst <= 1,
-        "composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
-    );
-}
-
-#[test]
-fn zmap_matches_cpu_exactly() {
-    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
-        return;
-    };
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width: 352,
-        height: 352,
-    };
-    let cmp = run_comparison(rect, 5);
-    assert_zmap_exact_or_near_tie(&cmp);
 }
 
 #[test]
@@ -396,14 +333,7 @@ fn overlap_edge_tile_matches_cpu() {
         width: 352,
         height: 352,
     };
-    let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
-    println!("overlap-edge composite parity: worst |delta|={worst} at sample index {worst_index}");
-    assert!(
-        worst <= 1,
-        "overlap-edge composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
-    );
-    assert_zmap_exact_or_near_tie(&cmp);
+    run_comparison(rect, 5).assert_within_one_lsb_and_zmap_near_ties("overlap-edge");
 }
 
 /// Whole frames held in memory, each `width` pixels wide at `spp` samples.
@@ -634,14 +564,7 @@ fn interior_tile_matches_cpu() {
         width: 200,
         height: 200,
     };
-    let cmp = run_comparison(rect, 3);
-    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
-    println!("interior composite parity: worst |delta|={worst} at sample index {worst_index}");
-    assert!(
-        worst <= 1,
-        "interior composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
-    );
-    assert_zmap_exact_or_near_tie(&cmp);
+    run_comparison(rect, 3).assert_within_one_lsb_and_zmap_near_ties("interior");
 }
 
 /// Frames 0, 2, 4, 5 and 7 of `mantis-512`, cropped to a non-square

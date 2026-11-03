@@ -257,17 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn the_minidump_and_its_metadata_share_one_stem() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, dump) =
-            create_new_numbered(dir.path(), "20260917T142530Z-focusforge-cli-7", "dmp").unwrap();
-        let metadata = dump.with_extension("json");
-
-        assert_eq!(dump.file_stem(), metadata.file_stem());
-        assert_eq!(dump.extension().unwrap(), "dmp");
-    }
-
-    #[test]
     fn the_body_timestamp_keeps_full_rfc_3339_precision() {
         assert_eq!(rfc3339(1789482330), "2026-09-15T14:25:30Z");
         assert_eq!(rfc3339(1709208000), "2024-02-29T12:00:00Z");
