@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
-use rawler::imgop::develop::{Intermediate, RawDevelop};
+use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
+use rawler::imgop::xyz::Illuminant;
+use rawler::rawimage::RawImage;
 use rawler::rawsource::RawSource;
 
-use super::frame_cache::{CacheFault, DecodedFrame, FrameCache, TileFault};
+use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
 use super::{FrameDesc, FrameReader, RawIdentity};
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::tile::Rect;
+use crate::equalize::UNIT_GAIN;
+use crate::tile::{Rect, Sample, SampleFormat};
+
+mod look;
+pub use look::LookTransform;
 
 /// Default bound for one developed RAW frame and its decode reservation.
 pub const DEFAULT_RAW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 // rawler's peak holds an original u16 mosaic (2 B/pixel), a scaled clone
-// (4 B/pixel), an f32 RGB intermediate (12 B/pixel), and the new f32 RGB
-// output while it is copied to retained u16 RGB (12 B/pixel).
+// (4 B/pixel), the demosaiced f32 RGB (12 B/pixel) and its default-cropped
+// copy (12 B/pixel). The cropped pixels are then moved, not copied, into the
+// retained frame.
 const DECODE_PEAK_BYTES_PER_PIXEL: u64 = 30;
 
 /// Decoder facts available before pixels are developed.
@@ -194,11 +202,33 @@ struct RawFrame {
     desc: FrameDesc,
 }
 
+#[derive(Debug)]
+struct LinearFrame {
+    width: u32,
+    height: u32,
+    /// Camera-linear RGB: black and white levels applied, no white balance,
+    /// colour matrix, curve or clip.
+    samples: Vec<[f32; 3]>,
+    /// Each channel's mean over the frame.
+    means: [f64; 3],
+    /// Grey replicated to three channels, so no colour transform applies.
+    monochrome: bool,
+}
+
+impl CachedFrame for LinearFrame {
+    fn retained_bytes(&self) -> Option<u64> {
+        u64::try_from(self.samples.len())
+            .ok()?
+            .checked_mul(std::mem::size_of::<[f32; 3]>() as u64)
+    }
+}
+
 /// A RAW frame set whose metadata is available before pixel development.
 #[derive(Debug)]
 pub struct RawStack {
     frames: Vec<RawFrame>,
-    cache: FrameCache,
+    cache: FrameCache<LinearFrame>,
+    look: OnceLock<LookTransform>,
 }
 
 impl RawStack {
@@ -268,6 +298,7 @@ impl RawStack {
         Ok(Self {
             frames,
             cache: FrameCache::new(cache_bytes),
+            look: OnceLock::new(),
         })
     }
 
@@ -286,6 +317,55 @@ impl RawStack {
     pub fn frame(&self, index: usize) -> Option<&FrameDesc> {
         self.frames.get(index).map(|frame| &frame.desc)
     }
+
+    /// The look transform of frame 0, shared by every frame of the set.
+    fn look(&self) -> Result<&LookTransform, RawError> {
+        if let Some(look) = self.look.get() {
+            return Ok(look);
+        }
+        let look = reference_look(&self.frames[0].metadata.path)?;
+        Ok(self.look.get_or_init(|| look))
+    }
+
+    /// Frame `index`, developed once and cached; developments are serialised.
+    fn decoded(&self, index: usize) -> Result<Arc<LinearFrame>, RawError> {
+        let frame = self.frames.get(index).ok_or(RawError::FrameIndex {
+            index,
+            count: self.frames.len(),
+        })?;
+        let path = &frame.metadata.path;
+        let required = reservation_bytes(frame)?;
+        self.cache
+            .get_or_decode(index, required, || {
+                // The decoder runs its own rayon loops. On a pool worker,
+                // waiting for them could pick up another reader's job, which
+                // blocks on the decode lock this call holds; a plain thread
+                // waits on the global pool without taking any work.
+                let developed = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| develop(path))
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })?;
+                if (developed.width, developed.height) != (frame.desc.width, frame.desc.height) {
+                    return Err(RawError::GeometryChanged {
+                        path: path.clone(),
+                        metadata: (frame.desc.width, frame.desc.height),
+                        developed: (developed.width, developed.height),
+                    });
+                }
+                Ok(developed)
+            })
+            .map_err(|fault| match fault {
+                CacheFault::Decode(error) => error,
+                CacheFault::TooSmall { bound, required } => RawError::CacheTooSmall {
+                    path: path.clone(),
+                    bound,
+                    required,
+                },
+                CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
+            })
+    }
 }
 
 impl FrameReader for RawStack {
@@ -302,45 +382,20 @@ impl FrameReader for RawStack {
     }
 }
 
-impl TileReader for RawStack {
-    fn read_tile_into(
+impl RawStack {
+    /// Reads `rect` of `frame` with the Q16 `gain` applied to the camera-linear
+    /// values, through the look, on the 16-bit scale (1.0 look white is
+    /// 65535). `S::narrow` is the only clip.
+    fn read_gained<S: Sample>(
         &self,
         frame: usize,
         rect: Rect,
-        out: &mut [u16],
+        gain: u32,
+        out: &mut [S],
     ) -> Result<(), AlgorithmError> {
-        let entry = self.frames.get(frame).ok_or(RawError::FrameIndex {
-            index: frame,
-            count: self.frames.len(),
-        });
-        let entry = entry.map_err(crate::io::FrameError::from)?;
-        let path = &entry.metadata.path;
-        let required = reservation_bytes(entry).map_err(crate::io::FrameError::from)?;
-        let decoded = self
-            .cache
-            .get_or_decode(frame, required, || {
-                let decoded = develop(path)?;
-                if (decoded.width, decoded.height) != (entry.desc.width, entry.desc.height) {
-                    return Err(RawError::GeometryChanged {
-                        path: path.clone(),
-                        metadata: (entry.desc.width, entry.desc.height),
-                        developed: (decoded.width, decoded.height),
-                    });
-                }
-                Ok(decoded)
-            })
-            .map_err(|fault| match fault {
-                CacheFault::Decode(error) => error,
-                CacheFault::TooSmall { bound, required } => RawError::CacheTooSmall {
-                    path: path.clone(),
-                    bound,
-                    required,
-                },
-                CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
-            })
-            .map_err(crate::io::FrameError::from)?;
-        decoded
-            .copy_tile(rect, out)
+        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
+        let path = &self.frames[frame].metadata.path;
+        check_tile(rect, (decoded.width, decoded.height), 3, out.len())
             .map_err(|fault| match fault {
                 TileFault::OutOfBounds { requested, frame } => RawError::OutOfBounds {
                     path: path.clone(),
@@ -354,9 +409,84 @@ impl TileReader for RawStack {
                 },
             })
             .map_err(crate::io::FrameError::from)?;
+        let grey_look;
+        let look = if decoded.monochrome {
+            grey_look = LookTransform::new([f32::NAN; 4], IDENTITY_MATRIX);
+            &grey_look
+        } else {
+            self.look().map_err(crate::io::FrameError::from)?
+        };
+        let scale = gain as f32 / UNIT_GAIN as f32;
+        let stride = decoded.width as usize;
+        let row_len = rect.width as usize * 3;
+        for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
+            let source = source_y as usize * stride + rect.x as usize;
+            let pixels = &decoded.samples[source..source + rect.width as usize];
+            let destination = &mut out[row * row_len..(row + 1) * row_len];
+            for (pixel, target) in pixels.iter().zip(destination.chunks_exact_mut(3)) {
+                let looked = look.forward_f32(pixel.map(|value| value * scale));
+                for (sample, value) in target.iter_mut().zip(looked) {
+                    *sample = S::narrow(value * WHITE);
+                }
+            }
+        }
         Ok(())
     }
 }
+
+/// The 16-bit-scale value of look white.
+const WHITE: f32 = 65_535.0;
+
+impl TileReader for RawStack {
+    fn sample_format(&self) -> SampleFormat {
+        SampleFormat::F32
+    }
+
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, UNIT_GAIN, out)
+    }
+
+    fn read_tile_gained_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, gain, out)
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, UNIT_GAIN, out)
+    }
+
+    fn read_tile_gained_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.read_gained(frame, rect, gain, out)
+    }
+
+    fn linear_means(&self, frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
+        let decoded = self.decoded(frame).map_err(crate::io::FrameError::from)?;
+        Ok(Some(decoded.means))
+    }
+}
+
+const IDENTITY_MATRIX: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
     u64::from(frame.metadata.raw_width)
@@ -368,7 +498,9 @@ fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
         })
 }
 
-fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
+/// Camera-linear RGB of the file: black and white levels, demosaic and the
+/// sensor's default crop, nothing else.
+fn develop(path: &Path) -> Result<LinearFrame, RawError> {
     let source = RawSource::new(path).map_err(|source| RawError::Io {
         path: path.to_path_buf(),
         source,
@@ -377,39 +509,236 @@ fn develop(path: &Path) -> Result<DecodedFrame, RawError> {
     let image = seam(path, || {
         decoder.raw_image(&source, &RawDecodeParams::default(), false)
     })?;
-    let intermediate = seam(path, || RawDevelop::default().develop_intermediate(&image))?;
-    match intermediate {
-        Intermediate::ThreeColor(pixels) => Ok(DecodedFrame {
-            width: pixels.width as u32,
-            height: pixels.height as u32,
-            samples_per_pixel: 3,
-            samples: pixels
-                .into_flatten()
-                .into_iter()
-                .map(float_to_u16)
-                .collect(),
-        }),
-        Intermediate::Monochrome(pixels) => Ok(DecodedFrame {
-            width: pixels.width as u32,
-            height: pixels.height as u32,
-            samples_per_pixel: 3,
-            samples: pixels
-                .data
-                .into_iter()
-                .flat_map(|sample| [float_to_u16(sample); 3])
-                .collect(),
-        }),
-        Intermediate::FourColor(_) => Err(RawError::Unsupported {
-            path: path.to_path_buf(),
-            make: String::new(),
-            model: String::new(),
-            detail: "development did not produce RGB".to_string(),
-        }),
-    }
+    let steps = [
+        ProcessingStep::Rescale,
+        ProcessingStep::Demosaic,
+        ProcessingStep::FujiRotate,
+        ProcessingStep::CropActiveArea,
+        ProcessingStep::CropDefault,
+    ];
+    let intermediate = seam(path, || {
+        RawDevelop::new_with(&steps).develop_intermediate(&image)
+    })?;
+    let (width, height, samples, monochrome) = match intermediate {
+        Intermediate::ThreeColor(pixels) => (pixels.width, pixels.height, pixels.data, false),
+        Intermediate::Monochrome(pixels) => (
+            pixels.width,
+            pixels.height,
+            pixels.data.into_iter().map(|value| [value; 3]).collect(),
+            true,
+        ),
+        Intermediate::FourColor(_) => {
+            return Err(RawError::Unsupported {
+                path: path.to_path_buf(),
+                make: String::new(),
+                model: String::new(),
+                detail: "development did not produce RGB".to_string(),
+            });
+        }
+    };
+    let means = channel_means(&samples);
+    Ok(LinearFrame {
+        width: width as u32,
+        height: height as u32,
+        samples,
+        means,
+        monochrome,
+    })
 }
 
-fn float_to_u16(sample: f32) -> u16 {
-    (sample.clamp(0.0, 1.0) * f32::from(u16::MAX) + 0.5) as u16
+fn channel_means(samples: &[[f32; 3]]) -> [f64; 3] {
+    let mut sums = [0.0_f64; 3];
+    for pixel in samples {
+        for (sum, value) in sums.iter_mut().zip(pixel) {
+            *sum += f64::from(*value);
+        }
+    }
+    sums.map(|sum| sum / samples.len().max(1) as f64)
+}
+
+/// The header-only [`RawImage`] of the file at `path`: camera facts and
+/// colour data, no pixels.
+fn reference_image(path: &Path) -> Result<RawImage, RawError> {
+    let source = RawSource::new(path).map_err(|source| RawError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let decoder = seam(path, || rawler::get_decoder(&source))?;
+    seam(path, || {
+        decoder.raw_image(&source, &RawDecodeParams::default(), true)
+    })
+}
+
+/// The look transform of the camera that took the file at `path`, from its
+/// metadata alone.
+fn reference_look(path: &Path) -> Result<LookTransform, RawError> {
+    Ok(LookTransform::from_image(&reference_image(path)?))
+}
+
+/// One of a camera's XYZ-to-camera matrices with the DNG light-source code of
+/// the illuminant it was measured under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DngMatrix {
+    /// DNG `CalibrationIlluminant` code.
+    pub illuminant: u16,
+    /// Row-major XYZ-to-camera matrix.
+    pub xyz_to_camera: [f32; 9],
+    /// Row-major `CameraCalibration` of the slot this matrix came from, when
+    /// the file has one.
+    pub calibration: Option<[f32; 9]>,
+}
+
+/// What a DNG needs to describe the camera space of a RAW stack's document:
+/// the look transform whose inverse leads back to it, and the colour tags of
+/// the first frame, the frame the look was taken from.
+#[derive(Debug, Clone)]
+pub struct DngColour {
+    /// Camera-linear to look-space transform of the first frame.
+    pub look: LookTransform,
+    /// Camera make, cleaned to a short consistent name.
+    pub make: String,
+    /// Camera model, cleaned to a short consistent name.
+    pub model: String,
+    /// `make` and `model` joined: the DNG's unique camera model.
+    pub unique_model: String,
+    /// TIFF Orientation of the frame, `None` when the file carries none.
+    pub orientation: Option<u16>,
+    /// The camera's matrices with a known colour temperature, at most two,
+    /// the lower colour temperature first.
+    pub matrices: Vec<DngMatrix>,
+    /// As-shot neutral: the reciprocal of the white-balance multipliers,
+    /// normalised to green = 1.
+    pub as_shot_neutral: [f64; 3],
+    /// `AnalogBalance` of the first frame, when the file has one.
+    pub analog_balance: Option<[f64; 3]>,
+}
+
+/// Correlated colour temperature in kelvin of the illuminants a camera
+/// matrix is commonly measured under.
+fn colour_temperature(illuminant: Illuminant) -> Option<u32> {
+    Some(match illuminant {
+        Illuminant::A => 2856,
+        Illuminant::Tungsten => 2850,
+        Illuminant::B => 4874,
+        Illuminant::D50 => 5003,
+        Illuminant::Daylight => 5500,
+        Illuminant::D55 => 5503,
+        Illuminant::D65 => 6504,
+        Illuminant::C => 6774,
+        Illuminant::D75 => 7504,
+        _ => return None,
+    })
+}
+
+/// A DNG's `CameraCalibration` matrices keyed by the `CalibrationIlluminant`
+/// code of their slot, and its `AnalogBalance`. Empty for other formats.
+#[derive(Default)]
+struct Calibration {
+    by_illuminant: Vec<(u16, [f32; 9])>,
+    analog_balance: Option<[f64; 3]>,
+}
+
+fn calibration(path: &Path) -> Result<Calibration, RawError> {
+    let source = RawSource::new(path).map_err(|source| RawError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let decoder = seam(path, || rawler::get_decoder(&source))?;
+    let Some(root) = seam(path, || decoder.ifd(WellKnownIFD::Root))? else {
+        return Ok(Calibration::default());
+    };
+    const TAG_CAMERA_CALIBRATION_1: u16 = 50723;
+    const TAG_CAMERA_CALIBRATION_2: u16 = 50724;
+    const TAG_ANALOG_BALANCE: u16 = 50727;
+    const TAG_CALIBRATION_ILLUMINANT_1: u16 = 50778;
+    const TAG_CALIBRATION_ILLUMINANT_2: u16 = 50779;
+    let slots = [
+        (TAG_CALIBRATION_ILLUMINANT_1, TAG_CAMERA_CALIBRATION_1),
+        (TAG_CALIBRATION_ILLUMINANT_2, TAG_CAMERA_CALIBRATION_2),
+    ];
+    let by_illuminant = slots
+        .into_iter()
+        .filter_map(|(illuminant_tag, calibration_tag)| {
+            let illuminant =
+                u16::try_from(root.get_entry(illuminant_tag)?.value.force_u32(0)).ok()?;
+            let values = values_f32(root.get_entry(calibration_tag))?;
+            Some((illuminant, values.try_into().ok()?))
+        })
+        .collect();
+    let analog_balance = values_f32(root.get_entry(TAG_ANALOG_BALANCE))
+        .and_then(|values| <[f32; 3]>::try_from(values).ok())
+        .map(|values| values.map(f64::from))
+        .filter(|values| values.iter().all(|v| v.is_finite() && *v > 0.0));
+    Ok(Calibration {
+        by_illuminant,
+        analog_balance,
+    })
+}
+
+/// The DNG colour data of the camera that took the file at `path`, read from
+/// the same header as the stack's look transform, so look and tags cannot
+/// disagree.
+///
+/// A monochrome sensor, a camera with no 3x3 matrix of known colour
+/// temperature and a file without usable as-shot multipliers are refused
+/// with [`RawError::Unsupported`].
+pub fn dng_colour(path: &Path) -> Result<DngColour, RawError> {
+    panic_boundary(path, || {
+        let image = reference_image(path)?;
+        let refuse = |detail: &str| RawError::Unsupported {
+            path: path.to_path_buf(),
+            make: image.clean_make.clone(),
+            model: image.clean_model.clone(),
+            detail: detail.to_string(),
+        };
+        if image.is_monochrome() {
+            return Err(refuse("a monochrome sensor has no camera colour space"));
+        }
+        let wb = image.wb_coeffs;
+        if !wb[..3].iter().all(|c| c.is_finite() && *c > 0.0) {
+            return Err(refuse("the file carries no as-shot white balance"));
+        }
+        let mut matrices: Vec<(u32, DngMatrix)> = image
+            .color_matrix
+            .iter()
+            .filter_map(|(&illuminant, flat)| {
+                Some((
+                    colour_temperature(illuminant)?,
+                    DngMatrix {
+                        illuminant: illuminant as u16,
+                        xyz_to_camera: flat.as_slice().try_into().ok()?,
+                        calibration: None,
+                    },
+                ))
+            })
+            .collect();
+        matrices.sort_by_key(|(kelvin, _)| *kelvin);
+        let Some(coolest) = matrices.first().cloned() else {
+            return Err(refuse("the file carries no colour matrix"));
+        };
+        let mut chosen = vec![coolest.1];
+        if matrices.len() > 1 {
+            chosen.extend(matrices.pop().map(|(_, matrix)| matrix));
+        }
+        let calibration = calibration(path)?;
+        for matrix in &mut chosen {
+            matrix.calibration = calibration
+                .by_illuminant
+                .iter()
+                .find(|(illuminant, _)| *illuminant == matrix.illuminant)
+                .map(|(_, calibration)| *calibration);
+        }
+        Ok(DngColour {
+            look: LookTransform::from_image(&image),
+            make: image.clean_make.clone(),
+            model: image.clean_model.clone(),
+            unique_model: format!("{} {}", image.clean_make, image.clean_model),
+            orientation: Some(image.orientation.to_u16()).filter(|&o| o != 0),
+            matrices: chosen,
+            as_shot_neutral: [0, 1, 2].map(|c| f64::from(wb[1]) / f64::from(wb[c])),
+            analog_balance: calibration.analog_balance,
+        })
+    })
 }
 
 fn open_frame(path: &Path) -> Result<RawFrame, RawError> {

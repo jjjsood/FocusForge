@@ -7,6 +7,8 @@
 //! callers; this file exercises the driver directly, through neither.
 
 mod common;
+#[path = "common/raw_dng.rs"]
+mod raw_dng;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,8 +38,9 @@ use focusforge_core::pipeline::{
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
-use focusforge_core::tile::{Rect, Tile, TileError};
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError};
 use focusforge_core::zmap::ZMapReader;
+use raw_dng::{DngSpec, write_dng};
 
 fn mantis_frames(count: usize) -> Vec<PathBuf> {
     let dir = common::mantis_512_dir().join("frames");
@@ -1390,6 +1393,7 @@ impl TileBackend for CappedBackend {
         _samples_per_pixel: u32,
         _levels: u32,
         _transforms: &[Transform],
+        _sample_format: SampleFormat,
     ) -> Option<String> {
         self.asked.lock().unwrap().push((width, height));
         self.shortfall.clone()
@@ -3217,6 +3221,76 @@ fn sharpness_heatmap_output_identical_with_and_without_subscriber() {
         run("heat_only", &only_heat);
         assert!(!only_heat.heats().is_empty());
         assert!(only_heat.composites().is_empty(), "{algorithm}: per-kind");
+    }
+}
+
+/// `count` 12-bit DNG frames of `width` x `height` under `dir`, each sharp in
+/// its own vertical band and bright enough that the as-shot white balance
+/// lifts the red channel past white.
+fn raw_frames(dir: &Path, count: usize, width: u32, height: u32) -> Vec<PathBuf> {
+    (0..count)
+        .map(|frame| {
+            let samples = (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    let band = (x as usize * count / width as usize).min(count - 1);
+                    let amplitude = if band == frame { 380 } else { 50 };
+                    let checker = if (x / 2 + y / 2) % 2 == 0 {
+                        0
+                    } else {
+                        amplitude
+                    };
+                    (2_700 + frame as u32 * 40 + checker) as u16
+                })
+                .collect();
+            let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+            spec.width = width;
+            spec.height = height;
+            spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
+            let written = write_dng(&spec, false);
+            let path = dir.join(format!("{frame:02}.dng"));
+            std::fs::copy(written.path(), &path).expect("the DNG frame copies");
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn raw_run_previews_its_f32_composite_and_heat() {
+    let frames = raw_frames(&scratch("raw_preview_frames"), 3, 320, 256);
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(2));
+    let mut request = base_request("raw_preview", frames, explicit);
+    request.output = FuseOutput::Hold(scratch("raw_preview_hold"));
+    request.tile_size = Some(128);
+    let log = PreviewLog::new(false, true).with_heat();
+    let report = run_observed(&request, &log);
+
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a held run");
+    };
+    assert_eq!(
+        focusforge_core::io::TiffStack::open_staged(&held.composite)
+            .expect("the held composite opens")
+            .sample_format(),
+        SampleFormat::F32,
+        "a RAW stack fuses into an f32 composite"
+    );
+    assert!(report.tiles >= 2, "{} tiles", report.tiles);
+    assert!(log.unavailable().is_empty(), "every kind is delivered");
+
+    for (kind, shown) in [("composite", log.composites()), ("heat", log.heats())] {
+        let last = shown.last().unwrap_or_else(|| panic!("no {kind} preview"));
+        assert_eq!(
+            last.covered,
+            (last.width * last.height) as usize,
+            "the last {kind} preview covers the whole extent"
+        );
+        assert!(
+            last.rgba.chunks_exact(4).any(|p| p[..3] != [0, 0, 0]),
+            "the {kind} preview is not black"
+        );
+        assert!(last.tiles.len() >= 2, "the {kind} preview carries the grid");
     }
 }
 

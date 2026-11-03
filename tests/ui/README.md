@@ -33,3 +33,7 @@ Start: --open fixtures/mantis-64/frames
 2. Do the steps in order. After each step compare the window with its `Expect:`.
 3. A step whose `Expect:` does not hold is a failure; note its number and what the window showed, then carry on with the next step.
 4. Close the window when done.
+
+## Journeys that need local camera files
+
+`manual/` holds journeys whose input is not a checked-in fixture (real camera RAW files that are too large to commit). They use the same format and the same steps as the numbered journeys, start with a short list of files to copy into `.scratch/`, and are run by hand as above; the numbered journeys in this folder do not cover them.

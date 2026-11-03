@@ -25,9 +25,10 @@ height, so a directory that mixes an `II`/`RowsPerStrip=1` frame with an
 
 A file that fails any of the six conditions above is not treated as broken:
 `focusforge-cli info` shows `mmap fast path: no — <reason>` and the same
-reason is available as the `refusal` field in `info --json`. A 16-bit
-unsigned chunky Classic TIFF with LZW or Deflate compression, or a tiled
-layout, is read through the compatible TIFF path instead. Other layouts are
+reason is available as the `refusal` field in `info --json`. A 16-bit or 8-bit
+unsigned chunky Classic TIFF with LZW or Deflate compression, a tiled
+layout, or 8-bit samples is read through the compatible TIFF path instead
+(8-bit samples are widened to the 16-bit range). Other layouts are
 refused by name when a stack is opened.
 
 ## What opening a stack checks across frames

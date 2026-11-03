@@ -540,6 +540,10 @@ fn unusable_x11_display_fails_clearly() {
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no wgpu adapter") {
+        println!("SKIP: no wgpu adapter, so the display is never opened");
+        return;
+    }
     assert!(
         stderr.contains("display") || stderr.contains("x11"),
         "no display error: {stderr}"
@@ -556,6 +560,10 @@ fn unusable_wayland_display_fails_clearly() {
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no wgpu adapter") {
+        println!("SKIP: no wgpu adapter, so the display is never opened");
+        return;
+    }
     assert!(
         stderr.contains("display") || stderr.contains("wayland"),
         "no Wayland display error: {stderr}"
@@ -613,6 +621,43 @@ fn x11_only_launch_reports_x11() {
         stdout.contains("resolved native display: winit-x11"),
         "{stdout}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn software_adapter_start() {
+    const LAVAPIPE_ICD: &str = "/usr/share/vulkan/icd.d/lvp_icd.json";
+    if !has_display() || !std::path::Path::new(LAVAPIPE_ICD).exists() {
+        println!("SKIP: needs a display and the lavapipe Vulkan driver");
+        return;
+    }
+    let output = common::gui_bin("software_adapter_start")
+        .env("VK_DRIVER_FILES", LAVAPIPE_ICD)
+        .env("WGPU_BACKEND", "vulkan")
+        .env_remove("SLINT_WGPU_CPU")
+        .args(["--exit-after", "1500"])
+        .output()
+        .expect("launch focusforge-gui on a software adapter");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stderr = stderr.to_lowercase();
+    assert!(stderr.contains("software adapter"), "{stderr}");
+    assert!(stderr.contains("llvmpipe"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn no_adapter_start() {
+    let output = common::gui_bin("no_adapter_start")
+        .env("DISPLAY", ":0")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("WGPU_BACKEND", "metal")
+        .args(["--exit-after", "1500"])
+        .output()
+        .expect("launch focusforge-gui without an adapter");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no wgpu adapter"), "{stderr}");
 }
 
 #[test]

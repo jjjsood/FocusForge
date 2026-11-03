@@ -44,7 +44,7 @@
 //! synthetic profile instead. Re-measure this claim whenever the kernel
 //! changes.
 //!
-//! Out-conversion is copied verbatim from `crate::fuse::pyramid`:
+//! Out-conversion to `u16` is [`Sample::narrow`]:
 //!
 //! ```text
 //! (v.clamp(0.0, 65535.0) + 0.5).floor() as u16
@@ -53,7 +53,9 @@
 //! written as that expression and **never** as the word "round" --
 //! Rust's `f32::round` is half-away-from-zero, WGSL's `round()` is
 //! ties-to-even, and the word alone is a **1 LSB** parity failure by
-//! construction. `u16 as f32` in is lossless.
+//! construction. `u16 as f32` in is lossless. An `f32` warp
+//! ([`warp_samples_into`] over `f32`) keeps the accumulated value as it is:
+//! overshoot above 65535 and ringing below 0 pass through unclamped.
 //!
 //! # Border taps and coverage
 //!
@@ -69,7 +71,7 @@
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::align::error::AlignError;
 use crate::align::transform::Transform;
-use crate::tile::{Rect, Tile};
+use crate::tile::{Rect, Sample, Tile};
 
 /// The four Catmull-Rom (`a = -0.5`) weights for fractional offset `t`
 /// (`0.0 <= t < 1.0`), in tap order `[-1, 0, 1, 2]` relative to
@@ -87,13 +89,6 @@ pub(crate) fn catmull_rom_weights(t: f32) -> [f32; 4] {
         t * (t * (-1.5 * t + 2.0) + 0.5),
         t * t * (0.5 * t - 0.5),
     ]
-}
-
-/// Converts one accumulated `f32` sample to `u16`: clamp to `[0, 65535]`,
-/// then round half-up. Copied verbatim from `crate::fuse::pyramid::Plane::to_u16_into`.
-#[inline]
-fn to_u16(v: f32) -> u16 {
-    (v.clamp(0.0, 65535.0) + 0.5).floor() as u16
 }
 
 /// The output of a tiled warp: the resampled [`Tile`] plus per-pixel
@@ -134,7 +129,33 @@ pub fn warp_from_tile_into(
     out_samples: &mut [u16],
     out_covered: &mut [bool],
 ) -> Result<(), AlignError> {
-    let spp = src.samples_per_pixel as usize;
+    warp_samples_into(
+        &src.samples,
+        src.rect,
+        src.samples_per_pixel,
+        frame,
+        dst,
+        t,
+        out_samples,
+        out_covered,
+    )
+}
+
+/// [`warp_from_tile_into`] over `samples`, the interleaved `samples_per_pixel`
+/// samples of `src_rect`, in any [`Sample`] type. The result is narrowed by
+/// `S::narrow`, so `f32` keeps overshoot and `u16` clips.
+#[allow(clippy::too_many_arguments)] // the tile's parts, the frame, the target and the two outputs
+pub fn warp_samples_into<S: Sample>(
+    samples: &[S],
+    src_rect: Rect,
+    samples_per_pixel: u32,
+    frame: (u32, u32),
+    dst: Rect,
+    t: &Transform,
+    out_samples: &mut [S],
+    out_covered: &mut [bool],
+) -> Result<(), AlignError> {
+    let spp = samples_per_pixel as usize;
     let pixel_count = dst.width as usize * dst.height as usize;
     let expected_samples = pixel_count * spp;
     if out_samples.len() != expected_samples {
@@ -151,15 +172,15 @@ pub fn warp_from_tile_into(
     }
 
     let (frame_w, frame_h) = frame;
-    let src_stride = src.rect.width as usize * spp;
+    let src_stride = src_rect.width as usize * spp;
 
     // Reads one sample of channel `c` at absolute frame coordinates
     // `(col, row)`, which must already be edge-clamped into `0..frame_w` /
     // `0..frame_h` and verified inside `src.rect`.
     let sample = |col: i64, row: i64, c: usize| -> f32 {
-        let x = (col as u32 - src.rect.x) as usize;
-        let y = (row as u32 - src.rect.y) as usize;
-        f32::from(src.samples[y * src_stride + x * spp + c])
+        let x = (col as u32 - src_rect.x) as usize;
+        let y = (row as u32 - src_rect.y) as usize;
+        samples[y * src_stride + x * spp + c].widen()
     };
 
     for dy in 0..dst.height {
@@ -176,7 +197,7 @@ pub fn warp_from_tile_into(
             if !covered_centre {
                 out_covered[pixel_idx] = false;
                 for c in 0..spp {
-                    out_samples[pixel_idx * spp + c] = 0;
+                    out_samples[pixel_idx * spp + c] = S::default();
                 }
                 continue;
             }
@@ -209,14 +230,14 @@ pub fn warp_from_tile_into(
                 width: (cols[3] - cols[0] + 1) as u32,
                 height: (rows[3] - rows[0] + 1) as u32,
             };
-            let fits = needed.x >= src.rect.x
-                && needed.y >= src.rect.y
-                && needed.x + needed.width <= src.rect.x + src.rect.width
-                && needed.y + needed.height <= src.rect.y + src.rect.height;
+            let fits = needed.x >= src_rect.x
+                && needed.y >= src_rect.y
+                && needed.x + needed.width <= src_rect.x + src_rect.width
+                && needed.y + needed.height <= src_rect.y + src_rect.height;
             if !fits {
                 return Err(AlignError::SourceTileTooSmall {
                     needed,
-                    have: src.rect,
+                    have: src_rect,
                 });
             }
 
@@ -232,7 +253,7 @@ pub fn warp_from_tile_into(
                     + wy[1] * row_results[1]
                     + wy[2] * row_results[2]
                     + wy[3] * row_results[3];
-                out_samples[pixel_idx * spp + c] = to_u16(value);
+                out_samples[pixel_idx * spp + c] = S::narrow(value);
             }
             out_covered[pixel_idx] = true;
         }
@@ -282,41 +303,62 @@ pub fn warp_tile(
     dst: Rect,
     t: &Transform,
 ) -> Result<WarpedTile, AlignError> {
-    match t.source_footprint(dst, frame)? {
-        crate::align::SourceFootprint::Outside => {
-            let pixel_count = dst.width as usize * dst.height as usize;
-            Ok(WarpedTile {
-                tile: Tile {
-                    rect: dst,
-                    samples_per_pixel,
-                    samples: vec![0u16; pixel_count * samples_per_pixel as usize],
-                },
-                covered: vec![false; pixel_count],
-            })
-        }
-        crate::align::SourceFootprint::Covers { read, .. } => {
-            let mut buf =
-                vec![0u16; read.width as usize * read.height as usize * samples_per_pixel as usize];
-            reader.read_tile_into(frame_index, read, &mut buf).map_err(
-                |source: AlgorithmError| AlignError::Read {
-                    frame: frame_index,
-                    rect: read,
-                    source: Box::new(source),
-                },
-            )?;
-            let src = Tile {
+    let (samples, covered) =
+        warp_tile_samples::<u16>(reader, frame_index, frame, samples_per_pixel, dst, t)?;
+    Ok(WarpedTile {
+        tile: Tile {
+            rect: dst,
+            samples_per_pixel,
+            samples,
+        },
+        covered,
+    })
+}
+
+/// [`warp_tile`] reading and warping in sample type `S`: the warped samples
+/// and the per-pixel coverage.
+pub fn warp_tile_samples<S: Sample>(
+    reader: &dyn TileReader,
+    frame_index: usize,
+    frame: (u32, u32),
+    samples_per_pixel: u32,
+    dst: Rect,
+    t: &Transform,
+) -> Result<(Vec<S>, Vec<bool>), AlignError> {
+    let pixel_count = dst.width as usize * dst.height as usize;
+    let mut samples = vec![S::default(); pixel_count * samples_per_pixel as usize];
+    let mut covered = vec![false; pixel_count];
+    if let crate::align::SourceFootprint::Covers { read, .. } = t.source_footprint(dst, frame)? {
+        let mut source =
+            vec![
+                S::default();
+                read.width as usize * read.height as usize * samples_per_pixel as usize
+            ];
+        S::read_tile(reader, frame_index, read, &mut source).map_err(
+            |source: AlgorithmError| AlignError::Read {
+                frame: frame_index,
                 rect: read,
-                samples_per_pixel,
-                samples: buf,
-            };
-            warp_from_tile(&src, frame, dst, t)
-        }
+                source: Box::new(source),
+            },
+        )?;
+        warp_samples_into(
+            &source,
+            read,
+            samples_per_pixel,
+            frame,
+            dst,
+            t,
+            &mut samples,
+            &mut covered,
+        )?;
     }
+    Ok((samples, covered))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tile::Sample;
 
     #[test]
     fn catmull_rom_weights_sum_to_one() {
@@ -335,5 +377,55 @@ mod tests {
     #[test]
     fn catmull_rom_weights_are_one_hot_at_t_zero() {
         assert_eq!(catmull_rom_weights(0.0), [0.0, 1.0, 0.0, 0.0]);
+    }
+
+    fn step_edge(width: u32, height: u32, edge: u32, high: f32) -> Vec<f32> {
+        (0..height)
+            .flat_map(|_| (0..width).map(move |x| if x < edge { 0.0 } else { high }))
+            .collect()
+    }
+
+    fn whole(width: u32, height: u32) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn f32_warp_passes_overshoot_and_undershoot_through() {
+        let (w, h) = (13u32, 9u32);
+        let src = step_edge(w, h, 6, 100_000.0);
+        let rect = whole(w, h);
+        let t = Transform::similarity(1.0, 0.0, 0.5, 0.0);
+        let mut out = vec![0.0f32; (w * h) as usize];
+        let mut covered = vec![false; (w * h) as usize];
+        warp_samples_into(&src, rect, 1, (w, h), rect, &t, &mut out, &mut covered).unwrap();
+        // At t = 0.5 the weights are [-1, 9, 9, -1] / 16.
+        assert!((out[6] - 106_250.0).abs() < 1.0, "{}", out[6]);
+        assert!((out[4] + 6_250.0).abs() < 1.0, "{}", out[4]);
+        assert!((out[5] - 50_000.0).abs() < 1.0, "{}", out[5]);
+    }
+
+    #[test]
+    fn f32_warp_narrowed_is_the_u16_warp_on_in_range_input() {
+        let (w, h) = (13u32, 9u32);
+        let wide = step_edge(w, h, 6, 40_000.0);
+        let narrow = Tile {
+            rect: whole(w, h),
+            samples_per_pixel: 1,
+            samples: wide.iter().map(|v| *v as u16).collect(),
+        };
+        let t = Transform::similarity(1.0, 0.0, 0.37, -0.21);
+        let rect = whole(w, h);
+        let mut out = vec![0.0f32; (w * h) as usize];
+        let mut covered = vec![false; (w * h) as usize];
+        warp_samples_into(&wide, rect, 1, (w, h), rect, &t, &mut out, &mut covered).unwrap();
+        let expected = warp_from_tile(&narrow, (w, h), rect, &t).unwrap();
+        assert_eq!(expected.covered, covered);
+        let narrowed: Vec<u16> = out.iter().map(|v| u16::narrow(*v)).collect();
+        assert_eq!(expected.tile.samples, narrowed);
     }
 }

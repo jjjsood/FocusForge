@@ -15,7 +15,7 @@ use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{
     AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
 };
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::tile::{Rect, SampleFormat, Tile};
 
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
@@ -25,7 +25,7 @@ use crate::budget::{
 use crate::device::{GpuError, SharedDevice, block_on, settled_device, shared_device};
 use crate::ecc::{self, EccState};
 use crate::errors;
-use crate::fuse::{self, FusionPipelines};
+use crate::fuse::{self, FusedSample, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
@@ -190,8 +190,16 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
         transforms: &[Transform],
+        sample_format: SampleFormat,
     ) -> Option<String> {
-        let (bytes, _) = tile_bytes(width, height, samples_per_pixel, levels, transforms);
+        let (bytes, _) = tile_bytes(
+            width,
+            height,
+            samples_per_pixel,
+            levels,
+            transforms,
+            sample_format,
+        );
         tile_shortfall_message(width, height, bytes, self.device_budget.bytes())
     }
 
@@ -314,12 +322,46 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
+        self.warp_fuse::<u16>(reader, frame, transforms, rect, samples_per_pixel, levels)
+    }
+
+    fn warp_fuse_tile_f32(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        self.warp_fuse::<f32>(reader, frame, transforms, rect, samples_per_pixel, levels)
+    }
+
+    fn device_lost(&self) -> bool {
+        self.device.lost()
+    }
+}
+
+impl GpuBackend {
+    /// The body of [`TileBackend::warp_fuse_tile`] and
+    /// [`TileBackend::warp_fuse_tile_f32`]: the budget permit and error
+    /// scopes around one tile, read back as `O`.
+    fn warp_fuse<O: FusedSample>(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         let (bytes, warped) = tile_bytes(
             rect.width,
             rect.height,
             samples_per_pixel,
             levels,
             transforms,
+            reader.sample_format(),
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
@@ -332,7 +374,7 @@ impl TileBackend for GpuBackend {
         let device = self.device.device();
         let result = errors::with_validation_scope(device, || {
             let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let result = crate::stack_tile::warp_fuse_tile_gpu(
+            let result = crate::stack_tile::warp_fuse_tile_gpu::<O>(
                 self.device,
                 &self.warp_pipelines,
                 &self.fuse_pipelines,
@@ -365,10 +407,6 @@ impl TileBackend for GpuBackend {
 
         result
     }
-
-    fn device_lost(&self) -> bool {
-        self.device.lost()
-    }
 }
 
 /// The device bytes of one `width x height` tile, and whether any frame is
@@ -380,10 +418,18 @@ fn tile_bytes(
     samples_per_pixel: u32,
     levels: u32,
     transforms: &[Transform],
+    sample_format: SampleFormat,
 ) -> (u64, bool) {
     let warped = transforms.iter().any(|t| *t != Transform::identity());
     (
-        device_bytes_per_tile(width, height, samples_per_pixel, levels, warped),
+        device_bytes_per_tile(
+            width,
+            height,
+            samples_per_pixel,
+            levels,
+            warped,
+            sample_format,
+        ),
         warped,
     )
 }

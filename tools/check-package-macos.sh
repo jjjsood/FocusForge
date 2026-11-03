@@ -32,6 +32,10 @@ done
 ! find "$app" -type d -name '*.dSYM' -print -quit | grep -q .
 ! find "$app" -type f \( -name '*.debug' -o -name '*.pdb' \) -print -quit | grep -q .
 python3 "$root/tools/package-symbols.py" verify "$symbols/aarch64-apple-darwin"
+codesign --verify --deep --strict --verbose=2 "$app" || { echo "invalid code signature: FocusForge.app" >&2; exit 1; }
+signature=$(codesign -dv "$app" 2>&1)
+printf '%s\n' "$signature"
+grep -q '^Sealed Resources version=' <<<"$signature" || { echo "unsealed bundle resources: FocusForge.app" >&2; exit 1; }
 plist="$app/Contents/Info.plist"
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist") == focusforge-gui ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") == "$bundle_version" ]]

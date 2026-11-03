@@ -17,7 +17,7 @@ import time
 import numpy as np
 import PIL
 
-from . import alignment_reference, coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid, photometric
+from . import alignment_reference, coefficient_shrinkage, complex_wavelet, consistency, focus_score, fusion, index_field, mask_pyramid, noise_score, photometric
 from .protocol import FAMILIES, HOLDOUT_SEEDS, TRAINING_SEEDS, SeedTriple, registration, require_seed, validate_registration
 from .scenes import family_members, render_family
 from .runner import gff, _wavelet_verify_file, _wavelet_input_identity, complex_wavelet_case_controls, _twin_disagreements, _validate_preparation, baseline_call_count, case_split, focus_configuration_checks, focus_support_records, focus_tile_checks, index_calibration, index_field_tile_checks, index_replay_controls, mask_pyramid_gff_context, mask_pyramid_references, mask_pyramid_resource_argv, mask_pyramid_resource_controls, noise_shrinkage_resource_controls, noise_shrinkage_weighted_references, photometric_full_frame_manifest, photometric_physical_controls, photometric_real_roi_coverage, photometric_repeat_equality, photometric_repeat_preflight, photometric_stack_command, preparation_self_check, prepare_case, prepare_real, replay_control_checks, replay_focus_baselines, complex_wavelet_paired_effects, complex_wavelet_repeat_equality, complex_wavelet_repeat_preflight, run_complex_wavelet_configurations, run_complex_wavelet_resource_body, run_complex_wavelet_stack, run_crops, run_detector_controls, run_focus_configurations, run_focus_stack, run_focused_twins, run_baselines, run_equalized_context, run_index_configurations, run_index_full_references, run_index_stack, run_mask_pyramid_configurations, run_mask_pyramid_stack, run_noise_shrinkage_configurations, run_noise_shrinkage_stack, run_photometric_source_controls, run_photometric_stage, run_selection_configurations, run_selection_replay, run_selection_stack, selection_streaming_resource_controls, selection_tile_self_checks, selection_width_allowances, selection_width_measurements
@@ -1389,6 +1389,30 @@ def main(argv: list[str] | None = None, *, alignment_executor: object | None = N
     selection.add_argument("--source", choices=("stack",))
     selection.add_argument("--prepared")
     selection.add_argument("--rect")
+    noise_score_command = sub.add_parser("noise-score")
+    noise_score_command.add_argument("--self-check", dest="noise_score_self_check", action="store_true")
+    noise_score_sub = noise_score_command.add_subparsers(dest="noise_score_command")
+    noise_cases = noise_score_sub.add_parser("cases")
+    noise_cases.add_argument("--seed", required=True)
+    noise_cases.add_argument("--frames", type=int, choices=noise_score.FRAME_COUNTS)
+    noise_cases.add_argument("--allow-holdout", action="store_true")
+    noise_cases.add_argument("--out", required=True)
+    noise_baseline = noise_score_sub.add_parser("baseline")
+    noise_baseline.add_argument("--split", choices=("training",), required=True)
+    noise_baseline.add_argument("--out", required=True)
+    noise_hashes = noise_score_sub.add_parser("fusion-hashes")
+    noise_hashes.add_argument("--out", required=True)
+    noise_checkpoint = noise_score_sub.add_parser("checkpoint")
+    noise_checkpoint.add_argument("--registration", required=True)
+    noise_checkpoint.add_argument("--runs", required=True)
+    noise_checkpoint.add_argument("--out", required=True)
+    noise_arms = noise_score_sub.add_parser("arms")
+    noise_arms.add_argument("--split", choices=("training",), required=True)
+    noise_arms.add_argument("--registration", required=True)
+    noise_arms.add_argument("--checkpoint", required=True)
+    noise_arms.add_argument("--runs", required=True)
+    noise_arms.add_argument("--out", required=True)
+    noise_arms.add_argument("--replay-only", action="store_true")
     shrinkage = sub.add_parser("noise-shrinkage")
     shrinkage.add_argument("--self-check", dest="shrinkage_self_check", action="store_true")
     shrinkage.add_argument("--split", choices=("training",), default="training")
@@ -1447,6 +1471,52 @@ def main(argv: list[str] | None = None, *, alignment_executor: object | None = N
     args = parser.parse_args(argv)
     if args.self_check:
         return self_check(Path(args.allowances) if args.allowances else None)
+    if args.command == "noise-score":
+        if args.noise_score_self_check:
+            try:
+                for line in noise_score.self_checks():
+                    print(line)
+            except (AssertionError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                return 1
+            return 0
+        if args.noise_score_command == "cases":
+            try:
+                seed = SeedTriple.parse(args.seed)
+                case_split(seed, args.allow_holdout)
+            except ValueError as error:
+                parser.error(str(error))
+            counts = noise_score.FRAME_COUNTS if args.frames is None else (args.frames,)
+            document = noise_score.render_cases(Path(args.out), seed, counts, args.allow_holdout)
+            print(f"{document['split']} cases: {len(document['cases'])}")
+            return 0
+        if args.noise_score_command == "baseline":
+            rows = run_baselines(Path(args.out), TRAINING_SEEDS, members=noise_score.BASELINE_MEMBERS)
+            print(f"baseline records: {len(rows)}")
+            return 0
+        if args.noise_score_command == "fusion-hashes":
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(noise_score.fusion_reference_hashes(), indent=2, sort_keys=True) + "\n")
+            return 0
+        if args.noise_score_command == "checkpoint":
+            try:
+                document = noise_score.write_checkpoint(Path(args.registration), Path(args.runs), Path(args.out))
+            except ValueError as error:
+                parser.error(str(error))
+            print(f"checkpoint configurations: {len(document['configurations'])}")
+            return 0
+        if args.noise_score_command == "arms":
+            try:
+                comparison = noise_score.run_arms(Path(args.registration), Path(args.checkpoint), Path(args.runs), Path(args.out),
+                                                  args.replay_only, sys.argv if argv is None else [sys.argv[0], *argv])
+            except ValueError as error:
+                parser.error(str(error))
+            print(f"replay records: {len(comparison['replay'])}")
+            print(f"candidate rows: {len(comparison['candidate_rows'])}")
+            return 0
+        noise_score_command.print_help()
+        return 2
     if args.command == "alignment-reference":
         executor = alignment_reference.execute_registered_stage if alignment_executor is None else alignment_executor
         if not callable(executor):

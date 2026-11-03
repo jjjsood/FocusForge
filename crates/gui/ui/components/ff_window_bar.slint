@@ -34,7 +34,7 @@ export component FFWindowBar inherits Rectangle {
     in property <bool> maximized: false;
     in property <bool> controls-enabled: true;
     in property <string> hovered-control: "";
-    callback drag-requested();
+    callback drag-pointer(PointerEventButton, bool);
     callback minimize-requested();
     callback maximize-toggled();
     callback close-requested();
@@ -47,7 +47,7 @@ export component FFWindowBar inherits Rectangle {
     drag-area := TouchArea {
         width: parent.width - 3 * ShellGeometry.comparison-window-control-width;
         height: parent.height;
-        changed pressed => { root.drag-requested(); }
+        pointer-event(event) => { root.drag-pointer(event.button, event.kind == PointerEventKind.down); }
     }
 
     Text {

@@ -1058,14 +1058,18 @@ fn paint_drag_is_a_hidden_table_row() {
 
 /// Files whose own widget owns a raw gesture callback rather than routing
 /// through the canvas's rebindable zoom/pan/drag gesture table: the canvas
-/// and detached window, every scrollable panel and drag-based control (the slider and
-/// the scrollbar), each forwarding its callback body in one line to
+/// and detached window, the window drag regions (tab strip and window bar,
+/// each forwarding the button and press kind), every scrollable panel and
+/// drag-based control (the slider and the scrollbar), each forwarding its
+/// callback body in one line to
 /// `AppController` and interpreting nothing in `.slint`, plus every modal
 /// scrim and the Projects overlay's background, whose `scroll-event`
 /// swallows the wheel with a bare `accept` and forwards nothing.
 const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "canvas.slint",
     "comparison_window.slint",
+    "tab_strip.slint",
+    "ff_window_bar.slint",
     "ff_slider.slint",
     "ff_scrollbar.slint",
     "settings_panel.slint",

@@ -13,8 +13,6 @@ if (Test-Path (Join-Path $Symbols 'x86_64-pc-windows-msvc')) { $Symbols = Join-P
 if ($LASTEXITCODE -ne 0) { throw 'invalid symbol inventory' }
 $logs = Join-Path $root ('.scratch/check-package-windows/' + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
-# A hosted Windows runner has no GPU, only the WARP software adapter, which Slint refuses unless told otherwise.
-$env:SLINT_WGPU_CPU = '1'
 $product = Join-Path $env:ProgramFiles 'FocusForge'
 $installLog = Join-Path $logs 'install.log'
 $uninstallLog = Join-Path $logs 'uninstall.log'
@@ -64,6 +62,38 @@ function Get-PeSubsystem([string]$Path) {
   if ($pe + 4 + 20 + 70 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw "$Path is not a PE file (no PE signature)" }
   [int][BitConverter]::ToUInt16($bytes, $pe + 4 + 20 + 68)
 }
+# DLL names in the regular import directory of a PE32+ file.
+function Get-PeImports([string]$Path) {
+  $bytes = [IO.File]::ReadAllBytes($Path)
+  if ($bytes.Length -lt 0x40) { throw "$Path is not a PE file (too short)" }
+  $pe = [BitConverter]::ToUInt32($bytes, 0x3C)
+  if ($pe + 4 + 20 + 124 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $pe) -ne 0x00004550) { throw "$Path is not a PE file (no PE signature)" }
+  $optional = $pe + 24
+  if ([BitConverter]::ToUInt16($bytes, $optional) -ne 0x20B) { throw "$Path is not a PE32+ file" }
+  if ([BitConverter]::ToUInt32($bytes, $optional + 108) -lt 2) { throw "$Path has no import directory" }
+  $sections = $optional + [BitConverter]::ToUInt16($bytes, $pe + 20)
+  $sectionCount = [BitConverter]::ToUInt16($bytes, $pe + 6)
+  function ConvertTo-FileOffset([uint32]$Rva) {
+    foreach ($index in 0..($sectionCount - 1)) {
+      $section = $sections + 40 * $index
+      $start = [BitConverter]::ToUInt32($bytes, $section + 12)
+      $size = [Math]::Max([BitConverter]::ToUInt32($bytes, $section + 8), [BitConverter]::ToUInt32($bytes, $section + 16))
+      if ($Rva -ge $start -and $Rva -lt $start + $size) { return [int]([BitConverter]::ToUInt32($bytes, $section + 20) + $Rva - $start) }
+    }
+    throw "$Path has an unmapped import RVA"
+  }
+  $names = @()
+  $descriptor = ConvertTo-FileOffset ([BitConverter]::ToUInt32($bytes, $optional + 120))
+  while ($true) {
+    $nameRva = [BitConverter]::ToUInt32($bytes, $descriptor + 12)
+    if ($nameRva -eq 0) { break }
+    $start = ConvertTo-FileOffset $nameRva
+    $end = [Array]::IndexOf($bytes, [byte]0, $start)
+    $names += [Text.Encoding]::ASCII.GetString($bytes, $start, $end - $start)
+    $descriptor += 20
+  }
+  $names
+}
 try {
   # msiexec is a GUI program: only a pipeline makes PowerShell wait for it and set $LASTEXITCODE.
   & msiexec.exe /i $Msi /qn /norestart '/L*v' $installLog | Out-Null
@@ -73,6 +103,12 @@ try {
   }
   $guiSubsystem = Get-PeSubsystem (Join-Path $product 'focusforge-gui.exe'); if ($guiSubsystem -ne 2) { throw "focusforge-gui.exe must be a windowed binary (PE subsystem 2), found subsystem $guiSubsystem" }
   $cliSubsystem = Get-PeSubsystem (Join-Path $product 'focusforge-cli.exe'); if ($cliSubsystem -ne 3) { throw "focusforge-cli.exe must be a console binary (PE subsystem 3), found subsystem $cliSubsystem" }
+  foreach ($exe in 'focusforge-cli.exe', 'focusforge-gui.exe') {
+    $imports = @(Get-PeImports (Join-Path $product $exe))
+    Write-Output "$exe imports: $($imports -join ', ')"
+    $runtime = $imports | Where-Object { $_ -match '^(vcruntime|msvcp)\d*(_\d+)?\.dll$' } | Select-Object -First 1
+    if ($runtime) { throw "$exe links the dynamic C runtime: $runtime" }
+  }
   foreach ($file in 'LICENSE', 'NOTICE', 'focusforge.ico') { if ((Get-FileHash (Join-Path $root $file.Replace('focusforge.ico', 'assets/build/focusforge.ico'))).Hash -ne (Get-FileHash (Join-Path $product $file)).Hash) { throw "$file hash mismatch" } }
   $cli = Join-Path $product 'focusforge-cli.exe'
   $inventory = Get-Content (Join-Path $Symbols 'symbol-inventory.json') -Raw | ConvertFrom-Json

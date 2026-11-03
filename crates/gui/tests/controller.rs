@@ -929,7 +929,6 @@ fn controller_events_reach_an_installed_sink() {
         sink_events.lock().unwrap().push(event)
     }));
 
-    controller.tab_strip_pressed();
     controller.window_minimize();
     controller.window_maximize_toggle();
     controller.select_dock_tab(DockTab::Settings);
@@ -943,13 +942,47 @@ fn controller_events_reach_an_installed_sink() {
     assert_eq!(
         got,
         vec![
-            ShellEvent::WindowDragRequested,
             ShellEvent::WindowMinimizeRequested,
             ShellEvent::WindowMaximizeToggled(true),
             ShellEvent::DockTabSelected(DockTab::Settings),
             ShellEvent::WindowCloseRequested,
         ],
         "events must reach the sink in the order they were raised"
+    );
+}
+
+#[test]
+fn window_drag_pointer_starts_only_on_a_left_press() {
+    use focusforge_gui::WindowTarget;
+    use focusforge_gui::input_map::Button;
+
+    let mut controller = AppController::new();
+    // No hook installed: every press is a no-op, not a panic.
+    controller.window_drag_pointer(WindowTarget::Main, Button::Left, true);
+
+    let calls: Arc<Mutex<Vec<WindowTarget>>> = Arc::new(Mutex::new(Vec::new()));
+    let hook_calls = calls.clone();
+    controller.set_native_drag(Arc::new(move |target| {
+        hook_calls.lock().unwrap().push(target)
+    }));
+
+    for target in [WindowTarget::Main, WindowTarget::Comparison] {
+        for button in [Button::Left, Button::Middle, Button::Right, Button::Other] {
+            for down in [true, false] {
+                let before = calls.lock().unwrap().len();
+                controller.window_drag_pointer(target, button, down);
+                let expected = usize::from(button == Button::Left && down);
+                assert_eq!(
+                    calls.lock().unwrap().len() - before,
+                    expected,
+                    "{target:?} {button:?} down={down}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![WindowTarget::Main, WindowTarget::Comparison]
     );
 }
 

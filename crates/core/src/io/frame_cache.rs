@@ -2,10 +2,19 @@
 
 //! A bounded cache of whole decoded frames for readers whose format has no
 //! random access: a frame is decoded once and tiles are cut from it.
+//!
+//! The cache is generic over the frame it holds: JPEG keeps [`DecodedFrame`]
+//! in the `u16` range, RAW keeps its own camera-linear `f32` frame.
 
 use std::sync::{Arc, Mutex};
 
 use crate::tile::Rect;
+
+/// A frame the cache can hold, measured against its bound.
+pub(crate) trait CachedFrame {
+    /// The bytes this frame keeps alive, or `None` when the count overflows.
+    fn retained_bytes(&self) -> Option<u64>;
+}
 
 /// One decoded frame, interleaved, in the pipeline's `u16` sample range.
 #[derive(Debug)]
@@ -68,13 +77,15 @@ pub(crate) fn check_tile(
     Ok(())
 }
 
-impl DecodedFrame {
+impl CachedFrame for DecodedFrame {
     fn retained_bytes(&self) -> Option<u64> {
         u64::try_from(self.samples.len())
             .ok()?
             .checked_mul(std::mem::size_of::<u16>() as u64)
     }
+}
 
+impl DecodedFrame {
     /// Copies the pixels of `rect` into `out`, row by row.
     pub(crate) fn copy_tile(&self, rect: Rect, out: &mut [u16]) -> Result<(), TileFault> {
         check_tile(
@@ -96,13 +107,13 @@ impl DecodedFrame {
     }
 }
 
-#[derive(Debug, Default)]
-struct State {
-    frames: Vec<(usize, Arc<DecodedFrame>, u64)>,
+#[derive(Debug)]
+struct State<F> {
+    frames: Vec<(usize, Arc<F>, u64)>,
     bytes: u64,
 }
 
-impl State {
+impl<F> State<F> {
     /// Drops the oldest frames until `extra` more bytes fit in `bound`.
     fn make_room(&mut self, extra: u64, bound: u64) {
         while self.bytes.saturating_add(extra) > bound && !self.frames.is_empty() {
@@ -115,17 +126,20 @@ impl State {
 /// Decoded frames keyed by frame index, evicted oldest first, never holding
 /// more than `bound` bytes.
 #[derive(Debug)]
-pub(crate) struct FrameCache {
+pub(crate) struct FrameCache<F = DecodedFrame> {
     bound: u64,
-    state: Mutex<State>,
+    state: Mutex<State<F>>,
     decode_lock: Mutex<()>,
 }
 
-impl FrameCache {
+impl<F: CachedFrame> FrameCache<F> {
     pub(crate) fn new(bound: u64) -> Self {
         Self {
             bound,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                frames: Vec::new(),
+                bytes: 0,
+            }),
             decode_lock: Mutex::new(()),
         }
     }
@@ -137,8 +151,8 @@ impl FrameCache {
         &self,
         index: usize,
         required: u64,
-        decode: impl FnOnce() -> Result<DecodedFrame, E>,
-    ) -> Result<Arc<DecodedFrame>, CacheFault<E>> {
+        decode: impl FnOnce() -> Result<F, E>,
+    ) -> Result<Arc<F>, CacheFault<E>> {
         let _decode = self
             .decode_lock
             .lock()
