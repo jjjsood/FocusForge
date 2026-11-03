@@ -12,6 +12,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 |---|---|
 | [`info`](#info) | prints project, TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
+| [`step-plan`](#step-plan) | computes the focus step, frame count, duration and disk need of a focus stack from the optics and a depth range |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
 | [`export`](#export) | renders a checkpoint to a TIFF, PNG, JPEG or (for RAW projects) DNG image, and/or writes its Z-Map or one source frame |
 | [`retouch`](#retouch) | appends an op list of brush strokes to a project as new checkpoints |
@@ -22,7 +23,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
 
 Root help groups `stack`, `align`, `retouch` and `export` under Processing;
-`info`, `review` and `algorithms` under Inspection; and `history`, `cache`
+`info`, `review`, `algorithms` and `step-plan` under Inspection; and `history`, `cache`
 and `diagnostics` under Maintenance.
 
 ## Global options
@@ -751,6 +752,74 @@ and the command exits without printing a schema.
 
 `--json` emits the same per-parameter facts described above, one element in
 `{"algorithms": [...]}`.
+
+## `step-plan`
+
+```
+focusforge-cli step-plan [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set a parameter; repeatable, and a repeated key is last-wins |
+| `--json` | print the plan as one JSON object |
+
+Computes how many frames a focus stack needs. The depth of field is
+`DOF = 0.55 µm / NA²`. A lens states its marked f-number `N` and the
+magnification `m`, which give `NA = 1 / (2 · N · (1 + m))` (the pupil
+magnification is taken as 1); an objective states its NA. The focus step is
+`DOF · (1 − overlap)`, rounded to a whole nanometre, and the frame count is
+`ceil(range / step) + 1`, so both ends of the depth range are covered. The
+duration is the frame count times the time per frame, and the disk need is
+the frame count times the size per frame.
+
+A parameter the chosen optics does not use is ignored: `na` with a lens,
+`aperture` with an objective. The output names the optics input that was
+used.
+
+| parameter | unit | default | allowed |
+|---|---|---|---|
+| `magnification` | × | 1 | 0.01 to 100 |
+| `optics` | | `lens` | `lens`, `objective` |
+| `aperture` | marked f-number | 8 | 0.7 to 64 |
+| `na` | numerical aperture | 0.25 | 0.01 to 0.95 |
+| `overlap` | fraction of the depth of field | 0.25 | 0 to 0.9 |
+| `range_mm` | mm | 5 | 0 to 1000 (0 plans one frame) |
+| `frame_seconds` | s | 1 | 0 to 3600 |
+| `frame_mb` | MB | 50 | 0 to 2000 |
+
+A value outside its range, an unknown key or an unparsable value is
+reported on stderr, one line per violation, and the exit code is 1.
+
+```
+$ focusforge-cli step-plan --set magnification=1 --set aperture=8 --set frame_seconds=3
+optics:    lens, f/8
+NA:        0.031
+DOF:       563.2 µm
+step:      422.4 µm (422400 nm)
+frames:    13
+duration:  39 s
+disk:      650 MB
+```
+
+`--json` prints the same plan as one object. Its `optics` object carries
+only the input that was used (`aperture` for a lens, `na` for an objective):
+
+```
+$ focusforge-cli step-plan --set optics=objective --set na=0.25 --set range_mm=1 --json
+{
+  "optics": {
+    "kind": "objective",
+    "na": 0.25
+  },
+  "na": 0.25,
+  "dof_um": 8.8,
+  "step_nm": 6600,
+  "frames": 153,
+  "duration_s": 153.0,
+  "disk_mb": 7650.0
+}
+```
 
 ## `export`
 
