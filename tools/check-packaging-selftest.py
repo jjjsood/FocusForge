@@ -499,10 +499,36 @@ def job_steps(job: str) -> list[str]:
     return re.split(r"^      - ", job[job.index("    steps:\n"):], flags=re.MULTILINE)[1:]
 
 
+# Package-manager check job -> its command; push job -> the check whose output it pushes.
+PACKAGE_MANAGER_JOBS = {"check-aur": "bash tools/check-package-aur.sh", "check-homebrew": "tools/check-package-homebrew.sh"}
+PACKAGE_MANAGER_PUSHES = {"aur": "check-aur", "homebrew": "check-homebrew"}
+
+
+def package_managers_valid(jobs: dict[str, str]) -> bool:
+    """Recipes are rendered with the release, checked on every run, and pushed only after a stable release."""
+    if "tools/package-managers.py render" not in jobs["assemble"]: return False
+    for name, command in PACKAGE_MANAGER_JOBS.items():
+        job = jobs[name]
+        if not re.search(r"^    needs: \[meta, assemble\]$", job, re.MULTILINE) or re.search(r"^    if:", job, re.MULTILINE): return False
+        checked = [step for step in job_steps(job) if f"run: {command} " in step]
+        if len(checked) != 1 or "if:" in checked[0]: return False
+    stable = "    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'"
+    for name, check in PACKAGE_MANAGER_PUSHES.items():
+        job = jobs[name]
+        if not re.search(rf"^{re.escape(stable)}$", job, re.MULTILINE): return False
+        if not re.search(rf"^    needs: \[meta, publish, {re.escape(check)}\]$", job, re.MULTILINE): return False
+        if not re.search(r"^    environment: package-managers$", job, re.MULTILINE) or "run: tools/push-package-repo.sh " not in job: return False
+    others = "".join(job for name, job in jobs.items() if name not in PACKAGE_MANAGER_PUSHES)
+    # Secrets and pushes stay in the two jobs a pull request never runs.
+    if "secrets." in others or "push-package-repo.sh" in others: return False
+    if not re.search(r"^          PACKAGE_REPO_SSH_FINGERPRINT: SHA256:[A-Za-z0-9+/]{43}$", jobs["aur"], re.MULTILINE): return False
+    return True
+
+
 def valid_release(release: str) -> bool:
     """The invariants the release workflow keeps: a gate before any build, publishing only on a tag, pinned actions."""
     jobs = workflow_jobs(release)
-    if set(jobs) != {"meta", "package-linux", "package-macos", "package-windows", "assemble", "publish"}: return False
+    if set(jobs) != {"meta", "package-linux", "package-macos", "package-windows", "assemble", "publish", *PACKAGE_MANAGER_JOBS, *PACKAGE_MANAGER_PUSHES}: return False
     if not re.search(r"^permissions: \{\}$", release, re.MULTILINE): return False
     if re.search(r"continue-on-error|\|\| true|--anonymous|pull_request_target", release): return False
     if any(not re.fullmatch(r"[0-9a-f]{40}", action.split("@", 1)[1]) for action in re.findall(r"uses:\s*([^\s]+)", release)): return False
@@ -525,6 +551,7 @@ def valid_release(release: str) -> bool:
     if not re.search(r"^    if: github\.ref_type == 'tag'$", publish, re.MULTILINE) or not re.search(r"^    needs: \[meta, assemble\]$", publish, re.MULTILINE): return False
     if re.findall(r"^          (?:name|pattern): (\S+)$", publish, re.MULTILINE) != ["release-assets"]: return False
     if "gh release create" not in publish or "--verify-tag" not in publish or "gh release" in "".join(job for name, job in jobs.items() if name != "publish"): return False
+    if not package_managers_valid(jobs): return False
     # Diagnostics and receipts upload after a failure; nothing else may run on `always()`.
     for job in jobs.values():
         for step in job_steps(job):
@@ -558,6 +585,17 @@ def graph() -> None:
         "no timeout": release.replace("    timeout-minutes: 10\n", "", 1),
         "always() on a build step": release.replace("      - name: Check Linux package\n", "      - name: Check Linux package\n        if: always()\n", 1),
         "release created outside publish": release.replace("      - name: Assemble the release\n", "      - name: Assemble the release\n        run: gh release create x\n", 1),
+        "recipes not rendered": release.replace("python3 tools/package-managers.py render", "python3 tools/package-managers.py", 1),
+        "AUR check only on tags": release.replace("  check-aur:\n    needs: [meta, assemble]\n", "  check-aur:\n    needs: [meta, assemble]\n    if: github.ref_type == 'tag'\n", 1),
+        "cask check skipped": release.replace("      - name: Check the Homebrew cask\n", "      - name: Check the Homebrew cask\n        if: false\n", 1),
+        "AUR push on pull requests": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-aur]", "    needs: [meta, publish, check-aur]", 1),
+        "tap push on a prerelease": release.replace("    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'\n    needs: [meta, publish, check-homebrew]", "    if: github.ref_type == 'tag'\n    needs: [meta, publish, check-homebrew]", 1),
+        "AUR push skips its check": release.replace("    needs: [meta, publish, check-aur]", "    needs: [meta, publish]", 1),
+        "tap push ahead of the release": release.replace("    needs: [meta, publish, check-homebrew]", "    needs: [meta, check-homebrew]", 1),
+        "push outside its environment": release.replace("    environment: package-managers\n", "", 1),
+        "push may write here": release.replace("    environment: package-managers\n    permissions:\n      contents: read", "    environment: package-managers\n    permissions:\n      contents: write", 1),
+        "secret in a pull request job": release.replace("      - name: Check the AUR package\n", "      - name: Check the AUR package\n        env:\n          KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}\n", 1),
+        "AUR host key unpinned": release.replace("          PACKAGE_REPO_SSH_FINGERPRINT: SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4\n", "", 1),
     }
     for name, mutated in refused.items():
         assert mutated != release, f"mutation did not apply: {name}"

@@ -6,6 +6,13 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Added
+
+- Each stable release now also publishes the Arch Linux AUR package
+  `focusforge-bin` and a Homebrew cask in `<owner>/homebrew-tap` for macOS on
+  Apple silicon. Both are built, installed and removed in the release workflow
+  before anything is pushed.
+
 ## [0.1.0] - 2026-10-27
 
 ### Added

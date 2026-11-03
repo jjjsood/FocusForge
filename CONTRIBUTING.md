@@ -256,6 +256,47 @@ disk-space and `hdiutil` output to `.scratch/package-macos-diagnostics/`, which
 the package workflow uploads as an artifact. The hosted check job is bounded
 at 240 minutes.
 
+### Package managers
+
+The release also feeds two package repositories outside this one: the AUR
+package `focusforge-bin`, which repackages the release `.deb`, and the cask
+`focusforge` in `<owner>/homebrew-tap`, which installs the release DMG.
+`tools/package-managers.py render` writes both recipes from the release's
+`SHA256SUMS` in the assemble job. On every run, pull requests included,
+`check-aur` builds, installs and removes the package with `makepkg` and
+`pacman` in a current Arch Linux container, and `check-homebrew` installs the
+cask from the DMG through a local tap and uninstalls it with `--zap`. Neither
+check downloads the release, so a pull request checks exactly what a tag would
+push. After a stable release (not a `-rc` candidate) is published, the `aur` and
+`homebrew` jobs push the checked files with `tools/push-package-repo.sh`. An
+unchanged recipe pushes nothing, so re-running a release is safe.
+
+To change a recipe, edit `tools/package-managers.py`, never the pushed files:
+the next release overwrites them. A new library that the binaries link or
+`dlopen` makes `check-aur` fail until its Arch package is in `AUR_DEPENDS`.
+
+One-time setup, before the first stable tag that should reach them:
+
+1. **AUR.** Create an account on <https://aur.archlinux.org> and add an SSH
+   public key to it. The private key goes into the secret
+   `AUR_SSH_PRIVATE_KEY`. The first push creates `focusforge-bin`, so the name
+   needs no reservation. The job checks the host's Ed25519 key against the
+   fingerprint pinned in `release.yml`, which is the one the AUR home page
+   publishes.
+2. **Homebrew tap.** Create the public repository `<owner>/homebrew-tap` with
+   a `main` branch, for example with a README. Create a fine-grained personal
+   access token with *Contents: read and write* on that repository only, and
+   store it as `HOMEBREW_TAP_TOKEN`. Users then install with
+   `brew install <owner>/tap/focusforge`.
+3. **Environment.** Create the environment `package-managers` under
+   *Settings → Environments*. Put both secrets there, not in the repository
+   secrets, and allow only tags matching `v*` to deploy to it. That way no
+   branch or pull request run can read them.
+
+Until a secret is set, its push job fails with a message that names the
+missing secret. The GitHub Release itself is published before either push
+runs and is unaffected.
+
 ### Release smoke checklist
 
 Run `tools/check-package-linux.sh .scratch/package-linux` after producing the

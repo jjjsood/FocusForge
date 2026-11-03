@@ -3,8 +3,12 @@
 # Builds the installers and the command-line archives, assembles exactly the files a
 # release publishes, and on a version tag creates the GitHub Release.
 #
-# A pull request runs everything except the check-run gate and the publish job, so the
+# A pull request runs everything except the check-run gate and the publish jobs, so the
 # assemble step that decides the release contents is rehearsed before any tag exists.
+#
+# The package-manager recipes (the AUR package focusforge-bin, the Homebrew cask in
+# <owner>/homebrew-tap) are rendered from the same SHA256SUMS, built and installed on
+# Arch Linux and macOS on every run, and pushed only after a stable release is published.
 name: Release
 
 on:
@@ -288,6 +292,15 @@ jobs:
           cp .scratch/native-artifacts/FocusForge-"$VERSION"-aarch64.dmg .scratch/native-artifacts/FocusForge-"$VERSION"-x86_64.msi release-in/
       - name: Assemble the release
         run: python3 tools/release-assets.py assemble release-in --out release-assets --version "$VERSION" --repo "$GITHUB_REPOSITORY"
+      - name: Render the package-manager recipes
+        run: python3 tools/package-managers.py render --version "$VERSION" --sums release-assets/files/SHA256SUMS --repo "$GITHUB_REPOSITORY" --out package-managers
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-managers
+          path: package-managers/
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-assets
@@ -302,6 +315,66 @@ jobs:
           retention-days: 90
           overwrite: true
           if-no-files-found: error
+
+  # Builds the AUR package from the release .deb, installs it on a current Arch Linux and removes it again.
+  check-aur:
+    needs: [meta, assemble]
+    runs-on: ubuntu-24.04
+    # Unpinned on purpose: Arch is a rolling release, and the check is about what an Arch user installs today.
+    container: archlinux:base-devel
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: package-managers
+          path: package-managers
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Check the AUR package
+        run: bash tools/check-package-aur.sh package-managers/aur "release-assets/files/focusforge_${VERSION}_amd64.deb" "$VERSION" aur-package
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: aur-package
+          path: aur-package/
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: error
+
+  # Installs the cask from the release disk image through a local tap and uninstalls it again.
+  check-homebrew:
+    needs: [meta, assemble]
+    runs-on: macos-14
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12.10'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: package-managers
+          path: package-managers
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Check the Homebrew cask
+        run: tools/check-package-homebrew.sh package-managers/homebrew/Casks/focusforge.rb "release-assets/files/FocusForge-$VERSION-aarch64.dmg" "$VERSION"
 
   publish:
     if: github.ref_type == 'tag'
@@ -325,3 +398,54 @@ jobs:
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" release-assets/files/* --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "FocusForge $VERSION" --notes-file release-assets/notes.md "${flags[@]}"
+
+  # A stable release only: the PKGBUILD and .SRCINFO that check-aur built, installed and removed.
+  aur:
+    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'
+    needs: [meta, publish, check-aur]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: package-managers
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: aur-package
+          path: aur-package
+      - name: Push to the AUR
+        env:
+          PACKAGE_REPO_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          # The Ed25519 host key fingerprint published on https://aur.archlinux.org.
+          PACKAGE_REPO_SSH_FINGERPRINT: SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+        run: tools/push-package-repo.sh ssh://aur@aur.archlinux.org/focusforge-bin.git master aur-package "Update to $VERSION"
+
+  # A stable release only: the cask that check-homebrew installed, into <owner>/homebrew-tap.
+  homebrew:
+    if: github.ref_type == 'tag' && needs.meta.outputs.prerelease == 'false'
+    needs: [meta, publish, check-homebrew]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: package-managers
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      TAP: ${{ github.repository_owner }}/homebrew-tap
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: package-managers
+          path: package-managers
+      - name: Push to the Homebrew tap
+        env:
+          PACKAGE_REPO_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: tools/push-package-repo.sh "https://github.com/$TAP.git" main package-managers/homebrew "focusforge $VERSION"
