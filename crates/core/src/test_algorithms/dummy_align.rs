@@ -45,10 +45,8 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
 });
 
 /// A unit-struct alignment algorithm: identity for the reference frame, a
-/// translation for every other frame -- the same shape as
-/// `crates/core/src/algorithm/mod.rs`'s own test-only `DummyAlign`. With
-/// `fail-frame` set, that frame instead reports a diverged registration
-/// with an identity transform.
+/// translation for every other frame. With `fail-frame` set, that frame
+/// instead reports a diverged registration with an identity transform.
 pub struct DummyAlign;
 
 impl AlignAlgorithm for DummyAlign {
