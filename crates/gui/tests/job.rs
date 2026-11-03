@@ -1121,22 +1121,36 @@ fn failure_is_reported_and_retryable() {
     }
 }
 
-/// A refused scratch volume is a setup failure whose message keeps the
-/// needed-versus-free figures.
+/// A refused volume is a setup failure whose message keeps the
+/// needed-versus-free figures of every short volume.
 #[test]
-fn raw_run_scratch_space_refusal_is_shown() {
-    let refusal = pipeline::PipelineError::ScratchSpace {
-        path: PathBuf::from("/scratch/volume"),
-        needed: 23_000_000_000,
-        free: 1_500_000_000,
+fn run_disk_space_refusal_is_shown() {
+    let shortfall = |path: &str, needed, free| pipeline::VolumeShortfall {
+        path: PathBuf::from(path),
+        needed,
+        free,
     };
-    let unanswered = pipeline::PipelineError::ScratchSpaceQuery {
+    let refusal = pipeline::PipelineError::DiskSpace(vec![
+        shortfall("/scratch/volume", 23_000_000_000, 1_500_000_000),
+        shortfall("/output/volume", 7_000_000_000, 2_000_000_000),
+    ]);
+    let unanswered = pipeline::PipelineError::DiskSpaceQuery {
         path: PathBuf::from("/scratch/volume"),
         source: std::io::Error::other("volume query refused"),
     };
     for (error, wanted) in [
-        (refusal, ["23000000000 bytes", "1500000000 bytes"]),
-        (unanswered, ["/scratch/volume", "volume query refused"]),
+        (
+            refusal,
+            vec![
+                "/scratch/volume",
+                "23000000000 bytes",
+                "1500000000 bytes",
+                "/output/volume",
+                "7000000000 bytes",
+                "2000000000 bytes",
+            ],
+        ),
+        (unanswered, vec!["/scratch/volume", "volume query refused"]),
     ] {
         let operation = job::FailedOperation::from(&error);
         assert_eq!(operation, job::FailedOperation::Setup);

@@ -12,6 +12,7 @@
 //! module never prints, never depends on a terminal or a window, and the
 //! poll thread it owns calls the observer, never a `println!`.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
+use crate::io::tiff::writer::file_len;
 use crate::io::{
     COMPOSITE_FILENAME, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack, ZMAP_FILENAME,
     open_frame_set,
@@ -39,7 +41,10 @@ use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
     self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
 };
-use crate::tile::{NoopPreprocess, TileConsumer, TileError, TileScheduler, TileSchedulerOptions};
+use crate::tile::{
+    NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
+    TileSchedulerOptions,
+};
 use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope};
 
 /// An alignment request: which algorithm, its explicit parameters, and
@@ -83,13 +88,44 @@ pub struct FuseRequest {
     /// How often the poll thread this module owns calls
     /// [`StageObserver::tick`].
     pub poll: Duration,
-    /// Answers how many bytes are free on the volume holding a path; `None`
-    /// asks the operating system.
+    /// Answers which volume holds a directory and how many bytes are free on
+    /// it; `None` asks the operating system.
     pub free_space: Option<FreeSpaceProbe>,
 }
 
 /// A free-space query, replaceable by a caller that needs a fixed answer.
-pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync>;
+pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> std::io::Result<VolumeSpace> + Send + Sync>;
+
+/// The volume that holds a directory and the bytes free on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeSpace {
+    /// Equal for directories on the same volume.
+    pub volume: OsString,
+    pub free: u64,
+}
+
+/// A volume that cannot hold what the run writes there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeShortfall {
+    /// The first destination directory measured on the volume.
+    pub path: PathBuf,
+    pub needed: u64,
+    pub free: u64,
+}
+
+impl std::fmt::Display for VolumeShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} has {} bytes ({:.1} GB) free, but the run needs {} bytes ({:.1} GB) there",
+            self.path.display(),
+            self.free,
+            gigabytes(self.free),
+            self.needed,
+            gigabytes(self.needed)
+        )
+    }
+}
 
 /// Where a completed run's result goes.
 pub enum FuseOutput {
@@ -316,56 +352,195 @@ pub enum PipelineError {
     Project(#[from] project::ProjectError),
     #[error("{0}")]
     Io(String),
-    #[error(
-        "{} has {free} bytes ({:.1} GB) free, but the developed frames need {needed} bytes ({:.1} GB)",
-        path.display(),
-        gigabytes(*free),
-        gigabytes(*needed)
-    )]
-    ScratchSpace {
-        path: PathBuf,
-        needed: u64,
-        free: u64,
-    },
+    #[error("{}", join_shortfalls(.0))]
+    DiskSpace(Vec<VolumeShortfall>),
     #[error("cannot measure the free space at {}: {source}", path.display())]
-    ScratchSpaceQuery {
+    DiskSpaceQuery {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+fn join_shortfalls(shortfalls: &[VolumeShortfall]) -> String {
+    shortfalls
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn gigabytes(bytes: u64) -> f64 {
     bytes as f64 / 1e9
 }
 
-/// Refuses a run whose developed frames (`needed` bytes) do not fit on the
-/// volume that holds the scratch root.
-fn check_scratch_space(request: &FuseRequest, needed: u64) -> Result<(), PipelineError> {
-    let root = std::path::absolute(&request.scratch_root).map_err(|source| {
-        PipelineError::ScratchSpaceQuery {
-            path: request.scratch_root.clone(),
+/// The volume holding `path` and the bytes free on it, as the operating
+/// system reports them.
+fn os_volume_space(path: &Path) -> std::io::Result<VolumeSpace> {
+    Ok(VolumeSpace {
+        volume: volume_id(path)?,
+        free: fs4::available_space(path)?,
+    })
+}
+
+#[cfg(unix)]
+fn volume_id(path: &Path) -> std::io::Result<OsString> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.dev().to_string().into())
+}
+
+/// The drive letter or share of the canonical path.
+#[cfg(not(unix))]
+fn volume_id(path: &Path) -> std::io::Result<OsString> {
+    Ok(match std::fs::canonicalize(path)?.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str().to_os_string(),
+        _ => OsString::new(),
+    })
+}
+
+/// Refuses a run that cannot write `destinations` (directory, bytes) to
+/// their volumes: bytes are summed per volume, each directory is asked once,
+/// and every volume with less free than its sum is reported.
+fn check_disk_space(
+    request: &FuseRequest,
+    destinations: &[(&Path, u64)],
+) -> Result<(), PipelineError> {
+    let mut volumes: Vec<(OsString, VolumeShortfall)> = Vec::new();
+    for &(dir, needed) in destinations {
+        let dir = std::path::absolute(dir).map_err(|source| PipelineError::DiskSpaceQuery {
+            path: dir.to_path_buf(),
             source,
+        })?;
+        // The directory may not exist yet; its nearest existing ancestor
+        // names the volume the new directories land on.
+        let measured = dir.ancestors().find(|path| path.exists()).unwrap_or(&dir);
+        let space = match &request.free_space {
+            Some(probe) => probe(measured),
+            None => os_volume_space(measured),
         }
-    })?;
-    // The root may not exist yet; its nearest existing ancestor names the
-    // volume the new directories land on.
-    let measured = root.ancestors().find(|path| path.exists()).unwrap_or(&root);
-    let free = match &request.free_space {
-        Some(probe) => probe(measured),
-        None => fs4::available_space(measured),
-    }
-    .map_err(|source| PipelineError::ScratchSpaceQuery {
-        path: measured.to_path_buf(),
-        source,
-    })?;
-    if free < needed {
-        return Err(PipelineError::ScratchSpace {
+        .map_err(|source| PipelineError::DiskSpaceQuery {
             path: measured.to_path_buf(),
-            needed,
-            free,
+            source,
+        })?;
+        match volumes
+            .iter_mut()
+            .find(|(volume, _)| *volume == space.volume)
+        {
+            Some((_, entry)) => {
+                entry.needed = entry.needed.checked_add(needed).ok_or_else(size_overflow)?;
+            }
+            None => volumes.push((
+                space.volume,
+                VolumeShortfall {
+                    path: measured.to_path_buf(),
+                    needed,
+                    free: space.free,
+                },
+            )),
+        }
+    }
+    let short: Vec<VolumeShortfall> = volumes
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .filter(|entry| entry.free < entry.needed)
+        .collect();
+    if short.is_empty() {
+        Ok(())
+    } else {
+        Err(PipelineError::DiskSpace(short))
+    }
+}
+
+fn size_overflow() -> PipelineError {
+    PipelineError::Input("the run's output size overflows a byte count".to_string())
+}
+
+/// Upper bound of the `ImageDescription` the staged composite carries, which
+/// is composed after alignment.
+const DESCRIPTION_ALLOWANCE: usize = 512;
+/// Bytes a resume ledger or project container adds beyond its fingerprint
+/// and per-unit lines.
+const LEDGER_FIXED_BYTES: u64 = 64 * 1024;
+/// Upper bound of one completed-unit line in the resume ledger.
+const LEDGER_UNIT_BYTES: u64 = 32;
+
+/// What a run's staged files and ledger are sized from.
+struct RunShape {
+    width: u32,
+    height: u32,
+    samples_per_pixel: u32,
+    format: SampleFormat,
+    frames: u32,
+    /// Tiles the scheduler will run.
+    units: u64,
+    /// Serialized length of the stack fingerprint.
+    fingerprint_len: u64,
+}
+
+/// The bytes a run writes, split by where they land. `output` is `Some` when
+/// a project is written beside the output path.
+#[derive(Debug)]
+struct RunSpace {
+    scratch: u64,
+    output: Option<u64>,
+}
+
+/// Bytes the staged composite and Z-Map, the resume ledger and, when
+/// `sealed`, the compressed planes occupy. Each compressed plane is counted
+/// at zstd's worst case on the scratch volume (its temporary blob) and again
+/// in the project on the output volume.
+fn run_space(shape: &RunShape, sealed: bool) -> Result<RunSpace, PipelineError> {
+    let composite = file_len(
+        shape.width,
+        shape.height,
+        shape.samples_per_pixel,
+        shape.format,
+        DESCRIPTION_ALLOWANCE,
+    );
+    let zmap = file_len(
+        shape.width,
+        shape.height,
+        1,
+        SampleFormat::U16,
+        crate::zmap::format_description(shape.frames).len() + 1,
+    );
+    let (Some(composite), Some(zmap)) = (composite, zmap) else {
+        return Err(size_overflow());
+    };
+    let bound = |len: u64| -> Result<u64, PipelineError> {
+        let len = usize::try_from(len).map_err(|_| size_overflow())?;
+        let bound = zstd::zstd_safe::compress_bound(len) as u64;
+        // A size zstd cannot bound comes back as an error code near the top
+        // of the range.
+        if bound < len as u64 || bound > u64::MAX / 4 {
+            return Err(size_overflow());
+        }
+        Ok(bound)
+    };
+    let ledger = shape
+        .units
+        .checked_mul(LEDGER_UNIT_BYTES)
+        .and_then(|units| units.checked_add(shape.fingerprint_len + LEDGER_FIXED_BYTES))
+        .ok_or_else(size_overflow)?;
+    let staged = composite
+        .checked_add(zmap)
+        .and_then(|staged| staged.checked_add(ledger))
+        .ok_or_else(size_overflow)?;
+    if !sealed {
+        return Ok(RunSpace {
+            scratch: staged,
+            output: None,
         });
     }
-    Ok(())
+    let planes = bound(composite)?
+        .checked_add(bound(zmap)?)
+        .ok_or_else(size_overflow)?;
+    let project = planes
+        .checked_add(shape.fingerprint_len + LEDGER_FIXED_BYTES)
+        .ok_or_else(size_overflow)?;
+    Ok(RunSpace {
+        scratch: staged.checked_add(planes).ok_or_else(size_overflow)?,
+        output: Some(project),
+    })
 }
 
 /// Runs one stack from `request.frames` to the result `request.output`
@@ -446,8 +621,42 @@ pub fn run(
         .max(1);
     let cancel_requested = || control.state() == ControlState::CancelRequested;
     let scratch_needed = frame_reader.develop_scratch_bytes()?;
-    if scratch_needed > 0 {
-        check_scratch_space(request, scratch_needed)?;
+    {
+        let (sealed, output_dir) = match &request.output {
+            FuseOutput::Seal(path) | FuseOutput::Append(path) => (
+                true,
+                Some(match path.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent,
+                    _ => Path::new("."),
+                }),
+            ),
+            FuseOutput::Hold(_) => (false, None),
+        };
+        let fingerprint_len = serde_json::to_vec(&fingerprint)
+            .map_err(|err| PipelineError::Io(err.to_string()))?
+            .len() as u64;
+        let units = TilePlan::new(width, height, options.tile_size, support)?.len() as u64;
+        let space = run_space(
+            &RunShape {
+                width,
+                height,
+                samples_per_pixel: spp,
+                format: frame_reader.sample_format(),
+                frames: frame_reader.len() as u32,
+                units,
+                fingerprint_len,
+            },
+            sealed,
+        )?;
+        let scratch_total = space
+            .scratch
+            .checked_add(scratch_needed)
+            .ok_or_else(size_overflow)?;
+        let mut destinations = vec![(request.scratch_root.as_path(), scratch_total)];
+        if let (Some(dir), Some(bytes)) = (output_dir, space.output) {
+            destinations.push((dir, bytes));
+        }
+        check_disk_space(request, &destinations)?;
     }
     // A RAW stack develops every frame here, once, so no later read does.
     if scratch_needed > 0 {
@@ -1601,5 +1810,40 @@ mod tests {
                 assert!(detail.contains("output="));
             }
         }
+    }
+
+    fn shape(width: u32, height: u32, spp: u32, format: SampleFormat) -> RunShape {
+        RunShape {
+            width,
+            height,
+            samples_per_pixel: spp,
+            format,
+            frames: 3,
+            units: 4,
+            fingerprint_len: 100,
+        }
+    }
+
+    #[test]
+    fn run_space_overflow_is_an_error() {
+        let big = |height| shape(u32::MAX, height, 4, SampleFormat::F32);
+        // A plane of u32::MAX four-sample f32 columns still fits a byte count
+        // at height 2^28; one more row overflows it.
+        assert_eq!(
+            file_len(u32::MAX, 1, 4, SampleFormat::F32, 5),
+            Some(180 + 16 * u64::from(u32::MAX))
+        );
+        assert_eq!(
+            file_len(u32::MAX, 1 << 28, 4, SampleFormat::F32, 5),
+            Some(u64::MAX - (1 << 31) + 181)
+        );
+        for (width, height, spp) in [(u32::MAX, u32::MAX, 3), (u32::MAX, (1 << 28) + 1, 4)] {
+            assert_eq!(file_len(width, height, spp, SampleFormat::F32, 5), None);
+            let error = run_space(&shape(width, height, spp, SampleFormat::F32), true)
+                .expect_err("an overflowing plane must not produce a figure");
+            assert!(matches!(error, PipelineError::Input(_)), "{error:?}");
+        }
+        let fits = run_space(&big(1), true).expect("one row fits");
+        assert!(fits.scratch > 16 * u64::from(u32::MAX));
     }
 }

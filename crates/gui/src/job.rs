@@ -85,8 +85,8 @@ impl From<&PipelineError> for FailedOperation {
         match err {
             PipelineError::Input(_)
             | PipelineError::Params(_)
-            | PipelineError::ScratchSpace { .. }
-            | PipelineError::ScratchSpaceQuery { .. } => FailedOperation::Setup,
+            | PipelineError::DiskSpace(_)
+            | PipelineError::DiskSpaceQuery { .. } => FailedOperation::Setup,
             PipelineError::Align(_) => FailedOperation::Alignment,
             _ => FailedOperation::Fusion,
         }

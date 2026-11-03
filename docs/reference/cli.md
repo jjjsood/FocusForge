@@ -460,10 +460,12 @@ for TIFF and JPEG stacks, and
 the human summary prints a `develops per frame: min= mean= max=` line only
 when the field is present.
 
-Before that pass, a RAW `stack` run measures the free space on the volume that
-holds `.scratch` and refuses, with a failure naming the directory, the bytes
-needed and the bytes free, when the developed frames (6 bytes per pixel per
-frame) do not fit; nothing is developed or left behind.
+Before any frame is read for fusion, every `stack` run measures the free space
+on each volume it writes to (the one holding `.scratch` and the one holding the
+output's directory) and refuses, with a failure naming each short directory,
+the bytes needed and the bytes free, when the developed RAW frames (6 bytes per
+pixel per frame), the staged composite and Z-Map, the resume ledger and the
+compressed result do not fit; nothing is developed, staged or left behind.
 
 ```json
 {

@@ -12,7 +12,7 @@ use focusforge_core::job::{JobControl, JobStage};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{
     FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
-    StageObserver,
+    StageObserver, VolumeShortfall, VolumeSpace,
 };
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
@@ -2461,19 +2461,61 @@ fn raw_scratch_unwritable_is_a_named_error() {
     assert_eq!(stack.develop_counts(), Some(vec![0; 2]));
 }
 
-/// A probe that reports `free` bytes and records every path it is asked about.
-fn recording_probe(free: u64) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
+/// Every path is on the volume `name` with `free` bytes free.
+fn volume(name: &str, free: u64) -> std::io::Result<VolumeSpace> {
+    Ok(VolumeSpace {
+        volume: name.into(),
+        free,
+    })
+}
+
+/// A probe answering through `answer` that records every path it is asked about.
+fn recording_probe(
+    answer: impl Fn(&Path) -> std::io::Result<VolumeSpace> + Send + Sync + 'static,
+) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&asked);
     let probe: FreeSpaceProbe = Arc::new(move |path: &Path| {
         log.lock().expect("probe log").push(path.to_path_buf());
-        Ok(free)
+        answer(path)
     });
     (probe, asked)
 }
 
 fn run_raw(request: &FuseRequest) -> Result<FuseOutcome, PipelineError> {
     focusforge_core::pipeline::run(request, &NoopObserver, JobControl::new(), None)
+}
+
+/// The one shortfall `request` is refused with when its single volume has
+/// `free` bytes.
+fn single_shortfall(request: &mut FuseRequest, free: u64) -> VolumeShortfall {
+    request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+    let Err(PipelineError::DiskSpace(mut shortfalls)) = run_raw(request) else {
+        panic!("a run that does not fit must be refused");
+    };
+    assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    shortfalls.remove(0)
+}
+
+/// Holds the result beside the scratch root.
+fn hold_request(frames: Vec<PathBuf>, root: &Path) -> FuseRequest {
+    let mut request = raw_request(frames, root, None, None);
+    request.output = FuseOutput::Hold(root.join("held"));
+    request
+}
+
+/// The summed length of the composite and Z-Map a completed hold run staged.
+fn held_len(request: &FuseRequest) -> u64 {
+    let FuseOutcome::Completed(report) = run_raw(request).expect("the RAW run completes") else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Held(held) = report.product else {
+        panic!("a hold request reports a held checkpoint");
+    };
+    [&held.composite, &held.zmap]
+        .iter()
+        .map(|file| std::fs::metadata(file).expect("held plane").len())
+        .sum()
 }
 
 #[test]
@@ -2505,56 +2547,65 @@ fn scratch_space_needed_matches_written_scratch() {
 }
 
 #[test]
-fn raw_run_refuses_when_scratch_space_is_short() {
+fn raw_run_space_staged_bytes_cover_written_staging() {
     let dng = gradient_dng(64, 48, 0);
-    let stack_needed = 4 * 64 * 48 * 6;
-    for free in [stack_needed - 1, 0] {
+    let develop = 4 * 64 * 48 * 6;
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let needed = single_shortfall(&mut hold_request(frames.clone(), root.path()), 0).needed;
+    let written = held_len(&hold_request(frames, root.path()));
+    let staged = needed - develop;
+    assert!(
+        staged >= written && staged - written < 256 * 1024,
+        "needed {needed}, developed {develop}, staged {written}"
+    );
+}
+
+#[test]
+fn raw_run_space_includes_developed_scratch() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let staged = held_len(&hold_request(frames.clone(), root.path()));
+    let probe_root = target_tmp();
+    let probe_frames = copies_of(&dng, 4, probe_root.path());
+    let needed = single_shortfall(&mut hold_request(probe_frames, probe_root.path()), 0).needed;
+    // The sealed result adds its temporary compressed planes to the scratch
+    // volume and the project itself to the output volume.
+    for free in [develop - 1, 0] {
         let root = target_tmp();
         let frames = copies_of(&dng, 4, root.path());
         let mut request = raw_request(frames, root.path(), None, None);
-        let (probe, asked) = recording_probe(free);
-        request.free_space = Some(probe);
-        let Err(error) = run_raw(&request) else {
-            panic!("a run that does not fit must be refused");
-        };
-        let PipelineError::ScratchSpace {
-            path,
-            needed,
-            free: reported,
-        } = &error
-        else {
-            panic!("expected a scratch-space refusal, got {error:?}");
-        };
-        assert_eq!(*needed, stack_needed);
-        assert_eq!(*reported, free);
-        assert_eq!(
-            asked.lock().expect("probe log").as_slice(),
-            std::slice::from_ref(path)
+        let shortfall = single_shortfall(&mut request, free);
+        assert_eq!(shortfall.free, free);
+        assert!(
+            shortfall.needed >= develop + 3 * staged,
+            "needed {} for {develop} developed and {staged} staged",
+            shortfall.needed
         );
-        let text = error.to_string();
+        assert!(shortfall.needed > needed);
+        assert_scratch_empty(&root.path().join("scratch"));
+        let text = PipelineError::DiskSpace(vec![shortfall.clone()]).to_string();
         for want in [
-            path.display().to_string(),
-            format!("{stack_needed} bytes"),
+            shortfall.path.display().to_string(),
+            format!("{} bytes", shortfall.needed),
             format!("{free} bytes"),
             "0.0 GB".to_string(),
         ] {
             assert!(text.contains(&want), "{want:?} missing from {text}");
         }
-        assert_scratch_empty(&root.path().join("scratch"));
     }
 }
 
 #[test]
-fn raw_run_proceeds_when_scratch_space_suffices() {
+fn raw_run_proceeds_when_run_space_suffices() {
     let dng = gradient_dng(64, 48, 0);
     let held = |free: Option<u64>| {
         let root = target_tmp();
         let frames = copies_of(&dng, 4, root.path());
-        let mut request = raw_request(frames, root.path(), None, None);
-        let hold = root.path().join("held");
-        std::fs::create_dir(&hold).expect("hold directory");
-        request.output = FuseOutput::Hold(hold);
-        request.free_space = free.map(|free| recording_probe(free).0);
+        let mut request = hold_request(frames, root.path());
+        request.free_space = free.map(|free| recording_probe(move |_| volume("only", free)).0);
         let FuseOutcome::Completed(report) = run_raw(&request).expect("the RAW run completes")
         else {
             panic!("expected a completed run");
@@ -2565,7 +2616,10 @@ fn raw_run_proceeds_when_scratch_space_suffices() {
         };
         std::fs::read(&held.composite).expect("composite is readable")
     };
-    assert_eq!(held(Some(4 * 64 * 48 * 6)), held(None));
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let needed = single_shortfall(&mut hold_request(frames, root.path()), 0).needed;
+    assert_eq!(held(Some(needed)), held(None));
 }
 
 #[test]
@@ -2575,17 +2629,15 @@ fn scratch_space_query_uses_nearest_existing_ancestor() {
     let frames = copies_of(&dng, 2, root.path());
     let mut request = raw_request(frames, root.path(), None, None);
     request.scratch_root = PathBuf::from("scratch-space-ancestor-test/deeper");
-    let (probe, asked) = recording_probe(0);
+    let (probe, asked) = recording_probe(|_| volume("only", 0));
     request.free_space = Some(probe);
     assert!(matches!(
         run_raw(&request),
-        Err(PipelineError::ScratchSpace { .. })
+        Err(PipelineError::DiskSpace(_))
     ));
     let cwd = std::env::current_dir().expect("working directory");
-    assert_eq!(
-        asked.lock().expect("probe log").as_slice(),
-        std::slice::from_ref(&cwd)
-    );
+    let asked = asked.lock().expect("probe log");
+    assert!(asked.contains(&cwd), "{asked:?}");
     assert!(!cwd.join("scratch-space-ancestor-test").exists());
 }
 
@@ -2602,7 +2654,7 @@ fn scratch_space_query_failure_refuses_the_run() {
         panic!("an unanswered query must refuse the run");
     };
     assert!(
-        matches!(error, PipelineError::ScratchSpaceQuery { .. }),
+        matches!(error, PipelineError::DiskSpaceQuery { .. }),
         "{error:?}"
     );
     let text = error.to_string();

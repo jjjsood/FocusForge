@@ -1932,18 +1932,33 @@ mod tests {
     }
 
     #[test]
-    fn stack_refuses_raw_run_when_scratch_space_is_short() {
-        let refusal = focusforge_core::pipeline::PipelineError::ScratchSpace {
-            path: PathBuf::from("/scratch/volume"),
-            needed: 23_000_000_000,
-            free: 1_500_000_000,
-        };
+    fn stack_refuses_run_when_disk_space_is_short() {
+        use focusforge_core::pipeline::{PipelineError, VolumeShortfall};
+        let refusal = PipelineError::DiskSpace(vec![
+            VolumeShortfall {
+                path: PathBuf::from("/scratch/volume"),
+                needed: 23_000_000_000,
+                free: 1_500_000_000,
+            },
+            VolumeShortfall {
+                path: PathBuf::from("/output/volume"),
+                needed: 7_000_000_000,
+                free: 2_000_000_000,
+            },
+        ]);
         let status = StatusSink::new(None, "raw-dump".to_string(), "stack");
         let result = failed(&status, Instant::now(), refusal.to_string());
         let GroupResult::Failed { error, .. } = &result else {
             panic!("a refused run is a failed group");
         };
-        for want in ["/scratch/volume", "23000000000 bytes", "1500000000 bytes"] {
+        for want in [
+            "/scratch/volume",
+            "23000000000 bytes",
+            "1500000000 bytes",
+            "/output/volume",
+            "7000000000 bytes",
+            "2000000000 bytes",
+        ] {
             assert!(error.contains(want), "{want:?} missing from {error}");
         }
         let entry = manifest_entry(
