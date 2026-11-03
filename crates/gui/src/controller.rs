@@ -8495,8 +8495,9 @@ impl AppController {
         Some(planes)
     }
 
-    /// `Discard` on the active tab's parked run: deletes its held files and
-    /// leaves the tab `Idle` with its checkpoint count unchanged.
+    /// `Discard` on the active tab's parked run: deletes its held files, drops
+    /// the tab's landed stage mosaic and leaves the tab `Idle` with its
+    /// checkpoint count unchanged.
     pub fn discard_fused(&mut self) {
         if self.active_history_frozen() {
             return;
