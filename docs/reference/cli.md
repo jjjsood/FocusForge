@@ -460,6 +460,11 @@ for TIFF and JPEG stacks, and
 the human summary prints a `develops per frame: min= mean= max=` line only
 when the field is present.
 
+Before that pass, a RAW `stack` run measures the free space on the volume that
+holds `.scratch` and refuses, with a failure naming the directory, the bytes
+needed and the bytes free, when the developed frames (6 bytes per pixel per
+frame) do not fit; nothing is developed or left behind.
+
 ```json
 {
   "input": "fixtures/mantis-512",

@@ -87,12 +87,28 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
+        free_space: None,
     }
 }
 
 #[derive(Default)]
 struct NoopObserver;
 impl StageObserver for NoopObserver {}
+
+#[test]
+fn tiff_run_skips_scratch_space_check() {
+    let mut request = base_request("tiff_space_skip", mantis_frames(2), ParamValues::new());
+    let queries = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&queries);
+    request.free_space = Some(Arc::new(move |_: &Path| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Ok(0)
+    }));
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+        .expect("a TIFF run develops nothing, so no space is needed");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+    assert_eq!(queries.load(Ordering::SeqCst), 0);
+}
 
 #[test]
 fn run_resolves_params_against_the_frames_it_opens() {

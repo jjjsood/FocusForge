@@ -10,11 +10,14 @@ use focusforge_core::io::Rect;
 use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
 use focusforge_core::job::JobControl;
 use focusforge_core::params::{ParamValue, ParamValues};
-use focusforge_core::pipeline::{FuseOutcome, FuseOutput, FuseRequest, StageObserver};
+use focusforge_core::pipeline::{
+    FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, StageObserver,
+};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::raw_dng::{DngSpec, write_dng};
 
@@ -577,7 +580,7 @@ fn decoded_frames_stay_within_budget() {
             &mut output,
         )
         .expect_err("overflowed geometry must fail before decode");
-    assert!(error.to_string().contains("overflows cache accounting"));
+    assert!(error.to_string().contains("overflows a byte count"));
 }
 
 #[test]
@@ -1976,6 +1979,7 @@ fn raw_request(
         resume: false,
         cache: false,
         poll: std::time::Duration::from_millis(5),
+        free_space: None,
     }
 }
 
@@ -2160,12 +2164,13 @@ fn raw_scratch_file_size_matches_encoding() {
     stack
         .develop_once(&scratch, u64::MAX, 2, &|| false)
         .expect("the pass develops every frame");
-    assert_eq!(stack.scratch_frame_bytes(), 48 * 20 * 6);
+    let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
+    assert_eq!(frame_bytes, 48 * 20 * 6);
     let files = scratch_files(&scratch);
     assert_eq!(files.len(), 8, "{files:?}");
     for file in files {
         let length = std::fs::metadata(&file).expect("scratch file").len();
-        assert_eq!(length, stack.scratch_frame_bytes(), "{}", file.display());
+        assert_eq!(length, frame_bytes, "{}", file.display());
     }
 }
 
@@ -2296,4 +2301,154 @@ fn raw_scratch_unwritable_is_a_named_error() {
         "{error}"
     );
     assert_eq!(stack.develop_counts(), Some(vec![0; 2]));
+}
+
+/// A probe that reports `free` bytes and records every path it is asked about.
+fn recording_probe(free: u64) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let probe: FreeSpaceProbe = Arc::new(move |path: &Path| {
+        log.lock().expect("probe log").push(path.to_path_buf());
+        Ok(free)
+    });
+    (probe, asked)
+}
+
+fn run_raw(request: &FuseRequest) -> Result<FuseOutcome, PipelineError> {
+    focusforge_core::pipeline::run(request, &NoopObserver, JobControl::new(), None)
+}
+
+#[test]
+fn scratch_space_needed_matches_written_scratch() {
+    for (width, height, count) in [(33, 17, 1), (62, 26, 5)] {
+        let dng = gradient_dng(width, height, 0);
+        let root = target_tmp();
+        let paths = copies_of(&dng, count, root.path());
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch root");
+        let needed = stack.develop_scratch_bytes().expect("the figure fits");
+        stack
+            .develop_once(&scratch, u64::MAX, 2, &|| false)
+            .expect("the pass develops every frame");
+        let (width, height) = stack.dimensions();
+        assert_eq!(
+            needed,
+            count as u64 * u64::from(width) * u64::from(height) * 6
+        );
+        let files = scratch_files(&scratch);
+        assert_eq!(files.len(), count, "{files:?}");
+        let written: u64 = files
+            .iter()
+            .map(|file| std::fs::metadata(file).expect("scratch file").len())
+            .sum();
+        assert_eq!(needed, written, "{width}x{height} x {count}");
+    }
+}
+
+#[test]
+fn raw_run_refuses_when_scratch_space_is_short() {
+    let dng = gradient_dng(64, 48, 0);
+    let stack_needed = 4 * 64 * 48 * 6;
+    for free in [stack_needed - 1, 0] {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = raw_request(frames, root.path(), None, None);
+        let (probe, asked) = recording_probe(free);
+        request.free_space = Some(probe);
+        let Err(error) = run_raw(&request) else {
+            panic!("a run that does not fit must be refused");
+        };
+        let PipelineError::ScratchSpace {
+            path,
+            needed,
+            free: reported,
+        } = &error
+        else {
+            panic!("expected a scratch-space refusal, got {error:?}");
+        };
+        assert_eq!(*needed, stack_needed);
+        assert_eq!(*reported, free);
+        assert_eq!(
+            asked.lock().expect("probe log").as_slice(),
+            std::slice::from_ref(path)
+        );
+        let text = error.to_string();
+        for want in [
+            path.display().to_string(),
+            format!("{stack_needed} bytes"),
+            format!("{free} bytes"),
+            "0.0 GB".to_string(),
+        ] {
+            assert!(text.contains(&want), "{want:?} missing from {text}");
+        }
+        assert_scratch_empty(&root.path().join("scratch"));
+    }
+}
+
+#[test]
+fn raw_run_proceeds_when_scratch_space_suffices() {
+    let dng = gradient_dng(64, 48, 0);
+    let held = |free: Option<u64>| {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = raw_request(frames, root.path(), None, None);
+        let hold = root.path().join("held");
+        std::fs::create_dir(&hold).expect("hold directory");
+        request.output = FuseOutput::Hold(hold);
+        request.free_space = free.map(|free| recording_probe(free).0);
+        let FuseOutcome::Completed(report) = run_raw(&request).expect("the RAW run completes")
+        else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(report.develop_counts, Some(vec![1; 4]));
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        std::fs::read(&held.composite).expect("composite is readable")
+    };
+    assert_eq!(held(Some(4 * 64 * 48 * 6)), held(None));
+}
+
+#[test]
+fn scratch_space_query_uses_nearest_existing_ancestor() {
+    let dng = gradient_dng(64, 48, 0);
+    let root = target_tmp();
+    let frames = copies_of(&dng, 2, root.path());
+    let mut request = raw_request(frames, root.path(), None, None);
+    request.scratch_root = PathBuf::from("scratch-space-ancestor-test/deeper");
+    let (probe, asked) = recording_probe(0);
+    request.free_space = Some(probe);
+    assert!(matches!(
+        run_raw(&request),
+        Err(PipelineError::ScratchSpace { .. })
+    ));
+    let cwd = std::env::current_dir().expect("working directory");
+    assert_eq!(
+        asked.lock().expect("probe log").as_slice(),
+        std::slice::from_ref(&cwd)
+    );
+    assert!(!cwd.join("scratch-space-ancestor-test").exists());
+}
+
+#[test]
+fn scratch_space_query_failure_refuses_the_run() {
+    let dng = gradient_dng(64, 48, 0);
+    let root = target_tmp();
+    let frames = copies_of(&dng, 2, root.path());
+    let mut request = raw_request(frames, root.path(), None, None);
+    request.free_space = Some(Arc::new(|_: &Path| {
+        Err(std::io::Error::other("volume query refused"))
+    }));
+    let Err(error) = run_raw(&request) else {
+        panic!("an unanswered query must refuse the run");
+    };
+    assert!(
+        matches!(error, PipelineError::ScratchSpaceQuery { .. }),
+        "{error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("volume query refused"), "{text}");
+    assert!(text.contains(&root.path().display().to_string()), "{text}");
+    assert_scratch_empty(&root.path().join("scratch"));
 }

@@ -191,6 +191,7 @@ fn gui_run_matches_the_cli_run() {
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
+        free_space: None,
     };
     struct Noop;
     impl StageObserver for Noop {}
@@ -326,6 +327,7 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
+        free_space: None,
     }
 }
 
@@ -1058,6 +1060,33 @@ fn failure_is_reported_and_retryable() {
         job::RunState::Failed(_) => {}
         other => {
             panic!("retrying the same unreadable frame must fail the same way, got {other:?}")
+        }
+    }
+}
+
+/// A refused scratch volume is a setup failure whose message keeps the
+/// needed-versus-free figures.
+#[test]
+fn raw_run_scratch_space_refusal_is_shown() {
+    let refusal = pipeline::PipelineError::ScratchSpace {
+        path: PathBuf::from("/scratch/volume"),
+        needed: 23_000_000_000,
+        free: 1_500_000_000,
+    };
+    let unanswered = pipeline::PipelineError::ScratchSpaceQuery {
+        path: PathBuf::from("/scratch/volume"),
+        source: std::io::Error::other("volume query refused"),
+    };
+    for (error, wanted) in [
+        (refusal, ["23000000000 bytes", "1500000000 bytes"]),
+        (unanswered, ["/scratch/volume", "volume query refused"]),
+    ] {
+        let operation = job::FailedOperation::from(&error);
+        assert_eq!(operation, job::FailedOperation::Setup);
+        assert_eq!(operation.summary(), "Setup failed");
+        let text = error.to_string();
+        for want in wanted {
+            assert!(text.contains(want), "{want:?} missing from {text}");
         }
     }
 }

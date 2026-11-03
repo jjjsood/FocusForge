@@ -83,7 +83,10 @@ impl FailedOperation {
 impl From<&PipelineError> for FailedOperation {
     fn from(err: &PipelineError) -> Self {
         match err {
-            PipelineError::Input(_) | PipelineError::Params(_) => FailedOperation::Setup,
+            PipelineError::Input(_)
+            | PipelineError::Params(_)
+            | PipelineError::ScratchSpace { .. }
+            | PipelineError::ScratchSpaceQuery { .. } => FailedOperation::Setup,
             PipelineError::Align(_) => FailedOperation::Alignment,
             _ => FailedOperation::Fusion,
         }
@@ -377,6 +380,7 @@ pub fn fuse_request(
         resume: false,
         cache: true,
         poll: POLL,
+        free_space: None,
     }
 }
 

@@ -491,6 +491,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64
+- Package: fs4 1.1.0
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: Linux x86_64, Windows x86_64, macOS arm64
 - Package: futures 0.3.34
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0

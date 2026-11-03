@@ -109,6 +109,12 @@ pub trait FrameReader: TileReader + Send + Sync {
         Ok(0)
     }
 
+    /// Bytes [`FrameReader::develop_once`] writes under its `scratch_root`;
+    /// `0` for a reader that develops nothing.
+    fn develop_scratch_bytes(&self) -> Result<u64, AlgorithmError> {
+        Ok(0)
+    }
+
     /// Facts used to resolve stack-dependent parameters.
     fn stack_context(&self) -> StackContext {
         let (width, height) = self.dimensions();

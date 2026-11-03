@@ -83,7 +83,13 @@ pub struct FuseRequest {
     /// How often the poll thread this module owns calls
     /// [`StageObserver::tick`].
     pub poll: Duration,
+    /// Answers how many bytes are free on the volume holding a path; `None`
+    /// asks the operating system.
+    pub free_space: Option<FreeSpaceProbe>,
 }
+
+/// A free-space query, replaceable by a caller that needs a fixed answer.
+pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync>;
 
 /// Where a completed run's result goes.
 pub enum FuseOutput {
@@ -275,6 +281,56 @@ pub enum PipelineError {
     Project(#[from] project::ProjectError),
     #[error("{0}")]
     Io(String),
+    #[error(
+        "{} has {free} bytes ({:.1} GB) free, but the developed frames need {needed} bytes ({:.1} GB)",
+        path.display(),
+        gigabytes(*free),
+        gigabytes(*needed)
+    )]
+    ScratchSpace {
+        path: PathBuf,
+        needed: u64,
+        free: u64,
+    },
+    #[error("cannot measure the free space at {}: {source}", path.display())]
+    ScratchSpaceQuery {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+fn gigabytes(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
+}
+
+/// Refuses a run whose developed frames (`needed` bytes) do not fit on the
+/// volume that holds the scratch root.
+fn check_scratch_space(request: &FuseRequest, needed: u64) -> Result<(), PipelineError> {
+    let root = std::path::absolute(&request.scratch_root).map_err(|source| {
+        PipelineError::ScratchSpaceQuery {
+            path: request.scratch_root.clone(),
+            source,
+        }
+    })?;
+    // The root may not exist yet; its nearest existing ancestor names the
+    // volume the new directories land on.
+    let measured = root.ancestors().find(|path| path.exists()).unwrap_or(&root);
+    let free = match &request.free_space {
+        Some(probe) => probe(measured),
+        None => fs4::available_space(measured),
+    }
+    .map_err(|source| PipelineError::ScratchSpaceQuery {
+        path: measured.to_path_buf(),
+        source,
+    })?;
+    if free < needed {
+        return Err(PipelineError::ScratchSpace {
+            path: measured.to_path_buf(),
+            needed,
+            free,
+        });
+    }
+    Ok(())
 }
 
 /// Runs one stack from `request.frames` to the result `request.output`
@@ -354,6 +410,10 @@ pub fn run(
         .min(control.admission_cap())
         .max(1);
     let cancel_requested = || control.state() == ControlState::CancelRequested;
+    let scratch_needed = frame_reader.develop_scratch_bytes()?;
+    if scratch_needed > 0 {
+        check_scratch_space(request, scratch_needed)?;
+    }
     // A RAW stack develops every frame here, once, so no later read does.
     match frame_reader.develop_once(
         &request.scratch_root,

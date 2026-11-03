@@ -1201,6 +1201,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         resume: job_opts.resume,
         cache: job_opts.cache,
         poll: job::POLL,
+        free_space: None,
     };
 
     // Resolved once: the report's `backend` field, and the ledger's own
@@ -1918,6 +1919,30 @@ mod tests {
         assert!(message.contains("--only \"c\""), "{message}");
         assert!(message.contains('a'), "{message}");
         assert!(message.contains('b'), "{message}");
+    }
+
+    #[test]
+    fn stack_refuses_raw_run_when_scratch_space_is_short() {
+        let refusal = focusforge_core::pipeline::PipelineError::ScratchSpace {
+            path: PathBuf::from("/scratch/volume"),
+            needed: 23_000_000_000,
+            free: 1_500_000_000,
+        };
+        let status = StatusSink::new(None, "raw-dump".to_string(), "stack");
+        let result = failed(&status, Instant::now(), refusal.to_string());
+        let GroupResult::Failed { error, .. } = &result else {
+            panic!("a refused run is a failed group");
+        };
+        for want in ["/scratch/volume", "23000000000 bytes", "1500000000 bytes"] {
+            assert!(error.contains(want), "{want:?} missing from {error}");
+        }
+        let entry = manifest_entry(
+            &sample_group("raw-dump", "dump"),
+            "raw-dump".into(),
+            &result,
+        );
+        assert_eq!(entry.outcome, "failed");
+        assert_eq!(entry.error.as_deref(), Some(error.as_str()));
     }
 
     fn sample_manifest_entry(name: &str, output: &str) -> groups::ManifestEntry {

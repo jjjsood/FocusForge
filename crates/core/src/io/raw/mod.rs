@@ -182,7 +182,7 @@ pub enum RawError {
         required: u64,
     },
     /// RAW geometry overflows a byte count.
-    #[error("{}: RAW geometry overflows cache accounting", path.display())]
+    #[error("{}: RAW geometry overflows a byte count", path.display())]
     BudgetOverflow {
         /// Source file.
         path: PathBuf,
@@ -393,9 +393,15 @@ impl RawStack {
     }
 
     /// Bytes one developed frame occupies in its scratch file.
-    pub fn scratch_frame_bytes(&self) -> u64 {
+    pub fn scratch_frame_bytes(&self) -> Result<u64, RawError> {
+        self.scratch_total(1)
+    }
+
+    fn scratch_total(&self, frames: usize) -> Result<u64, RawError> {
         let (width, height) = self.dimensions();
-        u64::from(width) * u64::from(height) * PIXEL_BYTES as u64
+        scratch_bytes(frames, width, height).ok_or_else(|| RawError::BudgetOverflow {
+            path: self.frames[0].metadata.path.clone(),
+        })
     }
 
     /// Metadata for frame `index`.
@@ -527,6 +533,12 @@ impl FrameReader for RawStack {
 
     fn frame(&self, index: usize) -> &FrameDesc {
         &self.frames[index].desc
+    }
+
+    fn develop_scratch_bytes(&self) -> Result<u64, AlgorithmError> {
+        Ok(self
+            .scratch_total(self.frames.len())
+            .map_err(FrameError::from)?)
     }
 
     fn develop_counts(&self) -> Option<Vec<u64>> {
@@ -755,6 +767,15 @@ impl TileReader for RawStack {
         let developed = self.developed(frame).map_err(crate::io::FrameError::from)?;
         Ok(Some(developed.means()))
     }
+}
+
+/// Bytes `frames` developed frames of `width` x `height` occupy in scratch
+/// files; `None` when the total overflows `u64`.
+fn scratch_bytes(frames: usize, width: u32, height: u32) -> Option<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(PIXEL_BYTES as u64)?
+        .checked_mul(frames as u64)
 }
 
 const IDENTITY_MATRIX: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -1368,8 +1389,23 @@ fn seam<T>(path: &Path, operation: impl FnOnce() -> rawler::Result<T>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{RawError, panic_boundary};
+    use super::{RawError, panic_boundary, scratch_bytes};
     use std::path::Path;
+
+    #[test]
+    fn scratch_space_needed_overflow_is_an_error() {
+        let widest = u64::from(u32::MAX);
+        assert_eq!(scratch_bytes(1, u32::MAX, u32::MAX), None);
+        assert_eq!(scratch_bytes(2, u32::MAX, u32::MAX), None);
+        assert_eq!(
+            scratch_bytes(1, u32::MAX, 715_827_882),
+            Some(widest * 715_827_882 * 6)
+        );
+        assert_eq!(scratch_bytes(1, u32::MAX, 715_827_883), None);
+        let frames = (u64::MAX / 6) as usize;
+        assert_eq!(scratch_bytes(frames, 1, 1), Some(frames as u64 * 6));
+        assert_eq!(scratch_bytes(frames + 1, 1, 1), None);
+    }
 
     #[test]
     fn caught_decoder_panic_does_not_poison_the_next_open() {
