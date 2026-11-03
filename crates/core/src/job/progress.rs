@@ -45,6 +45,13 @@ pub struct JobProgress {
     /// The frame count the prepare stage started with, `0` when the run does
     /// not equalize.
     pub prepare_total: usize,
+    /// How many RAW frames have been developed into scratch during the
+    /// develop stage. `0` on a run without the pass; like `align_done` it
+    /// keeps its final tally once the stage ends.
+    pub develop_done: usize,
+    /// The frame count the develop stage started with, `0` on a run without
+    /// the pass.
+    pub develop_total: usize,
 }
 
 /// Area-weighted mean ETA:

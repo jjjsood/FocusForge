@@ -33,8 +33,8 @@ use focusforge_core::job::{
 };
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
-    AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest, PipelineError,
-    RunStage, StageObserver,
+    AlignRequest, FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest,
+    PipelineError, RunStage, StageObserver, VolumeShortfall, VolumeSpace,
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
@@ -92,12 +92,277 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
+        free_space: None,
     }
 }
 
 #[derive(Default)]
 struct NoopObserver;
 impl StageObserver for NoopObserver {}
+
+/// Every path is on the volume `name` with `free` bytes free.
+fn volume(name: &str, free: u64) -> std::io::Result<VolumeSpace> {
+    Ok(VolumeSpace {
+        volume: name.into(),
+        free,
+    })
+}
+
+/// A probe answering through `answer` that records every path it is asked about.
+fn recording_probe(
+    answer: impl Fn(&Path) -> std::io::Result<VolumeSpace> + Send + Sync + 'static,
+) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let probe: FreeSpaceProbe = Arc::new(move |path: &Path| {
+        log.lock().expect("probe log").push(path.to_path_buf());
+        answer(path)
+    });
+    (probe, asked)
+}
+
+/// Everything under `out_dir` is the volume "output", everything else "scratch".
+fn two_volumes(out_dir: &Path, scratch_free: u64, output_free: u64) -> FreeSpaceProbe {
+    let out_dir = out_dir.to_path_buf();
+    recording_probe(move |path| {
+        if path.starts_with(&out_dir) {
+            volume("output", output_free)
+        } else {
+            volume("scratch", scratch_free)
+        }
+    })
+    .0
+}
+
+fn run_plain(request: &FuseRequest) -> Result<FuseOutcome, PipelineError> {
+    focusforge_core::pipeline::run(request, &NoopObserver, JobControl::new(), None)
+}
+
+/// The shortfalls `request` is refused with under `probe`.
+fn refusal(request: &mut FuseRequest, probe: FreeSpaceProbe) -> Vec<VolumeShortfall> {
+    request.free_space = Some(probe);
+    match run_plain(request) {
+        Err(PipelineError::DiskSpace(shortfalls)) => shortfalls,
+        Err(other) => panic!("expected a disk-space refusal, got {other:?}"),
+        Ok(_) => panic!("a volume that is short must refuse the run"),
+    }
+}
+
+/// The one shortfall `request` is refused with when its single volume has
+/// nothing free.
+fn needed_on_one_volume(request: &mut FuseRequest) -> u64 {
+    let shortfalls = refusal(request, recording_probe(|_| volume("only", 0)).0);
+    assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    shortfalls[0].needed
+}
+
+/// A request whose result goes to a directory of its own, apart from the
+/// scratch root; returns that directory and the run directory.
+fn split_request(label: &str, file: &str) -> (FuseRequest, PathBuf, PathBuf) {
+    let mut request = base_request(label, mantis_frames(2), ParamValues::new());
+    let out_dir = scratch(&format!("{label}_out"));
+    request.output = FuseOutput::Seal(out_dir.join(file));
+    let root = request
+        .scratch_root
+        .parent()
+        .expect("run directory")
+        .to_path_buf();
+    (request, root, out_dir)
+}
+
+fn hold_beside_scratch(request: &mut FuseRequest) {
+    request.output = FuseOutput::Hold(request.scratch_root.with_file_name("held"));
+}
+
+#[test]
+fn run_space_staged_bytes_cover_written_staging() {
+    for (frames, tile_size) in [(2, 448), (3, 448), (2, 256), (3, 256)] {
+        let label = format!("space_staged_{frames}_{tile_size}");
+        let make = || {
+            // Three levels keep the 256-pixel tile larger than the support margin.
+            let mut explicit = ParamValues::new();
+            explicit.insert("levels".to_string(), ParamValue::Int(3));
+            let mut request = base_request(&label, mantis_frames(frames), explicit);
+            request.tile_size = Some(tile_size);
+            hold_beside_scratch(&mut request);
+            request
+        };
+        let needed = needed_on_one_volume(&mut make());
+        let FuseOutcome::Completed(report) = run_plain(&make()).expect("the hold run completes")
+        else {
+            panic!("expected a completed run");
+        };
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        let written: u64 = [&held.composite, &held.zmap]
+            .iter()
+            .map(|file| std::fs::metadata(file).expect("held plane").len())
+            .sum();
+        assert!(
+            needed >= written && needed - written < 256 * 1024,
+            "{frames} frames, tile {tile_size}: needed {needed}, staged {written}"
+        );
+    }
+}
+
+#[test]
+fn tiff_run_refuses_when_run_space_is_short() {
+    let label = "space_short";
+    let needed = needed_on_one_volume(&mut base_request(
+        label,
+        mantis_frames(2),
+        ParamValues::new(),
+    ));
+    for free in [needed - 1, 0] {
+        let mut request = base_request(label, mantis_frames(2), ParamValues::new());
+        let root = request
+            .scratch_root
+            .parent()
+            .expect("run directory")
+            .to_path_buf();
+        request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+        let Err(error) = run_plain(&request) else {
+            panic!("a run that does not fit must be refused");
+        };
+        let PipelineError::DiskSpace(shortfalls) = &error else {
+            panic!("expected a disk-space refusal, got {error:?}");
+        };
+        assert_eq!(
+            shortfalls.as_slice(),
+            [VolumeShortfall {
+                path: root,
+                needed,
+                free
+            }]
+        );
+        let text = error.to_string();
+        for want in [
+            format!("{needed} bytes"),
+            format!("{free} bytes"),
+            format!("{:.1} GB", needed as f64 / 1e9),
+            format!("{:.1} GB", free as f64 / 1e9),
+        ] {
+            assert!(text.contains(&want), "{want:?} missing from {text}");
+        }
+        assert!(!request.scratch_root.join("projects").exists());
+        assert!(!request.scratch_root.join("resume").exists());
+    }
+}
+
+#[test]
+fn run_space_is_summed_per_volume() {
+    // Two volumes: one shortfall each, carrying only its own term.
+    let (mut request, root, out_dir) = split_request("space_volumes", "project.ffp");
+    let split = refusal(&mut request, two_volumes(&out_dir, 0, 0));
+    assert_eq!(split.len(), 2, "{split:?}");
+    let term = |dir: &Path| {
+        split
+            .iter()
+            .find(|shortfall| shortfall.path == dir)
+            .unwrap_or_else(|| panic!("{dir:?} missing from {split:?}"))
+            .needed
+    };
+    let (scratch_term, output_term) = (term(&root), term(&out_dir));
+    assert!(scratch_term > 0 && output_term > 0);
+
+    // One volume: the single shortfall carries the sum, at the first path.
+    let (mut request, root, _) = split_request("space_volumes", "project.ffp");
+    let one = refusal(&mut request, recording_probe(|_| volume("only", 0)).0);
+    assert_eq!(
+        one,
+        [VolumeShortfall {
+            path: root,
+            needed: scratch_term + output_term,
+            free: 0
+        }]
+    );
+
+    // Only the output volume short: only it is named, with its own bytes.
+    let (mut request, _, out_dir) = split_request("space_volumes", "project.ffp");
+    let only_output = refusal(&mut request, two_volumes(&out_dir, u64::MAX, 0));
+    assert_eq!(
+        only_output,
+        [VolumeShortfall {
+            path: out_dir,
+            needed: output_term,
+            free: 0
+        }]
+    );
+
+    // A hold asks about the scratch root alone.
+    let (mut request, root, _) = split_request("space_volumes", "project.ffp");
+    hold_beside_scratch(&mut request);
+    let (probe, asked) = recording_probe(|_| volume("only", 0));
+    refusal(&mut request, probe);
+    assert_eq!(asked.lock().expect("probe log").as_slice(), [root]);
+}
+
+#[test]
+fn run_proceeds_when_run_space_suffices() {
+    let held = |free: Option<u64>| {
+        let mut request = base_request("space_proceeds", mantis_frames(2), ParamValues::new());
+        hold_beside_scratch(&mut request);
+        request.free_space = free.map(|free| recording_probe(move |_| volume("only", free)).0);
+        let FuseOutcome::Completed(report) = run_plain(&request).expect("the run completes") else {
+            panic!("expected a completed run");
+        };
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        std::fs::read(&held.composite).expect("composite is readable")
+    };
+    let mut request = base_request("space_proceeds", mantis_frames(2), ParamValues::new());
+    hold_beside_scratch(&mut request);
+    let needed = needed_on_one_volume(&mut request);
+    assert_eq!(held(Some(needed)), held(None));
+
+    // A sealed run whose two volumes each hold exactly their term.
+    let (mut request, _, out_dir) = split_request("space_proceeds_seal", "project.ffp");
+    let split = refusal(&mut request, two_volumes(&out_dir, 0, 0));
+    let exact = |dir: &Path| split.iter().find(|s| s.path == dir).expect("volume").needed;
+    let (mut request, root, out_dir) = split_request("space_proceeds_seal", "project.ffp");
+    request.free_space = Some(two_volumes(&out_dir, exact(&root), exact(&out_dir)));
+    assert!(matches!(
+        run_plain(&request).expect("a run that exactly fits completes"),
+        FuseOutcome::Completed(_)
+    ));
+}
+
+#[test]
+fn run_space_query_failure_refuses_the_run() {
+    let (mut request, _, out_dir) = split_request("space_query", "a/b/project.ffp");
+    let failing = out_dir.clone();
+    let (probe, asked) = recording_probe(move |path| {
+        if path.starts_with(&failing) {
+            Err(std::io::Error::other("output volume refused"))
+        } else {
+            volume("scratch", u64::MAX)
+        }
+    });
+    request.free_space = Some(probe);
+    let Err(error) = run_plain(&request) else {
+        panic!("an unanswered query must refuse the run");
+    };
+    let PipelineError::DiskSpaceQuery { path, .. } = &error else {
+        panic!("expected a query failure, got {error:?}");
+    };
+    assert_eq!(path, &out_dir);
+    let text = error.to_string();
+    assert!(text.contains("output volume refused"), "{text}");
+    assert!(text.contains(&out_dir.display().to_string()), "{text}");
+    assert_eq!(
+        asked
+            .lock()
+            .expect("probe log")
+            .iter()
+            .filter(|path| path.starts_with(&out_dir))
+            .collect::<Vec<_>>(),
+        [&out_dir]
+    );
+    assert!(!request.scratch_root.join("projects").exists());
+    assert!(!request.scratch_root.join("resume").exists());
+}
 
 #[test]
 fn run_resolves_params_against_the_frames_it_opens() {
@@ -150,6 +415,7 @@ struct StageLog {
 impl StageObserver for StageLog {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
@@ -2044,6 +2310,7 @@ struct StageProbe {
 impl StageObserver for StageProbe {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
@@ -2076,6 +2343,10 @@ fn prepare_stage_is_reported_before_align() {
         request.output = FuseOutput::Hold(scratch("eq_prepare_stage_hold"));
         focusforge_core::pipeline::run(&request, &probe, control, None).expect("the run completes");
         let seen = probe.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(label, _)| *label != "develop"),
+            "a TIFF run develops nothing up front: {seen:?}"
+        );
         assert_eq!(seen[0].0, first);
         if first == "prepare" {
             assert_eq!(seen[0], ("prepare", JobStage::Prepare));
@@ -2670,6 +2941,7 @@ impl PreviewLog {
 impl StageObserver for PreviewLog {
     fn stage(&self, stage: RunStage) {
         let name = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",

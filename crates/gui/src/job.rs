@@ -86,7 +86,10 @@ impl FailedOperation {
 impl From<&PipelineError> for FailedOperation {
     fn from(err: &PipelineError) -> Self {
         match err {
-            PipelineError::Input(_) | PipelineError::Params(_) => FailedOperation::Setup,
+            PipelineError::Input(_)
+            | PipelineError::Params(_)
+            | PipelineError::DiskSpace(_)
+            | PipelineError::DiskSpaceQuery { .. } => FailedOperation::Setup,
             PipelineError::Align(_) => FailedOperation::Alignment,
             _ => FailedOperation::Fusion,
         }
@@ -309,6 +312,8 @@ mod stage_tests {
             align_total: 0,
             prepare_done: 0,
             prepare_total: 0,
+            develop_done: 0,
+            develop_total: 0,
         }
     }
 
@@ -419,6 +424,18 @@ mod stage_tests {
             Phase::Fusing,
             "no Preparing snapshot is left between alignment and the first fuse tick"
         );
+    }
+
+    #[test]
+    fn developing_raw_frames_shows_the_preparing_card() {
+        let observer = GuiObserver::with_previews(PreviewKinds::default(), HeatRamp::default());
+        observer.stage(RunStage::Develop { frames: 3 });
+        let developing = observer.last_progress();
+        assert_eq!(progress_phase(developing.as_ref()), Phase::Developing);
+        assert!(matches!(
+            observer.stage_view(developing.as_ref(), false, Instant::now()),
+            Some(StageView::Placeholder { title, .. }) if title == PREPARING.0
+        ));
     }
 
     #[test]
@@ -584,6 +601,7 @@ pub fn fuse_request(
         resume: false,
         cache: true,
         poll: POLL,
+        free_space: None,
     }
 }
 
@@ -965,7 +983,7 @@ impl GuiObserver {
             }))
         };
         match progress_phase(Some(progress)) {
-            Phase::Preparing => card(PREPARING),
+            Phase::Developing | Phase::Preparing => card(PREPARING),
             Phase::Aligning => match &images.aligned {
                 Some((frame, pixels, extent)) => {
                     image(Some(*frame), pixels, *extent, Vec::new(), None)
@@ -1090,13 +1108,13 @@ impl StageObserver for GuiObserver {
         ) {
             self.stage_images().aligned = None;
         }
-        // The first Prepare snapshot is recorded here, so the bar shows the
-        // frame total before the engine's first tick. A cached alignment
-        // never ticks, so its stage is recorded here too; a computed one
-        // ticks on its own, with a real total. Fuse is recorded at once, so
-        // the cleared aligned frame is followed by the Fusing card, never by
-        // a stale Preparing one before the first fuse tick.
-        let snapshot = |stage, prepare_total| JobProgress {
+        // The first Develop and Prepare snapshots are recorded here, so the
+        // bar shows the frame total before the engine's first tick. A cached
+        // alignment never ticks, so its stage is recorded here too; a computed
+        // one ticks on its own, with a real total. Fuse is recorded at once,
+        // so the cleared aligned frame is followed by the Fusing card, never
+        // by a stale Preparing one before the first fuse tick.
+        let snapshot = |stage, prepare_total, develop_total| JobProgress {
             stage,
             units_done: 0,
             unit_total: 0,
@@ -1108,14 +1126,17 @@ impl StageObserver for GuiObserver {
             align_total: 0,
             prepare_done: 0,
             prepare_total,
+            develop_done: 0,
+            develop_total,
         };
         match stage {
-            RunStage::Prepare { frames } => self.tick(&snapshot(JobStage::Prepare, frames)),
+            RunStage::Develop { frames } => self.tick(&snapshot(JobStage::Develop, 0, frames)),
+            RunStage::Prepare { frames } => self.tick(&snapshot(JobStage::Prepare, frames, 0)),
             RunStage::Align {
                 source: AlignSource::Cached,
                 ..
-            } => self.tick(&snapshot(JobStage::Align, 0)),
-            RunStage::Fuse => self.tick(&snapshot(JobStage::Fuse, 0)),
+            } => self.tick(&snapshot(JobStage::Align, 0, 0)),
+            RunStage::Fuse => self.tick(&snapshot(JobStage::Fuse, 0, 0)),
             _ => {}
         }
     }
@@ -1201,6 +1222,7 @@ impl StageObserver for GuiObserver {
 /// phase added later needs only an arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    Developing,
     Preparing,
     Aligning,
     Fusing,
@@ -1210,6 +1232,7 @@ pub enum Phase {
 impl Phase {
     pub fn name(self) -> &'static str {
         match self {
+            Phase::Developing => "Developing",
             Phase::Preparing => "Preparing",
             Phase::Aligning => "Aligning",
             Phase::Fusing => "Fusing",
@@ -1219,10 +1242,13 @@ impl Phase {
 
     /// `Some((done, total))` while `self` works per frame and `progress`
     /// carries a non-zero total for it, `None` otherwise -- a cached or
-    /// resumed alignment included, since its total is `0`. `Preparing` and
-    /// `Aligning` are the phases with a frame total.
+    /// resumed alignment included, since its total is `0`. `Developing`,
+    /// `Preparing` and `Aligning` are the phases with a frame total.
     pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
         match self {
+            Phase::Developing if progress.develop_total > 0 => {
+                Some((progress.develop_done, progress.develop_total))
+            }
             Phase::Preparing if progress.prepare_total > 0 => {
                 Some((progress.prepare_done, progress.prepare_total))
             }
@@ -1234,13 +1260,15 @@ impl Phase {
     }
 }
 
-/// Which [`Phase`] `progress` is on: `Preparing` while the engine reports the
+/// Which [`Phase`] `progress` is on: `Developing` while the engine reports
+/// the up-front RAW develop pass, `Preparing` while it reports the
 /// brightness preparation, `Aligning` while it reports the align stage,
 /// `Writing` once every unit of the fuse stage is done (the seal, which the
 /// engine reports as no stage of its own -- `JobStage` has no seal stage),
 /// `Fusing` otherwise -- including no progress at all yet.
 pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     match progress {
+        Some(p) if p.stage == JobStage::Develop => Phase::Developing,
         Some(p) if p.stage == JobStage::Prepare => Phase::Preparing,
         Some(p) if p.stage == JobStage::Align => Phase::Aligning,
         Some(p) if p.unit_total > 0 && p.units_done >= p.unit_total => Phase::Writing,
@@ -1248,8 +1276,8 @@ pub fn progress_phase(progress: Option<&JobProgress>) -> Phase {
     }
 }
 
-/// The stage word the bar shows for `state`/`progress` -- `Preparing`,
-/// `Aligning`, `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a
+/// The stage word the bar shows for `state`/`progress` -- `Developing`,
+/// `Preparing`, `Aligning`, `Fusing`, `Writing`, `Paused`, `Cancelling`, `Failed` or a
 /// completed run's own `fused HH:MM`. `progress` picks the phase word while
 /// running, via `progress_phase`.
 pub fn stage_word(state: &RunState, progress: Option<&JobProgress>) -> String {
@@ -1374,13 +1402,17 @@ pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     }
 }
 
-/// The bar's fill fraction: during the prepare stage,
+/// The bar's fill fraction: during the develop pass,
+/// `develop_done / develop_total`; during the prepare stage,
 /// `prepare_done / prepare_total`; during a computed align stage,
 /// `align_done / align_total`, restarting from zero once the fuse stage
 /// begins; otherwise `units_done / unit_total` of the fuse job. `0.0` before
 /// the first unit, during a cached align stage, or with no run at all.
 pub fn bar_fraction(progress: Option<&JobProgress>) -> f32 {
     match progress {
+        Some(p) if p.stage == JobStage::Develop && p.develop_total > 0 => {
+            p.develop_done as f32 / p.develop_total as f32
+        }
         Some(p) if p.stage == JobStage::Prepare && p.prepare_total > 0 => {
             p.prepare_done as f32 / p.prepare_total as f32
         }

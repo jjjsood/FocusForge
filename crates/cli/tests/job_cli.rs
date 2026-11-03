@@ -331,13 +331,13 @@ fn prepare_progress_reaches_a_redirected_log() {
     let prepare: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.starts_with("prepare ") && line.ends_with(" frames"))
+        .filter(|(_, line)| line.starts_with("prepare ") && line.contains(" frames eta "))
         .filter(|(_, line)| line.contains('/'))
         .map(|(at, _)| at)
         .collect();
     let first = prepare
         .first()
-        .unwrap_or_else(|| panic!("no `prepare <k>/<N> frames` line: {}", out.stderr));
+        .unwrap_or_else(|| panic!("no `prepare <k>/<N> frames eta` line: {}", out.stderr));
     assert!(
         lines[*first].starts_with("prepare 0/8 frames"),
         "the first count line: {}",

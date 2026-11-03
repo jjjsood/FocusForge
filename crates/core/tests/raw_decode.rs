@@ -4,13 +4,22 @@ mod common;
 #[path = "common/raw_dng.rs"]
 mod raw_dng;
 
-use focusforge_core::algorithm::TileReader;
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::io::Rect;
 use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
+use focusforge_core::job::{JobControl, JobStage};
+use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::pipeline::{
+    FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
+    StageObserver, VolumeShortfall, VolumeSpace,
+};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::raw_dng::{DngSpec, write_dng};
 
@@ -573,7 +582,7 @@ fn decoded_frames_stay_within_budget() {
             &mut output,
         )
         .expect_err("overflowed geometry must fail before decode");
-    assert!(error.to_string().contains("overflows cache accounting"));
+    assert!(error.to_string().contains("overflows a byte count"));
 }
 
 #[test]
@@ -596,6 +605,90 @@ fn sigma_pin_rejects_a_replaced_fixture() {
         })
         .is_err()
     );
+}
+
+/// Prints how far scratch reads of whole corpus frames fall from cached reads.
+#[test]
+#[ignore]
+fn raw_scratch_error_on_corpus_frames() {
+    let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
+        eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
+        return;
+    };
+    for name in ["panasonic-dmc-lx7.rw2", "fujifilm-x-s10.raf"] {
+        let path = PathBuf::from(&samples).join(name);
+        if !path.is_file() {
+            eprintln!("skip: {} is missing", path.display());
+            continue;
+        }
+        let cached = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
+        let developed = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
+        let root = target_tmp();
+        developed
+            .develop_once(root.path(), u64::MAX, 1, &|| false, &AtomicUsize::new(0))
+            .expect("the pass develops the frame");
+        let (width, height) = cached.dimensions();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let count = width as usize * height as usize * 3;
+
+        let (mut want16, mut got16) = (vec![0u16; count], vec![0u16; count]);
+        cached
+            .read_tile_into(0, rect, &mut want16)
+            .expect("cached u16 read");
+        developed
+            .read_tile_into(0, rect, &mut got16)
+            .expect("mapped u16 read");
+        let differing16 = want16.iter().zip(&got16).filter(|(w, g)| w != g).count();
+        let worst16 = want16.iter().zip(&got16).map(|(w, g)| w.abs_diff(*g)).max();
+        let over = |limit: u16| {
+            want16
+                .iter()
+                .zip(&got16)
+                .filter(|(w, g)| w.abs_diff(**g) > limit)
+                .count()
+        };
+
+        let (mut want, mut got) = (vec![0f32; count], vec![0f32; count]);
+        cached
+            .read_tile_f32_into(0, rect, &mut want)
+            .expect("cached f32 read");
+        developed
+            .read_tile_f32_into(0, rect, &mut got)
+            .expect("mapped f32 read");
+        let differing = want.iter().zip(&got).filter(|(w, g)| w != g).count();
+        let worst = want
+            .iter()
+            .zip(&got)
+            .map(|(w, g)| (w - g).abs())
+            .fold(0.0f32, f32::max);
+        let worst_relative = want
+            .iter()
+            .zip(&got)
+            .map(|(w, g)| (w - g).abs() / (w.abs() / 65_535.0).max(1.0))
+            .fold(0.0f32, f32::max);
+        let (low, high) = got.iter().fold((f32::MAX, f32::MIN), |(low, high), v| {
+            (low.min(*v), high.max(*v))
+        });
+        eprintln!(
+            "{name}: {width}x{height} u16 max diff {worst16:?} LSB, {differing16} differ; \
+             u16 diff over 8/16/32/64 LSB: {}/{}/{}/{}; \
+             f32 max diff {worst} (relative bound {worst_relative}) LSB, {differing} differ; \
+             mapped f32 min {low} max {high}",
+            over(8),
+            over(16),
+            over(32),
+            over(64),
+        );
+        assert!(
+            got.iter().all(|value| value.is_finite()),
+            "{name}: a mapped read is not finite"
+        );
+    }
 }
 
 #[test]
@@ -1835,4 +1928,737 @@ fn raw_f32_stack_agrees_with_the_u16_stack_below_white() {
         (0..3).all(|c| fused.wide[c].abs_diff(fused.narrow[c]) <= 1),
         "{fused:?}"
     );
+}
+
+/// A gradient frame in the tinted camera, its pixels moving with `shift`.
+fn gradient_dng(width: u32, height: u32, shift: u32) -> tempfile::NamedTempFile {
+    let samples = (0..width * height)
+        .map(|i| ((((i % width) + (i / width)) * 8 + shift) % 4000) as u16)
+        .collect();
+    write_dng(&tinted_spec(samples, width, height, [0, 1, 1, 2]), false)
+}
+
+fn copies_of(dng: &tempfile::NamedTempFile, count: usize, dir: &Path) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let path = dir.join(format!("{index:02}.dng"));
+            std::fs::copy(dng.path(), &path).expect("copy the DNG frame");
+            path
+        })
+        .collect()
+}
+
+fn target_tmp() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temporary directory")
+}
+
+struct NoopObserver;
+impl StageObserver for NoopObserver {}
+
+fn raw_request(
+    frames: Vec<PathBuf>,
+    root: &Path,
+    equalize: Option<EqualizeSettings>,
+    max_host_memory: Option<u64>,
+) -> FuseRequest {
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(3));
+    FuseRequest {
+        frames,
+        output: FuseOutput::Seal(root.join("project.ffp")),
+        scratch_root: root.join("scratch"),
+        staging_key: "raw-develop".to_string(),
+        algorithm: focusforge_core::registry::find_stack("laplacian")
+            .expect("laplacian is registered"),
+        explicit,
+        align: None,
+        crop: false,
+        equalize,
+        tile_size: Some(160),
+        max_host_memory,
+        backend: None,
+        align_backend: None,
+        resume: false,
+        cache: false,
+        poll: std::time::Duration::from_millis(5),
+        free_space: None,
+    }
+}
+
+#[test]
+fn raw_stack_develops_each_frame_once() {
+    let dng = gradient_dng(256, 256, 0);
+    for equalize in [
+        None,
+        Some(EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        }),
+    ] {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 8, root.path());
+        // Room for two developed frames and a decode, far below the stack.
+        let request = raw_request(frames, root.path(), equalize, Some(12 * 1024 * 1024));
+        let outcome =
+            focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+                .expect("the RAW run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(
+            report.develop_counts,
+            Some(vec![1; 8]),
+            "equalize: {equalize:?}"
+        );
+    }
+}
+
+/// Largest read difference, in 16-bit output LSB, a frame read through the
+/// scratch file may show against the same read through the in-memory cache:
+/// half-precision storage reaches 86 LSB on the Panasonic and 42 on the
+/// Fujifilm bench frame, a few samples in a million above 32.
+const SCRATCH_TOLERANCE: f32 = 96.0;
+
+/// Whether a scratch read `got` is within [`SCRATCH_TOLERANCE`] of the cached
+/// read `want`; the bound grows relative to `want` above white.
+fn within_scratch_bound(want: f32, got: f32) -> bool {
+    (got - want).abs() <= SCRATCH_TOLERANCE * (want.abs() / 65_535.0).max(1.0)
+}
+
+fn assert_scratch_f32_reads(want: &[f32], got: &[f32], what: &str) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    for (index, (want, got)) in want.iter().zip(got).enumerate() {
+        assert!(
+            within_scratch_bound(*want, *got),
+            "{what}: sample {index} read {got} against {want}"
+        );
+    }
+}
+
+fn assert_scratch_u16_reads(want: &[u16], got: &[u16], what: &str) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    for (index, (want, got)) in want.iter().zip(got).enumerate() {
+        assert!(
+            f32::from(want.abs_diff(*got)) <= SCRATCH_TOLERANCE,
+            "{what}: sample {index} read {got} against {want}"
+        );
+    }
+}
+
+#[test]
+fn raw_develop_pass_reads_match_cached_reads() {
+    const SIDE: (u32, u32) = (40, 30);
+    let files: Vec<_> = (0..3)
+        .map(|i| gradient_dng(SIDE.0, SIDE.1, i * 700))
+        .collect();
+    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+    let cached = RawStack::open_files(&paths).expect("DNG stack opens");
+    let developed = RawStack::open_files(&paths).expect("DNG stack opens");
+    let root = target_tmp();
+    developed
+        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect("the pass develops every frame");
+    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+    let rects = [
+        Rect {
+            x: 0,
+            y: 0,
+            width: SIDE.0,
+            height: SIDE.1,
+        },
+        Rect {
+            x: SIDE.0 - 5,
+            y: SIDE.1 - 3,
+            width: 5,
+            height: 3,
+        },
+        Rect {
+            x: SIDE.0 - 1,
+            y: SIDE.1 - 1,
+            width: 1,
+            height: 1,
+        },
+    ];
+    for frame in 0..3 {
+        for rect in rects {
+            let samples = rect.width as usize * rect.height as usize * 3;
+            for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                cached
+                    .read_tile_gained_into(frame, rect, gain, &mut want)
+                    .expect("cached read");
+                developed
+                    .read_tile_gained_into(frame, rect, gain, &mut got)
+                    .expect("mapped read");
+                assert_scratch_u16_reads(
+                    &want,
+                    &got,
+                    &format!("u16 frame {frame} {rect:?} gain {gain}"),
+                );
+
+                let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                cached
+                    .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                    .expect("cached read");
+                developed
+                    .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                    .expect("mapped read");
+                assert_scratch_f32_reads(
+                    &want,
+                    &got,
+                    &format!("f32 frame {frame} {rect:?} gain {gain}"),
+                );
+            }
+            let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+            cached
+                .read_tile_into(frame, rect, &mut want)
+                .expect("cached read");
+            developed
+                .read_tile_into(frame, rect, &mut got)
+                .expect("mapped read");
+            assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
+            let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+            cached
+                .read_tile_f32_into(frame, rect, &mut want)
+                .expect("cached read");
+            developed
+                .read_tile_f32_into(frame, rect, &mut got)
+                .expect("mapped read");
+            assert_scratch_f32_reads(
+                &want,
+                &got,
+                &format!("unit gain f32 frame {frame} {rect:?}"),
+            );
+        }
+        assert_eq!(
+            cached.linear_means(frame).expect("cached means"),
+            developed.linear_means(frame).expect("mapped means"),
+            "means of frame {frame}"
+        );
+    }
+    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+}
+
+fn scratch_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("scratch directory lists") {
+            let path = entry.expect("scratch entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn raw_scratch_file_size_matches_encoding() {
+    let dng = gradient_dng(48, 20, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 8, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).expect("scratch root");
+    stack
+        .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect("the pass develops every frame");
+    let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
+    assert_eq!(frame_bytes, 48 * 20 * 6);
+    let files = scratch_files(&scratch);
+    assert_eq!(files.len(), 8, "{files:?}");
+    for file in files {
+        let length = std::fs::metadata(&file).expect("scratch file").len();
+        assert_eq!(length, frame_bytes, "{}", file.display());
+    }
+}
+
+#[test]
+fn raw_scratch_keeps_values_above_white() {
+    let files = [textured_dng(2600), textured_dng(1500)];
+    let cached = open_pair(&files);
+    let developed = open_pair(&files);
+    let root = target_tmp();
+    developed
+        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect("the pass develops every frame");
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: SIDE,
+    };
+    let samples = SIDE as usize * SIDE as usize * 3;
+    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+    cached
+        .read_tile_f32_into(0, rect, &mut want)
+        .expect("cached read");
+    developed
+        .read_tile_f32_into(0, rect, &mut got)
+        .expect("mapped read");
+    assert!(got.iter().any(|value| *value > 65_535.0 + 100.0));
+    assert_scratch_f32_reads(&want, &got, "highlight frame");
+}
+
+#[test]
+fn raw_develops_overlap() {
+    let dng = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let one = 8 * 8 * 30 + std::fs::metadata(dng.path()).expect("DNG size").len();
+    let paths = vec![PathBuf::from(dng.path()); 4];
+    let root = target_tmp();
+    let developed = AtomicUsize::new(0);
+    let pass = |budget: u64, workers: usize| {
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        developed.store(0, Ordering::SeqCst);
+        let result = stack.develop_once(root.path(), budget, workers, &|| false, &developed);
+        (stack, result)
+    };
+
+    let (stack, result) = pass(4 * one, 4);
+    assert_eq!(result.expect("four reservations fit"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(one + one / 2, 4);
+    assert_eq!(result.expect("one and a half reservations fit one"), 1);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(100 * one, 8);
+    assert_eq!(result.expect("workers beyond the frames idle"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+
+    let (stack, result) = pass(one - 1, 4);
+    let error = result.expect_err("a budget below one reservation refuses");
+    assert!(
+        matches!(
+            error,
+            AlgorithmError::Frame(FrameError::Raw(RawError::CacheTooSmall { required, .. }))
+                if required == one
+        ),
+        "{error}"
+    );
+    assert_eq!(stack.develop_counts(), Some(vec![0; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 0);
+}
+
+/// `root` holds no file or directory.
+fn assert_scratch_empty(root: &Path) {
+    let left: Vec<_> = match std::fs::read_dir(root) {
+        Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+        Err(_) => Vec::new(),
+    };
+    assert!(left.is_empty(), "scratch left behind: {left:?}");
+}
+
+#[test]
+fn raw_develop_failure_leaves_no_scratch() {
+    let good = gradient_dng(256, 256, 0);
+    let withheld = write_dng(
+        &tinted_spec(vec![64; 256 * 256], 256, 256, [0, 1, 1, 2]),
+        true,
+    );
+    let root = target_tmp();
+    let frames = vec![
+        PathBuf::from(good.path()),
+        PathBuf::from(withheld.path()),
+        PathBuf::from(good.path()),
+    ];
+    let request = raw_request(frames, root.path(), None, None);
+    let Err(error) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+    else {
+        panic!("a frame without pixels must end the run");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&withheld.path().display().to_string()),
+        "{error}"
+    );
+    assert_scratch_empty(&request.scratch_root);
+
+    let request = raw_request(copies_of(&good, 3, root.path()), root.path(), None, None);
+    let control = JobControl::new();
+    control.cancel();
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, control, None)
+        .expect("a pre-cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_scratch_empty(&request.scratch_root);
+}
+
+/// Records the stage announcements and, on [`RunStage::Develop`], what the
+/// control reports at that moment; cancels the run there when asked.
+struct DevelopWatch {
+    control: Arc<JobControl>,
+    cancel_on_develop: bool,
+    seen: Mutex<Vec<&'static str>>,
+    at_develop: Mutex<Option<(JobStage, usize, usize)>>,
+}
+
+impl DevelopWatch {
+    fn new(control: &Arc<JobControl>, cancel_on_develop: bool) -> Self {
+        DevelopWatch {
+            control: Arc::clone(control),
+            cancel_on_develop,
+            seen: Mutex::default(),
+            at_develop: Mutex::default(),
+        }
+    }
+}
+
+impl StageObserver for DevelopWatch {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { frames } => {
+                let p = self.control.progress();
+                *self.at_develop.lock().expect("no panic while logging") =
+                    Some((p.stage, p.develop_total, frames));
+                if self.cancel_on_develop {
+                    self.control.cancel();
+                }
+                "develop"
+            }
+            RunStage::Prepare { .. } => "prepare",
+            RunStage::Align { .. } => "align",
+            RunStage::Fuse => "fuse",
+            _ => "other",
+        };
+        self.seen.lock().expect("no panic while logging").push(name);
+    }
+}
+
+#[test]
+fn raw_run_reports_the_develop_stage() {
+    let dng = gradient_dng(64, 64, 0);
+    for count in [3, 5] {
+        let root = target_tmp();
+        let request = raw_request(
+            copies_of(&dng, count, root.path()),
+            root.path(),
+            Some(EqualizeSettings {
+                max_gain: 4.0,
+                target_stops: 0.0,
+            }),
+            None,
+        );
+        let control = JobControl::new();
+        let watch = DevelopWatch::new(&control, false);
+        let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+            .expect("the RAW run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        let seen = watch.seen.lock().expect("no panic while logging");
+        assert_eq!(
+            seen[..2],
+            ["develop", "prepare"],
+            "{count} frames: {seen:?}"
+        );
+        assert_eq!(
+            *watch.at_develop.lock().expect("no panic while logging"),
+            Some((JobStage::Develop, count, count)),
+            "the control is on the develop stage when it is announced"
+        );
+        let progress = control.progress();
+        assert_eq!(
+            (progress.develop_done, progress.develop_total),
+            (count, count)
+        );
+        assert!(report.stages.develop.is_some(), "{:?}", report.stages);
+    }
+
+    let root = target_tmp();
+    let request = raw_request(copies_of(&dng, 4, root.path()), root.path(), None, None);
+    let control = JobControl::new();
+    let watch = DevelopWatch::new(&control, true);
+    let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+        .expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        watch.seen.lock().expect("no panic while logging")[..],
+        ["develop"],
+        "nothing follows a cancel raised on the develop announcement"
+    );
+    assert_scratch_empty(&request.scratch_root);
+}
+
+/// Cancels the run from a tick that reports every frame developed, and
+/// records the stage announcements that follow.
+struct CancelWhenDeveloped {
+    control: Arc<JobControl>,
+    seen: Mutex<Vec<&'static str>>,
+}
+
+impl StageObserver for CancelWhenDeveloped {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { .. } => "develop",
+            RunStage::Prepare { .. } => "prepare",
+            _ => "other",
+        };
+        self.seen.lock().expect("no panic while logging").push(name);
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        if progress.stage == JobStage::Develop && progress.develop_done == progress.develop_total {
+            self.control.cancel();
+        }
+    }
+}
+
+#[test]
+fn a_cancel_landing_as_the_develop_pass_ends_stops_the_run_in_that_stage() {
+    let dng = gradient_dng(64, 64, 0);
+    let root = target_tmp();
+    let request = raw_request(
+        copies_of(&dng, 4, root.path()),
+        root.path(),
+        Some(EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        }),
+        None,
+    );
+    let control = JobControl::new();
+    let watch = CancelWhenDeveloped {
+        control: Arc::clone(&control),
+        seen: Mutex::default(),
+    };
+    let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+        .expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        watch.seen.lock().expect("no panic while logging")[..],
+        ["develop"],
+        "the preparation pass is never announced after the cancel"
+    );
+    assert_eq!(control.progress().stage, JobStage::Develop);
+    assert_scratch_empty(&request.scratch_root);
+}
+
+#[test]
+fn raw_scratch_unwritable_is_a_named_error() {
+    let dng = gradient_dng(8, 8, 0);
+    let paths = vec![PathBuf::from(dng.path()); 2];
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let blocker = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("a regular file at the scratch root");
+    let error = stack
+        .develop_once(blocker.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect_err("a scratch root that is a file cannot hold a directory");
+    assert!(
+        error
+            .to_string()
+            .contains(&blocker.path().display().to_string()),
+        "{error}"
+    );
+    assert_eq!(stack.develop_counts(), Some(vec![0; 2]));
+}
+
+/// Every path is on the volume `name` with `free` bytes free.
+fn volume(name: &str, free: u64) -> std::io::Result<VolumeSpace> {
+    Ok(VolumeSpace {
+        volume: name.into(),
+        free,
+    })
+}
+
+/// A probe answering through `answer` that records every path it is asked about.
+fn recording_probe(
+    answer: impl Fn(&Path) -> std::io::Result<VolumeSpace> + Send + Sync + 'static,
+) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let probe: FreeSpaceProbe = Arc::new(move |path: &Path| {
+        log.lock().expect("probe log").push(path.to_path_buf());
+        answer(path)
+    });
+    (probe, asked)
+}
+
+fn run_raw(request: &FuseRequest) -> Result<FuseOutcome, PipelineError> {
+    focusforge_core::pipeline::run(request, &NoopObserver, JobControl::new(), None)
+}
+
+/// The one shortfall `request` is refused with when its single volume has
+/// `free` bytes.
+fn single_shortfall(request: &mut FuseRequest, free: u64) -> VolumeShortfall {
+    request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+    let Err(PipelineError::DiskSpace(mut shortfalls)) = run_raw(request) else {
+        panic!("a run that does not fit must be refused");
+    };
+    assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    shortfalls.remove(0)
+}
+
+/// Holds the result beside the scratch root.
+fn hold_request(frames: Vec<PathBuf>, root: &Path) -> FuseRequest {
+    let mut request = raw_request(frames, root, None, None);
+    request.output = FuseOutput::Hold(root.join("held"));
+    request
+}
+
+/// The summed length of the composite and Z-Map a completed hold run staged.
+fn held_len(request: &FuseRequest) -> u64 {
+    let FuseOutcome::Completed(report) = run_raw(request).expect("the RAW run completes") else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Held(held) = report.product else {
+        panic!("a hold request reports a held checkpoint");
+    };
+    [&held.composite, &held.zmap]
+        .iter()
+        .map(|file| std::fs::metadata(file).expect("held plane").len())
+        .sum()
+}
+
+#[test]
+fn scratch_space_needed_matches_written_scratch() {
+    for (width, height, count) in [(33, 17, 1), (62, 26, 5)] {
+        let dng = gradient_dng(width, height, 0);
+        let root = target_tmp();
+        let paths = copies_of(&dng, count, root.path());
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch root");
+        let needed = stack.develop_scratch_bytes().expect("the figure fits");
+        stack
+            .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+            .expect("the pass develops every frame");
+        let (width, height) = stack.dimensions();
+        assert_eq!(
+            needed,
+            count as u64 * u64::from(width) * u64::from(height) * 6
+        );
+        let files = scratch_files(&scratch);
+        assert_eq!(files.len(), count, "{files:?}");
+        let written: u64 = files
+            .iter()
+            .map(|file| std::fs::metadata(file).expect("scratch file").len())
+            .sum();
+        assert_eq!(needed, written, "{width}x{height} x {count}");
+    }
+}
+
+#[test]
+fn raw_run_space_staged_bytes_cover_written_staging() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let needed = single_shortfall(&mut hold_request(frames.clone(), root.path()), 0).needed;
+    let written = held_len(&hold_request(frames, root.path()));
+    let staged = needed - develop;
+    assert!(
+        staged >= written && staged - written < 256 * 1024,
+        "needed {needed}, developed {develop}, staged {written}"
+    );
+}
+
+#[test]
+fn raw_run_space_includes_developed_scratch() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let staged = held_len(&hold_request(frames.clone(), root.path()));
+    let probe_root = target_tmp();
+    let probe_frames = copies_of(&dng, 4, probe_root.path());
+    let needed = single_shortfall(&mut hold_request(probe_frames, probe_root.path()), 0).needed;
+    // The sealed result adds its temporary compressed planes to the scratch
+    // volume and the project itself to the output volume.
+    for free in [develop - 1, 0] {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = raw_request(frames, root.path(), None, None);
+        let shortfall = single_shortfall(&mut request, free);
+        assert_eq!(shortfall.free, free);
+        assert!(
+            shortfall.needed >= develop + 3 * staged,
+            "needed {} for {develop} developed and {staged} staged",
+            shortfall.needed
+        );
+        assert!(shortfall.needed > needed);
+        assert_scratch_empty(&root.path().join("scratch"));
+        let text = PipelineError::DiskSpace(vec![shortfall.clone()]).to_string();
+        for want in [
+            shortfall.path.display().to_string(),
+            format!("{} bytes", shortfall.needed),
+            format!("{free} bytes"),
+            "0.0 GB".to_string(),
+        ] {
+            assert!(text.contains(&want), "{want:?} missing from {text}");
+        }
+    }
+}
+
+#[test]
+fn raw_run_proceeds_when_run_space_suffices() {
+    let dng = gradient_dng(64, 48, 0);
+    let held = |free: Option<u64>| {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = hold_request(frames, root.path());
+        request.free_space = free.map(|free| recording_probe(move |_| volume("only", free)).0);
+        let FuseOutcome::Completed(report) = run_raw(&request).expect("the RAW run completes")
+        else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(report.develop_counts, Some(vec![1; 4]));
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        std::fs::read(&held.composite).expect("composite is readable")
+    };
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let needed = single_shortfall(&mut hold_request(frames, root.path()), 0).needed;
+    assert_eq!(held(Some(needed)), held(None));
+}
+
+#[test]
+fn scratch_space_query_uses_nearest_existing_ancestor() {
+    let dng = gradient_dng(64, 48, 0);
+    let root = target_tmp();
+    let frames = copies_of(&dng, 2, root.path());
+    let mut request = raw_request(frames, root.path(), None, None);
+    request.scratch_root = PathBuf::from("scratch-space-ancestor-test/deeper");
+    let (probe, asked) = recording_probe(|_| volume("only", 0));
+    request.free_space = Some(probe);
+    assert!(matches!(
+        run_raw(&request),
+        Err(PipelineError::DiskSpace(_))
+    ));
+    let cwd = std::env::current_dir().expect("working directory");
+    let asked = asked.lock().expect("probe log");
+    assert!(asked.contains(&cwd), "{asked:?}");
+    assert!(!cwd.join("scratch-space-ancestor-test").exists());
+}
+
+#[test]
+fn scratch_space_query_failure_refuses_the_run() {
+    let dng = gradient_dng(64, 48, 0);
+    let root = target_tmp();
+    let frames = copies_of(&dng, 2, root.path());
+    let mut request = raw_request(frames, root.path(), None, None);
+    request.free_space = Some(Arc::new(|_: &Path| {
+        Err(std::io::Error::other("volume query refused"))
+    }));
+    let Err(error) = run_raw(&request) else {
+        panic!("an unanswered query must refuse the run");
+    };
+    assert!(
+        matches!(error, PipelineError::DiskSpaceQuery { .. }),
+        "{error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("volume query refused"), "{text}");
+    assert!(text.contains(&root.path().display().to_string()), "{text}");
+    assert_scratch_empty(&root.path().join("scratch"));
 }
