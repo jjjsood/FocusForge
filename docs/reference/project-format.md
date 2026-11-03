@@ -20,7 +20,9 @@ identical archives.
 
 The container carries no format version. A project written by an older
 build that lacks a field the current reader needs is refused when opened
-(see [Refusals](#refusals)); re-stack the frames to get a current one.
+(see [Refusals](#refusals)); re-stack the frames to get a current one. A RAW project holds its composite
+as unclipped 32-bit float samples, so a RAW project saved before that is
+refused on open and must be stacked again.
 
 - `manifest.json` — the algorithm, its resolved parameters, the source frame
   paths with each file's content hash, dimensions, each frame's solved

@@ -10,11 +10,11 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::algorithm::{AlgorithmError, StackAlgorithm};
+use crate::algorithm::{AlgorithmError, StackAlgorithm, TileOutput};
 use crate::fuse::error::algorithm_error;
-use crate::io::{TiffSpec, TiffWriter};
+use crate::io::{TiffError, TiffSpec, TiffWriter};
 use crate::params::ParamValues;
-use crate::tile::{Rect, TileConsumer, TileJob, TilePlan};
+use crate::tile::{Rect, SampleFormat, TileConsumer, TileJob, TilePlan};
 use crate::zmap::{ZMapInfo, ZMapWriter};
 
 /// Drives one [`StackAlgorithm`] over every tile a scheduler hands it, and
@@ -43,6 +43,10 @@ pub struct FusionConsumer {
     values: ParamValues,
     composite: Mutex<Option<TiffWriter<File>>>,
     zmap: Mutex<Option<ZMapWriter<File>>>,
+    /// The composite's sample format: `consume` fuses with `fuse` for `U16`
+    /// and `fuse_f32` for `F32`, and the composite file is a 16-bit or a
+    /// 32-bit float TIFF to match.
+    format: SampleFormat,
     /// `None` means both outputs are declared at the full frame extent;
     /// `Some(rect)` means both are declared at `rect`'s dimensions, and
     /// every written tile is clipped to `rect` and translated by
@@ -96,6 +100,26 @@ impl FusionConsumer {
         zmap_path: Option<&Path>,
         geometry: FusionGeometry,
     ) -> Result<Self, AlgorithmError> {
+        Self::create_as(
+            algorithm,
+            values,
+            composite_path,
+            zmap_path,
+            geometry,
+            SampleFormat::U16,
+        )
+    }
+
+    /// [`Self::create`] with the composite in `format`: `F32` writes a float
+    /// TIFF from [`StackAlgorithm::fuse_f32`], nothing clamped.
+    pub fn create_as(
+        algorithm: &'static dyn StackAlgorithm,
+        values: ParamValues,
+        composite_path: &Path,
+        zmap_path: Option<&Path>,
+        geometry: FusionGeometry,
+        format: SampleFormat,
+    ) -> Result<Self, AlgorithmError> {
         let out_rect = geometry.out_rect();
         let FusionGeometry {
             samples_per_pixel,
@@ -104,15 +128,16 @@ impl FusionConsumer {
             description,
             ..
         } = geometry;
-        let composite = TiffWriter::create(
-            composite_path,
-            TiffSpec {
-                width: out_rect.width,
-                height: out_rect.height,
-                samples_per_pixel,
-                description,
-            },
-        )?;
+        let spec = TiffSpec {
+            width: out_rect.width,
+            height: out_rect.height,
+            samples_per_pixel,
+            description,
+        };
+        let composite = match format {
+            SampleFormat::U16 => TiffWriter::create(composite_path, spec)?,
+            SampleFormat::F32 => TiffWriter::create_f32(composite_path, spec)?,
+        };
         let zmap = match zmap_path {
             Some(zmap_path) => {
                 let zmap_info = ZMapInfo::new(out_rect.width, out_rect.height, frame_count)
@@ -128,6 +153,7 @@ impl FusionConsumer {
             values,
             composite: Mutex::new(Some(composite)),
             zmap: Mutex::new(zmap),
+            format,
             crop,
         })
     }
@@ -152,6 +178,27 @@ impl FusionConsumer {
         geometry: FusionGeometry,
         covered: &[Rect],
     ) -> Result<Self, AlgorithmError> {
+        Self::reopen_as(
+            algorithm,
+            values,
+            composite_path,
+            zmap_path,
+            geometry,
+            covered,
+            SampleFormat::U16,
+        )
+    }
+
+    /// [`Self::reopen`] for a composite [`Self::create_as`] made in `format`.
+    pub fn reopen_as(
+        algorithm: &'static dyn StackAlgorithm,
+        values: ParamValues,
+        composite_path: &Path,
+        zmap_path: Option<&Path>,
+        geometry: FusionGeometry,
+        covered: &[Rect],
+        format: SampleFormat,
+    ) -> Result<Self, AlgorithmError> {
         let out_rect = geometry.out_rect();
         let FusionGeometry {
             samples_per_pixel,
@@ -160,15 +207,13 @@ impl FusionConsumer {
             description,
             ..
         } = geometry;
-        let mut composite = TiffWriter::reopen(
-            composite_path,
-            TiffSpec {
-                width: out_rect.width,
-                height: out_rect.height,
-                samples_per_pixel,
-                description,
-            },
-        )?;
+        let spec = TiffSpec {
+            width: out_rect.width,
+            height: out_rect.height,
+            samples_per_pixel,
+            description,
+        };
+        let mut composite = reopen_writer(composite_path, spec, format)?;
         for &rect in covered {
             composite.seed_coverage(rect);
         }
@@ -190,6 +235,7 @@ impl FusionConsumer {
             values,
             composite: Mutex::new(Some(composite)),
             zmap: Mutex::new(zmap),
+            format,
             crop,
         })
     }
@@ -218,9 +264,35 @@ impl FusionConsumer {
         zmap_path: Option<&Path>,
         geometry: FusionGeometry,
     ) -> Result<(Self, Vec<usize>), AlgorithmError> {
+        Self::resume_as(
+            plan,
+            completed,
+            algorithm,
+            values,
+            composite_path,
+            zmap_path,
+            geometry,
+            SampleFormat::U16,
+        )
+    }
+
+    /// [`Self::resume`] for a composite [`Self::create_as`] made in `format`;
+    /// a recorded unit is kept only when the file holds its rows at that
+    /// format's sample width.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_as(
+        plan: &TilePlan,
+        completed: &[usize],
+        algorithm: &'static dyn StackAlgorithm,
+        values: ParamValues,
+        composite_path: &Path,
+        zmap_path: Option<&Path>,
+        geometry: FusionGeometry,
+        format: SampleFormat,
+    ) -> Result<(Self, Vec<usize>), AlgorithmError> {
         let crop = geometry.crop;
         let out_rect = geometry.out_rect();
-        let probe = TiffWriter::reopen(
+        let probe = reopen_writer(
             composite_path,
             TiffSpec {
                 width: out_rect.width,
@@ -228,6 +300,7 @@ impl FusionConsumer {
                 samples_per_pixel: geometry.samples_per_pixel,
                 description: geometry.description.clone(),
             },
+            format,
         )?;
 
         let mut surviving_indices = Vec::new();
@@ -256,13 +329,14 @@ impl FusionConsumer {
         }
         drop(probe);
 
-        let consumer = Self::reopen(
+        let consumer = Self::reopen_as(
             algorithm,
             values,
             composite_path,
             zmap_path,
             geometry,
             &surviving_rects,
+            format,
         )?;
         Ok((consumer, surviving_indices))
     }
@@ -276,7 +350,30 @@ impl FusionConsumer {
     pub fn write_output(
         &self,
         job: &TileJob<'_>,
-        output: &crate::algorithm::TileOutput,
+        output: &TileOutput,
+    ) -> Result<(), AlgorithmError> {
+        self.write_output_as(job, output, TiffWriter::write_tile)
+    }
+
+    /// [`Self::write_output`] for an `f32` output, into a float composite.
+    pub fn write_output_f32(
+        &self,
+        job: &TileJob<'_>,
+        output: &TileOutput<f32>,
+    ) -> Result<(), AlgorithmError> {
+        self.write_output_as(job, output, TiffWriter::write_tile_f32)
+    }
+
+    /// The composite's sample format.
+    pub fn format(&self) -> SampleFormat {
+        self.format
+    }
+
+    fn write_output_as<S: Copy + Default>(
+        &self,
+        job: &TileJob<'_>,
+        output: &TileOutput<S>,
+        write: impl FnOnce(&mut TiffWriter<File>, Rect, &[S]) -> Result<(), TiffError>,
     ) -> Result<(), AlgorithmError> {
         let interior = job.interior();
         let spp = output.tile.samples_per_pixel;
@@ -295,7 +392,7 @@ impl FusionConsumer {
         };
 
         let mut cropped_composite =
-            vec![0u16; target.width as usize * target.height as usize * spp as usize];
+            vec![S::default(); target.width as usize * target.height as usize * spp as usize];
         output
             .tile
             .crop_into(target, &mut cropped_composite)
@@ -307,12 +404,15 @@ impl FusionConsumer {
         let target_written = written_rect(interior, self.crop)
             .expect("interior already clipped to the crop above, target is non-empty");
 
-        self.composite
-            .lock()
-            .unwrap()
-            .as_mut()
-            .expect("composite writer present")
-            .write_tile(target_written, &cropped_composite)?;
+        write(
+            self.composite
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("composite writer present"),
+            target_written,
+            &cropped_composite,
+        )?;
 
         if let Some(zmap_writer) = self.zmap.lock().unwrap().as_mut() {
             let mut cropped_zmap = vec![0u16; target.width as usize * target.height as usize];
@@ -340,6 +440,17 @@ impl FusionConsumer {
                 .map_err(algorithm_error(self.algorithm.id()))?;
         }
         Ok(())
+    }
+}
+
+fn reopen_writer(
+    path: &Path,
+    spec: TiffSpec,
+    format: SampleFormat,
+) -> Result<TiffWriter<File>, TiffError> {
+    match format {
+        SampleFormat::U16 => TiffWriter::reopen(path, spec),
+        SampleFormat::F32 => TiffWriter::reopen_f32(path, spec),
     }
 }
 
@@ -393,8 +504,16 @@ pub(crate) fn written_rect(interior: Rect, crop: Option<Rect>) -> Option<Rect> {
 
 impl TileConsumer for FusionConsumer {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
-        let output = self.algorithm.fuse(job.ctx(), &self.values)?;
-        self.write_output(job, &output)
+        match self.format {
+            SampleFormat::U16 => {
+                let output = self.algorithm.fuse(job.ctx(), &self.values)?;
+                self.write_output(job, &output)
+            }
+            SampleFormat::F32 => {
+                let output = self.algorithm.fuse_f32(job.ctx(), &self.values)?;
+                self.write_output_f32(job, &output)
+            }
+        }
     }
 
     /// Takes both writers out of their mutexes and drops them: called only

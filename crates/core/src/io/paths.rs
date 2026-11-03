@@ -7,6 +7,7 @@ use super::{TiffError, is_frame_path};
 pub const TIFF_EXTENSIONS: &[&str] = &["tif", "tiff"];
 pub const PNG_EXTENSIONS: &[&str] = &["png"];
 pub const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
+pub const DNG_EXTENSIONS: &[&str] = &["dng"];
 pub const RAW_EXTENSIONS: &[&str] = &[
     "ari", "arw", "cr2", "cr3", "crm", "crw", "dcr", "dcs", "dng", "erf", "iiq", "kdc", "mef",
     "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "raf", "raw", "rw2", "rwl", "srw", "3fr",

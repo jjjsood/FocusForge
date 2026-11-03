@@ -453,9 +453,12 @@ mod tests {
                 .is_some()
         );
         assert!(renderer.composite_pane.display_texture.is_some());
+        let scratch = tempfile::tempdir().unwrap();
+        let replacement = scratch.path().join("composite.tif");
+        std::fs::copy(&composite, &replacement).unwrap();
         renderer
-            .set_planes(&composite, Some(&zmap))
-            .expect("fixture planes re-open");
+            .set_planes(&replacement, Some(&zmap))
+            .expect("replacement planes open");
         assert!(renderer.composite_pane.display_texture.is_none());
         assert!(renderer.composite_pane.image.is_none());
     }
@@ -583,6 +586,26 @@ pub enum CanvasRendererError {
     },
 }
 
+/// An open plane file as [`CanvasRenderer::set_planes`] tells two apart: its
+/// path, size and last write time.
+#[derive(Clone, PartialEq)]
+struct PlaneFile {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl PlaneFile {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
 /// The composite pane's GPU-owned state, the frame pane's own, the one
 /// [`DisplayRenderer`] every pane renders through, and the CPU scratch the
 /// synchronous redraws read into. A pane's read is a [`PaneJob`] (none when
@@ -598,6 +621,8 @@ pub struct CanvasRenderer {
     sample_scratch: Vec<u16>,
     composite: Option<Arc<TiffStack>>,
     zmap: Option<Arc<ZMapReader>>,
+    /// The files [`Self::set_planes`] last opened.
+    planes: Option<(PlaneFile, Option<PlaneFile>)>,
     composite_pane: PaneTexture,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
@@ -626,6 +651,7 @@ impl CanvasRenderer {
             sample_scratch: Vec::new(),
             composite: None,
             zmap: None,
+            planes: None,
             composite_pane: PaneTexture::default(),
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
@@ -711,20 +737,28 @@ impl CanvasRenderer {
     }
 
     /// Opens `composite`, and `zmap` when given, as this renderer's planes,
-    /// replacing whichever were open before. A composite that fails to open
-    /// is an error naming it, leaving the previous planes untouched. A Z-Map
-    /// that fails to open is logged and left closed: the composite draws
-    /// without it, and only the overlay is lost.
+    /// replacing whichever were open before. Files already open (same paths,
+    /// sizes and write times) stay as they are, with the reads in flight for
+    /// them still valid. A composite that fails to open is an error naming
+    /// it, leaving the previous planes untouched. A Z-Map that fails to open
+    /// is logged and left closed: the composite draws without it, and only
+    /// the overlay is lost.
     pub fn set_planes(
         &mut self,
         composite_path: &Path,
         zmap_path: Option<&Path>,
     ) -> Result<(), CanvasRendererError> {
-        let composite = TiffStack::open_files(std::slice::from_ref(&composite_path.to_path_buf()))
-            .map_err(|source| CanvasRendererError::Composite {
+        let files = PlaneFile::of(composite_path)
+            .map(|composite| (composite, zmap_path.and_then(PlaneFile::of)));
+        if files.is_some() && files == self.planes {
+            return Ok(());
+        }
+        let composite = TiffStack::open_staged(composite_path).map_err(|source| {
+            CanvasRendererError::Composite {
                 path: composite_path.to_path_buf(),
                 source: Box::new(source),
-            })?;
+            }
+        })?;
         self.zmap = zmap_path.and_then(|path| match ZMapReader::open(path) {
             Ok(zmap) => Some(Arc::new(zmap)),
             Err(error) => {
@@ -733,6 +767,7 @@ impl CanvasRenderer {
             }
         });
         self.composite = Some(Arc::new(composite));
+        self.planes = files;
         self.reset_planes();
         Ok(())
     }
@@ -741,6 +776,7 @@ impl CanvasRenderer {
     pub fn clear_planes(&mut self) {
         self.composite = None;
         self.zmap = None;
+        self.planes = None;
         self.reset_planes();
     }
 

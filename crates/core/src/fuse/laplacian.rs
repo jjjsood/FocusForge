@@ -150,11 +150,11 @@ use crate::fuse::sharpness::eligible;
 use crate::fuse::{Plane, Pyramid, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
-use crate::tile::Tile;
 use crate::tile::plan::{
     DEFAULT_TILE_SIZE, MAX_LEVELS, TileSupport, margin_for_levels, max_levels_for_tile,
 };
 use crate::tile::scheduler::DEFAULT_LEVELS;
+use crate::tile::{Sample, SampleFormat, Tile};
 use crate::zmap::NO_SOURCE;
 
 /// `auto_levels(ctx) = min(fuse::max_levels(ctx.width, ctx.height),
@@ -368,6 +368,59 @@ impl StackAlgorithm for Laplacian {
     }
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, u16>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, u16>(ctx, cfg),
+        }
+    }
+
+    fn fuse_f32(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, f32>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, f32>(ctx, cfg),
+        }
+    }
+
+    /// Two `f32` pyramids (the running best and the current frame's, `4/3`
+    /// for the levels), the collapsed plane and `u16` output, then per level
+    /// a score, a winner, the current score and an eligibility byte, plus the
+    /// Z-Map; an `f32` output adds 2 B per sample.
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        samples_per_pixel: u32,
+        format: SampleFormat,
+    ) -> u64 {
+        let per_sample = if format == SampleFormat::F32 { 19 } else { 17 };
+        per_sample * u64::from(samples_per_pixel) + 17
+    }
+
+    /// The composite's dependency cone (`composite_reach`) on the `levels`
+    /// decimation grid.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        let levels = cfg
+            .get("levels")
+            .and_then(ParamValue::as_i64)
+            .map(|levels| levels.max(0) as u32)
+            .unwrap_or(0);
+        TileSupport {
+            reach_px: composite_reach(levels),
+            decimation_levels: levels,
+        }
+    }
+}
+
+impl Laplacian {
+    /// Fuses frames read as `S` into a composite of `O` samples.
+    fn fuse_as<S: Sample, O: Sample>(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
         let levels = cfg
             .get("levels")
@@ -395,9 +448,9 @@ impl StackAlgorithm for Laplacian {
         // Frame 0's pyramid seeds the running best -- streaming, never
         // `frame_count` pyramids at once.
         let mut running: Option<Running> = None;
-        ctx.for_each_frame(|f, tile, covered| {
-            let current = build(&tile.samples, width, height, spp, levels)
-                .map_err(algorithm_error("laplacian"))?;
+        ctx.for_each_frame_as::<S>(|f, samples, covered| {
+            let current =
+                build(samples, width, height, spp, levels).map_err(algorithm_error("laplacian"))?;
             let masks = covered.map(|covered| EligibleMasks::new(covered, width, height, levels));
 
             let Some(run) = running.as_mut() else {
@@ -509,10 +562,7 @@ impl StackAlgorithm for Laplacian {
         }
 
         let collapsed = collapse(&best);
-        let mut samples = vec![0u16; width as usize * height as usize * spp_usize];
-        collapsed
-            .to_u16_into(&mut samples)
-            .map_err(algorithm_error("laplacian"))?;
+        let samples: Vec<O> = collapsed.data().iter().map(|&v| O::narrow(v)).collect();
 
         // Level-0 winner is the Z-Map; `levels >= 1` is enforced by the
         // schema, so `winner` always has at least one entry.
@@ -531,28 +581,6 @@ impl StackAlgorithm for Laplacian {
             },
             zmap,
         })
-    }
-
-    /// Two `f32` pyramids (the running best and the current frame's, `4/3`
-    /// for the levels), the collapsed plane and `u16` output, then per level
-    /// a score, a winner, the current score and an eligibility byte, plus the
-    /// Z-Map.
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
-        17 * u64::from(samples_per_pixel) + 17
-    }
-
-    /// The composite's dependency cone (`composite_reach`) on the `levels`
-    /// decimation grid.
-    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
-        let levels = cfg
-            .get("levels")
-            .and_then(ParamValue::as_i64)
-            .map(|levels| levels.max(0) as u32)
-            .unwrap_or(0);
-        TileSupport {
-            reach_px: composite_reach(levels),
-            decimation_levels: levels,
-        }
     }
 }
 
@@ -827,8 +855,24 @@ mod tests {
     #[test]
     fn working_bytes_per_pixel_are_pinned() {
         let cfg = cfg_with_levels(5);
-        assert_eq!(Laplacian.working_bytes_per_pixel(&cfg, 3), 68);
-        assert_eq!(Laplacian.working_bytes_per_pixel(&cfg, 1), 34);
+        assert_eq!(
+            Laplacian.working_bytes_per_pixel(&cfg, 3, SampleFormat::U16),
+            68
+        );
+        assert_eq!(
+            Laplacian.working_bytes_per_pixel(&cfg, 1, SampleFormat::U16),
+            34
+        );
+    }
+
+    #[test]
+    fn f32_output_adds_two_bytes_per_sample_to_the_working_bytes() {
+        let cfg = cfg_with_levels(5);
+        for spp in [1, 3] {
+            let u16_bytes = Laplacian.working_bytes_per_pixel(&cfg, spp, SampleFormat::U16);
+            let f32_bytes = Laplacian.working_bytes_per_pixel(&cfg, spp, SampleFormat::F32);
+            assert_eq!(f32_bytes - u16_bytes, 2 * u64::from(spp));
+        }
     }
 
     #[test]

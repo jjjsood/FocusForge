@@ -22,7 +22,7 @@ use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::project::Op;
-use focusforge_core::tile::{HostBudget, Rect};
+use focusforge_core::tile::{HostBudget, Rect, Sample};
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
 
@@ -505,7 +505,13 @@ struct PreparerState {
     /// An exact read is running: set when the worker takes `pending`, cleared
     /// under the lock that stores its result.
     reading_exact: bool,
+    /// Exact requests the worker has taken so far.
+    exact_requests: u64,
+    /// The newest exact request's results: one entry per pane read so far,
+    /// the earlier request's replaced as soon as a newer one lands its first.
     done: Option<Vec<Prepared>>,
+    /// The request `done` holds results of.
+    done_request: u64,
     /// Finished backdrop reads, one per pane at most; never replaces `done`.
     done_backdrop: Vec<Prepared>,
     pool: Vec<Vec<u16>>,
@@ -518,6 +524,29 @@ impl PreparerState {
         if self.pool.len() < POOLED_BUFFERS {
             self.pool.push(buffer);
         }
+    }
+
+    /// Stores `fresh` for the next [`Preparer::take`]: an exact result joins
+    /// the ones its request already landed and replaces an older request's;
+    /// a backdrop result replaces the same pane's. Returns what it displaced.
+    fn park(&mut self, fresh: Prepared, backdrop: bool, request: u64) -> Vec<Prepared> {
+        if backdrop {
+            let at = self
+                .done_backdrop
+                .iter()
+                .position(|parked| parked.job.pane == fresh.job.pane);
+            let stale = at.map(|at| self.done_backdrop.swap_remove(at));
+            self.done_backdrop.push(fresh);
+            return stale.into_iter().collect();
+        }
+        let stale = if self.done_request == request {
+            Vec::new()
+        } else {
+            self.done.take().unwrap_or_default()
+        };
+        self.done_request = request;
+        self.done.get_or_insert_default().push(fresh);
+        stale
     }
 }
 
@@ -590,8 +619,8 @@ impl Preparer {
         self.shared.wakeup.notify_one();
     }
 
-    /// The newest completed exact request, then any completed backdrop
-    /// reads, if some landed since the last call.
+    /// The newest exact request's reads landed since the last call, then any
+    /// completed backdrop reads.
     pub fn take(&self) -> Option<Vec<Prepared>> {
         let mut state = self.shared.lock();
         let mut done = state.done.take().unwrap_or_default();
@@ -627,7 +656,7 @@ impl Drop for Preparer {
 
 fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
     loop {
-        let (jobs, backdrop, mut buffers) = {
+        let (mut jobs, backdrop, request, mut buffers) = {
             let mut state = shared.lock();
             let (jobs, backdrop) = loop {
                 if state.shutdown {
@@ -635,6 +664,7 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                 }
                 if let Some(jobs) = state.pending.take() {
                     state.reading_exact = true;
+                    state.exact_requests += 1;
                     break (jobs, false);
                 }
                 if !state.pending_backdrop.is_empty() {
@@ -651,54 +681,49 @@ fn prepare_loop(shared: &PreparerShared, wake: &(dyn Fn() + Send + Sync)) {
                 .sum();
             let keep = state.pool.len().saturating_sub(wanted);
             let buffers = state.pool.split_off(keep);
-            (jobs, backdrop, buffers)
+            (jobs, backdrop, state.exact_requests, buffers)
         };
-        let prepared: Vec<Prepared> = jobs
-            .into_iter()
-            .filter_map(|job| {
-                let samples = buffers.pop().unwrap_or_default();
-                let indices = if job.indices.is_some() {
-                    buffers.pop().unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+        // A plane maps a file and reads at once; a frame can develop a RAW
+        // image for seconds. Planes go first and every result is parked as
+        // it lands, so none waits behind a slower pane.
+        jobs.sort_by_key(|job| job.pane == Pane::Frame);
+        for job in jobs {
+            let samples = buffers.pop().unwrap_or_default();
+            let indices = if job.indices.is_some() {
+                buffers.pop().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let prepared = {
                 let _scope = backdrop.then(|| measurement_scope("gui_canvas_backdrop_read"));
                 read_job(job, samples, indices)
-            })
-            .collect();
-
+            };
+            let Some(prepared) = prepared else {
+                continue;
+            };
+            let mut state = shared.lock();
+            if state.shutdown {
+                return;
+            }
+            let was_empty = state.done.is_none() && state.done_backdrop.is_empty();
+            let stale = state.park(prepared, backdrop, request);
+            for spent in stale {
+                state.pool_buffer(spent.samples);
+                if spent.indices.capacity() > 0 {
+                    state.pool_buffer(spent.indices);
+                }
+            }
+            drop(state);
+            if was_empty {
+                wake();
+            }
+        }
         let mut state = shared.lock();
         if !backdrop {
             state.reading_exact = false;
         }
         if state.shutdown {
             return;
-        }
-        if prepared.is_empty() {
-            continue;
-        }
-        let was_empty = state.done.is_none() && state.done_backdrop.is_empty();
-        let mut stale = Vec::new();
-        if backdrop {
-            for fresh in prepared {
-                let parked = &mut state.done_backdrop;
-                if let Some(at) = parked.iter().position(|p| p.job.pane == fresh.job.pane) {
-                    stale.push(parked.swap_remove(at));
-                }
-                parked.push(fresh);
-            }
-        } else {
-            stale.extend(state.done.replace(prepared).into_iter().flatten());
-        }
-        for spent in stale {
-            state.pool_buffer(spent.samples);
-            if spent.indices.capacity() > 0 {
-                state.pool_buffer(spent.indices);
-            }
-        }
-        drop(state);
-        if was_empty {
-            wake();
         }
     }
 }
@@ -722,9 +747,11 @@ fn rect_intersect(a: Rect, b: Rect) -> Option<Rect> {
 }
 
 /// One resident tile: its samples, and which texels hold an edited pixel.
+/// Samples are `f32` on the 16-bit scale for both project kinds: a `u16` value
+/// widens and narrows back exactly.
 #[derive(Clone)]
 struct Tile {
-    samples: Vec<u16>,
+    samples: Vec<f32>,
     filled: Vec<bool>,
 }
 
@@ -732,7 +759,7 @@ impl Tile {
     fn empty(tile_size: u32, samples_per_pixel: usize) -> Self {
         let texels = tile_size as usize * tile_size as usize;
         Self {
-            samples: vec![0u16; texels * samples_per_pixel],
+            samples: vec![0.0; texels * samples_per_pixel],
             filled: vec![false; texels],
         }
     }
@@ -790,7 +817,7 @@ impl ResidentTiles {
 
     /// The edited pixel at `(x, y)`, if an install has covered it --
     /// `None` outside every installed region.
-    fn pixel_at(&self, x: u32, y: u32) -> Option<&[u16]> {
+    fn pixel_at(&self, x: u32, y: u32) -> Option<&[f32]> {
         let key = (x / self.tile_size, y / self.tile_size);
         let tile = self.tiles.get(&key)?;
         let local_x = (x % self.tile_size) as usize;
@@ -873,8 +900,9 @@ impl ResidentTiles {
     }
 
     /// Copies the filled texels inside `region` onto `out`, `region`'s own
-    /// row-major samples, and leaves every other texel as it is.
-    pub fn overlay_into(&self, region: Rect, out: &mut [u16]) {
+    /// row-major samples, narrowed to `S`, and leaves every other texel as it
+    /// is.
+    pub fn overlay_into<S: Sample>(&self, region: Rect, out: &mut [S]) {
         let (ts, spp) = (self.tile_size as usize, self.samples_per_pixel as usize);
         for (key, tile_rect) in self.grid(region) {
             let (Some(tile), Some(part)) =
@@ -891,8 +919,12 @@ impl ResidentTiles {
                     let at = ((y - region.y) as usize * region.width as usize
                         + (x - region.x) as usize)
                         * spp;
-                    out[at..at + spp]
-                        .copy_from_slice(&tile.samples[local * spp..(local + 1) * spp]);
+                    for (dst, &src) in out[at..at + spp]
+                        .iter_mut()
+                        .zip(&tile.samples[local * spp..(local + 1) * spp])
+                    {
+                        *dst = S::narrow(src);
+                    }
                 }
             }
         }
@@ -902,7 +934,7 @@ impl ResidentTiles {
     /// into every grid tile `region` meets, allocating a tile empty on first
     /// touch and marking the texels filled. Bumps [`Self::generation`] once
     /// and logs `region`, regardless of how many tiles it spans.
-    pub fn install(&mut self, region: Rect, samples: &[u16]) {
+    pub fn install<S: Sample>(&mut self, region: Rect, samples: &[S]) {
         let ts = self.tile_size;
         let spp = self.samples_per_pixel as usize;
         for (key, tile_rect) in self.grid(region) {
@@ -920,8 +952,12 @@ impl ResidentTiles {
                 let src_row = (part.y - region.y) as usize + row;
                 let src = (src_row * region.width as usize + (part.x - region.x) as usize) * spp;
                 let texel = (local_y0 + row) * ts as usize + local_x0;
-                tile.samples[texel * spp..(texel + row_len) * spp]
-                    .copy_from_slice(&samples[src..src + row_len * spp]);
+                for (dst, &sample) in tile.samples[texel * spp..(texel + row_len) * spp]
+                    .iter_mut()
+                    .zip(&samples[src..src + row_len * spp])
+                {
+                    *dst = sample.widen();
+                }
                 tile.filled[texel..texel + row_len].fill(true);
             }
         }
@@ -978,7 +1014,8 @@ fn read_job(job: PaneJob, mut samples: Vec<u16>, mut indices: Vec<u16>) -> Optio
 
 /// Overlays `samples` (already the sealed composite, decimated over `rect`
 /// at `step`) with `tiles`' edited pixel at every texel it holds one for --
-/// left as the sealed pixel everywhere else.
+/// left as the sealed pixel everywhere else. An edited sample is clipped to
+/// 16 bits with [`u16::narrow`], as the sealed composite's own read is.
 pub fn overlay_edited(
     samples: &mut [u16],
     rect: Rect,
@@ -997,7 +1034,9 @@ pub fn overlay_edited(
         while sx < rect.x + rect.width {
             let t = (oy * out_w + ox) as usize;
             if let Some(pixel) = tiles.pixel_at(sx, sy) {
-                samples[t * spp..t * spp + spp].copy_from_slice(pixel);
+                for (dst, &src) in samples[t * spp..t * spp + spp].iter_mut().zip(pixel) {
+                    *dst = u16::narrow(src);
+                }
             }
             ox += 1;
             sx += step;

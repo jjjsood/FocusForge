@@ -25,7 +25,7 @@ use std::time::UNIX_EPOCH;
 use super::error::ProjectError;
 use super::manifest::SourceRef;
 use crate::io::TiffStack;
-use crate::tile::Rect;
+use crate::tile::{Rect, SampleFormat};
 use crate::zmap::ZMapReader;
 
 /// Which of a project's two payload planes is meant.
@@ -86,6 +86,8 @@ pub struct StagedBlob {
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
+    /// The sample type the uncompressed bytes hold.
+    pub format: SampleFormat,
     /// The compressed temp file. Removed by [`StagedBlob::remove`].
     pub path: PathBuf,
 }
@@ -272,15 +274,26 @@ pub fn stage_plane(
     let reader = PlaneReader::open(source, plane)?;
     let (width, height, spp) = (reader.width, reader.height, reader.samples_per_pixel);
 
+    let format = reader.format;
     let row_samples = width as usize * spp as usize;
-    let rows = (BAND_BYTES / (row_samples * 2)).clamp(1, height as usize) as u32;
+    let rows =
+        (BAND_BYTES / (row_samples * format.bytes() as usize)).clamp(1, height as usize) as u32;
 
     let temp = out_dir.join(format!("{}.zst", plane.stem()));
     let mut encoder = encoder(&temp, level)?;
 
     let mut hasher = blake3::Hasher::new();
     let mut samples = vec![0u16; row_samples * rows as usize];
-    let mut bytes: Vec<u8> = Vec::with_capacity(row_samples * rows as usize * 2);
+    let mut wide = vec![
+        0f32;
+        if format == SampleFormat::F32 {
+            samples.len()
+        } else {
+            0
+        }
+    ];
+    let mut bytes: Vec<u8> =
+        Vec::with_capacity(row_samples * rows as usize * format.bytes() as usize);
     let mut uncompressed_len = 0u64;
 
     let mut y = 0;
@@ -293,10 +306,20 @@ pub fn stage_plane(
             width,
             height: band_rows,
         };
-        reader.read_band(rect, &mut samples[..len])?;
         bytes.clear();
-        for sample in &samples[..len] {
-            bytes.extend_from_slice(&sample.to_le_bytes());
+        match format {
+            SampleFormat::U16 => {
+                reader.read_band(rect, &mut samples[..len])?;
+                for sample in &samples[..len] {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+            }
+            SampleFormat::F32 => {
+                reader.read_band_f32(rect, &mut wide[..len])?;
+                for sample in &wide[..len] {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+            }
         }
         hasher.update(&bytes);
         encoder
@@ -322,6 +345,7 @@ pub fn stage_plane(
         width,
         height,
         samples_per_pixel: spp,
+        format,
         path: temp,
     })
 }
@@ -340,17 +364,19 @@ struct PlaneReader {
     width: u32,
     height: u32,
     samples_per_pixel: u32,
+    format: SampleFormat,
 }
 
 impl PlaneReader {
     fn open(path: &Path, plane: Plane) -> Result<Self, ProjectError> {
         match plane {
             Plane::Composite => {
-                let stack = TiffStack::open_files(std::slice::from_ref(&path.to_path_buf()))
+                let stack = TiffStack::open_staged(path)
                     .map_err(|err| ProjectError::container(path, err))?;
                 let (width, height) = stack.dimensions();
                 let samples_per_pixel = stack.header(0).samples_per_pixel;
                 Ok(PlaneReader {
+                    format: stack.sample_format(),
                     source: PlaneSource::Composite(Box::new(stack)),
                     path: path.to_path_buf(),
                     width,
@@ -368,9 +394,20 @@ impl PlaneReader {
                     width,
                     height,
                     samples_per_pixel: 1,
+                    format: SampleFormat::U16,
                 })
             }
         }
+    }
+
+    /// [`Self::read_band`] in `f32` samples; only a composite has them.
+    fn read_band_f32(&self, rect: Rect, out: &mut [f32]) -> Result<(), ProjectError> {
+        let PlaneSource::Composite(stack) = &self.source else {
+            unreachable!("only a composite is read as f32");
+        };
+        stack
+            .read_tile_f32_into(0, rect, out)
+            .map_err(|err| ProjectError::container(&self.path, err))
     }
 
     fn read_band(&self, rect: Rect, out: &mut [u16]) -> Result<(), ProjectError> {

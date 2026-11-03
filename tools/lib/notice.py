@@ -20,6 +20,7 @@ TARGETS = (
 )
 TREE_PACKAGE = re.compile(r"^([A-Za-z0-9_-]+) v([^\s]+)(?: \(([^)]+)\))?$")
 ABOUT_COPYRIGHT = re.compile(r"Copyright © [^\";]+")
+CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 VERSION = re.compile(r"Version vendored: ([0-9.]+)")
 
 
@@ -64,6 +65,7 @@ def metadata_index(root: Path, target: str) -> tuple[dict[tuple[str, str], list[
             "version": package["version"],
             "source": package["source"],
             "license": package["license"],
+            "manifest_path": package.get("manifest_path"),
         })
     return index, set(metadata["workspace_members"])
 
@@ -73,6 +75,7 @@ def selected_components(
     index: dict[tuple[str, str], list[dict[str, object]]],
     workspace_members: set[str],
     target: str,
+    root: Path,
 ) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
     for name, version, source_hint in members:
@@ -91,7 +94,11 @@ def selected_components(
         if package["source"] is None:
             if package["id"] in workspace_members:
                 continue
-            raise ValueError(f"runtime path dependency lacks a registry or git source: {name} {version}")
+            # A patched copy of a crates.io package under vendor/ keeps its crates.io identity.
+            manifest = package.get("manifest_path")
+            if not manifest or not Path(str(manifest)).resolve().is_relative_to(root / "vendor"):
+                raise ValueError(f"runtime path dependency lacks a registry or git source: {name} {version}")
+            package = {**package, "source": CRATES_IO}
         if not package["license"]:
             raise ValueError(f"{name} {version} has no declared license")
         selected.append(package)
@@ -102,7 +109,7 @@ def release_components(root: Path) -> list[dict[str, object]]:
     by_identity: dict[tuple[str, str, str], dict[str, object]] = {}
     for target, label in TARGETS:
         index, workspace_members = metadata_index(root, target)
-        for package in selected_components(tree_members(root, target), index, workspace_members, target):
+        for package in selected_components(tree_members(root, target), index, workspace_members, target, root):
             identity = (str(package["name"]), str(package["version"]), str(package["source"]))
             component = by_identity.setdefault(identity, {**package, "targets": set()})
             component["targets"].add(label)  # type: ignore[index]

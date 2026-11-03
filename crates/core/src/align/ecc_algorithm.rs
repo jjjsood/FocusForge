@@ -85,7 +85,7 @@ use crate::fuse::pyramid::{KERNEL, Plane};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
-use crate::tile::{Rect, Tile};
+use crate::tile::{Rect, Sample, SampleFormat};
 use crate::timing::{TimingCounter, measurement_scope, record_level_iterations, record_timing};
 
 /// Pixels the level-0 window extends past the seed's source footprint. Absorbs
@@ -526,13 +526,17 @@ impl PyramidalEcc {
     ) -> Result<AlignPyramid, AlgorithmError> {
         let _scope = measurement_scope("pyramid_prepare");
         let stack = ctx.stack();
-        AlignPyramid::stream(
-            (stack.width, stack.height, stack.samples_per_pixel),
-            depth,
-            DEFAULT_TILE_SIZE / 2,
-            |rect, out| ctx.read_tile_into(frame, rect, out),
-        )
-        .map_err(|e| match e {
+        let extent = (stack.width, stack.height, stack.samples_per_pixel);
+        let band_rows = DEFAULT_TILE_SIZE / 2;
+        let streamed = match ctx.sample_format() {
+            SampleFormat::U16 => AlignPyramid::stream(extent, depth, band_rows, |rect, out| {
+                ctx.read_tile_into(frame, rect, out)
+            }),
+            SampleFormat::F32 => AlignPyramid::stream(extent, depth, band_rows, |rect, out| {
+                ctx.read_tile_f32_into(frame, rect, out)
+            }),
+        };
+        streamed.map_err(|e| match e {
             StreamError::Read(e) => e,
             StreamError::Pyramid(e) => wrap_error(e),
         })
@@ -1139,25 +1143,39 @@ fn read_luma_window(
     frame: usize,
     rect: Rect,
 ) -> Result<Plane, AlgorithmError> {
+    match ctx.sample_format() {
+        SampleFormat::U16 => {
+            luma_window::<u16>(ctx, rect, |out| ctx.read_tile_into(frame, rect, out))
+        }
+        SampleFormat::F32 => {
+            luma_window::<f32>(ctx, rect, |out| ctx.read_tile_f32_into(frame, rect, out))
+        }
+    }
+}
+
+fn luma_window<S: Sample>(
+    ctx: &AlignContext<'_>,
+    rect: Rect,
+    read: impl FnOnce(&mut [S]) -> Result<(), AlgorithmError>,
+) -> Result<Plane, AlgorithmError> {
     let spp = ctx.stack().samples_per_pixel;
-    let mut tile = Tile {
-        rect: Rect {
-            x: 0,
-            y: 0,
-            width: rect.width,
-            height: rect.height,
-        },
-        samples_per_pixel: spp,
-        samples: vec![0u16; rect.width as usize * rect.height as usize * spp as usize],
-    };
+    let mut samples = vec![S::default(); rect.width as usize * rect.height as usize * spp as usize];
     record_timing(
         TimingCounter::AllocationBytes,
-        (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
+        (samples.capacity() * std::mem::size_of::<S>()) as u64,
     );
     record_timing(TimingCounter::AllocationOperations, 1);
-    ctx.read_tile_into(frame, rect, &mut tile.samples)?;
+    read(&mut samples)?;
     let mut assembler = LumaAssembler::new(rect.width, rect.height);
-    assembler.push_tile(&tile).map_err(wrap_error)?;
+    let local = Rect {
+        x: 0,
+        y: 0,
+        width: rect.width,
+        height: rect.height,
+    };
+    assembler
+        .push_samples(local, spp, &samples)
+        .map_err(wrap_error)?;
     assembler.finish().map_err(wrap_error)
 }
 
@@ -1695,6 +1713,65 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// [`MemReader`]'s frames served as `f32` only: its `u16` read fails.
+    struct WideReader(MemReader);
+
+    impl TileReader for WideReader {
+        fn sample_format(&self) -> SampleFormat {
+            SampleFormat::F32
+        }
+
+        fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+            Err(AlgorithmError::Failed {
+                algorithm: "wide".to_string(),
+                detail: "serves f32 only".to_string(),
+            })
+        }
+
+        fn read_tile_f32_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [f32],
+        ) -> Result<(), AlgorithmError> {
+            let mut narrow = vec![0u16; out.len()];
+            self.0.read_tile_into(frame, rect, &mut narrow)?;
+            for (wide, narrow) in out.iter_mut().zip(narrow) {
+                *wide = f32::from(narrow);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ecc_reads_an_f32_serving_context_through_its_f32_read() {
+        let shifts = [(0.0, 0.0), (3.0, -2.0)];
+        let wide = WideReader(reader(W, H, &shifts, false));
+        let narrow = reader(W, H, &shifts, false);
+        let stack = StackContext::new(2, W, H, 1);
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+        cfg.insert("max-iterations".to_string(), ParamValue::Int(20));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+        let found = PyramidalEcc
+            .align_frame(&AlignContext::new(stack, 0, &wide), 1, &cfg)
+            .unwrap();
+        let expected = PyramidalEcc
+            .align_frame(&AlignContext::new(stack, 0, &narrow), 1, &cfg)
+            .unwrap();
+        assert_eq!(found, expected);
+        let (_, _, tx, ty) = found.transform.similarity_parts();
+        assert!(
+            (tx - 3.0).abs() < 0.05 && (ty + 2.0).abs() < 0.05,
+            "({tx}, {ty})"
+        );
     }
 
     /// The scene's sinusoids: spatial frequency per pixel (x, y), phase,

@@ -190,7 +190,7 @@ component WindowIconButton inherits FFIconButton {
 
 export component FFTabStrip inherits Rectangle {
     // Forwarded straight to the AppController via AppWindow.
-    callback window-drag-requested();
+    callback window-drag-pointer(PointerEventButton, bool);
     callback window-minimize-requested();
     callback window-maximize-toggled();
     callback window-close-requested();
@@ -230,13 +230,12 @@ export component FFTabStrip inherits Rectangle {
     background: Theme.surface-canvas;
 
     // The drag region: the whole strip behind the window-control cluster.
-    // `changed pressed` is a single-statement handler; it fires on both
-    // press and release, and a refused or redundant compositor move is a
-    // documented no-op.
+    // Every pointer event is forwarded with its button and whether it is a
+    // press; only a left press starts the native window move.
     TouchArea {
         width: parent.width;
         height: parent.height;
-        changed pressed => { root.window-drag-requested(); }
+        pointer-event(event) => { root.window-drag-pointer(event.button, event.kind == PointerEventKind.down); }
     }
 
     // The four-square Projects-overlay button: lit while the overlay is

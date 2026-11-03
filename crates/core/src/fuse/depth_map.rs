@@ -67,8 +67,8 @@ use crate::fuse::pyramid::Plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane, eligible as sharpness_eligible};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
-use crate::tile::Tile;
 use crate::tile::plan::TileSupport;
+use crate::tile::{Sample, SampleFormat, Tile};
 use crate::zmap::NO_SOURCE;
 
 const SCORE_RADIUS_DEFAULT: i64 = 4;
@@ -153,6 +153,55 @@ impl StackAlgorithm for DepthMap {
     }
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, u16>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, u16>(ctx, cfg),
+        }
+    }
+
+    fn fuse_f32(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, f32>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, f32>(ctx, cfg),
+        }
+    }
+
+    /// The output (2 B per sample as `u16`, 4 B as `f32`), the detail
+    /// plane's one-level pyramid with its cloned level (9 B per sample at the
+    /// peak), and per pixel the `f32` best and `u16` winner (6 B) plus the
+    /// per-frame `f32` detail, raw score and smoothed planes with the
+    /// eligibility mask and its erosion scratch (14 B).
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        samples_per_pixel: u32,
+        format: SampleFormat,
+    ) -> u64 {
+        let per_sample = if format == SampleFormat::F32 { 13 } else { 11 };
+        per_sample * u64::from(samples_per_pixel) + 20
+    }
+
+    /// `4 + score-radius + smoothing-radius` on the one-level decimation
+    /// grid of its detail plane.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        TileSupport {
+            reach_px: DETAIL_REACH + Self::score_radius(cfg) + Self::smoothing_radius(cfg),
+            decimation_levels: 1,
+        }
+    }
+}
+
+impl DepthMap {
+    /// Fuses frames read as `S` into a composite of `O` samples.
+    fn fuse_as<S: Sample, O: Sample>(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
         let score_radius =
             cfg.get("score-radius")
@@ -172,11 +221,11 @@ impl StackAlgorithm for DepthMap {
 
         let mut best = vec![f32::NEG_INFINITY; pixel_count];
         let mut winner = vec![NO_SOURCE; pixel_count];
-        let mut out = vec![0u16; pixel_count * spp_usize];
+        let mut out = vec![O::default(); pixel_count * spp_usize];
 
-        ctx.for_each_frame(|f, tile, covered| {
-            let detail = detail_plane(&tile.samples, width, height, spp)
-                .map_err(algorithm_error("depth-map"))?;
+        ctx.for_each_frame_as::<S>(|f, samples, covered| {
+            let detail =
+                detail_plane(samples, width, height, spp).map_err(algorithm_error("depth-map"))?;
             let raw_score = score_plane(&detail, score_radius);
             let smoothed = box_smooth(&raw_score, width, height, smoothing_radius);
             let eligible = covered.map(|covered| {
@@ -199,8 +248,12 @@ impl StackAlgorithm for DepthMap {
                     best[p] = smoothed[p];
                     winner[p] = f as u16;
                     let base = p * spp_usize;
-                    out[base..base + spp_usize]
-                        .copy_from_slice(&tile.samples[base..base + spp_usize]);
+                    for (out, sample) in out[base..base + spp_usize]
+                        .iter_mut()
+                        .zip(&samples[base..base + spp_usize])
+                    {
+                        *out = O::narrow(sample.widen());
+                    }
                 }
             }
             Ok(())
@@ -217,24 +270,6 @@ impl StackAlgorithm for DepthMap {
             },
             zmap: winner,
         })
-    }
-
-    /// The `u16` output (2 B per sample), the detail plane's one-level
-    /// pyramid with its cloned level (9 B per sample at the peak), and per
-    /// pixel the `f32` best and `u16` winner (6 B) plus the per-frame `f32`
-    /// detail, raw score and smoothed planes with the eligibility mask and
-    /// its erosion scratch (14 B).
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
-        11 * u64::from(samples_per_pixel) + 20
-    }
-
-    /// `4 + score-radius + smoothing-radius` on the one-level decimation
-    /// grid of its detail plane.
-    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
-        TileSupport {
-            reach_px: DETAIL_REACH + Self::score_radius(cfg) + Self::smoothing_radius(cfg),
-            decimation_levels: 1,
-        }
     }
 }
 
@@ -551,8 +586,24 @@ mod tests {
     #[test]
     fn working_bytes_per_pixel_are_pinned() {
         let cfg = ParamValues::new();
-        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 3), 53);
-        assert_eq!(DepthMap.working_bytes_per_pixel(&cfg, 1), 31);
+        assert_eq!(
+            DepthMap.working_bytes_per_pixel(&cfg, 3, SampleFormat::U16),
+            53
+        );
+        assert_eq!(
+            DepthMap.working_bytes_per_pixel(&cfg, 1, SampleFormat::U16),
+            31
+        );
+    }
+
+    #[test]
+    fn f32_output_adds_two_bytes_per_sample_to_the_working_bytes() {
+        let cfg = ParamValues::new();
+        for spp in [1, 3] {
+            let u16_bytes = DepthMap.working_bytes_per_pixel(&cfg, spp, SampleFormat::U16);
+            let f32_bytes = DepthMap.working_bytes_per_pixel(&cfg, spp, SampleFormat::F32);
+            assert_eq!(f32_bytes - u16_bytes, 2 * u64::from(spp));
+        }
     }
 
     #[test]

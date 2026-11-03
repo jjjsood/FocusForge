@@ -46,9 +46,9 @@ for relative, content in {
     path.write_text(content, encoding="utf-8")
 
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
-def package(name, version, source, license_name, identifier=None):
-    return {"id": identifier or f"{source or 'path'}#{name}@{version}", "name": name, "version": version, "source": source, "license": license_name}
-def state(active_license="MIT", extra=None, path_dependency=False, linux_on_windows=False, malformed=False, missing_identity=False, reverse=False):
+def package(name, version, source, license_name, identifier=None, manifest=None):
+    return {"id": identifier or f"{source or 'path'}#{name}@{version}", "name": name, "version": version, "source": source, "license": license_name, "manifest_path": str(manifest) if manifest else None}
+def state(active_license="MIT", extra=None, path_dependency=False, vendor_dependency=False, linux_on_windows=False, malformed=False, missing_identity=False, reverse=False):
     trees = {target: ["focusforge-cli v0.1.0 (/workspace/cli)", "active v1.0.0"] for target in targets}
     trees[targets[0]].append("linux-only v1.0.0")
     trees[targets[1]].append("renamed-target v2.0.0")
@@ -57,6 +57,7 @@ def state(active_license="MIT", extra=None, path_dependency=False, linux_on_wind
     trees[targets[0]].extend(["same-version v1.0.0", "same-version v2.0.0"])
     if extra: trees[targets[0]].append(extra["tree"])
     if path_dependency: trees[targets[0]].append("path-only v1.0.0 (/outside/path-only)")
+    if vendor_dependency: trees[targets[0]].append(f"vendored v1.0.0 ({root}/vendor/vendored)")
     if linux_on_windows: trees[targets[1]].append("linux-only v1.0.0")
     if malformed: trees[targets[0]].append("malformed cargo tree record")
     if missing_identity: trees[targets[0]].append("missing-runtime v1.0.0")
@@ -77,7 +78,8 @@ def state(active_license="MIT", extra=None, path_dependency=False, linux_on_wind
         if target == targets[2]: packages.append(package("same", "1.0.0", "git+https://example.invalid/git#abc", "MIT"))
         if target == targets[1]: packages.append(package("same", "1.0.0", "registry+example", "Apache-2.0"))
         if extra and target == targets[0]: packages.append(package(extra["name"], extra["version"], "registry+example", extra["license"]))
-        if path_dependency and target == targets[0]: packages.append(package("path-only", "1.0.0", None, "MIT", "path+outside#path-only@1.0.0"))
+        if path_dependency and target == targets[0]: packages.append(package("path-only", "1.0.0", None, "MIT", "path+outside#path-only@1.0.0", root.parent / "outside/path-only/Cargo.toml"))
+        if vendor_dependency and target == targets[0]: packages.append(package("vendored", "1.0.0", None, "MIT", "path+vendor#vendored@1.0.0", root / "vendor/vendored/Cargo.toml"))
         metadata[target] = {"packages": list(reversed(packages)) if reverse else packages, "workspace_members": ["path+workspace#focusforge-cli@0.1.0"]}
         if reverse: trees[target].reverse()
     return {"trees": trees, "metadata": metadata}
@@ -153,6 +155,14 @@ before_notice, before_lock = digest(notice), digest(lock)
 fixture.write_text(json.dumps({"fail": True}), encoding="utf-8")
 result = run(want=1)
 assert "fixture cargo failure" in result.stderr and digest(notice) == before_notice and digest(lock) == before_lock
+
+fixture.write_text(json.dumps(state(vendor_dependency=True)), encoding="utf-8")
+run("--write"); run()
+vendored = b"- Package: vendored 1.0.0\n  Source: registry+https://github.com/rust-lang/crates.io-index\n  Declared license: MIT\n"
+assert vendored in notice.read_bytes()
+fixture.write_text(json.dumps(state(vendor_dependency=True, path_dependency=True)), encoding="utf-8")
+before_notice, before_lock = digest(notice), digest(lock)
+assert "runtime path dependency lacks a registry or git source: path-only 1.0.0" in run(want=1).stderr and digest(notice) == before_notice and digest(lock) == before_lock
 PY
 
 echo "OK: NOTICE selftest covers the collector, renderer, stale records, and failure atomicity"

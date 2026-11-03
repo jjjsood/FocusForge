@@ -45,7 +45,7 @@ export component ComparisonWindow inherits Window {
     in property <length> cursor-y;
     in property <bool> window-maximized: false;
 
-    callback window-drag-requested();
+    callback window-drag-pointer(PointerEventButton, bool);
     callback window-minimize-requested();
     callback window-maximize-toggled();
     callback window-close-requested();
@@ -115,7 +115,7 @@ export component ComparisonWindow inherits Window {
         width: root.width;
         title: root.bar-title;
         maximized: root.window-maximized;
-        drag-requested => { root.window-drag-requested(); }
+        drag-pointer(button, down) => { root.window-drag-pointer(button, down); }
         minimize-requested => { root.window-minimize-requested(); }
         maximize-toggled => { root.window-maximize-toggled(); }
         close-requested => { root.window-close-requested(); }
