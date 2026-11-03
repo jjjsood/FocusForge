@@ -287,25 +287,6 @@ To change a recipe, edit `tools/package-managers.py`, never the submitted
 files: the next release overwrites them. A new library that the binaries link
 or `dlopen` makes `check-aur` fail until its Arch package is in `AUR_DEPENDS`.
 
-One-time setup, before the first stable tag that should reach them:
-
-1. **AUR.** Create an account on <https://aur.archlinux.org> and add an SSH
-   public key to it. The private key goes into the secret
-   `AUR_SSH_PRIVATE_KEY`. The first push creates `focusforge-bin`, so the name
-   needs no reservation. The job checks the host's Ed25519 key against the
-   fingerprint pinned in `release.yml`, which is the one the AUR home page
-   publishes.
-2. **winget.** Create a classic personal access token with the `public_repo`
-   scope and store it as `WINGET_TOKEN`. A fine-grained token cannot open a
-   pull request on a repository it does not own. wingetcreate forks
-   `microsoft/winget-pkgs` into the token owner's account. The first pull
-   request adds the package, and winget-pkgs' reviewers check it before
-   merging.
-3. **Environment.** Create the environment `package-managers` under
-   *Settings → Environments*. Put both secrets there, not in the repository
-   secrets, and allow only tags matching `v*` to deploy to it. That way no
-   branch or pull request run can read them.
-
 Until a secret is set, its job fails with a message that names the missing
 secret. The GitHub Release itself is published before either job runs and is
 unaffected.
