@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm, TileOutput};
 use crate::display::preview::{PreviewMosaic, heat16};
@@ -440,16 +441,20 @@ impl FusionConsumer {
         if let Some(mosaic) = &self.preview {
             // The preview shows what the display shows: an `f32` composite
             // clamped onto the 16-bit scale.
+            let start = Instant::now();
             let shown: Vec<u16> = cropped_composite
                 .iter()
                 .map(|sample| u16::narrow(sample.widen()))
                 .collect();
+            mosaic.charge(start.elapsed());
             mosaic.fold(target_written, &shown);
         }
         if let Some((mosaic, max_score)) = &self.heat
             && let Some(sharpness) = &output.sharpness
         {
+            let start = Instant::now();
             let heat = heat_window(sharpness, job.read_rect(), target, *max_score);
+            mosaic.charge(start.elapsed());
             mosaic.fold(target_written, &heat);
         }
 

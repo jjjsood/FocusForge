@@ -22,7 +22,7 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
-use crate::display::{PreviewFeed, PreviewKinds, StagePreview};
+use crate::display::{PreviewCost, PreviewFeed, PreviewKinds, StagePreview};
 use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
 use crate::fuse::consumer::written_rect;
 use crate::fuse::description::format_composite_description;
@@ -178,6 +178,9 @@ pub struct FuseReport {
     pub stages: StageTimings,
     pub wall_seconds: f64,
     pub metrics: Metrics,
+    /// The time spent building and delivering each preview kind; zero when
+    /// the observer asked for none.
+    pub preview_cost: PreviewCost,
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
@@ -1054,6 +1057,7 @@ pub fn run(
         stages,
         wall_seconds,
         metrics,
+        preview_cost: feed.as_ref().map(PreviewFeed::cost).unwrap_or_default(),
     })))
 }
 

@@ -22,7 +22,7 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, FailurePolicy, Transform};
-use focusforge_core::display::{PreviewKind, PreviewKinds, StagePreview};
+use focusforge_core::display::{PreviewCost, PreviewKind, PreviewKinds, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
@@ -2883,6 +2883,27 @@ fn preview_feed_absent_without_subscriber() {
     let request = ecc_request("pf_absent", 3, "anchor");
     run_observed(&request, &observer);
     assert_eq!(observer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn preview_cost_is_reported_per_requested_kind() {
+    let plain = run_observed(&ecc_request("pf_cost_plain", 3, "anchor"), &NoopObserver);
+    assert_eq!(plain.preview_cost, PreviewCost::default());
+
+    let log = PreviewLog::new(true, true);
+    let report = run_observed(&ecc_request("pf_cost_sub", 3, "anchor"), &log);
+    let cost = report.preview_cost;
+    assert!(cost.composite > Duration::ZERO, "composite work is charged");
+    assert!(
+        cost.aligned_frame > Duration::ZERO,
+        "aligned work is charged"
+    );
+    assert_eq!(cost.heat, Duration::ZERO, "heat was not requested");
+
+    let heat = PreviewLog::heat_only();
+    let report = run_observed(&ecc_request("pf_cost_heat", 3, "anchor"), &heat);
+    assert!(report.preview_cost.heat > Duration::ZERO);
+    assert_eq!(report.preview_cost.composite, Duration::ZERO);
 }
 
 fn mantis8_frames(count: usize) -> Vec<PathBuf> {

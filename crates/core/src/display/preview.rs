@@ -7,7 +7,9 @@
 //! [`PreviewFeed::deliver`] hands out at most one changed image per kind.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::align::AlignPyramid;
 use crate::align::Transform;
@@ -23,6 +25,39 @@ pub struct PreviewKinds {
     pub aligned_frame: bool,
     pub composite: bool,
     pub heat: bool,
+}
+
+/// The time a run spent building and handing over each kind of preview,
+/// summed over every thread that worked on it. Zero for a kind nobody
+/// requested.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreviewCost {
+    pub aligned_frame: Duration,
+    pub composite: Duration,
+    pub heat: Duration,
+}
+
+/// Nanoseconds spent on one kind, added from any thread.
+#[derive(Default)]
+struct Meter(AtomicU64);
+
+impl Meter {
+    fn charge(&self, spent: Duration) {
+        let nanos = u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX);
+        self.0.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// Runs `work` and charges its wall time.
+    fn time<T>(&self, work: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let out = work();
+        self.charge(start.elapsed());
+        out
+    }
+
+    fn total(&self) -> Duration {
+        Duration::from_nanos(self.0.load(Ordering::Relaxed))
+    }
 }
 
 /// What a [`StagePreview`] shows.
@@ -138,11 +173,29 @@ impl PreviewFeed {
         })
     }
 
+    /// The time spent on each kind so far, delivery included.
+    pub fn cost(&self) -> PreviewCost {
+        let mosaic =
+            |m: &OnceLock<Arc<PreviewMosaic>>| m.get().map_or(Duration::ZERO, |m| m.cost.total());
+        PreviewCost {
+            aligned_frame: self
+                .aligned
+                .as_ref()
+                .map_or(Duration::ZERO, |sink| sink.cost.total()),
+            composite: mosaic(&self.composite),
+            heat: mosaic(&self.heat),
+        }
+    }
+
     /// Hands `send` every preview that changed since the last call, at most
     /// one per kind. Called from the run's poll thread only.
     pub fn deliver(&self, mut send: impl FnMut(&StagePreview)) {
-        if let Some(preview) = self.aligned.as_ref().and_then(AlignedFrameSink::take_new) {
-            send(&preview);
+        if let Some((sink, preview)) = self
+            .aligned
+            .as_ref()
+            .and_then(|sink| Some((sink, sink.take_new()?)))
+        {
+            sink.cost.time(|| send(&preview));
         }
         let with_tiles = |mut preview: StagePreview| {
             if let Some(tiles) = self.tiles.get() {
@@ -150,11 +203,13 @@ impl PreviewFeed {
             }
             preview
         };
-        if let Some(preview) = self.composite.get().and_then(|m| m.take_new()) {
-            send(&with_tiles(preview));
-        }
-        if let Some(preview) = self.heat.get().and_then(|m| m.take_new()) {
-            send(&with_tiles(preview));
+        for mosaic in [&self.composite, &self.heat] {
+            if let Some(mosaic) = mosaic.get()
+                && let Some(preview) = mosaic.take_new()
+            {
+                let preview = with_tiles(preview);
+                mosaic.cost.time(|| send(&preview));
+            }
         }
     }
 }
@@ -233,6 +288,7 @@ impl Gray {
 pub struct AlignedFrameSink {
     frame_size: (u32, u32),
     state: Mutex<AlignedState>,
+    cost: Meter,
 }
 
 #[derive(Default)]
@@ -249,6 +305,7 @@ impl AlignedFrameSink {
         AlignedFrameSink {
             frame_size,
             state: Mutex::new(AlignedState::default()),
+            cost: Meter::default(),
         }
     }
 
@@ -256,6 +313,10 @@ impl AlignedFrameSink {
     /// least [`PREVIEW_LONG_EDGE`] long, or of level 1 when none is. A
     /// pyramid with no level offers nothing.
     pub(crate) fn offer(&self, frame: usize, pyramid: &AlignPyramid) {
+        self.cost.time(|| self.offer_untimed(frame, pyramid));
+    }
+
+    fn offer_untimed(&self, frame: usize, pyramid: &AlignPyramid) {
         let depth = pyramid.depth() as usize;
         let Some(level) = (1..=depth)
             .rev()
@@ -281,6 +342,15 @@ impl AlignedFrameSink {
     }
 
     fn take_new(&self) -> Option<StagePreview> {
+        let start = Instant::now();
+        let preview = self.take_new_untimed();
+        if preview.is_some() {
+            self.cost.charge(start.elapsed());
+        }
+        preview
+    }
+
+    fn take_new_untimed(&self) -> Option<StagePreview> {
         let (frame, gray, transform) = {
             let mut state = self.state.lock().unwrap();
             if state.completed == state.delivered {
@@ -331,6 +401,7 @@ pub struct PreviewMosaic {
     samples_per_pixel: u32,
     size: (u32, u32),
     state: Mutex<MosaicState>,
+    cost: Meter,
 }
 
 struct MosaicState {
@@ -358,6 +429,7 @@ impl PreviewMosaic {
                 folded: 0,
                 delivered: 0,
             }),
+            cost: Meter::default(),
         }
     }
 
@@ -365,12 +437,29 @@ impl PreviewMosaic {
     /// the output's own corner), `samples` its samples (16-bit heat values
     /// for the heat kind).
     pub(crate) fn fold(&self, rect: Rect, samples: &[u16]) {
-        let mut state = self.state.lock().unwrap();
-        state.reducer.add_band(samples, rect);
-        state.folded += 1;
+        self.cost.time(|| {
+            let mut state = self.state.lock().unwrap();
+            state.reducer.add_band(samples, rect);
+            state.folded += 1;
+        });
+    }
+
+    /// Adds work done on this kind's behalf outside the mosaic, such as
+    /// preparing the samples to fold.
+    pub(crate) fn charge(&self, spent: Duration) {
+        self.cost.charge(spent);
     }
 
     fn take_new(&self) -> Option<StagePreview> {
+        let start = Instant::now();
+        let preview = self.take_new_untimed();
+        if preview.is_some() {
+            self.cost.charge(start.elapsed());
+        }
+        preview
+    }
+
+    fn take_new_untimed(&self) -> Option<StagePreview> {
         let (samples, covered) = {
             let mut state = self.state.lock().unwrap();
             if state.folded == state.delivered {
@@ -443,6 +532,47 @@ mod tests {
         let mosaic = feed.begin_heat(rect(0, 0, 64, 64)).expect("heat requested");
         let again = feed.begin_heat(rect(0, 0, 64, 64)).unwrap();
         assert!(Arc::ptr_eq(&mosaic, &again), "one mosaic per run");
+    }
+
+    #[test]
+    fn a_feed_charges_each_kind_only_its_own_work() {
+        let all = PreviewKinds {
+            aligned_frame: true,
+            composite: true,
+            heat: true,
+        };
+        let feed = PreviewFeed::new(all, (512, 512)).unwrap();
+        assert_eq!(feed.cost(), PreviewCost::default());
+        let composite = feed.begin_composite(rect(0, 0, 512, 512), 1).unwrap();
+        let _heat = feed.begin_heat(rect(0, 0, 512, 512)).unwrap();
+        composite.fold(rect(0, 0, 512, 512), &vec![0x8000; 512 * 512]);
+        let cost = feed.cost();
+        assert!(cost.composite > Duration::ZERO);
+        assert_eq!(cost.heat, Duration::ZERO);
+        assert_eq!(cost.aligned_frame, Duration::ZERO);
+    }
+
+    #[test]
+    fn delivery_time_is_charged_to_the_delivered_kind() {
+        let kinds = PreviewKinds {
+            aligned_frame: false,
+            composite: true,
+            heat: true,
+        };
+        let feed = PreviewFeed::new(kinds, (4, 4)).unwrap();
+        let composite = feed.begin_composite(rect(0, 0, 4, 4), 1).unwrap();
+        let heat = feed.begin_heat(rect(0, 0, 4, 4)).unwrap();
+        composite.fold(rect(0, 0, 4, 4), &[1; 16]);
+        heat.fold(rect(0, 0, 4, 4), &[1; 16]);
+        let before = feed.cost();
+        feed.deliver(|p| {
+            if p.kind == PreviewKind::Heat {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let cost = feed.cost();
+        assert!(cost.heat - before.heat >= Duration::from_millis(2));
+        assert!(cost.composite < cost.heat);
     }
 
     #[test]
