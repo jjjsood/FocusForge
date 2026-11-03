@@ -10,10 +10,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
+use crate::source_previews::PreviewPixels;
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
+pub use focusforge_core::display::PreviewKinds;
+use focusforge_core::display::{PreviewKind, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, GainReader};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
@@ -281,6 +284,210 @@ pub fn spawn_after(
 }
 
 #[cfg(test)]
+mod stage_tests {
+    use super::*;
+
+    const EXTENT: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 60,
+    };
+
+    fn progress(units_done: usize) -> JobProgress {
+        JobProgress {
+            stage: JobStage::Fuse,
+            units_done,
+            unit_total: 8,
+            pixels_done: 0,
+            pixel_total: 0,
+            running: Duration::ZERO,
+            eta: None,
+            align_done: 0,
+            align_total: 0,
+            prepare_done: 0,
+            prepare_total: 0,
+        }
+    }
+
+    /// Eight tiles over [`EXTENT`], row-major: four columns of 32 px with a
+    /// 4 px last one, two rows of 32 and 28 px.
+    fn tiles() -> Arc<[Rect]> {
+        let columns = [(0, 32), (32, 32), (64, 32), (96, 4)];
+        let rows = [(0, 32), (32, 28)];
+        rows.iter()
+            .flat_map(|&(y, height)| {
+                columns.iter().map(move |&(x, width)| Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+            })
+            .collect()
+    }
+
+    /// A 10 x 6 preview of [`EXTENT`] whose `fused` tiles are opaque, each
+    /// pixel `value` grey.
+    fn preview(kind: PreviewKind, fused: &[usize], value: u8) -> StagePreview {
+        let tiles = tiles();
+        let mut rgba = vec![0u8; 10 * 6 * 4];
+        for &i in fused {
+            let t = tiles[i];
+            for y in t.y / 10..(t.y + t.height) / 10 {
+                for x in t.x / 10..(t.x + t.width) / 10 {
+                    let at = (y * 10 + x) as usize * 4;
+                    rgba[at..at + 4].copy_from_slice(&[value, value, value, 255]);
+                }
+            }
+        }
+        StagePreview {
+            kind,
+            width: 10,
+            height: 6,
+            rgba,
+            extent: EXTENT,
+            tiles,
+        }
+    }
+
+    fn image(view: Option<StageView>) -> StageImage {
+        match view {
+            Some(StageView::Picture(image)) => image,
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    fn front(image: &StageImage) -> Vec<Rect> {
+        image
+            .tiles
+            .iter()
+            .filter(|mark| mark.front)
+            .map(|mark| mark.rect)
+            .collect()
+    }
+
+    #[test]
+    fn stage_front_is_the_tiles_fused_since_the_previous_preview() {
+        let observer = GuiObserver::with_previews(
+            PreviewKinds {
+                aligned_frame: false,
+                composite: true,
+                heat: true,
+            },
+            HeatRamp::default(),
+        );
+        let tiles = tiles();
+        let now = Instant::now();
+        let view = || image(observer.stage_view(Some(&progress(2)), false, now));
+
+        // Two tiles fuse in one preview, one of them in the ragged last column.
+        observer.preview(&preview(PreviewKind::Composite, &[0, 3], 90));
+        observer.preview(&preview(PreviewKind::Heat, &[0, 3], 255));
+        let first = view();
+        assert_eq!(front(&first), vec![tiles[0], tiles[3]]);
+        let unfused = first.tiles.iter().filter(|mark| !mark.front).count();
+        assert_eq!(unfused, 6, "every tile not fused yet keeps its grid mark");
+        let ramp = HeatRamp::default().colour(255);
+        assert_eq!(
+            first.pixels.rgba[..4],
+            [ramp[0], ramp[1], ramp[2], 255],
+            "a front tile shows its heat"
+        );
+
+        // The next preview fused nothing new: the front is empty.
+        observer.preview(&preview(PreviewKind::Composite, &[0, 3], 90));
+        let second = view();
+        assert!(front(&second).is_empty());
+        assert_eq!(second.tiles.len(), 6);
+        assert_eq!(second.pixels.rgba[..4], [90, 90, 90, 255]);
+
+        // A later preview marks only what it added.
+        observer.preview(&preview(PreviewKind::Composite, &[0, 3, 7], 90));
+        assert_eq!(front(&view()), vec![tiles[7]]);
+    }
+
+    #[test]
+    fn fuse_stage_replaces_the_aligned_frame_with_the_fusing_phase_at_once() {
+        let observer = GuiObserver::with_previews(PreviewKinds::default(), HeatRamp::default());
+        observer.stage(RunStage::Prepare { frames: 2 });
+        observer.stage(RunStage::Fuse);
+        assert_eq!(
+            progress_phase(observer.last_progress().as_ref()),
+            Phase::Fusing,
+            "no Preparing snapshot is left between alignment and the first fuse tick"
+        );
+    }
+
+    #[test]
+    fn writing_keeps_the_inset_for_two_seconds_after_the_last_tile() {
+        let observer = GuiObserver::with_previews(
+            PreviewKinds {
+                aligned_frame: false,
+                composite: true,
+                heat: true,
+            },
+            HeatRamp::default(),
+        );
+        let all: Vec<usize> = (0..8).collect();
+        observer.preview(&preview(PreviewKind::Composite, &all, 90));
+        observer.preview(&preview(PreviewKind::Heat, &all, 200));
+        observer.tick(&progress(8));
+        let now = Instant::now();
+        let at =
+            |later: Duration| image(observer.stage_view(Some(&progress(8)), true, now + later));
+        assert!(at(Duration::from_millis(1900)).inset.is_some());
+        assert!(at(Duration::from_secs(3)).inset.is_none());
+    }
+
+    #[test]
+    fn heat_ramp_hits_its_stops() {
+        let stops = [
+            [0x08, 0x08, 0x08],
+            [0x2A, 0x18, 0x10],
+            [0xC8, 0x5F, 0x28],
+            [0xE8, 0x76, 0x3A],
+            [0xF2, 0xF2, 0xF2],
+        ];
+        let ramp = HeatRamp::new(stops);
+        assert_eq!(ramp.colour(0), stops[0]);
+        assert_eq!(ramp.colour(255), stops[4]);
+        for (value, stop) in [(77u8, 1), (158, 2), (209, 3)] {
+            let got = ramp.colour(value);
+            for c in 0..3 {
+                let off = got[c].abs_diff(stops[stop][c]);
+                assert!(
+                    off <= 2,
+                    "value {value} channel {c}: {got:?} vs {:?}",
+                    stops[stop]
+                );
+            }
+        }
+        let halfway = ramp.colour(38);
+        for c in 0..3 {
+            let (a, b) = (i16::from(stops[0][c]), i16::from(stops[1][c]));
+            assert!(
+                (i16::from(halfway[c]) - (a + b) / 2).abs() <= 2,
+                "linear between the first two stops: {halfway:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn landing_fade_matches_the_stage_primitives_motion() {
+        let theme = include_str!("../ui/theme.slint");
+        assert!(theme.contains("motion-slow: 400ms;"));
+        assert_eq!(LANDING_FADE, Duration::from_millis(400));
+        for primitive in [
+            include_str!("../ui/components/ff_stage_view.slint"),
+            include_str!("../ui/components/ff_stage_inset.slint"),
+        ] {
+            assert!(primitive.contains("duration: Theme.motion-slow;"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod spawn_tests {
     use std::sync::{Arc, mpsc};
 
@@ -404,6 +611,236 @@ pub fn resolve_align_backend(
     Some(lazy)
 }
 
+/// Where the heat ramp's five colour stops sit, as fractions of the 8-bit
+/// heat value.
+const HEAT_STOP_POSITIONS: [f32; 5] = [0.0, 0.30, 0.62, 0.82, 1.0];
+
+/// The sharpness ramp: five colours at fixed positions, linear in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeatRamp([[u8; 3]; 5]);
+
+impl HeatRamp {
+    pub fn new(stops: [[u8; 3]; 5]) -> Self {
+        HeatRamp(stops)
+    }
+
+    /// The ramp colour of an 8-bit heat value.
+    pub fn colour(&self, value: u8) -> [u8; 3] {
+        let at = f32::from(value) / 255.0;
+        let upper = HEAT_STOP_POSITIONS
+            .iter()
+            .position(|&stop| at <= stop)
+            .unwrap_or(4)
+            .max(1);
+        let (lo, hi) = (HEAT_STOP_POSITIONS[upper - 1], HEAT_STOP_POSITIONS[upper]);
+        let t = ((at - lo) / (hi - lo)).clamp(0.0, 1.0);
+        std::array::from_fn(|c| {
+            let (a, b) = (f32::from(self.0[upper - 1][c]), f32::from(self.0[upper][c]));
+            (a + (b - a) * t).round() as u8
+        })
+    }
+}
+
+/// A heat ramp that runs from black to white until the theme's stops arrive.
+impl Default for HeatRamp {
+    fn default() -> Self {
+        HeatRamp([[0; 3], [77; 3], [158; 3], [209; 3], [255; 3]])
+    }
+}
+
+/// What the Composite pane shows for a live run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageView {
+    Picture(StageImage),
+    /// The landed composite with the sharpness inset still over it, fading
+    /// out when `fading`.
+    Inset {
+        pixels: Arc<PreviewPixels>,
+        fading: bool,
+    },
+    /// No image yet: a card with a title and one line.
+    Placeholder {
+        title: &'static str,
+        body: &'static str,
+    },
+}
+
+/// One stage image with its overlays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageImage {
+    /// The pane label; `AppController::stage_view` fills it.
+    pub label: String,
+    /// The index of the aligned frame the image shows, `None` for the composite.
+    pub frame: Option<usize>,
+    pub pixels: Arc<PreviewPixels>,
+    /// Where the image sits, in the displayed image's pixels.
+    pub extent: Rect,
+    /// Every tile that is not fused yet or is on the front, in output
+    /// coordinates; empty while aligning and writing.
+    pub tiles: Vec<StageTileMark>,
+    /// The sharpness of the tiles fused so far, when the run shows heat.
+    pub inset: Option<Arc<PreviewPixels>>,
+    /// The image is fading out over the composite it stood in for.
+    pub fading: bool,
+    /// The inset is fading out.
+    pub inset_fading: bool,
+}
+
+/// A tile the stage view marks: not fused yet, or fused since the previous
+/// composite preview (`front`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageTileMark {
+    pub rect: Rect,
+    pub front: bool,
+}
+
+const PREPARING: (&str, &str) = (
+    "Preparing frames",
+    "Images appear here once alignment starts.",
+);
+const ALIGNMENT_REUSED: (&str, &str) = (
+    "Alignment reused",
+    "Frames were aligned in an earlier run. Fusing starts next.",
+);
+const FUSING: (&str, &str) = ("Fusing", "The result builds here tile by tile.");
+
+/// How long the sharpness inset stays after the last tile fuses.
+pub const INSET_AFTER_FUSION: Duration = Duration::from_secs(2);
+
+/// How long the landing fades take; the stage view's `animate` uses
+/// `Theme.motion-slow`, the same 400 ms.
+pub const LANDING_FADE: Duration = Duration::from_millis(400);
+
+/// The composite and heat previews of one run, composed for display.
+struct CompositeStage {
+    complete: Arc<PreviewPixels>,
+    extent: Rect,
+    tiles: Arc<[Rect]>,
+    fused: Vec<bool>,
+    front: Vec<bool>,
+    heat: Option<Vec<u8>>,
+    image: Arc<PreviewPixels>,
+    inset: Arc<PreviewPixels>,
+}
+
+/// The preview pixels a run holds, latest of each kind.
+#[derive(Default)]
+struct StageImages {
+    aligned: Option<(usize, Arc<PreviewPixels>, Rect)>,
+    composite: Option<CompositeStage>,
+    heat_unavailable: bool,
+}
+
+/// `rect` (output coordinates over `extent`) in the pixels of a `width` x
+/// `height` preview, as `(x0, y0, x1, y1)`.
+fn preview_rect(rect: Rect, extent: Rect, width: u32, height: u32) -> (usize, usize, usize, usize) {
+    let scale = |v: u32, size: u32, over: u32| {
+        (u64::from(v) * u64::from(size) / u64::from(over.max(1))) as usize
+    };
+    (
+        scale(rect.x, width, extent.width),
+        scale(rect.y, height, extent.height),
+        scale(rect.x + rect.width, width, extent.width).min(width as usize),
+        scale(rect.y + rect.height, height, extent.height).min(height as usize),
+    )
+}
+
+impl CompositeStage {
+    fn new(preview: &StagePreview, previous: Option<CompositeStage>) -> Self {
+        let (width, height) = (preview.width, preview.height);
+        let fused: Vec<bool> = preview
+            .tiles
+            .iter()
+            .map(|tile| {
+                let centre = Rect {
+                    x: tile.x + tile.width / 2,
+                    y: tile.y + tile.height / 2,
+                    width: 1,
+                    height: 1,
+                };
+                let (x, y, _, _) = preview_rect(centre, preview.extent, width, height);
+                let (x, y) = (x.min(width as usize - 1), y.min(height as usize - 1));
+                preview.rgba[(y * width as usize + x) * 4 + 3] == 255
+            })
+            .collect();
+        let was_fused = |i: usize| {
+            previous
+                .as_ref()
+                .is_some_and(|p| p.fused.get(i).copied().unwrap_or(false))
+        };
+        let front = fused
+            .iter()
+            .enumerate()
+            .map(|(i, &now)| now && !was_fused(i))
+            .collect();
+        let empty = Arc::new(PreviewPixels {
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        });
+        CompositeStage {
+            complete: Arc::new(PreviewPixels {
+                width,
+                height,
+                rgba: preview.rgba.clone(),
+            }),
+            extent: preview.extent,
+            tiles: Arc::clone(&preview.tiles),
+            fused,
+            front,
+            heat: previous.and_then(|p| p.heat),
+            image: Arc::clone(&empty),
+            inset: empty,
+        }
+    }
+
+    /// Rebuilds the composed image and the inset from the composite and the
+    /// latest heat: front tiles show their heat, or nothing without it.
+    fn compose(&mut self, ramp: &HeatRamp) {
+        let (width, height) = (self.complete.width, self.complete.height);
+        let heat_at = |heat: &[u8], i: usize| {
+            (heat.len() == self.complete.rgba.len() && heat[i * 4 + 3] == 255)
+                .then(|| ramp.colour(heat[i * 4]))
+        };
+        let mut rgba = self.complete.rgba.clone();
+        for (tile, _) in self
+            .tiles
+            .iter()
+            .zip(&self.front)
+            .filter(|(_, front)| **front)
+        {
+            let (x0, y0, x1, y1) = preview_rect(*tile, self.extent, width, height);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = y * width as usize + x;
+                    let heated = self.heat.as_deref().and_then(|h| heat_at(h, i));
+                    let [r, g, b] = heated.unwrap_or([0; 3]);
+                    let a = if heated.is_some() { 255 } else { 0 };
+                    rgba[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, a]);
+                }
+            }
+        }
+        self.image = Arc::new(PreviewPixels {
+            width,
+            height,
+            rgba,
+        });
+        if let Some(heat) = &self.heat {
+            let mut inset = vec![0u8; heat.len()];
+            for i in 0..heat.len() / 4 {
+                if let Some([r, g, b]) = heat_at(heat, i) {
+                    inset[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, 255]);
+                }
+            }
+            self.inset = Arc::new(PreviewPixels {
+                width,
+                height,
+                rgba: inset,
+            });
+        }
+    }
+}
+
 /// The GUI's [`StageObserver`]: no terminal, no signal -- `paused` parks on
 /// a condvar until [`GuiObserver::resume`] or the control itself is
 /// cancelled, and every tick is stashed for `AppController::job_view` to
@@ -423,11 +860,25 @@ pub struct GuiObserver {
     align_adapter: OnceLock<&'static OnceLock<String>>,
     /// Why the align stage reran on the CPU, when it did.
     rerun_reason: Mutex<Option<String>>,
+    kinds: PreviewKinds,
+    ramp: HeatRamp,
+    images: Mutex<StageImages>,
+    /// When the first progress snapshot showed every tile fused.
+    fusion_ended: OnceLock<Instant>,
 }
 
 impl GuiObserver {
     pub fn new() -> Self {
+        Self::with_previews(PreviewKinds::default(), HeatRamp::default())
+    }
+
+    /// An observer that asks the run for the `kinds` of preview and holds
+    /// them for [`Self::stage_view`], heat coloured by `ramp`.
+    pub fn with_previews(kinds: PreviewKinds, ramp: HeatRamp) -> Self {
         GuiObserver {
+            kinds,
+            ramp,
+            images: Mutex::new(StageImages::default()),
             last_progress: Mutex::new(None),
             pause_gate: Mutex::new(false),
             condvar: Condvar::new(),
@@ -435,6 +886,7 @@ impl GuiObserver {
             notices: Mutex::new(Vec::new()),
             align_adapter: OnceLock::new(),
             rerun_reason: Mutex::new(None),
+            fusion_ended: OnceLock::new(),
         }
     }
 
@@ -475,6 +927,110 @@ impl GuiObserver {
 
     fn set_align_adapter(&self, adapter: &'static OnceLock<String>) {
         let _ = self.align_adapter.set(adapter);
+    }
+
+    fn stage_images(&self) -> std::sync::MutexGuard<'_, StageImages> {
+        self.images
+            .lock()
+            .expect("no thread panicked while holding the stage image lock")
+    }
+
+    /// What the Composite pane shows for the run at `progress`: the image of
+    /// its stage, a card when the stage has none and the tab has no composite
+    /// (`has_composite` false), `None` when the old composite stays.
+    pub fn stage_view(
+        &self,
+        progress: Option<&JobProgress>,
+        has_composite: bool,
+        now: Instant,
+    ) -> Option<StageView> {
+        let card =
+            |(title, body)| (!has_composite).then_some(StageView::Placeholder { title, body });
+        let Some(progress) = progress else {
+            return card(PREPARING);
+        };
+        let images = self.stage_images();
+        let image = |frame, pixels: &Arc<PreviewPixels>, extent, tiles, inset| {
+            Some(StageView::Picture(StageImage {
+                label: String::new(),
+                frame,
+                pixels: Arc::clone(pixels),
+                extent,
+                tiles,
+                inset,
+                fading: false,
+                inset_fading: false,
+            }))
+        };
+        match progress_phase(Some(progress)) {
+            Phase::Preparing => card(PREPARING),
+            Phase::Aligning => match &images.aligned {
+                Some((frame, pixels, extent)) => {
+                    image(Some(*frame), pixels, *extent, Vec::new(), None)
+                }
+                None if progress.align_total == 0 => card(ALIGNMENT_REUSED),
+                None => card(PREPARING),
+            },
+            Phase::Writing => match &images.composite {
+                Some(c) => {
+                    let inset = self.heat_inset(&images).filter(|_| {
+                        self.fusion_ended.get().is_none_or(|&ended| {
+                            now.saturating_duration_since(ended) < INSET_AFTER_FUSION
+                        })
+                    });
+                    image(None, &c.complete, c.extent, Vec::new(), inset)
+                }
+                None => card(FUSING),
+            },
+            Phase::Fusing => match &images.composite {
+                Some(c) => {
+                    let tiles = (0..c.tiles.len())
+                        .filter(|&i| c.front[i] || !c.fused[i])
+                        .map(|i| StageTileMark {
+                            rect: c.tiles[i],
+                            front: c.front[i],
+                        })
+                        .collect();
+                    image(None, &c.image, c.extent, tiles, self.heat_inset(&images))
+                }
+                None => card(FUSING),
+            },
+        }
+    }
+
+    /// The sharpness inset of the composite so far, `None` when the run
+    /// shows no heat.
+    fn heat_inset(&self, images: &StageImages) -> Option<Arc<PreviewPixels>> {
+        let heat_on = self.kinds.heat && !images.heat_unavailable;
+        images
+            .composite
+            .as_ref()
+            .filter(|_| heat_on)
+            .map(|c| Arc::clone(&c.inset))
+    }
+
+    /// The complete mosaic the run ended with, carrying the sharpness inset
+    /// when the run shows heat, and when its last tile fused (now, if no
+    /// snapshot showed writing); `None` when no composite preview arrived.
+    pub fn final_stage(&self, now: Instant) -> Option<(StageImage, Instant)> {
+        let ended = self.fusion_ended.get().copied().unwrap_or(now);
+        let images = self.stage_images();
+        let c = images.composite.as_ref()?;
+        let image = StageImage {
+            label: "Composite".to_string(),
+            frame: None,
+            pixels: Arc::clone(&c.complete),
+            extent: Rect {
+                x: 0,
+                y: 0,
+                ..c.extent
+            },
+            tiles: Vec::new(),
+            inset: self.heat_inset(&images),
+            fading: false,
+            inset_fading: false,
+        };
+        Some((image, ended))
     }
 
     /// The most recent [`JobProgress`] snapshot `tick` recorded, or `None`
@@ -522,10 +1078,22 @@ impl Default for GuiObserver {
 
 impl StageObserver for GuiObserver {
     fn stage(&self, stage: RunStage) {
+        if matches!(
+            stage,
+            RunStage::Fuse
+                | RunStage::Align {
+                    source: AlignSource::Cached | AlignSource::Resumed,
+                    ..
+                }
+        ) {
+            self.stage_images().aligned = None;
+        }
         // The first Prepare snapshot is recorded here, so the bar shows the
         // frame total before the engine's first tick. A cached alignment
         // never ticks, so its stage is recorded here too; a computed one
-        // ticks on its own, with a real total.
+        // ticks on its own, with a real total. Fuse is recorded at once, so
+        // the cleared aligned frame is followed by the Fusing card, never by
+        // a stale Preparing one before the first fuse tick.
         let snapshot = |stage, prepare_total| JobProgress {
             stage,
             units_done: 0,
@@ -545,6 +1113,7 @@ impl StageObserver for GuiObserver {
                 source: AlignSource::Cached,
                 ..
             } => self.tick(&snapshot(JobStage::Align, 0)),
+            RunStage::Fuse => self.tick(&snapshot(JobStage::Fuse, 0)),
             _ => {}
         }
     }
@@ -553,11 +1122,49 @@ impl StageObserver for GuiObserver {
         self.record_notice(None, message);
     }
 
+    fn preview_kinds(&self) -> PreviewKinds {
+        self.kinds
+    }
+
+    fn preview(&self, preview: &StagePreview) {
+        let mut images = self.stage_images();
+        match preview.kind {
+            PreviewKind::AlignedFrame { frame } => {
+                let pixels = PreviewPixels {
+                    width: preview.width,
+                    height: preview.height,
+                    rgba: preview.rgba.clone(),
+                };
+                images.aligned = Some((frame, Arc::new(pixels), preview.extent));
+            }
+            PreviewKind::Composite => {
+                let mut stage = CompositeStage::new(preview, images.composite.take());
+                stage.compose(&self.ramp);
+                images.composite = Some(stage);
+            }
+            PreviewKind::Heat => {
+                if let Some(stage) = &mut images.composite {
+                    stage.heat = Some(preview.rgba.clone());
+                    stage.compose(&self.ramp);
+                }
+            }
+        }
+    }
+
+    fn preview_unavailable(&self, kinds: PreviewKinds) {
+        if kinds.heat {
+            self.stage_images().heat_unavailable = true;
+        }
+    }
+
     fn frame_notice(&self, frame: usize, message: &str) {
         self.record_notice(Some(frame), message);
     }
 
     fn tick(&self, progress: &JobProgress) {
+        if progress_phase(Some(progress)) == Phase::Writing {
+            let _ = self.fusion_ended.set(Instant::now());
+        }
         *self
             .last_progress
             .lock()

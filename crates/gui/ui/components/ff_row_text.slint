@@ -8,8 +8,12 @@ import { Theme } from "../theme.slint";
 export component FFRowText inherits Text {
     in property <bool> muted: false;
     in property <bool> accent: false;
+    // A line of explanation under a row: muted, in the body weight.
+    in property <bool> hint: false;
 
-    color: root.accent ? Theme.accent-default : root.muted ? Theme.text-muted : Theme.text-primary;
+    color: root.accent ? Theme.accent-default
+        : (root.muted || root.hint) ? Theme.text-muted : Theme.text-primary;
     font-size: Theme.text-value.size;
+    font-weight: root.hint ? Theme.text-body.weight : Theme.text-value.weight;
     vertical-alignment: center;
 }

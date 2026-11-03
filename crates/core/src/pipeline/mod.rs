@@ -24,6 +24,7 @@ use crate::align::{
 };
 use crate::display::{PreviewFeed, PreviewKinds, StagePreview};
 use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
+use crate::fuse::consumer::written_rect;
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
@@ -704,6 +705,16 @@ pub fn run(
         None => &warping_reader,
     };
     let scheduler = TileScheduler::new(reader, stack_ctx, spp, &options)?;
+    if let Some(feed) = &feed {
+        feed.set_tiles(
+            scheduler
+                .plan()
+                .tiles()
+                .iter()
+                .filter_map(|tile| written_rect(tile.interior(), applied_crop))
+                .collect(),
+        );
+    }
 
     let staging = request
         .scratch_root

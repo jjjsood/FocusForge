@@ -23,6 +23,9 @@ import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
+import { FFStageView, StageTile } from "components/ff_stage_view.slint";
+import { FFStageInset } from "components/ff_stage_inset.slint";
+import { FFHeatLegend } from "components/ff_heat_legend.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
@@ -199,7 +202,40 @@ component IconSizeSample inherits Rectangle {
     }
 }
 
+component StagePane inherits Rectangle {
+    in property <string> label;
+    in property <image> source;
+    in property <[StageTile]> tiles;
+    in property <bool> inset-visible;
+    in property <image> heat;
+
+    width: 400px;
+    height: 280px;
+
+    FFStageView {
+        width: parent.width;
+        height: parent.height;
+        image-w: parent.width;
+        image-h: parent.height;
+        source: root.source;
+        tiles: root.tiles;
+        inset-visible: root.inset-visible;
+        heat: root.heat;
+    }
+    FFPaneLabel {
+        x: ShellGeometry.pane-chrome-inset;
+        y: ShellGeometry.pane-chrome-inset;
+        label: root.label;
+    }
+}
+
 export component ThemeSheet inherits Window {
+    in property <image> stage-fusing;
+    in property <image> stage-fusing-bare;
+    in property <image> stage-complete;
+    in property <image> stage-heat;
+    in property <[StageTile]> stage-tiles;
+
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
     preferred-height: 1000px;
@@ -214,6 +250,32 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "Stage view: fusing with heat, fusing heat off, aligning, writing"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                StagePane { label: "Composite"; source: root.stage-fusing; tiles: root.stage-tiles; inset-visible: true; heat: root.stage-heat; }
+                StagePane { label: "Composite"; source: root.stage-fusing-bare; tiles: root.stage-tiles; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                StagePane { label: "Aligned · IMG_0042.tif"; source: root.stage-complete; }
+                StagePane { label: "Composite"; source: root.stage-complete; }
+            }
+        }
+
+        GroupHeading { text: "Stage inset: empty, filled; heat legend"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFStageInset { }
+            FFStageInset { heat: root.stage-heat; }
+            FFHeatLegend { }
+        }
 
         GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
         VerticalLayout {

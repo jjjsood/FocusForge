@@ -1060,6 +1060,66 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
     }
 }
 
+/// Samples for the sheet's stage view: a 5 x 4 tile grid over a synthetic
+/// picture, the first eight tiles fused, the next two the front.
+fn fill_stage_sheet(sheet: &ThemeSheet) {
+    use focusforge_gui::{StageTile, Theme};
+    const COLS: usize = 5;
+    const ROWS: usize = 4;
+    const TILE: (usize, usize) = (40, 35);
+    const FUSED: usize = 5;
+    const FRONT: usize = 7;
+    let ramp = bridge::heat_ramp(&sheet.global::<Theme>());
+    let (w, h) = (COLS * TILE.0, ROWS * TILE.1);
+    let heat_at = |x: usize, y: usize| {
+        let ripple = (x as f32 * 0.17).sin() * (y as f32 * 0.23).cos();
+        (128.0 + 127.0 * ripple).clamp(0.0, 255.0) as u8
+    };
+    let picture = |x: usize, y: usize| {
+        let stripe = if (x / 6 + y / 6).is_multiple_of(2) {
+            14
+        } else {
+            0
+        };
+        [
+            (60 + 120 * x / w + stripe) as u8,
+            (90 + 80 * y / h + stripe) as u8,
+            (150 - 70 * x / w + stripe) as u8,
+        ]
+    };
+    // `keep` says per tile whether it is opaque; `heated` whether it shows
+    // its heat instead of the picture.
+    let build = |keep: &dyn Fn(usize) -> bool, heated: &dyn Fn(usize) -> bool, only_heat: bool| {
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w as u32, h as u32);
+        for (i, px) in pixels.make_mut_slice().iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            let tile = (y / TILE.1) * COLS + x / TILE.0;
+            let [r, g, b] = if only_heat || heated(tile) {
+                ramp.colour(heat_at(x, y))
+            } else {
+                picture(x, y)
+            };
+            let a = if keep(tile) { 255 } else { 0 };
+            *px = slint::Rgba8Pixel { r, g, b, a };
+        }
+        slint::Image::from_rgba8(pixels)
+    };
+    let tiles: Vec<StageTile> = (FUSED..COLS * ROWS)
+        .map(|i| StageTile {
+            x: (i % COLS) as f32 * 80.0,
+            y: (i / COLS) as f32 * 70.0,
+            width: 80.0,
+            height: 70.0,
+            front: i < FRONT,
+        })
+        .collect();
+    sheet.set_stage_fusing(build(&|t| t < FRONT, &|t| t >= FUSED, false));
+    sheet.set_stage_fusing_bare(build(&|t| t < FUSED, &|_| false, false));
+    sheet.set_stage_complete(build(&|_| true, &|_| false, false));
+    sheet.set_stage_heat(build(&|t| t < FRONT, &|_| false, true));
+    sheet.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
+}
+
 fn preview_image() -> slint::Image {
     let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(2, 2);
     pixels.make_mut_bytes().copy_from_slice(&[
@@ -1642,6 +1702,7 @@ fn install_recent(
     controller.install_performance(performance);
     controller.install_appearance(appearance);
     app.set_appearance_presentation(controller.source_presentation().slug().into());
+    app.set_appearance_sharpness_heatmap(controller.sharpness_heatmap());
     controller.install_recent(entries, config_dir);
 }
 
@@ -1793,6 +1854,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
+        fill_stage_sheet(&sheet);
         run_window(sheet, args, None, None, None)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");

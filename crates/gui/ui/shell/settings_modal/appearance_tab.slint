@@ -9,6 +9,7 @@ import { FFMenu } from "../../components/ff_menu.slint";
 import { FFRowText } from "../../components/ff_row_text.slint";
 import { FFSettingsRow } from "../../components/ff_settings_row.slint";
 import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFToggle } from "../../components/ff_toggle.slint";
 
 export component FFAppearanceTab inherits Rectangle {
     in property <string> presentation: "image-list";
@@ -16,7 +17,9 @@ export component FFAppearanceTab inherits Rectangle {
     in property <bool> menu-focused: false;
     in property <bool> menu-disabled: false;
     in property <string> save-error: "";
+    in property <bool> sharpness-heatmap: true;
     callback presentation-selected(string);
+    callback sharpness-heatmap-toggled(bool);
     callback menu-toggled();
 
     property <int> pending-index: root.presentation == "list" ? 0
@@ -86,6 +89,33 @@ export component FFAppearanceTab inherits Rectangle {
         FFRowText {
             text: "Editor source rows stay read-only.";
             vertical-alignment: top;
+        }
+
+        VerticalLayout {
+            padding-top: ShellGeometry.settings-section-gap - Theme.space-2;
+            spacing: Theme.space-2;
+
+            FFSettingsSection {
+                heading: "FUSE PREVIEW";
+
+                FFSettingsRow {
+                    label: "Sharpness heatmap";
+                    align-end: true;
+                    divider: false;
+
+                    FFToggle {
+                        name: "Sharpness heatmap";
+                        on: root.sharpness-heatmap;
+                        toggled => { root.sharpness-heatmap-toggled(!root.sharpness-heatmap); }
+                    }
+                }
+            }
+
+            FFRowText {
+                text: "Shows where each frame is sharp while fusing.";
+                hint: true;
+                vertical-alignment: top;
+            }
         }
 
         if root.save-error != "": VerticalLayout {

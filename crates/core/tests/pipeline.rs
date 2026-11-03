@@ -2556,6 +2556,7 @@ struct Shown {
     extent: Rect,
     covered: usize,
     rgba: Vec<u8>,
+    tiles: Arc<[Rect]>,
     thread: ThreadId,
     thread_name: String,
 }
@@ -2697,6 +2698,7 @@ impl StageObserver for PreviewLog {
             extent: preview.extent,
             covered,
             rgba: preview.rgba.clone(),
+            tiles: Arc::clone(&preview.tiles),
             thread: current.id(),
             thread_name: current.name().unwrap_or_default().to_string(),
         }));
@@ -3081,6 +3083,42 @@ fn sharpness_heatmap_covers_every_tile() {
                 last_shown < log.stage_at("seal"),
                 "{context}: arrives before the seal"
             );
+        }
+    }
+}
+
+#[test]
+fn composite_preview_carries_the_tile_grid() {
+    for (tile_size, crop) in [(256u32, false), (256, true), (448, true)] {
+        let label = format!("grid_{tile_size}_{crop}");
+        let log = PreviewLog::new(false, true).with_heat();
+        heat_run(&label, "laplacian", tile_size, crop, &log);
+        let shown: Vec<Shown> = log.heats().into_iter().chain(log.composites()).collect();
+        assert!(
+            !shown.is_empty(),
+            "tile {tile_size} crop {crop}: no preview"
+        );
+        for preview in &shown {
+            let (w, h) = (preview.extent.width, preview.extent.height);
+            assert!(
+                preview.tiles.len() > 1,
+                "tile {tile_size} crop {crop}: {} tiles",
+                preview.tiles.len()
+            );
+            let mut painted = vec![0u8; w as usize * h as usize];
+            for tile in preview.tiles.iter() {
+                assert!(tile.x + tile.width <= w && tile.y + tile.height <= h);
+                for y in tile.y..tile.y + tile.height {
+                    for x in tile.x..tile.x + tile.width {
+                        painted[(y * w + x) as usize] += 1;
+                    }
+                }
+            }
+            assert!(
+                painted.iter().all(|&n| n == 1),
+                "tile {tile_size} crop {crop}: the tiles do not partition the output extent"
+            );
+            assert_eq!(preview.tiles, shown[0].tiles, "one grid per run");
         }
     }
 }

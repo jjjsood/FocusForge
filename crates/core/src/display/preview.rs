@@ -40,6 +40,9 @@ pub enum PreviewKind {
 /// One preview image: `width * height` RGBA8 pixels, alpha 0 where the image
 /// has no content yet (an unfused tile, the margin outside a warped frame).
 /// `extent` is the rect the image covers, in reference-frame pixels.
+/// `tiles` are the run's tile interiors in output coordinates (the origin is
+/// the output's own corner), set for the composite and heat kinds and empty
+/// for an aligned frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagePreview {
     pub kind: PreviewKind,
@@ -47,6 +50,7 @@ pub struct StagePreview {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub extent: Rect,
+    pub tiles: Arc<[Rect]>,
 }
 
 /// `(width, height)` scaled so the longer edge is at most
@@ -70,6 +74,7 @@ pub struct PreviewFeed {
     composite: OnceLock<Arc<PreviewMosaic>>,
     want_heat: bool,
     heat: OnceLock<Arc<PreviewMosaic>>,
+    tiles: OnceLock<Arc<[Rect]>>,
 }
 
 impl PreviewFeed {
@@ -87,7 +92,14 @@ impl PreviewFeed {
             composite: OnceLock::new(),
             want_heat: kinds.heat,
             heat: OnceLock::new(),
+            tiles: OnceLock::new(),
         })
+    }
+
+    /// Records the run's tile interiors, in output coordinates, for the
+    /// composite and heat previews to carry; the first call wins.
+    pub(crate) fn set_tiles(&self, tiles: Vec<Rect>) {
+        let _ = self.tiles.set(tiles.into());
     }
 
     /// The aligned-frame state, when that kind was requested.
@@ -132,11 +144,17 @@ impl PreviewFeed {
         if let Some(preview) = self.aligned.as_ref().and_then(AlignedFrameSink::take_new) {
             send(&preview);
         }
+        let with_tiles = |mut preview: StagePreview| {
+            if let Some(tiles) = self.tiles.get() {
+                preview.tiles = Arc::clone(tiles);
+            }
+            preview
+        };
         if let Some(preview) = self.composite.get().and_then(|m| m.take_new()) {
-            send(&preview);
+            send(&with_tiles(preview));
         }
         if let Some(preview) = self.heat.get().and_then(|m| m.take_new()) {
-            send(&preview);
+            send(&with_tiles(preview));
         }
     }
 }
@@ -283,6 +301,7 @@ impl AlignedFrameSink {
                 width: self.frame_size.0,
                 height: self.frame_size.1,
             },
+            tiles: Arc::from([]),
         })
     }
 }
@@ -382,6 +401,7 @@ impl PreviewMosaic {
             height,
             rgba,
             extent: self.extent,
+            tiles: Arc::from([]),
         })
     }
 }

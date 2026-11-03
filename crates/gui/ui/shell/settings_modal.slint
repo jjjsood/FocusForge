@@ -38,7 +38,9 @@ export component FFSettingsModal inherits FFModalPanel {
     in property <bool> appearance-menu-focused: false;
     in property <bool> appearance-menu-disabled: false;
     in property <string> appearance-save-error: "";
+    in property <bool> appearance-sharpness-heatmap: true;
     callback appearance-presentation-selected(string);
+    callback appearance-sharpness-heatmap-toggled(bool);
     callback appearance-menu-toggled();
 
     in property <StorageState> storage;
@@ -213,7 +215,9 @@ export component FFSettingsModal inherits FFModalPanel {
             menu-focused: root.appearance-menu-focused;
             menu-disabled: root.appearance-menu-disabled;
             save-error: root.appearance-save-error;
+            sharpness-heatmap: root.appearance-sharpness-heatmap;
             presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+            sharpness-heatmap-toggled(on) => { root.appearance-sharpness-heatmap-toggled(on); }
             menu-toggled => { root.appearance-menu-toggled(); }
         }
 

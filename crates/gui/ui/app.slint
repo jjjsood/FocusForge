@@ -10,6 +10,8 @@ export { Theme, TypeRole, ThemeProbe }
 
 import { ThemeSheet } from "theme_sheet.slint";
 export { ThemeSheet }
+import { StageTile } from "components/ff_stage_view.slint";
+export { StageTile }
 
 import { ShellGeometry } from "geometry.slint";
 import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
@@ -242,6 +244,23 @@ export component AppWindow inherits Window {
     // pane's not-yet-fused placeholder. Set from Rust alongside
     // `project-loaded` in `src/bridge.rs::push_projects`.
     in property <bool> composite-ready: false;
+    // The Composite pane's label and live stage view, set from
+    // `src/bridge.rs::push_stage_view`.
+    in property <string> composite-label: "Composite";
+    in property <bool> stage-visible: false;
+    in property <image> stage-source;
+    in property <length> stage-image-x;
+    in property <length> stage-image-y;
+    in property <length> stage-image-w;
+    in property <length> stage-image-h;
+    in property <[StageTile]> stage-tiles: [];
+    in property <bool> stage-inset-visible: false;
+    in property <bool> stage-inset-only: false;
+    in property <bool> stage-mosaic-fading: false;
+    in property <bool> stage-inset-fading: false;
+    in property <image> stage-heat;
+    in property <string> stage-card-title: "";
+    in property <string> stage-card-body: "";
     // The checkpoints panel's own line -- the active tab's checkpoint
     // count, or the empty-state wording. Set from Rust alongside
     // `composite-ready` in `src/bridge.rs::push_projects`.
@@ -362,6 +381,21 @@ export component AppWindow inherits Window {
             detached-pane: root.detached-pane;
             project-loaded: root.project-loaded;
             composite-ready: root.composite-ready;
+            composite-label: root.composite-label;
+            stage-visible: root.stage-visible;
+            stage-source: root.stage-source;
+            stage-image-x: root.stage-image-x;
+            stage-image-y: root.stage-image-y;
+            stage-image-w: root.stage-image-w;
+            stage-image-h: root.stage-image-h;
+            stage-tiles: root.stage-tiles;
+            stage-inset-visible: root.stage-inset-visible;
+            stage-inset-only: root.stage-inset-only;
+            stage-mosaic-fading: root.stage-mosaic-fading;
+            stage-inset-fading: root.stage-inset-fading;
+            stage-heat: root.stage-heat;
+            stage-card-title: root.stage-card-title;
+            stage-card-body: root.stage-card-body;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
@@ -580,7 +614,9 @@ export component AppWindow inherits Window {
     in property <bool> appearance-menu-focused: false;
     in property <bool> appearance-menu-disabled: false;
     in property <string> appearance-save-error: "";
+    in property <bool> appearance-sharpness-heatmap: true;
     callback appearance-presentation-selected(string);
+    callback appearance-sharpness-heatmap-toggled(bool);
     callback appearance-menu-toggled();
 
     in property <StorageState> storage;
@@ -769,7 +805,9 @@ export component AppWindow inherits Window {
         appearance-menu-focused: root.appearance-menu-focused;
         appearance-menu-disabled: root.appearance-menu-disabled;
         appearance-save-error: root.appearance-save-error;
+        appearance-sharpness-heatmap: root.appearance-sharpness-heatmap;
         appearance-presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+        appearance-sharpness-heatmap-toggled(on) => { root.appearance-sharpness-heatmap-toggled(on); }
         appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
