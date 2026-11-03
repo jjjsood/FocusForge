@@ -325,6 +325,85 @@ fn develop_counts_of(output: &std::process::Output) -> serde_json::Value {
         .clone()
 }
 
+/// Plain-mode progress text and `stack --json` timings of a RAW run: the
+/// develop pass is announced and counted before any fuse line, and its
+/// timing key joins the sum.
+#[test]
+fn raw_stack_reports_the_develop_stage() {
+    let cwd = common::tmp_dir("stack_raw_develop_stage");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for count in [3usize, 6] {
+        let input = cwd.join(format!("input-{count}"));
+        let output = cwd.join(format!("output-{count}"));
+        std::fs::create_dir(&input).expect("input directory");
+        std::fs::create_dir(&output).expect("output directory");
+        for index in 0..count {
+            std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+                .expect("copy RAW frame");
+        }
+        let stacked = run(&cwd, &stack_json_args(&input, &output, &[]));
+        assert!(
+            stacked.status.success(),
+            "stack stderr: {}",
+            String::from_utf8_lossy(&stacked.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&stacked.stderr).into_owned();
+        let position = |needle: &str| {
+            stderr
+                .find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in: {stderr}"))
+        };
+        let entry = position(&format!("develop {count} frames (RAW)"));
+        let first = position(&format!("develop 0/{count} frames eta --"));
+        assert!(entry < first, "entry line precedes the count: {stderr}");
+        assert!(
+            first < position("fuse "),
+            "the develop line precedes every fuse line: {stderr}"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&stacked.stdout).expect("JSON report");
+        let stages = &report["stages"];
+        assert!(stages["develop"].is_number(), "{report}");
+        let sum: f64 = [
+            "setup",
+            "develop",
+            "align",
+            "fuse",
+            "warp_write",
+            "finalize",
+        ]
+        .iter()
+        .filter_map(|key| stages[key].as_f64())
+        .sum();
+        let wall = report["wall_seconds"].as_f64().expect("wall_seconds");
+        assert!(
+            (sum - wall).abs() <= 1e-6,
+            "sum {sum} vs wall {wall}: {report}"
+        );
+
+        let human_output = cwd.join(format!("human-{count}"));
+        std::fs::create_dir(&human_output).expect("output directory");
+        let mut human_args = stack_json_args(&input, &human_output, &[]);
+        human_args.retain(|arg| arg != "--json");
+        let human = run(&cwd, &human_args);
+        assert!(
+            human.status.success(),
+            "stack stderr: {}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        let text = String::from_utf8_lossy(&human.stdout);
+        let stages_line = text
+            .lines()
+            .find(|line| line.starts_with("stages:"))
+            .unwrap_or_else(|| panic!("no stages line in: {text}"));
+        assert!(stages_line.contains("develop="), "{stages_line}");
+    }
+}
+
 #[test]
 fn raw_develop_counts_are_one_per_frame() {
     let cwd = common::tmp_dir("stack_raw_develop_counts");
@@ -416,6 +495,13 @@ fn a_header_only_raw_frame_fails_the_run_by_name_without_panicking() {
     );
     assert!(stderr.contains("01.dng"), "stderr: {stderr}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    let entry = stderr
+        .find("develop 3 frames (RAW)")
+        .unwrap_or_else(|| panic!("no develop entry line in: {stderr}"));
+    assert!(
+        entry < stderr.find("01.dng").expect("checked above"),
+        "the develop entry line precedes the error: {stderr}"
+    );
 }
 
 #[cfg(unix)]

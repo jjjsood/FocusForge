@@ -389,6 +389,11 @@ fn stage_timings_report_fuse_as_not_entered() {
         serde_json::Value::Null,
         "align never fuses: {report}"
     );
+    assert_eq!(
+        report["stages"]["develop"],
+        serde_json::Value::Null,
+        "align never enters the develop pass: {report}"
+    );
     for key in ["setup", "align", "finalize"] {
         assert!(
             report["stages"][key].is_number(),

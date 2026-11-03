@@ -393,6 +393,63 @@ fn the_bar_reads_preparing_from_the_moment_equalization_starts() {
     );
 }
 
+/// Forwards to a [`job::GuiObserver`] and cancels the run from the first
+/// tick that reports every frame developed.
+struct CancelWhenDeveloped {
+    inner: job::GuiObserver,
+    control: std::sync::Arc<focusforge_core::job::JobControl>,
+}
+
+impl StageObserver for CancelWhenDeveloped {
+    fn stage(&self, stage: pipeline::RunStage) {
+        StageObserver::stage(&self.inner, stage);
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        StageObserver::tick(&self.inner, progress);
+        if progress.stage == focusforge_core::job::JobStage::Develop
+            && progress.develop_done == progress.develop_total
+        {
+            self.control.cancel();
+        }
+    }
+}
+
+#[test]
+fn a_cancel_as_the_develop_pass_ends_still_reads_developing() {
+    let root = common::tree("cancel_developing");
+    let samples = (0..64u32 * 64)
+        .map(|i| (((i % 64) + (i / 64)) * 8 % 4000) as u16)
+        .collect();
+    let mut spec = raw_dng::DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+    spec.width = 64;
+    spec.height = 64;
+    spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
+    let dngs: Vec<_> = (0..4).map(|_| raw_dng::write_dng(&spec, false)).collect();
+    let mut request = no_align_request("cancel_developing_request", 0);
+    request.frames = dngs.iter().map(|d| d.path().to_path_buf()).collect();
+    request.equalize = Some(focusforge_core::equalize::EqualizeSettings {
+        max_gain: 4.0,
+        target_stops: 0.0,
+    });
+    request.scratch_root = root.join("scratch");
+    request.cache = false;
+
+    let control = focusforge_core::job::JobControl::new();
+    let observer = CancelWhenDeveloped {
+        inner: job::GuiObserver::new(),
+        control: std::sync::Arc::clone(&control),
+    };
+    let outcome =
+        pipeline::run(&request, &observer, control, None).expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        job::progress_phase(observer.inner.last_progress().as_ref()),
+        job::Phase::Developing,
+        "the cancel card reads the stage the run was in when the cancel landed"
+    );
+}
+
 /// One `pipeline::run` of `request` through the stage cache under its
 /// scratch root: the step text the bar reads when the align stage is
 /// announced, and the report's alignment source.
@@ -1212,6 +1269,8 @@ fn phases_map_onto_engine_stages() {
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
+        develop_done: 0,
+        develop_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&aligning)),
@@ -1231,6 +1290,8 @@ fn phases_map_onto_engine_stages() {
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
+        develop_done: 0,
+        develop_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&fusing)),
@@ -1249,6 +1310,8 @@ fn phases_map_onto_engine_stages() {
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
+        develop_done: 0,
+        develop_total: 0,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&sealing)),
@@ -1281,6 +1344,8 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         align_total,
         prepare_done: 0,
         prepare_total: 0,
+        develop_done: 0,
+        develop_total: 0,
     }
 }
 
@@ -1298,6 +1363,8 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
+        develop_done: 0,
+        develop_total: 0,
     }
 }
 
@@ -1390,6 +1457,88 @@ fn prepare_progress_names_the_frame_count_and_fills_the_bar() {
         assert_eq!(bar_fraction(Some(&snapshot)), done as f32 / total as f32);
         assert_eq!(Phase::Preparing.frames(&snapshot), Some((done, total)));
     }
+}
+
+fn develop_progress(
+    develop_done: usize,
+    develop_total: usize,
+) -> focusforge_core::job::JobProgress {
+    focusforge_core::job::JobProgress {
+        stage: focusforge_core::job::JobStage::Develop,
+        develop_done,
+        develop_total,
+        ..fuse_progress(0, 0)
+    }
+}
+
+#[test]
+fn develop_progress_names_the_frame_count_and_fills_the_bar() {
+    use focusforge_gui::job::{
+        Phase, RunState, bar_fraction, eta_text, phase_line, progress_phase, progress_text,
+        stage_word,
+    };
+
+    for (done, total) in [(3, 8), (20, 20), (0, 5)] {
+        let snapshot = develop_progress(done, total);
+        assert_eq!(progress_phase(Some(&snapshot)), Phase::Developing);
+        assert_eq!(
+            stage_word(&RunState::Running, Some(&snapshot)),
+            "Developing"
+        );
+        assert_eq!(
+            progress_text(&RunState::Running, Some(&snapshot)),
+            format!("{done} of {total}")
+        );
+        assert_eq!(
+            phase_line(&RunState::Running, Some(&snapshot)).as_deref(),
+            Some(format!("developing, {done} of {total}").as_str())
+        );
+        assert_eq!(bar_fraction(Some(&snapshot)), done as f32 / total as f32);
+        assert_eq!(Phase::Developing.frames(&snapshot), Some((done, total)));
+    }
+
+    let mut snapshot = develop_progress(0, 8);
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "estimating");
+    snapshot.develop_done = 2;
+    snapshot.eta = Some(Duration::from_secs(95));
+    assert_eq!(eta_text(&RunState::Running, Some(&snapshot)), "ETA 1:35");
+}
+
+#[test]
+fn developing_hands_over_to_the_next_phase_from_zero() {
+    use focusforge_gui::job::{Phase, bar_fraction, progress_phase};
+
+    let finished = develop_progress(8, 8);
+    assert_eq!(bar_fraction(Some(&finished)), 1.0);
+    // The finished tally keeps its total, but a later stage ignores it.
+    let preparing = focusforge_core::job::JobProgress {
+        develop_done: 8,
+        develop_total: 8,
+        ..prepare_progress(0, 8)
+    };
+    assert_eq!(progress_phase(Some(&preparing)), Phase::Preparing);
+    assert_eq!(bar_fraction(Some(&preparing)), 0.0);
+    let fusing = focusforge_core::job::JobProgress {
+        develop_done: 8,
+        develop_total: 8,
+        ..fuse_progress(0, 10)
+    };
+    assert_eq!(progress_phase(Some(&fusing)), Phase::Fusing);
+    assert_eq!(bar_fraction(Some(&fusing)), 0.0);
+    assert_eq!(Phase::Developing.frames(&develop_progress(0, 0)), None);
+}
+
+#[test]
+fn develop_stage_announcement_records_the_frame_total() {
+    use focusforge_core::job::JobStage;
+    use focusforge_core::pipeline::{RunStage, StageObserver};
+
+    let observer = job::GuiObserver::new();
+    observer.stage(RunStage::Develop { frames: 9 });
+    let recorded = observer.last_progress().expect("a Develop snapshot");
+    assert_eq!(recorded.stage, JobStage::Develop);
+    assert_eq!((recorded.develop_done, recorded.develop_total), (0, 9));
+    assert_eq!(job::progress_phase(Some(&recorded)), job::Phase::Developing);
 }
 
 #[test]

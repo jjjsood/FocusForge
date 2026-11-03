@@ -47,16 +47,22 @@ impl ProgressMode {
     }
 }
 
-/// `prepare <done>/<total> frames` while the prepare stage counts frames;
-/// `align <done>/<total> frames` while a computed align stage is running;
-/// otherwise `fuse <done>/<total> tiles <pct>% eta <duration|<1s|-->`.
-/// `eta` reads `--` until the first unit completes, and a genuine
-/// sub-second estimate renders as `<1s` rather than a `0s` that would
-/// read as "finished" while units are still running.
+/// `develop`/`prepare <done>/<total> frames eta <eta>` while that stage counts
+/// frames; `align <done>/<total> frames` while a computed align stage runs;
+/// otherwise `fuse <done>/<total> tiles <pct>% eta <eta>`. `<eta>` reads `--`
+/// until the first unit completes, and a sub-second estimate renders as `<1s`
+/// rather than a `0s` that would read as "finished" mid-run.
 pub fn format_line(progress: &JobProgress) -> String {
+    let eta = eta_text(progress.eta);
+    if progress.stage == JobStage::Develop && progress.develop_total > 0 {
+        return format!(
+            "develop {}/{} frames eta {eta}",
+            progress.develop_done, progress.develop_total
+        );
+    }
     if progress.stage == JobStage::Prepare && progress.prepare_total > 0 {
         return format!(
-            "prepare {}/{} frames",
+            "prepare {}/{} frames eta {eta}",
             progress.prepare_done, progress.prepare_total
         );
     }
@@ -74,15 +80,18 @@ pub fn format_line(progress: &JobProgress) -> String {
     } else {
         0
     };
-    let eta = match progress.eta {
+    format!(
+        "fuse {}/{} tiles {}% eta {eta}",
+        progress.units_done, progress.unit_total, pct
+    )
+}
+
+fn eta_text(eta: Option<Duration>) -> String {
+    match eta {
         Some(duration) if duration < Duration::from_secs(1) => "<1s".to_string(),
         Some(duration) => format!("{}s", duration.as_secs()),
         None => "--".to_string(),
-    };
-    format!(
-        "fuse {}/{} tiles {}% eta {}",
-        progress.units_done, progress.unit_total, pct, eta
-    )
+    }
 }
 
 /// Renders progress to stderr. Owns just enough state to rewrite a single
@@ -228,6 +237,8 @@ mod tests {
             align_total: 0,
             prepare_done: 0,
             prepare_total: 0,
+            develop_done: 0,
+            develop_total: 0,
         }
     }
 
@@ -244,6 +255,8 @@ mod tests {
             align_total,
             prepare_done: 0,
             prepare_total: 0,
+            develop_done: 0,
+            develop_total: 0,
         }
     }
 
@@ -256,13 +269,51 @@ mod tests {
         }
     }
 
+    fn with_eta(progress: JobProgress, eta: Option<Duration>) -> JobProgress {
+        JobProgress { eta, ..progress }
+    }
+
+    fn develop_progress(develop_done: usize, develop_total: usize) -> JobProgress {
+        JobProgress {
+            stage: JobStage::Develop,
+            develop_done,
+            develop_total,
+            ..progress(0, 0, None)
+        }
+    }
+
     #[test]
-    fn prepare_line_counts_frames() {
-        assert_eq!(format_line(&prepare_progress(3, 8)), "prepare 3/8 frames");
+    fn prepare_line_counts_frames_and_names_the_eta() {
+        let at = |done, total, eta| format_line(&with_eta(prepare_progress(done, total), eta));
+        assert_eq!(at(0, 8, None), "prepare 0/8 frames eta --");
         assert_eq!(
-            format_line(&prepare_progress(61, 61)),
-            "prepare 61/61 frames"
+            at(7, 8, Some(Duration::from_millis(400))),
+            "prepare 7/8 frames eta <1s"
         );
+        assert_eq!(
+            at(3, 61, Some(Duration::from_secs(42))),
+            "prepare 3/61 frames eta 42s"
+        );
+    }
+
+    #[test]
+    fn develop_line_counts_frames_and_names_the_eta() {
+        let at = |done, total, eta| format_line(&with_eta(develop_progress(done, total), eta));
+        assert_eq!(at(0, 20, None), "develop 0/20 frames eta --");
+        assert_eq!(
+            at(19, 20, Some(Duration::from_millis(400))),
+            "develop 19/20 frames eta <1s"
+        );
+        assert_eq!(
+            at(5, 20, Some(Duration::from_secs(90))),
+            "develop 5/20 frames eta 90s"
+        );
+    }
+
+    #[test]
+    fn develop_line_without_a_total_falls_back_to_the_fuse_line() {
+        let line = format_line(&develop_progress(0, 0));
+        assert!(line.starts_with("fuse "), "line was: {line}");
     }
 
     #[test]

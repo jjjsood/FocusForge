@@ -553,13 +553,15 @@ impl FrameReader for RawStack {
     /// Develops every frame once, in parallel, into mapped scratch files in a
     /// directory under `scratch_root` that lives as long as this reader. At
     /// most `workers` develops overlap, and no more than `budget` holds
-    /// decode reservations for.
+    /// decode reservations for. `developed` gains one as each frame lands in
+    /// scratch.
     fn develop_once(
         &self,
         scratch_root: &Path,
         budget: u64,
         workers: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
+        developed: &AtomicUsize,
     ) -> Result<usize, AlgorithmError> {
         if self.scratch.get().is_some() {
             return Ok(0);
@@ -617,6 +619,7 @@ impl FrameReader for RawStack {
                                 slots[index]
                                     .set(frame)
                                     .expect("each frame is taken by one worker");
+                                developed.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(error) => {
                                 next.store(slots.len(), Ordering::Relaxed);

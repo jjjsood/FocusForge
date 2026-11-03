@@ -112,9 +112,10 @@ pub struct StackReport {
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run.
     pub align_cached: bool,
-    /// Wall-clock stage breakdown -- `setup`/`align`/`fuse`/`finalize` as
-    /// seconds, `warp_write` always `null` (`stack` never enters it). Every
-    /// figure is wall clock, never CPU time; the four non-null stages sum
+    /// Wall-clock stage breakdown -- `setup`/`develop`/`align`/`fuse`/`finalize`
+    /// as seconds, `develop` a number only when a RAW stack was developed up
+    /// front and `warp_write` always `null` (`stack` never enters it). Every
+    /// figure is wall clock, never CPU time; the non-null stages sum
     /// exactly to `wall_seconds`, because the spans are contiguous and
     /// disjoint by construction -- see
     /// [`focusforge_core::timing::StageTimings`]'s own rustdoc for the full
@@ -1291,6 +1292,10 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             .lock()
             .expect("no thread panicked while rendering");
         match stage {
+            RunStage::Develop { frames } => {
+                renderer.stage(&format!("develop {frames} frames (RAW)"));
+                renderer.start(&self.control.progress());
+            }
             RunStage::Prepare { frames } => {
                 renderer.stage(&format!("prepare {frames} frames (brightness)"));
                 renderer.start(&self.control.progress());
@@ -1337,11 +1342,13 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             }
         }
         // Only the stage that is counting renders: a tick outside fuse,
-        // outside a counted prepare stage, and with a cached or absent
-        // alignment (`align_total == 0`) carries a stale or zeroed total.
+        // outside a counted develop or prepare stage, and with a cached or
+        // absent alignment (`align_total == 0`) carries a stale or zeroed
+        // total.
         use focusforge_core::job::JobStage;
+        let developing = progress.stage == JobStage::Develop && progress.develop_total > 0;
         let preparing = progress.stage == JobStage::Prepare && progress.prepare_total > 0;
-        if progress.stage == JobStage::Fuse || preparing || progress.align_total > 0 {
+        if progress.stage == JobStage::Fuse || developing || preparing || progress.align_total > 0 {
             self.renderer
                 .lock()
                 .expect("no thread panicked while rendering")
@@ -1612,8 +1619,9 @@ fn render(report: &StackReport) -> String {
     // symmetry with `crate::align::render` -- both `?` unless the align
     // stage was actually computed.
     lines.push(format!(
-        "stages: {} {} {} {} workers={} peak={}",
+        "stages: {} {} {} {} {} workers={} peak={}",
         stage_fact("setup", report.stages.setup),
+        stage_fact("develop", report.stages.develop),
         stage_fact("align", report.stages.align),
         stage_fact("fuse", report.stages.fuse),
         stage_fact("finalize", report.stages.finalize),
@@ -1741,6 +1749,7 @@ mod tests {
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),
+                develop: None,
                 align: Some(1.2),
                 fuse: Some(0.25),
                 warp_write: None,
@@ -1781,6 +1790,7 @@ mod tests {
             "backend: cpu",
             "stages:",
             "setup=0.012s",
+            "develop=not-entered",
             "align=1.200s",
             "fuse=0.250s",
             "finalize=0.038s",

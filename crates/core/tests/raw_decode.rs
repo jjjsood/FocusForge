@@ -8,15 +8,17 @@ use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::io::Rect;
 use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
-use focusforge_core::job::JobControl;
+use focusforge_core::job::{JobControl, JobStage};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{
-    FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, StageObserver,
+    FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
+    StageObserver,
 };
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::raw_dng::{DngSpec, write_dng};
@@ -623,7 +625,7 @@ fn raw_scratch_error_on_corpus_frames() {
         let developed = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
         let root = target_tmp();
         developed
-            .develop_once(root.path(), u64::MAX, 1, &|| false)
+            .develop_once(root.path(), u64::MAX, 1, &|| false, &AtomicUsize::new(0))
             .expect("the pass develops the frame");
         let (width, height) = cached.dimensions();
         let rect = Rect {
@@ -2054,7 +2056,7 @@ fn raw_develop_pass_reads_match_cached_reads() {
     let developed = RawStack::open_files(&paths).expect("DNG stack opens");
     let root = target_tmp();
     developed
-        .develop_once(root.path(), u64::MAX, 2, &|| false)
+        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
         .expect("the pass develops every frame");
     assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
     let rects = [
@@ -2162,7 +2164,7 @@ fn raw_scratch_file_size_matches_encoding() {
     let scratch = root.path().join("scratch");
     std::fs::create_dir(&scratch).expect("scratch root");
     stack
-        .develop_once(&scratch, u64::MAX, 2, &|| false)
+        .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
         .expect("the pass develops every frame");
     let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
     assert_eq!(frame_bytes, 48 * 20 * 6);
@@ -2181,7 +2183,7 @@ fn raw_scratch_keeps_values_above_white() {
     let developed = open_pair(&files);
     let root = target_tmp();
     developed
-        .develop_once(root.path(), u64::MAX, 2, &|| false)
+        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
         .expect("the pass develops every frame");
     let rect = Rect {
         x: 0,
@@ -2210,21 +2212,26 @@ fn raw_develops_overlap() {
     let one = 8 * 8 * 30 + std::fs::metadata(dng.path()).expect("DNG size").len();
     let paths = vec![PathBuf::from(dng.path()); 4];
     let root = target_tmp();
+    let developed = AtomicUsize::new(0);
     let pass = |budget: u64, workers: usize| {
         let stack = RawStack::open_files(&paths).expect("DNG stack opens");
-        let result = stack.develop_once(root.path(), budget, workers, &|| false);
+        developed.store(0, Ordering::SeqCst);
+        let result = stack.develop_once(root.path(), budget, workers, &|| false, &developed);
         (stack, result)
     };
 
     let (stack, result) = pass(4 * one, 4);
     assert_eq!(result.expect("four reservations fit"), 4);
     assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
     let (stack, result) = pass(one + one / 2, 4);
     assert_eq!(result.expect("one and a half reservations fit one"), 1);
     assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
     let (stack, result) = pass(100 * one, 8);
     assert_eq!(result.expect("workers beyond the frames idle"), 4);
     assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
 
     let (stack, result) = pass(one - 1, 4);
     let error = result.expect_err("a budget below one reservation refuses");
@@ -2237,6 +2244,7 @@ fn raw_develops_overlap() {
         "{error}"
     );
     assert_eq!(stack.develop_counts(), Some(vec![0; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 0);
 }
 
 /// `root` holds no file or directory.
@@ -2284,6 +2292,156 @@ fn raw_develop_failure_leaves_no_scratch() {
     assert_scratch_empty(&request.scratch_root);
 }
 
+/// Records the stage announcements and, on [`RunStage::Develop`], what the
+/// control reports at that moment; cancels the run there when asked.
+struct DevelopWatch {
+    control: Arc<JobControl>,
+    cancel_on_develop: bool,
+    seen: Mutex<Vec<&'static str>>,
+    at_develop: Mutex<Option<(JobStage, usize, usize)>>,
+}
+
+impl DevelopWatch {
+    fn new(control: &Arc<JobControl>, cancel_on_develop: bool) -> Self {
+        DevelopWatch {
+            control: Arc::clone(control),
+            cancel_on_develop,
+            seen: Mutex::default(),
+            at_develop: Mutex::default(),
+        }
+    }
+}
+
+impl StageObserver for DevelopWatch {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { frames } => {
+                let p = self.control.progress();
+                *self.at_develop.lock().expect("no panic while logging") =
+                    Some((p.stage, p.develop_total, frames));
+                if self.cancel_on_develop {
+                    self.control.cancel();
+                }
+                "develop"
+            }
+            RunStage::Prepare { .. } => "prepare",
+            RunStage::Align { .. } => "align",
+            RunStage::Fuse => "fuse",
+            _ => "other",
+        };
+        self.seen.lock().expect("no panic while logging").push(name);
+    }
+}
+
+#[test]
+fn raw_run_reports_the_develop_stage() {
+    let dng = gradient_dng(64, 64, 0);
+    for count in [3, 5] {
+        let root = target_tmp();
+        let request = raw_request(
+            copies_of(&dng, count, root.path()),
+            root.path(),
+            Some(EqualizeSettings {
+                max_gain: 4.0,
+                target_stops: 0.0,
+            }),
+            None,
+        );
+        let control = JobControl::new();
+        let watch = DevelopWatch::new(&control, false);
+        let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+            .expect("the RAW run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        let seen = watch.seen.lock().expect("no panic while logging");
+        assert_eq!(
+            seen[..2],
+            ["develop", "prepare"],
+            "{count} frames: {seen:?}"
+        );
+        assert_eq!(
+            *watch.at_develop.lock().expect("no panic while logging"),
+            Some((JobStage::Develop, count, count)),
+            "the control is on the develop stage when it is announced"
+        );
+        let progress = control.progress();
+        assert_eq!(
+            (progress.develop_done, progress.develop_total),
+            (count, count)
+        );
+        assert!(report.stages.develop.is_some(), "{:?}", report.stages);
+    }
+
+    let root = target_tmp();
+    let request = raw_request(copies_of(&dng, 4, root.path()), root.path(), None, None);
+    let control = JobControl::new();
+    let watch = DevelopWatch::new(&control, true);
+    let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+        .expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        watch.seen.lock().expect("no panic while logging")[..],
+        ["develop"],
+        "nothing follows a cancel raised on the develop announcement"
+    );
+    assert_scratch_empty(&request.scratch_root);
+}
+
+/// Cancels the run from a tick that reports every frame developed, and
+/// records the stage announcements that follow.
+struct CancelWhenDeveloped {
+    control: Arc<JobControl>,
+    seen: Mutex<Vec<&'static str>>,
+}
+
+impl StageObserver for CancelWhenDeveloped {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { .. } => "develop",
+            RunStage::Prepare { .. } => "prepare",
+            _ => "other",
+        };
+        self.seen.lock().expect("no panic while logging").push(name);
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        if progress.stage == JobStage::Develop && progress.develop_done == progress.develop_total {
+            self.control.cancel();
+        }
+    }
+}
+
+#[test]
+fn a_cancel_landing_as_the_develop_pass_ends_stops_the_run_in_that_stage() {
+    let dng = gradient_dng(64, 64, 0);
+    let root = target_tmp();
+    let request = raw_request(
+        copies_of(&dng, 4, root.path()),
+        root.path(),
+        Some(EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        }),
+        None,
+    );
+    let control = JobControl::new();
+    let watch = CancelWhenDeveloped {
+        control: Arc::clone(&control),
+        seen: Mutex::default(),
+    };
+    let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+        .expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        watch.seen.lock().expect("no panic while logging")[..],
+        ["develop"],
+        "the preparation pass is never announced after the cancel"
+    );
+    assert_eq!(control.progress().stage, JobStage::Develop);
+    assert_scratch_empty(&request.scratch_root);
+}
+
 #[test]
 fn raw_scratch_unwritable_is_a_named_error() {
     let dng = gradient_dng(8, 8, 0);
@@ -2292,7 +2450,7 @@ fn raw_scratch_unwritable_is_a_named_error() {
     let blocker = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("a regular file at the scratch root");
     let error = stack
-        .develop_once(blocker.path(), u64::MAX, 2, &|| false)
+        .develop_once(blocker.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
         .expect_err("a scratch root that is a file cannot hold a directory");
     assert!(
         error
@@ -2329,7 +2487,7 @@ fn scratch_space_needed_matches_written_scratch() {
         std::fs::create_dir(&scratch).expect("scratch root");
         let needed = stack.develop_scratch_bytes().expect("the figure fits");
         stack
-            .develop_once(&scratch, u64::MAX, 2, &|| false)
+            .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
             .expect("the pass develops every frame");
         let (width, height) = stack.dimensions();
         assert_eq!(

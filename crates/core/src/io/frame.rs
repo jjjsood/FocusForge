@@ -3,6 +3,7 @@
 //! Format-neutral facts and tile access for an opened set of frames.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 
 use serde::{Deserialize, Serialize};
 
@@ -98,13 +99,15 @@ pub trait FrameReader: TileReader + Send + Sync {
     /// of decode reservations. Returns how many develop at once, `0` for a
     /// reader with nothing to develop. `cancelled` is polled before each frame
     /// ([`AlgorithmError::Cancelled`]); a failed or cancelled pass leaves
-    /// nothing under `scratch_root`.
+    /// nothing under `scratch_root`. `developed` gains one as each frame
+    /// finishes.
     fn develop_once(
         &self,
         _scratch_root: &Path,
         _budget: u64,
         _workers: usize,
         _cancelled: &(dyn Fn() -> bool + Sync),
+        _developed: &AtomicUsize,
     ) -> Result<usize, AlgorithmError> {
         Ok(0)
     }

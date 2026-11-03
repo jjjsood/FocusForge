@@ -161,6 +161,7 @@ struct StageLog {
 impl StageObserver for StageLog {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
@@ -2055,6 +2056,7 @@ struct StageProbe {
 impl StageObserver for StageProbe {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
@@ -2087,6 +2089,10 @@ fn prepare_stage_is_reported_before_align() {
         request.output = FuseOutput::Hold(scratch("eq_prepare_stage_hold"));
         focusforge_core::pipeline::run(&request, &probe, control, None).expect("the run completes");
         let seen = probe.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(label, _)| *label != "develop"),
+            "a TIFF run develops nothing up front: {seen:?}"
+        );
         assert_eq!(seen[0].0, first);
         if first == "prepare" {
             assert_eq!(seen[0], ("prepare", JobStage::Prepare));

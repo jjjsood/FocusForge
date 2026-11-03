@@ -203,6 +203,11 @@ pub fn working_space(kind: ReaderKind) -> &'static str {
 /// [`StageObserver::tick`] afterwards, on [`JobProgress`]'s `align_done`/
 /// `align_total`.
 pub enum RunStage {
+    /// The up-front develop of `frames` RAW sources into scratch, before
+    /// anything else reads them.
+    Develop {
+        frames: usize,
+    },
     /// Brightness preparation of `frames` sources, before alignment.
     Prepare {
         frames: usize,
@@ -214,6 +219,36 @@ pub enum RunStage {
     Fuse,
     Seal,
     Finished,
+}
+
+/// Runs `work` while a watcher thread reports `control`'s progress to
+/// `observer` every `poll`, and joins the watcher before `work`'s result
+/// returns.
+fn with_progress_ticks<T>(
+    observer: &dyn StageObserver,
+    control: &JobControl,
+    poll: Duration,
+    work: impl FnOnce() -> T,
+) -> T {
+    let done = AtomicBool::new(false);
+    // The stage span is re-entered on the watcher thread, which does not
+    // inherit it.
+    let parent = tracing::Span::current();
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let _parent = parent.enter();
+            while !done.load(Ordering::SeqCst) {
+                std::thread::sleep(poll);
+                observer.tick(&control.progress());
+            }
+        });
+        let result = work();
+        done.store(true, Ordering::SeqCst);
+        watcher
+            .join()
+            .expect("progress watcher thread must not panic");
+        result
+    })
 }
 
 /// How the align stage is about to be satisfied -- named so a front end can
@@ -415,20 +450,43 @@ pub fn run(
         check_scratch_space(request, scratch_needed)?;
     }
     // A RAW stack develops every frame here, once, so no later read does.
-    match frame_reader.develop_once(
-        &request.scratch_root,
-        develop_budget,
-        workers,
-        &cancel_requested,
-    ) {
-        Err(AlgorithmError::Cancelled) => {
+    if scratch_needed > 0 {
+        timer.mark(Stage::Setup);
+        timer.enter(Stage::Develop);
+        let developed = control.begin_develop(frame_reader.len());
+        control.set_stage(JobStage::Develop);
+        observer.stage(RunStage::Develop {
+            frames: frame_reader.len(),
+        });
+        let result = with_progress_ticks(observer, &control, request.poll, || {
+            frame_reader.develop_once(
+                &request.scratch_root,
+                develop_budget,
+                workers,
+                &cancel_requested,
+                &developed,
+            )
+        });
+        timer.mark(Stage::Develop);
+        timer.enter(Stage::Setup);
+        // Workers that claimed their frame before a cancel finish it, so the
+        // pass can return Ok with the cancel already raised.
+        match result {
+            Err(AlgorithmError::Cancelled) => {
+                return Ok(FuseOutcome::Cancelled {
+                    units_done: 0,
+                    unit_total: 0,
+                });
+            }
+            other => {
+                other?;
+            }
+        }
+        if cancel_requested() {
             return Ok(FuseOutcome::Cancelled {
                 units_done: 0,
                 unit_total: 0,
             });
-        }
-        other => {
-            other?;
         }
     }
 
@@ -439,37 +497,18 @@ pub fn run(
             observer.stage(RunStage::Prepare {
                 frames: frame_reader.len(),
             });
-            let done = AtomicBool::new(false);
-            let poll = request.poll;
-            // The stage span is re-entered on the watcher thread, which does
-            // not inherit it.
-            let parent = tracing::Span::current();
-            let estimated = std::thread::scope(|scope| {
-                let watcher = scope.spawn(|| {
-                    let _parent = parent.enter();
-                    while !done.load(Ordering::SeqCst) {
-                        std::thread::sleep(poll);
-                        observer.tick(&control.progress());
-                    }
-                });
-                let result = {
-                    let _prepare = equalize_scope();
-                    equalize::estimate(
-                        frame_reader,
-                        frame_reader.len(),
-                        (width, height),
-                        spp,
-                        settings,
-                        workers,
-                        &frames_done,
-                        &cancel_requested,
-                    )
-                };
-                done.store(true, Ordering::SeqCst);
-                watcher
-                    .join()
-                    .expect("prepare watcher thread must not panic");
-                result
+            let estimated = with_progress_ticks(observer, &control, request.poll, || {
+                let _prepare = equalize_scope();
+                equalize::estimate(
+                    frame_reader,
+                    frame_reader.len(),
+                    (width, height),
+                    spp,
+                    settings,
+                    workers,
+                    &frames_done,
+                    &cancel_requested,
+                )
             });
             let report = match estimated {
                 Err(AlgorithmError::Cancelled) => {

@@ -732,6 +732,11 @@ fn stage_timings_are_reported_for_every_entered_stage() {
         "stack never enters warp_write: {report}"
     );
     assert_eq!(
+        stages["develop"],
+        serde_json::Value::Null,
+        "a TIFF stack never enters the develop pass: {report}"
+    );
+    assert_eq!(
         report["align_source"], "computed",
         "a fresh alignment must report align_source=\"computed\": {report}"
     );
@@ -880,10 +885,17 @@ fn stage_timings_account_for_the_wall_clock() {
     assert!(out.success, "stderr: {}", out.stderr);
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
     let stages = &report["stages"];
-    let sum: f64 = ["setup", "align", "fuse", "finalize", "warp_write"]
-        .iter()
-        .filter_map(|key| stages[key].as_f64())
-        .sum();
+    let sum: f64 = [
+        "setup",
+        "develop",
+        "align",
+        "fuse",
+        "finalize",
+        "warp_write",
+    ]
+    .iter()
+    .filter_map(|key| stages[key].as_f64())
+    .sum();
     let wall = report["wall_seconds"].as_f64().expect("wall_seconds");
     assert!(
         (sum - wall).abs() <= 1e-6,
