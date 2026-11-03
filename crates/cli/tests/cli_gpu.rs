@@ -25,11 +25,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{CliOutput, mantis_512_dir, read_whole};
-
-fn bin() -> Command {
-    common::cli_bin("cli_gpu")
-}
+use common::{CliOutput, bin, export_both, mantis_512_dir, read_whole};
 
 /// The largest absolute per-sample difference between two same-length
 /// sample buffers.
@@ -99,7 +95,7 @@ fn four_tile_args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
 
 /// The composite of `project`, exported beside it as
 /// `<project-file-name>.composite.tif` for byte comparison.
-fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
+fn export_to_composite_tif(cwd: &Path, project: &Path) -> PathBuf {
     let composite = project.with_extension("composite.tif");
     let out = run(
         cwd,
@@ -206,8 +202,8 @@ fn stack_gpu_matches_stack_no_gpu() {
         serde_json::from_str(&cpu.stdout).expect("cpu run --json must parse");
     assert_eq!(cpu_report["backend"], "cpu", "report: {cpu_report}");
 
-    let gpu_composite = export_composite(&cwd, &gpu_dir.join("mantis-512.ffp"));
-    let cpu_composite = export_composite(&cwd, &cpu_dir.join("mantis-512.ffp"));
+    let gpu_composite = export_to_composite_tif(&cwd, &gpu_dir.join("mantis-512.ffp"));
+    let cpu_composite = export_to_composite_tif(&cwd, &cpu_dir.join("mantis-512.ffp"));
     let (gpu_samples, gw, gh, gspp) = read_whole(&gpu_composite);
     let (cpu_samples, cw, ch, cspp) = read_whole(&cpu_composite);
     assert_eq!(
@@ -734,25 +730,6 @@ fn log_path(data_dir: &Path) -> PathBuf {
         .join("focusforge.jsonl")
 }
 
-/// Both payloads of `project`, exported beside it in one invocation.
-fn export_both(cwd: &Path, project: &Path) -> (PathBuf, PathBuf) {
-    let composite = project.with_extension("composite.tif");
-    let zmap = project.with_extension("zmap.tif");
-    let out = run(
-        cwd,
-        &[
-            "export",
-            project.to_str().unwrap(),
-            "-o",
-            composite.to_str().unwrap(),
-            "--zmap",
-            zmap.to_str().unwrap(),
-        ],
-    );
-    assert!(out.success, "export stderr: {}", out.stderr);
-    (composite, zmap)
-}
-
 /// `stack` over the standard fixture with alignment off and a tile size
 /// small enough to plan several tiles -- the shape both sides of the
 /// device-loss comparison run with. Alignment off means identity transforms
@@ -877,7 +854,7 @@ fn equalized_stack_gpu_matches_no_gpu() {
         assert!(result.success, "{name} run stderr: {}", result.stderr);
         let report: serde_json::Value =
             serde_json::from_str(&result.stdout).expect("--json must parse");
-        let (samples, ..) = read_whole(&export_composite(&cwd, &out.join("mantis-512.ffp")));
+        let (samples, ..) = read_whole(&export_to_composite_tif(&cwd, &out.join("mantis-512.ffp")));
         (samples, report)
     };
     let mean =
