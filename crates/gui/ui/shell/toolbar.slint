@@ -3,11 +3,12 @@
 // The stacking-mode toolbar: the run's transport at the left, two dim,
 // inert labels at the right end.
 
+import { FFAppear } from "../components/ff_appear.slint";
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFButton } from "../components/ff_button.slint";
 
-export component FFToolbar inherits Rectangle {
+export component FFToolbar inherits FFAppear {
     // "idle" | "running" | "paused" | "cancelling" | "failed" | "queued".
     // Any other value renders as "idle".
     in property <string> run-state: "idle";

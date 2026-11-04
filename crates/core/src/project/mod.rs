@@ -79,6 +79,7 @@ pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
+use manifest::{FORMAT_VERSION, FormatProbe};
 pub use render::{CheckpointImage, PendingState, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
@@ -470,7 +471,25 @@ impl Project {
                 path: path.to_path_buf(),
             });
         }
-        let manifest: Manifest = read_json(&file, &index, path, "manifest.json")?;
+        let manifest_bytes = read_entry_bytes(&file, &index, path, "manifest.json")?;
+        let probe: FormatProbe = serde_json::from_slice(&manifest_bytes).map_err(|err| {
+            let field = if err.classify() == serde_json::error::Category::Data {
+                "format_version: "
+            } else {
+                ""
+            };
+            ProjectError::container(path, format!("manifest.json: {field}{err}"))
+        })?;
+        let found = probe.format_version.unwrap_or(1);
+        if found > FORMAT_VERSION {
+            return Err(ProjectError::NewerFormat {
+                path: path.to_path_buf(),
+                found,
+                supported: FORMAT_VERSION,
+            });
+        }
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?;
 
         let mut checkpoints = Vec::new();
         for name in index.names() {
@@ -982,16 +1001,26 @@ pub(super) fn checkpoint_entry(id: &str) -> String {
     format!("checkpoints/{id}.json")
 }
 
+fn read_entry_bytes(
+    file: &File,
+    index: &Index,
+    path: &Path,
+    entry: &str,
+) -> Result<Vec<u8>, ProjectError> {
+    let mut bytes = Vec::new();
+    container::record_reader(file, index, path, entry)?
+        .read_to_end(&mut bytes)
+        .map_err(|source| ProjectError::io(path, source))?;
+    Ok(bytes)
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(
     file: &File,
     index: &Index,
     path: &Path,
     entry: &str,
 ) -> Result<T, ProjectError> {
-    let mut bytes = Vec::new();
-    container::record_reader(file, index, path, entry)?
-        .read_to_end(&mut bytes)
-        .map_err(|source| ProjectError::io(path, source))?;
+    let bytes = read_entry_bytes(file, index, path, entry)?;
     serde_json::from_slice(&bytes)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
 }

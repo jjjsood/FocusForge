@@ -920,10 +920,30 @@ mod tests {
         outcomes
     }
 
-    fn wait_until_idle(worker: &PreviewWorker) {
-        while worker.metrics().active_workers != 0 {
+    /// Longest a test waits on a channel or a worker condition before failing.
+    const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Spins until `done` holds for the worker's metrics; panics naming `what`
+    /// after [`WAIT_BOUND`].
+    fn wait_until(
+        worker: &PreviewWorker,
+        what: &str,
+        done: impl Fn(&super::PreviewMetrics) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + WAIT_BOUND;
+        while !done(&worker.metrics()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out after {WAIT_BOUND:?} waiting for {what}"
+            );
             std::thread::yield_now();
         }
+    }
+
+    fn wait_until_idle(worker: &PreviewWorker) {
+        wait_until(worker, "the worker to go idle", |metrics| {
+            metrics.active_workers == 0
+        });
     }
 
     #[test]
@@ -981,7 +1001,7 @@ mod tests {
                 slow_release_rx
                     .lock()
                     .unwrap()
-                    .recv()
+                    .recv_timeout(WAIT_BOUND)
                     .expect("test releases the slow row");
             }
             Ok((one_pixel(), reservation()))
@@ -1005,10 +1025,12 @@ mod tests {
                 .to_vec(),
             HostBudget::explicit(1024),
         );
-        slow_started_rx.recv().expect("the second row is rendering");
-        while worker.metrics().outcome_bytes == 0 {
-            std::thread::yield_now();
-        }
+        slow_started_rx
+            .recv_timeout(WAIT_BOUND)
+            .expect("the second row is rendering");
+        wait_until(&worker, "the second row to park an outcome", |metrics| {
+            metrics.outcome_bytes != 0
+        });
         worker.set_visible(
             ["fresh-a", "fresh-b"].map(request).to_vec(),
             HostBudget::explicit(1024),
@@ -1042,7 +1064,7 @@ mod tests {
             release_rx
                 .lock()
                 .expect("renderer release lock")
-                .recv()
+                .recv_timeout(WAIT_BOUND)
                 .expect("the test releases renderer");
             if cancelled.load(Ordering::Acquire) {
                 return Err(PreviewError::Cancelled);
@@ -1058,7 +1080,7 @@ mod tests {
         }));
         worker.set_visible(vec![request("claimed")], HostBudget::explicit(1024));
         started_rx
-            .recv()
+            .recv_timeout(WAIT_BOUND)
             .expect("render was claimed before quiesce");
         assert_eq!(worker.metrics().active_workers, 1);
         assert_eq!(worker.metrics().peak_workers, 1);
@@ -1077,7 +1099,7 @@ mod tests {
         );
         release_tx.send(()).expect("renderer release sends");
         released_rx
-            .recv()
+            .recv_timeout(WAIT_BOUND)
             .expect("quiesce completes after renderer releases");
         assert_eq!(worker.metrics().outcome_bytes, 0);
     }
@@ -1096,7 +1118,7 @@ mod tests {
                 second_release_rx
                     .lock()
                     .expect("second renderer release lock")
-                    .recv()
+                    .recv_timeout(WAIT_BOUND)
                     .expect("test releases second renderer");
             }
             Ok((
@@ -1109,14 +1131,16 @@ mod tests {
             ))
         }));
         worker.set_visible(vec![request("first")], HostBudget::explicit(1024));
-        first_published_rx.recv().expect("first render completes");
-        while worker.metrics().outcome_bytes == 0 {
-            std::thread::yield_now();
-        }
+        first_published_rx
+            .recv_timeout(WAIT_BOUND)
+            .expect("first render completes");
+        wait_until(&worker, "the first render to park its outcome", |metrics| {
+            metrics.outcome_bytes != 0
+        });
 
         worker.set_visible(vec![request("second")], HostBudget::explicit(1024));
         second_started_rx
-            .recv()
+            .recv_timeout(WAIT_BOUND)
             .expect("second decode starts only after replacement");
         assert_eq!(
             worker.metrics().outcome_bytes,
@@ -1124,9 +1148,11 @@ mod tests {
             "the parked first result was dropped before second admission"
         );
         second_release_tx.send(()).expect("release second renderer");
-        while worker.metrics().outcome_bytes == 0 {
-            std::thread::yield_now();
-        }
+        wait_until(
+            &worker,
+            "the second render to park its outcome",
+            |metrics| metrics.outcome_bytes != 0,
+        );
         let outcomes = worker.drain();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].request, request("second"));
@@ -1151,13 +1177,17 @@ mod tests {
             Arc::new(move || exited_tx.send(()).expect("worker exit reaches test")),
         );
         worker.set_visible(vec![request("parked")], HostBudget::explicit(1024));
-        rendered_rx.recv().expect("renderer completed");
-        while worker.metrics().outcome_bytes == 0 {
-            std::thread::yield_now();
-        }
+        rendered_rx
+            .recv_timeout(WAIT_BOUND)
+            .expect("renderer completed");
+        wait_until(&worker, "the rendered outcome to park", |metrics| {
+            metrics.outcome_bytes != 0
+        });
 
         drop(worker);
 
-        exited_rx.recv().expect("drop releases the worker thread");
+        exited_rx
+            .recv_timeout(WAIT_BOUND)
+            .expect("drop releases the worker thread");
     }
 }

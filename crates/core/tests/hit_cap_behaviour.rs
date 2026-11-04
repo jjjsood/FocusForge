@@ -6,80 +6,21 @@
 
 mod common;
 
-use std::path::PathBuf;
+use common::align::{
+    corner_error, default_region, frame_3_tile, full_rect, open_fixture, resolved_defaults,
+    two_frame_reader,
+};
+
 use std::time::Instant;
 
-use focusforge_core::algorithm::{
-    AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader,
-};
+use focusforge_core::algorithm::{AlignAlgorithm, AlignContext, AlignStatus};
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
     DivergenceReason, EccLevelRecord, EccStatus, PyramidalEcc, Transform,
 };
-use focusforge_core::io::{FrameError, TiffError, TiffStack};
-use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 
-const FRAME_3: usize = 3;
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
-/// Identical to `PyramidalEcc::solve_region`'s own 512px-level rect
-/// (`crates/core/tests/align_algorithm.rs` documents the same equality),
-/// which is what makes the truncation-cost corners meaningful.
-fn default_region() -> Rect {
-    Rect {
-        x: 64,
-        y: 64,
-        width: 384,
-        height: 384,
-    }
-}
-
-/// The maximum, over `region`'s four corners, of the Euclidean distance
-/// between where `a` and `b` map that corner -- the solver's own
-/// termination measure, reused here as the deconfounded truncation-cost and
-/// corner-error metric.
-fn corner_error(a: &Transform, b: &Transform, region: Rect) -> f64 {
-    let corners = [
-        (region.x as f64, region.y as f64),
-        ((region.x + region.width - 1) as f64, region.y as f64),
-        (region.x as f64, (region.y + region.height - 1) as f64),
-        (
-            (region.x + region.width - 1) as f64,
-            (region.y + region.height - 1) as f64,
-        ),
-    ];
-    corners
-        .iter()
-        .map(|&(x, y)| {
-            let (ax, ay) = a.map_point(x, y).expect("a stays in domain");
-            let (bx, by) = b.map_point(x, y).expect("b stays in domain");
-            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
-        })
-        .fold(0.0f64, f64::max)
-}
-
-/// Fully resolved defaults for `PyramidalEcc` against `ctx` -- the same
-/// pattern `align_algorithm.rs`'s `resolved_defaults` uses.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    params::resolved_values(&resolved)
-}
-
-/// The shipped defaults, with `mode` and `max-iterations` overridden --
+/// The defaults resolved for `ctx`, with `mode` and `max-iterations` overridden --
 /// every other key (`epsilon-px`, `pyramid-depth = auto`, `reference-policy`,
 /// `reference-frame`, the last unused here since the reference is set on
 /// `AlignContext` directly) stays exactly as `PyramidalEcc::params` declares
@@ -92,96 +33,6 @@ fn cfg_for(ctx: &StackContext, mode: &str, max_iterations: i64) -> ParamValues {
         ParamValue::Int(max_iterations),
     );
     cfg
-}
-
-/// A synthetic in-memory `TileReader` over same-sized frames -- mirrors
-/// `align_algorithm.rs`'s own `FramesReader` (private per test binary, so
-/// reimplemented here rather than shared).
-struct FramesReader {
-    width: u32,
-    height: u32,
-    spp: u32,
-    frames: Vec<Vec<u16>>,
-}
-
-impl TileReader for FramesReader {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        let Some(src) = self.frames.get(frame) else {
-            return Err(AlgorithmError::FrameOutOfRange {
-                frame,
-                frame_count: self.frames.len(),
-            });
-        };
-        let expected = rect.width as usize * rect.height as usize * self.spp as usize;
-        if out.len() != expected {
-            return Err(AlgorithmError::Frame(FrameError::Tiff(
-                TiffError::BufferSize {
-                    expected,
-                    got: out.len(),
-                },
-            )));
-        }
-        let in_bounds = rect
-            .x
-            .checked_add(rect.width)
-            .is_some_and(|xw| xw <= self.width)
-            && rect
-                .y
-                .checked_add(rect.height)
-                .is_some_and(|yh| yh <= self.height);
-        if !in_bounds {
-            return Err(AlgorithmError::Frame(FrameError::Tiff(
-                TiffError::OutOfBounds {
-                    path: PathBuf::from("<memory>"),
-                    requested: rect,
-                    frame: (self.width, self.height),
-                },
-            )));
-        }
-        let stride = self.width as usize * self.spp as usize;
-        let row_len = rect.width as usize * self.spp as usize;
-        let mut off = 0;
-        for r in rect.y..(rect.y + rect.height) {
-            let row_start = r as usize * stride + rect.x as usize * self.spp as usize;
-            out[off..off + row_len].copy_from_slice(&src[row_start..row_start + row_len]);
-            off += row_len;
-        }
-        Ok(())
-    }
-}
-
-/// `reference` is frame 0, `moving` is frame 1 -- the same convention
-/// `align_algorithm.rs::two_frame_reader` uses.
-fn two_frame_reader(
-    width: u32,
-    height: u32,
-    spp: u32,
-    reference: Vec<u16>,
-    moving: Vec<u16>,
-) -> FramesReader {
-    FramesReader {
-        width,
-        height,
-        spp,
-        frames: vec![reference, moving],
-    }
-}
-
-/// Reads frame 3's full tile from the fixture.
-fn frame_3_tile() -> (Tile, u32, u32, u32) {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(FRAME_3).samples_per_pixel;
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
-    (tile, width, height, spp)
 }
 
 /// `First -> 0`, `Middle -> (frame_count - 1) / 2`, `Last -> frame_count -
@@ -225,11 +76,12 @@ fn print_level_row(mode: &str, frame: usize, rec: &EccLevelRecord, epsilon_px: f
 }
 
 /// **Distance from epsilon**: for every `HitCap` frame of
-/// `fixtures/mantis-512` under the shipped defaults, in both modes, the
-/// final step measure and its ratio to `epsilon-px` -- per pyramid level,
-/// so no statement compares a four-level iteration sum against a per-level
-/// threshold.
+/// `fixtures/mantis-512` at cap 50 and the configured `epsilon-px`, in both
+/// modes, the final step measure and its ratio to `epsilon-px` -- per
+/// pyramid level, so no statement compares a multi-level iteration sum against
+/// a per-level threshold.
 #[test]
+#[ignore = "measurement: prints each level's final step and its ratio to epsilon-px at cap 50"]
 fn hit_cap_frames_report_their_distance_from_epsilon() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -345,6 +197,7 @@ fn classify_trajectory(window: &[f64]) -> Trajectory {
 /// **Step trajectory**: classify the step trajectory of every `HitCap`
 /// level over its last `min(10, iterations)` recorded steps.
 #[test]
+#[ignore = "measurement: prints the step trajectory verdict of each capped level at cap 50"]
 fn hit_cap_step_trajectory_is_classified() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -397,12 +250,13 @@ fn hit_cap_step_trajectory_is_classified() {
 }
 
 /// **Cap sensitivity**: the cap is measured, not assumed. For every frame
-/// that hit-caps under the shipped default, sweep `max-iterations` upward and
+/// that hit-caps at cap 50, sweep `max-iterations` upward and
 /// record the truncation cost -- the same frame's transform at cap `C`
 /// against its own transform at the sweep's largest cap, over
 /// `default_region()`'s corners. Frame, content, focus distance and anchor
 /// are identical on both sides, so they cancel exactly.
 #[test]
+#[ignore = "measurement: prints the truncation cost of each frame across a sweep of max-iterations"]
 fn raising_the_cap_is_measured_not_assumed() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -413,13 +267,13 @@ fn raising_the_cap_is_measured_not_assumed() {
     let region = default_region();
 
     let overall_start = Instant::now();
-    // Caps sized to fit the file's wall-clock ceiling: this sweep measures
-    // 93.4 s (the full `[50, 100, 200, 400, 1000]` sweep: 134.5 s).
+    // This sweep measures 93.4 s (the full `[50, 100, 200, 400, 1000]` sweep:
+    // 134.5 s).
     for (mode, caps) in [
         ("rotation-scale", vec![50i64, 200, 400, 1000]),
         ("translation", vec![50i64, 1000]),
     ] {
-        // Which frames hit-cap under the shipped default, measured here.
+        // Which frames hit-cap at cap 50, measured here.
         let default_cfg = cfg_for(&stack_ctx, mode, 50);
         let mut hit_cap_frames = Vec::new();
         for frame in 0..frame_count {
@@ -491,6 +345,7 @@ fn raising_the_cap_is_measured_not_assumed() {
 /// alone explains it; if it never appears, defocus-driven content mismatch
 /// is implicated for the real frames.
 #[test]
+#[ignore = "measurement: prints the status and corner error of known warps registered against their own source frame"]
 fn hit_cap_without_a_focus_difference() {
     let (tile, width, height, spp) = frame_3_tile();
     let rect = full_rect(width, height);
@@ -551,9 +406,10 @@ fn hit_cap_without_a_focus_difference() {
 
 /// **Distance from anchor**: hit-cap status against `|frame - anchor|`,
 /// over the 21 non-anchor pairs the three `reference-frame` settings
-/// produce, at the default cap. The test asserts nothing about
-/// correlation; it states present / absent / indeterminate.
+/// produce, at cap 50. The test asserts nothing about correlation; it states
+/// present / absent / indeterminate.
 #[test]
+#[ignore = "measurement: prints hit-cap status against distance from the anchor and a contingency table"]
 fn hit_cap_against_distance_from_the_anchor() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();

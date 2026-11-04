@@ -17,13 +17,32 @@ use std::time::{Duration, Instant};
 
 use common::has_display;
 
+/// Spawns every command before awaiting any, so the windows open together,
+/// and returns the outputs in command order.
+fn run_together(commands: Vec<std::process::Command>) -> Vec<std::process::Output> {
+    let children: Vec<_> = commands
+        .into_iter()
+        .map(|mut command| {
+            command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("launch focusforge-gui")
+        })
+        .collect();
+    children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("await focusforge-gui"))
+        .collect()
+}
+
 #[test]
 fn comparison_window_geometry() {
     use focusforge_gui::ComparisonWindow;
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     let rect = |id| {
@@ -45,7 +64,7 @@ fn comparison_current_crop_matches_the_visible_draw() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     window.set_crop_x(18.0);
@@ -80,7 +99,7 @@ fn comparison_backdrop_sits_under_the_exact_image_outside_its_crop() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     let images = |window: &ComparisonWindow| {
@@ -129,7 +148,7 @@ fn comparison_window_forwards_focused_keys_and_focus_loss() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let focus_changes = Rc::new(Cell::new(0));
@@ -167,7 +186,7 @@ fn comparison_hover_ends_outside_its_pane() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     window.window().dispatch_event(WindowEvent::PointerMoved {
@@ -188,7 +207,7 @@ fn undock_without_project_is_empty() {
     use focusforge_gui::{AppController, ComparisonWindow};
     use i_slint_backend_testing::ElementQuery;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let mut controller = AppController::new();
     controller.undock_requested(PaneSource::Frame);
     assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
@@ -212,7 +231,7 @@ fn dock_back_restores_two_panes() {
     use focusforge_gui::{AppController, AppWindow};
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -237,7 +256,7 @@ fn comparison_capture_requires_detached_pane() {
     let output = common::gui_bin("comparison_capture_requires_detached_pane")
         .args(["--exit-after", "500", "--screenshot-window", "comparison"])
         .arg("--screenshot")
-        .arg(common::workspace_root().join(".scratch/gui-screenshots/no-detached-pane.png"))
+        .arg(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-detached-pane.png"))
         .output()
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
@@ -260,12 +279,16 @@ fn refused_slow_down_values_are_logged_and_the_window_opens() {
         (&["--slow-run-seconds", "x"], "--slow-run-seconds expects"),
         (&["--slow-open", "x"], "--slow-open expects"),
     ];
-    for (i, (args, expected)) in cases.into_iter().enumerate() {
-        let output = common::gui_bin(&format!("refused_slow_down_{i}"))
-            .args(args)
-            .args(["--exit-after", "500"])
-            .output()
-            .expect("launch focusforge-gui");
+    let commands = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (args, _))| {
+            let mut command = common::gui_bin(&format!("refused_slow_down_{i}"));
+            command.args(*args).args(["--exit-after", "500"]);
+            command
+        })
+        .collect();
+    for ((args, expected), output) in cases.into_iter().zip(run_together(commands)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -300,13 +323,19 @@ fn refused_save_folder_is_logged_and_the_window_opens() {
             refused.push(locked);
         }
     }
-    for (i, path) in refused.iter().enumerate() {
-        let output = common::gui_bin(&format!("refused_save_folder_{i}"))
-            .arg("--save-folder")
-            .arg(path)
-            .args(["--exit-after", "500"])
-            .output()
-            .expect("launch focusforge-gui");
+    let commands = refused
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let mut command = common::gui_bin(&format!("refused_save_folder_{i}"));
+            command
+                .arg("--save-folder")
+                .arg(path)
+                .args(["--exit-after", "500"]);
+            command
+        })
+        .collect();
+    for (path, output) in refused.iter().zip(run_together(commands)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -331,16 +360,22 @@ fn both_sides_open_a_real_comparison_window() {
         return;
     }
     let dir = common::tree("both_comparison_sides");
-    for side in ["frame", "composite"] {
+    let sides = ["frame", "composite"];
+    let commands = sides
+        .iter()
+        .map(|side| {
+            let mut command = common::gui_bin(&format!("comparison_{side}"));
+            command
+                .arg("--open")
+                .arg(common::fixture_frame("mantis-64", 0))
+                .args(["--undock-pane", side, "--exit-after", "8000"])
+                .args(["--screenshot-window", "comparison", "--screenshot"])
+                .arg(dir.join(format!("{side}.png")));
+            command
+        })
+        .collect();
+    for (side, output) in sides.into_iter().zip(run_together(commands)) {
         let capture = dir.join(format!("{side}.png"));
-        let output = common::gui_bin(&format!("comparison_{side}"))
-            .arg("--open")
-            .arg(common::fixture_frame("mantis-64", 0))
-            .args(["--undock-pane", side, "--exit-after", "8000"])
-            .args(["--screenshot-window", "comparison", "--screenshot"])
-            .arg(&capture)
-            .output()
-            .expect("launch comparison window");
         assert!(
             output.status.success(),
             "{side} failed: {}",
@@ -361,7 +396,8 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
         return;
     }
     let capture = common::tree("comparison_reopen").join("reopened.png");
-    let output = common::gui_bin("comparison_reopen")
+    let mut reopen = common::gui_bin("comparison_reopen");
+    reopen
         .arg("--open")
         .arg(common::fixture_frame("mantis-64", 0))
         .args([
@@ -377,18 +413,11 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "comparison",
             "--screenshot",
         ])
-        .arg(&capture)
-        .output()
-        .expect("launch reopened comparison");
-    assert!(
-        output.status.success(),
-        "reopen failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(capture.exists(), "reopened comparison was not captured");
+        .arg(&capture);
 
     let watchdog_capture = common::tree("comparison_main_close").join("watchdog.png");
-    let output = common::gui_bin("comparison_main_close")
+    let mut main_close = common::gui_bin("comparison_main_close");
+    main_close
         .arg("--open")
         .arg(common::fixture_frame("mantis-64", 0))
         .args([
@@ -400,13 +429,21 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "15000",
             "--screenshot",
         ])
-        .arg(&watchdog_capture)
-        .output()
-        .expect("launch comparison and close main");
+        .arg(&watchdog_capture);
+
+    let mut outputs = run_together(vec![reopen, main_close]).into_iter();
+    let (output, main_close_output) = (outputs.next().unwrap(), outputs.next().unwrap());
     assert!(
         output.status.success(),
-        "main close failed: {}",
+        "reopen failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(capture.exists(), "reopened comparison was not captured");
+
+    assert!(
+        main_close_output.status.success(),
+        "main close failed: {}",
+        String::from_utf8_lossy(&main_close_output.stderr)
     );
     assert!(
         !watchdog_capture.exists(),
@@ -667,8 +704,7 @@ fn screenshot_is_not_uniform() {
         return;
     }
 
-    let out_path = common::workspace_root()
-        .join(".scratch")
+    let out_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("gui-screenshots")
         .join("screenshot_is_not_uniform.png");
     if let Some(parent) = out_path.parent() {

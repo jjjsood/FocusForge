@@ -105,6 +105,18 @@ The canvas in the middle of the window shows two images side by side:
   "Fuse stack builds the composite here." After a fuse it shows the checkpoint
   selected in **CHECKPOINTS**.
 
+While a run is live, the **Composite** pane shows what it is doing instead of
+the "Not fused yet" card: "Preparing frames" while frames are developed and
+aligned, "Alignment reused" when the cached alignment serves, then the
+aligned frame and the result growing tile by tile with its tile grid. A
+sharpness inset shows where each frame is sharp as the result grows; it fades
+out two seconds after the last tile, and the finished result crossfades in.
+Pause keeps the view, **Cancel** returns the pane to "Not fused yet", and
+**Discard** removes the run's view along with its result. Each tab keeps its
+own view, and a Composite pane in its own window shows the same card. The
+inset is switched off under **Sharpness heatmap** in
+[Appearance](settings-window.md#appearance).
+
 The two panes always show the same part of the picture at the same zoom: pan
 or zoom in one, and the other follows. That makes it easy to compare a
 detail in one frame with the same detail in the result.

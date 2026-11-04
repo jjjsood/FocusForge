@@ -136,9 +136,12 @@ report and flight recording, and the crash-notice bookkeeping and
 diagnostics bundle's redaction and manifest, each writing into its own
 temporary directory rather than a shared one.
 
-Under `cargo nextest` (`.config/nextest.toml`) each test is killed after 15
-minutes and reported as a named TIMEOUT; the `hit_cap_behaviour` binary gets
-40.
+Under `cargo nextest` (`.config/nextest.toml`) the default profile kills each
+test after 15 minutes (30 for `stack_cli`) and reports a named TIMEOUT. The
+`quick` profile, used by `tools/check-all.sh --quick`, skips four memory and
+reference-cache binaries and kills any test after 180 s. The
+`hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
+`--ignored`.
 
 `tests/ui/` holds 18 journeys, each one whole path through the window as
 numbered clicks, keys and hovers with an `Expect:` line per step, plus
@@ -157,7 +160,10 @@ behavioural check
 (`cargo test -p focusforge-cli --no-default-features --test cli
 no_gpu_flag_absent_without_the_feature`) is run by hand, not in the standing
 gate. `cargo clippy --workspace --all-targets -- -D warnings` lints the
-default feature set on every gate pass. The device tests that need
+default feature set on every gate pass; the gate also lints the `gpu-tests`
+trees (`--features focusforge-gpu/gpu-tests,focusforge-gui/gpu-tests,focusforge-cli/gpu-tests`)
+without running them. Clippy denies `#[ignore]` without a reason
+(`ignore_without_reason`), so every ignored test states why. The device tests that need
 a real GPU adapter sit behind a separate, non-default `gpu-tests` feature and
 run as `cargo test --workspace --features gpu-tests -- --test-threads=1` —
 run by hand, deliberately, once per change to that code, never inside the
@@ -253,7 +259,13 @@ should come with the matching page edit and regenerated screenshots.
 
 `tools/check-all.sh` runs every gate (formatting, licenses, SPDX headers, NOTICE, fixtures, build,
 clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
-check) in one command; `--static` is the fast subset a pre-commit hook runs.
+check) in one command; `--static` is the fast subset a pre-commit hook runs,
+including `tools/check-test-bodies.py`, which flags tests without an assertion
+(exempt one with `// assertion-free: <reason>`) and tests that write the fixed
+workspace `.scratch` path. `--quick` swaps the full test run for the nextest
+`quick` profile and skips the trace and advisories stages, a working check
+while editing; `--log-dir DIR` writes the gate logs to `DIR` instead of
+`.logs/gate/`.
 Run this local gate before acceptance and merge. GitHub Actions calls the same
 gate on Linux, macOS and Windows as additional evidence; a green hosted run
 does not replace a required local run.

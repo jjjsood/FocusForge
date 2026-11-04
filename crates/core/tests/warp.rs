@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::align::{CallCountingReader, open_fixture};
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
@@ -14,32 +16,7 @@ use focusforge_core::align::warp::{warp_from_tile, warp_tile};
 use focusforge_core::align::{
     AlignError, KERNEL_RADIUS, SourceFootprint, Transform, WarpingReader,
 };
-use focusforge_core::io::TiffStack;
 use focusforge_core::tile::{Rect, Tile};
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-/// A [`TileReader`] that counts calls, for asserting "no read attempted".
-struct CountingReader<'a> {
-    inner: &'a TiffStack,
-    calls: AtomicUsize,
-}
-
-impl<'a> TileReader for CountingReader<'a> {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.inner
-            .read_tile_into(frame, rect, out)
-            .map_err(AlgorithmError::from)
-    }
-}
 
 #[test]
 fn identity_warp_is_bit_identical() {
@@ -222,7 +199,7 @@ fn tile_whose_source_crosses_the_frame_edge() {
 
     // A destination rect that pulls entirely from outside the frame: no
     // read attempted, all pixels uncovered.
-    let counting = CountingReader {
+    let counting = CallCountingReader {
         inner: &stack,
         calls: AtomicUsize::new(0),
     };

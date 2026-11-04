@@ -174,8 +174,9 @@ const MAX_REGION_PIXELS: u32 = 1 << 20;
 const LEVEL0_REGION_PIXELS: u32 = 4 * MAX_REGION_PIXELS;
 
 /// The fewest solve-region pixels at which a level is offered to an align
-/// backend. Smaller levels cost less to solve than to hand over.
-const ECC_BACKEND_MIN_REGION_PX: u64 = 1_000_000;
+/// backend that does not ask for another floor. Smaller levels cost less to
+/// solve than to hand over.
+pub(crate) const ECC_BACKEND_MIN_REGION_PX: u64 = 1_000_000;
 const _: () = assert!(ECC_BACKEND_MIN_REGION_PX <= MAX_REGION_PIXELS as u64);
 
 /// The floor on a pyramid level's shorter dimension the `auto`
@@ -667,6 +668,9 @@ impl PyramidalEcc {
         traced: bool,
     ) -> Result<(Attempt, Escalation), AlgorithmError> {
         let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+        if let Some(sink) = ctx.preview() {
+            sink.offer(frame, &frame_pyramid);
+        }
         let first = Self::solve_from(
             ctx,
             frame,
@@ -1180,10 +1184,10 @@ fn luma_window<S: Sample>(
 }
 
 /// Solves one pyramid level. A template region of at least
-/// [`ECC_BACKEND_MIN_REGION_PX`] pixels is offered to the context's align
-/// backend; a level with no backend, a declined one or a smaller region runs on
-/// the CPU. The off-centre patch checks call [`solve_prepared`] directly and
-/// are never offered.
+/// [`min_ecc_region_px`](crate::gpu::AlignBackend::min_ecc_region_px) pixels
+/// is offered to the context's align backend; a level with no backend, a
+/// declined one or a smaller region runs on the CPU. The off-centre patch
+/// checks call [`solve_prepared`] directly and are never offered.
 fn solve_routed(
     ctx: &AlignContext<'_>,
     template: &EccTemplate,
@@ -1194,8 +1198,10 @@ fn solve_routed(
     mut trace: Option<&mut Vec<EccIteration>>,
 ) -> Result<EccResult, AlgorithmError> {
     let region = template.region();
-    let offered = u64::from(region.width) * u64::from(region.height) >= ECC_BACKEND_MIN_REGION_PX;
-    if let Some(backend) = ctx.align_backend().filter(|_| offered)
+    let pixels = u64::from(region.width) * u64::from(region.height);
+    if let Some(backend) = ctx
+        .align_backend()
+        .filter(|backend| pixels >= backend.min_ecc_region_px())
         && let Some(result) = solve_prepared_on(
             template,
             moving,
@@ -2121,10 +2127,7 @@ mod tests {
             .unwrap();
         let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
         assert_eq!(with, without);
-        assert!(matches!(
-            with.status,
-            AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-        ));
+        assert_eq!(with.status, AlignStatus::Converged);
     }
 
     #[test]
@@ -2471,10 +2474,7 @@ mod tests {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, -2.0)], false);
         for mode in [EccMode::Translation, EccMode::Similarity] {
             let (reference, attempt, escalation) = registered(&mem, mode, 2, 1);
-            assert!(matches!(
-                attempt.status,
-                AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-            ));
+            assert_eq!(attempt.status, AlignStatus::Converged, "{mode:?}");
             assert_eq!(escalation, Escalation::default(), "{mode:?}");
             assert!(reference.features.get().is_none(), "{mode:?}");
         }
@@ -2501,13 +2501,7 @@ mod tests {
                 "{mode:?}"
             );
             assert!(reference.features.get().is_some());
-            assert!(
-                matches!(
-                    attempt.status,
-                    AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-                ),
-                "{mode:?}: {attempt:?}"
-            );
+            assert_eq!(attempt.status, AlignStatus::Converged, "{mode:?}");
             let (scale, radians, tx, ty) = attempt.transform.similarity_parts();
             assert!(
                 (tx - 150.0).abs() < 0.05 && (ty + 90.0).abs() < 0.05,
@@ -2515,8 +2509,40 @@ mod tests {
             );
             if mode == EccMode::Translation {
                 assert_eq!((scale, radians), (1.0, 0.0), "a pure translation");
+                prepared_run_matches_unprepared(&mem);
             }
         }
+    }
+
+    /// Aligning frame 1 against a reference built by `prepare_run` gives the
+    /// outcome of aligning without one; the shared reference detects nothing
+    /// until a frame needs its features.
+    fn prepared_run_matches_unprepared(mem: &MemReader) {
+        let stack = StackContext::new(2, W, H, 1);
+        let ctx = AlignContext::new(stack, 0, mem);
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(2));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+
+        let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
+        let shared = prepared.downcast_ref::<PreparedReference>().unwrap();
+        assert!(shared.features.get().is_none(), "preparing detects nothing");
+        let with = PyramidalEcc
+            .align_frame(
+                &AlignContext::new(stack, 0, mem).with_prepared(Some(&*prepared)),
+                1,
+                &cfg,
+            )
+            .unwrap();
+        assert!(shared.features.get().is_some());
+        let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
+        assert_eq!(with, without);
+        assert_eq!(with.status, AlignStatus::Converged);
     }
 
     #[test]
@@ -2574,10 +2600,7 @@ mod tests {
             },
             "{fit:?}"
         );
-        assert!(
-            !matches!(attempt.status, AlignStatus::Diverged(_)),
-            "{attempt:?}"
-        );
+        assert_eq!(attempt.status, AlignStatus::Converged, "{attempt:?}");
         let (_, _, tx, ty) = attempt.transform.similarity_parts();
         assert!(
             (tx - shift.0).abs() < 0.05 && (ty - shift.1).abs() < 0.05,
@@ -2790,44 +2813,13 @@ mod tests {
         assert_eq!(seed_level(2049, 1367, 5), Some(3));
     }
 
-    #[test]
-    fn a_driver_prepared_reference_gives_the_same_seeded_outcome_as_none() {
-        let mem = blob_reader(&[(0.0, 0.0), (150.0, -90.0)]);
-        let stack = StackContext::new(2, W, H, 1);
-        let ctx = AlignContext::new(stack, 0, &mem);
-        let mut cfg = crate::params::resolved_values(
-            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
-        );
-        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(2));
-        cfg.insert(
-            "mode".to_string(),
-            ParamValue::Enum("translation".to_string()),
-        );
-
-        let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
-        let shared = prepared.downcast_ref::<PreparedReference>().unwrap();
-        assert!(shared.features.get().is_none(), "preparing detects nothing");
-        let with = PyramidalEcc
-            .align_frame(
-                &AlignContext::new(stack, 0, &mem).with_prepared(Some(&*prepared)),
-                1,
-                &cfg,
-            )
-            .unwrap();
-        assert!(shared.features.get().is_some());
-        let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
-        assert_eq!(with, without);
-        assert!(matches!(
-            with.status,
-            AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-        ));
-    }
-
     /// Records every region offered to it; declines each, or opens a session
-    /// that sums the moments on the CPU.
+    /// that sums the moments on the CPU. Asks for regions of at least
+    /// `min_region_px` pixels.
     struct RecordingBackend {
         offered: std::sync::Mutex<Vec<Rect>>,
         accept: bool,
+        min_region_px: u64,
     }
 
     impl RecordingBackend {
@@ -2835,7 +2827,13 @@ mod tests {
             Self {
                 offered: std::sync::Mutex::new(Vec::new()),
                 accept,
+                min_region_px: ECC_BACKEND_MIN_REGION_PX,
             }
+        }
+
+        fn with_min_region_px(mut self, min_region_px: u64) -> Self {
+            self.min_region_px = min_region_px;
+            self
         }
 
         fn offered(&self) -> Vec<Rect> {
@@ -2844,6 +2842,10 @@ mod tests {
     }
 
     impl AlignBackend for RecordingBackend {
+        fn min_ecc_region_px(&self) -> u64 {
+            self.min_region_px
+        }
+
         fn open_ecc(
             &self,
             request: &EccSessionRequest<'_>,
@@ -2857,18 +2859,21 @@ mod tests {
 
     #[test]
     fn ecc_level_routing_skips_small_regions() {
-        const BIG_W: u32 = 1700;
-        const BIG_H: u32 = 1100;
-        let region0 = PyramidalEcc::solve_region(BIG_W, BIG_H, 0);
-        let region1 = PyramidalEcc::solve_region(BIG_W / 2, BIG_H / 2, 1);
         let pixels = |r: Rect| u64::from(r.width) * u64::from(r.height);
-        assert_eq!((region0.width, region0.height), (1275, 825));
-        assert!(pixels(region0) >= ECC_BACKEND_MIN_REGION_PX);
-        assert!(pixels(region1) < ECC_BACKEND_MIN_REGION_PX);
+        let big_region0 = PyramidalEcc::solve_region(1700, 1100, 0);
+        let big_region1 = PyramidalEcc::solve_region(1700 / 2, 1100 / 2, 1);
+        assert_eq!((big_region0.width, big_region0.height), (1275, 825));
+        assert!(pixels(big_region0) >= ECC_BACKEND_MIN_REGION_PX);
+        assert!(pixels(big_region1) < ECC_BACKEND_MIN_REGION_PX);
+
+        const SIDE: u32 = 256;
+        let region0 = PyramidalEcc::solve_region(SIDE, SIDE, 0);
+        let region1 = PyramidalEcc::solve_region(SIDE / 2, SIDE / 2, 1);
+        assert_eq!((pixels(region0), pixels(region1)), (36_864, 9_216));
 
         let shift = (0.4, -0.3);
-        let mem = reader(BIG_W, BIG_H, &[(0.0, 0.0), shift], false);
-        let stack = StackContext::new(2, BIG_W, BIG_H, 1);
+        let mem = reader(SIDE, SIDE, &[(0.0, 0.0), shift], false);
+        let stack = StackContext::new(2, SIDE, SIDE, 1);
         let config = |policy: &str| {
             let mut cfg = crate::params::resolved_values(
                 &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack)
@@ -2903,11 +2908,19 @@ mod tests {
         };
 
         let plain = run("anchor", None);
-        let declining = RecordingBackend::new(false);
-        assert_eq!(run("anchor", Some(&declining)), plain);
-        assert_eq!(declining.offered(), vec![region0]);
+        let shipped = RecordingBackend::new(false);
+        run("anchor", Some(&shipped));
+        assert_eq!(shipped.offered(), vec![], "the default threshold is 1e6 px");
 
-        let accepting = RecordingBackend::new(true);
+        let at_the_boundary = RecordingBackend::new(false).with_min_region_px(pixels(region0));
+        assert_eq!(run("anchor", Some(&at_the_boundary)), plain);
+        assert_eq!(at_the_boundary.offered(), vec![region0]);
+
+        let one_above = RecordingBackend::new(false).with_min_region_px(pixels(region0) + 1);
+        assert_eq!(run("anchor", Some(&one_above)), plain);
+        assert_eq!(one_above.offered(), vec![]);
+
+        let accepting = RecordingBackend::new(true).with_min_region_px(pixels(region0));
         let chained = run("chain", Some(&accepting));
         assert_eq!(accepting.offered(), vec![region0]);
         let m = chained.frames[1].transform.m;
@@ -2915,8 +2928,11 @@ mod tests {
         assert!((m[1][2] - shift.1).abs() < 0.05, "y {}", m[1][2]);
     }
 
-    /// Opens sessions whose first `moments` call reports a lost device.
-    struct LosingBackend;
+    /// Opens sessions whose first `moments` call reports a lost device; asks
+    /// for regions of at least `min_region_px` pixels.
+    struct LosingBackend {
+        min_region_px: u64,
+    }
 
     struct LostSession;
 
@@ -2929,6 +2945,10 @@ mod tests {
     }
 
     impl AlignBackend for LosingBackend {
+        fn min_ecc_region_px(&self) -> u64 {
+            self.min_region_px
+        }
+
         fn open_ecc(
             &self,
             _request: &EccSessionRequest<'_>,
@@ -2939,11 +2959,10 @@ mod tests {
 
     #[test]
     fn align_stage_reruns_on_cpu_after_a_backend_loss() {
-        const BIG_W: u32 = 1700;
-        const BIG_H: u32 = 1100;
+        const SIDE: u32 = 256;
         let shifts = [(0.0, 0.0), (0.6, -0.2), (-0.35, 0.45)];
-        let mem = reader(BIG_W, BIG_H, &shifts, false);
-        let stack = StackContext::new(3, BIG_W, BIG_H, 1);
+        let mem = reader(SIDE, SIDE, &shifts, false);
+        let stack = StackContext::new(3, SIDE, SIDE, 1);
         let mut cfg = crate::params::resolved_values(
             &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
         );
@@ -2975,14 +2994,14 @@ mod tests {
         assert_eq!(plain.rerun_reason, None);
 
         let done = Arc::new(AtomicUsize::new(0));
-        let rerun = run(Some(&LosingBackend), &done);
+        let rerun = run(Some(&LosingBackend { min_region_px: 1 }), &done);
         assert_eq!(rerun.alignment, plain.alignment);
         assert!(!rerun.backend_used);
         let reason = rerun.rerun_reason.expect("the loss is reported");
         assert!(reason.contains("the device was lost"), "{reason}");
         assert_eq!(done.load(Ordering::SeqCst), stack.frame_count);
 
-        let accepting = RecordingBackend::new(true);
+        let accepting = RecordingBackend::new(true).with_min_region_px(1);
         let accepted = run(Some(&accepting), &Arc::new(AtomicUsize::new(0)));
         assert!(accepted.backend_used);
         assert_eq!(accepted.rerun_reason, None);

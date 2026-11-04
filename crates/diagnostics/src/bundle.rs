@@ -959,6 +959,17 @@ mod tests {
         assert_eq!(entry["input_map"]["exists"], true);
     }
 
+    /// This machine's host name, or `None` when `hostname` cannot be run or
+    /// prints nothing.
+    fn this_hosts_name() -> Option<String> {
+        let output = std::process::Command::new("hostname").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let name = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+        (!name.is_empty()).then_some(name)
+    }
+
     #[test]
     fn the_system_entry_carries_this_host_and_never_its_name() {
         let root = tempfile::tempdir().unwrap();
@@ -966,13 +977,24 @@ mod tests {
         let out = root.path().join("bundle.zip");
         write(&manifest, &out, false, &Redaction::default()).unwrap();
 
-        let system: serde_json::Value =
-            serde_json::from_str(&archive_text(&out, "system.json")).unwrap();
+        let text = archive_text(&out, "system.json");
+        let system: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(system["total_memory"].as_u64().unwrap() > 0);
         assert!(system["logical_cores"].as_u64().unwrap() >= 1);
         assert_eq!(system["facts_origin"], "Probed");
         assert_eq!(system["os"], std::env::consts::OS);
         assert!(system.get("host_name").is_none());
+
+        match this_hosts_name() {
+            None => println!("SKIP host-name assertion: no host name is readable"),
+            Some(name) if name == std::env::consts::OS => {
+                println!("SKIP host-name assertion: the host name {name:?} equals the OS name");
+            }
+            Some(name) => assert!(
+                !text.contains(&name),
+                "system.json carries this host's name {name:?}: {text}"
+            ),
+        }
     }
 
     #[test]

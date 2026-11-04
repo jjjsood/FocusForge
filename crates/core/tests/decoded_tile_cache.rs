@@ -473,9 +473,8 @@ fn uniformity_mismatches_and_unsupported_codecs_are_typed() {
         .join("mantis-64-lzw-p1-strip-ii")
         .join("frames")
         .join("00.tif");
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let scratch = workspace.join(".scratch/decoded-cache-tests");
-    std::fs::create_dir_all(&scratch).unwrap();
+    let temp = common::target_tmp();
+    let scratch = temp.path();
     for (tag, value) in [(256, 63_u32), (257, 63), (277, 1), (262, 0), (284, 2)] {
         let path = scratch.join(format!("uniform-mismatch-{tag}.tif"));
         let mut bytes = std::fs::read(&source).unwrap();
@@ -516,9 +515,8 @@ fn first_differing_bit_depth_is_a_typed_frame_mismatch() {
         .join("mantis-64-lzw-p1-strip-ii")
         .join("frames")
         .join("00.tif");
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let scratch = workspace.join(".scratch/decoded-cache-tests");
-    std::fs::create_dir_all(&scratch).unwrap();
+    let temp = common::target_tmp();
+    let scratch = temp.path();
     let mismatch = scratch.join("uniform-mismatch-bits-per-sample.tif");
     let mut bytes = std::fs::read(&source).unwrap();
     patch_tag_value(&mut bytes, 258, 8);
@@ -728,9 +726,8 @@ fn boundary_errors_release_waiters() {
         .join("mantis-64-deflate-p1-strip-ii")
         .join("frames")
         .join("00.tif");
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let scratch = workspace.join(".scratch/decoded-cache-tests");
-    std::fs::create_dir_all(&scratch).unwrap();
+    let temp = common::target_tmp();
+    let scratch = temp.path();
     let malformed = scratch.join("malformed-last-segment.tif");
     let mut bytes = std::fs::read(&source).unwrap();
     bytes.pop();

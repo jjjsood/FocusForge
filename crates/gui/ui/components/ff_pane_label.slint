@@ -6,18 +6,17 @@ import { ShellGeometry } from "../geometry.slint";
 export component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
 
-    width: ShellGeometry.pane-label-width;
+    width: max(ShellGeometry.pane-label-width, label-text.preferred-width + 2 * Theme.space-2);
     height: ShellGeometry.pane-label-height;
     background: Theme.surface-overlay;
     border-radius: Theme.radius-sm;
 
-    Text {
+    label-text := Text {
         text: root.label;
         color: Theme.text-primary;
         font-size: Theme.text-body.size;
         font-weight: Theme.text-body.weight;
         horizontal-alignment: center;
         vertical-alignment: center;
-        overflow: elide;
     }
 }

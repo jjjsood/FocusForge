@@ -13,8 +13,12 @@ repository = "https://github.com/jjjsood/FocusForge"
 [profile.dev]
 debug = "line-tables-only"
 
+# Dependencies build optimised; workspace crates keep the dev default, so
+# product code stays debuggable. The full nextest run takes about 345 s
+# instead of 572 s, and a clean build costs the same.
 [profile.dev.package."*"]
 debug = false
+opt-level = 2
 
 # Installers retain this same-build information only long enough for the
 # platform packagers to extract native symbols.  Shipping copies are stripped.
@@ -34,3 +38,6 @@ minidump-writer = { path = "vendor/minidump-writer" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[workspace.lints.clippy]
+ignore_without_reason = "deny"

@@ -23,7 +23,9 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
+use crate::display::{PreviewCost, PreviewFeed, PreviewKinds, StagePreview};
 use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
+use crate::fuse::consumer::written_rect;
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
@@ -221,6 +223,9 @@ pub struct FuseReport {
     pub develop_counts: Option<Vec<u64>>,
     pub wall_seconds: f64,
     pub metrics: Metrics,
+    /// The time spent building and delivering each preview kind; zero when
+    /// the observer asked for none.
+    pub preview_cost: PreviewCost,
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
@@ -321,6 +326,20 @@ pub trait StageObserver: Sync {
     fn frame_notice(&self, _frame: usize, message: &str) {
         self.notice(message);
     }
+    /// Which preview images this observer wants. Nothing by default, and a
+    /// run that is asked for nothing builds no preview state.
+    fn preview_kinds(&self) -> PreviewKinds {
+        PreviewKinds::default()
+    }
+    /// A preview image of a kind [`Self::preview_kinds`] asked for: at most
+    /// one per kind per poll interval, from the same poll thread as
+    /// [`Self::tick`], never from a worker thread.
+    fn preview(&self, _preview: &StagePreview) {}
+    /// Called once, right after the fuse stage starts, with the kinds
+    /// [`Self::preview_kinds`] asked for that the run cannot supply (the
+    /// stacking algorithm offers no sharpness plane), so a front end can drop
+    /// that view before the first tile.
+    fn preview_unavailable(&self, _kinds: PreviewKinds) {}
 }
 
 /// The tail of the [`StageObserver::notice`] raised when the align stage
@@ -739,6 +758,8 @@ pub fn run(
 
     timer.mark(Stage::Setup);
 
+    let wanted_kinds = observer.preview_kinds();
+    let feed = PreviewFeed::new(wanted_kinds, (width, height));
     let mut alignment_result: Option<(
         &'static dyn AlignAlgorithm,
         ResolvedParams,
@@ -850,6 +871,9 @@ pub fn run(
                                 continue;
                             }
                             observer.tick(&control.progress());
+                            if let Some(feed) = &feed {
+                                feed.deliver(|preview| observer.preview(preview));
+                            }
                             if !warned && control.state() == ControlState::CancelRequested {
                                 observer.notice(
                                     "cancel requested -- stopping alignment once the frames \
@@ -857,6 +881,9 @@ pub fn run(
                                 );
                                 warned = true;
                             }
+                        }
+                        if let Some(feed) = &feed {
+                            feed.deliver(|preview| observer.preview(preview));
                         }
                     });
                     let result = align_stack_with(
@@ -875,6 +902,7 @@ pub fn run(
                                 control.add_align_hold(held.elapsed());
                             }),
                             align_backend: request.align_backend,
+                            preview: feed.as_ref().and_then(PreviewFeed::aligned_sink),
                         },
                     );
                     done.store(true, Ordering::SeqCst);
@@ -942,6 +970,24 @@ pub fn run(
         ));
     }
     let applied_crop = if request.crop { crop_rect_value } else { None };
+    let output_extent = applied_crop.unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    });
+    let mosaic = feed
+        .as_ref()
+        .and_then(|feed| feed.begin_composite(output_extent, spp));
+    let heat_scale = wanted_kinds
+        .heat
+        .then(|| request.algorithm.heat_scale(&values, spp))
+        .flatten();
+    let heat = heat_scale.and_then(|max_score| {
+        let mosaic = feed.as_ref()?.begin_heat(output_extent)?;
+        Some((mosaic, max_score))
+    });
+    let heat_unavailable = wanted_kinds.heat && heat_scale.is_none();
 
     let description =
         alignment_result
@@ -993,6 +1039,16 @@ pub fn run(
         None => &warping_reader,
     };
     let scheduler = TileScheduler::new(reader, stack_ctx, spp, &options)?;
+    if let Some(feed) = &feed {
+        feed.set_tiles(
+            scheduler
+                .plan()
+                .tiles()
+                .iter()
+                .filter_map(|tile| written_rect(tile.interior(), applied_crop))
+                .collect(),
+        );
+    }
 
     let staging = request
         .scratch_root
@@ -1113,6 +1169,8 @@ pub fn run(
         }
     };
 
+    let sink = sink.with_preview(mosaic, heat);
+
     control.set_stage(JobStage::Fuse);
     // `Job::with_control` is what credits `control` with the plan's real
     // unit/pixel totals (and any already-completed units on a resume);
@@ -1125,6 +1183,12 @@ pub fn run(
         Arc::clone(&control),
     );
     observer.stage(RunStage::Fuse);
+    if heat_unavailable {
+        observer.preview_unavailable(PreviewKinds {
+            heat: true,
+            ..PreviewKinds::default()
+        });
+    }
 
     let backend_consumer = backend.map(|b| {
         BackendFusionConsumer::new(
@@ -1146,7 +1210,14 @@ pub fn run(
         ledger: &ledger,
     };
 
-    let outcome = match drive_job(&mut job, &control, &recording, observer, request.poll) {
+    let outcome = match drive_job(
+        &mut job,
+        &control,
+        &recording,
+        observer,
+        request.poll,
+        feed.as_ref(),
+    ) {
         Ok(outcome) => outcome,
         Err(err) => {
             cleanup_staging(&staging);
@@ -1314,6 +1385,7 @@ pub fn run(
         develop_counts: frame_reader.develop_counts(),
         wall_seconds,
         metrics,
+        preview_cost: feed.as_ref().map(PreviewFeed::cost).unwrap_or_default(),
     })))
 }
 
@@ -1343,9 +1415,10 @@ fn drive_job(
     consumer: &dyn TileConsumer,
     observer: &dyn StageObserver,
     poll: Duration,
+    feed: Option<&PreviewFeed>,
 ) -> Result<JobOutcome, TileError> {
     loop {
-        let outcome = run_segment(job, control, consumer, poll, observer)?;
+        let outcome = run_segment(job, control, consumer, poll, observer, feed)?;
         match outcome {
             JobOutcome::Completed | JobOutcome::Cancelled => return Ok(outcome),
             JobOutcome::Paused => {
@@ -1367,6 +1440,7 @@ fn run_segment(
     consumer: &dyn TileConsumer,
     poll: Duration,
     observer: &dyn StageObserver,
+    feed: Option<&PreviewFeed>,
 ) -> Result<JobOutcome, TileError> {
     // Span context does not cross onto the segment thread by itself: the
     // stage span current here is captured and re-entered there, so every
@@ -1383,6 +1457,13 @@ fn run_segment(
             }
             std::thread::sleep(poll);
             observer.tick(&control.progress());
+            if let Some(feed) = feed {
+                feed.deliver(|preview| observer.preview(preview));
+            }
+        }
+        // The last tiles land between the final poll and the job ending.
+        if let Some(feed) = feed {
+            feed.deliver(|preview| observer.preview(preview));
         }
         handle.join().expect("job segment thread must not panic")
     })

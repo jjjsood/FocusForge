@@ -7,8 +7,8 @@
 //! No display server and no GPU: `i_slint_backend_testing::init_no_event_loop()`
 //! simulates a windowing system without one and renders no pixels. The
 //! backend is per-thread and a second `init` on the same thread is an error,
-//! so every test reaches the probe through [`probe`], which guards the
-//! `init` call behind a `thread_local!`.
+//! so every test reaches the probe through [`probe`], which installs the
+//! backend with the shared per-thread guard.
 
 mod common;
 
@@ -17,18 +17,10 @@ use std::fs;
 use focusforge_gui::{Theme, ThemeProbe};
 use slint::{Color, Global};
 
-/// A headless `ThemeProbe` instance; the `thread_local!` guard makes a
-/// repeat call on the same thread safe.
+/// A headless `ThemeProbe` instance; the shared per-thread backend guard
+/// makes a repeat call on the same thread safe.
 fn probe() -> ThemeProbe {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     ThemeProbe::new().unwrap()
 }
 
@@ -398,4 +390,31 @@ fn every_component_is_on_the_component_sheet() {
         missing.is_empty(),
         "not on the component sheet: {missing:?}"
     );
+}
+
+/// `(motion-fast, motion-slow, flash-hold)` in milliseconds.
+fn motion_tokens(theme: &Theme<'_>) -> (i64, i64, i64) {
+    (
+        theme.get_motion_fast(),
+        theme.get_motion_slow(),
+        theme.get_flash_hold(),
+    )
+}
+
+#[test]
+fn motion_tokens_are_zero_with_reduced_motion() {
+    let probe = probe();
+    let theme = Theme::get(&probe);
+    assert!(!theme.get_reduce_motion());
+    assert_eq!(motion_tokens(&theme), (150, 400, 150));
+
+    theme.set_reduce_motion(true);
+    assert_eq!(
+        motion_tokens(&theme),
+        (0, 0, 150),
+        "reduced motion zeroes the fades and keeps the flash hold"
+    );
+
+    theme.set_reduce_motion(false);
+    assert_eq!(motion_tokens(&theme), (150, 400, 150));
 }

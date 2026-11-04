@@ -47,22 +47,25 @@ fn appearance_presentation_loads_defaults_and_round_trips_saved_choice() {
         appearance_settings::load(dir.path()),
         AppearanceSettings {
             presentation: SourcePresentation::List,
+            ..AppearanceSettings::default()
         }
     );
     appearance_settings::save(
         dir.path(),
         AppearanceSettings {
             presentation: SourcePresentation::Large,
+            ..AppearanceSettings::default()
         },
     )
     .unwrap();
     let saved = fs::read_to_string(path).unwrap();
     assert!(saved.contains("[recent]\nkeep = \"yes\""));
-    assert!(saved.contains("[appearance]\npresentation = \"large\""));
+    assert!(saved.contains("[appearance]\npresentation = \"large\"\nsharpness_heatmap = true"));
     assert_eq!(
         appearance_settings::load(dir.path()),
         AppearanceSettings {
             presentation: SourcePresentation::Large,
+            ..AppearanceSettings::default()
         },
         "the saved appearance choice survives a fresh load"
     );
@@ -278,6 +281,7 @@ fn unparseable_file_is_never_overwritten() {
                 dir.path(),
                 AppearanceSettings {
                     presentation: SourcePresentation::Large,
+                    ..AppearanceSettings::default()
                 },
             )
             .is_err()
@@ -323,6 +327,7 @@ fn non_utf8_file_is_never_overwritten() {
             dir.path(),
             AppearanceSettings {
                 presentation: SourcePresentation::Large,
+                ..AppearanceSettings::default()
             },
         )
         .is_err()

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::common::target_tmp;
 use crate::raw_dng::{DngSpec, write_dng};
 
 #[test]
@@ -609,7 +610,7 @@ fn sigma_pin_rejects_a_replaced_fixture() {
 
 /// Prints how far scratch reads of whole corpus frames fall from cached reads.
 #[test]
-#[ignore]
+#[ignore = "measurement: prints the scratch-versus-cached read error of corpus frames; needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn raw_scratch_error_on_corpus_frames() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -692,7 +693,7 @@ fn raw_scratch_error_on_corpus_frames() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn canon_dummy_metadata_has_no_pixel_buffer() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -721,7 +722,7 @@ fn canon_dummy_metadata_has_no_pixel_buffer() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn canon_develops_after_lazy_open() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -750,7 +751,7 @@ fn canon_develops_after_lazy_open() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_LOCAL_SAMPLES corpus"]
 fn local_canon_cr3_smoke() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_LOCAL_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_LOCAL_SAMPLES is not set");
@@ -816,7 +817,7 @@ fn local_canon_cr3_smoke() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn supported_corpus_dummy_metadata_has_no_pixel_buffers() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -844,7 +845,7 @@ fn supported_corpus_dummy_metadata_has_no_pixel_buffers() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn corpus_matches_manifest() {
     let (Some(samples), Some(expectations)) = (
         std::env::var_os("FOCUSFORGE_RAW_SAMPLES"),
@@ -1775,10 +1776,8 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
         .expect("parameters resolve");
     let values = params::resolved_values(&resolved);
 
-    let out_dir = common::workspace_root()
-        .join(".scratch")
-        .join("raw-f32-stack");
-    std::fs::create_dir_all(&out_dir).expect("output dir");
+    let temp = target_tmp();
+    let out_dir = temp.path();
     let composite = out_dir.join(format!("{label}.tif"));
     let mut options = TileSchedulerOptions::explicit_budget(out_dir.join(label), 1 << 30);
     options.apply_support(algo.tile_support(&values));
@@ -1946,10 +1945,6 @@ fn copies_of(dng: &tempfile::NamedTempFile, count: usize, dir: &Path) -> Vec<Pat
             path
         })
         .collect()
-}
-
-fn target_tmp() -> tempfile::TempDir {
-    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temporary directory")
 }
 
 struct NoopObserver;

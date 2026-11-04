@@ -1919,6 +1919,10 @@ mod tests {
         )
         .expect("valid solver inputs");
         assert_eq!(a.status, EccStatus::HitCap, "run A: {a:?}");
+        assert_eq!(
+            a.iterations, base_params.max_iterations,
+            "the cap is honoured exactly: {a:?}"
+        );
         let s = a.final_step.expect("HitCap always reports a final_step");
         eprintln!("hit_cap_reports_its_final_step: max_iterations=2 final_step={s}");
 

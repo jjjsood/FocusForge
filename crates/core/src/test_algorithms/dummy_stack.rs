@@ -110,6 +110,7 @@ impl StackAlgorithm for DummyStack {
                 samples,
             },
             zmap,
+            sharpness: None,
         })
     }
 }

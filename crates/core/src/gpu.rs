@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
 use crate::align::warp::WarpedTile;
-use crate::align::{AlignError, Transform};
+use crate::align::{AlignError, ECC_BACKEND_MIN_REGION_PX, Transform};
 use crate::tile::{Rect, SampleFormat, Tile};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
@@ -220,6 +220,12 @@ pub trait EccMomentSession: Send {
 /// An optional accelerator for the ECC alignment solver. Object-safe and
 /// `Send + Sync` for the same reason as [`TileBackend`].
 pub trait AlignBackend: Send + Sync {
+    /// The fewest solve-region pixels at which a level is worth handing to
+    /// this backend; a smaller level runs on the CPU without being offered.
+    fn min_ecc_region_px(&self) -> u64 {
+        ECC_BACKEND_MIN_REGION_PX
+    }
+
     /// Opens a session for one level, or `Ok(None)` to decline it, in which
     /// case the level runs on the CPU. An error fails the whole alignment.
     fn open_ecc(

@@ -147,8 +147,10 @@ Finish the entry, or empty the field, and the outline goes away.
 
 ## Appearance
 
-**Appearance** has one setting, **Presentation**, under SOURCE IMAGES. It
-chooses how the [Images panel](images-panel.md) shows the frames of a stack:
+**Appearance** has three settings: **Presentation** under SOURCE IMAGES,
+**Sharpness heatmap**, and **Reduce motion** under MOTION. The tab scrolls
+when its content is taller than the window. **Presentation** chooses how the
+[Images panel](images-panel.md) shows the frames of a stack:
 
 | Choice | Shows |
 | --- | --- |
@@ -167,8 +169,14 @@ version, and in the editor the frame rows can be looked at but not changed.
 What each presentation looks like is shown in
 [The Images panel](images-panel.md).
 
-The choice is saved in the `[appearance]` table of the settings file and
-used at every start. If it cannot be saved, the section shows the reason and
+**Sharpness heatmap** (on by default) shows the sharpness inset in the
+Composite pane while a run fuses; see [The window](gui.md). **Reduce motion**
+makes every transition instant: the projects overview, the settings window
+and its sections, dialogs, toasts, the mode switch and the Composite pane's
+crossfades.
+
+The choices are saved in the `[appearance]` table of the settings file and
+used at every start. If one cannot be saved, the section shows the reason and
 "The selected view is active for this session.": the new view stays until you
 quit, and the next start uses the one saved before.
 
@@ -410,7 +418,7 @@ file is in TOML format, one table per topic:
 | Table | Holds | Changed by |
 | --- | --- | --- |
 | `[recent]` | the projects in the RECENT list of the Projects overview, up to five, each with its `path` | opening and saving projects |
-| `[appearance]` | `presentation = "list"`, `"image-list"` or `"large"` | [Appearance](#appearance) |
+| `[appearance]` | `presentation = "list"`, `"image-list"` or `"large"`, `sharpness_heatmap = true` or `false`, `reduce_motion = true` or `false` | [Appearance](#appearance) |
 | `[input]` | the key and mouse bindings | editing by hand, see [Rebind a gesture](#rebind-a-gesture) |
 | `[export]` | the export dialog's last format and its settings | [Exporting an image](export.md) |
 | `[performance]` | `gpu = true` or `false`, and the optional size strings `max-host-memory` and `max-vram` | [Performance](#performance) |
