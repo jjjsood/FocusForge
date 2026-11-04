@@ -202,7 +202,7 @@ fn calculator_button_toggles_the_overlay() {
 
 #[test]
 fn calculator_readout_matches_the_cli_plan() {
-    // Defaults: the Lens board's values, in the CLI's text format.
+    // Defaults for the lens optics, in the CLI's text format.
     let mut calculator = Calculator::new();
     assert_eq!(*calculator.plan(), core_plan(&[]));
     let view = calculator.view();
