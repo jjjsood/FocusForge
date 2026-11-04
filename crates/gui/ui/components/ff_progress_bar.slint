@@ -40,6 +40,6 @@ export component FFProgressBar inherits Rectangle {
         x: root.indeterminate ? (root.sweep-right ? parent.width - self.width : 0px) : 0px;
 
         animate x { duration: 900ms; easing: ease-in-out; }
-        animate width { duration: 150ms; }
+        animate width { duration: Theme.motion-fast; easing: ease-out; }
     }
 }

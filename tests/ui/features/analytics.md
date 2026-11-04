@@ -8,4 +8,4 @@ Gotchas:
 - With the hold flag every opening shows the waiting caption for the hold time; a step that reads rows says `(within 60 s)`.
 - Not covered by the journey: the failed state (a frame deleted after the folder was opened, reachable only by deleting a file during the hold), a list taller than the body with its scrollbar (needs a stack of more frames than fits, none is checked in, and the wheel is a human-only input), and the editor mode. Check them by hand with a copy of a fixture under `.scratch/`.
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
-Guides: 21-analytics.md
+Guides: 22-analytics.md

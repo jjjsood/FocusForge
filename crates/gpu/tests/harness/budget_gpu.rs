@@ -26,18 +26,9 @@ use focusforge_gpu::budget::device_bytes_per_tile;
 use focusforge_gpu::device::SharedDevice;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
 
-use crate::common;
+use crate::common::{self, non_identity_transforms};
 
 const LEVELS: u32 = 5;
-
-/// The whole-pipeline parity test's mild non-identity transform, so the
-/// warp stage sits inside the measured path.
-fn non_identity_transforms(frame_count: usize) -> Vec<Transform> {
-    let t = Transform::similarity(1.005, 0.0075, 0.4, -0.25);
-    (0..frame_count)
-        .map(|i| if i == 0 { Transform::identity() } else { t })
-        .collect()
-}
 
 type TileKey = (u32, u32, u32, u32);
 type TileOutputSamples = (Vec<u16>, Vec<u16>);

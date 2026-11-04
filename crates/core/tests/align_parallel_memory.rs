@@ -16,6 +16,8 @@
 
 mod common;
 
+use common::align::{open_stack_context, resolved_defaults};
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +28,7 @@ use focusforge_core::align::{
     bytes_shared_reference,
 };
 use focusforge_core::io::TiffStack;
-use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
+use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, Rect};
 
@@ -86,12 +88,6 @@ fn peak_since_reset() -> usize {
 
 /// Serializes memory-measuring tests in this binary against each other.
 static SERIAL: Mutex<()> = Mutex::new(());
-
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    params::resolved_values(&resolved)
-}
 
 /// The worker budget genuinely bounds live heap, not merely divides a
 /// number on paper: a 1x-`bytes_per_registration` budget runs the anchor arm
@@ -192,19 +188,6 @@ fn peak_live_heap_tracks_the_worker_budget() {
     );
 }
 
-fn open_fixture(name: &str) -> (TiffStack, StackContext) {
-    let stack = TiffStack::open(common::fixtures_dir().join(name))
-        .unwrap_or_else(|err| panic!("{name} must open: {err}"));
-    let (width, height) = stack.dimensions();
-    let ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
-    (stack, ctx)
-}
-
 fn config(ctx: &StackContext, mode: &str, policy: &str) -> ParamValues {
     let mut cfg = resolved_defaults(ctx);
     cfg.insert("mode".to_string(), ParamValue::Enum(mode.to_string()));
@@ -223,7 +206,7 @@ fn config(ctx: &StackContext, mode: &str, policy: &str) -> ParamValues {
 fn retained_heap_after_prepare_run_matches_the_shared_figure() {
     let _guard = SERIAL.lock().unwrap();
     for name in ["mantis-512", "mantis-64"] {
-        let (stack, ctx) = open_fixture(name);
+        let (stack, ctx) = open_stack_context(name);
         let shared = bytes_shared_reference(ctx);
         for mode in ["translation", "rotation-scale"] {
             let cfg = config(&ctx, mode, "anchor");
@@ -252,8 +235,25 @@ fn retained_heap_after_prepare_run_matches_the_shared_figure() {
 #[test]
 fn serial_peak_stays_within_shared_plus_one_registration() {
     let _guard = SERIAL.lock().unwrap();
-    for name in ["mantis-512", "mantis-64"] {
-        let (stack, ctx) = open_fixture(name);
+    // Three 512 px frames keep the geometry the accounted figure depends on
+    // while each configuration registers two frames.
+    let frames_512: Vec<_> = ["02", "03", "04"]
+        .iter()
+        .map(|name| common::mantis_512_dir().join(format!("frames/{name}.tif")))
+        .collect();
+    let stack_512 = TiffStack::open_files(&frames_512).expect("opening three mantis-512 frames");
+    let (width, height) = stack_512.dimensions();
+    let ctx_512 = StackContext::new(
+        stack_512.len(),
+        width,
+        height,
+        stack_512.header(0).samples_per_pixel,
+    );
+    let (stack_64, ctx_64) = open_stack_context("mantis-64");
+    for (name, stack, ctx) in [
+        ("mantis-512", stack_512, ctx_512),
+        ("mantis-64", stack_64, ctx_64),
+    ] {
         let accounted =
             bytes_shared_reference(ctx) + bytes_per_registration(ctx, DEFAULT_TILE_SIZE);
         for mode in ["translation", "rotation-scale"] {

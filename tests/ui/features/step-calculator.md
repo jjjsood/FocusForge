@@ -8,4 +8,4 @@ Gotchas:
 - Calculated values keep the last valid plan while a box holds a violation; the ENTERED row shows the last valid value too.
 - The illustration (planes, leader lines, inset, dimension marks) is judged by eye and is `(human only)`.
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
-Guides: 20-step-calculator.md
+Guides: 21-step-calculator.md

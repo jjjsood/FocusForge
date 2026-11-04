@@ -50,6 +50,7 @@ use crate::align::Transform;
 use crate::align::ecc_algorithm::{
     retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
 };
+use crate::display::preview::AlignedFrameSink;
 use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
 use crate::job::{ControlState, JobControl};
 use crate::params::{ParamValue, ParamValues, StackContext};
@@ -173,6 +174,9 @@ pub struct AlignDriverOptions<'a> {
     /// An accelerator the registration may offer its large solves to; `None`
     /// solves everything on the CPU.
     pub align_backend: Option<&'a dyn AlignBackend>,
+    /// Receives each non-reference frame's final transform as its
+    /// registration completes; `None` records nothing.
+    pub preview: Option<&'a AlignedFrameSink>,
 }
 
 impl Default for AlignDriverOptions<'_> {
@@ -183,6 +187,7 @@ impl Default for AlignDriverOptions<'_> {
             control: None,
             on_pause: None,
             align_backend: None,
+            preview: None,
         }
     }
 }
@@ -337,6 +342,13 @@ fn credit_frame_done(counter: Option<&AtomicUsize>) {
     }
 }
 
+/// Tells the preview sink, if any, that `frame` registered with `transform`.
+fn record_preview(options: &AlignDriverOptions<'_>, frame: usize, transform: Transform) {
+    if let Some(sink) = options.preview {
+        sink.complete(frame, transform);
+    }
+}
+
 /// The frame-boundary check every registration site in every arm makes
 /// before it starts: [`AlgorithmError::Cancelled`] once `options.control`
 /// reads `CancelRequested`; a hold, calling `options.on_pause` and
@@ -439,8 +451,9 @@ fn run_chain_leg(
     let mut prefix = Transform::identity();
     for i in indices {
         wait_at_boundary(options)?;
-        let ctx =
-            AlignContext::new(stack, previous, reader).with_align_backend(options.align_backend);
+        let ctx = AlignContext::new(stack, previous, reader)
+            .with_align_backend(options.align_backend)
+            .with_preview(options.preview);
         let outcome = algorithm.align_frame(&ctx, i, cfg)?;
         let diverged = matches!(outcome.status, AlignStatus::Diverged(_));
         let fallback = diverged && failure == FailurePolicy::IdentityFallback;
@@ -458,6 +471,7 @@ fn run_chain_leg(
             residual: outcome.residual,
             fallback,
         });
+        record_preview(options, i, composed);
         credit_frame_done(options.frames_done.as_deref());
         prefix = composed;
         previous = i;
@@ -570,6 +584,7 @@ fn rebound<'a>(
         control: options.control.clone(),
         on_pause: options.on_pause,
         align_backend: backend,
+        preview: options.preview,
     }
 }
 
@@ -580,6 +595,10 @@ struct CountingBackend<'a> {
 }
 
 impl AlignBackend for CountingBackend<'_> {
+    fn min_ecc_region_px(&self) -> u64 {
+        self.inner.min_ecc_region_px()
+    }
+
     fn open_ecc(
         &self,
         request: &EccSessionRequest<'_>,
@@ -644,7 +663,8 @@ fn align_stack_once(
             // `Arc` binding lives in this stack frame and drops when this
             // function returns.
             let ctx = AlignContext::new(stack, reference, reader)
-                .with_align_backend(options.align_backend);
+                .with_align_backend(options.align_backend)
+                .with_preview(options.preview);
             let prepared = {
                 let _prepare = measurement_scope("align_prepare");
                 algorithm.prepare_run(&ctx, cfg)?
@@ -662,7 +682,9 @@ fn align_stack_once(
                     wait_at_boundary(options)?;
                     let _solve = measurement_scope("align_solve");
                     let outcome = algorithm.align_frame(&ctx, i, cfg)?;
-                    *slot = Some(anchored_alignment(i, outcome, failure));
+                    let alignment = anchored_alignment(i, outcome, failure);
+                    record_preview(options, i, alignment.transform);
+                    *slot = Some(alignment);
                     credit_frame_done(options.frames_done.as_deref());
                 }
                 (1, 1)
@@ -729,6 +751,9 @@ fn align_stack_once(
                                                 |outcome| anchored_alignment(i, outcome, failure),
                                             );
                                             live.fetch_sub(1, Ordering::SeqCst);
+                                            if let Ok(alignment) = &result {
+                                                record_preview(options, i, alignment.transform);
+                                            }
                                             credit_frame_done(options.frames_done.as_deref());
                                             Some(result)
                                         }
@@ -1247,7 +1272,7 @@ mod tests {
             budget: HostBudget::host_derived(&facts),
             ..Default::default()
         };
-        align_stack_with(
+        let run = align_stack_with(
             &ConstAlign,
             anchor_stack(),
             &NullReader,
@@ -1256,6 +1281,8 @@ mod tests {
             &options,
         )
         .expect("the budget covers the shared term and one registration");
+        assert_eq!(run.alignment.frames.len(), 4);
+        assert_eq!(run.alignment.failure_count(), 0);
     }
 
     #[test]

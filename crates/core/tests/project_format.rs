@@ -219,20 +219,40 @@ fn container_layout_is_exactly_the_named_entries() {
     }
 }
 
+fn manifest_value(path: &Path) -> serde_json::Value {
+    let bytes = Index::read(path)
+        .unwrap()
+        .read_entry(path, "manifest.json")
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 #[test]
 fn manifest_carries_no_format_version() {
     let (_dir, project_path) = sealed("project_format_no_version");
-    let bytes = Index::read(&project_path)
-        .unwrap()
-        .read_entry(&project_path, "manifest.json")
-        .unwrap();
-    let text = String::from_utf8(bytes).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let value = manifest_value(&project_path);
     assert!(
         value.get("format_version").is_none(),
-        "the manifest must carry no version key: {text}"
+        "the sealed manifest must carry no version key: {value}"
     );
     assert_eq!(value["hash_algorithm"], serde_json::json!(HASH_ALGORITHM));
+
+    project::append_ops(
+        &project_path,
+        vec![Op::BrushStroke {
+            source_id: 0,
+            path: vec![Point { x: 1, y: 1 }],
+            radius: 2.0,
+            softness: 0.5,
+        }],
+        None,
+    )
+    .unwrap();
+    let saved = manifest_value(&project_path);
+    assert!(
+        saved.get("format_version").is_none(),
+        "a saved manifest must carry no version key: {saved}"
+    );
 }
 
 #[test]
@@ -670,6 +690,135 @@ fn registration_missing_from_the_manifest_is_refused() {
     assert!(
         text.contains("manifest.json") && text.contains("registration"),
         "the refusal must name the manifest and the field: {text}"
+    );
+}
+
+/// A copy of a sealed project whose manifest is edited as a JSON value.
+fn with_manifest(
+    src: &Path,
+    name: &str,
+    edit: impl Fn(&mut serde_json::Map<String, serde_json::Value>),
+) -> PathBuf {
+    let dst = src.with_extension(format!("{name}.ffp"));
+    rewrite_entry(src, &dst, "manifest.json", |bytes| {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        edit(value.as_object_mut().unwrap());
+        serde_json::to_vec_pretty(&value).unwrap()
+    });
+    dst
+}
+
+fn open_err(path: &Path) -> project::ProjectError {
+    match Project::open(path) {
+        Ok(_) => panic!("{} must be refused", path.display()),
+        Err(err) => err,
+    }
+}
+
+#[test]
+fn newer_format_version_is_refused() {
+    let (_dir, project_path) = sealed("project_format_newer");
+    for found in [2u32, 7] {
+        let newer = with_manifest(&project_path, &format!("v{found}"), |m| {
+            m.insert("format_version".into(), serde_json::json!(found));
+        });
+        let err = open_err(&newer);
+        assert!(
+            matches!(
+                &err,
+                project::ProjectError::NewerFormat { found: f, supported: 1, .. } if *f == found
+            ),
+            "expected NewerFormat for version {found}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: saved by a newer FocusForge (project format {found}; this build reads up to 1). Update FocusForge to open it.",
+                newer.display()
+            )
+        );
+    }
+}
+
+#[test]
+fn newer_format_version_is_refused_before_the_manifest_is_decoded() {
+    let (_dir, project_path) = sealed("project_format_newer_undecodable");
+    let newer = with_manifest(&project_path, "v2-no-registration", |m| {
+        m.insert("format_version".into(), serde_json::json!(2));
+        m.remove("registration")
+            .expect("the sealed manifest must carry a registration key to remove");
+    });
+    let err = open_err(&newer);
+    assert!(
+        matches!(&err, project::ProjectError::NewerFormat { found: 2, .. }),
+        "expected NewerFormat, not a parse error: {err:?}"
+    );
+}
+
+#[test]
+fn format_version_absent_or_current_opens() {
+    let (_dir, project_path) = sealed("project_format_version_current");
+    let head = Project::open(&project_path)
+        .unwrap()
+        .manifest()
+        .checkpoint
+        .clone();
+    let cases = [
+        ("absent", None),
+        ("one", Some(serde_json::json!(1))),
+        ("zero", Some(serde_json::json!(0))),
+        ("null", Some(serde_json::Value::Null)),
+    ];
+    for (name, version) in cases {
+        let copy = with_manifest(&project_path, name, |m| {
+            if let Some(v) = &version {
+                m.insert("format_version".into(), v.clone());
+            }
+        });
+        let opened = Project::open(&copy).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(opened.manifest().checkpoint, head, "{name}: head differs");
+    }
+}
+
+#[test]
+fn malformed_format_version_is_refused() {
+    let (_dir, project_path) = sealed("project_format_version_malformed");
+    let bad = [
+        ("string", serde_json::json!("2")),
+        ("negative", serde_json::json!(-1)),
+        ("fraction", serde_json::json!(2.5)),
+    ];
+    for (name, version) in bad {
+        let copy = with_manifest(&project_path, name, |m| {
+            m.insert("format_version".into(), version.clone());
+        });
+        let err = open_err(&copy);
+        assert!(
+            matches!(&err, project::ProjectError::Container { .. }),
+            "{name}: expected a container error: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("manifest.json") && text.contains("format_version"),
+            "{name}: the refusal must name the manifest and the field: {text}"
+        );
+    }
+
+    let truncated = project_path.with_extension("truncated.ffp");
+    rewrite_entry(&project_path, &truncated, "manifest.json", |bytes| {
+        bytes[..bytes.len() / 2].to_vec()
+    });
+    let err = open_err(&truncated);
+    assert!(
+        matches!(&err, project::ProjectError::Container { .. }),
+        "expected a container error: {err:?}"
+    );
+    let text = err
+        .to_string()
+        .replace(&truncated.display().to_string(), "");
+    assert!(
+        text.contains("manifest.json") && !text.contains("format_version"),
+        "a syntax error must not name the field: {text}"
     );
 }
 

@@ -2,36 +2,36 @@
 Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 ## The gallery with two fresh projects
 1. Click **Projects** (`FFTabStrip::projects-button`).
-   Expect: the overlay (`AppWindow::projects-overlay`) covers the window below the tab strip, with the left rail entries "New project", "Open project…", "Save project", "Close project" and "RECENT" (no row under it), the gallery heading "Open projects" and the count "2 open"; the first card's second line reads "3 frames · no checkpoint yet", the second card's reads "8 frames · no checkpoint yet", both carry an "UNSAVED" chip, and no card is headed "Cancelled".
+   Expect: the overlay (`AppWindow::projects-overlay`) covers the window below the tab strip, with the left rail entries "New project", "Open project…", "Save project", "Close project" and "RECENT" (no row under it), the gallery heading "Open projects" and the count "2 open"; the first card's second line reads "3 frames · no checkpoint yet", the second card's reads "8 frames · no checkpoint yet", both carry an "UNSAVED" chip, and no card is headed "Cancelled" (within 1 s).
 ## Switch between the two projects
 2. Click the first card (`FFProjectCard::card-area` 0).
-   Expect: the overlay is gone and the dock header reads "3 frames · 0 excluded".
+   Expect: the overlay is gone and the dock header reads "3 frames · 0 excluded" (within 1 s).
 3. Click **Projects** (`FFTabStrip::projects-button`).
-   Expect: the "CURRENT" chip is on the "3 frames" card and not on the "8 frames" card.
+   Expect: the "CURRENT" chip is on the "3 frames" card and not on the "8 frames" card (within 1 s).
 4. Click the second card (`FFProjectCard::card-area` 1).
-   Expect: the overlay is gone and the dock header reads "8 frames · 0 excluded".
+   Expect: the overlay is gone and the dock header reads "8 frames · 0 excluded" (within 1 s).
 5. Click **Projects** (`FFTabStrip::projects-button`).
-   Expect: the "CURRENT" chip is now on the "8 frames" card and not on the "3 frames" card.
+   Expect: the "CURRENT" chip is now on the "8 frames" card and not on the "3 frames" card (within 1 s).
 6. Click **Projects** (`FFTabStrip::projects-button`) again.
-   Expect: the overlay is gone and the dock header still reads "8 frames · 0 excluded".
+   Expect: the overlay is gone and the dock header still reads "8 frames · 0 excluded" (within 1 s).
 7. Click the first tab (`FFTab::area` 0).
    Expect: the dock header reads "3 frames · 0 excluded" and the tab strip shows two tabs titled "frames".
 ## Fuse the 3-frame project and read its unsaved card
 8. Click **Fuse stack** (`FFToolbar::fuse-button`).
    Expect: (within 60 s) a dialog titled "Keep this fused result?" is on screen.
 9. Click **Keep** (`AppWindow::divergence-warning`).
-   Expect: the dialog is gone and the bottom bar reads "fused" followed by a time.
+   Expect: the dialog is gone and the bottom bar reads "fused" followed by a time (within 1 s).
 10. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the first card's second line reads "3 frames · 1 checkpoint" and the card carries an "UNSAVED" chip and a "CURRENT" chip; the second card still reads "8 frames · no checkpoint yet" and has no "CURRENT" chip.
+    Expect: the first card's second line reads "3 frames · 1 checkpoint" and the card carries an "UNSAVED" chip and a "CURRENT" chip; the second card still reads "8 frames · no checkpoint yet" and has no "CURRENT" chip (within 1 s).
 11. Click **Projects** (`FFTabStrip::projects-button`) again.
-    Expect: the overlay is gone and the tab strip shows two tabs titled "frames", each with an "UNSAVED" marker.
+    Expect: the overlay is gone and the tab strip shows two tabs titled "frames", each with an "UNSAVED" marker (within 1 s).
 12. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the rail shows "New project" with "Ctrl+N", "Open project…" with "Ctrl+O", "Save project" with "Ctrl+S" and "Close project" with "Ctrl+W", and the count reads "2 open".
+    Expect: the rail shows "New project" with "Ctrl+N", "Open project…" with "Ctrl+O", "Save project" with "Ctrl+S" and "Close project" with "Ctrl+W", and the count reads "2 open" (within 1 s).
 ## Close projects with and without unsaved work
 13. Click the close glyph of the first tab (`FFTab::close-area` 0).
     Expect: Must not: the project closes at once; a dialog titled "Save this state first?" shows the line "Closing frames" and the text "1 unsaved checkpoint.", and the count behind it still reads "2 open".
 14. Click **Cancel** (`AppWindow::close-guard`).
-    Expect: the dialog is gone and the count still reads "2 open".
+    Expect: the dialog is gone and the count still reads "2 open" (within 1 s).
 15. Click the close glyph of the second tab (`FFTab::close-area` 1).
     Expect: Must not: a dialog appears; the project closes at once, the count reads "1 open" and only the card "3 frames · 1 checkpoint" is left, carrying the "CURRENT" chip.
 ## Save, close and reopen from RECENT
@@ -42,7 +42,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 18. Click the RECENT row "frames" (`FFProjectsRail::recent-row` 0).
     Expect: (within 30 s) the overlay is gone and the tab strip shows one tab titled "frames" with no "UNSAVED" marker.
 19. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the count reads "1 open" and the one card reads "3 frames · 1 checkpoint" with the "CURRENT" chip and no "UNSAVED" chip.
+    Expect: the count reads "1 open" and the one card reads "3 frames · 1 checkpoint" with the "CURRENT" chip and no "UNSAVED" chip (within 1 s).
 20. Hover the remaining card (`FFProjectCard::card-area` 0).
     Expect: `buttons AppWindow::projects-overlay` lists **Close** with id `FFProjectCard::close`; no dialog is shown and the count reads "1 open".
 21. Click **Close** (`FFProjectCard::close`).
@@ -55,10 +55,10 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 24. (human only) Click **Open project…** (`FFProjectsRail::open-project`), then cancel the file chooser that opens.
     Expect: the overlay stays open and still shows "No projects open".
 25. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overlay is gone; the canvas shows the title "No project open" and a button "Open…".
+    Expect: the overlay is gone; the canvas shows the title "No project open" and a button "Open…" (within 1 s).
 26. Click **Fuse stack** (`FFToolbar::fuse-button`) with no project open.
     Expect: Must not: a job starts; the bottom bar status reads "No project open" and **Fuse stack** is greyed out (read with `buttons AppWindow::toolbar`: its line starts with `x`).
 27. Click **Export image** (`FFCheckpointPanel::checkpoint-export`) with no project open.
     Expect: Must not: an "Export image" dialog opens; **Export image** is greyed out (read with `buttons FFDock::checkpoint-panel`: its line starts with `x`).
 28. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the gallery heading reads "Open projects" with the count "0 open", the centred text "No projects open" is shown, no card is listed and one row "frames" sits under "RECENT" in the rail.
+    Expect: the gallery heading reads "Open projects" with the count "0 open", the centred text "No projects open" is shown, no card is listed and one row "frames" sits under "RECENT" in the rail (within 1 s).

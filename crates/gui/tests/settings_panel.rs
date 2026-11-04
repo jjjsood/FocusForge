@@ -899,15 +899,7 @@ fn layout_survives_a_long_label() {
     use i_slint_backend_testing::ElementQuery;
     use slint::{ComponentHandle, Model as _};
 
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
 
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
@@ -972,18 +964,6 @@ fn panel_scrolls_and_the_heading_sticks() {
     );
 }
 
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn mounted(app: &focusforge_gui::AppWindow, id: &str) -> i_slint_backend_testing::ElementHandle {
     i_slint_backend_testing::ElementQuery::from_root(app)
         .match_id(id)
@@ -1038,7 +1018,7 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     }
 
     enable_trace_accounting();
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -1220,7 +1200,7 @@ fn a_slider_drag_survives_a_panel_push() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -1279,25 +1259,34 @@ fn a_slider_drag_survives_a_panel_push() {
 }
 
 #[test]
-fn scrollbar_is_a_shared_primitive() {
-    let contents = fs::read_to_string(
-        common::ui_dir()
-            .join("components")
-            .join("ff_scrollbar.slint"),
-    )
-    .unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("export component").count(),
-        1,
-        "ff_scrollbar.slint must export exactly one component"
-    );
-    assert!(code.contains("export component FFScrollbar"));
-    for shell_import in ["shell/", "\"../shell"] {
-        assert!(
-            !code.contains(shell_import),
-            "a primitive must import no shell file"
+fn scrollbar_and_more_toggle_are_shared_primitives() {
+    for (file, component, forbids_colour_literal) in [
+        ("ff_scrollbar.slint", "FFScrollbar", false),
+        ("ff_more_toggle.slint", "FFMoreToggle", true),
+    ] {
+        let contents = fs::read_to_string(common::ui_dir().join("components").join(file)).unwrap();
+        let code = common::strip_line_comments(&contents);
+        assert_eq!(
+            code.matches("export component").count(),
+            1,
+            "{file} must export exactly one component"
         );
+        assert!(
+            code.contains(&format!("export component {component}")),
+            "{file} must export {component}"
+        );
+        for shell_import in ["shell/", "\"../shell"] {
+            assert!(
+                !code.contains(shell_import),
+                "{file}: a primitive must import no shell file"
+            );
+        }
+        if forbids_colour_literal {
+            assert!(
+                !code.contains('#'),
+                "{file}: a primitive holds no colour literal"
+            );
+        }
     }
 }
 
@@ -1334,30 +1323,15 @@ fn auto_crop_defaults_on_and_is_a_reversible_flag() {
     );
 }
 
-/// `job_running()` is currently hardcoded `false`, with no way to drive a
-/// real job; what matters here is the wiring from one bool to the *whole*
-/// panel -- opacity and the scroll/click hit-area together, not a per-field
-/// disable -- so the property is driven directly instead.
+/// The panel's disable is one bool for the *whole* panel -- opacity and the
+/// scroll/click hit-area together, not a per-field disable -- so the property
+/// is driven directly on the window.
 #[test]
 fn panel_disable_is_whole_panel() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    let controller = AppController::new();
-    assert!(
-        !controller.job_running(),
-        "job_running must read false with no job running -- the panel reads it as a whole-panel disable"
-    );
-
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -1729,30 +1703,6 @@ fn schema_ids(method: &str) -> Vec<String> {
         .iter()
         .map(|d| d.id.clone())
         .collect()
-}
-
-#[test]
-fn more_toggle_is_a_shared_primitive() {
-    let contents = fs::read_to_string(
-        common::ui_dir()
-            .join("components")
-            .join("ff_more_toggle.slint"),
-    )
-    .unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("export component").count(),
-        1,
-        "ff_more_toggle.slint must export exactly one component"
-    );
-    assert!(code.contains("export component FFMoreToggle"));
-    for shell_import in ["shell/", "\"../shell"] {
-        assert!(
-            !code.contains(shell_import),
-            "a primitive must import no shell file"
-        );
-    }
-    assert!(!code.contains('#'), "a primitive holds no colour literal");
 }
 
 #[test]
@@ -2316,7 +2266,7 @@ impl MountedPanel {
         use slint::ComponentHandle;
         use std::sync::{Arc, Mutex};
 
-        init_window_backend();
+        common::init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
         // Tall enough that every strip stays inside the panel's viewport with
         // the Prepare and Fuse sections open: a strip below the viewport's edge
@@ -2543,7 +2493,7 @@ fn reset_all_and_switches_report_their_state() {
     use i_slint_backend_testing::{AccessibleRole, ElementQuery};
     use slint::{ComponentHandle, Model as _};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     // Tall enough that no row is clipped out of the panel's viewport, where
     // an element query does not look.
@@ -2826,7 +2776,7 @@ fn keyboard_step_moves_the_target_by_one_step_and_clamps() {
 
 #[test]
 fn the_panel_is_disabled_without_a_project() {
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     let mut controller = AppController::new();
     focusforge_gui::bridge::push_settings_panel(&app, &controller);

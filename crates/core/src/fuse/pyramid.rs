@@ -986,7 +986,6 @@ mod tests {
 
     #[test]
     fn stated_margin_matches_the_measurement() {
-        let started = std::time::Instant::now();
         let mut computed = [0u32; MEASURED_MARGIN.len()];
         for n in 0..=7u32 {
             computed[n as usize] = measure_margin(n);
@@ -999,7 +998,6 @@ mod tests {
             MEASURED_MARGIN, computed,
             "MEASURED_MARGIN must equal the freshly measured margin at every level"
         );
-        let _elapsed = started.elapsed();
     }
 
     #[test]
@@ -1076,15 +1074,37 @@ mod tests {
         );
     }
 
+    /// A seeded xorshift32 generator, distinct instance per call so each test
+    /// buffer is independently reproducible.
+    fn seeded_noise(len: usize, seed: u32) -> Vec<u16> {
+        let mut rng = XorShift32(seed);
+        (0..len).map(|_| (rng.next() % 65536) as u16).collect()
+    }
+
+    #[test]
+    fn channels_build_and_collapse_independently() {
+        let (side, levels, spp) = (32u32, 3u32, 3usize);
+        let samples = seeded_noise(side as usize * side as usize * spp, 0xBEEF);
+        let three = build(&samples, side, side, spp as u32, levels).unwrap();
+        let mut three_out = vec![0u16; samples.len()];
+        collapse_into(&three, &mut three_out).unwrap();
+        for c in 0..spp {
+            let channel: Vec<u16> = samples.iter().skip(c).step_by(spp).copied().collect();
+            let one = build(&channel, side, side, 1, levels).unwrap();
+            for (k, (plane3, plane1)) in three.levels().iter().zip(one.levels()).enumerate() {
+                let from_three: Vec<f32> =
+                    plane3.data().iter().skip(c).step_by(spp).copied().collect();
+                assert_eq!(from_three, plane1.data(), "channel {c}, level {k}");
+            }
+            let mut one_out = vec![0u16; channel.len()];
+            collapse_into(&one, &mut one_out).unwrap();
+            let from_three: Vec<u16> = three_out.iter().skip(c).step_by(spp).copied().collect();
+            assert_eq!(from_three, one_out, "channel {c}, collapsed");
+        }
+    }
+
     #[test]
     fn interior_is_margin_independent() {
-        /// A seeded xorshift32 generator, distinct instance per call so
-        /// each test buffer is independently reproducible.
-        fn seeded_noise(len: usize, seed: u32) -> Vec<u16> {
-            let mut rng = XorShift32(seed);
-            (0..len).map(|_| (rng.next() % 65536) as u16).collect()
-        }
-
         for &n in &[3u32, 7u32] {
             let margin = MEASURED_MARGIN[n as usize];
             // The band of maximally-different content sits immediately
@@ -1099,7 +1119,7 @@ mod tests {
             // inset is exactly `2 * margin`, the number at which the
             // <= 1 LSB criterion actually holds.
             let side = (4 * margin + 64).max(4 << n);
-            let spp = 3u32;
+            let spp = 1u32;
             let len = side as usize * side as usize * spp as usize;
 
             // `a`: seeded noise plus a step edge crossing the window
@@ -1136,9 +1156,12 @@ mod tests {
                 }
             }
 
+            let pyramid_a = build(&a, side, side, spp, n).unwrap();
+            let pyramid_b = build(&b, side, side, spp, n).unwrap();
+
             for &scale_laplacians in &[false, true] {
-                let run = |samples: &[u16]| -> Vec<u16> {
-                    let mut pyramid = build(samples, side, side, spp, n).unwrap();
+                let run = |built: &Pyramid| -> Vec<u16> {
+                    let mut pyramid = built.clone();
                     if scale_laplacians {
                         for k in 0..pyramid.level_count() {
                             for v in pyramid.level_mut(k).data_mut() {
@@ -1161,8 +1184,8 @@ mod tests {
                     }
                 };
 
-                let out_a = run(&a);
-                let out_b = run(&b);
+                let out_a = run(&pyramid_a);
+                let out_b = run(&pyramid_b);
 
                 for y in assert_inset..(assert_inset + assert_window) {
                     for x in assert_inset..(assert_inset + assert_window) {

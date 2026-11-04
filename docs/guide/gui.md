@@ -105,6 +105,18 @@ is reused from an earlier run, the bar reads "from cache" for that stage. A fail
 a toast naming which step it failed at — setup, alignment or fusion —
 rather than a generic failure message.
 
+While a run is live, the **Composite** pane shows what it is doing instead
+of the "Not fused yet" card: "Preparing frames" while frames are developed
+and aligned, "Alignment reused" when the cached alignment serves, then the
+aligned frame and the result growing tile by tile with its tile grid. A
+sharpness inset shows where each frame is sharp as the result grows; it
+fades out two seconds after the last tile, and the finished result
+crossfades in. Pause keeps the view, **Cancel** returns the pane to "Not
+fused yet", and **Discard** removes the run's view along with its result.
+Each tab keeps its own view, and a Composite pane in its own window shows
+the same card. The inset is switched off in Settings > Appearance >
+**Sharpness heatmap**.
+
 If the graphics device the window is using disappears (a driver reset, a
 GPU unplugged), the canvas stops updating and the window closes itself a
 moment later rather than hanging; see
@@ -285,7 +297,12 @@ which has six tabs:
 - **Appearance** chooses how the **Images** panel presents the source frames:
   **List**, **Image list** (the default) or **Large previews**. The latter two
   show a preview of each original source image beside its name. The choice is
-  saved in the `[appearance]` table of `settings.toml`.
+  saved in the `[appearance]` table of `settings.toml`. **Sharpness heatmap**
+  (on by default) shows the sharpness inset while a run fuses. Under
+  **MOTION**, **Reduce motion** makes every transition instant: the
+  projects overview, the settings window and its sections, dialogs, toasts,
+  the mode switch and the Composite pane's crossfades. The tab scrolls when
+  its content is taller than the window.
 - **Storage** lists where the settings file, the logs, the crash reports and
   the scratch directory live, and marks one that does not exist yet. **Clear
   cache** deletes the cached fuse stages.
@@ -315,7 +332,8 @@ such as `alt+wheel`. Alt is not a wheel modifier; it is only the pipette.
 `settings.toml` in the platform's per-user config directory holds
 everything the window remembers, one table per concern: `[recent]` (the
 rail's recent projects, up to five, each row needing its `path`), `[appearance]`
-(`presentation = "list"|"image-list"|"large"`), `[input]`
+(`presentation = "list"|"image-list"|"large"`, `sharpness_heatmap = true|false`,
+`reduce_motion = true|false`), `[input]`
 (the bindings above), `[export]` (the export dialog's last choice) and
 `[performance]` (`gpu = true|false`, and optional `max-host-memory` and
 `max-vram` size strings, as set on the Performance tab). The

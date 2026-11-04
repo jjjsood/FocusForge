@@ -9,6 +9,7 @@
 //! `TilePlan::new` rather than guessed.
 
 use focusforge_core::algorithm::{StackAlgorithm, TileCtx, TileOutput, TileReader};
+use focusforge_core::display::{heat8, heat16};
 use focusforge_core::fuse::laplacian::{EligibleMasks, Laplacian, score_plane, score_radius};
 use focusforge_core::fuse::pyramid::{self, Plane};
 use focusforge_core::gpu::TileBackend;
@@ -264,10 +265,8 @@ fn score_plane_matches_cpu() {
 /// (`Laplacian::fuse(&TileCtx::new(rect, &tiles), cfg)`) against the GPU
 /// result (`GpuBackend::fuse_tile`), both at the same `(rect, levels)`.
 struct Comparison {
-    cpu_composite: Vec<u16>,
-    gpu_composite: Vec<u16>,
-    cpu_zmap: Vec<u16>,
-    gpu_zmap: Vec<u16>,
+    cpu: TileOutput<u16>,
+    gpu: TileOutput<u16>,
     tiles: Vec<Tile>,
     rect: Rect,
     spp: u32,
@@ -283,18 +282,16 @@ fn run_comparison(rect: Rect, levels: u32) -> Comparison {
     let ctx = TileCtx::new(rect, &tiles);
     let mut cfg = ParamValues::new();
     cfg.insert("levels".to_string(), ParamValue::Int(levels as i64));
-    let cpu_out = Laplacian.fuse(&ctx, &cfg).expect("cpu fuse");
+    let cpu = Laplacian.fuse(&ctx, &cfg).expect("cpu fuse");
 
     let backend = gpu_backend().expect("gpu backend");
-    let gpu_out = backend
+    let gpu = backend
         .fuse_tile(&stack, frame_count, rect, spp, levels)
         .expect("gpu fuse_tile");
 
     Comparison {
-        cpu_composite: cpu_out.tile.samples,
-        gpu_composite: gpu_out.tile.samples,
-        cpu_zmap: cpu_out.zmap,
-        gpu_zmap: gpu_out.zmap,
+        cpu,
+        gpu,
         tiles,
         rect,
         spp,
@@ -302,85 +299,26 @@ fn run_comparison(rect: Rect, levels: u32) -> Comparison {
     }
 }
 
-/// For a Z-Map pixel where the GPU and CPU disagree: the CPU's own
-/// level-0 winning and runner-up scores at that pixel, recomputed from
-/// every frame's own pyramid.
-fn near_tie_margin(cmp: &Comparison, pixel: usize) -> (f32, f32) {
-    let radius = score_radius(cmp.levels, 0);
-    let mut scores: Vec<f32> = cmp
-        .tiles
-        .iter()
-        .map(|tile| {
-            let pyr = pyramid::build(
-                &tile.samples,
-                cmp.rect.width,
-                cmp.rect.height,
-                cmp.spp,
-                cmp.levels,
-            )
-            .expect("build");
-            score_plane(&pyr.levels()[0], radius)[pixel]
-        })
-        .collect();
-    scores.sort_by(|a, b| b.partial_cmp(a).expect("scores are always finite"));
-    (scores[0], scores[1])
-}
-
-fn assert_zmap_exact_or_near_tie(cmp: &Comparison) {
-    let mut differing = 0usize;
-    for (p, (&g, &c)) in cmp.gpu_zmap.iter().zip(cmp.cpu_zmap.iter()).enumerate() {
-        if g == c {
-            continue;
-        }
-        differing += 1;
-        let (best, runner_up) = near_tie_margin(cmp, p);
-        let bound = NEAR_TIE_REL * best;
-        println!(
-            "zmap parity: pixel {p} differs (gpu={g}, cpu={c}), cpu margin={} bound={bound}",
-            best - runner_up
-        );
+impl Comparison {
+    /// Every composite sample within 1 LSB, and a Z-Map equal to the CPU's
+    /// except at proven near-ties between the two best frames.
+    fn assert_within_one_lsb_and_zmap_near_ties(&self, label: &str) {
+        let (worst, worst_index) = worst_delta(&self.gpu.tile.samples, &self.cpu.tile.samples);
+        println!("{label} composite parity: worst |delta|={worst} at sample index {worst_index}");
         assert!(
-            best - runner_up <= bound,
-            "pixel {p} differs (gpu={g}, cpu={c}) but is not a proven near-tie: \
-             best={best} runner_up={runner_up} bound={bound}"
+            worst <= 1,
+            "{label} composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
+        );
+        assert_matches_cpu_outside_near_ties(
+            label,
+            &self.cpu,
+            &self.gpu,
+            &tile_samples(&self.tiles),
+            self.rect,
+            self.spp,
+            self.levels,
         );
     }
-    println!("zmap parity: {differing} differing index(es), all proven near-ties");
-}
-
-#[test]
-fn composite_matches_cpu_within_one_lsb() {
-    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
-        return;
-    };
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width: 352,
-        height: 352,
-    };
-    let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
-    println!("composite parity: worst |delta|={worst} at sample index {worst_index}");
-    assert!(
-        worst <= 1,
-        "composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
-    );
-}
-
-#[test]
-fn zmap_matches_cpu_exactly() {
-    let Some(_shared) = focusforge_gpu::device::shared_device_or_skip() else {
-        return;
-    };
-    let rect = Rect {
-        x: 0,
-        y: 0,
-        width: 352,
-        height: 352,
-    };
-    let cmp = run_comparison(rect, 5);
-    assert_zmap_exact_or_near_tie(&cmp);
 }
 
 #[test]
@@ -396,14 +334,7 @@ fn overlap_edge_tile_matches_cpu() {
         width: 352,
         height: 352,
     };
-    let cmp = run_comparison(rect, 5);
-    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
-    println!("overlap-edge composite parity: worst |delta|={worst} at sample index {worst_index}");
-    assert!(
-        worst <= 1,
-        "overlap-edge composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
-    );
-    assert_zmap_exact_or_near_tie(&cmp);
+    run_comparison(rect, 5).assert_within_one_lsb_and_zmap_near_ties("overlap-edge");
 }
 
 /// Whole frames held in memory, each `width` pixels wide at `spp` samples.
@@ -634,14 +565,7 @@ fn interior_tile_matches_cpu() {
         width: 200,
         height: 200,
     };
-    let cmp = run_comparison(rect, 3);
-    let (worst, worst_index) = worst_delta(&cmp.gpu_composite, &cmp.cpu_composite);
-    println!("interior composite parity: worst |delta|={worst} at sample index {worst_index}");
-    assert!(
-        worst <= 1,
-        "interior composite parity exceeded 1 LSB: worst={worst} at index {worst_index}"
-    );
-    assert_zmap_exact_or_near_tie(&cmp);
+    run_comparison(rect, 3).assert_within_one_lsb_and_zmap_near_ties("interior");
 }
 
 /// Frames 0, 2, 4, 5 and 7 of `mantis-512`, cropped to a non-square
@@ -788,4 +712,120 @@ fn masked_fuse_with_full_coverage_matches_unmasked() {
     let masked = run(&full);
     assert_eq!(masked.tile.samples, unmasked.tile.samples);
     assert_eq!(masked.zmap, unmasked.zmap);
+}
+
+/// The 8-bit heat of every pixel of `output`'s sharpness plane.
+fn heat_bytes(output: &TileOutput, max_score: f64) -> Vec<u8> {
+    let sharpness = output
+        .sharpness
+        .as_ref()
+        .expect("laplacian supplies a score plane");
+    (0..output.zmap.len())
+        .map(|pixel| heat8(heat16(sharpness.score(pixel), max_score)))
+        .collect()
+}
+
+/// Per-pixel heat of the GPU's score plane against the CPU twin's: the worst
+/// difference, which must be at most one, and how many pixels are cold.
+fn assert_heat_matches(label: &str, cpu: &TileOutput, gpu: &TileOutput, spp: u32, levels: u32) {
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let max_score = Laplacian
+        .heat_scale(&cfg, spp)
+        .expect("laplacian has a heat scale");
+    let (cpu_heat, gpu_heat) = (heat_bytes(cpu, max_score), heat_bytes(gpu, max_score));
+    let worst = cpu_heat
+        .iter()
+        .zip(&gpu_heat)
+        .map(|(&c, &g)| c.abs_diff(g))
+        .max()
+        .expect("a non-empty tile");
+    let cold = cpu_heat.iter().filter(|&&h| h == 0).count();
+    println!(
+        "{label} heat parity: worst |delta|={worst} over {} pixels, {cold} cold, hottest cpu={} gpu={}",
+        cpu_heat.len(),
+        cpu_heat.iter().max().unwrap(),
+        gpu_heat.iter().max().unwrap()
+    );
+    assert!(worst <= 1, "{label}: heat parity exceeded 1: worst={worst}");
+}
+
+#[test]
+fn sharpness_heatmap_parity() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    // A true-interior rect and the border-clamped tile-0 rect of the golden geometry.
+    for (label, rect, levels) in [
+        (
+            "interior",
+            Rect {
+                x: 128,
+                y: 128,
+                width: 200,
+                height: 200,
+            },
+            3u32,
+        ),
+        (
+            "golden tile 0",
+            Rect {
+                x: 0,
+                y: 0,
+                width: 352,
+                height: 352,
+            },
+            5,
+        ),
+    ] {
+        let stack = open_stack();
+        let spp = stack.header(0).samples_per_pixel;
+        let tiles = read_all_frames(&stack, rect, spp);
+        let mut cfg = ParamValues::new();
+        cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+        let cpu = Laplacian
+            .fuse(&TileCtx::new(rect, &tiles), &cfg)
+            .expect("cpu fuse");
+        let gpu = gpu_backend()
+            .expect("gpu backend")
+            .fuse_tile(&stack, stack.len(), rect, spp, levels)
+            .expect("gpu fuse_tile");
+        assert_heat_matches(label, &cpu, &gpu, spp, levels);
+    }
+
+    let (reader, rect, coverage) = masked_case();
+    let (spp, levels, frame_count) = (reader.spp, 5u32, reader.frames.len());
+    let tiles = read_in_memory_tiles(&reader, frame_count, rect, spp);
+    let mut cfg = ParamValues::new();
+    cfg.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let cpu = Laplacian
+        .fuse(&TileCtx::new(rect, &tiles).with_coverage(&coverage), &cfg)
+        .expect("cpu fuse");
+    let gpu = fuse_tile_gpu(
+        shared,
+        &reader,
+        &FusionPipelines::new(),
+        frame_count,
+        rect,
+        spp,
+        levels,
+        &coverage,
+    )
+    .expect("gpu fuse_tile_gpu");
+    let uncovered = cpu.zmap.iter().filter(|&&z| z == NO_SOURCE).count();
+    assert!(
+        uncovered > 0,
+        "the corner block must leave pixels without a source"
+    );
+    for (pixel, &z) in cpu.zmap.iter().enumerate() {
+        if z == NO_SOURCE {
+            let score = gpu.sharpness.as_ref().expect("a score plane").score(pixel);
+            assert_eq!(
+                score,
+                f64::NEG_INFINITY,
+                "pixel {pixel} has no eligible frame"
+            );
+        }
+    }
+    assert_heat_matches("masked", &cpu, &gpu, spp, levels);
 }

@@ -17,15 +17,7 @@ use slint::ComponentHandle;
 /// otherwise reports 800 x 600 until set (`i-slint-backend-testing`
 /// 1.17.1's `TestingWindow`).
 fn app_at(width: u32, height: u32) -> AppWindow {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window()
         .set_size(slint::PhysicalSize::new(width, height));
@@ -1303,19 +1295,20 @@ fn input_map_rows_stay_inside_the_content_area() {
     }
 }
 
-/// Under the Projects overview a failure shows no toast and stays unread,
-/// and the closed toast never blocks a click on the card underneath it.
+/// A failure raised under the Projects overview shows no toast and stays
+/// unread, and the toast it leaves closed never blocks a click on the card
+/// underneath it.
 #[test]
-fn projects_suppresses_a_failure_toast_and_keeps_it_unread() {
+fn a_suppressed_toast_never_blocks_a_card_click() {
     let mut controller = common::controller_with_frames("shell_projects_failure", 3);
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_projects_overlay();
     assert!(controller.start_fuse());
+    let refused = controller
+        .add_frames(&[common::fixture_frame("mantis-64", 0)])
+        .expect_err("a running job refuses an add");
     assert!(
-        controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
-            .is_err(),
-        "a running job refuses an add"
+        matches!(refused, focusforge_gui::entry::ImportRefused::JobRunning),
+        "{refused:?}"
     );
     common::wait_for_settle(&mut controller, std::time::Duration::from_secs(60));
     let controller: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
@@ -2999,7 +2992,7 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         .unwrap()
         .install_recent(Vec::new(), config_dir);
 
-    let app = app_at(1200, 760);
+    let app = app_at(1200, 900);
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
@@ -3041,6 +3034,22 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         })
         .find_first()
         .expect("the source-rows note precedes the save failure");
+    let tab = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_type_name("FFAppearanceTab")
+        .find_first()
+        .expect("the Appearance tab is mounted");
+    let tab_pos = tab.absolute_position();
+    let tab_size = tab.size();
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(
+                tab_pos.x + tab_size.width / 2.0,
+                tab_pos.y + tab_size.height / 2.0,
+            ),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
     let session_note = ElementQuery::from_root(&app)
         .match_descendants()
         .match_accessible_role(AccessibleRole::Text)
@@ -3051,6 +3060,11 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         })
         .find_first()
         .expect("the session note follows the save failure");
+    assert!(
+        session_note.absolute_position().y + session_note.size().height
+            <= tab_pos.y + tab_size.height,
+        "the scrolled tab shows the session note inside its visible area"
+    );
     let error_pos = error.absolute_position();
     let error_size = error.size();
     assert!(
@@ -3071,7 +3085,6 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
 
 mod notification {
     use super::*;
-    use focusforge_core::params::ParamValue;
     use focusforge_gui::notifications::Kind;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::cell::RefCell;
@@ -3176,15 +3189,15 @@ mod notification {
     /// settled afterwards: one failure record per refusal. The first toast is
     /// held while the run settles, so a slow settle cannot expire it.
     fn controller_with_refusals(name: &str, refusals: usize) -> AppController {
-        let mut controller = common::controller_with_frames(name, 4);
-        controller.set_align_algorithm("dummy-align");
+        let mut controller = common::controller_with_frames(name, 3);
         assert!(controller.start_fuse());
         for _ in 0..refusals {
+            let refused = controller
+                .add_frames(&[common::fixture_frame("mantis-64", 0)])
+                .expect_err("a running job refuses an add");
             assert!(
-                controller
-                    .add_frames(&[common::fixture_frame("mantis-64", 4)])
-                    .is_err(),
-                "a running job refuses an add"
+                matches!(refused, focusforge_gui::entry::ImportRefused::JobRunning),
+                "{refused:?}"
             );
             controller.hold_toast(true);
         }
@@ -3456,14 +3469,7 @@ mod notification {
 
     #[test]
     fn a_brightness_row_names_the_frame_file() {
-        let mut controller = common::controller_with_frames("shell_brightness_row", 4);
-        controller.set_align_algorithm("dummy-align");
-        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
-        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
-        controller.toggle_frame_excluded(0);
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let controller = common::every_frame_clamps("shell_brightness_row", Some(0));
         let project = controller.notifications()[0]
             .project_title
             .clone()
@@ -3491,10 +3497,10 @@ mod notification {
             .collect();
         assert_eq!(
             contexts.len(),
-            3,
+            2,
             "the excluded frame is not part of the run"
         );
-        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif", "03.tif"]) {
+        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif"]) {
             assert!(
                 context.starts_with(&format!("{project} · {file}")),
                 "{context:?} names {file}"
@@ -3946,7 +3952,6 @@ mod dialog_close {
     fn export_close_button_cancels_a_running_write() {
         let app = app_at(1440, 900);
         let mut fused = common::controller_with_frames("export_close_writing", 2);
-        fused.set_align_algorithm("dummy-align");
         assert!(fused.start_fuse());
         while common::wait_for_settle(&mut fused, std::time::Duration::from_secs(60)).is_some() {}
         assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
@@ -4127,7 +4132,6 @@ mod dialog_escape {
     /// open in the controller and pushed to the window.
     fn fused_export_rig(name: &str) -> Rig {
         let mut fused = common::controller_with_frames(name, 2);
-        fused.set_align_algorithm("dummy-align");
         assert!(fused.start_fuse());
         while common::wait_for_settle(&mut fused, Duration::from_secs(60)).is_some() {}
         assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
@@ -4384,6 +4388,362 @@ mod dialog_escape {
                 "Ctrl+S reaches canvas-key-pressed, saw {:?}",
                 seen.borrow()
             );
+        }
+    }
+}
+
+mod fading_overlays {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use focusforge_gui::{AppWindow, ProjectCardView, Theme};
+    use i_slint_backend_testing::{ElementHandle, ElementQuery};
+    use slint::platform::{Key, WindowEvent};
+    use slint::{ComponentHandle, Global};
+
+    use super::app_at;
+
+    fn advance(ms: u64) {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(ms));
+    }
+
+    fn click(app: &AppWindow, element: &ElementHandle) {
+        let (at, size) = (element.absolute_position(), element.size());
+        let position =
+            slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+        for event in [
+            slint::platform::WindowEvent::PointerPressed {
+                position,
+                button: slint::platform::PointerEventButton::Left,
+            },
+            slint::platform::WindowEvent::PointerReleased {
+                position,
+                button: slint::platform::PointerEventButton::Left,
+            },
+        ] {
+            app.window().dispatch_event(event);
+        }
+    }
+
+    /// One overlay under test: how it opens, the elements a click would
+    /// trigger, the count of callbacks those clicks fire and the fade length.
+    struct Overlay {
+        name: &'static str,
+        set_open: Box<dyn Fn(bool)>,
+        targets: Vec<ElementHandle>,
+        fired: Rc<Cell<u32>>,
+        fade_ms: u64,
+    }
+
+    impl Overlay {
+        /// What a user sees of the overlay: the opacity its first target
+        /// renders with, the product of its parents' fades.
+        fn opacity(&self) -> f32 {
+            self.targets[0].computed_opacity()
+        }
+
+        /// Opens or closes, then reads the opacity once so the fade starts
+        /// at the current tick.
+        fn set(&self, open: bool) -> f32 {
+            (self.set_open)(open);
+            self.opacity()
+        }
+
+        /// Clicks every target and returns how many callbacks fired.
+        fn click_all(&self, app: &AppWindow) -> u32 {
+            let before = self.fired.get();
+            for target in &self.targets {
+                click(app, target);
+            }
+            self.fired.get() - before
+        }
+    }
+
+    fn dialog(app: &AppWindow) -> Overlay {
+        let fired = Rc::new(Cell::new(0));
+        app.on_checkpoint_delete_confirmed({
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        app.set_checkpoint_delete_open(true);
+        let confirm = ElementHandle::find_by_accessible_label(app, "Delete")
+            .next()
+            .expect("the checkpoint delete dialog has a Delete button");
+        app.set_checkpoint_delete_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "checkpoint delete dialog",
+            set_open: Box::new(move |open| weak.unwrap().set_checkpoint_delete_open(open)),
+            targets: vec![confirm],
+            fired,
+            fade_ms: 150,
+        }
+    }
+
+    fn toast(app: &AppWindow) -> Overlay {
+        let fired = Rc::new(Cell::new(0));
+        app.on_toast_activated({
+            let fired = fired.clone();
+            move |_| fired.set(fired.get() + 1)
+        });
+        app.on_toast_dismissed({
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        app.set_toast_open(true);
+        let link = ElementQuery::from_root(app)
+            .match_id("FFToast::card")
+            .find_first()
+            .expect("the toast has a card");
+        let close = ElementHandle::find_by_accessible_label(app, "Dismiss notification")
+            .next()
+            .expect("the toast has a close control");
+        app.set_toast_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "toast",
+            set_open: Box::new(move |open| weak.unwrap().set_toast_open(open)),
+            targets: vec![link, close],
+            fired,
+            fade_ms: 400,
+        }
+    }
+
+    fn overview(app: &AppWindow) -> Overlay {
+        let card = ProjectCardView {
+            kind: "open".into(),
+            opened: true,
+            current: false,
+            unsaved: false,
+            fusing: false,
+            fusing_fraction: 0.0,
+            project_name: "demo".into(),
+            meta_text: "".into(),
+            headline: "".into(),
+            stage: "".into(),
+            reason: "".into(),
+            action_label: "".into(),
+            has_picture: false,
+            picture: slint::Image::default(),
+            x: 0.0,
+            y: 0.0,
+        };
+        app.set_project_cards(Rc::new(slint::VecModel::from(vec![card])).into());
+        app.set_gallery_content_height(300.0);
+        let fired = Rc::new(Cell::new(0));
+        app.on_projects_card_clicked({
+            let fired = fired.clone();
+            move |_| fired.set(fired.get() + 1)
+        });
+        app.set_projects_overlay_open(true);
+        let card = ElementQuery::from_root(app)
+            .match_inherits("FFProjectCard")
+            .find_first()
+            .expect("the gallery draws the card");
+        app.set_projects_overlay_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "projects overview",
+            set_open: Box::new(move |open| weak.unwrap().set_projects_overlay_open(open)),
+            targets: vec![card],
+            fired,
+            fade_ms: 150,
+        }
+    }
+
+    fn settings(app: &AppWindow) -> Overlay {
+        let fired = Rc::new(Cell::new(0));
+        app.on_settings_close_requested({
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        app.set_settings_open(true);
+        let close = ElementHandle::find_by_accessible_label(app, "Close settings")
+            .next()
+            .expect("the settings modal has a close control");
+        app.set_settings_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "settings",
+            set_open: Box::new(move |open| weak.unwrap().set_settings_open(open)),
+            targets: vec![close],
+            fired,
+            fade_ms: 150,
+        }
+    }
+
+    /// Records the text of every `canvas-key-pressed`.
+    fn record_canvas_keys(app: &AppWindow) -> Rc<RefCell<Vec<slint::SharedString>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        app.on_canvas_key_pressed({
+            let seen = seen.clone();
+            move |text, _, _, _| seen.borrow_mut().push(text)
+        });
+        seen
+    }
+
+    /// Presses and releases `key`, running the `changed` handlers first as
+    /// the event loop does before an event.
+    fn press(app: &AppWindow, key: Key) {
+        slint::platform::update_timers_and_animations();
+        let text: slint::SharedString = key.into();
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text });
+    }
+
+    /// A toast reopened while it fades out turns back to fully shown and
+    /// takes clicks from that moment.
+    #[test]
+    fn a_toast_reopened_mid_fade_out_is_fully_shown() {
+        let app = app_at(1440, 900);
+        app.set_show_empty_state(false);
+        let toast = toast(&app);
+
+        toast.set(true);
+        advance(toast.fade_ms);
+        assert_eq!(toast.opacity(), 1.0, "fully shown before it closes");
+        toast.set(false);
+        advance(toast.fade_ms / 3);
+        let closing = toast.opacity();
+        assert!(closing > 0.0 && closing < 1.0, "fading out: {closing}");
+
+        toast.set(true);
+        assert_eq!(
+            toast.click_all(&app),
+            toast.targets.len() as u32,
+            "a click right after the reopen fires"
+        );
+        advance(toast.fade_ms);
+        assert_eq!(toast.opacity(), 1.0, "fully shown after the fade");
+    }
+
+    /// A settings close set from Rust hands keyboard focus to the canvas at
+    /// once, though the content stays drawn while it fades out.
+    #[test]
+    fn a_settings_close_set_from_rust_moves_focus_to_the_canvas() {
+        let app = app_at(1440, 900);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        app.set_show_empty_state(false);
+        let settings = settings(&app);
+        let keys = record_canvas_keys(&app);
+
+        settings.set(true);
+        advance(settings.fade_ms);
+        assert_eq!(settings.opacity(), 1.0, "fully shown before it closes");
+
+        settings.set(false);
+        assert!(settings.opacity() > 0.0, "the content is still drawn");
+        press(&app, Key::Escape);
+        assert_eq!(*keys.borrow(), [slint::SharedString::from(Key::Escape)]);
+        assert_eq!(settings.fired.get(), 0, "closing settings take no key");
+    }
+
+    /// Right after a close, and while the fade runs, Escape and Return reach
+    /// the window and the overlay takes neither them nor a click on its
+    /// button.
+    #[test]
+    fn a_closed_overlay_takes_no_key_or_click() {
+        let app = app_at(1440, 900);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        app.set_show_empty_state(false);
+        let overlays = [dialog(&app), toast(&app), overview(&app), settings(&app)];
+        let keys = record_canvas_keys(&app);
+
+        for overlay in &overlays {
+            let name = overlay.name;
+            overlay.set(true);
+            advance(overlay.fade_ms);
+            assert_eq!(
+                overlay.opacity(),
+                1.0,
+                "{name} fully shown before it closes"
+            );
+            overlay.set(false);
+            for step in [0, overlay.fade_ms / 3, overlay.fade_ms] {
+                advance(step);
+                let before = (keys.borrow().len(), overlay.fired.get());
+                press(&app, Key::Escape);
+                press(&app, Key::Return);
+                assert_eq!(
+                    (keys.borrow().len(), overlay.fired.get()),
+                    (before.0 + 2, before.1),
+                    "{name}: Escape and Return reach the window ({step} ms after the close)"
+                );
+                assert_eq!(
+                    overlay.click_all(&app),
+                    0,
+                    "{name}: a click on its button fires nothing ({step} ms after the close)"
+                );
+            }
+        }
+    }
+
+    /// A dialog, the toast and the projects overview fade in taking clicks
+    /// at once, fade out taking none from the first frame, and are gone at
+    /// 0 ms under reduced motion.
+    #[test]
+    fn closing_overlays_take_no_input_while_they_fade() {
+        let app = app_at(1440, 900);
+        app.set_show_empty_state(false);
+        let overlays = [dialog(&app), toast(&app), overview(&app)];
+
+        for overlay in &overlays {
+            let name = overlay.name;
+            assert_eq!(overlay.set(false), 0.0, "{name} starts closed");
+            assert_eq!(overlay.click_all(&app), 0, "{name}: closed takes no click");
+
+            overlay.set(true);
+            advance(overlay.fade_ms / 3);
+            let opening = overlay.opacity();
+            assert!(
+                opening > 0.0 && opening < 1.0,
+                "{name} fading in: {opening}"
+            );
+            assert_eq!(
+                overlay.click_all(&app),
+                overlay.targets.len() as u32,
+                "{name}: a click mid-fade-in fires"
+            );
+            advance(overlay.fade_ms);
+            assert_eq!(overlay.opacity(), 1.0, "{name} fully shown");
+
+            overlay.set(false);
+            advance(overlay.fade_ms / 3);
+            let closing = overlay.opacity();
+            assert!(
+                closing > 0.0 && closing < 1.0,
+                "{name} fading out: {closing}"
+            );
+            assert_eq!(
+                overlay.click_all(&app),
+                0,
+                "{name}: a click mid-fade-out fires nothing"
+            );
+            advance(overlay.fade_ms);
+            assert_eq!(overlay.opacity(), 0.0, "{name} gone after the fade");
+
+            Theme::get(&app).set_reduce_motion(true);
+            assert_eq!(
+                overlay.set(true),
+                1.0,
+                "{name}: instant in under reduced motion"
+            );
+            assert_eq!(
+                overlay.set(false),
+                0.0,
+                "{name}: instant out under reduced motion"
+            );
+            assert_eq!(overlay.click_all(&app), 0, "{name}: gone takes no click");
+            Theme::get(&app).set_reduce_motion(false);
         }
     }
 }

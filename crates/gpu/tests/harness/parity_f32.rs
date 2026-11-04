@@ -21,7 +21,9 @@ use focusforge_gpu::transfer::download_f32;
 use focusforge_gpu::warp::{WarpPipelines, warp_tile_f32_gpu};
 
 use crate::budget_gpu::sample_allocator;
-use crate::common::{MantisF32, assert_matches_cpu_outside_near_ties};
+use crate::common::{
+    MantisF32, assert_matches_cpu_outside_near_ties, texture, worst_ecc_sample_delta,
+};
 
 /// Offsets that push `mantis-512` above 65535 and below 0.
 const OFFSETS: [f32; 2] = [40_000.0, -40_000.0];
@@ -596,12 +598,6 @@ const ECC_PAD: u32 = 40;
 /// ids start above anything another module uses.
 static NEXT_ECC_TEMPLATE_ID: AtomicU64 = AtomicU64::new(1 << 40);
 
-fn scene(x: f64, y: f64, phase: f64) -> f32 {
-    (30_000.0
-        + 12_000.0 * (0.093 * x + 0.071 * y + phase).sin()
-        + 8_000.0 * (0.047 * x - 0.113 * y + 2.0 * phase).cos()) as f32
-}
-
 impl EccInputs {
     fn new(columns: usize, offset: f32) -> Self {
         let (rw, rh) = (37u32, 23u32);
@@ -615,7 +611,7 @@ impl EccInputs {
         let moving = (0..window.1)
             .flat_map(|j| (0..window.0).map(move |i| (i, j)))
             .map(|(i, j)| {
-                scene(
+                texture(
                     f64::from(ECC_ORIGIN.0 + i),
                     f64::from(ECC_ORIGIN.1 + j),
                     0.4,
@@ -624,7 +620,7 @@ impl EccInputs {
             .collect();
         let template = (0..rh)
             .flat_map(|j| (0..rw).map(move |i| (i, j)))
-            .map(|(i, j)| scene(f64::from(region.x + i), f64::from(region.y + j), 0.0))
+            .map(|(i, j)| texture(f64::from(region.x + i), f64::from(region.y + j), 0.0))
             .collect();
         Self {
             region,
@@ -667,15 +663,7 @@ fn parity_f32_ecc_samples_match_cpu() {
             let got = backend
                 .ecc_sample_values(&request, &warp)
                 .expect("gpu samples");
-            assert_eq!(got.len(), expected.len());
-            let mut worst = 0.0f32;
-            for (i, (g, c)) in got.iter().zip(&expected).enumerate() {
-                match (g, c) {
-                    (Some(g), Some(c)) => worst = worst.max((g - c).abs()),
-                    (None, None) => {}
-                    _ => panic!("sample {i}: gpu {g:?} against cpu {c:?}"),
-                }
-            }
+            let worst = worst_ecc_sample_delta(&got, &expected);
             println!("ecc f32 offset {offset}, {columns} columns: worst |delta|={worst}");
             assert!(worst <= 1.0, "worst sample delta {worst}");
         }

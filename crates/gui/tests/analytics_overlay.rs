@@ -39,15 +39,7 @@ struct Rig {
 }
 
 fn rig_with(controller: AppController) -> Rig {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.window()
@@ -183,8 +175,11 @@ fn controller_with_identical_frames(name: &str, count: usize) -> AppController {
 #[test]
 fn rows_match_the_core_counts() {
     for count in [8, 3] {
-        let mut controller =
-            common::controller_with_frames(&format!("analytics_rows_{count}"), count);
+        let mut controller = common::controller_with_frames_from(
+            "mantis-512",
+            &format!("analytics_rows_{count}"),
+            count,
+        );
         count_now(&mut controller);
         let rows = rows_of(&controller);
         let expected = core_counts(&fixture_frames(count));
@@ -484,7 +479,7 @@ fn analytics_button_needs_a_stack() {
 
 #[test]
 fn excluded_frames_are_listed() {
-    let mut controller = common::controller_with_frames("analytics_excluded", 4);
+    let mut controller = common::controller_with_frames_from("mantis-512", "analytics_excluded", 4);
     controller.toggle_frame_excluded(1);
     count_now(&mut controller);
     let rows = rows_of(&controller);
@@ -501,7 +496,7 @@ fn tab_switch_follows_the_active_stack() {
     let mut controller = common::controller_with_frames("analytics_tabs", 3);
     let second = common::tree("analytics_tabs_second_frames");
     for i in 0..2 {
-        common::copy_frame(&second, &format!("s{i}.tif"), i + 4);
+        common::copy_frame(&second, &format!("s{i}.tif"), i + 1);
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, std::slice::from_ref(&second)),

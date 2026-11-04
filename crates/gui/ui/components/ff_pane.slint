@@ -79,6 +79,9 @@ export component FFPane inherits Rectangle {
         }
     }
 
+    // Content that fills the pane, drawn under the label and the undock control.
+    @children
+
     pane-label := FFPaneLabel {
         x: ShellGeometry.pane-chrome-inset;
         y: ShellGeometry.pane-chrome-inset;

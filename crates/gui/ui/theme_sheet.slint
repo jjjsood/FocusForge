@@ -10,6 +10,7 @@ import { ShellGeometry } from "geometry.slint";
 import { FFIconButton } from "components/ff_icon_button.slint";
 import { FFSlider } from "components/ff_slider.slint";
 import { FFField } from "components/ff_field.slint";
+import { FFAppear } from "components/ff_appear.slint";
 import { FFToggle } from "components/ff_toggle.slint";
 import { FFMenu } from "components/ff_menu.slint";
 import { FFMenuList } from "components/ff_menu_list.slint";
@@ -23,6 +24,9 @@ import { FFRowText } from "components/ff_row_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
+import { FFStageView, StageTile } from "components/ff_stage_view.slint";
+import { FFStageInset } from "components/ff_stage_inset.slint";
+import { FFHeatLegend } from "components/ff_heat_legend.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
@@ -39,6 +43,8 @@ import { FFStatusGlyph } from "components/ff_status_glyph.slint";
 import { FFHeading } from "components/ff_heading.slint";
 import { FFDivider } from "components/ff_divider.slint";
 import { FFSegmented } from "components/ff_segmented.slint";
+import { FFModeLabel } from "components/ff_mode_label.slint";
+import { FFModePill } from "components/ff_mode_pill.slint";
 import { FFPane } from "components/ff_pane.slint";
 import { FFPaneLabel } from "components/ff_pane_label.slint";
 import { FFUndockControl } from "components/ff_undock_control.slint";
@@ -208,12 +214,55 @@ component IconSizeSample inherits Rectangle {
     }
 }
 
+component StagePane inherits Rectangle {
+    in property <string> label;
+    in property <image> source;
+    in property <[StageTile]> tiles;
+    in property <bool> inset-visible;
+    in property <image> heat;
+
+    width: 400px;
+    height: 280px;
+
+    FFStageView {
+        width: parent.width;
+        height: parent.height;
+        image-w: parent.width;
+        image-h: parent.height;
+        source: root.source;
+        tiles: root.tiles;
+        inset-visible: root.inset-visible;
+        heat: root.heat;
+    }
+    FFPaneLabel {
+        x: ShellGeometry.pane-chrome-inset;
+        y: ShellGeometry.pane-chrome-inset;
+        label: root.label;
+    }
+}
+
 export component ThemeSheet inherits Window {
+    in property <image> stage-fusing;
+    in property <image> stage-fusing-bare;
+    in property <image> stage-complete;
+    in property <image> stage-heat;
+    in property <[StageTile]> stage-tiles;
+    // The motion demos below show and hide together.
+    in-out property <bool> demo-shown: true;
+    in-out property <bool> demo-loop: true;
+    in-out property <int> guard-clicks: 0;
+
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
     preferred-height: 1000px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
+
+    Timer {
+        interval: 2s;
+        running: root.demo-loop;
+        triggered => { root.demo-shown = !root.demo-shown; }
+    }
 
     Flickable {
         width: root.width;
@@ -329,6 +378,152 @@ export component ThemeSheet inherits Window {
             ];
         }
         FFCalculatorLegend { }
+
+        GroupHeading { text: "Motion: FFAppear enter-only, fade-out, slow fade-out; modal panel; toast"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            alignment: start;
+            FFToggle {
+                on: Theme.reduce-motion;
+                name: "Reduce motion";
+                toggled => { Theme.reduce-motion = !Theme.reduce-motion; }
+            }
+            Text { text: "Reduce motion"; color: Theme.text-primary; vertical-alignment: center; }
+            FFToggle {
+                on: root.demo-loop;
+                name: "Loop";
+                toggled => { root.demo-loop = !root.demo-loop; }
+            }
+            Text { text: "Loop every 2 s"; color: Theme.text-primary; vertical-alignment: center; }
+            FFButton {
+                width: 120px;
+                compact: true;
+                text: root.demo-shown ? "Hide" : "Show";
+                clicked => { root.demo-shown = !root.demo-shown; }
+            }
+            Text {
+                text: "motion-fast " + Theme.motion-fast / 1ms + " ms, motion-slow " + Theme.motion-slow / 1ms + " ms, flash-hold " + Theme.flash-hold / 1ms + " ms";
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            Rectangle {
+                width: 220px;
+                height: 96px;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                FFAppear {
+                    shown: root.demo-shown;
+                    background: Theme.surface-raised;
+                    Text {
+                        text: "Enter-only: fades in, cuts out";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Rectangle {
+                width: 220px;
+                height: 96px;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                FFAppear {
+                    shown: root.demo-shown;
+                    fade-out: true;
+                    background: Theme.surface-raised;
+                    VerticalLayout {
+                        padding: Theme.space-3;
+                        spacing: Theme.space-2;
+                        alignment: center;
+                        Text { text: "Fade-out, 150 ms"; color: Theme.text-primary; }
+                        HorizontalLayout {
+                            spacing: Theme.space-2;
+                            alignment: start;
+                            FFButton {
+                                width: 88px;
+                                compact: true;
+                                text: "Click me";
+                                clicked => { root.guard-clicks += 1; }
+                            }
+                            Text { text: "clicks: " + root.guard-clicks; color: Theme.text-secondary; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                width: 220px;
+                height: 96px;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                FFAppear {
+                    shown: root.demo-shown;
+                    fade-out: true;
+                    slow: true;
+                    background: Theme.surface-raised;
+                    Text {
+                        text: "Slow fade-out, 400 ms";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            Rectangle {
+                width: 500px;
+                height: 220px;
+                clip: true;
+                FFModalPanel {
+                    modal-open: root.demo-shown;
+                    show-close: true;
+                    panel-width: 440px;
+                    panel-height: 180px;
+                    FFHeading {
+                        x: Theme.space-4;
+                        y: Theme.space-4;
+                        text: "Panel and scrim fade together";
+                    }
+                }
+            }
+            Rectangle {
+                width: 300px;
+                height: 84px;
+                FFToast { toast-open: root.demo-shown; kind: "warning"; title: "Brightness target limited"; }
+            }
+        }
+
+        GroupHeading { text: "Stage view: fusing with heat, fusing heat off, aligning, writing"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                StagePane { label: "Composite"; source: root.stage-fusing; tiles: root.stage-tiles; inset-visible: true; heat: root.stage-heat; }
+                StagePane { label: "Composite"; source: root.stage-fusing-bare; tiles: root.stage-tiles; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                StagePane { label: "Aligned · IMG_0042.tif"; source: root.stage-complete; }
+                StagePane { label: "Composite"; source: root.stage-complete; }
+            }
+        }
+
+        GroupHeading { text: "Stage inset: empty, filled; heat legend"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFStageInset { }
+            FFStageInset { heat: root.stage-heat; }
+            FFHeatLegend { }
+        }
 
         GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
         VerticalLayout {
@@ -1792,6 +1987,15 @@ export component ThemeSheet inherits Window {
 
         GroupHeading { text: "Dialog: segmented selector"; }
         FFSegmented { width: 168px; segments: ["TIFF", "JPEG"]; selected: "TIFF"; }
+
+        GroupHeading { text: "Dock: mode switch pill and labels"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFModePill { width: 60px; height: 28px; }
+            Rectangle { width: 80px; height: 28px; FFModeLabel { text: "STACKING"; cover: 0.0; } }
+            Rectangle { width: 80px; height: 28px; FFModePill { } FFModeLabel { text: "EDITOR"; cover: 1.0; } }
+            Rectangle { width: 80px; height: 28px; FFModeLabel { text: "EDITOR"; cover: 0.0; disabled: true; } }
+        }
 
         GroupHeading { text: "Projects overlay: chip"; }
         HorizontalLayout {

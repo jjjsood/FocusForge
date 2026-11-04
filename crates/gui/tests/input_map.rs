@@ -1063,8 +1063,10 @@ fn paint_drag_is_a_hidden_table_row() {
 /// drag-based control (the slider and the scrollbar), each forwarding its
 /// callback body in one line to
 /// `AppController` and interpreting nothing in `.slint`, plus every modal
-/// scrim, the Projects overlay's background and the calculator overlay's,
-/// whose `scroll-event` swallows the wheel with a bare `accept` and forwards nothing.
+/// scrim, the Projects overlay's background, the calculator and Analytics
+/// overlays' backgrounds and the cover that swallows input over a fading
+/// element, whose `scroll-event` swallows the wheel with a bare `accept` and
+/// forwards nothing.
 const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "canvas.slint",
     "comparison_window.slint",
@@ -1079,6 +1081,7 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "gallery.slint",
     "ff_manifest_list.slint",
     "ff_modal_panel.slint",
+    "ff_appear.slint",
     "projects_overlay.slint",
     "calculator_overlay.slint",
     "analytics_overlay.slint",

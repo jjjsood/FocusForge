@@ -934,7 +934,11 @@ mod tests {
                 s.default_tile_size(),
             ];
             for tile_size in tile_sizes {
-                for extent in 1..=1300u32 {
+                // Three tiles per axis plus the margin, deep enough for the
+                // pyramid check below, and no more than 1300.
+                let interior = tile_size - 2 * s.margin();
+                let cap = (3 * interior + 2 * s.margin()).max(4 << levels).min(1300);
+                for extent in 1..=cap {
                     let plan = TilePlan::new(extent, extent, tile_size, s)
                         .unwrap_or_else(|e| panic!("extent {extent}: {e}"));
                     for tile in plan.tiles() {

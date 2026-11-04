@@ -124,6 +124,9 @@ run_gate "lock directory selftest" tools/with-lock-selftest.sh
 run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 run_gate "image-metrics selftest" python3 tools/image-metrics.py --selftest
 run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
+run_gate "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
+run_gate "test bodies"      python3 tools/check-test-bodies.py
+run_gate "test bodies selftest" python3 tools/check-test-bodies.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
@@ -148,17 +151,19 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # cargo command -- see the header.
   run_logged_bg "fixture e2e" tools/with-lock.sh build -- tools/fixture-e2e.sh
 
+  # Cargo-free, so no lock. Linux only: several groups feed /bin/true to a
+  # parser that accepts only x86-64 ELF, and shell out to bash. The two PowerShell groups stay in
+  # the full run before package builds.
+  [ "$(uname -s)" = Linux ] && run_logged_bg "packaging selftest" python3 tools/check-packaging-selftest.py --no-pwsh
+
   # Foreground and BEFORE `cargo test`, never a background stage: `cargo
   # test` reads what this writes (.scratch/synth-align/measurement.json), so
   # a background stage joined at the end would race the test into skipping.
   run_gate "synthetic alignment truth" tools/synth-align.sh
 
   # --- remaining gates --------------------------------------------------
-  # Default features only, not --all-features: that flag pulled in gpu-tests
-  # (the parity test tree), a third feature-fingerprint compiled on every run
-  # just to be linted, never run. Lint that tree explicitly when it changes:
-  # cargo clippy -p focusforge-gpu --features gpu-tests --all-targets -- -D warnings
-  run_gate "clippy"         tools/with-lock.sh build -- cargo clippy --workspace --all-targets -- -D warnings
+  # The gpu-tests parity test tree is linted here, never run.
+  run_gate "clippy"         tools/with-lock.sh build -- cargo clippy --workspace --all-targets --features focusforge-gpu/gpu-tests,focusforge-gui/gpu-tests,focusforge-cli/gpu-tests -- -D warnings
 
   # FF_REQUIRE_SYNTH_ALIGN=1 turns the test's skip into a failure when the
   # artefact exists: a skip inside the gate must read as a bug, not a pass.

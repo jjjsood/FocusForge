@@ -3,9 +3,10 @@
 // The dock's images/settings tab row. Content behind each tab lives
 // elsewhere, not here.
 
+import { FFAppear } from "../../components/ff_appear.slint";
 import { Theme } from "../../theme.slint";
 
-export component FFDockTabs inherits Rectangle {
+export component FFDockTabs inherits FFAppear {
     callback tab-selected(string);
     in property <string> active: "images";
 

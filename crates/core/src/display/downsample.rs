@@ -161,6 +161,12 @@ impl Downsampler {
     /// skipped part of the crop) reads back `0` rather than dividing by
     /// zero.
     pub fn finish(self) -> Vec<u16> {
+        self.snapshot().0
+    }
+
+    /// [`Self::finish`] without consuming the accumulator, plus one flag per
+    /// target cell: whether any source sample reached it.
+    pub fn snapshot(&self) -> (Vec<u16>, Vec<bool>) {
         let spp = self.samples_per_pixel as usize;
         let mut out = vec![0u16; self.sums.len()];
         for (cell, &count) in self.counts.iter().enumerate() {
@@ -172,6 +178,46 @@ impl Downsampler {
                     (self.sums[cell * spp + c] / u64::from(count)).min(u64::from(u16::MAX)) as u16;
             }
         }
-        out
+        (out, self.counts.iter().map(|&n| n > 0).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn band(x: u32, y: u32, width: u32, height: u32) -> (Rect, Vec<u16>) {
+        let samples = (0..width * height).map(|i| 100 + i as u16).collect();
+        (
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            samples,
+        )
+    }
+
+    #[test]
+    fn snapshot_equals_finish_for_the_same_bands() {
+        let mut down = Downsampler::new_full_source(4, 4, 1, 2, 2);
+        for (x, y) in [(0, 0), (0, 2)] {
+            let (rect, samples) = band(x, y, 4, 2);
+            down.add_band(&samples, rect);
+        }
+        let (snapshot, covered) = down.snapshot();
+        assert_eq!(covered, [true; 4]);
+        assert_eq!(snapshot, down.finish());
+    }
+
+    #[test]
+    fn snapshot_reports_the_cells_a_partial_feed_missed() {
+        let mut down = Downsampler::new_full_source(4, 4, 1, 2, 2);
+        let (rect, samples) = band(0, 0, 4, 2);
+        down.add_band(&samples, rect);
+        let (values, covered) = down.snapshot();
+        assert_eq!(covered, [true, true, false, false]);
+        assert_eq!(&values[2..], [0, 0]);
     }
 }

@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import struct
@@ -1929,5 +1930,27 @@ def smoke_callers() -> None:
     assert diagnostics_path.rstrip("/") in (ROOT / "tools/package-macos.sh").read_text()
 
 
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--no-pwsh"]):
+        print("usage: check-packaging-selftest.py [--no-pwsh]", file=sys.stderr)
+        return 2
+    no_pwsh = argv == ["--no-pwsh"]
+    if not no_pwsh and not shutil.which("pwsh"):
+        print("PowerShell 7+ is required on PATH; pass --no-pwsh to run the cases that do not need it", file=sys.stderr)
+        return 1
+    pwsh_groups = (wix_version_cases, windows_checker_mock)
+    groups = (
+        producer, producer_cleanup_mock, checker, cli_asset_helper_cases, gate_checks, gate_retry_cases, graph,
+        native_boundaries, symbol_tool_cases, linux_known_main_cases, linux_crash_roundtrip_cases, source_privacy_cases,
+        hosted_runner_path_cases, macos_source_cases, windows_identity_cases, wix_version_cases, macos_checker_mock,
+        macos_producer_mock, linux_producer_fresh_root, windows_checker_mock, smoke_callers,
+    )
+    for group in groups:
+        if not (no_pwsh and group in pwsh_groups):
+            group()
+    print("packaging selftest: PASS" + (" (without PowerShell cases)" if no_pwsh else ""))
+    return 0
+
+
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); linux_producer_fresh_root(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    sys.exit(main(sys.argv[1:]))

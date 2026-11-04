@@ -945,7 +945,8 @@ focusforge-cli export mantis-64.ffp --checkpoint 5b71 --zmap zmap-5b71.tif
 
 A source frame that cannot be found, or whose content changed since the
 project was written, makes a retouched `-o` and `--frame-output` refuse, naming every
-such frame; nothing is written. `--zmap` alone never reads a source frame.
+such frame; nothing is written. `--zmap` alone never reads a source frame and writes the fusion's Z-Map
+unchanged: retouch strokes are not included.
 The `.partial` file a run writes into is renamed only when the write
 completes.
 

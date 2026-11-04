@@ -199,15 +199,27 @@ fn fuse_tabs_help_names_the_decision_wait() {
 /// refused ones above, so this needs a compositor (`common::has_display`).
 #[test]
 fn settings_section_argument_opens_every_live_tab() {
-    for section in live_slugs() {
-        if !common::has_display() {
-            println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
-            return;
-        }
-        let status = common::gui_bin("diagnostics_section_accept")
-            .args(["--settings-section", section, "--exit-after", "500"])
-            .status()
-            .expect("failed to run focusforge-gui");
+    if !common::has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let children: Vec<_> = live_slugs()
+        .into_iter()
+        .map(|section| {
+            let child = common::gui_bin(&format!("diagnostics_section_accept_{section}"))
+                .args(["--settings-section", section, "--exit-after", "500"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to run focusforge-gui");
+            (section, child)
+        })
+        .collect();
+    for (section, child) in children {
+        let status = child
+            .wait_with_output()
+            .expect("failed to await focusforge-gui")
+            .status;
         assert!(
             status.success(),
             "--settings-section {section} must be accepted, got {status:?}"

@@ -86,6 +86,17 @@ pub enum ProjectError {
     #[error("{}: is not a FocusForge project", path.display())]
     NotAProject { path: PathBuf },
 
+    /// The manifest's `format_version` is above the highest this build reads.
+    #[error(
+        "{}: saved by a newer FocusForge (project format {found}; this build reads up to {supported}). Update FocusForge to open it.",
+        path.display()
+    )]
+    NewerFormat {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
     /// `path` carries the project header but no footer that validates -- the
     /// file was cut short before its first save was committed.
     #[error(

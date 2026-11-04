@@ -1819,6 +1819,10 @@ pub struct AppController {
     slow_run: Option<(usize, Duration)>,
     /// Runs started so far, counted after the budget refusal.
     runs_started: usize,
+    /// The colours the stage view paints sharpness with.
+    heat_ramp: job::HeatRamp,
+    /// What the last run left in the pane until its composite is drawn.
+    landing: Option<Landing>,
     /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
     /// returns in place of the active run's, until the next run starts.
     toolbar_preview: Option<JobView>,
@@ -1881,6 +1885,73 @@ pub struct SourcePreviewSnapshot {
     pub outcome_bytes: u64,
     pub peak_outcome_bytes: u64,
     pub owned_bytes: u64,
+}
+
+/// The complete mosaic of a run that landed on `tab_id`: shown until the
+/// landed composite is drawn in the pane, with its sharpness inset until
+/// `until`.
+struct Landing {
+    tab_id: u64,
+    image: job::StageImage,
+    until: Instant,
+    /// When the pane first showed the composite.
+    drawn: Option<Instant>,
+}
+
+impl Landing {
+    /// What `run_tab_id`'s run leaves in the pane: its mosaic when it fused
+    /// and showed a composite preview, nothing after a cancel or failure.
+    fn after(
+        run_tab_id: Option<u64>,
+        state: &job::RunState,
+        observer: &job::GuiObserver,
+        now: Instant,
+    ) -> Option<Self> {
+        let (Some(tab_id), job::RunState::Fused { .. }) = (run_tab_id, state) else {
+            return None;
+        };
+        observer.final_stage(now).map(|(image, ended)| Landing {
+            tab_id,
+            image,
+            until: ended + job::INSET_AFTER_FUSION,
+            drawn: None,
+        })
+    }
+
+    /// The mosaic until the composite is drawn and then fading out over it,
+    /// the inset until `until` and then fading out; `None` once both are gone.
+    fn view(&self, now: Instant) -> Option<job::StageView> {
+        let inset = self
+            .image
+            .inset
+            .clone()
+            .filter(|_| now < self.until + job::LANDING_FADE);
+        let inset_fading = now >= self.until;
+        let mosaic_gone = self
+            .drawn
+            .is_some_and(|drawn| now >= drawn + job::LANDING_FADE);
+        if mosaic_gone {
+            return inset.map(|pixels| job::StageView::Inset {
+                pixels,
+                fading: inset_fading,
+            });
+        }
+        Some(job::StageView::Picture(job::StageImage {
+            inset,
+            fading: self.drawn.is_some(),
+            inset_fading,
+            ..self.image.clone()
+        }))
+    }
+
+    /// Whether the mosaic and the inset have both faded out, or the pane's
+    /// tab was left (`on_tab` false) after the inset's fade.
+    fn finished(&self, now: Instant, on_tab: bool) -> bool {
+        let faded = self
+            .drawn
+            .is_some_and(|drawn| now >= drawn + job::LANDING_FADE);
+        now >= self.until + job::LANDING_FADE && (faded || !on_tab)
+    }
 }
 
 /// The single live worker, if any: the control/observer pair a background
@@ -7627,14 +7698,49 @@ impl AppController {
         self.cancel_frame_drag();
         self.set_images_scroll(self.state.images_scroll_y);
         self.keep_selected_image_visible();
+        self.save_appearance();
+        self.refresh_source_previews();
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Whether the next run shows the sharpness heatmap.
+    pub fn sharpness_heatmap(&self) -> bool {
+        self.appearance.sharpness_heatmap
+    }
+
+    /// The previews a run asks for: the aligned frames and the growing
+    /// composite always, the sharpness heat while the setting is on.
+    fn preview_kinds(&self) -> job::PreviewKinds {
+        job::PreviewKinds {
+            aligned_frame: true,
+            composite: true,
+            heat: self.appearance.sharpness_heatmap,
+        }
+    }
+
+    /// Takes effect from the next run on.
+    pub fn set_sharpness_heatmap(&mut self, on: bool) {
+        self.appearance.sharpness_heatmap = on;
+        self.save_appearance();
+    }
+
+    /// Whether transitions are instant.
+    pub fn reduce_motion(&self) -> bool {
+        self.appearance.reduce_motion
+    }
+
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.appearance.reduce_motion = on;
+        self.save_appearance();
+    }
+
+    fn save_appearance(&mut self) {
         self.appearance_save_error = self
             .state
             .config_dir
             .as_deref()
             .and_then(|dir| appearance_settings::save(dir, self.appearance).err())
             .map(|error| error.to_string());
-        self.refresh_source_previews();
-        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// Saves `performance` when a config directory is installed; a failed
@@ -7959,7 +8065,11 @@ impl AppController {
         {
             control.set_min_running(floor);
         }
-        let observer = Arc::new(job::GuiObserver::new());
+        self.landing = None;
+        let observer = Arc::new(job::GuiObserver::with_previews(
+            self.preview_kinds(),
+            self.heat_ramp,
+        ));
         self.job.control = Some(Arc::clone(&control));
         self.job.observer = Some(Arc::clone(&observer));
         self.job.frames = request.frames.clone();
@@ -8192,6 +8302,94 @@ impl AppController {
         }
     }
 
+    /// What a run that just landed leaves in the pane at `now`, while the
+    /// active tab is the run's.
+    fn landing_view(&self, now: Instant) -> Option<job::StageView> {
+        self.landing
+            .as_ref()
+            .filter(|_| self.on_landing_tab())?
+            .view(now)
+    }
+
+    fn on_landing_tab(&self) -> bool {
+        let tab_id = self.landing.as_ref().map(|landing| landing.tab_id);
+        self.state.active().map(|tab| tab.id) == tab_id
+    }
+
+    /// Records that the Composite pane shows the active tab's landed
+    /// composite at `now`, so the mosaic standing in for it can fade out.
+    /// While the tab's run waits on Keep or Discard the mosaic stays, however
+    /// the pane redraws.
+    pub fn composite_drawn(&mut self, now: Instant) {
+        let parked = self.state.active().is_some_and(|tab| tab.parked.is_some());
+        if !parked
+            && self.on_landing_tab()
+            && let Some(landing) = self.landing.as_mut()
+        {
+            landing.drawn.get_or_insert(now);
+        }
+    }
+
+    /// Whether a landed run still has something to show or take away at
+    /// `now`, dropping it once its composite is drawn (or its tab left) and
+    /// its fades have run; the poll timer runs until this is false.
+    pub fn inset_pending(&mut self, now: Instant) -> bool {
+        let on_tab = self.on_landing_tab();
+        if self
+            .landing
+            .as_ref()
+            .is_some_and(|landing| landing.finished(now, on_tab))
+        {
+            self.landing = None;
+        }
+        self.landing.is_some()
+    }
+
+    /// The colours the stage view paints sharpness with, from the next run on.
+    pub fn set_heat_ramp(&mut self, ramp: job::HeatRamp) {
+        self.heat_ramp = ramp;
+    }
+
+    /// What the Composite pane shows for the active tab's live run, `None`
+    /// when no run is live on it or the composite it already has stays.
+    pub fn stage_view(&self, now: Instant) -> Option<job::StageView> {
+        let Some(observer) = self.job.observer.as_ref() else {
+            return self.landing_view(now);
+        };
+        if self.state.active != self.running_tab() {
+            return None;
+        }
+        let has_composite = self.composite_ready();
+        let mut view =
+            observer.stage_view(observer.last_progress().as_ref(), has_composite, now)?;
+        // A refusal's own lines fill the pane; a card would draw over them.
+        if matches!(view, job::StageView::Placeholder { .. })
+            && !self.composite_message_lines().is_empty()
+        {
+            return None;
+        }
+        if let job::StageView::Picture(image) = &mut view {
+            if has_composite {
+                image.extent.x = 0;
+                image.extent.y = 0;
+            }
+            image.label = match image.frame {
+                Some(frame) => {
+                    let name = self
+                        .job
+                        .frames
+                        .get(frame)
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    format!("Aligned · {name}")
+                }
+                None => "Composite".to_string(),
+            };
+        }
+        Some(view)
+    }
+
     /// Holds a literal transport view -- `state` is one of `idle`, `running`,
     /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
     /// until the next run starts; `fuse_enabled` still follows the active
@@ -8289,6 +8487,7 @@ impl AppController {
             .as_ref()
             .map(|o| o.notices())
             .unwrap_or_default();
+        let run_tab_id = self.job.tab_id;
         let tab_index = self.job.tab_id.take().and_then(|id| self.tab_index(id));
         let owner = tab_index.and_then(|i| self.state.projects.get(i));
         let was_cancelling = owner.is_some_and(|tab| tab.run == job::RunState::Cancelling);
@@ -8297,6 +8496,7 @@ impl AppController {
             self.last_backend_line = Some(line);
         }
         let settled = job::settle(handle.join(), &observer);
+        self.landing = Landing::after(run_tab_id, &settled.state, &observer, Instant::now());
         self.job.control = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
         // no tab gains a checkpoint, and no outcome lands on whichever tab
@@ -8535,16 +8735,24 @@ impl AppController {
         Some(planes)
     }
 
-    /// `Discard` on the active tab's parked run: deletes its held files and
-    /// leaves the tab `Idle` with its checkpoint count unchanged.
+    /// `Discard` on the active tab's parked run: deletes its held files, drops
+    /// the tab's landed stage mosaic and leaves the tab `Idle` with its
+    /// checkpoint count unchanged.
     pub fn discard_fused(&mut self) {
         if self.active_history_frozen() {
             return;
         }
-        let Some(parked) = self.state.active_mut().and_then(|tab| tab.parked.take()) else {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let Some(parked) = tab.parked.take() else {
             return;
         };
         remove_held(std::slice::from_ref(&parked.held));
+        if self.landing.as_ref().is_some_and(|l| l.tab_id == tab_id) {
+            self.landing = None;
+        }
         self.emit(ShellEvent::JobChanged);
     }
 
@@ -10408,6 +10616,7 @@ mod tests {
         ));
         controller.install_appearance(AppearanceSettings {
             presentation: SourcePresentation::ImageList,
+            ..AppearanceSettings::default()
         });
         controller.set_images_viewport_height(120.0);
 
@@ -10464,6 +10673,7 @@ mod tests {
         ));
         controller.install_appearance(AppearanceSettings {
             presentation: SourcePresentation::ImageList,
+            ..AppearanceSettings::default()
         });
         controller.set_images_viewport_height(120.0);
         controller.images_viewport_scrolled(360.0);
@@ -10589,6 +10799,7 @@ mod tests {
         ));
         controller.install_appearance(AppearanceSettings {
             presentation: SourcePresentation::ImageList,
+            ..AppearanceSettings::default()
         });
         controller.set_images_viewport_height(120.0);
         let (started_rx, release_tx, completed_rx) =
@@ -10651,6 +10862,7 @@ mod tests {
         ));
         controller.install_appearance(AppearanceSettings {
             presentation: SourcePresentation::ImageList,
+            ..AppearanceSettings::default()
         });
         controller.set_images_viewport_height(120.0);
         let (started_rx, release_tx, completed_rx) =
@@ -10760,6 +10972,209 @@ mod tests {
             );
             std::thread::yield_now();
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use focusforge_core::display::{PreviewKind, PreviewKinds, StagePreview};
+    use focusforge_core::io::test_frames::write_frame_with_capture_time;
+    use focusforge_core::pipeline::StageObserver;
+
+    use super::{AppController, Landing, OpenOutcome, RowPlanes};
+    use crate::job::{GuiObserver, HeatRamp, JobControl, Rect, RunState, StageImage, StageView};
+
+    const FADE: Duration = Duration::from_millis(400);
+
+    fn observer(heat: bool) -> GuiObserver {
+        let observer = GuiObserver::with_previews(
+            PreviewKinds {
+                aligned_frame: false,
+                composite: true,
+                heat,
+            },
+            HeatRamp::default(),
+        );
+        let extent = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+        };
+        let tiles: Arc<[Rect]> = Arc::from(vec![
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            Rect {
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        ]);
+        for (kind, value) in [(PreviewKind::Composite, 90), (PreviewKind::Heat, 200)] {
+            observer.preview(&StagePreview {
+                kind,
+                width: 4,
+                height: 2,
+                rgba: [value, value, value, 255].repeat(8),
+                extent,
+                tiles: Arc::clone(&tiles),
+            });
+        }
+        observer
+    }
+
+    fn fused() -> RunState {
+        RunState::Fused {
+            at: "10:00".into(),
+            unaligned: 0,
+        }
+    }
+
+    /// A landing at `t0` whose last tile fused at `t0`.
+    fn landing(heat: bool, t0: Instant) -> Landing {
+        Landing::after(Some(7), &fused(), &observer(heat), t0).expect("a fused run with a mosaic")
+    }
+
+    fn image(view: Option<StageView>) -> StageImage {
+        match view {
+            Some(StageView::Picture(image)) => image,
+            other => panic!("expected the mosaic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_mosaic_stays_until_the_composite_is_drawn_then_fades() {
+        for heat in [true, false] {
+            let t0 = Instant::now();
+            let mut landing = landing(heat, t0);
+            for later in [Duration::ZERO, Duration::from_secs(10)] {
+                let shown = image(landing.view(t0 + later));
+                assert!(!shown.fading, "heat {heat}: undrawn composite, {later:?}");
+            }
+            let drawn = t0 + Duration::from_millis(100);
+            landing.drawn = Some(drawn);
+            assert!(image(landing.view(drawn)).fading);
+            assert!(image(landing.view(drawn + FADE - Duration::from_millis(1))).fading);
+            let gone = landing.view(drawn + FADE);
+            if heat {
+                assert!(matches!(gone, Some(StageView::Inset { fading: false, .. })));
+            } else {
+                assert_eq!(gone, None, "no heat leaves nothing once the mosaic is gone");
+            }
+        }
+    }
+
+    #[test]
+    fn the_inset_fades_from_its_deadline_and_is_gone_a_fade_later() {
+        let t0 = Instant::now();
+        let mut landing = landing(true, t0);
+        landing.drawn = Some(t0 + Duration::from_millis(100));
+        let until = landing.until;
+        assert_eq!(until, t0 + crate::job::INSET_AFTER_FUSION);
+
+        assert!(matches!(
+            landing.view(until - Duration::from_millis(1)),
+            Some(StageView::Inset { fading: false, .. })
+        ));
+        assert!(matches!(
+            landing.view(until),
+            Some(StageView::Inset { fading: true, .. })
+        ));
+        assert!(matches!(
+            landing.view(until + FADE - Duration::from_millis(1)),
+            Some(StageView::Inset { fading: true, .. })
+        ));
+        assert_eq!(landing.view(until + FADE), None);
+
+        // The composite not drawn yet: the mosaic stays, the inset is gone.
+        landing.drawn = None;
+        let late = image(landing.view(until + FADE));
+        assert!(late.inset.is_none() && late.inset_fading && !late.fading);
+    }
+
+    #[test]
+    fn the_landing_ends_when_both_fades_have_run() {
+        let t0 = Instant::now();
+        let mut landing = landing(true, t0);
+        let end = landing.until + FADE;
+        assert!(!landing.finished(end, true), "the composite is not drawn");
+        assert!(landing.finished(end, false), "the pane's tab was left");
+        landing.drawn = Some(t0 + Duration::from_millis(100));
+        assert!(!landing.finished(end - Duration::from_millis(1), true));
+        assert!(landing.finished(end, true));
+    }
+
+    #[test]
+    fn cancel_failure_and_a_run_without_a_mosaic_leave_no_landing() {
+        let t0 = Instant::now();
+        let observer = observer(true);
+        for state in [
+            RunState::Idle,
+            RunState::Cancelling,
+            RunState::Failed("unreadable frame".into()),
+        ] {
+            assert!(Landing::after(Some(7), &state, &observer, t0).is_none());
+        }
+        assert!(Landing::after(None, &fused(), &observer, t0).is_none());
+        assert!(Landing::after(Some(7), &fused(), &GuiObserver::new(), t0).is_none());
+    }
+
+    #[test]
+    fn a_run_subscribes_to_heat_only_while_the_setting_is_on() {
+        let mut controller = AppController::new();
+        assert!(controller.preview_kinds().heat);
+        controller.set_sharpness_heatmap(false);
+        let kinds = controller.preview_kinds();
+        assert!(!kinds.heat);
+        assert!(kinds.aligned_frame && kinds.composite);
+    }
+
+    #[test]
+    fn a_refused_composite_row_keeps_the_stage_card_off_the_pane() {
+        let root = std::env::temp_dir().join(format!(
+            "focusforge-controller-stage-card-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["first.tif", "second.tif"] {
+            write_frame_with_capture_time(&root.join(name), 4, 4, Some("2026:08:29 10:00:00"))
+                .unwrap();
+        }
+        let mut controller = AppController::new();
+        controller.set_scratch_root_for_test(root.join("scratch"));
+        controller
+            .open_paths(std::slice::from_ref(&root))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(matches!(
+            controller.settle_open(),
+            Some(OpenOutcome::Opened(_))
+        ));
+        let id = controller.state.active().unwrap().id;
+        controller.job.control = Some(JobControl::new());
+        controller.job.observer = Some(Arc::new(GuiObserver::new()));
+        controller.job.tab_id = Some(id);
+
+        let now = Instant::now();
+        assert!(matches!(
+            controller.stage_view(now),
+            Some(StageView::Placeholder { .. })
+        ));
+        controller.state.active_mut().unwrap().row_planes = Some(RowPlanes::Refused(vec![
+            "Cannot show this position.".into(),
+        ]));
+        assert_eq!(controller.stage_view(now), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

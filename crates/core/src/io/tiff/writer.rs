@@ -1346,6 +1346,7 @@ mod tests {
     #[test]
     fn tiles_in_reverse_raster_order_still_complete() {
         let mut writer = TiffWriter::new(Cursor::new(Vec::new()), spec(4, 4, 1)).unwrap();
+        let row_of = |y: u32| -> [u16; 4] { std::array::from_fn(|x| (y * 100 + x as u32) as u16) };
         for y in (0..4u32).rev() {
             let rect = Rect {
                 x: 0,
@@ -1353,9 +1354,24 @@ mod tests {
                 width: 4,
                 height: 1,
             };
-            writer.write_tile(rect, &[7u16; 4]).unwrap();
+            writer.write_tile(rect, &row_of(y)).unwrap();
         }
+        let pixel_start = writer.pixel_start as usize;
+        let row_bytes = writer.row_bytes as usize;
+        let bytes = writer.sink.get_ref().clone();
         writer.finish().expect("fully covered frame must finish");
+
+        for y in 0..4u32 {
+            let row_off = pixel_start + y as usize * row_bytes;
+            let actual: Vec<u16> = (0..4)
+                .map(|x| u16::from_le_bytes([bytes[row_off + x * 2], bytes[row_off + x * 2 + 1]]))
+                .collect();
+            assert_eq!(
+                actual,
+                row_of(y),
+                "row {y} sits at its own offset, not in arrival order"
+            );
+        }
     }
 
     #[test]

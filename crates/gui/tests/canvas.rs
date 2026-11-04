@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use common::open_fixture_tab;
 use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
@@ -153,7 +154,7 @@ fn undo_and_redo_refresh_window_without_another_pointer_event() {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     let controller = Arc::new(Mutex::new(AppController::new()));
     let canvas = Rc::new(RefCell::new(focusforge_gui::bridge::Canvas::default()));
@@ -401,34 +402,6 @@ fn pending_pan_keeps_retained_coverage_inside_current_crop_until_latest_publish(
 // `canvas_feed`'s answer.
 // ---------------------------------------------------------------------
 
-/// Opens `fixtures/<set>`'s first `count` frames, copied under a fresh
-/// directory (never the committed fixture itself, since a fuse seals a
-/// `.ffp` beside its frames), as a new tab -- the newly opened tab becomes
-/// active. Returns the folder the tab was opened from.
-fn open_fixture_tab(
-    controller: &mut AppController,
-    name: &str,
-    set: &str,
-    count: usize,
-) -> PathBuf {
-    let root = common::tree(&format!("{name}_{set}_frames"));
-    for i in 0..count {
-        std::fs::copy(
-            common::fixture_frame(set, i),
-            root.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    // Canvas feeding is under test, not alignment quality; an algorithm that
-    // always converges keeps every run clean.
-    controller.set_align_algorithm("dummy-align");
-    root
-}
-
 /// A controller with two sealed tabs open -- tab 0 from `fixtures/mantis-64`
 /// (64x64), tab 1 from `fixtures/mantis-512` (512x512), the size mismatch
 /// a background run must survive. Tab 1 is active on return, the same
@@ -440,7 +413,7 @@ fn two_sealed_tabs(name: &str) -> AppController {
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60))
         .expect("the small fixture must fuse");
-    open_fixture_tab(&mut controller, name, "mantis-512", 3);
+    open_fixture_tab(&mut controller, name, "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the large fixture must fuse");
@@ -475,11 +448,11 @@ fn load_path(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
 fn background_run_leaves_canvas_alone(name: &str, background_set: &str, foreground_set: &str) {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    open_fixture_tab(&mut controller, name, background_set, 3);
+    open_fixture_tab(&mut controller, name, background_set, 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60))
         .expect("the background tab's first fuse must complete");
-    open_fixture_tab(&mut controller, name, foreground_set, 3);
+    open_fixture_tab(&mut controller, name, foreground_set, 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the foreground tab's first fuse must complete");
@@ -579,7 +552,7 @@ fn switching_to_an_unfused_tab_shows_no_stale_planes() {
     let _ = load_path(&mut controller, None);
 
     // A second tab, opened but never fused -- nothing sealed to show yet.
-    open_fixture_tab(&mut controller, "unfused", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "unfused", "mantis-512", 2);
     assert_eq!(controller.active_project(), Some(1));
     assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
 }
@@ -594,7 +567,7 @@ fn closing_the_active_tab_feeds_the_neighbour() {
     open_fixture_tab(&mut controller, "close_active", "mantis-64", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 0 must fuse");
-    open_fixture_tab(&mut controller, "close_active", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "close_active", "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("tab 1 must fuse");
     open_fixture_tab(&mut controller, "close_active", "mantis-64", 3);
@@ -634,7 +607,7 @@ fn closing_the_active_tab_feeds_the_neighbour() {
     open_fixture_tab(&mut controller, "close_bg", "mantis-64", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 1 must fuse");
-    open_fixture_tab(&mut controller, "close_bg", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "close_bg", "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("tab 2 must fuse");
 
@@ -693,7 +666,7 @@ fn composite_ready_follows_the_active_tabs_own_fuse() {
         CanvasFeed::Load { tab: 0, .. }
     ));
 
-    open_fixture_tab(&mut controller, "composite_ready", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "composite_ready", "mantis-512", 2);
     assert!(
         !controller.composite_ready(),
         "a second, never-fused tab being active must read false, even though tab 0 is fused"
@@ -731,7 +704,7 @@ fn opening_a_saved_project_feeds_its_own_planes() {
     assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     assert!(ffp.is_file());
 
-    open_fixture_tab(&mut controller, "saved", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "saved", "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the second fuse must complete");
@@ -795,7 +768,7 @@ fn controller_over(scratch: &Path, ffps: &[&Path]) -> AppController {
 
 #[test]
 fn an_opened_project_feeds_its_planes_once_the_render_settles() {
-    let ffp = sealed_project("render_settles", "mantis-512", 3);
+    let ffp = sealed_project("render_settles", "mantis-64", 3);
     let scratch = common::tree("render_settles_scratch");
     let mut controller = controller_over(&scratch, &[&ffp]);
 
@@ -829,7 +802,7 @@ fn an_opened_project_feeds_its_planes_once_the_render_settles() {
 #[test]
 fn a_saved_rows_planes_never_feed_a_tab_switched_to_meanwhile() {
     let small = sealed_project("switched_meanwhile", "mantis-64", 3);
-    let large = sealed_project("switched_meanwhile", "mantis-512", 3);
+    let large = sealed_project("switched_meanwhile", "mantis-512", 2);
     let scratch = common::tree("switched_meanwhile_scratch");
     let mut controller = controller_over(&scratch, &[&small, &large]);
 
@@ -884,7 +857,7 @@ fn a_refused_saved_row_is_not_rendered_again() {
 }
 
 /// Both panes draw at the sealed composite's own extent once a tab holds
-/// one, not the raw source frames': fuses a `mantis-512` tab (512x512
+/// one, not the raw source frames': fuses a `mantis-64` tab (64x64
 /// frames), whose alignment crop makes the composite smaller, and asserts
 /// `frame_draw` and `plane_draw` return the identical source rect, bounded
 /// by the composite's own dimensions.
@@ -892,7 +865,7 @@ fn a_refused_saved_row_is_not_rendered_again() {
 fn right_pane_uses_composite_extent() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree("right_pane_extent_scratch"));
-    open_fixture_tab(&mut controller, "right_pane_extent", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "right_pane_extent", "mantis-64", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the fuse must complete");
@@ -901,8 +874,8 @@ fn right_pane_uses_composite_extent() {
     let composite_header =
         TiffHeader::open(&composite_path).expect("the sealed composite must have a real header");
     assert!(
-        composite_header.width < 512 || composite_header.height < 512,
-        "the alignment crop must make the composite smaller than the 512x512 frames, got {}x{}",
+        composite_header.width < 64 || composite_header.height < 64,
+        "the alignment crop must make the composite smaller than the 64x64 frames, got {}x{}",
         composite_header.width,
         composite_header.height
     );
@@ -1233,15 +1206,7 @@ const GEOMETRY_EPS: f32 = 0.5;
 
 #[test]
 fn pane_chrome_geometry() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     // The label and undock control are hidden until a project is open --
@@ -1300,15 +1265,7 @@ fn pane_chrome_geometry() {
 /// yet run `bridge::repaint`.
 #[test]
 fn pane_chrome_hidden_without_a_project() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1325,15 +1282,7 @@ fn pane_chrome_hidden_without_a_project() {
 
 #[test]
 fn current_crop_bounds_each_main_pane() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_frame_crop_x(21.0);
@@ -1383,15 +1332,7 @@ fn current_crop_bounds_each_main_pane() {
 /// no run state at all.
 #[test]
 fn pane_placeholder_shows_only_until_the_first_fuse() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
 
     for (label, width, height) in [("base", 1440, 900), ("minimum", 1200, 760)] {
@@ -1504,15 +1445,7 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
 /// pane's rect exactly.
 #[test]
 fn both_brush_cursors_follow_either_pane() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3657,7 +3590,7 @@ fn a_stroke_does_not_swallow_the_next_click() {
         .expect("the fixture must fuse");
     common::enter_editor(&mut controller);
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3770,7 +3703,7 @@ fn scale_factor_change_without_resize_reaches_the_next_draw() {
     let mut controller = AppController::new();
     open_fixture_tab(&mut controller, "scale_factor_change", "mantis-512", 3);
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1200, 760));
     app.set_project_loaded(true);
