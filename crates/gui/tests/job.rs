@@ -664,9 +664,9 @@ fn cancel_shows_the_cancelling_interval() {
 #[test]
 fn pause_during_alignment_holds_align_progress() {
     // `dummy-align` finishes in microseconds; the real solver on mantis-512
-    // frames is what gives the hold something to catch mid-stage. Translation-only
-    // chain registration flags frames of this fixture as validation-failed, so
-    // the run parks and is kept.
+    // frames is what gives the hold something to catch mid-stage.
+    // Translation-only chain registration flags frames of this fixture as
+    // validation-failed, so the run parks and is kept.
     let mut controller = common::controller_with_frames_from("mantis-512", "pause_align", 3);
     controller.set_align_algorithm("pyramidal-ecc");
     controller.set_param_value("align", "mode", ParamValue::Enum("translation".to_string()));

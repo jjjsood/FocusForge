@@ -3435,10 +3435,10 @@ fn settle_until_parked(controller: &mut AppController) {
 
 const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
 
-/// Tab 0 parks at its question on the default aligner; `tails` are the tabs queued
-/// behind it, each `true` for `dummy-align` and `false` for the default
-/// aligner. Checks the queue head runs while tab 0 waits and every tab
-/// settles to an outcome of its own, then answers each question.
+/// Tab 0 parks at its question on the default aligner; `tails` are the tabs
+/// queued behind it, each `true` for `dummy-align` and `false` for the
+/// default aligner. Checks the queue head runs while tab 0 waits and every
+/// tab settles to an outcome of its own, then answers each question.
 fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
     let mut c = controller_with_scratch(name);
     open_mantis64_frames(&mut c, &format!("{name}_head"), 3);
