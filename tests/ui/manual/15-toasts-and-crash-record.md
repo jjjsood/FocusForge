@@ -16,14 +16,14 @@ The crash steps need a data folder that already holds a crash report: step 7 mak
 3. (human only) Click **Fuse stack** (`FFToolbar::fuse-button`).
    Expect: the dialog "Keep this fused result?" appears (within 90 s) and the bell shows the number 8.
 4. (human only) Click **Keep** (`AppWindow::divergence-warning`).
-   Expect: the dialog is gone; the bell shows the number 9; a toast with a title and "Open notification" shows at the top left of the canvas under the toolbar.
+   Expect: the dialog is gone; the bell shows the number 9; a toast with a title and "Open notification" shows at the top left of the canvas under the toolbar (within 2 s).
 5. (human only) Click **Dismiss notification** (`FFToast::close`).
    Expect: Must not: the center opens or the number changes; the center stays closed and the bell still shows the number 9.
 6. (human only) Click the toast (`FFToast::card`) that shows next.
    Expect: the center opens reading "9 notifications · this session"; the bell number is gone and no toast shows; one row has an orange outline and shows its full message, and that row carries the title the toast showed.
 ## A crash record
 7. (human only) Quit the window. Make a data folder holding `focusforge/crashes/20260918T010203Z-focusforge-gui-panic.json` with the content `{"format":1,"payload":"boom"}`, then start the window again with the same arguments, a throwaway `--config-dir` and `FOCUSFORGE_DATA_DIR` set to that folder.
-   Expect: a toast titled "Previous session stopped" with an amber stripe and "Open notification" shows at the top left of the canvas; the bell shows the number 1.
+   Expect: a toast titled "Previous session stopped" with an amber stripe and "Open notification" shows at the top left of the canvas; the bell shows the number 1 (within 2 s).
 8. (human only) Move the pointer onto the toast and keep it there for 20 seconds.
    Expect: the toast is still showing after 20 seconds, twice its 10 second lifetime.
 9. (human only) Move the pointer off the toast.

@@ -51,6 +51,7 @@ fn controller_with_list_frames(name: &str, count: usize) -> AppController {
     let mut controller = controller_with_timed_frames(name, count);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     controller
 }
@@ -86,6 +87,7 @@ fn image_list_queues_only_the_visible_window_plus_two_rows() {
     let mut controller = controller_with_timed_frames("preview_visible_window", 8);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     let snapshot = controller.source_preview_snapshot();
@@ -103,6 +105,7 @@ fn image_list_keeps_a_fractional_thousand_row_viewport_to_the_two_row_margin() {
     let mut controller = controller_with_timed_frames("preview_fractional_thousand", 1000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
 
     controller.set_images_viewport_height(120.5);
@@ -208,6 +211,7 @@ fn source_preview_cap_change_replaces_an_unchanged_visible_set() {
     let mut controller = controller_with_timed_frames("preview_cap_change", 8);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     let before = controller.source_preview_snapshot();
@@ -248,6 +252,7 @@ fn live_processing_reserves_cached_native_preview_growth_during_resize() {
     let mut controller = controller_with_timed_frames("preview_live_resize_reserve", 4);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_host_memory_cap("1MiB");
     controller.set_images_viewport_height(120.0);
@@ -312,6 +317,7 @@ fn an_idle_tab_cannot_schedule_source_previews_while_another_tab_processes() {
     let mut controller = controller_with_timed_frames("preview_global_job_guard", 4);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
 
@@ -1563,6 +1569,7 @@ fn metadata_follows_the_source_through_reorder_and_remove() {
     ));
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     std::fs::remove_dir_all(&root).unwrap();
 
@@ -1770,6 +1777,7 @@ fn presentation_switches_drag_and_scroll_geometry_without_reusing_list_height() 
 
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
     controller.frame_drag_pointer(0, PointerKind::Move, 190.0);
@@ -2193,6 +2201,7 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
     let mut editor = controller_in_editor_mode("keyboard_visible_selection_editor");
     editor.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     editor.set_images_viewport_height(10.0);
     editor.select_frame(0);
@@ -2214,7 +2223,10 @@ fn editor_source_list_follows_appearance_presentation() {
         (SourcePresentation::ImageList, 120.0, true),
         (SourcePresentation::Large, 200.0, true),
     ] {
-        editor.install_appearance(AppearanceSettings { presentation });
+        editor.install_appearance(AppearanceSettings {
+            presentation,
+            ..AppearanceSettings::default()
+        });
         editor.set_images_viewport_height(10.0);
         assert_eq!(editor.source_presentation(), presentation);
 
@@ -3366,6 +3378,7 @@ fn images_panel_disable_is_whole_panel() {
     let mut controller = controller_with_frames("images_panel_disable_is_whole_panel", 3);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     focusforge_gui::bridge::push_images_panel(&app, &controller);
     assert!(
@@ -3451,6 +3464,7 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     let mut loaded = controller_with_frames("job_disables_images_and_settings", 3);
     loaded.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     let controller = Arc::new(Mutex::new(loaded));
     let _installed = focusforge_gui::bridge::install(
@@ -3614,6 +3628,7 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         .unwrap()
         .install_appearance(AppearanceSettings {
             presentation: SourcePresentation::List,
+            ..AppearanceSettings::default()
         });
     let _installed = focusforge_gui::bridge::install(
         &app,

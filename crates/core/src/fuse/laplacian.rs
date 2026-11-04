@@ -144,7 +144,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
+use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::sharpness::eligible;
 use crate::fuse::{Plane, Pyramid, build, collapse, max_levels};
@@ -220,6 +220,19 @@ pub fn score_radius(levels: u32, level: u32) -> u32 {
     let headroom = margin_for_levels(levels).saturating_sub(build_reach);
     let w = SCORE_RADIUS.min(headroom).max(1);
     (w >> level).max(1)
+}
+
+/// The largest value a chain of [`score_plane`] passes can reach on a plane
+/// whose entries are at most 65535 in magnitude: each pass sums
+/// `(2 * radius + 1)^2` such entries per channel.
+pub(crate) fn window_score_ceiling(samples_per_pixel: u32, radii: &[u32]) -> f64 {
+    radii.iter().fold(
+        65535.0 * f64::from(samples_per_pixel),
+        |ceiling, &radius| {
+            let side = f64::from(2 * radius + 1);
+            ceiling * side * side
+        },
+    )
 }
 
 /// The windowed sharpness score of every pixel of one Laplacian level: a
@@ -412,6 +425,19 @@ impl StackAlgorithm for Laplacian {
             decimation_levels: levels,
         }
     }
+
+    /// A level-0 score sums `|L|` (at most 65535) over a `(2r + 1)`-square
+    /// window of every channel.
+    fn heat_scale(&self, cfg: &ParamValues, samples_per_pixel: u32) -> Option<f64> {
+        let levels = cfg
+            .get("levels")
+            .and_then(ParamValue::as_i64)
+            .map(|levels| levels.max(0) as u32)?;
+        Some(window_score_ceiling(
+            samples_per_pixel,
+            &[score_radius(levels, 0)],
+        ))
+    }
 }
 
 impl Laplacian {
@@ -542,6 +568,7 @@ impl Laplacian {
         })?;
         let Running {
             mut best,
+            best_scores,
             winner,
             residual_sum,
             residual_count,
@@ -580,6 +607,9 @@ impl Laplacian {
                 samples,
             },
             zmap,
+            sharpness: Some(Sharpness::Score(best_scores.into_iter().next().expect(
+                "levels >= 1 (enforced by the schema) guarantees a level-0 score plane",
+            ))),
         })
     }
 }
@@ -1081,5 +1111,100 @@ mod tests {
         // = 6, so the clamp binds: W = min(8, 6) = 6, and r_1 = max(1, 3).
         assert_eq!(score_radius(2, 0), 6);
         assert_eq!(score_radius(2, 1), 3);
+    }
+
+    fn textured(w: u32, h: u32, spp: u32, seed: u32) -> Vec<u16> {
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..spp {
+                    let hash = (x * 7 + y * 13 + c * 5 + seed).wrapping_mul(2654435761u32);
+                    out.push((hash >> 16) as u16);
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close(actual: f64, expected: f64, context: &str) {
+        assert!(
+            (actual - expected).abs() <= 1e-6 * expected.abs(),
+            "{context}: {actual} against {expected}"
+        );
+    }
+
+    #[test]
+    fn sharpness_heatmap_matches_running_best() {
+        let (w, h, levels) = (64u32, 40u32, 2u32);
+        for spp in [1u32, 3] {
+            let tiles: Vec<Tile> = (1..=3)
+                .map(|seed| tile_of(w, h, spp, textured(w, h, spp, seed)))
+                .collect();
+            let ctx = TileCtx::new(rect(w, h), &tiles);
+            let out = Laplacian
+                .fuse(&ctx, &cfg_with_levels(i64::from(levels)))
+                .unwrap();
+            let sharpness = out
+                .sharpness
+                .as_ref()
+                .expect("laplacian hands over its scores");
+            let planes: Vec<Vec<f32>> = tiles
+                .iter()
+                .map(|t| {
+                    let pyramid = build(&t.samples, w, h, spp, levels).unwrap();
+                    score_plane(&pyramid.levels()[0], score_radius(levels, 0))
+                })
+                .collect();
+            for p in 0..(w * h) as usize {
+                let expected = planes
+                    .iter()
+                    .map(|plane| plane[p])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                assert_close(
+                    sharpness.score(p),
+                    f64::from(expected),
+                    &format!("spp {spp} pixel {p}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_ineligible_and_flat() {
+        let (w, h, spp) = (16u32, 16u32, 3u32);
+        let tiles = [
+            tile_of(w, h, spp, checkerboard(w, h, spp)),
+            tile_of(w, h, spp, flat(w, h, spp, 999)),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], 2, w, h);
+        let sharpness = out.sharpness.as_ref().unwrap();
+        for p in 0..(w * h) as usize {
+            assert_eq!(sharpness.score(p), f64::NEG_INFINITY);
+            assert_eq!(
+                crate::display::preview::heat16(sharpness.score(p), 1.0e6),
+                0
+            );
+        }
+
+        let tiles = constant_tiles([30000; 3], 3, 32, 32);
+        let out = Laplacian
+            .fuse(&TileCtx::new(rect(32, 32), &tiles), &cfg_with_levels(3))
+            .unwrap();
+        let sharpness = out.sharpness.as_ref().unwrap();
+        let hottest = (0..32 * 32)
+            .map(|p| crate::display::preview::heat16(sharpness.score(p), 1.0e6))
+            .max();
+        assert_eq!(hottest, Some(0), "a flat stack is cold everywhere");
+    }
+
+    #[test]
+    fn sharpness_heatmap_scale_is_the_largest_windowed_sum() {
+        let cfg = cfg_with_levels(5);
+        let side = u64::from(2 * score_radius(5, 0) + 1);
+        assert_eq!(
+            Laplacian.heat_scale(&cfg, 3),
+            Some((65535 * 3 * side * side) as f64)
+        );
     }
 }

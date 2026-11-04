@@ -52,7 +52,7 @@ export component FFCheckpointRow inherits Rectangle {
         animate opacity { duration: Theme.motion-fast; easing: ease-out; }
 
         Timer {
-            interval: Theme.motion-fast;
+            interval: Theme.flash-hold;
             running: root.flashing;
             triggered => { root.flashing = false; }
         }

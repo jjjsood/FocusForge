@@ -23,7 +23,7 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 5. Click **Fuse stack** (`FFToolbar::fuse-button`).
    Expect: the dialog "Keep this fused result?" appears (within 90 s) and the bell shows the number 8.
 6. Click **Keep** (`AppWindow::divergence-warning`).
-   Expect: the dialog is gone; the bell shows the number 9.
+   Expect: the dialog is gone; the bell shows the number 9 (within 1 s).
 
 ## Open the center from the bell
 7. Click **Notifications** (`FFIconBar::bell`).
@@ -47,9 +47,9 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 14. Click **Close notifications** (`AppWindow::notification-center`).
     Expect: the center is gone and the bell shows no number.
 15. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the Projects overview opens to the right of the icon bar; the bell and Settings stay visible in the icon bar.
+    Expect: the Projects overview opens to the right of the icon bar; the bell and Settings stay visible in the icon bar (within 1 s).
 16. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overview is gone and the center stays closed.
+    Expect: the overview is gone and the center stays closed (within 1 s).
 
 ## A second run, counted from the bell
 17. Click **STACKING** (`FFModeSwitch::stacking-half`).
@@ -57,10 +57,10 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 18. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: the dialog "Keep this fused result?" appears (within 60 s) and the bell shows the number 8, not 17.
 19. Click **Keep** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone and the bell shows the number 9.
+    Expect: the dialog is gone and the bell shows the number 9 (within 1 s).
 20. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overview opens with the center closed; the bell shows the number 9 in the icon bar.
+    Expect: the overview opens with the center closed; the bell shows the number 9 in the icon bar (within 1 s).
 21. Click **Notifications** (`FFIconBar::bell`).
-    Expect: the overview is gone and the center is open reading "18 notifications · this session"; the bell number is gone.
+    Expect: the overview is gone and the center is open reading "18 notifications · this session"; the bell number is gone (within 1 s).
 22. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: Must not: the center stays open next to the overview; the overview shows, the center is gone and the bell shows no number.
+    Expect: Must not: the center stays open next to the overview; the overview shows, the center is gone and the bell shows no number (within 1 s).
