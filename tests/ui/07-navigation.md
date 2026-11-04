@@ -4,9 +4,9 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 1. Click the first tab (`FFTab::area` 0).
    Expect: the tab strip shows two tabs and the dock header reads "3 frames · 0 excluded".
 2. Click **Settings** (`FFDockTabs::settings-tab`).
-   Expect: the dock shows a list of parameter rows including a row labelled "Algorithm"; the text "3 frames" is not visible.
+   Expect: the dock shows a list of parameter rows including a row labelled "Algorithm"; the text "3 frames" is not visible (within 1 s).
 3. Click **Images** (`FFDockTabs::images-tab`).
-   Expect: the dock header reads "3 frames · 0 excluded" and the list shows 3 rows.
+   Expect: the dock header reads "3 frames · 0 excluded" and the list shows 3 rows (within 1 s).
 4. Click the second frame row (`FFImageRow::area` 1).
    Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif".
 ## Two projects keep their own state
@@ -40,11 +40,11 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
     Expect: the zoom readout shows the fit value of step 10 again.
 ## The settings window blocks the main window
 18. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
-    Expect: a window titled "Settings" opens (`AppWindow::settings-modal`) with six rail entries Performance, Appearance, Storage, Input map, Diagnostics and About.
+    Expect: a window titled "Settings" opens (`AppWindow::settings-modal`) with six rail entries Performance, Appearance, Storage, Input map, Diagnostics and About (within 1 s).
 19. Click **Zoom in** (`FFZoomCluster::zoom-in`) while the Settings window is open.
     Expect: Must not: the zoom readout behind the window rises above the fit value; it still shows the fit value of step 10.
 20. Click **Close settings** (`FFSettingsModal::close`).
-    Expect: the "Settings" window and its rail are gone; the canvas panes are visible and the zoom readout shows the fit value.
+    Expect: the "Settings" window and its rail are gone; the canvas panes are visible and the zoom readout shows the fit value (within 1 s).
 ## Must not work: the overlay before a fuse
 21. Click the **Overlay** toggle (`FFToggle::area` 0, the one at the right of the bottom bar).
     Expect: Must not: the toggle turns on; the knob stays on the left with no accent fill and the toggle looks dimmed.
@@ -58,7 +58,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 25. Click **Keep** (`AppWindow::divergence-warning`).
     Expect: the dialog is gone, the bottom bar status reads "fused" followed by a time (for example "fused 16:34") and the right pane shows a filled composite (within 10 s; the pane is blank for about 2 s after Keep, and a notification "2 frames unaligned" may cover the left pane label for a few seconds).
 26. Click **STACKING** (`FFModeSwitch::stacking-half`).
-    Expect: the stacking toolbar shows a **Fuse stack** button (read with `buttons AppWindow::toolbar`) and the canvas shows the frame pane and the Composite pane.
+    Expect: the stacking toolbar shows a **Fuse stack** button (read with `buttons AppWindow::toolbar`) and the canvas shows the frame pane and the Composite pane (within 1 s).
 ## The overlay after a fuse
 27. Click the **Overlay** toggle (`FFToggle::area` 0, the one at the right of the bottom bar).
     Expect: the toggle is on (knob on the right, accent fill) and the percentage beside the slider reads "65%" at full strength.
@@ -72,7 +72,7 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames
 31. Click **Fit** (`FFZoomCluster::zoom-fit`).
     Expect: the main window still shows one pane, labelled "Composite", and the zoom readout shows a percentage ending in " %".
 32. Click **Settings** (`FFDockTabs::settings-tab`).
-    Expect: Must not: the Composite pane in the main window shows an undock control in its top-right corner (the dock does show a row labelled "Algorithm").
+    Expect: Must not: the Composite pane in the main window shows an undock control in its top-right corner (the dock does show a row labelled "Algorithm") (within 1 s).
 33. Click the close control in the second window's title bar (`FFWindowBar::close`).
     Expect: the second window is gone; the main window shows two panes, "00.tif" on the left and "Composite" on the right, each with an undock control.
 34. Click the undock control of the left pane (`FFUndockControl::area` 0).

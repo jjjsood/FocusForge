@@ -33,16 +33,16 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --slow
 14. (human only) Watch the right pane in the first seconds after the click of step 13. The card reads "Alignment reused" with the line "Frames were aligned in an earlier run. Fusing starts next." and no "Aligned · " label shows; then the result grows tile by tile with a grid on the tiles not fused yet, the tiles just fused framed in the accent colour, and a card "Sharpness" at the bottom right with the words "blurred" and "sharp".
     Expect: the card "Alignment reused" shows first, then the growing result with its grid and its "Sharpness" card.
 15. Click **Discard** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone, the right pane shows the card "Not fused yet" with no picture and no "Sharpness" card, and the bottom bar status reads "No job running".
+    Expect: the dialog is gone, the right pane shows the card "Not fused yet" with no picture and no "Sharpness" card, and the bottom bar status reads "No job running" (within 1 s).
 16. Click **STACKING** (`FFModeSwitch::stacking-half`).
     Expect: Must not: the CHECKPOINTS list holds a row; it still shows the line "None yet — fuse a stack".
 ## A fuse that is kept
 17. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: (within 60 s) the dialog "Keep this fused result?" with "Discard" and "Keep" is shown.
 18. Click **Keep** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone and the bottom bar status reads "fused" followed by a time.
+    Expect: the dialog is gone and the bottom bar status reads "fused" followed by a time (within 1 s).
 19. Click **STACKING** (`FFModeSwitch::stacking-half`).
-    Expect: the CHECKPOINTS list holds one row, the right pane is labelled "Composite" and shows a filled image, and it shows no card "Not fused yet", no card "Fusing" and no "Sharpness" card.
+    Expect: the CHECKPOINTS list holds one row, the right pane is labelled "Composite" and shows a filled image, and it shows no card "Not fused yet", no card "Fusing" and no "Sharpness" card (within 1 s).
 ## Fuse again over the kept result
 20. Click **Fuse stack** (`FFToolbar::fuse-button`) with the kept result on screen.
     Expect: Must not: the right pane shows a card "Not fused yet", "Alignment reused", "Preparing frames" or "Fusing"; it shows image content (the run ends within seconds, so the question may already cover it).
@@ -51,4 +51,4 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --slow
 22. (human only) Watch the right pane in the seconds after the click of step 20. The result grows tile by tile over the kept composite, with its grid and its "Sharpness" card, and the kept composite is hidden under it.
     Expect: the growing result covers the kept composite tile by tile.
 23. Click **Discard** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone, the right pane still shows a filled composite and no card, and the CHECKPOINTS list holds one row.
+    Expect: the dialog is gone, the right pane still shows a filled composite and no card, and the CHECKPOINTS list holds one row (within 1 s).

@@ -1117,6 +1117,9 @@ fn open_comparison(
     canvas: &Rc<RefCell<Canvas>>,
 ) -> Result<(), slint::PlatformError> {
     let window = Rc::new(ComparisonWindow::new()?);
+    window
+        .global::<Theme>()
+        .set_reduce_motion(controller.lock().unwrap().reduce_motion());
     window.on_dock_requested({
         let app_weak = app.as_weak();
         let controller = controller.clone();
@@ -3760,6 +3763,27 @@ pub fn install(
             }
         }
     });
+    app.on_appearance_reduce_motion_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            let save_error = {
+                let mut state = controller.lock().unwrap();
+                state.set_reduce_motion(on);
+                state.appearance_save_error().map(str::to_owned)
+            };
+            if let Some(app) = app_weak.upgrade() {
+                app.set_appearance_reduce_motion(on);
+                app.global::<Theme>().set_reduce_motion(on);
+                app.set_appearance_save_error(save_error.unwrap_or_default().into());
+            }
+            COMPARISON_WINDOW.with(|slot| {
+                if let Some(window) = slot.borrow().as_ref() {
+                    window.global::<Theme>().set_reduce_motion(on);
+                }
+            });
+        }
+    });
     app.on_appearance_menu_toggled({
         let app_weak = app.as_weak();
         move || {
@@ -5702,6 +5726,46 @@ mod tests {
                 press_cycle(window, &rig.calls, centre_of(&*detached, id), Left, &[]);
             }
         }
+        super::hide_comparison();
+    }
+
+    #[test]
+    fn detached_window_follows_reduced_motion() {
+        const NAME: &str = "bridge::tests::detached_window_follows_reduced_motion";
+        if runs_in_child(NAME) {
+            return;
+        }
+        let rig = DragRig::new();
+        let frames = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames");
+        {
+            let mut controller = rig.controller.lock().unwrap();
+            if let Some(load) = controller.open_paths(&[frames]) {
+                load.join().expect("the load worker did not panic");
+            }
+            controller.settle_open().expect("the fixture load settles");
+            controller.undock_requested(PaneSource::Frame);
+            controller.set_reduce_motion(true);
+        }
+        super::open_comparison(&rig.app, PaneSource::Frame, &rig.controller, &rig.canvas)
+            .expect("the detached window opens on the testing backend");
+        let detached = super::COMPARISON_WINDOW
+            .with(|slot| slot.borrow().as_ref().cloned())
+            .expect("the detached window is kept");
+        let fade = || detached.global::<super::Theme>().get_motion_fast();
+        assert!(
+            detached.global::<super::Theme>().get_reduce_motion(),
+            "a window opened under reduced motion starts with it"
+        );
+        assert_eq!(fade(), 0);
+
+        rig.app.invoke_appearance_reduce_motion_toggled(false);
+        assert!(!detached.global::<super::Theme>().get_reduce_motion());
+        assert_eq!(fade(), 150);
+
+        rig.app.invoke_appearance_reduce_motion_toggled(true);
+        assert!(detached.global::<super::Theme>().get_reduce_motion());
+        assert!(rig.app.global::<super::Theme>().get_reduce_motion());
+        assert!(rig.controller.lock().unwrap().reduce_motion());
         super::hide_comparison();
     }
 }

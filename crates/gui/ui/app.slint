@@ -615,8 +615,10 @@ export component AppWindow inherits Window {
     in property <bool> appearance-menu-disabled: false;
     in property <string> appearance-save-error: "";
     in property <bool> appearance-sharpness-heatmap: true;
+    in property <bool> appearance-reduce-motion: false;
     callback appearance-presentation-selected(string);
     callback appearance-sharpness-heatmap-toggled(bool);
+    callback appearance-reduce-motion-toggled(bool);
     callback appearance-menu-toggled();
 
     in property <StorageState> storage;
@@ -806,8 +808,10 @@ export component AppWindow inherits Window {
         appearance-menu-disabled: root.appearance-menu-disabled;
         appearance-save-error: root.appearance-save-error;
         appearance-sharpness-heatmap: root.appearance-sharpness-heatmap;
+        appearance-reduce-motion: root.appearance-reduce-motion;
         appearance-presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
         appearance-sharpness-heatmap-toggled(on) => { root.appearance-sharpness-heatmap-toggled(on); }
+        appearance-reduce-motion-toggled(on) => { root.appearance-reduce-motion-toggled(on); }
         appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
@@ -958,6 +962,14 @@ export component AppWindow inherits Window {
         } else if root.settings-open {
             settings-modal.focus();
         } else {
+            canvas-ground.focus();
+        }
+    }
+
+    // The Settings content stays drawn while it fades out; a close set from
+    // outside the window hands focus back at once.
+    changed settings-open => {
+        if !root.settings-open && !root.dialog-open {
             canvas-ground.focus();
         }
     }

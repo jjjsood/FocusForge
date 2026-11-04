@@ -7498,6 +7498,16 @@ impl AppController {
         self.save_appearance();
     }
 
+    /// Whether transitions are instant.
+    pub fn reduce_motion(&self) -> bool {
+        self.appearance.reduce_motion
+    }
+
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.appearance.reduce_motion = on;
+        self.save_appearance();
+    }
+
     fn save_appearance(&mut self) {
         self.appearance_save_error = self
             .state

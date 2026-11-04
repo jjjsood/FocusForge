@@ -399,3 +399,30 @@ fn every_component_is_on_the_component_sheet() {
         "not on the component sheet: {missing:?}"
     );
 }
+
+/// `(motion-fast, motion-slow, flash-hold)` in milliseconds.
+fn motion_tokens(theme: &Theme<'_>) -> (i64, i64, i64) {
+    (
+        theme.get_motion_fast(),
+        theme.get_motion_slow(),
+        theme.get_flash_hold(),
+    )
+}
+
+#[test]
+fn motion_tokens_are_zero_with_reduced_motion() {
+    let probe = probe();
+    let theme = Theme::get(&probe);
+    assert!(!theme.get_reduce_motion());
+    assert_eq!(motion_tokens(&theme), (150, 400, 150));
+
+    theme.set_reduce_motion(true);
+    assert_eq!(
+        motion_tokens(&theme),
+        (0, 0, 150),
+        "reduced motion zeroes the fades and keeps the flash hold"
+    );
+
+    theme.set_reduce_motion(false);
+    assert_eq!(motion_tokens(&theme), (150, 400, 150));
+}

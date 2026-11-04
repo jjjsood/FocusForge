@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, picker, screenshot};
+use focusforge_gui::{
+    AppController, AppWindow, Theme, ThemeSheet, bridge, job, picker, screenshot,
+};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
@@ -1776,6 +1778,9 @@ fn install_recent(
     controller.install_appearance(appearance);
     app.set_appearance_presentation(controller.source_presentation().slug().into());
     app.set_appearance_sharpness_heatmap(controller.sharpness_heatmap());
+    app.set_appearance_reduce_motion(controller.reduce_motion());
+    app.global::<Theme>()
+        .set_reduce_motion(controller.reduce_motion());
     controller.install_recent(entries, config_dir);
 }
 
