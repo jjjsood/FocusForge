@@ -1,16 +1,4 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-#
-# `fuse_algorithms.rs` and `laplacian_fusion.rs` each write a shared, fixed
-# `.scratch/fuse/<label>.tif` path per fixture label (`tiff-diff.py` compares
-# that exact path by hand), so nextest -- where every test is its own
-# process -- must run these two binaries one at a time rather than racing to
-# write the same file.
-[test-groups]
-fuse-fixture-writers = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'binary_id(focusforge-core::fuse_algorithms) + binary_id(focusforge-core::laplacian_fusion)'
-test-group = 'fuse-fixture-writers'
 
 # A per-test kill on the default and quick profiles, so a hang ends as a named
 # TIMEOUT instead of a silent wait. Measured slowest test:

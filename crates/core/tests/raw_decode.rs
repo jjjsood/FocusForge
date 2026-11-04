@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::common::target_tmp;
 use crate::raw_dng::{DngSpec, write_dng};
 
 #[test]
@@ -1775,10 +1776,8 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
         .expect("parameters resolve");
     let values = params::resolved_values(&resolved);
 
-    let out_dir = common::workspace_root()
-        .join(".scratch")
-        .join("raw-f32-stack");
-    std::fs::create_dir_all(&out_dir).expect("output dir");
+    let temp = target_tmp();
+    let out_dir = temp.path();
     let composite = out_dir.join(format!("{label}.tif"));
     let mut options = TileSchedulerOptions::explicit_budget(out_dir.join(label), 1 << 30);
     options.apply_support(algo.tile_support(&values));
@@ -1946,10 +1945,6 @@ fn copies_of(dng: &tempfile::NamedTempFile, count: usize, dir: &Path) -> Vec<Pat
             path
         })
         .collect()
-}
-
-fn target_tmp() -> tempfile::TempDir {
-    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temporary directory")
 }
 
 struct NoopObserver;

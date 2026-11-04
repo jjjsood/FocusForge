@@ -235,8 +235,25 @@ fn retained_heap_after_prepare_run_matches_the_shared_figure() {
 #[test]
 fn serial_peak_stays_within_shared_plus_one_registration() {
     let _guard = SERIAL.lock().unwrap();
-    for name in ["mantis-512", "mantis-64"] {
-        let (stack, ctx) = open_stack_context(name);
+    // Three 512 px frames keep the geometry the accounted figure depends on
+    // while each configuration registers two frames.
+    let frames_512: Vec<_> = ["02", "03", "04"]
+        .iter()
+        .map(|name| common::mantis_512_dir().join(format!("frames/{name}.tif")))
+        .collect();
+    let stack_512 = TiffStack::open_files(&frames_512).expect("opening three mantis-512 frames");
+    let (width, height) = stack_512.dimensions();
+    let ctx_512 = StackContext::new(
+        stack_512.len(),
+        width,
+        height,
+        stack_512.header(0).samples_per_pixel,
+    );
+    let (stack_64, ctx_64) = open_stack_context("mantis-64");
+    for (name, stack, ctx) in [
+        ("mantis-512", stack_512, ctx_512),
+        ("mantis-64", stack_64, ctx_64),
+    ] {
         let accounted =
             bytes_shared_reference(ctx) + bytes_per_registration(ctx, DEFAULT_TILE_SIZE);
         for mode in ["translation", "rotation-scale"] {

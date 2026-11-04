@@ -49,6 +49,19 @@ fn mantis_frames(count: usize) -> Vec<PathBuf> {
     entries
 }
 
+/// `count` frames from `fixtures/mantis-64`, its three frames in order and
+/// repeated when `count` exceeds three.
+fn mantis_64_frames(count: usize) -> Vec<PathBuf> {
+    let dir = common::fixtures_dir().join("mantis-64/frames");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("frames dir must exist")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    entries.into_iter().cycle().take(count).collect()
+}
+
 fn scratch(label: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("pipeline_{label}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -296,7 +309,7 @@ fn run_space_is_summed_per_volume() {
 #[test]
 fn run_proceeds_when_run_space_suffices() {
     let held = |free: Option<u64>| {
-        let mut request = base_request("space_proceeds", mantis_frames(2), ParamValues::new());
+        let mut request = base_request("space_proceeds", mantis_64_frames(2), ParamValues::new());
         hold_beside_scratch(&mut request);
         request.free_space = free.map(|free| recording_probe(move |_| volume("only", free)).0);
         let FuseOutcome::Completed(report) = run_plain(&request).expect("the run completes") else {
@@ -307,16 +320,18 @@ fn run_proceeds_when_run_space_suffices() {
         };
         std::fs::read(&held.composite).expect("composite is readable")
     };
-    let mut request = base_request("space_proceeds", mantis_frames(2), ParamValues::new());
+    let mut request = base_request("space_proceeds", mantis_64_frames(2), ParamValues::new());
     hold_beside_scratch(&mut request);
     let needed = needed_on_one_volume(&mut request);
     assert_eq!(held(Some(needed)), held(None));
 
     // A sealed run whose two volumes each hold exactly their term.
     let (mut request, _, out_dir) = split_request("space_proceeds_seal", "project.ffp");
+    request.frames = mantis_64_frames(2);
     let split = refusal(&mut request, two_volumes(&out_dir, 0, 0));
     let exact = |dir: &Path| split.iter().find(|s| s.path == dir).expect("volume").needed;
     let (mut request, root, out_dir) = split_request("space_proceeds_seal", "project.ffp");
+    request.frames = mantis_64_frames(2);
     request.free_space = Some(two_volumes(&out_dir, exact(&root), exact(&out_dir)));
     assert!(matches!(
         run_plain(&request).expect("a run that exactly fits completes"),
@@ -529,11 +544,7 @@ fn cancel_during_alignment_stops_at_a_frame_boundary() {
     // per other worker, so a cancel noticed only once alignment returns
     // would register frames past that bound.
     let frame_count = CANCEL_ON + workers + 8;
-    let frames: Vec<PathBuf> = mantis_frames(8)
-        .into_iter()
-        .cycle()
-        .take(frame_count)
-        .collect();
+    let frames = mantis_64_frames(frame_count);
 
     for (policy, bound) in [("anchor", CANCEL_ON + workers - 1), ("chain", CANCEL_ON)] {
         let control = JobControl::new();
@@ -705,11 +716,7 @@ fn pause_during_alignment_stops_registering_frames() {
     // pause noticed only once alignment returns would register frames past
     // the bound below.
     let frame_count = PAUSE_ON + workers + 8;
-    let frames: Vec<PathBuf> = mantis_frames(8)
-        .into_iter()
-        .cycle()
-        .take(frame_count)
-        .collect();
+    let frames = mantis_64_frames(frame_count);
 
     // The pausing call itself, plus at most one in-flight registration per
     // other worker; the chain arm registers on one thread.
@@ -766,11 +773,7 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
     const PAUSE_ON: usize = 2;
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let frame_count = PAUSE_ON + workers + 8;
-    let frames: Vec<PathBuf> = mantis_frames(8)
-        .into_iter()
-        .cycle()
-        .take(frame_count)
-        .collect();
+    let frames = mantis_64_frames(frame_count);
 
     for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
         let control = JobControl::new();
@@ -905,7 +908,7 @@ fn align_progress_counts_every_frame() {
         };
         let mut request = base_request(
             &format!("align_progress_{count}"),
-            mantis_frames(count),
+            mantis_64_frames(count),
             ParamValues::new(),
         );
         request.align = Some(align);
@@ -939,7 +942,11 @@ fn align_progress_counts_every_frame() {
     }
 
     // No align stage at all: both counters stay at 0.
-    let request = base_request("align_progress_none", mantis_frames(2), ParamValues::new());
+    let request = base_request(
+        "align_progress_none",
+        mantis_64_frames(2),
+        ParamValues::new(),
+    );
     let control = JobControl::new();
     let outcome =
         focusforge_core::pipeline::run(&request, &NoopObserver, Arc::clone(&control), None)
@@ -1001,7 +1008,7 @@ fn timed_align_request(
         "reference-policy".to_string(),
         ParamValue::Enum("chain".to_string()),
     );
-    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    let mut request = base_request(label, mantis_64_frames(count), ParamValues::new());
     request.align = Some(AlignRequest {
         algorithm,
         explicit,
@@ -1140,7 +1147,7 @@ impl StageObserver for PrepareTickLog {
 }
 
 fn prepare_request(label: &str, count: usize, equalize: Option<EqualizeSettings>) -> FuseRequest {
-    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    let mut request = base_request(label, mantis_64_frames(count), ParamValues::new());
     request.align = Some(dummy_align_request());
     request.equalize = equalize;
     request.poll = Duration::from_millis(1);

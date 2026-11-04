@@ -33,6 +33,12 @@ pub fn mantis_512_dir() -> PathBuf {
     fixtures_dir().join("mantis-512")
 }
 
+/// A fresh temporary directory under `CARGO_TARGET_TMPDIR`, removed on drop.
+#[allow(dead_code)]
+pub fn target_tmp() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temporary directory")
+}
+
 /// Fuses `frames` in-process with the registered stack algorithm
 /// `algorithm_id` at its default parameters (frames aligned, the crop applied
 /// when `crop`) and returns the held result: the fusion's own composite and

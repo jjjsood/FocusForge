@@ -16,7 +16,8 @@ mod common;
 
 use common::align::{
     CountingReader, ESCALATION_READS, FramesReader, PATCH_COUNT, XorShift32, frame_3_tile,
-    lowered_max_iterations, open_fixture, reference_reads, streamed_band_reads, uncached_outcomes,
+    lowered_max_iterations, open_fixture, open_stack_context, reference_reads, streamed_band_reads,
+    uncached_outcomes,
 };
 
 use focusforge_core::algorithm::AlignOutcome;
@@ -141,14 +142,7 @@ fn anchored_runs_match_serial_parallel_and_uncached() {
 
 #[test]
 fn chain_mode_stays_serial() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
+    let (stack, stack_ctx) = open_stack_context("mantis-64");
     let mut cfg = lowered_max_iterations(&stack_ctx);
     cfg.insert(
         "reference-policy".to_string(),

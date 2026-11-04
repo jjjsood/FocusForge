@@ -43,15 +43,11 @@ fn cropped_run_declares_both_outputs_at_the_crop() {
         params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve must succeed");
     let values = params::resolved_values(&resolved);
 
-    let scratch_dir = common::workspace_root()
-        .join(".scratch")
-        .join("cropped_output");
-    std::fs::create_dir_all(&scratch_dir).expect("scratch dir must be creatable");
-    let composite_path = scratch_dir.join("composite.tif");
-    let zmap_path = scratch_dir.join("zmap.tif");
+    let temp = common::target_tmp();
+    let composite_path = temp.path().join("composite.tif");
+    let zmap_path = temp.path().join("zmap.tif");
 
-    let scheduler_scratch =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cropped_output_scheduler");
+    let scheduler_scratch = temp.path().join("scheduler");
     let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, 1 << 30);
     options.tile_size = 448;
     options.levels = 5;

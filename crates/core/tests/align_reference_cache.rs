@@ -10,7 +10,7 @@ mod common;
 
 use common::align::{
     CountingReader, ESCALATION_READS, anchor_defaults, lowered_max_iterations, open_fixture,
-    reference_reads, uncached_outcomes,
+    open_stack_context, reference_reads, uncached_outcomes,
 };
 
 use std::sync::Arc;
@@ -294,31 +294,33 @@ fn assert_mismatched_prepared_is_ignored(
 
 #[test]
 fn prepared_for_another_reference_frame_is_ignored() {
-    let stack = open_fixture();
-    let cfg = lowered_max_iterations(&stack_context(&stack));
-    assert_mismatched_prepared_is_ignored((&stack, 4, &cfg), (&stack, 2, &cfg), &[1, 6]);
+    let (stack, ctx) = open_stack_context("mantis-64");
+    let cfg = lowered_max_iterations(&ctx);
+    assert_mismatched_prepared_is_ignored((&stack, 0, &cfg), (&stack, 2, &cfg), &[1]);
 }
 
 #[test]
 fn prepared_for_another_mode_is_ignored() {
-    let stack = open_fixture();
-    let cfg = lowered_max_iterations(&stack_context(&stack));
+    let (stack, ctx) = open_stack_context("mantis-64");
+    let cfg = lowered_max_iterations(&ctx);
     let mut translation = cfg.clone();
     translation.insert(
         "mode".to_string(),
         ParamValue::Enum("translation".to_string()),
     );
-    assert_mismatched_prepared_is_ignored((&stack, 4, &translation), (&stack, 4, &cfg), &[1, 6]);
+    assert_mismatched_prepared_is_ignored((&stack, 1, &translation), (&stack, 1, &cfg), &[0, 2]);
 }
 
+/// The automatic depth at 64 px is 0: the prepared reference lacks the
+/// coarse level the run's explicit depth 1 needs.
 #[test]
 fn prepared_for_another_pyramid_depth_is_ignored() {
-    let stack = open_fixture();
-    let cfg = lowered_max_iterations(&stack_context(&stack));
-    let mut shallow = cfg.clone();
-    shallow.insert("pyramid-depth".to_string(), ParamValue::Int(2));
-    assert_ne!(cfg.get("pyramid-depth"), shallow.get("pyramid-depth"));
-    assert_mismatched_prepared_is_ignored((&stack, 4, &shallow), (&stack, 4, &cfg), &[1, 6]);
+    let (stack, ctx) = open_stack_context("mantis-64");
+    let cfg = lowered_max_iterations(&ctx);
+    let mut deeper = cfg.clone();
+    deeper.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+    assert_ne!(cfg.get("pyramid-depth"), deeper.get("pyramid-depth"));
+    assert_mismatched_prepared_is_ignored((&stack, 1, &cfg), (&stack, 1, &deeper), &[0, 2]);
 }
 
 #[test]
