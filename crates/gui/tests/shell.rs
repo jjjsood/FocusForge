@@ -201,6 +201,7 @@ fn checkpoint_panel_touches_no_storage() {
         "overlay.rs",
         "performance_settings.rs",
         "calculator.rs",
+        "analytics.rs",
         "recent.rs",
         "settings.rs",
     ];
@@ -3237,6 +3238,55 @@ mod notification {
         }
     }
 
+    fn button_rect(app: &AppWindow, label: &str) -> (f32, f32, f32, f32) {
+        let found: Vec<_> = ElementQuery::from_root(app)
+            .match_accessible_role(AccessibleRole::Button)
+            .find_all()
+            .into_iter()
+            .filter(|b| b.accessible_label().as_deref() == Some(label))
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one button named {label:?}");
+        let (pos, size) = (found[0].absolute_position(), found[0].size());
+        (pos.x, pos.y, size.width, size.height)
+    }
+
+    #[test]
+    fn analytics_button_sits_under_the_calculator_button() {
+        for height in [600u32, 760, 900] {
+            let controller =
+                common::controller_with_frames(&format!("shell_analytics_{height}"), 2);
+            let rig = rig(controller, 1440, height);
+            let h = height as f32;
+            let calculator = button_rect(&rig.app, "Step calculator");
+            let analytics = button_rect(&rig.app, "Analytics");
+            assert_eq!(analytics.0, calculator.0, "same x at {height}");
+            assert_eq!(
+                (analytics.2, analytics.3),
+                (calculator.2, calculator.3),
+                "same size at {height}"
+            );
+            assert_eq!(analytics.1, calculator.1 + 40.0, "40 px below at {height}");
+
+            assert_rect(&rig.app, "FFIconBar::bell", (8.0, h - 80.0, 32.0, 32.0));
+            assert_rect(&rig.app, "FFIconBar::settings", (8.0, h - 40.0, 32.0, 32.0));
+
+            // Declared after the rail, the button takes the click the rail's
+            // ground would otherwise get.
+            rig.controller
+                .lock()
+                .unwrap()
+                .set_analytics_hold(Duration::from_secs(30));
+            rig.click(
+                analytics.0 + analytics.2 / 2.0,
+                analytics.1 + analytics.3 / 2.0,
+            );
+            assert!(
+                rig.controller.lock().unwrap().analytics_open(),
+                "the click reaches the button at {height}"
+            );
+        }
+    }
+
     #[test]
     fn unread_badge_counts_and_hides_at_zero() {
         let rig = rig(controller_with_refusals("shell_badge", 3), 1440, 900);
@@ -3484,7 +3534,11 @@ mod notification {
     /// unread bell glyph and the muted close glyph are `FFIconButton`'s own.
     #[test]
     fn icon_bar_and_center_set_no_colour_themselves() {
-        for file in ["shell/icon_bar.slint", "shell/notification_center.slint"] {
+        for file in [
+            "shell/icon_bar.slint",
+            "shell/notification_center.slint",
+            "shell/analytics_overlay.slint",
+        ] {
             let source = ui_source(file);
             for needle in [
                 "color:",

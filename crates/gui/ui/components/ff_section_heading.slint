@@ -24,6 +24,8 @@ export component FFSectionHeading inherits Rectangle {
     // A settings section's heading: the bare label on a transparent ground,
     // no badge and no rule, `settings-heading-height` tall.
     in property <bool> flat: false;
+    // The label in the secondary text colour instead of the muted one.
+    in property <bool> strong: false;
 
     background: root.opaque && !root.flat ? Theme.surface-raised : transparent;
     // The label/badge band's own height -- every child below positions
@@ -45,7 +47,7 @@ export component FFSectionHeading inherits Rectangle {
         // the descender space that metric reserves is never actually used.
         y: root.compact || root.flat ? 0px : (root.head-height - self.height) / 2;
         text: root.label;
-        color: Theme.text-muted;
+        color: root.strong ? Theme.text-secondary : Theme.text-muted;
         font-size: Theme.text-section.size;
         font-weight: Theme.text-section.weight;
         letter-spacing: Theme.text-section.letter-spacing;

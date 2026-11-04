@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The left icon bar: the step calculator button at the top, and the
-// notification bell with its unread count above Settings, stacked up from
+// The left icon bar: the step calculator and Analytics buttons at the top, and
+// the notification bell with its unread count above Settings, stacked up from
 // the window's bottom edge.
 
 import { Theme } from "../theme.slint";
@@ -15,7 +15,12 @@ export component FFIconBar inherits Rectangle {
     in property <bool> center-open: false;
     // The calculator button is drawn selected while its overlay is open.
     in property <bool> calculator-open: false;
+    // The Analytics button is drawn selected while its overlay is open, and
+    // disabled with no stack to count.
+    in property <bool> analytics-open: false;
+    in property <bool> analytics-enabled: false;
     callback calculator-activated();
+    callback analytics-activated();
     callback bell-activated();
     callback settings-requested();
 
@@ -57,5 +62,15 @@ export component FFIconBar inherits Rectangle {
         current: root.calculator-open;
         accessible-label: "Step calculator";
         triggered => { root.calculator-activated(); }
+    }
+    FFIconButton {
+        x: Theme.space-2;
+        y: Theme.space-2 + ShellGeometry.icon-bar-slot-height;
+        icon: @image-url("../../../../assets/icons/chart-bar.svg");
+        focusable: true;
+        current: root.analytics-open;
+        enabled: root.analytics-enabled;
+        accessible-label: "Analytics";
+        triggered => { root.analytics-activated(); }
     }
 }

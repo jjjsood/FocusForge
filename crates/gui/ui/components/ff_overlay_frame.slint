@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A full-canvas overlay: title and close x over a rule, the body, and a
-// footer band under a rule. Children fill the body; `footer-y` and
-// `footer-height` place the caller's footer content.
+// footer band under a rule, drawn only while `footer-height` is above 0.
+// Children fill the body; `footer-y` and `footer-height` place the
+// caller's footer content.
 
 import { Theme } from "../theme.slint";
 import { FFIconButton } from "ff_icon_button.slint";
@@ -49,7 +50,7 @@ export component FFOverlayFrame inherits Rectangle {
 
         @children
     }
-    Rectangle {
+    if root.footer-height > 0px: Rectangle {
         y: root.footer-y;
         width: 100%;
         height: root.footer-height;

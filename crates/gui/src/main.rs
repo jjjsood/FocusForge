@@ -114,6 +114,12 @@ struct Args {
     /// Opens the step calculator overlay at startup.
     #[arg(long)]
     calculator: bool,
+    /// Opens the Analytics overlay once the `--open` load has landed.
+    #[arg(long, requires = "open")]
+    analytics: bool,
+    /// With `--analytics`, holds the count's worker for MS milliseconds.
+    #[arg(long, requires = "analytics", value_name = "MS")]
+    analytics_hold_ms: Option<u64>,
     /// With `--calculator`, selects the objective optics.
     #[arg(long, requires = "calculator")]
     calculator_objective: bool,
@@ -1979,6 +1985,36 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
                 canvas.clone(),
                 &open_wait_timer,
                 rest.to_vec(),
+            );
+        }
+
+        let analytics_timer = Rc::new(slint::Timer::default());
+        if args.analytics {
+            if let Some(ms) = args.analytics_hold_ms {
+                controller
+                    .lock()
+                    .unwrap()
+                    .set_analytics_hold(Duration::from_millis(ms));
+            }
+            let controller = controller.clone();
+            let timer = analytics_timer.clone();
+            let tabs = args.open.len();
+            analytics_timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(50),
+                move || {
+                    let mut controller = controller.lock().unwrap();
+                    // Every `--open` has produced a tab; a later load would
+                    // switch tabs and close the overlay.
+                    if controller.load_in_flight()
+                        || !controller.analytics_enabled()
+                        || controller.project_tabs().len() < tabs
+                    {
+                        return;
+                    }
+                    controller.toggle_analytics();
+                    timer.stop();
+                },
             );
         }
 

@@ -1081,6 +1081,7 @@ const RAW_GESTURE_CALLBACK_EXCEPTIONS: &[&str] = &[
     "ff_modal_panel.slint",
     "projects_overlay.slint",
     "calculator_overlay.slint",
+    "analytics_overlay.slint",
 ];
 
 #[test]

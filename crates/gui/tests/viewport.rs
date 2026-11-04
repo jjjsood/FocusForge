@@ -682,6 +682,7 @@ fn gestures_come_from_the_input_map() {
         "ff_modal_panel.slint",
         "projects_overlay.slint",
         "calculator_overlay.slint",
+        "analytics_overlay.slint",
     ];
     for path in common::find_slint_files(&common::ui_dir()) {
         if path

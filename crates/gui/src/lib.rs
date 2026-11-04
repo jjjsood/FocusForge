@@ -131,5 +131,8 @@ pub mod recent;
 /// `tests/checkpoint_panel.rs` reaches its types directly.
 pub mod checkpoints;
 
+/// The Analytics overlay's rows and count.
+pub mod analytics;
+
 /// The step calculator's state and views.
 pub mod calculator;
