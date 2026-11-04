@@ -32,6 +32,7 @@ decides silently:
   the EXIF `DateTimeOriginal` tag (36867) of a TIFF, or the capture time a RAW
   file records. The TIFF `DateTime` tag (306) is never used: an editor such as
   darktable rewrites it with the export time.
+- **Camera RAW and TIFF files in one folder** always form separate stacks.
 
 The reason for each split is named on the grouping line, and each group lists
 the signal that made it. A folder with two subfolders `a/` and `b/` of three

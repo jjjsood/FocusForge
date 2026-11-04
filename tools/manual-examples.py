@@ -509,7 +509,7 @@ def motion(r: Runner, emit) -> None:
     size = (480, 480)
     unaligned = r.fuse("motion-unaligned", shifted, size, *DETAILS, "--no-align")
     aligned = r.fuse("motion-aligned", shifted, size, *DETAILS)
-    window = (150, 20, 288, 288)
+    window = (120, 90, 256, 256)
     panels = [r.composite(f).crop(*in_reference(f, *window)) for f in (unaligned, aligned)]
     emit("failure-images/motion.jpg", side_by_side(panels))
 
