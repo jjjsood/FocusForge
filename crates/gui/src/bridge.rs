@@ -40,7 +40,7 @@ use crate::generated::{
     ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView,
     PerformanceCap, PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
     RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StoragePathState, StorageState,
+    StageTile, StoragePathState, StorageState, Theme,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -328,6 +328,7 @@ fn publish_completed(
         (controller.frame_draw(), controller.plane_draw())
     };
     show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+    push_stage_view_after_draw(app, controller, &canvas.borrow(), plane_draw);
     show_comparison_pane(app, controller, &canvas.borrow(), frame_draw, plane_draw);
     // The textures were rendered into in place; Slint sees no property change.
     app.window().request_redraw();
@@ -528,7 +529,6 @@ fn show_comparison_pane(
                 }
             }
             PaneSource::Composite => {
-                window.set_pane_label("Composite".into());
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
                 match plane_draw
@@ -695,6 +695,7 @@ pub fn repaint(
         overlay.as_ref(),
     );
     show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
+    push_stage_view_after_draw(app, controller, &canvas.borrow(), plane_draw);
     show_comparison_pane(app, controller, &canvas.borrow(), frame_draw, plane_draw);
 }
 
@@ -1116,6 +1117,9 @@ fn open_comparison(
     canvas: &Rc<RefCell<Canvas>>,
 ) -> Result<(), slint::PlatformError> {
     let window = Rc::new(ComparisonWindow::new()?);
+    window
+        .global::<Theme>()
+        .set_reduce_motion(controller.lock().unwrap().reduce_motion());
     window.on_dock_requested({
         let app_weak = app.as_weak();
         let controller = controller.clone();
@@ -1779,6 +1783,148 @@ pub fn push_job(app: &AppWindow, view: &JobView) {
     app.set_fuse_enabled(view.fuse_enabled);
 }
 
+/// The sharpness ramp the theme's colour tokens define.
+pub fn heat_ramp(theme: &Theme<'_>) -> job::HeatRamp {
+    let rgb = |c: slint::Color| [c.red(), c.green(), c.blue()];
+    job::HeatRamp::new([
+        rgb(theme.get_surface_canvas()),
+        rgb(theme.get_accent_subtle()),
+        rgb(theme.get_accent_pressed()),
+        rgb(theme.get_accent_default()),
+        rgb(theme.get_text_primary()),
+    ])
+}
+
+/// [`push_stage_view`] once `show_panes` has run: a Composite pane that now
+/// holds an image lets a landed run's mosaic go in the same pass, so the
+/// pane never shows neither.
+fn push_stage_view_after_draw(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Canvas,
+    plane_draw: Option<PaneDraw>,
+) {
+    let mut controller = controller.lock().unwrap();
+    if let (Some(renderer), Some(draw)) = (canvas.renderer.as_ref(), plane_draw.as_ref())
+        && (renderer.placement(Pane::Composite, draw).is_some()
+            || renderer.backdrop_placement(Pane::Composite, draw).is_some())
+    {
+        controller.composite_drawn(Instant::now());
+    }
+    push_stage_view(app, &controller);
+}
+
+/// The Composite pane's label and stage view as the properties the docked
+/// window and the detached Composite window both take.
+#[derive(Default)]
+struct StageProps {
+    label: String,
+    card: (&'static str, &'static str),
+    visible: bool,
+    inset_only: bool,
+    inset_visible: bool,
+    mosaic_fading: bool,
+    inset_fading: bool,
+    source: slint::Image,
+    heat: slint::Image,
+    rect: (f32, f32, f32, f32),
+    tiles: Vec<StageTile>,
+}
+
+/// Sets `$props` on `$target`, a window with the `stage-*` properties.
+macro_rules! apply_stage {
+    ($target:expr, $props:expr) => {{
+        let (t, p) = (&$target, &$props);
+        t.set_stage_card_title(p.card.0.into());
+        t.set_stage_card_body(p.card.1.into());
+        t.set_stage_visible(p.visible);
+        t.set_stage_inset_only(p.inset_only);
+        t.set_stage_inset_visible(p.inset_visible);
+        t.set_stage_mosaic_fading(p.mosaic_fading);
+        t.set_stage_inset_fading(p.inset_fading);
+        t.set_stage_source(p.source.clone());
+        t.set_stage_heat(p.heat.clone());
+        t.set_stage_image_x(p.rect.0);
+        t.set_stage_image_y(p.rect.1);
+        t.set_stage_image_w(p.rect.2);
+        t.set_stage_image_h(p.rect.3);
+        t.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(p.tiles.clone())));
+    }};
+}
+
+/// The live run's stage view, placed over the pane the way the composite
+/// itself is, so the stage image follows the shared zoom and pan; everything
+/// is empty while no run shows one.
+fn stage_props(controller: &AppController) -> StageProps {
+    let mut props = StageProps {
+        label: "Composite".to_string(),
+        ..StageProps::default()
+    };
+    match controller.stage_view(Instant::now()) {
+        Some(job::StageView::Inset { pixels, fading }) => {
+            props.inset_only = true;
+            props.inset_fading = fading;
+            props.inset_visible = true;
+            props.visible = true;
+            props.heat = source_preview_image(Some(&pixels));
+        }
+        Some(job::StageView::Picture(stage)) => {
+            if let Some(draw) = controller.plane_draw() {
+                props.label = truncate_pane_label(&stage.label);
+                let extent = stage.extent;
+                let (x, y, w, h) = draw.place((extent.x, extent.y, extent.width, extent.height));
+                // Whole-pixel edges keep the one-pixel grid lines crisp, and
+                // tiles that share an edge round it the same way.
+                let scale = |v: u32, origin: f32, size: f32, over: u32| {
+                    (origin + size * v as f32 / over.max(1) as f32).round()
+                };
+                props.tiles = stage
+                    .tiles
+                    .iter()
+                    .map(|mark| {
+                        let r = mark.rect;
+                        let x0 = scale(r.x, x, w, extent.width);
+                        let y0 = scale(r.y, y, h, extent.height);
+                        StageTile {
+                            x: x0,
+                            y: y0,
+                            width: scale(r.x + r.width, x, w, extent.width) - x0,
+                            height: scale(r.y + r.height, y, h, extent.height) - y0,
+                            front: mark.front,
+                        }
+                    })
+                    .collect();
+                props.source = source_preview_image(Some(&stage.pixels));
+                props.heat = source_preview_image(stage.inset.as_ref());
+                props.rect = (x, y, w, h);
+                props.mosaic_fading = stage.fading;
+                props.inset_fading = stage.inset_fading;
+                props.inset_visible = stage.inset.is_some();
+                props.visible = true;
+            }
+        }
+        Some(job::StageView::Placeholder { title, body }) => props.card = (title, body),
+        None => {}
+    }
+    props
+}
+
+/// Pushes the live run's stage view and the Composite pane's label to the
+/// docked window and, while the Composite pane is detached, to its window.
+pub fn push_stage_view(app: &AppWindow, controller: &AppController) {
+    let props = stage_props(controller);
+    app.set_composite_label(props.label.as_str().into());
+    apply_stage!(app, props);
+    if controller.detached_pane() == Some(PaneSource::Composite) {
+        COMPARISON_WINDOW.with(|slot| {
+            if let Some(window) = slot.borrow().as_ref() {
+                window.set_pane_label(props.label.as_str().into());
+                apply_stage!(window, props);
+            }
+        });
+    }
+}
+
 /// Installs a repeating timer, on the window's own clock ([`job::POLL`]),
 /// that polls the live run's progress onto the toolbar/bottom-bar
 /// properties, opens the failure toast the moment a run fails, and stops
@@ -1815,6 +1961,10 @@ fn start_job_timer(
         let view = controller.lock().unwrap().job_view();
         let live = controller.lock().unwrap().work_pending();
         push_job(&app, &view);
+        // Checked before the push: the tick that finds the inset's time up
+        // drops it, clears it from the pane and may stop the timer.
+        let inset_pending = controller.lock().unwrap().inset_pending(Instant::now());
+        push_stage_view(&app, &controller.lock().unwrap());
         push_projects_overlay(&app, &controller.lock().unwrap());
         push_divergence(&app, &controller.lock().unwrap());
         if !live {
@@ -1838,7 +1988,10 @@ fn start_job_timer(
             // The finished run lifts the clear's refusal.
             push_storage_view(&app, &controller);
         }
-        if !live && let Some(t) = timer_slot.borrow().as_ref() {
+        if !live
+            && !inset_pending
+            && let Some(t) = timer_slot.borrow().as_ref()
+        {
             t.stop();
         }
     });
@@ -2800,6 +2953,10 @@ pub fn install(
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Installed {
     TOAST_SLOT.with(|slot| *slot.borrow_mut() = Rc::downgrade(&toast_timer));
+    controller
+        .lock()
+        .unwrap()
+        .set_heat_ramp(heat_ramp(&app.global::<Theme>()));
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let preview_timer = slint::Timer::default();
@@ -3589,6 +3746,42 @@ pub fn install(
                 push_images_panel(&app, &controller.lock().unwrap());
                 repaint(&app, &controller, &canvas);
             }
+        }
+    });
+    app.on_appearance_sharpness_heatmap_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            let save_error = {
+                let mut state = controller.lock().unwrap();
+                state.set_sharpness_heatmap(on);
+                state.appearance_save_error().map(str::to_owned)
+            };
+            if let Some(app) = app_weak.upgrade() {
+                app.set_appearance_sharpness_heatmap(on);
+                app.set_appearance_save_error(save_error.unwrap_or_default().into());
+            }
+        }
+    });
+    app.on_appearance_reduce_motion_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            let save_error = {
+                let mut state = controller.lock().unwrap();
+                state.set_reduce_motion(on);
+                state.appearance_save_error().map(str::to_owned)
+            };
+            if let Some(app) = app_weak.upgrade() {
+                app.set_appearance_reduce_motion(on);
+                app.global::<Theme>().set_reduce_motion(on);
+                app.set_appearance_save_error(save_error.unwrap_or_default().into());
+            }
+            COMPARISON_WINDOW.with(|slot| {
+                if let Some(window) = slot.borrow().as_ref() {
+                    window.global::<Theme>().set_reduce_motion(on);
+                }
+            });
         }
     });
     app.on_appearance_menu_toggled({
@@ -5533,6 +5726,46 @@ mod tests {
                 press_cycle(window, &rig.calls, centre_of(&*detached, id), Left, &[]);
             }
         }
+        super::hide_comparison();
+    }
+
+    #[test]
+    fn detached_window_follows_reduced_motion() {
+        const NAME: &str = "bridge::tests::detached_window_follows_reduced_motion";
+        if runs_in_child(NAME) {
+            return;
+        }
+        let rig = DragRig::new();
+        let frames = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames");
+        {
+            let mut controller = rig.controller.lock().unwrap();
+            if let Some(load) = controller.open_paths(&[frames]) {
+                load.join().expect("the load worker did not panic");
+            }
+            controller.settle_open().expect("the fixture load settles");
+            controller.undock_requested(PaneSource::Frame);
+            controller.set_reduce_motion(true);
+        }
+        super::open_comparison(&rig.app, PaneSource::Frame, &rig.controller, &rig.canvas)
+            .expect("the detached window opens on the testing backend");
+        let detached = super::COMPARISON_WINDOW
+            .with(|slot| slot.borrow().as_ref().cloned())
+            .expect("the detached window is kept");
+        let fade = || detached.global::<super::Theme>().get_motion_fast();
+        assert!(
+            detached.global::<super::Theme>().get_reduce_motion(),
+            "a window opened under reduced motion starts with it"
+        );
+        assert_eq!(fade(), 0);
+
+        rig.app.invoke_appearance_reduce_motion_toggled(false);
+        assert!(!detached.global::<super::Theme>().get_reduce_motion());
+        assert_eq!(fade(), 150);
+
+        rig.app.invoke_appearance_reduce_motion_toggled(true);
+        assert!(detached.global::<super::Theme>().get_reduce_motion());
+        assert!(rig.app.global::<super::Theme>().get_reduce_motion());
+        assert!(rig.controller.lock().unwrap().reduce_motion());
         super::hide_comparison();
     }
 }

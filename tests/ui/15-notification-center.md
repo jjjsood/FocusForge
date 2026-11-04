@@ -23,7 +23,7 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 5. Click **Fuse stack** (`FFToolbar::fuse-button`).
    Expect: the dialog "Keep this fused result?" appears (within 90 s) and the bell shows the number 8.
 6. Click **Keep** (`AppWindow::divergence-warning`).
-   Expect: the dialog is gone; the bell shows the number 9.
+   Expect: the dialog is gone; the bell shows the number 9 (within 1 s).
 
 ## Open the center from the bell
 7. Click **Notifications** (`FFIconBar::bell`).
@@ -47,9 +47,9 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 14. Click **Close notifications** (`AppWindow::notification-center`).
     Expect: the center is gone and the bell shows no number.
 15. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the Projects overview opens to the right of the icon bar; the bell and Settings stay visible in the icon bar.
+    Expect: the Projects overview opens to the right of the icon bar; the bell and Settings stay visible in the icon bar (within 1 s).
 16. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overview is gone and the center stays closed.
+    Expect: the overview is gone and the center stays closed (within 1 s).
 
 ## A second run, counted from the bell
 17. Click **STACKING** (`FFModeSwitch::stacking-half`).
@@ -57,23 +57,23 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 18. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: the dialog "Keep this fused result?" appears (within 60 s) and the bell shows the number 8, not 17.
 19. Click **Keep** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone and the bell shows the number 9.
+    Expect: the dialog is gone and the bell shows the number 9 (within 1 s).
 20. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overview opens with the center closed; the bell shows the number 9 in the icon bar.
+    Expect: the overview opens with the center closed; the bell shows the number 9 in the icon bar (within 1 s).
 21. Click **Notifications** (`FFIconBar::bell`).
-    Expect: the overview is gone and the center is open reading "18 notifications · this session"; the bell number is gone.
+    Expect: the overview is gone and the center is open reading "18 notifications · this session"; the bell number is gone (within 1 s).
 22. Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: Must not: the center stays open next to the overview; the overview shows, the center is gone and the bell shows no number.
+    Expect: Must not: the center stays open next to the overview; the overview shows, the center is gone and the bell shows no number (within 1 s).
 
 ## Toasts (window focused)
 23. (human only) Click **Projects** (`FFTabStrip::projects-button`).
-    Expect: the overview is gone.
+    Expect: the overview is gone (within 1 s).
 24. (human only) Click **STACKING** (`FFModeSwitch::stacking-half`).
     Expect: **Fuse stack** shows in the toolbar.
 25. (human only) Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: the dialog "Keep this fused result?" appears (within 60 s) and the bell shows the number 8.
 26. (human only) Click **Keep** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone; the bell shows the number 9; a toast with a title and "Open notification" shows at the top left of the canvas under the toolbar.
+    Expect: the dialog is gone; the bell shows the number 9; a toast with a title and "Open notification" shows at the top left of the canvas under the toolbar (within 2 s).
 27. (human only) Click **Dismiss notification** (`FFToast::close`).
     Expect: Must not: the center opens or the number changes; the center stays closed and the bell still shows the number 9.
 28. (human only) Click the toast (`FFToast::card`) that shows next.
@@ -81,7 +81,7 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 
 ## A crash record
 29. (human only) Quit the window. Make a data folder holding `focusforge/crashes/20260918T010203Z-focusforge-gui-panic.json` with the content `{"format":1,"payload":"boom"}`, then start the window again with the same arguments, a throwaway `--config-dir` and `FOCUSFORGE_DATA_DIR` set to that folder.
-    Expect: a toast titled "Previous session stopped" with an amber stripe and "Open notification" shows at the top left of the canvas; the bell shows the number 1.
+    Expect: a toast titled "Previous session stopped" with an amber stripe and "Open notification" shows at the top left of the canvas; the bell shows the number 1 (within 2 s).
 30. (human only) Move the pointer onto the toast and keep it there for 20 seconds.
     Expect: the toast is still showing after 20 seconds, twice its 10 second lifetime.
 31. (human only) Move the pointer off the toast.

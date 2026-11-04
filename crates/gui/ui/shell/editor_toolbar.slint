@@ -3,6 +3,7 @@
 // The editor-mode toolbar: brush size and softness, the pipette, undo/redo
 // and the checkpoint button.
 
+import { FFAppear } from "../components/ff_appear.slint";
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFSlider } from "../components/ff_slider.slint";
@@ -10,7 +11,7 @@ import { FFIconButton } from "../components/ff_icon_button.slint";
 import { FFButton } from "../components/ff_button.slint";
 import { FFRowText } from "../components/ff_row_text.slint";
 
-export component FFEditorToolbar inherits Rectangle {
+export component FFEditorToolbar inherits FFAppear {
     in property <string> size-text: "";
     in property <float> size-fraction: 0.0;
     in property <int> size-ceiling: 1;

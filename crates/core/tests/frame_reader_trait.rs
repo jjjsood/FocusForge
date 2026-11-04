@@ -312,6 +312,7 @@ impl StackAlgorithm for SourceSelector {
                 samples,
             },
             zmap,
+            sharpness: None,
         })
     }
 }

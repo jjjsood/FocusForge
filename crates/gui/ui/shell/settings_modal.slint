@@ -5,6 +5,7 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFAppear } from "../components/ff_appear.slint";
 import { FFModalPanel } from "../components/ff_modal_panel.slint";
 import { FFHeading } from "../components/ff_heading.slint";
 import { FFDivider } from "../components/ff_divider.slint";
@@ -38,7 +39,11 @@ export component FFSettingsModal inherits FFModalPanel {
     in property <bool> appearance-menu-focused: false;
     in property <bool> appearance-menu-disabled: false;
     in property <string> appearance-save-error: "";
+    in property <bool> appearance-sharpness-heatmap: true;
+    in property <bool> appearance-reduce-motion: false;
     callback appearance-presentation-selected(string);
+    callback appearance-sharpness-heatmap-toggled(bool);
+    callback appearance-reduce-motion-toggled(bool);
     callback appearance-menu-toggled();
 
     in property <StorageState> storage;
@@ -167,72 +172,106 @@ export component FFSettingsModal inherits FFModalPanel {
             return reject;
         }
 
-        if root.settings-section == "diagnostics": FFDiagnosticsPanel {
+        if root.settings-section == "diagnostics": FFAppear {
             width: 100%;
             height: 100%;
-            rows: root.diagnostics-rows;
-            note: root.diagnostics-note;
-            include-minidumps: root.diagnostics-include-minidumps;
-            destination: root.diagnostics-destination;
-            status: root.diagnostics-status;
-            message: root.diagnostics-message;
-            primary-label: root.diagnostics-primary-label;
-            busy: root.diagnostics-busy;
-            loading: root.diagnostics-loading;
-            manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
-            manifest-content-height: root.diagnostics-manifest-content-height;
-            destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
-            minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
-            destination-edited(t) => { root.diagnostics-destination-edited(t); }
-            destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
-            primary-clicked => { root.diagnostics-primary-clicked(); }
-            manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
-            manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
-            manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
-            manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+            FFDiagnosticsPanel {
+                width: 100%;
+                height: 100%;
+                rows: root.diagnostics-rows;
+                note: root.diagnostics-note;
+                include-minidumps: root.diagnostics-include-minidumps;
+                destination: root.diagnostics-destination;
+                status: root.diagnostics-status;
+                message: root.diagnostics-message;
+                primary-label: root.diagnostics-primary-label;
+                busy: root.diagnostics-busy;
+                loading: root.diagnostics-loading;
+                manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+                manifest-content-height: root.diagnostics-manifest-content-height;
+                destination-scroll-offset: root.diagnostics-destination-scroll-offset;
+
+                minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+                destination-edited(t) => { root.diagnostics-destination-edited(t); }
+                destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+                primary-clicked => { root.diagnostics-primary-clicked(); }
+                manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+                manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+                manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+                manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+            }
         }
 
-        if root.settings-section == "performance": FFPerformanceTab {
+        if root.settings-section == "performance": FFAppear {
             width: 100%;
             height: 100%;
-            performance: root.performance;
 
-            gpu-toggled(on) => { root.performance-gpu-toggled(on); }
-            host-cap-edited(t) => { root.performance-host-cap-edited(t); }
-            vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
-            host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
-            vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+            FFPerformanceTab {
+                width: 100%;
+                height: 100%;
+                performance: root.performance;
+
+                gpu-toggled(on) => { root.performance-gpu-toggled(on); }
+                host-cap-edited(t) => { root.performance-host-cap-edited(t); }
+                vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+                host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
+                vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+            }
         }
 
-        if root.settings-section == "appearance": FFAppearanceTab {
+        if root.settings-section == "appearance": FFAppear {
             width: 100%;
             height: 100%;
-            presentation: root.appearance-presentation;
-            menu-open: root.appearance-menu-open;
-            menu-focused: root.appearance-menu-focused;
-            menu-disabled: root.appearance-menu-disabled;
-            save-error: root.appearance-save-error;
-            presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
-            menu-toggled => { root.appearance-menu-toggled(); }
+
+            FFAppearanceTab {
+                width: 100%;
+                height: 100%;
+                presentation: root.appearance-presentation;
+                menu-open: root.appearance-menu-open;
+                menu-focused: root.appearance-menu-focused;
+                menu-disabled: root.appearance-menu-disabled;
+                save-error: root.appearance-save-error;
+                sharpness-heatmap: root.appearance-sharpness-heatmap;
+                reduce-motion: root.appearance-reduce-motion;
+                presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+                sharpness-heatmap-toggled(on) => { root.appearance-sharpness-heatmap-toggled(on); }
+                reduce-motion-toggled(on) => { root.appearance-reduce-motion-toggled(on); }
+                menu-toggled => { root.appearance-menu-toggled(); }
+            }
         }
 
-        if root.settings-section == "storage": FFStorageTab {
+        if root.settings-section == "storage": FFAppear {
             width: 100%;
             height: 100%;
-            storage: root.storage;
 
-            clear-requested => { root.storage-clear-requested(); }
+            FFStorageTab {
+                width: 100%;
+                height: 100%;
+                storage: root.storage;
+
+                clear-requested => { root.storage-clear-requested(); }
+            }
         }
 
-        if root.settings-section == "input-map": FFInputMapTab {
-            input-rows: root.input-rows;
-        }
-
-        if root.settings-section == "about": FFAboutTab {
+        if root.settings-section == "input-map": FFAppear {
             width: 100%;
             height: 100%;
-            about: root.about;
+
+            FFInputMapTab {
+                input-rows: root.input-rows;
+            }
+        }
+
+        if root.settings-section == "about": FFAppear {
+            width: 100%;
+            height: 100%;
+
+            FFAboutTab {
+                width: 100%;
+                height: 100%;
+                about: root.about;
+            }
         }
     }
 }
