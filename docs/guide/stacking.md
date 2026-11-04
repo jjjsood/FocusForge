@@ -336,7 +336,7 @@ the Settings tab shows that project's settings.
 
 ## While a fuse is running
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the bottom bar reads Aligning with a progress bar and an ETA, and the whole Settings tab in the dock is drawn faded.](../assets/manual/stacking/stacking-locked-during-run.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the Composite pane shows the card "Preparing frames", the bottom bar reads Aligning with a progress bar and an ETA, and the whole Settings tab in the dock is drawn faded.](../assets/manual/stacking/stacking-locked-during-run.png)
 
 *During a run the Settings tab is faded and locked.*
 

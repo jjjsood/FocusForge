@@ -33,7 +33,7 @@ what will be written:
 You do not have to save the project or keep your strokes as a checkpoint
 before exporting: the dialog writes exactly what the **Composite** pane shows.
 
-![The Export image dialog with TIFF selected: the lines "mantis-512-fused.ffp · Details" with a date and "Exporting the saved checkpoint you selected.", the Format row with TIFF, PNG and JPEG, TIFF SETTINGS with Bit depth 16-bit and Compression None, the METADATA switch turned on, and the buttons Cancel and Export](../assets/manual/export/export-tiff.png)
+![The Export image dialog with TIFF selected: the lines "mantis-512-fused.ffp · Details" with a date and "Exporting the saved checkpoint you selected.", the Format row with TIFF, PNG, JPEG and DNG, TIFF SETTINGS with Bit depth 16-bit and Compression None, the METADATA switch turned on, and the buttons Cancel and Export](../assets/manual/export/export-tiff.png)
 
 *The export dialog for a saved checkpoint, with the TIFF settings it starts with.*
 

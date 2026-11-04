@@ -39,6 +39,16 @@ crop  = "FFModalPanel::panel"
 pad   = 16
 
 [[shot]]
+name  = "first-stack-one-frame"
+args  = ["--open", "fixtures/mantis-64/frames/00.tif"]
+steps = [
+  ["wait-text", "1 frame · 0 excluded", "90"],
+  ["pause", "800"],
+]
+out   = "assets/manual/first-stack/one-frame.png"
+
+
+[[shot]]
 name  = "first-stack-not-a-project"
 args  = ["--open", "fixtures/projects/corrupt.ffp"]
 steps = [

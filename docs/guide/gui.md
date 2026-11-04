@@ -121,6 +121,12 @@ own view, and a Composite pane in its own window shows the same card. The
 inset is switched off under **Sharpness heatmap** in
 [Appearance](settings-window.md#appearance).
 
+![The window during a fuse, with the Frame pane showing 00.tif and the Composite pane showing the card "Preparing frames" with "Images appear here once alignment starts."; the bottom bar reads Aligning, 1 of 8, with a progress bar and an ETA.](../assets/manual/first-stack/fuse-running.png)
+
+*A run in progress; the Composite pane shows its stage card, here
+"Preparing frames". The growing
+picture passes in a few seconds on a small stack and is not shown here.*
+
 The two panes always show the same part of the picture at the same zoom: pan
 or zoom in one, and the other follows. That makes it easy to compare a
 detail in one frame with the same detail in the result.

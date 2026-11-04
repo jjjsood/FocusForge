@@ -171,6 +171,10 @@ While the question is up, the rest of the window does not react.
   **Fuse stack** is greyed out, so you can look at a frame or check how it is
   read.
 
+![The window after opening one file, 00.tif: the tab is named 00, the Frame pane shows the frame, the Composite pane reads "Not fused yet", the Images tab lists "1 frame · 0 excluded" with a single row, and the Fuse stack button is dimmed.](../assets/manual/first-stack/one-frame.png)
+
+*One TIFF file opened as a one-frame project.*
+
 ## When a folder or project will not open
 
 A path that cannot be opened never closes the window and never changes the
@@ -302,7 +306,7 @@ With the frames open:
 3. Watch the bottom bar. The window stays fully usable while the stack is
    being fused.
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, and the bottom bar shows the current stage, the frames done, a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Composite pane shows the card "Preparing frames", and the bottom bar shows the current stage (Aligning), the frames done (1 of 8), a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
 
 *A fuse in progress.*
 

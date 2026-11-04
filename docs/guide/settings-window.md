@@ -167,9 +167,9 @@ when its content is taller than the window. **Presentation** chooses how the
 | **Image list** (default) | a small preview of each frame beside its name |
 | **Large previews** | a large preview of each frame |
 
-![The Appearance section with the Presentation menu open, offering List, Image list (checked) and Large previews; below it the lines "Previews show original source images." and "Editor source rows stay read-only."](../assets/manual/settings-window/settings-appearance.png)
+![The Appearance section with the Presentation menu open, offering List, Image list (checked) and Large previews; below it the Sharpness heatmap switch, turned on, and, under MOTION, the Reduce motion switch, turned off.](../assets/manual/settings-window/settings-appearance.png)
 
-*The Presentation menu. The panel changes as soon as you pick a choice.*
+*The Presentation menu, with the two other settings below it. The panel changes as soon as you pick a choice.*
 
 Click the menu and pick a choice, or use the Up and Down keys and Return;
 Esc closes the menu without changing anything. The previews always show your
