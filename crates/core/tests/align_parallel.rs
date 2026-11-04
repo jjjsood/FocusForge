@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `align_stack_with`'s anchor arm run in parallel, checked against the same
-//! arm run serially over the same input -- the behavioural counterpart of
-//! `align_parallel_memory.rs`'s memory test.
+//! arm run serially and against an uncached per-frame loop over the same
+//! input, with the serial run's per-frame read counts bounded through a
+//! counting reader -- the behavioural counterpart of `align_parallel_memory.rs`'s
+//! memory test.
 //!
-//! Every fixture-driven test here overrides `max-iterations` down to 40 from
-//! the shipped 400: an 8-frame fixture align at the shipped default costs
-//! seconds this ordering property does not need, and a lowered cap makes some
-//! frames diverge, which the failure-policy test wants anyway. No test asserts
-//! a literal worker count from a fixture run -- `available_parallelism` is the
-//! host's -- only that the parallel arm actually engaged (`worker_limit > 1`)
-//! and that its result matches the serial arm's exactly.
+//! The fixture-driven tests lower `max-iterations` from the shipped 400 to 40:
+//! the ordering property needs no more, and some frames then diverge. No test
+//! asserts a literal worker count -- `available_parallelism` is the host's --
+//! only that the parallel arm engaged (`worker_limit > 1`) and matches the
+//! serial arm exactly.
 
 mod common;
 
