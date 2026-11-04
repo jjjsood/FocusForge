@@ -12,24 +12,24 @@ file or a number, this page writes it as `<path>`, `N` or "…".
 
 ### "No frames here"
 
-![The dialog "No frames here" with the text "FocusForge reads 16-bit TIFF (.tif, .tiff) and camera RAW files. This folder holds none." and the button Pick another folder….](assets/manual/first-stack/refusal-no-frames.png)
+![The dialog "No frames here" with the text "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none." and the button Pick another folder….](assets/manual/first-stack/refusal-no-frames.png)
 
 *The refusal for a folder that holds nothing FocusForge can stack.*
 
-> FocusForge reads 16-bit TIFF (.tif, .tiff) and camera RAW files. This folder holds none.
+> FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none.
 
-**Cause:** the folder you opened holds no frames FocusForge can read. JPEG and
-PNG files are not stacked; neither are documents or sidecar files.
+**Cause:** the folder you opened holds no frames FocusForge can read. PNG
+files are not stacked; neither are documents or sidecar files.
 
 **Fix:** click **Pick another folder…** and choose the folder that holds the
-frames, or press `Escape`. If your frames are JPEGs, export 16-bit TIFFs from
-your raw converter instead, or open the [camera RAW](glossary.md#camera-raw) files directly.
+frames, or press `Escape`. If your frames are PNG files, export TIFFs or JPEGs
+from your raw converter instead, or open the [camera RAW](glossary.md#camera-raw) files directly.
 
 The same dialog title appears with other messages:
 
 | Message | Cause and fix |
 |---|---|
-| "These files mix camera RAW and TIFF. A stack is one kind of file." | Pick only the RAW files or only the TIFF files. |
+| "These files mix camera RAW and TIFF. A stack is one kind of file." | Pick files of one kind. The message names the kinds you mixed: "camera RAW and JPEG", "JPEG and TIFF" or "camera RAW, JPEG and TIFF". |
 | "These files are in different folders. A stack's frames share one folder." | Move the frames into one folder, or open the folder with **New project**. |
 | "`<path>`: not a folder of frames or a FocusForge project" | You opened a single file that is neither a frame nor a project file. Open the folder of frames or the `.ffp` file instead. |
 | "`<path>` is no longer on disk. This project cannot be fused again until it is back." | You pressed **Fuse stack** on a project whose frames were moved or deleted. See [The frames are no longer there](#the-frames-are-no-longer-there). |
@@ -132,11 +132,11 @@ In the **Images** list a row reads "Preview unavailable", and the **Frame**
 pane reads "Cannot show this frame:" with the file name.
 
 **Cause:** FocusForge cannot decode that file: it is damaged or cut short, or
-it is a TIFF layout FocusForge does not read (8-bit, 32-bit floating point,
-BigTIFF). A fuse of the stack will fail; see the next section.
+it is a TIFF layout FocusForge does not read (JPEG-compressed, 32-bit
+floating point, BigTIFF). A fuse of the stack will fail; see the next section.
 
 **Fix:** exclude or remove the frame in the **Images** panel, or re-export it
-as a 16-bit TIFF. See [Which files can FocusForge read?](#which-files-can-focusforge-read)
+as an uncompressed or LZW-compressed TIFF. See [Which files can FocusForge read?](#which-files-can-focusforge-read)
 and [The Images panel](guide/images-panel.md#leave-a-frame-out-of-the-next-fuse).
 
 ## Fusing
@@ -157,12 +157,12 @@ reason, for example:
 |---|---|
 | "`<path>`: IFD value for tag 273 runs past end of file" | The frame's file is cut short, for example by an interrupted copy. |
 | "`<path>`: BigTIFF (magic 43) is not supported, only classic TIFF (magic 42)" | The frame is a BigTIFF file. |
-| "`<path>`: BitsPerSample=[8, 8, 8] is not supported by the decoded TIFF reader" | The frame is an 8-bit TIFF (a 32-bit floating-point TIFF reads `[32, 32, 32]`). |
+| "`<path>`: Compression=7 is not supported by the decoded TIFF reader" | The frame is a TIFF compressed with JPEG (a 32-bit floating-point TIFF reads `BitsPerSample=[32, 32, 32]` instead). |
 
 **Fix:** **Retry** runs the same fuse again, which only helps when the cause
 was passing (a network drive that was briefly away). For a damaged or
-unsupported frame, exclude or remove it, or replace it with a 16-bit TIFF
-export, and fuse again.
+unsupported frame, exclude or remove it, or replace it with an uncompressed
+or LZW-compressed TIFF export, and fuse again.
 
 See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails) and
 [Cards that need attention](guide/batch-runs.md#cards-that-need-attention).
@@ -265,11 +265,12 @@ See: [GPU processing and the Backend line](guide/settings-window.md#gpu-processi
 
 ## Adding frames
 
-### "No TIFF images to add" and similar
+### "No TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) or camera RAW images to add" and similar
 
 | Notification | Cause and fix |
 |---|---|
-| "No TIFF images to add" | What you dropped or picked holds no TIFF frames. **Add images** takes TIFF frames only. |
+| "No TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) or camera RAW images to add" | What you dropped or picked holds no TIFF, JPEG or camera RAW frames. |
+| "Cannot mix camera RAW and TIFF in one stack" | The project and the files you added hold more than one kind of frame; the message names the kinds ("camera RAW and JPEG", "camera RAW, JPEG and TIFF"). Add files of the project's kind. |
 | "Switch to Stacking to add images" | The tab is in the editor. Click **STACKING** first. |
 | "Adding images waits for the run to finish" | This project is being fused. Wait, or cancel the fuse. |
 | "Still checking the last images added" | The previous add is still being compared with the frames already there. Wait a moment. |
@@ -395,7 +396,7 @@ error: <path>: no TIFF frames found
 
 **Cause:** the folder you passed to `stack` or `info` holds no frames
 FocusForge can read. The message says "TIFF" but a folder of camera RAW
-files is read too. Exit status 1; nothing is written.
+files is read too, and so is a folder of JPEG files. Exit status 1; nothing is written.
 
 **Fix:** pass the folder that holds the frames (for a folder with a `frames`
 subfolder, the parent works too).
@@ -455,17 +456,19 @@ See: [Source frames](reference/project-format.md#source-frames).
 
 ```
 error: <path>: BigTIFF (magic 43) is not supported, only classic TIFF (magic 42)
-error: <path>: BitsPerSample=[8, 8, 8] is not supported by the decoded TIFF reader
+error: <path>: Compression=7 is not supported by the decoded TIFF reader
 ```
 
-`info` shows the reason without refusing, for example for an 8-bit frame:
+`info` shows the reason without refusing, for example for a TIFF compressed
+with JPEG (`Compression=7, only uncompressed (1) is supported`) or for an
+8-bit frame, which is read through the compatible path:
 
 ```
 mmap fast path: no — BitsPerSample=[8, 8, 8], only 16-bit is supported
 ```
 
-**Fix:** export the frames from your raw converter as 16-bit TIFF (classic,
-not BigTIFF; uncompressed, LZW or Deflate), or stack the RAW files directly.
+**Fix:** export the frames from your raw converter as TIFF (classic, not
+BigTIFF; uncompressed, LZW or Deflate), or stack the RAW files directly.
 See [Which files can FocusForge read?](#which-files-can-focusforge-read) and
 [TIFF fast path](reference/tiff-fast-path.md#what-the-reader-accepts).
 
@@ -601,15 +604,15 @@ Plan disk space too: a 16-bit TIFF from a 45-megapixel camera is about
 
 | Reads | Does not read |
 |---|---|
-| 16-bit TIFF (`.tif`, `.tiff`), uncompressed, LZW or Deflate compressed, in strips or tiles, either byte order | 8-bit TIFF, 32-bit floating-point TIFF, BigTIFF |
+| 8-bit and 16-bit TIFF (`.tif`, `.tiff`), uncompressed, LZW or Deflate compressed, in strips or tiles, either byte order | 32-bit floating-point TIFF, BigTIFF, TIFF compressed with JPEG |
+| JPEG (`.jpg`, `.jpeg`) | PNG (an export format only) |
 | Camera RAW files its built-in decoder supports, including DNG and `.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.pef` | RAW files the decoder does not support (reported by name) |
-| | JPEG and PNG (these are export formats only) |
 
-One stack is always one kind of file: RAW and TIFF frames in one folder
-become two stacks. RAW files are developed with each file's recorded white
+One stack is always one kind of file: RAW, JPEG and TIFF frames in one folder
+become separate stacks. Every frame is read upright by its orientation tag. RAW files are developed with each file's recorded white
 balance. Results export as TIFF, PNG or JPEG. See
 [Choose a file format](stacking/shooting-practice.md#choose-a-file-format)
-and [Camera RAW and compressed TIFF](guide/first-stack.md#camera-raw-and-compressed-tiff).
+and [Camera RAW, JPEG and compressed TIFF](guide/first-stack.md#camera-raw-jpeg-and-compressed-tiff).
 
 ### Can I script FocusForge?
 

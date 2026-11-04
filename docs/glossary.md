@@ -70,7 +70,7 @@ The unprocessed files a camera records (`.cr3`, `.nef`, `.arw`, DNG and
 many more). FocusForge opens a folder of RAW files like a folder of TIFF
 files and develops them with each file's recorded white balance. One stack is
 always one kind of file.
-See: [Camera RAW and compressed TIFF](guide/first-stack.md#camera-raw-and-compressed-tiff)
+See: [Camera RAW, JPEG and compressed TIFF](guide/first-stack.md#camera-raw-jpeg-and-compressed-tiff)
 and [Choose a file format](stacking/shooting-practice.md#choose-a-file-format).
 
 ## Cap
@@ -383,9 +383,10 @@ See: [Tabs: one project each](guide/gui.md#tabs-one-project-each).
 
 ## TIFF
 
-The image file format FocusForge stacks besides camera RAW: 16-bit TIFF,
-uncompressed or LZW or Deflate compressed. 8-bit TIFF, 32-bit floating-point
-TIFF and BigTIFF are not read. Uncompressed 16-bit TIFFs open fastest.
+An image file format FocusForge stacks besides camera RAW and JPEG: 8-bit or
+16-bit TIFF, uncompressed or LZW or Deflate compressed. 32-bit floating-point
+TIFF, BigTIFF and TIFF compressed with JPEG are not read. Uncompressed 16-bit
+TIFFs open fastest.
 See: [Choose a file format](stacking/shooting-practice.md#choose-a-file-format)
 and [TIFF fast path](reference/tiff-fast-path.md).
 

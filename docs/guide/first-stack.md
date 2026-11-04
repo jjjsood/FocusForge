@@ -12,13 +12,17 @@ If you have not installed FocusForge yet, start with
 
 - **The frames of one [stack](../glossary.md#stack)**: the photographs you
   shot at different focus distances, all of the same scene. FocusForge reads
-  **16-bit TIFF** files (`.tif`, `.tiff`) and **camera RAW** files (`.dng`,
-  `.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2` and many more).
+  **TIFF** files (`.tif`, `.tiff`; 8-bit or 16-bit), **JPEG** files (`.jpg`,
+  `.jpeg`) and **camera RAW** files (`.dng`, `.cr2`, `.cr3`, `.nef`, `.arw`,
+  `.raf`, `.orf`, `.rw2` and many more). Frames are read upright: a frame
+  stored sideways, as many cameras do, is turned by its orientation tag.
 - **One folder per stack** is the easiest way to work. A folder that holds
   several stacks is fine too; FocusForge asks how to split it (see
   [A folder with several stacks](#a-folder-with-several-stacks)).
 - **Two or more frames.** A single frame has nothing to combine with, so
-  **Fuse stack** stays greyed out.
+  **Fuse stack** stays greyed out. One TIFF, JPEG or camera RAW file still
+  opens, as a one-frame project (see
+  [Camera RAW, JPEG and compressed TIFF](#camera-raw-jpeg-and-compressed-tiff)).
 
 FocusForge never changes or moves your frames. Everything it makes is kept
 in the window until you save it as a [project](../glossary.md#project) file.
@@ -38,8 +42,8 @@ When no project is open, the window shows a start page with one button:
 
 1. Click **Open…**. Your system's file chooser opens, titled "Open images".
 2. Go to the folder with your frames and select all of them (usually
-   `Ctrl+A`, or `Cmd+A` on a Mac). The chooser can show TIFF frames or
-   camera RAW files.
+   `Ctrl+A`, or `Cmd+A` on a Mac). The chooser can show TIFF frames, JPEG
+   frames or camera RAW files.
 3. Confirm. The frames open in a new tab, sorted by file name.
 
 **Open…** opens exactly the files you picked, and nothing else from their
@@ -129,7 +133,7 @@ When you open a folder (with **New project**, by dropping it, or with
 - **Within one folder, a pause of more than a minute** between two frames'
   capture times starts a new stack. Frames of one stack are usually seconds
   apart; two subjects are usually minutes apart.
-- **Camera RAW and TIFF files** in the same folder always form separate
+- **Camera RAW, JPEG and TIFF files** in the same folder always form separate
   stacks.
 
 If the folder holds exactly one stack, it opens straight away. If it holds
@@ -150,16 +154,20 @@ frames" means six frames in total, split into two stacks. Choose one answer:
 
 While the question is up, the rest of the window does not react.
 
-## Camera RAW and compressed TIFF
+## Camera RAW, JPEG and compressed TIFF
 
 - **Camera RAW** frames open exactly like TIFF frames: a folder of RAW
-  files is a stack. One stack is always one kind of file, so RAW and TIFF
-  files in the same folder become two stacks. A folder holding a single RAW
-  frame opens as a one-frame project, with **Fuse stack** greyed out.
+  files is a stack. One stack is always one kind of file, so RAW, JPEG and
+  TIFF files in the same folder become separate stacks.
+- **JPEG** frames open and fuse like TIFF frames. A JPEG holds 8 bits per
+  colour, which FocusForge widens to its 16-bit range.
 - **Compressed TIFF** files (LZW or Deflate, in strips or tiles, either byte
-  order) open and fuse like uncompressed ones. Uncompressed 16-bit TIFFs are
-  read fastest; [The TIFF fast path](../reference/tiff-fast-path.md) explains
-  why.
+  order) open and fuse like uncompressed ones, and so do 8-bit TIFF files.
+  Uncompressed 16-bit TIFFs are read fastest;
+  [The TIFF fast path](../reference/tiff-fast-path.md) explains why. A TIFF
+  compressed with JPEG (`Compression=7`) is not read.
+- **One file** opens as a one-frame project named after the file, with
+  **Fuse stack** greyed out, so you can look at a frame or check how it is read.
 
 ## When a folder or project will not open
 
@@ -171,13 +179,13 @@ same.
 
 ### "No frames here"
 
-![The dialog "No frames here" with the text "FocusForge reads 16-bit TIFF (.tif, .tiff) and camera RAW files. This folder holds none." and the button Pick another folder….](../assets/manual/first-stack/refusal-no-frames.png)
+![The dialog "No frames here" with the text "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none." and the button Pick another folder….](../assets/manual/first-stack/refusal-no-frames.png)
 
 *A folder without any frames FocusForge can read.*
 
-The folder holds no 16-bit TIFF or camera RAW files, so there is nothing to
-stack. The dialog reads "FocusForge reads 16-bit TIFF (.tif, .tiff) and
-camera RAW files. This folder holds none."
+The folder holds no TIFF, JPEG or camera RAW files, so there is nothing to
+stack. The dialog reads "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg,
+.jpeg) and camera RAW files. This folder holds none."
 
 - Click **Pick another folder…** to choose a different folder right away.
 - Press `Escape` to close the dialog without choosing.
@@ -190,7 +198,7 @@ stack, with one of these messages:
 
 | Message | What to do |
 |---|---|
-| "These files mix camera RAW and TIFF. A stack is one kind of file." | Pick only the RAW files, or only the TIFF files. |
+| "These files mix camera RAW and TIFF. A stack is one kind of file." (the kinds named are the ones you picked: "camera RAW and JPEG", or "camera RAW, JPEG and TIFF") | Pick files of one kind: only RAW, only JPEG or only TIFF. |
 | "These files are in different folders. A stack's frames share one folder." | Move the frames into one folder, or open the folder that holds them with **New project**. |
 
 ### "This project cannot be opened"

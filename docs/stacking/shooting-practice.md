@@ -515,16 +515,22 @@ a lot can move in two minutes.
 
 ## Choose a file format
 
-FocusForge stacks two kinds of file. JPEG and PNG are export formats only:
-FocusForge does not stack them.
+FocusForge stacks three kinds of file: camera RAW, TIFF and JPEG. PNG is an
+export format only: FocusForge does not stack it. A stack is always one kind
+of file. Whatever the kind, FocusForge reads each frame upright by its
+orientation tag, so a frame the camera stored sideways stacks like the
+others.
 
-| | RAW files | TIFF files |
-|---|---|---|
-| What FocusForge reads | Camera RAW files its built-in decoder supports, including DNG and the usual extensions (`.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.pef` and others) | 16-bit TIFF with interleaved colour samples: uncompressed, LZW or Deflate (ZIP) compressed, in strips or tiles |
-| Not read | Files the decoder does not support (FocusForge reports them by name) | 8-bit TIFF, 32-bit floating-point TIFF, BigTIFF |
-| Workflow | Copy the RAW files into a folder and open it | Develop the RAW files in your converter first, then export 16-bit TIFFs |
-| Development | Done by FocusForge with its decoder's standard rendering, using each file's recorded white balance | Done by you, with full control: lens profiles, noise reduction, colour |
-| Disk space | Smaller files | Large: about 270 MB per 16-bit frame from a 45-megapixel camera |
+| | RAW files | TIFF files | JPEG files |
+|---|---|---|---|
+| What FocusForge reads | Camera RAW files its built-in decoder supports, including DNG and the usual extensions (`.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.pef` and others) | 8-bit or 16-bit TIFF with interleaved colour samples: uncompressed, LZW or Deflate (ZIP) compressed, in strips or tiles | `.jpg` and `.jpeg` files |
+| Not read | Files the decoder does not support (FocusForge reports them by name) | 32-bit floating-point TIFF, BigTIFF, TIFF compressed with JPEG | |
+| Workflow | Copy the RAW files into a folder and open it | Develop the RAW files in your converter first, then export 16-bit TIFFs | Copy the files into a folder and open it |
+| Development | Done by FocusForge with its decoder's standard rendering, using each file's recorded white balance | Done by you, with full control: lens profiles, noise reduction, colour | Done by the camera, which left 8 bits per colour |
+| Disk space | Smaller files | Large: about 270 MB per 16-bit frame from a 45-megapixel camera | Smallest files |
+
+An export from JPEG frames carries their EXIF data, and every export records
+Orientation 1, because the pixels are already upright.
 
 Recommendations:
 

@@ -140,10 +140,10 @@ name order.
 There are two ways to add frames to the project in the active tab:
 
 - Click **Add images** (the folder with a plus) in the header. Your system's
-  file dialog opens, titled "Add frames"; choose one or more TIFF frames and
-  confirm.
-- Drop a folder or a set of TIFF frames onto the window while the tab is
-  open. They are added to this project rather than opened as a new one.
+  file dialog opens, titled "Add frames"; choose one or more TIFF, JPEG or
+  camera RAW frames and confirm.
+- Drop a folder or a set of TIFF, JPEG or camera RAW frames onto the window
+  while the tab is open. They are added to this project rather than opened as a new one.
 
 New frames are added at the end of the list, and the sort check mark is
 cleared. An empty list reads "No source images" and "Add images to begin.",
@@ -162,8 +162,10 @@ those frames and notes "New images are added either way.":
 
 If the project already holds a checkpoint, the add then asks the question in
 the next section.
-If the add cannot happen, a notification says why: "No TIFF images to add",
-"Switch to Stacking to add images", "Adding images waits for the run to
+If the add cannot happen, a notification says why: "No TIFF (.tif, .tiff),
+JPEG (.jpg, .jpeg) or camera RAW images to add", "Cannot mix camera RAW and
+TIFF in one stack" (the kinds named are the ones the tab and your files
+hold), "Switch to Stacking to add images", "Adding images waits for the run to
 finish" or "Still checking the last images added".
 
 ## Sorting, reordering or adding after a checkpoint
