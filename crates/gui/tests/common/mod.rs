@@ -105,25 +105,31 @@ fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
 
 /// `fixtures/<set>/frames/<index>.tif` -- `set` names a fixture directory
 /// under `fixtures/` (`"mantis-64"`, `"mantis-512"`), `index` the frame's own
-/// two-digit position in it.
+/// two-digit position in it. Panics, naming the path, when that frame does
+/// not exist.
 #[allow(dead_code)]
 pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
-    workspace_root()
+    let path = workspace_root()
         .join("fixtures")
         .join(set)
         .join("frames")
-        .join(format!("{index:02}.tif"))
+        .join(format!("{index:02}.tif"));
+    assert!(path.is_file(), "no fixture frame at {}", path.display());
+    path
 }
 
-/// Copies `mantis-512` fixture frame `source_index` into `dest_dir` as `name`.
+/// Copies `mantis-64` fixture frame `source_index` into `dest_dir` as `name`.
 #[allow(dead_code)]
 pub fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
+    copy_frame_from("mantis-64", dest_dir, name, source_index);
+}
+
+/// [`copy_frame`] from the fixture set `set`.
+#[allow(dead_code)]
+pub fn copy_frame_from(set: &str, dest_dir: &Path, name: &str, source_index: usize) {
     std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(
-        fixture_frame("mantis-512", source_index),
-        dest_dir.join(name),
-    )
-    .expect("fixture frame must copy");
+    std::fs::copy(fixture_frame(set, source_index), dest_dir.join(name))
+        .expect("fixture frame must copy");
 }
 
 /// A fresh, empty renderer cell for `bridge::install`, with no project's
@@ -144,13 +150,23 @@ pub fn tree(name: &str) -> PathBuf {
 }
 
 /// A controller with one unsaved project open over `count` copied
-/// `mantis-512` frames (`00.tif`, `01.tif`, ... in fixture order), its own
-/// scratch root under `CARGO_TARGET_TMPDIR`.
+/// `mantis-64` frames (`00.tif`, `01.tif`, ... in fixture order), its own
+/// scratch root under `CARGO_TARGET_TMPDIR`, aligning with `dummy-align`,
+/// which always converges.
 #[allow(dead_code)]
 pub fn controller_with_frames(name: &str, count: usize) -> AppController {
+    let mut controller = controller_with_frames_from("mantis-64", name, count);
+    controller.set_align_algorithm("dummy-align");
+    controller
+}
+
+/// [`controller_with_frames`] over the fixture set `set`, on the default
+/// aligner.
+#[allow(dead_code)]
+pub fn controller_with_frames_from(set: &str, name: &str, count: usize) -> AppController {
     let root = tree(&format!("{name}_frames"));
     for i in 0..count {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
+        copy_frame_from(set, &root, &format!("{i:02}.tif"), i);
     }
     let mut controller = AppController::new();
     assert!(matches!(

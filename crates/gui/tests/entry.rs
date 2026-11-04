@@ -17,7 +17,7 @@ use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome, ShellMode};
 use slint::ComponentHandle;
 
-use common::{copy_frame, tree};
+use common::{copy_frame_from, tree};
 
 fn base_pane() -> (PaneRect, PaneRect) {
     (
@@ -45,8 +45,8 @@ fn base_pane() -> (PaneRect, PaneRect) {
 #[test]
 fn unambiguous_folder_opens_one_project() {
     let root = tree("entry_unambiguous");
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[root]);
@@ -62,8 +62,8 @@ fn unambiguous_folder_opens_one_project() {
 #[test]
 fn ambiguous_folder_asks_once() {
     let root = tree("entry_ambiguous");
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
 
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[root]) {
@@ -92,8 +92,8 @@ fn ambiguous_folder_asks_once() {
 #[test]
 fn both_answers_open_what_they_say() {
     let one_root = tree("entry_both_answers_one");
-    copy_frame(&one_root.join("subject-a"), "00.tif", 0);
-    copy_frame(&one_root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &one_root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &one_root.join("subject-b"), "00.tif", 1);
 
     let mut one = AppController::new();
     assert!(matches!(
@@ -109,8 +109,8 @@ fn both_answers_open_what_they_say() {
     assert!(one.pending_question().is_none());
 
     let many_root = tree("entry_both_answers_many");
-    copy_frame(&many_root.join("subject-a"), "00.tif", 0);
-    copy_frame(&many_root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &many_root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &many_root.join("subject-b"), "00.tif", 1);
 
     let mut many = AppController::new();
     assert!(matches!(
@@ -132,8 +132,8 @@ fn both_answers_open_what_they_say() {
 #[test]
 fn drop_of_a_folder_matches_the_picker() {
     let root = tree("entry_drop_folder");
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
 
     let mut picked = AppController::new();
     common::open_and_settle(&mut picked, std::slice::from_ref(&root));
@@ -153,9 +153,9 @@ fn drop_of_a_folder_matches_the_picker() {
 #[test]
 fn drop_of_several_files_is_one_open() {
     let root = tree("entry_drop_files");
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
-    copy_frame(&root, "02.tif", 2);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "02.tif", 2);
 
     let mut controller = AppController::new();
     let paths = vec![
@@ -186,7 +186,7 @@ fn active_frame_paths(controller: &AppController) -> Vec<PathBuf> {
 fn tree_of_frames(label: &str, names: &[&str]) -> PathBuf {
     let root = tree(label);
     for (index, name) in names.iter().enumerate() {
-        copy_frame(&root, name, index);
+        copy_frame_from("mantis-512", &root, name, index);
     }
     root
 }
@@ -392,7 +392,7 @@ fn picked_jpeg_frames_open_as_one_project() {
 #[test]
 fn mixed_kinds_name_the_kinds_present() {
     let root = tree("entry_mixed_kinds");
-    copy_frame(&root, "t.tif", 0);
+    copy_frame_from("mantis-512", &root, "t.tif", 0);
     let tiff = root.join("t.tif");
     let jpeg = write_jpeg(&root, "j.jpg", 10);
     let raw = write_raw(&root, "r.dng", 1);
@@ -636,7 +636,7 @@ fn a_path_that_is_neither_a_folder_nor_a_project_is_refused_by_name() {
 #[test]
 fn skipped_subfolders_are_reported_not_failed() {
     let root = tree("entry_skipped");
-    copy_frame(&root.join("subject"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject"), "00.tif", 0);
     std::fs::create_dir_all(root.join("thumbs")).unwrap();
     std::fs::write(root.join("thumbs").join("readme.txt"), b"not a frame").unwrap();
 
@@ -660,7 +660,7 @@ fn skipped_subfolders_are_reported_not_failed() {
 #[test]
 fn two_skipped_subfolders_make_one_record_naming_both_paths() {
     let root = tree("entry_two_skipped");
-    copy_frame(&root.join("subject"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject"), "00.tif", 0);
     for name in ["thumbs", "notes"] {
         std::fs::create_dir_all(root.join(name)).unwrap();
         std::fs::write(root.join(name).join("readme.txt"), b"not a frame").unwrap();
@@ -726,8 +726,8 @@ fn no_grouping_vocabulary_after_the_answer() {
     }
 
     let ambiguous_root = tree("entry_no_group_ambiguous");
-    copy_frame(&ambiguous_root.join("subject-a"), "00.tif", 0);
-    copy_frame(&ambiguous_root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &ambiguous_root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &ambiguous_root.join("subject-b"), "00.tif", 1);
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[ambiguous_root]) {
         OpenOutcome::Question(question, _) => {
@@ -805,7 +805,12 @@ fn tab_strip_scrolls_to_every_tab() {
     let mut controller = AppController::new();
     let root = tree("entry_nine_tabs");
     for i in 0..9 {
-        copy_frame(&root.join(format!("subject-{i}")), "00.tif", i % 8);
+        copy_frame_from(
+            "mantis-512",
+            &root.join(format!("subject-{i}")),
+            "00.tif",
+            i % 8,
+        );
     }
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(..) => {
@@ -882,7 +887,7 @@ fn tab_strip_scrolls_to_every_tab() {
 #[test]
 fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     let root = tree("entry_single_tab_no_resize");
-    copy_frame(&root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[root]);
@@ -907,7 +912,12 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
 
     let root = tree("entry_tab_scroll_events");
     for i in 0..10 {
-        copy_frame(&root.join(format!("subject-{i}")), "00.tif", i % 8);
+        copy_frame_from(
+            "mantis-512",
+            &root.join(format!("subject-{i}")),
+            "00.tif",
+            i % 8,
+        );
     }
     let mut controller = AppController::new();
     controller.set_tab_region_width(1254.0);
@@ -1077,9 +1087,9 @@ fn a_file_that_is_not_a_project_is_refused_by_name() {
 #[test]
 fn each_tab_keeps_its_own_viewport() {
     let root_a = tree("entry_viewport_a");
-    copy_frame(&root_a, "00.tif", 0);
+    copy_frame_from("mantis-512", &root_a, "00.tif", 0);
     let root_b = tree("entry_viewport_b");
-    copy_frame(&root_b, "00.tif", 1);
+    copy_frame_from("mantis-512", &root_b, "00.tif", 1);
 
     let mut controller = AppController::new();
     let (left, right) = base_pane();
@@ -1113,7 +1123,7 @@ fn each_tab_keeps_its_own_viewport() {
 /// A controller with one project already open from `name`'s one-frame tree.
 fn with_one_project(name: &str) -> AppController {
     let root = tree(name);
-    copy_frame(&root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
     let mut controller = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -1160,7 +1170,7 @@ fn opening_a_folder_from_plus_appends_and_activates_the_first() {
     controller.select_plus();
 
     let root = tree("entry_plus_open");
-    copy_frame(&root, "00.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 1);
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
@@ -1190,9 +1200,9 @@ fn a_multi_stack_open_from_plus_appends_all_in_order() {
     controller.select_plus();
 
     let root = tree("entry_plus_multi");
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
-    copy_frame(&root.join("subject-c"), "00.tif", 2);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-c"), "00.tif", 2);
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Question(..)
@@ -1250,9 +1260,9 @@ fn closing_the_last_tab_selects_plus() {
 fn with_four_projects(name: &str) -> focusforge_gui::AppController {
     let mut controller = with_one_project(&format!("{name}_first"));
     let root = tree(name);
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
-    copy_frame(&root.join("subject-c"), "00.tif", 2);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-c"), "00.tif", 2);
     common::open_and_settle(&mut controller, &[root]);
     common::answer_and_settle(&mut controller, OpenAs::NProjects);
     assert_eq!(controller.project_tabs().len(), 4);
@@ -1412,8 +1422,8 @@ fn answering_the_question_closes_its_dialog() {
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let root = tree("entry_question_dialog_closes");
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
 
     let controller = Arc::new(Mutex::new(AppController::new()));
     let outcome = common::open_and_settle(&mut controller.lock().unwrap(), &[root]);
@@ -1448,7 +1458,12 @@ fn opening_a_folder_onto_a_loaded_tab_appends_new_tabs() {
 
     let root = tree("entry_drop_loaded");
     for i in 0..3 {
-        copy_frame(&root.join(format!("subject-{i}")), "00.tif", i);
+        copy_frame_from(
+            "mantis-512",
+            &root.join(format!("subject-{i}")),
+            "00.tif",
+            i,
+        );
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -1480,8 +1495,8 @@ fn a_drop_while_plus_is_selected_appends() {
     controller.select_plus();
 
     let root = tree("entry_drop_plus");
-    copy_frame(&root, "00.tif", 1);
-    copy_frame(&root, "01.tif", 2);
+    copy_frame_from("mantis-512", &root, "00.tif", 1);
+    copy_frame_from("mantis-512", &root, "01.tif", 2);
     let dropped = vec![root.join("00.tif"), root.join("01.tif")];
     assert!(matches!(
         common::open_and_settle(&mut controller, &dropped),
@@ -1507,8 +1522,8 @@ fn a_drop_while_plus_is_selected_appends() {
 /// mid-run or outside-Stacking drop test needs to reach that state.
 fn with_fused_project(name: &str) -> AppController {
     let root = tree(name);
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
     let mut controller = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -1526,8 +1541,8 @@ fn a_drop_of_a_folder_with_a_frames_subfolder_adds_to_the_active_tab() {
     let before_frames = controller.images_panel().rows.len();
 
     let root = tree("entry_drop_frames_subfolder");
-    copy_frame(&root.join("frames"), "00.tif", 2);
-    copy_frame(&root.join("frames"), "01.tif", 3);
+    copy_frame_from("mantis-512", &root.join("frames"), "00.tif", 2);
+    copy_frame_from("mantis-512", &root.join("frames"), "01.tif", 3);
 
     common::add_and_settle(&mut controller, &[root]).expect("an add onto an active tab");
 
@@ -1546,8 +1561,8 @@ fn a_multi_file_drop_spanning_two_parent_directories_adds_to_the_active_tab() {
 
     let dir_a = tree("entry_drop_multi_parent_a");
     let dir_b = tree("entry_drop_multi_parent_b");
-    copy_frame(&dir_a, "00.tif", 4);
-    copy_frame(&dir_b, "00.tif", 5);
+    copy_frame_from("mantis-512", &dir_a, "00.tif", 4);
+    copy_frame_from("mantis-512", &dir_b, "00.tif", 5);
     let dropped = vec![dir_a.join("00.tif"), dir_b.join("00.tif")];
 
     common::add_and_settle(&mut controller, &dropped).expect("an add onto an active tab");
@@ -1584,8 +1599,8 @@ fn a_drop_with_the_plus_tab_selected_still_opens_through_drop_paths() {
     controller.select_plus();
 
     let root = tree("entry_drop_plus_route");
-    copy_frame(&root, "00.tif", 6);
-    copy_frame(&root, "01.tif", 7);
+    copy_frame_from("mantis-512", &root, "00.tif", 6);
+    copy_frame_from("mantis-512", &root, "01.tif", 7);
     let dropped = vec![root.join("00.tif"), root.join("01.tif")];
 
     let handle = controller
@@ -1616,7 +1631,7 @@ fn a_drop_outside_stacking_mode_is_refused_and_changes_nothing() {
     let before_frames = controller.frame_count();
 
     let root = tree("entry_drop_outside_stacking_extra");
-    copy_frame(&root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
     let result = controller.drop_paths(&[root.join("00.tif")]);
     assert!(matches!(result, Err(ImportRefused::NotStacking)));
     assert_eq!(controller.project_tabs().len(), 1);
@@ -1631,7 +1646,7 @@ fn a_drop_while_this_tabs_job_is_running_is_refused_and_changes_nothing() {
     let before_frames = controller.frame_count();
 
     let root = tree("entry_drop_mid_run_extra");
-    copy_frame(&root, "00.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 1);
     let result = controller.drop_paths(&[root.join("00.tif")]);
     assert!(matches!(result, Err(ImportRefused::JobRunning)));
     assert_eq!(controller.frame_count(), before_frames);
@@ -1645,14 +1660,14 @@ fn a_second_drop_while_the_first_scan_is_still_being_checked_is_refused() {
     let before_frames = controller.frame_count();
 
     let root_a = tree("entry_drop_still_checking_a");
-    copy_frame(&root_a, "00.tif", 2);
+    copy_frame_from("mantis-512", &root_a, "00.tif", 2);
     let handle = controller
         .drop_paths(&[root_a.join("00.tif")])
         .expect("the first drop must not refuse");
     let handle = handle.expect("adding a real frame spawns a worker");
 
     let root_b = tree("entry_drop_still_checking_b");
-    copy_frame(&root_b, "00.tif", 3);
+    copy_frame_from("mantis-512", &root_b, "00.tif", 3);
     let second = controller.drop_paths(&[root_b.join("00.tif")]);
     assert!(matches!(second, Err(ImportRefused::StillChecking)));
     assert_eq!(controller.frame_count(), before_frames);
@@ -1740,7 +1755,7 @@ fn import_adds_jpeg_to_a_jpeg_tab() {
     let tiff_root = tree_of_frames("entry_import_tiff", &["00.tif"]);
     let mut tiffs = open_set(&[tiff_root.join("00.tif")]);
     let tiff_extra = tree("entry_import_tiff_extra");
-    copy_frame(&tiff_extra, "01.tif", 1);
+    copy_frame_from("mantis-512", &tiff_extra, "01.tif", 1);
     common::add_and_settle(&mut tiffs, &[tiff_extra.join("01.tif")])
         .expect("TIFF onto a TIFF tab is accepted");
     assert_eq!(active_frame_paths(&tiffs).len(), 2);
@@ -1756,13 +1771,13 @@ fn import_adds_jpeg_to_a_jpeg_tab() {
 #[test]
 fn import_refuses_a_kind_the_tab_does_not_hold() {
     let root = tree("entry_import_cross");
-    copy_frame(&root, "t.tif", 0);
+    copy_frame_from("mantis-512", &root, "t.tif", 0);
     let tiff = root.join("t.tif");
     let jpeg = write_jpeg(&root, "j.jpg", 10);
     let raw = write_raw(&root, "r.dng", 1);
 
     let extra = tree("entry_import_cross_extra");
-    copy_frame(&extra, "t2.tif", 1);
+    copy_frame_from("mantis-512", &extra, "t2.tif", 1);
     let tiff_in = extra.join("t2.tif");
     let jpeg_in = write_jpeg(&extra, "j2.jpg", 20);
     let raw_in = write_raw(&extra, "r2.dng", 2);
@@ -1833,9 +1848,9 @@ fn import_expands_a_folder_with_the_open_scan() {
     let tiff_root = tree_of_frames("entry_import_folder_tiff_tab", &["00.tif"]);
     let mut tiffs = open_set(&[tiff_root.join("00.tif")]);
     let tiff_folder = tree("entry_import_folder_tiff");
-    copy_frame(&tiff_folder, "01.tif", 1);
-    copy_frame(&tiff_folder, "composite.tif", 2);
-    copy_frame(&tiff_folder, "zmap.tif", 3);
+    copy_frame_from("mantis-512", &tiff_folder, "01.tif", 1);
+    copy_frame_from("mantis-512", &tiff_folder, "composite.tif", 2);
+    copy_frame_from("mantis-512", &tiff_folder, "zmap.tif", 3);
     common::add_and_settle(&mut tiffs, &[tiff_folder]).expect("a TIFF folder onto a TIFF tab");
     let names: Vec<_> = active_frame_paths(&tiffs)
         .iter()
@@ -1847,7 +1862,7 @@ fn import_expands_a_folder_with_the_open_scan() {
     write_raw(&foreign, "x.dng", 3);
     let both = tree("entry_import_folder_both");
     write_jpeg(&both, "y.jpg", 70);
-    copy_frame(&both, "y.tif", 4);
+    copy_frame_from("mantis-512", &both, "y.tif", 4);
     for (folder, text) in [
         (foreign, "Cannot mix camera RAW and JPEG in one stack"),
         (both, "Cannot mix JPEG and TIFF in one stack"),

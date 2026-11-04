@@ -19,7 +19,7 @@ use focusforge_gui::job;
 use focusforge_gui::source_previews::{self, PreviewError};
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
-use common::{controller_with_frames, copy_frame, tree};
+use common::{controller_with_frames_from, copy_frame_from, tree};
 
 fn write_timed(dir: &Path, name: &str, when: Option<&str>) -> PathBuf {
     let path = dir.join(name);
@@ -637,7 +637,7 @@ fn selection_is_always_exactly_one() {
 
     // The post-run re-seed: a second fuse must land exactly one selected
     // row again, regardless of what was selected before it started.
-    let mut controller = controller_with_frames("selection_always_one_run", 3);
+    let mut controller = controller_with_frames_from("mantis-512", "selection_always_one_run", 3);
     // An algorithm that always converges keeps the fuse out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
@@ -688,7 +688,8 @@ fn selection_survives_reorder_and_remove() {
 
 #[test]
 fn confirming_a_reorder_keeps_the_selected_source_visible() {
-    let mut controller = controller_with_frames("confirmed_reorder_selection_visibility", 3);
+    let mut controller =
+        controller_with_frames_from("mantis-512", "confirmed_reorder_selection_visibility", 3);
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
@@ -783,7 +784,7 @@ fn curating_is_free_before_the_first_fuse() {
 
 #[test]
 fn frame_set_change_warns_with_a_count() {
-    let mut controller = controller_with_frames("frame_set_change_warns", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "frame_set_change_warns", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -802,7 +803,7 @@ fn frame_set_change_warns_with_a_count() {
 
 #[test]
 fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
-    let mut controller = controller_with_frames("add_reorder_new_project", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "add_reorder_new_project", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
@@ -821,7 +822,7 @@ fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
 
 #[test]
 fn remove_offers_exclude_instead_and_mentions_a_new_project() {
-    let mut controller = controller_with_frames("remove_offers_exclude", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "remove_offers_exclude", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
@@ -834,7 +835,7 @@ fn remove_offers_exclude_instead_and_mentions_a_new_project() {
 
 #[test]
 fn confirm_button_is_not_the_default() {
-    let mut controller = controller_with_frames("confirm_not_default", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "confirm_not_default", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
@@ -854,7 +855,7 @@ fn confirm_button_is_not_the_default() {
 
 #[test]
 fn confirming_a_pending_change_applies_it_and_re_fuses() {
-    let mut controller = controller_with_frames("confirm_applies", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "confirm_applies", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -876,12 +877,12 @@ fn confirming_a_pending_change_applies_it_and_re_fuses() {
 // Additive import: duplicate identity by content, replace/keep/cancel.
 // ---------------------------------------------------------------------
 
-/// [`controller_with_frames`], opened twice over two fresh trees, both
+/// [`controller_with_frames_from`], opened twice over two fresh trees, both
 /// stacking-mode tabs -- the second one active, as any newly opened tab is.
 fn controller_with_two_projects(name: &str) -> AppController {
     let root_a = tree(&format!("{name}_a"));
     for i in 0..2 {
-        copy_frame(&root_a, &format!("{i:02}.tif"), i);
+        copy_frame_from("mantis-512", &root_a, &format!("{i:02}.tif"), i);
     }
     let mut controller = AppController::new();
     assert!(matches!(
@@ -890,7 +891,7 @@ fn controller_with_two_projects(name: &str) -> AppController {
     ));
     let root_b = tree(&format!("{name}_b"));
     for i in 0..2 {
-        copy_frame(&root_b, &format!("{i:02}.tif"), i);
+        copy_frame_from("mantis-512", &root_b, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root_b]),
@@ -901,9 +902,9 @@ fn controller_with_two_projects(name: &str) -> AppController {
 
 #[test]
 fn import_of_a_renamed_copy_is_a_conflict_by_content() {
-    let mut controller = controller_with_frames("import_conflict_by_content", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_conflict_by_content", 2);
     let extra_dir = tree("import_conflict_by_content_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
 
     common::add_and_settle(&mut controller, &[extra_dir.join("renamed.tif")])
         .expect("the add must not refuse");
@@ -924,9 +925,10 @@ fn import_of_a_renamed_copy_is_a_conflict_by_content() {
 
 #[test]
 fn import_of_a_different_frame_under_an_existing_name_is_not_a_conflict() {
-    let mut controller = controller_with_frames("import_same_name_diff_content", 2);
+    let mut controller =
+        controller_with_frames_from("mantis-512", "import_same_name_diff_content", 2);
     let extra_dir = tree("import_same_name_diff_content_extra");
-    copy_frame(&extra_dir, "00.tif", 5);
+    copy_frame_from("mantis-512", &extra_dir, "00.tif", 5);
 
     common::add_and_settle(&mut controller, &[extra_dir.join("00.tif")])
         .expect("the add must not refuse");
@@ -944,10 +946,10 @@ fn import_of_a_different_frame_under_an_existing_name_is_not_a_conflict() {
 
 #[test]
 fn import_collapses_identical_incoming_copies_into_one_row() {
-    let mut controller = controller_with_frames("import_collapse_incoming", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_collapse_incoming", 2);
     let extra_dir = tree("import_collapse_incoming_extra");
-    copy_frame(&extra_dir, "copy-a.tif", 6);
-    copy_frame(&extra_dir, "copy-b.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "copy-a.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "copy-b.tif", 6);
 
     common::add_and_settle(
         &mut controller,
@@ -965,13 +967,13 @@ fn import_collapses_identical_incoming_copies_into_one_row() {
 
 #[test]
 fn import_replace_puts_the_new_file_at_the_same_position_and_keeps_exclusion() {
-    let mut controller = controller_with_frames("import_replace_position", 3);
+    let mut controller = controller_with_frames_from("mantis-512", "import_replace_position", 3);
     controller.toggle_frame_excluded(1);
     assert!(controller.images_panel().rows[1].excluded);
 
     let extra_dir = tree("import_replace_position_extra");
-    copy_frame(&extra_dir, "renamed-01.tif", 1);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "renamed-01.tif", 1);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
 
     common::add_and_settle(
         &mut controller,
@@ -1000,10 +1002,10 @@ fn import_replace_puts_the_new_file_at_the_same_position_and_keeps_exclusion() {
 
 #[test]
 fn import_keep_existing_retains_the_conflict_and_still_adds_new_frames() {
-    let mut controller = controller_with_frames("import_keep_existing", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_keep_existing", 2);
     let extra_dir = tree("import_keep_existing_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
 
     common::add_and_settle(
         &mut controller,
@@ -1029,12 +1031,12 @@ fn import_keep_existing_retains_the_conflict_and_still_adds_new_frames() {
 
 #[test]
 fn import_cancel_leaves_the_project_unchanged() {
-    let mut controller = controller_with_frames("import_cancel", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_cancel", 2);
     let before = controller.images_panel();
 
     let extra_dir = tree("import_cancel_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
 
     common::add_and_settle(
         &mut controller,
@@ -1054,13 +1056,13 @@ fn import_cancel_leaves_the_project_unchanged() {
 
 #[test]
 fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
-    let mut controller = controller_with_frames("import_all_declined", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_all_declined", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let extra_dir = tree("import_all_declined_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
 
     common::add_and_settle(&mut controller, &[extra_dir.join("renamed.tif")])
         .expect("the add must not refuse");
@@ -1079,7 +1081,7 @@ fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
 
 #[test]
 fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
-    let mut controller = controller_with_frames("import_same_paths_accepted", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_same_paths_accepted", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -1105,14 +1107,14 @@ fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
 
 #[test]
 fn import_with_a_checkpoint_shows_the_duplicate_question_before_the_add_warning() {
-    let mut controller = controller_with_frames("import_checkpoint_order", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_checkpoint_order", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let extra_dir = tree("import_checkpoint_order_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
 
     common::add_and_settle(
         &mut controller,
@@ -1148,7 +1150,7 @@ fn import_settled_after_a_tab_switch_lands_on_neither_tab() {
     assert_eq!(controller.active_project(), Some(1));
 
     let extra_dir = tree("import_after_tab_switch_extra");
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
     let handle = controller
         .add_frames(&[extra_dir.join("new.tif")])
         .expect("the add must not refuse")
@@ -1174,10 +1176,10 @@ fn import_settled_after_a_tab_switch_lands_on_neither_tab() {
 
 #[test]
 fn import_settled_after_a_frame_was_removed_meanwhile_changes_nothing() {
-    let mut controller = controller_with_frames("import_after_frame_removed", 3);
+    let mut controller = controller_with_frames_from("mantis-512", "import_after_frame_removed", 3);
 
     let extra_dir = tree("import_after_frame_removed_extra");
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
     let handle = controller
         .add_frames(&[extra_dir.join("new.tif")])
         .expect("the add must not refuse")
@@ -1205,9 +1207,9 @@ fn import_wiring_shows_the_duplicate_question_and_keep_existing_button() {
     init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
 
-    let mut controller = controller_with_frames("import_wiring_duplicate", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_wiring_duplicate", 2);
     let extra_dir = tree("import_wiring_duplicate_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
     common::add_and_settle(&mut controller, &[extra_dir.join("renamed.tif")])
         .expect("the add must not refuse");
     assert!(controller.pending_frame_change().is_some());
@@ -1272,10 +1274,10 @@ fn import_wiring_keep_existing_click_adds_the_new_frame_and_closes_the_question(
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let mut controller = controller_with_frames("import_wiring_keep_click", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "import_wiring_keep_click", 2);
     let extra_dir = tree("import_wiring_keep_click_extra");
-    copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame_from("mantis-512", &extra_dir, "renamed.tif", 0);
+    copy_frame_from("mantis-512", &extra_dir, "new.tif", 6);
     common::add_and_settle(
         &mut controller,
         &[extra_dir.join("renamed.tif"), extra_dir.join("new.tif")],
@@ -1399,7 +1401,8 @@ fn mutations_are_stacking_mode_only() {
 
 #[test]
 fn mutations_are_refused_while_this_tabs_job_is_running() {
-    let mut controller = controller_with_frames("mutations_refused_during_job", 3);
+    let mut controller =
+        controller_with_frames_from("mantis-512", "mutations_refused_during_job", 3);
     assert!(controller.start_fuse());
     assert!(controller.job_running());
 
@@ -1484,7 +1487,7 @@ fn an_unreachable_source_renders_greyed() {
 
 #[test]
 fn a_sealed_tab_reads_as_having_a_checkpoint() {
-    let mut controller = controller_with_frames("sealed_tab_checkpoint_gate", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "sealed_tab_checkpoint_gate", 2);
     assert_eq!(controller.checkpoint_count(), Some(0));
     controller.remove_frame(0);
     assert!(
@@ -1494,7 +1497,7 @@ fn a_sealed_tab_reads_as_having_a_checkpoint() {
 
     // A fresh controller over the same fixture frames, this time actually
     // fused -- the point already made above is that `Some(0)` gates nothing.
-    let mut controller = controller_with_frames("sealed_tab_checkpoint_gate", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "sealed_tab_checkpoint_gate", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     controller.remove_frame(0);
@@ -3387,7 +3390,8 @@ fn images_panel_disable_is_whole_panel() {
     app.set_images_enabled(true);
     assert_eq!(panel_opacity(), 1.0, "re-enabling restores full opacity");
 
-    let mut controller = controller_with_frames("images_panel_disable_is_whole_panel", 4);
+    let mut controller =
+        controller_with_frames_from("mantis-512", "images_panel_disable_is_whole_panel", 4);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
     });
@@ -3472,7 +3476,8 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let mut loaded = controller_with_frames("job_disables_images_and_settings", 3);
+    let mut loaded =
+        controller_with_frames_from("mantis-512", "job_disables_images_and_settings", 3);
     loaded.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
     });
@@ -4107,7 +4112,7 @@ fn a_source_drag_survives_leaving_the_viewport_and_row_recycling() {
 
 #[test]
 fn exclude_instead_excludes_the_frame_and_clears_the_warning() {
-    let mut controller = controller_with_frames("exclude_instead_excludes", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "exclude_instead_excludes", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
@@ -4132,7 +4137,7 @@ fn exclude_instead_excludes_the_frame_and_clears_the_warning() {
 
 #[test]
 fn exclude_instead_is_a_no_op_off_a_remove_warning() {
-    let mut controller = controller_with_frames("exclude_instead_wrong_kind", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "exclude_instead_wrong_kind", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
 
@@ -4148,7 +4153,7 @@ fn exclude_instead_is_a_no_op_off_a_remove_warning() {
 
 #[test]
 fn new_project_instead_opens_a_second_tab_and_leaves_the_first_alone() {
-    let mut controller = controller_with_frames("new_project_instead", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "new_project_instead", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -4179,7 +4184,8 @@ fn new_project_instead_opens_a_second_tab_and_leaves_the_first_alone() {
 
 #[test]
 fn switching_tabs_dismisses_a_stale_frame_set_warning() {
-    let mut controller = controller_with_frames("switching_tabs_dismisses_warning", 2);
+    let mut controller =
+        controller_with_frames_from("mantis-512", "switching_tabs_dismisses_warning", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -4192,7 +4198,7 @@ fn switching_tabs_dismisses_a_stale_frame_set_warning() {
 
     let root = tree("switching_tabs_dismisses_warning_second");
     for i in 0..2 {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
+        copy_frame_from("mantis-512", &root, &format!("{i:02}.tif"), i);
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -4225,7 +4231,7 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let mut controller = controller_with_frames("dialog_footer_pinned", 2);
+    let mut controller = controller_with_frames_from("mantis-512", "dialog_footer_pinned", 2);
     assert!(controller.start_fuse());
     wait_for_settle(&mut controller, Duration::from_secs(120));
     controller.remove_frame(0);
@@ -4307,7 +4313,7 @@ fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
 
     init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
-    let mut controller = controller_with_frames("frame_change_refuse_window", 3);
+    let mut controller = controller_with_frames_from("mantis-512", "frame_change_refuse_window", 3);
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("the fuse settles");

@@ -418,6 +418,19 @@ fn open_mantis64_frames(controller: &mut AppController, name: &str, count: usize
     root
 }
 
+#[test]
+#[should_panic(expected = "no fixture frame at")]
+fn fixture_frame_refuses_a_missing_frame() {
+    // `mantis-64` holds frames 00 to 02 only.
+    common::fixture_frame("mantis-64", 3);
+}
+
+#[test]
+#[should_panic(expected = "no fixture frame at")]
+fn fixture_frame_refuses_an_unknown_set() {
+    common::fixture_frame("no-such-set", 0);
+}
+
 fn open_many_timed_frames(controller: &mut AppController, name: &str, count: usize) {
     let root = common::tree(&format!("{name}_frames"));
     for index in 0..count {
@@ -1901,8 +1914,8 @@ fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
     };
 
     let frames_dir = tree("controller_shape_frames");
-    copy_frame(&frames_dir, "00.tif", 2);
-    copy_frame(&frames_dir, "01.tif", 3);
+    copy_frame(&frames_dir, "00.tif", 0);
+    copy_frame(&frames_dir, "01.tif", 1);
     let frame_paths = vec![frames_dir.join("00.tif"), frames_dir.join("01.tif")];
 
     for paths in [vec![folder], vec![project_path], frame_paths] {
@@ -1941,7 +1954,8 @@ fn load_progress_ticks_report_frames_of_the_real_total_and_never_after_ready() {
     copy_frame(&two_subfolders.join("subject-a"), "00.tif", 0);
     copy_frame(&two_subfolders.join("subject-a"), "01.tif", 1);
     copy_frame(&two_subfolders.join("subject-a"), "02.tif", 2);
-    copy_frame(&two_subfolders.join("subject-b"), "00.tif", 3);
+    // Four distinct frames are the count claim, and mantis-64 has three.
+    common::copy_frame_from("mantis-512", &two_subfolders.join("subject-b"), "00.tif", 3);
 
     let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
 
@@ -3344,40 +3358,28 @@ fn crash_notice_cleared_by_a_bundle_write() {
     assert!(!crash2.acknowledged && crash2.ids.len() == 2);
 }
 
-/// A controller with `fixtures/mantis-512` open as one tab, its scratch root
-/// under `CARGO_TARGET_TMPDIR`. A first fuse writes nothing beside the frames.
-fn controller_on_mantis_512(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+// The unaligned names are the real-image content of `fixtures/mantis-512`
+// under the default aligner.
+#[test]
+fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
+    let mut controller = controller_with_scratch("default_fuse_mantis_512");
     let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
     assert!(matches!(
         common::open_and_settle(&mut controller, &[mantis_512]),
-        focusforge_gui::OpenOutcome::Opened(_)
+        OpenOutcome::Opened(_)
     ));
-    controller
-}
-
-/// [`controller_on_mantis_512`] with the default aligner's `anchor` reference
-/// policy, which parks the run at its Keep/Discard question at a fraction of
-/// the `chain` policy's cost.
-fn divergent_controller_on_mantis_512(name: &str) -> AppController {
-    let mut controller = controller_on_mantis_512(name);
-    controller.set_param_value(
-        "align",
-        "reference-policy",
-        focusforge_core::params::ParamValue::Enum("anchor".to_string()),
-    );
-    controller
-}
-
-#[test]
-fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
-    let mut controller = controller_on_mantis_512("default_fuse_mantis_512");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, std::time::Duration::from_secs(300));
     assert!(
         controller.job_failure_message().is_none(),
         "a default fuse completes rather than failing"
+    );
+    assert!(
+        controller
+            .notifications()
+            .iter()
+            .all(|n| !n.title.ends_with("unaligned")),
+        "nothing is recorded before Keep"
     );
     assert_eq!(controller.checkpoint_count(), Some(0));
     let names = ["00.tif", "01.tif"].map(String::from);
@@ -3399,7 +3401,9 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         .filter(|n| n.title == "2 frames unaligned")
         .collect();
     assert_eq!(kept.len(), 1, "keeping records the count once");
+    assert_eq!(kept[0].kind, focusforge_gui::notifications::Kind::Warning);
     assert!(kept[0].message.contains("2 frames unaligned"));
+    assert!(kept[0].project_title.is_some());
     let summary = controller.last_alignment().expect("a completed run");
     assert_eq!(
         (summary.source.as_str(), summary.backend.as_str()),
@@ -3415,29 +3419,29 @@ fn tab_run(controller: &mut AppController, index: usize) -> job::RunState {
     controller.job_view().state
 }
 
-/// Polls until some tab holds a parked run, within the budget a mantis-512
+/// Polls until some tab holds a parked run, within the budget a mantis-64
 /// fuse needs.
 fn settle_until_parked(controller: &mut AppController) {
     let start = Instant::now();
     while !controller.parked_run_waiting() {
         controller.settle_job();
         assert!(
-            start.elapsed() < Duration::from_secs(300),
+            start.elapsed() < Duration::from_secs(60),
             "no run parked within the budget"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-const MANTIS_512_UNALIGNED: [&str; 2] = ["00.tif", "01.tif"];
 const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
 
-/// Tab 0 (mantis-512) parks at its question; `tails` are the tabs queued
+/// Tab 0 parks at its question on the default aligner; `tails` are the tabs queued
 /// behind it, each `true` for `dummy-align` and `false` for the default
 /// aligner. Checks the queue head runs while tab 0 waits and every tab
 /// settles to an outcome of its own, then answers each question.
 fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
-    let mut c = controller_on_mantis_512(name);
+    let mut c = controller_with_scratch(name);
+    open_mantis64_frames(&mut c, &format!("{name}_head"), 3);
     for (i, dummy) in tails.iter().enumerate() {
         let tab = format!("{name}_{i}");
         if *dummy {
@@ -3467,7 +3471,7 @@ fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_whil
     c.select_project(0);
     assert_eq!(
         c.pending_divergence(),
-        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+        Some(&MANTIS_64_UNALIGNED.map(String::from)[..])
     );
     let answer_first = |c: &mut AppController| {
         c.select_project(0);
@@ -3506,7 +3510,7 @@ fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_whil
         c.select_project(0);
         assert_eq!(
             c.pending_divergence(),
-            Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+            Some(&MANTIS_64_UNALIGNED.map(String::from)[..])
         );
         answer_first(&mut c);
     }
@@ -3534,7 +3538,8 @@ fn queued_tab_runs_past_a_keep_question() {
 
 /// Tab 0 parked, tab 1 running slowly, tabs 2 and 3 queued behind it.
 fn parked_tab_with_two_queued(name: &str) -> AppController {
-    let mut c = controller_on_mantis_512(name);
+    let mut c = controller_with_scratch(name);
+    open_mantis64_frames(&mut c, &format!("{name}_head"), 3);
     for i in 0..3 {
         open_mantis64_tab(&mut c, &format!("{name}_{i}"), 3);
     }
@@ -3584,7 +3589,7 @@ fn queue_survives_cancelling_a_queued_tab() {
     c.select_project(0);
     assert_eq!(
         c.pending_divergence(),
-        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+        Some(&MANTIS_64_UNALIGNED.map(String::from)[..])
     );
 }
 
@@ -3612,7 +3617,8 @@ fn a_clean_run_raises_no_unaligned_notice() {
 
 #[test]
 fn an_unresolved_align_id_is_refused_before_any_run() {
-    let mut controller = controller_on_mantis_512("unresolved_align_id");
+    let mut controller = controller_with_scratch("unresolved_align_id");
+    open_mantis64_tab(&mut controller, "unresolved_align_id", 2);
     controller.set_align_algorithm("");
     assert!(!controller.start_fuse());
     assert!(!controller.any_job_running());
@@ -6123,9 +6129,6 @@ fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("equalize_rows", 3);
-    // The default aligner parks these frames on a diverged one; a run that
-    // always converges keeps the held checkpoint this test reads.
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_section_more("prepare");
     let rows: Vec<_> = controller
         .settings_panel()
@@ -6186,10 +6189,7 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
     use focusforge_core::equalize::UNIT_GAIN;
     use focusforge_core::params::ParamValue;
 
-    let mut controller = common::controller_with_frames("equalize_clamped_notice", 8);
-    // The default aligner parks eight mantis frames on a diverged one; a run
-    // that always converges keeps the held checkpoint this test reads.
-    controller.set_align_algorithm("dummy-align");
+    let mut controller = common::controller_with_frames("equalize_clamped_notice", 3);
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
@@ -6244,7 +6244,6 @@ fn settings_journey_fuses_each_method_with_its_settings() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("journey_each_method", 3);
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_section_more("fuse");
     controller.toggle_section_more("prepare");
     let methods = [
@@ -6292,9 +6291,6 @@ fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("focus_map_equalize_default", 3);
-    // The default aligner parks these frames on a diverged one; a run that
-    // always converges keeps the held checkpoint this test reads.
-    controller.set_align_algorithm("dummy-align");
     controller.set_fuse_algorithm("depth-map");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
@@ -6996,7 +6992,8 @@ fn brush_cursor_hidden_under_every_modal() {
     // divergent run on a tab already holding a checkpoint, and
     // `brush_cursor_view` has no mode check either way.
     {
-        let mut c = divergent_controller_on_mantis_512("cursor_divergence");
+        let mut c = controller_with_scratch("cursor_divergence");
+        open_mantis64_frames(&mut c, "cursor_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(
             c.brush_cursor_view().is_some(),
@@ -7131,7 +7128,8 @@ fn canvas_input_blocked_under_every_modal() {
         c.toggle_projects_overlay();
     }
     {
-        let mut c = divergent_controller_on_mantis_512("blocked_divergence");
+        let mut c = controller_with_scratch("blocked_divergence");
+        open_mantis64_frames(&mut c, "blocked_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(c.start_fuse());
         settle_all(&mut c);
@@ -7181,7 +7179,8 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
 
 #[test]
 fn refusal_dialog_counts_as_modal() {
-    let mut controller = controller_on_mantis_512("refusal_modal");
+    let mut controller = controller_with_scratch("refusal_modal");
+    open_mantis64_tab(&mut controller, "refusal_modal", 2);
     controller.set_align_algorithm("");
     assert!(!controller.modal_open(), "nothing raised yet");
     assert!(!controller.canvas_blocked());
@@ -9012,11 +9011,11 @@ fn storage_clear_failure_line_names_the_cause_without_the_os_error_code() {
 mod notification {
     use super::{AppController, SETTLE, common};
     use focusforge_core::params::ParamValue;
+    use focusforge_gui::entry::ImportRefused;
     use focusforge_gui::notifications::{Kind, Notification};
 
     fn every_frame_clamps(name: &str, excluded: Option<usize>) -> AppController {
-        let mut controller = common::controller_with_frames(name, 4);
-        controller.set_align_algorithm("dummy-align");
+        let mut controller = common::controller_with_frames(name, 3);
         controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
         controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
         controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
@@ -9041,7 +9040,7 @@ mod notification {
     fn every_brightness_warning_becomes_its_own_record() {
         let controller = every_frame_clamps("notification_every_warning", None);
         let records = warnings(&controller);
-        assert_eq!(records.len(), 4, "one record per clamped frame");
+        assert_eq!(records.len(), 3, "one record per clamped frame");
         for (i, record) in records.iter().enumerate() {
             assert!(
                 record.message.starts_with(&format!("frame {i}:")),
@@ -9058,39 +9057,15 @@ mod notification {
         let records = warnings(&controller);
         assert_eq!(
             records.len(),
-            3,
+            2,
             "the excluded frame is not part of the run"
         );
         let files: Vec<_> = records.iter().map(|r| r.frame.as_deref()).collect();
-        assert_eq!(files, [Some("01.tif"), Some("02.tif"), Some("03.tif")]);
+        assert_eq!(files, [Some("01.tif"), Some("02.tif")]);
         assert!(
             records[0].message.starts_with("frame 0:"),
             "the index is the run's own"
         );
-    }
-
-    #[test]
-    fn kept_unaligned_frames_record_the_count() {
-        let mut controller = super::controller_on_mantis_512("notification_kept_unaligned");
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, std::time::Duration::from_secs(300));
-        assert!(
-            controller
-                .notifications()
-                .iter()
-                .all(|n| !n.title.ends_with("unaligned")),
-            "nothing is recorded before Keep"
-        );
-        controller.keep_fused().expect("a parked run keeps");
-        let kept: Vec<_> = controller
-            .notifications()
-            .iter()
-            .filter(|n| n.title == "2 frames unaligned")
-            .collect();
-        assert_eq!(kept.len(), 1, "Keep records the count once");
-        assert_eq!(kept[0].kind, Kind::Warning);
-        assert!(kept[0].message.contains("2 frames unaligned"));
-        assert!(kept[0].project_title.is_some());
     }
 
     #[test]
@@ -9107,11 +9082,11 @@ mod notification {
     #[test]
     fn refused_add_records_its_full_message() {
         let mut controller = common::controller_with_frames("notification_refused", 3);
-        controller.set_align_algorithm("dummy-align");
         assert!(controller.start_fuse());
         let refused = controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+            .add_frames(&[common::fixture_frame("mantis-64", 0)])
             .expect_err("a running job refuses an add");
+        assert!(matches!(refused, ImportRefused::JobRunning), "{refused:?}");
         let record = controller
             .notifications()
             .last()
@@ -9180,6 +9155,7 @@ mod notification {
 
 mod native_delivery {
     use super::{AppController, SETTLE, common};
+    use focusforge_gui::entry::ImportRefused;
     use focusforge_gui::native_notify;
     use focusforge_gui::notifications::{Banner, context_line};
     use std::cell::Cell;
@@ -9192,13 +9168,13 @@ mod native_delivery {
     #[test]
     fn background_arrival_is_banner_once() {
         let mut controller = common::controller_with_frames("native_once", 3);
-        controller.set_align_algorithm("dummy-align");
         controller.set_window_focused(1, false);
         crash_notice(&mut controller);
         assert!(controller.start_fuse());
-        controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+        let refused = controller
+            .add_frames(&[common::fixture_frame("mantis-64", 0)])
             .expect_err("a running job refuses an add");
+        assert!(matches!(refused, ImportRefused::JobRunning), "{refused:?}");
 
         let titles: Vec<_> = controller
             .take_native_notifications()
