@@ -111,7 +111,7 @@ auto-crop that precedes fusion are both on by default (`--no-align` /
 `--no-crop` turn them off); `focusforge-cli align` reports the same
 transforms on their own, before any fusion runs. See
 [`docs/guide/stacking.md`](docs/guide/stacking.md) for the other algorithms
-and their parameters, and [`docs/guide/batch-runs.md`](docs/guide/batch-runs.md)
+and their parameters, and [`docs/reference/batch-runs.md`](docs/reference/batch-runs.md)
 for stacking a folder that holds more than one stack.
 
 The Mantis photographs and derived comparison image are used only within this

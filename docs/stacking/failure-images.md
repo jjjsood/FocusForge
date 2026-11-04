@@ -1,6 +1,6 @@
 # Common failure images
 
-Most stacks that go wrong go wrong in one of three ways: a glow along the
+Most [stacks](../glossary.md#stack) that go wrong go wrong in one of three ways: a glow along the
 edges of the subject, doubled or broken outlines, or soft bands between sharp
 ones. Each has a cause you can name, a way to avoid it next time you shoot,
 and often a way to repair it in FocusForge.
@@ -15,7 +15,7 @@ praying mantis's head, numbered 00 to 07 in focus order, that the chapter
 caption says otherwise. The motion example is simulated by moving frames in
 software, and its caption says so.
 
-> **Tip:** Judge a composite at 100 %. All three failures are easy to miss
+> **Tip:** Judge a [composite](../glossary.md#composite) at 100 %. All three failures are easy to miss
 > in a small preview. In the window, the bottom bar's **Overlay** colours the
 > **Composite** pane by the frame each area came from; it is the quickest way
 > to see where a soft band or a halo was taken from (see
@@ -48,11 +48,11 @@ the frames focused on the foreground object, the background behind it is
 blurred. In the frames focused further back, the foreground object is out of
 focus and its blur spreads out over the background beside it. Next to the
 edge there is therefore no frame in which the background is both sharp and
-free of the foreground's blur. The fusion method has to choose between
+free of the foreground's blur. The [fusion method](../glossary.md#fusion-method) has to choose between
 blurred versions, and a broad, soft edge can score as "detail" too.
 
 The fusion methods handle this differently, as the first example shows.
-**Details** works scale by scale and kept the cleanest edges here.
+**[Details](../glossary.md#details)** works scale by scale and kept the cleanest edges here.
 **Soft transitions** blends every frame at every pixel, so the soft spread
 of the out-of-focus frames is mixed into the strip beside the edge: here a
 dark band along the rim. **Focus map** picks one frame per area from a
@@ -105,7 +105,7 @@ it, the camera moved. When only one part does, the subject moved.
 
 ### Why it happens
 
-Focus stacking assumes that only the focus changes between frames. If the
+[Focus stacking](../glossary.md#focus-stacking) assumes that only the focus changes between frames. If the
 camera moves, every frame after the movement shows the scene in a slightly
 different place. If the subject moves, a leg, an antenna or a leaf is in a
 different place in some frames while everything else stays put. Either way,
@@ -125,8 +125,8 @@ series or calm moments. All of this is covered in
 
 ### How to repair it
 
-- **Camera movement:** alignment repairs it. It is on by default: FocusForge
-  registers every frame onto a reference frame, shifting, rotating and
+- **Camera movement:** [alignment](../glossary.md#alignment) repairs it. It is on by default: FocusForge
+  registers every frame onto a [reference frame](../glossary.md#reference-frame), shifting, rotating and
   scaling it as needed, and crops the result to the area every frame covers.
   When it cannot register a frame, it fuses that frame as it is, and the
   window asks **Keep this fused result?**, naming the frames that "could not
@@ -170,7 +170,7 @@ show up as stripes: sharp, soft, sharp, soft.
 
 A **[focus gap](../glossary.md#focus-gap)** is a slice of the subject that is
 not sharp in any frame. Either the step between two frames was larger than
-the depth of field, so their sharp slices did not overlap, or frames are
+the [depth of field](../glossary.md#depth-of-field), so their sharp slices did not overlap, or frames are
 missing from the series: deleted, skipped, or excluded before fusing. Focus
 stacking can only pick from what the frames contain, so a slice that no frame
 holds sharp stays soft.

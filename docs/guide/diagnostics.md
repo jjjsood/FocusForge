@@ -36,13 +36,13 @@ The **Storage** section of the settings window shows the exact folders on
 your computer; see [Storage](settings-window.md#storage).
 
 > **Tip:** When the settings window tells you a problem is "named in the
-> log" (a refused key binding, a cap in the settings file that does not
+> log" (a refused key binding, a [cap](../glossary.md#cap) in the settings file that does not
 > parse), search `focusforge.jsonl` for `WARN`. If you start
 > `focusforge-gui` from a terminal, the same warnings also appear there.
 
 ### Crash reports
 
-If FocusForge fails in a way it can catch itself, it writes a crash report
+If FocusForge fails in a way it can catch itself, it writes a [crash report](../glossary.md#crash-report)
 into the `crashes` folder next to `logs`: the error message, where in the
 program it happened, and a short recording of the most recent log activity,
 so a crash you cannot repeat still comes with context.

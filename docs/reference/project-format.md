@@ -1,5 +1,11 @@
 # The project container (`.ffp`)
 
+This appendix is for people who script FocusForge, archive projects or want
+to know exactly what a project file holds and when it is refused. To save,
+reopen and manage projects in the window, you do not need it: see
+[Checkpoints and saving](../guide/history.md) and
+[Damaged or moved projects](../guide/first-stack.md#damaged-or-moved-projects).
+
 `focusforge-cli stack` writes one `.ffp` file per detected stack instead
 of an image. It is a zip archive holding exactly three kinds of entry:
 

@@ -8,7 +8,7 @@ checkpoint can be shown again, exported, or used as the starting point for
 new strokes, so trying something never costs you the version you already
 liked.
 
-Checkpoints are stored in the project file (`.ffp`) when you save the
+Checkpoints are stored in the [project](../glossary.md#project) file (`.ffp`) when you save the
 project. A retouched checkpoint stores its strokes, not a second copy of the
 image, so it adds very little to the file.
 
@@ -16,7 +16,7 @@ image, so it adds very little to the file.
 
 The CHECKPOINTS list sits in the dock, under the **STACKING** / **EDITOR**
 switch, in both modes. It lists the active tab's checkpoints, newest first.
-Each row shows the fusion method and the time the checkpoint was made. A
+Each row shows the [fusion method](../glossary.md#fusion-method) and the time the checkpoint was made. A
 retouched checkpoint shows the fusion method of the result it was painted on.
 When the list spans more than one day, the rows are grouped under day
 headings: TODAY, YESTERDAY, then the date.
@@ -168,7 +168,7 @@ When a project cannot be opened, or its frames were moved or changed since it
 was saved, the window explains what is wrong and offers **Locate frames…** to
 point it at the frames' new folder. What each message means and what to do is
 in [Damaged or moved projects](first-stack.md#damaged-or-moved-projects) in *Your first stack*; the command-line side (accepting
-changed frames, exit codes) is in [Troubleshooting](../troubleshooting.md).
+changed frames, exit codes) is in [Troubleshooting](../troubleshooting.md#source-frames-changed-since-this-project-was-written).
 How a project records its frames is described in
 [the project format](../reference/project-format.md#source-frames).
 
@@ -194,9 +194,9 @@ focusforge-cli history compact frames.ffp
   bytes reclaimed.
 - `retouch` appends an op list (its shape is in
   [Retouching](retouch.md#from-the-command-line)) to the head, or to the
-  checkpoint `--from` names, which starts a branch.
+  checkpoint `--from` names, which starts a [branch](../glossary.md#branch).
 - `export --checkpoint <id>` writes any checkpoint as an image, and with
-  `--zmap` its Z-Map.
+  `--zmap` its [Z-Map](../glossary.md#z-map).
 
 Every flag and exit code is in the
 [command-line reference](../reference/cli.md#history).

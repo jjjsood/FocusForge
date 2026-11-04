@@ -1,7 +1,7 @@
 # The Images panel
 
 The **Images** panel is the frame list in the lower half of the dock. It
-shows every frame of the stack in the order FocusForge fuses them, and it is
+shows every frame of the [stack](../glossary.md#stack) in the order FocusForge fuses them, and it is
 where you decide which frames take part: look at a frame, leave it out of
 the next fuse, remove it, sort or reorder the list, and add more frames.
 
@@ -64,7 +64,7 @@ It stays in the list, so you can bring it back at any time.
 3. To bring the frame back, click the crossed-out eye (**Include**).
 
 The next **Fuse stack** on this tab leaves excluded frames out. Excluding
-never asks a question, not even when the project already has checkpoints:
+never asks a question, not even when the [project](../glossary.md#project) already has checkpoints:
 it changes nothing until you fuse again.
 
 ## Remove a frame

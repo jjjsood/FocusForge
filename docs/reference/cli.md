@@ -1,5 +1,12 @@
 # CLI reference
 
+This appendix is for scripting and batch work in a terminal: it lists every
+`focusforge-cli` command, flag, output field and exit status, exactly as the
+program accepts them. Photographers working in the window do not need it;
+start with [Your first stack](../guide/first-stack.md) and the chapters that
+follow it. Installing the command line and shell completion is covered in
+[For the command line](../getting-started.md#for-the-command-line).
+
 `focusforge-cli` is the headless interface to FocusForge. Every algorithm,
 and every batch-run control (grouping, presets, resume, review, the stage
 cache), is reachable here.
@@ -250,7 +257,7 @@ off.
 
 **Grouping runs before that.** `<DIR>` may hold more than one stack; `stack`
 proposes a split by capture time or directory structure and prints it before
-doing anything else — see [`guide/batch-runs.md`](../guide/batch-runs.md)
+doing anything else — see [`reference/batch-runs.md`](batch-runs.md)
 for the full workflow (`--groups`, `--write-groups`, `--only`).
 
 | flag | meaning |
@@ -262,7 +269,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
-| `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame. Alignment is on by default, matching the project's `align` value |
+| `--no-align` | skip alignment: frame tiles are fused unwarped. The auto-crop still trims a 2-pixel border on every side; add `--no-crop` to keep the full frame. Alignment is on by default, matching the project's `align` value |
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on. The crop is on by default, matching the project's `auto-crop` value; with the crop on and no interior common to the aligned frames, `stack` stops and names this flag |
 | `--align-algorithm <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--strict` | refuse the run if any frame fails registration; identity fallback is the default |
@@ -273,7 +280,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--tile-size <PX>` | override the scheduler's outer tile size, in pixels |
 | `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
 | `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; absent when the binary was built `--no-default-features` |
-| `--preset <PATH>` | read parameter values from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets) |
+| `--preset <PATH>` | read parameter values from a TOML preset — see [`reference/batch-runs.md`](batch-runs.md#presets) |
 | `--write-preset <PATH>` | write the preset that reproduces this run |
 | `--status <PATH>` | append one NDJSON status record for this stack to this path |
 | `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
@@ -539,7 +546,7 @@ Options:
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
 | `-q, --quiet` | log errors only; results and required warnings remain visible |
 | `--no-progress` | suppress the one stage line |
-| `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
+| `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`reference/batch-runs.md`](batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
 | `--write-preset <PATH>` | write the preset that reproduces this run: `align-algo` plus the `[align]` values chosen |
 | `--status <PATH>` | append one NDJSON status record for this run to this path |
 | `--max-host-memory <SIZE>` | ceiling on the host-memory budget the alignment workers are sized from; it only lowers the derived budget |
@@ -681,9 +688,12 @@ pyramidal-ecc - Pyramidal ECC (alignment)
 weighted-average - Weighted Average (stacking)
 ```
 
-- `laplacian` — Laplacian-pyramid coefficient selection
-- `weighted-average` — per-pixel sharpness-weighted blend
-- `depth-map` — per-pixel selection from a smoothed sharpness surface
+- `laplacian` — Laplacian-pyramid coefficient selection; the window calls it
+  **Details**
+- `weighted-average` — per-pixel sharpness-weighted blend; the window calls it
+  **Soft transitions**
+- `depth-map` — per-pixel selection from a smoothed sharpness surface; the
+  window calls it **Focus map**
 - `pyramidal-ecc` — the alignment solver `align` and `stack` both drive; see
   [`guide/alignment.md`](../guide/alignment.md)
 
@@ -925,7 +935,10 @@ focusforge-cli review [OPTIONS] <DIR>
 Reports one record per stack found under `<DIR>` — a `stack` run's `-o`
 output directory, or a plain directory of `.ffp` files — without
 re-fusing, re-grouping or writing anything. When `<DIR>` holds a run
-manifest (`manifest.json`, written by every `stack` run), `review` reads it
+manifest (written by every `stack` run: `manifest.json` in the `-o`
+directory, or `<folder>-run.json` inside the folder the run was pointed at
+when `-o` is omitted),
+`review` reads it
 and lists every group the run attempted, a failed one included; otherwise it
 lists the `.ffp` files it finds directly, non-recursively.
 
@@ -940,7 +953,7 @@ project's manifest; `coherence` is computed by streaming the project's
 Z-Map. Both are `--` when a project has no recorded metrics — a failed
 stack, for instance — and a note (the metrics reason, or the run's error)
 prints after the fields instead. See
-[`guide/batch-runs.md`](../guide/batch-runs.md#reviewing-the-results) for a
+[`reference/batch-runs.md`](batch-runs.md#reviewing-the-results) for a
 walkthrough.
 
 ### `--json`
@@ -978,7 +991,7 @@ focusforge-cli cache clear [OPTIONS]
 
 Removes every entry from the stage cache under `.scratch/stage-cache/`, the
 store `stack` reads and writes to skip a repeated alignment solve — see
-[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). Never touches
+[`reference/batch-runs.md`](batch-runs.md#the-stage-cache). Never touches
 `.scratch/resume/` or any project — a clear must never be able to destroy a
 cancelled run's recoverable work.
 

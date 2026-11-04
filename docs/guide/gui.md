@@ -1,7 +1,7 @@
 # The window
 
 This chapter is a guided tour of the FocusForge window: what each area is
-for, how to move around a picture, how to keep several stacks open at once
+for, how to move around a picture, how to keep several [stacks](../glossary.md#stack) open at once
 and how to give one image its own window on a second screen. It assumes you
 have opened a stack at least once; if not, start with
 [Your first stack](first-stack.md).
@@ -35,7 +35,7 @@ The sections below take these areas one at a time.
 
 ## Tabs: one project each
 
-Every stack you open becomes a project in its own tab. A tab shows the
+Every stack you open becomes a [project](../glossary.md#project) in its own [tab](../glossary.md#tab). A tab shows the
 project's name and, on the right, an **x** that closes it. Next to the name
 you may see:
 
@@ -56,7 +56,7 @@ move the window.
 ### Work on two projects at once
 
 Each tab keeps its own frames, its own selected frame, its own settings, its
-own checkpoints and its own zoom. Switching tabs never mixes them up.
+own [checkpoints](../glossary.md#checkpoint) and its own zoom. Switching tabs never mixes them up.
 
 1. Open the first stack, then open a second one (with **+** and **Open…**,
    or by dropping a folder onto the **+** tab).
@@ -97,7 +97,7 @@ The toolbar changes with what you are doing:
 
 The canvas in the middle of the window shows two images side by side:
 
-- **The Frame pane** (left) shows one source frame: the one selected in the
+- **The Frame pane** (left) shows one [source frame](../glossary.md#source-frame): the one selected in the
   [Images panel](images-panel.md). Its label is the frame's file name, for
   example `00.tif`. Click another row in the list to look at another frame.
 - **The Composite pane** (right) shows the [composite](../glossary.md#composite),
@@ -118,7 +118,7 @@ the whole image and sharpens it a moment later, so you never see empty edges.
 
 *The dock of a fused project, in stacking.*
 
-The dock runs down the right side of the window. From top to bottom:
+The [dock](../glossary.md#dock) runs down the right side of the window. From top to bottom:
 
 1. **STACKING / EDITOR.** The two halves switch between preparing and fusing
    a stack (**STACKING**) and retouching its result (**EDITOR**). **EDITOR**
@@ -286,9 +286,10 @@ The canvas responds to these inputs by default:
 | Left drag | — | Paint |
 | Ctrl + Z / Ctrl + Shift + Z | — | Undo / redo |
 
-The settings window's **Input map** tab lists the bindings in effect and
-where each came from; you can change them in the settings file. See
-[The settings window](settings-window.md#input-map).
+The settings window's **Input map** section lists the bindings in effect
+(see [Input map](settings-window.md#input-map)); you can change them in the
+settings file, as described in
+[Keyboard and mouse bindings](settings-window.md#keyboard-and-mouse-bindings).
 
 A few keys are fixed and work anywhere in the window:
 
@@ -356,7 +357,10 @@ The bell, the notification center, toasts and desktop banners:
 
 ### The settings window
 
+Performance, Appearance, Storage, Input map, Diagnostics and About:
+[The settings window](settings-window.md#open-and-close-the-window).
+
 ### The settings file
 
-Performance, Appearance, Storage, Input map, Diagnostics and About, and the
-`settings.toml` file behind them: [The settings window](settings-window.md).
+The `settings.toml` file behind them, and how to use another one:
+[The settings file](settings-window.md#the-settings-file).

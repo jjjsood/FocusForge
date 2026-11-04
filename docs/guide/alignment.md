@@ -1,6 +1,6 @@
 # Alignment
 
-No two frames of a focus stack line up perfectly. The camera drifts a little
+No two frames of a focus [stack](../glossary.md#stack) line up perfectly. The camera drifts a little
 on the tripod or between handheld shots, and most lenses change the image
 size slightly as focus moves, an effect called
 [focus breathing](../glossary.md#focus-breathing). Fused as they are, such
@@ -40,7 +40,7 @@ For every frame, FocusForge:
 4. **Moves the frame** into place for fusing. Your source files are not
    changed.
 
-Finally, **Auto-crop** in the **FINISH** section trims the result to the area
+Finally, **[Auto-crop](../glossary.md#auto-crop)** in the **FINISH** section trims the result to the area
 every aligned frame covers.
 
 On a 61-frame macro stack, alignment recovers up to 159 pixels of drift in
@@ -156,14 +156,14 @@ section's **DEFAULT** badge; **Reset All to Default** brings it back (see
 
 Aligning is often the slowest part of a fuse, so FocusForge keeps each
 alignment it computes. When you fuse the same frames again after changing
-only the fusion method or its settings under **FUSE**, the stored alignment
+only the [fusion method](../glossary.md#fusion-method) or its settings under **FUSE**, the stored alignment
 is used and the bottom bar briefly reads
 **Aligning** with "from cache" instead of a frame count. The second fuse is
 then much quicker.
 
 The stored alignments are recognised by the content of the frames, so they
 are found again even when the files were moved or renamed; frames you reshoot
-are aligned afresh. **Clear cache** (Stage cache) in the **Storage** section of
+are aligned afresh. **Clear cache** ([Stage cache](../glossary.md#stage-cache)) in the **Storage** section of
 [the settings window](settings-window.md) deletes them.
 
 ## When a frame cannot be aligned
@@ -189,7 +189,7 @@ blurred frames, such as the first frames of a stack focused on the background,
 often cannot be aligned because they hold little detail, but they also
 contribute little; that is what happens in the sample stack above, and its
 result is fine. Before you decide, look at the result for doubled edges or
-smeared detail, and use the Z-Map overlay to see where the named frames were
+smeared detail, and use the [Z-Map](../glossary.md#z-map) overlay to see where the named frames were
 used (see
 [See where each pixel came from](gui.md#see-where-each-pixel-came-from)).
 

@@ -1,6 +1,6 @@
 # Projects, notifications and quitting
 
-FocusForge keeps every stack you open as a [project](../glossary.md#project)
+FocusForge keeps every [stack](../glossary.md#stack) you open as a [project](../glossary.md#project)
 in a tab of its own, so you can work on several at once. This chapter shows
 how to keep track of them in the **Projects** overview, what happens when you
 open a folder that holds several stacks, how to fuse several projects one
@@ -274,7 +274,7 @@ titled "Previous session stopped", with the context line
 | Button | What it does |
 |---|---|
 | **Acknowledge** | Marks the crash report as dealt with, so the notice does not come back at the next start. The row then reads "Acknowledged" and the button is dimmed. |
-| **Diagnostics** | Acknowledges the report the same way and opens the settings window on its Diagnostics section, where you can package a bundle to send with a bug report. See [After a crash](diagnostics.md#after-a-crash). |
+| **Diagnostics** | Acknowledges the report the same way and opens the settings window on its Diagnostics section, where you can package a [bundle](../glossary.md#diagnostics-bundle) to send with a bug report. See [After a crash](diagnostics.md#after-a-crash). |
 
 Reading the notice, letting its toast run out or closing the center does not
 acknowledge anything: "Reading or closing this notice does not acknowledge the

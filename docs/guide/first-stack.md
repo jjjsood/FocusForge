@@ -280,7 +280,7 @@ Click **Close** or press `Escape`, then try another folder.
 > card in the projects overview.
 
 The command-line side of damaged projects (accepting changed frames, exit
-codes) is in [Troubleshooting](../troubleshooting.md).
+codes) is in [Troubleshooting](../troubleshooting.md#source-frames-changed-since-this-project-was-written).
 
 ## Fuse the stack
 
@@ -471,6 +471,6 @@ everyday work.
   overlay that shows which frame each pixel came from.
 - [Stacking settings](stacking.md): the settings behind **Fuse stack**, and
   when to change them.
-- [Retouching](retouch.md): fix halos and other flaws by painting from the
+- [Retouching](retouch.md): fix [halos](../glossary.md#halo) and other flaws by painting from the
   right frame.
 - [Exporting an image](export.md): write the result as TIFF, PNG or JPEG.

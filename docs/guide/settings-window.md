@@ -1,9 +1,9 @@
 # The settings window
 
 The settings window holds the preferences that apply to FocusForge as a
-whole, not to one stack: whether to use the graphics card, how much memory
+whole, not to one [stack](../glossary.md#stack): whether to use the graphics card, how much memory
 FocusForge may claim, how the **Images** panel looks, where FocusForge keeps
-its files, which mouse and key gestures do what, and the diagnostics bundle
+its files, which mouse and key gestures do what, and the [diagnostics bundle](../glossary.md#diagnostics-bundle)
 you attach to a bug report.
 
 > **Note:** The **Settings** tab in the dock on the right is a different
@@ -63,7 +63,7 @@ depend on your computer.*
 
 | Setting | Values | Default | What it does |
 | --- | --- | --- | --- |
-| **GPU processing** | on / off | on | Fuses on the graphics card (GPU) when the fusion method supports it. Off fuses on the processor only. |
+| **GPU processing** | on / off | on | Fuses on the graphics card (GPU) when the [fusion method](../glossary.md#fusion-method) supports it. Off fuses on the processor only. |
 | **Backend** | text | empty | What the last fuse actually ran on, and why. |
 | **Host memory cap** | a size, or empty | empty ("No cap") | The most working memory a fuse may use. |
 | **VRAM cap** | a size, or empty | empty ("No cap") | The most graphics-card memory a fuse may use. |
@@ -175,7 +175,7 @@ quit, and the next start uses the one saved before.
 ## Storage
 
 **Storage** shows where FocusForge keeps its files on this computer, and
-lets you empty the stage cache.
+lets you empty the [stage cache](../glossary.md#stage-cache).
 
 ![The Storage section: under LOCATIONS the rows Settings file, Logs, Crash reports and Scratch each show a folder path, Crash reports and Scratch followed by "not created yet"; under CACHE the row Stage cache with "Deletes cached fuse stages." and a Clear cache button](../assets/manual/settings-window/settings-storage.png)
 
@@ -203,8 +203,8 @@ When FocusForge fuses, it keeps the results of expensive steps, above all the
 [stage cache](../glossary.md#stage-cache) in the scratch folder. Fusing the
 same frames again, for example with another fusion method, can then skip
 those steps. The cache can grow over time; **Clear cache** deletes it to free
-disk space. Nothing else in the scratch folder is touched, and your projects,
-checkpoints and exported images are not affected. The next fuse of each stack
+disk space. Nothing else in the scratch folder is touched, and your [projects](../glossary.md#project),
+[checkpoints](../glossary.md#checkpoint) and exported images are not affected. The next fuse of each stack
 simply computes those steps again.
 
 Click **Clear cache**. The line under the row then reads, for example,

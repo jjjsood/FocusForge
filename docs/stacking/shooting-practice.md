@@ -1,6 +1,6 @@
 # Shooting a stack
 
-A good stack is decided at the camera. FocusForge lines frames up, evens out
+A good [stack](../glossary.md#stack) is decided at the camera. FocusForge lines frames up, evens out
 small brightness differences and picks the sharpest detail from each frame,
 but it can only work with what you shot: a slice of the subject that no frame
 has in focus stays soft, and a leg that moved between frames stays doubled.
@@ -52,7 +52,7 @@ does not, measure it:
 
 ## Choose the step and the number of frames
 
-The **step** is how far the plane of focus moves from one frame to the next.
+The **[step](../glossary.md#step)** is how far the plane of focus moves from one frame to the next.
 Too large a step leaves bands that no frame has sharp, a
 [focus gap](../glossary.md#focus-gap) (see
 [Common failure images](failure-images.md)). Too small a step only costs
@@ -76,14 +76,14 @@ Why 0.015 mm? The classic full-frame value, 0.03 mm, used in the
 [depth of field chapter](depth-of-field.md), describes what looks sharp when
 the whole picture is viewed at a normal size. A stack is usually judged at
 100% on screen, where that blur is plainly visible, so this chapter uses half
-the classic value. Every depth of field here is therefore half the one you get
+the classic value. Every [depth of field](../glossary.md#depth-of-field) here is therefore half the one you get
 with 0.03 mm: at 1:1 and f/8 the previous chapter's 0.96 mm becomes 0.48 mm.
 The larger figure is fine for small prints, too generous for a stack you want
 sharp at full size.
 
 The formula also assumes a lens whose entrance and exit pupils are the same
 size (a pupil magnification of 1). Real macro lenses differ a little in either
-direction, which is one more reason to keep the overlap described next.
+direction, which is one more reason to keep the [overlap](../glossary.md#overlap) described next.
 
 > **Note:** For a smaller sensor, divide c by the crop factor: about
 > 0.010 mm for APS-C (×1.5) and 0.0075 mm for Micro Four Thirds (×2), again
@@ -195,7 +195,7 @@ the lens markings suggest.
 
 When a lens focuses close, the image it projects is spread over a larger area,
 so less light reaches each part of the sensor and the lens behaves as if it
-were stopped down further. This **effective aperture** is approximately:
+were stopped down further. This **[effective aperture](../glossary.md#effective-aperture)** is approximately:
 
 > effective aperture = N × (1 + m)
 
@@ -339,7 +339,7 @@ Detail that is pure white in a frame is lost in that frame.
 > **Note:** If you move focus with the focus ring, magnification grows as you
 > focus closer, and with it the effective aperture. With a fixed manual
 > exposure, frames at the near end of the stack come out slightly darker:
-> going from 0.8× to 1× costs about 0.3 stops. Brightness equalization (next
+> going from 0.8× to 1× costs about 0.3 stops. [Brightness equalization](../glossary.md#brightness-equalization) (next
 > section) evens out a change of this size.
 
 ### What FocusForge evens out, and what it does not
@@ -410,7 +410,7 @@ past the farthest part.
   turn can depend on how fast you turn, so turn slowly and evenly.
 - **Expect:** magnification changes from the first frame to the last.
   FocusForge's alignment absorbs it, but the edges of the frame differ, and
-  the result is cropped to the area every frame covers (**Auto-crop**).
+  the result is cropped to the area every frame covers (**[Auto-crop](../glossary.md#auto-crop)**).
 
 > **Tip:** To judge the step by eye, magnify live view on a detail at the
 > back edge of the sharp zone. After you turn the ring, that detail should

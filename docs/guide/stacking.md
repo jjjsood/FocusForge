@@ -1,9 +1,9 @@
 # Stacking settings
 
-The dock's **Settings** tab holds everything the next fuse of a project uses:
+The dock's **Settings** tab holds everything the next fuse of a [project](../glossary.md#project) uses:
 how the frames are evened out in brightness, which
 [fusion method](../glossary.md#fusion-method) combines them, how they are
-lined up, and how the result is trimmed. The defaults suit most stacks, so you
+lined up, and how the result is trimmed. The defaults suit most [stacks](../glossary.md#stack), so you
 can fuse without ever opening this tab. When a result disappoints, this page
 tells you which setting to try and why.
 
@@ -46,7 +46,7 @@ badge disappears, so you can see at a glance where you have changed something.
 - Setting a value back to what it was does not bring the badge back: the
   section still counts as changed. Only
   [**Reset All to Default**](#reset-all-to-default) does.
-- In **ALIGN**, the **Enabled** switch counts: switching alignment off, or off
+- In **ALIGN**, the **Enabled** switch counts: switching [alignment](../glossary.md#alignment) off, or off
   and on again, removes the badge.
 - Choosing another fusion method changes no value, so **FUSE** keeps its badge.
 
@@ -260,11 +260,11 @@ A practical approach:
    remains by [retouching](retouch.md).
 
 [Common failure images](../stacking/failure-images.md) shows what halos,
-motion and focus gaps look like and which settings help.
+motion and [focus gaps](../glossary.md#focus-gap) look like and which settings help.
 
 ## ALIGN: line the frames up
 
-**ALIGN** moves every frame so that it lines up with one reference frame
+**ALIGN** moves every frame so that it lines up with one [reference frame](../glossary.md#reference-frame)
 before fusing, correcting drift and the change in image size as focus moves.
 It is on by default.
 
@@ -432,9 +432,9 @@ focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 
 `export` reads a project and writes the image (`-o`), the Z-Map (`--zmap`),
 or both; at least one of the two is required. The image is rendered from the
-project's stored composite, so it reflects the checkpoint you ask for (the
+project's stored [composite](../glossary.md#composite), so it reflects the checkpoint you ask for (the
 newest by default; `--checkpoint <id>` picks another). An unretouched
-checkpoint needs no source frames; a retouched one reads them again and checks
+checkpoint needs no [source frames](../glossary.md#source-frame); a retouched one reads them again and checks
 them against the hashes recorded when the project was written, and a missing
 or changed frame is named with nothing written. `export` refuses an output
 path that names the project itself.

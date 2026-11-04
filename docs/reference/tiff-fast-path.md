@@ -1,5 +1,12 @@
 # TIFF fast path
 
+This appendix is for readers who want the technical detail behind "16-bit
+TIFF": which TIFF layouts FocusForge reads, which it reads fastest, and what
+it writes. For choosing what to export from your raw converter, the short
+answer is in [Choose a file format](../stacking/shooting-practice.md#choose-a-file-format);
+for what the window does with RAW and compressed TIFF, see
+[Camera RAW and compressed TIFF](../guide/first-stack.md#camera-raw-and-compressed-tiff).
+
 FocusForge's fast TIFF path is zero-decode: for a file with `Compression = 1`
 (uncompressed), every row's bytes sit at a file offset that is computable
 straight from the header, so a tile is sliced directly out of a memory

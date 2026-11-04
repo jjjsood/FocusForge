@@ -1,9 +1,9 @@
 # Retouching
 
-No fusion method gets every pixel right. A halo beside an antenna, a smeared
+No [fusion method](../glossary.md#fusion-method) gets every pixel right. A [halo](../glossary.md#halo) beside an antenna, a smeared
 patch where a leg moved, a spot where the wrong frame won: these are easier to
 fix by hand than by fusing again. FocusForge's editor lets you do that with a
-brush that paints pixels from one of your own frames into the composite.
+brush that paints pixels from one of your own frames into the [composite](../glossary.md#composite).
 
 You are not painting colour. Every stroke takes the pixels of one
 [source frame](../glossary.md#source-frame) (the frame you choose in the
@@ -27,7 +27,7 @@ The switch at the top of the dock has two halves, **STACKING** and
 
 When a fuse finishes and its result is kept (if FocusForge asks "Keep this
 fused result?", by clicking **Keep**), the window switches to the editor by
-itself, as long as you are still looking at that tab. A saved project you open
+itself, as long as you are still looking at that tab. A saved [project](../glossary.md#project) you open
 starts in **STACKING**; click **EDITOR** to retouch it.
 
 In the editor the window changes in three places:
@@ -246,7 +246,7 @@ focusforge-cli retouch path/to/frames/frames.ffp --ops ops.json
 
 Every op is checked before anything is written; an invalid one is refused by
 its 0-based position. The ops go on the project's current head, or on another
-checkpoint with `--from <id>`, which starts a branch; `--name <text>` names
+checkpoint with `--from <id>`, which starts a [branch](../glossary.md#branch); `--name <text>` names
 the last one. To see the result, export it:
 
 ```bash

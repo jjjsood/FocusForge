@@ -5,8 +5,8 @@
 *A stack of eight frames of a praying mantis, fused and open in the editor.*
 
 FocusForge turns a series of photographs focused at different distances — a
-*focus stack* — into one image that is sharp from front to back. It lines the
-frames up, picks the sharpest part of each, blends them into one composite and
+[*focus stack*](glossary.md#focus-stacking) — into one image that is sharp from front to back. It lines the
+frames up, picks the sharpest part of each, blends them into one [composite](glossary.md#composite) and
 then lets you repair by hand whatever the automatic result got wrong. It runs
 on Linux, macOS and Windows, uses a graphics card when there is one and gives
 the same result without one.
@@ -22,7 +22,7 @@ way.
 photography. Why a macro shot is only sharp in a thin slice, how many frames a
 subject needs and how far apart they should be, which aperture to choose, how
 to light and support a stack, and how to recognise and avoid the typical
-failures: halos, ghosts from movement and soft bands between frames. Read it
+failures: [halos](glossary.md#halo), ghosts from movement and soft bands between frames. Read it
 before your first shoot, or whenever a result looks wrong and you want to know
 why.
 

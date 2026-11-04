@@ -112,7 +112,7 @@ sharp. In practice that fails because of
 **[diffraction](../glossary.md#diffraction)**. The smaller the aperture, the
 more light spreads as it passes the aperture's edge, and every point in the
 picture, including the ones in focus, turns into a larger soft spot. At macro
-magnifications the effective aperture is what counts, so you reach that
+magnifications the [effective aperture](../glossary.md#effective-aperture) is what counts, so you reach that
 limit early: past a certain f-number you buy a deeper zone with a softer
 picture overall.
 
@@ -131,9 +131,9 @@ slice, and the software assembles the sharp parts into one image, the
    subject to the farthest. The sharp slices of neighbouring frames must
    overlap, so that every part of the subject is sharp in at least one frame.
 2. **Line the frames up.** Moving the focus changes the magnification a
-   little (focus breathing), and the camera may shift slightly between
+   little ([focus breathing](../glossary.md#focus-breathing)), and the camera may shift slightly between
    frames. FocusForge's **[alignment](../glossary.md#alignment)** registers
-   every frame onto a reference frame and crops the result to the area every
+   every frame onto a [reference frame](../glossary.md#reference-frame) and crops the result to the area every
    frame covers. See [Alignment](../guide/alignment.md).
 3. **Score sharpness everywhere.** For every pixel of every frame, FocusForge
    measures how much fine detail sits around it: how strongly the brightness
@@ -143,7 +143,7 @@ slice, and the software assembles the sharp parts into one image, the
    frame that scored sharpest there, or blends several frames weighted by
    their scores. The rule for this is the
    **[fusion method](../glossary.md#fusion-method)**; FocusForge has three,
-   **Details**, **Soft transitions** and **Focus map**, described in
+   **[Details](../glossary.md#details)**, **[Soft transitions](../glossary.md#soft-transitions)** and **[Focus map](../glossary.md#focus-map)**, described in
    [Stacking settings](../guide/stacking.md).
 5. **Keep the record.** FocusForge stores which frame each pixel came from as
    the **[Z-Map](../glossary.md#z-map)**. You can show it over the composite

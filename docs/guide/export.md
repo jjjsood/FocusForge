@@ -1,6 +1,6 @@
 # Exporting an image
 
-A project keeps your result as checkpoints, which only FocusForge can read.
+A [project](../glossary.md#project) keeps your result as [checkpoints](../glossary.md#checkpoint), which only FocusForge can read.
 To print, publish or keep editing the result in another program, export it as
 an image file: TIFF, PNG or JPEG.
 
@@ -10,7 +10,7 @@ export it. Exporting changes nothing in the project.
 
 ## Open the export dialog
 
-1. Fuse a stack and keep the result, or open a saved project.
+1. Fuse a [stack](../glossary.md#stack) and keep the result, or open a saved project.
 2. Click the checkpoint you want in the CHECKPOINTS list, or stay in the
    editor with the strokes you are working on.
 3. Click **Export image** in the heading of the CHECKPOINTS list.
@@ -90,9 +90,9 @@ list without closing the dialog.
 The METADATA section has one switch, **Metadata**, and it starts turned on.
 
 - **On:** the image carries the camera information (EXIF: make, model,
-  exposure and capture time) of the frame the stack was aligned to, with the
+  exposure and capture time) of the frame the stack was [aligned](../glossary.md#alignment) to, with the
   exported image's own size, the program and the export time written in. It
-  also embeds the colour profile (ICC) of the source frames; for RAW frames,
+  also embeds the colour profile (ICC) of the [source frames](../glossary.md#source-frame); for RAW frames,
   a built-in sRGB profile.
 - **Off:** the image carries no metadata and no colour profile.
 
