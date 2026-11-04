@@ -151,7 +151,8 @@ The [dock](../glossary.md#dock) runs down the right side of the window. From top
    named after the [fusion method](../glossary.md#fusion-method) and the time.
    Before the first fuse it reads "None yet — fuse a stack". Click a row to
    show that result in the **Composite** pane. **Export image** saves the
-   result you are looking at as a TIFF, PNG or JPEG file. See
+   result you are looking at as a TIFF, PNG or JPEG file, or as a DNG file for a
+   project stacked from camera RAW files. See
    [Checkpoints and saving](history.md) and [Exporting an image](export.md).
 3. **Images** and **Settings.** Two tabs that share the lower part of the
    dock:

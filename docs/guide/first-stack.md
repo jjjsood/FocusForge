@@ -324,9 +324,8 @@ shows what the run is doing:
 | **Writing** | Stores the finished result | — |
 
 For a camera RAW stack the bar reads **Developing** first, with the number of
-frames developed and the same time remaining. Developing a RAW frame is the
-slowest part of the setup, which is why it is done once and its result reused
-by the later stages.
+frames developed and the same time remaining. Each RAW frame is developed
+once, before the other stages, and they reuse the result.
 
 Next to the progress bar, the time remaining reads "estimating" until
 FocusForge has enough to go on, then "ETA 1:12" (minutes and seconds). Time
@@ -500,4 +499,4 @@ everyday work.
   when to change them.
 - [Retouching](retouch.md): fix [halos](../glossary.md#halo) and other flaws by painting from the
   right frame.
-- [Exporting an image](export.md): write the result as TIFF, PNG or JPEG.
+- [Exporting an image](export.md): write the result as TIFF, PNG or JPEG, or as DNG for a camera RAW project.

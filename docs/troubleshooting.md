@@ -699,7 +699,7 @@ Plan disk space too: a 16-bit TIFF from a 45-megapixel camera is about
 
 One stack is always one kind of file: RAW, JPEG and TIFF frames in one folder
 become separate stacks. Every frame is read upright by its orientation tag. RAW files are developed with each file's recorded white
-balance. Results export as TIFF, PNG or JPEG. See
+balance. Results export as TIFF, PNG or JPEG, and as DNG for a project stacked from camera RAW files. See
 [Choose a file format](stacking/shooting-practice.md#choose-a-file-format)
 and [Camera RAW, JPEG and compressed TIFF](guide/first-stack.md#camera-raw-jpeg-and-compressed-tiff).
 

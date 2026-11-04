@@ -2,7 +2,8 @@
 
 A [project](../glossary.md#project) keeps your result as [checkpoints](../glossary.md#checkpoint), which only FocusForge can read.
 To print, publish or keep editing the result in another program, export it as
-an image file: TIFF, PNG or JPEG.
+an image file: TIFF, PNG or JPEG, or DNG for a project stacked from camera RAW
+files.
 
 An export writes the version you are looking at. Choose the checkpoint first
 in the CHECKPOINTS list (see [Checkpoints and saving](history.md)), then
