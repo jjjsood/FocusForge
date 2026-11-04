@@ -101,7 +101,7 @@ mod tests {
 
     fn frames(n: usize) -> Vec<PathBuf> {
         (0..n)
-            .map(|i| PathBuf::from(format!("/stack/{i:02}.tif")))
+            .map(|i| PathBuf::from(format!("/frames/{i:02}.tif")))
             .collect()
     }
 
