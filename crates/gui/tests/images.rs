@@ -1341,7 +1341,6 @@ fn manual_order_clears_the_sort_selection() {
 /// into editor mode through `set_mode`, the same path the mode switch takes.
 fn controller_in_editor_mode(name: &str) -> AppController {
     let mut controller = controller_with_frames_from("mantis-64", name, 3);
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     // An algorithm that always converges keeps the fuse out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
