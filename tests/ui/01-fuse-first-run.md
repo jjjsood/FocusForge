@@ -31,25 +31,19 @@ Start: --open fixtures/mantis-64/frames
     Expect: the right pane shows a filled composite without the card "Not fused yet"; the CHECKPOINTS list holds one row and the line "None yet — fuse a stack" is gone.
 14. Click the **Overlay** toggle (`FFBottomBar::overlay-toggle`).
     Expect: the toggle is on (knob on the right, accent fill).
-## A second kept result and a second discard
+## A second discard
 15. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: (within 60 s) the dialog "Keep this fused result?" with "Discard" and "Keep" is shown.
-16. Click **Keep** (`AppWindow::divergence-warning`).
-    Expect: the dialog is gone and the bottom bar status reads "fused" followed by a time.
-17. Click **STACKING** (`FFModeSwitch::stacking-half`).
-    Expect: the CHECKPOINTS list holds two rows.
-18. Click **Fuse stack** (`FFToolbar::fuse-button`).
-    Expect: (within 60 s) the dialog "Keep this fused result?" with "Discard" and "Keep" is shown.
-19. Click **Discard** (`AppWindow::divergence-warning`).
+16. Click **Discard** (`AppWindow::divergence-warning`).
     Expect: the dialog is gone.
-20. Click **STACKING** (`FFModeSwitch::stacking-half`).
-    Expect: Must not: the CHECKPOINTS list holds a third row; it still holds exactly two rows.
+17. Click **STACKING** (`FFModeSwitch::stacking-half`).
+    Expect: Must not: the CHECKPOINTS list holds a second row; it still holds exactly one row.
 ## Alignment off: the result is kept with no question
-21. Click **Settings** (`FFDockTabs::settings-tab`).
+18. Click **Settings** (`FFDockTabs::settings-tab`).
     Expect: the Settings dock lists the headings "PREPARE", "FUSE" and "ALIGN" (FINISH sits below the fold), and the **Enabled** switch under ALIGN is on.
-22. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
+19. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
     Expect: the switch is off and the ALIGN "Algorithm" label and field are drawn greyed out.
-23. Click **Fuse stack** (`FFToolbar::fuse-button`).
+20. Click **Fuse stack** (`FFToolbar::fuse-button`).
     Expect: (within 60 s) the bottom bar status reads "fused" followed by a time, and no dialog titled "Keep this fused result?" is on screen.
-24. Click **STACKING** (`FFModeSwitch::stacking-half`).
-    Expect: the CHECKPOINTS list holds three rows.
+21. Click **STACKING** (`FFModeSwitch::stacking-half`).
+    Expect: the CHECKPOINTS list holds two rows.

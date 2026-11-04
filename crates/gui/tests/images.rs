@@ -174,6 +174,19 @@ fn every_directed_source_presentation_transition_preserves_identity_and_tab_stat
             controller.source_preview_row_visible(selected_index),
             "{from:?} -> {to:?} keeps the selected source visible"
         );
+        // Scrolling past the end lands on the last offset the row height allows:
+        // five rows in a 120 px viewport.
+        let row_height = match to {
+            SourcePresentation::List => ROW_HEIGHT,
+            SourcePresentation::ImageList => 120.0,
+            SourcePresentation::Large => 200.0,
+        };
+        controller.images_viewport_scrolled(1.0e6);
+        assert_eq!(
+            controller.images_scroll_y(),
+            5.0 * row_height - 120.0,
+            "{from:?} -> {to:?} row height"
+        );
     }
 
     let other = tree("presentation_transition_second_tab");
