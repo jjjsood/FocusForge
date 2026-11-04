@@ -166,8 +166,10 @@ While the question is up, the rest of the window does not react.
   Uncompressed 16-bit TIFFs are read fastest;
   [The TIFF fast path](../reference/tiff-fast-path.md) explains why. A TIFF
   compressed with JPEG (`Compression=7`) is not read.
-- **One file** opens as a one-frame project named after the file, with
-  **Fuse stack** greyed out, so you can look at a frame or check how it is read.
+- **One file** opens as a one-frame project named after the file (`00.tif`
+  gives a tab named `00`). The frame list reads "1 frame · 0 excluded" and
+  **Fuse stack** is greyed out, so you can look at a frame or check how it is
+  read.
 
 ## When a folder or project will not open
 

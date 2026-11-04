@@ -45,10 +45,12 @@ you may see:
   **…** mark while it waits in line behind another tab's run. The
   **UNSAVED** chip comes back once the run has finished.
 
-The last box in the strip, **+**, is a tab of its own: click it to get the
-empty start page with **Open…**, from which you open another stack (see
-[Your first stack](first-stack.md#open-a-folder)). When there are more
-tabs than fit, arrows appear at the ends of the strip to scroll through them.
+The last box in the strip, **+**, is a tab of its own, as the screenshot at the
+top of this chapter shows: click it to get the empty start page with
+**Open…**, pictured in
+[Your first stack](first-stack.md#from-the-start-page), from which you open
+another stack. When there are more tabs than fit, arrows appear at the ends
+of the strip to scroll through them.
 
 The tab strip is also the window's title bar: drag an empty part of it to
 move the window.
@@ -107,8 +109,10 @@ The canvas in the middle of the window shows two images side by side:
 
 While a run is live, the **Composite** pane shows what it is doing instead of
 the "Not fused yet" card: "Preparing frames" while frames are developed and
-aligned, "Alignment reused" when the cached alignment serves, then the
-aligned frame and the result growing tile by tile with its tile grid. A
+aligned, "Alignment reused" when the cached alignment serves, the aligned
+frame as alignment proceeds, a card named "Fusing" ("The result builds here
+tile by tile.") until the first tile is fused, and then the result growing
+tile by tile with its tile grid. A
 sharpness inset shows where each frame is sharp as the result grows; it fades
 out two seconds after the last tile, and the finished result crossfades in.
 Pause keeps the view, **Cancel** returns the pane to "Not fused yet", and
