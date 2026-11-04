@@ -68,8 +68,10 @@ See: [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets)
 
 The unprocessed files a camera records (`.cr3`, `.nef`, `.arw`, DNG and
 many more). FocusForge opens a folder of RAW files like a folder of TIFF
-files and develops them with each file's recorded white balance. One stack is
-always one kind of file.
+files and develops them once into the camera's own linear colour, using each
+file's recorded white balance. The developed frames, the fused result and a
+RAW project's saved composite stay unclipped, so highlights above white
+survive until the result is exported. One stack is always one kind of file.
 See: [Camera RAW, JPEG and compressed TIFF](guide/first-stack.md#camera-raw-jpeg-and-compressed-tiff)
 and [Choose a file format](stacking/shooting-practice.md#choose-a-file-format).
 
@@ -121,6 +123,15 @@ smaller than the [circle of confusion](#circle-of-confusion), so the picture
 looks sharp. At macro distances it is a fraction of a millimetre, which is
 why stacks exist.
 See: [What depth of field is](stacking/depth-of-field.md#what-depth-of-field-is).
+
+## Developing
+
+The first stage of a fuse of camera RAW frames: each frame is converted once
+from the camera's recorded data to linear colour, and the later stages work
+on that. The bottom bar reads **Developing** with the number of frames done.
+TIFF and JPEG frames need no developing, so their fuse starts at
+**Preparing**.
+See: [Fuse the stack](guide/first-stack.md#fuse-the-stack).
 
 ## Details
 

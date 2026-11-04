@@ -311,10 +311,16 @@ shows what the run is doing:
 
 | Stage | What happens | Step shown |
 |---|---|---|
+| **Developing** | Develops each camera RAW frame once, before anything else; the stage does not appear for TIFF or JPEG frames | "3 of 8" (frames done) |
 | **Preparing** | Measures each frame's brightness and evens out exposure differences between frames | "3 of 8" (frames done) |
 | **Aligning** | [Alignment](../glossary.md#alignment): shifts, scales and turns the frames so they line up | "5 of 8" (frames done), or "from cache" when an earlier run's alignment of the same frames is reused |
 | **Fusing** | Picks the sharpest parts of every frame and blends them into the [composite](../glossary.md#composite) | — |
 | **Writing** | Stores the finished result | — |
+
+For a camera RAW stack the bar reads **Developing** first, with the number of
+frames developed and the same time remaining. Developing a RAW frame is the
+slowest part of the setup, which is why it is done once and its result reused
+by the later stages.
 
 Next to the progress bar, the time remaining reads "estimating" until
 FocusForge has enough to go on, then "ETA 1:12" (minutes and seconds). Time
@@ -430,6 +436,13 @@ stops and says so:
   the notification center behind the bell, where its full message names the
   file and the reason.
 - The projects overview shows the project with a "Did not stack" card.
+
+A full disk is one cause of "Setup failed". Before the first stage starts, a
+fuse checks that the volumes it writes to have room for the run, and refuses
+when one does not. The full message then reads, for example,
+"`<dir>` has `N` bytes (`X` GB) free, but the run needs `M` bytes (`Y` GB)
+there", with one such sentence per volume, joined by "; ". Free space on that
+volume, or choose a folder on a volume with more room, then press **Retry**.
 
 **Retry** only helps when the cause was passing (a network drive that was
 briefly away, for example). For a damaged frame, look for a frame row that

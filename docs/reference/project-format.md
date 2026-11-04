@@ -103,6 +103,9 @@ name rather than opened partially:
 | a referenced entry is missing | 6 |
 | a blob fails its hash check | 7 |
 | a dangling parent, a parent cycle, a stack fingerprint that disagrees with the recorded sources, or a checkpoint with ops but no parent | 8 |
+| a RAW project saved by an earlier version, which stored a clipped 16-bit result | 1 |
+
+The last row reads `<path>: is a RAW project saved by an older version, which stored a clipped 16-bit result; stack its source frames again to open it`.
 
 A checkpoint with no ops must carry the record of its own fuse; one without
 it is refused as a damaged container. Any other failure exits 1. The

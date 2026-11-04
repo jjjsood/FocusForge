@@ -55,6 +55,22 @@ Otherwise open the folder of frames and fuse again: that makes a new project
 
 See: ["This project cannot be opened"](guide/first-stack.md#this-project-cannot-be-opened).
 
+### A RAW project saved by an earlier version
+
+A RAW project saved by an earlier version stored a clipped 16-bit result.
+FocusForge now keeps a RAW result unclipped, so it refuses the old project.
+The window shows the damaged-history message of
+["This project cannot be opened"](#this-project-cannot-be-opened). The
+command line names the cause:
+
+```
+error: <path>: is a RAW project saved by an older version, which stored a clipped 16-bit result; stack its source frames again to open it
+```
+
+**Fix:** open the RAW frames and fuse again; that makes a project in the
+current form. Exit status 1.
+See: [Refusals](reference/project-format.md#refusals).
+
 ### "The frames are no longer there"
 
 > A project remembers its frames by path. N of N cannot be found in this location.
@@ -167,6 +183,22 @@ or LZW-compressed TIFF export, and fuse again.
 See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails) and
 [Cards that need attention](guide/batch-runs.md#cards-that-need-attention).
 
+### Not enough free space
+
+```
+<dir> has N bytes (X GB) free, but the run needs M bytes (Y GB) there
+```
+
+**Cause:** before it starts, a fuse measures the room on every volume it
+writes to and refuses when one is too small. In the window this is a "Setup
+failed" notification and the bottom bar reads "Failed"; on the command line
+the line above follows `error:` and the exit status is 1. Nothing is written.
+With several volumes, one such sentence per volume is joined by "; ".
+
+**Fix:** free space on the volume named, or write to a volume with more room
+(`-o` on the command line), then **Retry** or run the command again.
+See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails).
+
 ### "Keep this fused result?"
 
 > 00.tif and 02.tif could not be aligned and were fused as they are.
@@ -262,6 +294,17 @@ When no usable graphics card is found at all, **VRAM cap** and **VRAM
 budget** read "Unavailable" and the switch cannot be changed for the session.
 
 See: [GPU processing and the Backend line](guide/settings-window.md#gpu-processing-and-the-backend-line).
+
+### "STOPPED WHILE DEVELOPING" and "FAILED WHILE DEVELOPING"
+
+The project's card in the projects overview names the stage a run ended in.
+For a camera RAW stack that can be the first stage, **Developing**: "STOPPED
+WHILE DEVELOPING" after you cancelled, "FAILED WHILE DEVELOPING" after a
+failure whose message names the file.
+
+**Cause and fix:** a RAW file the decoder cannot read fails the run here,
+before anything is fused; exclude or remove that frame and fuse again.
+See: [Projects, notifications and quitting](guide/batch-runs.md#cards-that-need-attention).
 
 ## Adding frames
 
@@ -471,6 +514,27 @@ mmap fast path: no — BitsPerSample=[8, 8, 8], only 16-bit is supported
 BigTIFF; uncompressed, LZW or Deflate), or stack the RAW files directly.
 See [Which files can FocusForge read?](#which-files-can-focusforge-read) and
 [TIFF fast path](reference/tiff-fast-path.md#what-the-reader-accepts).
+
+### DNG export refusals
+
+`export` writes a DNG for a camera RAW project (`-o out.dng` or
+`--format dng`; see [From the command line](guide/export.md#from-the-command-line))
+and refuses, before any pixel is rendered and with nothing written, in
+these cases:
+
+```
+error: <path>: a DNG holds camera RAW data, and this project's sources are not camera RAW
+error: <path>: cannot write a DNG: <reason>
+error: --format tiff conflicts with out.dng's extension, which names dng
+```
+
+**Cause:** the project was stacked from TIFF or JPEG frames; or the first
+source frame has no camera colour space to write (a monochrome sensor, no
+colour matrix, no as-shot white balance); or `--format` names one format
+while the extension of `-o` names another.
+
+**Fix:** export TIFF, PNG or JPEG for a project that is not camera RAW;
+otherwise drop `--format` or make it agree with the extension.
 
 ### A damaged frame
 

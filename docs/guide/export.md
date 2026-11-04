@@ -192,4 +192,29 @@ focusforge-cli export frames.ffp -o result.png --png-bits 8 --zmap zmap.tif
   `--xmp` and `--iptc` (off by default; IPTC is never written to PNG).
 - `--zmap` writes the [Z-Map](../glossary.md#z-map) as an image as well.
 
+### A DNG of a RAW project
+
+For a project whose sources are all camera RAW, `-o result.dng` (or
+`--format dng`) writes a linear DNG:
+
+```bash
+focusforge-cli export frames.ffp -o result.dng
+```
+
+The file holds the fused result in the camera's own colour space, with the
+camera's colour matrices and as-shot white balance, and with the highlights
+above white kept as they are. A raw converter opens it and develops it with
+exposure, white balance and highlight recovery still open. A DNG has no
+format options. The window's export dialog offers TIFF, PNG and JPEG only;
+a DNG is written from the command line.
+
+`export` refuses a DNG it cannot write, before any pixel is rendered, and
+writes nothing:
+
+| `error:` line | Cause |
+|---|---|
+| `<path>: a DNG holds camera RAW data, and this project's sources are not camera RAW` | The project was stacked from TIFF or JPEG frames. Export TIFF, PNG or JPEG instead. |
+| `<path>: cannot write a DNG: <reason>` | The first source frame cannot describe a camera colour space, for example a monochrome sensor or a file without a colour matrix or an as-shot white balance. |
+| `--format tiff conflicts with out.dng's extension, which names dng` | `--format` names one format and the extension of `-o` another. Drop one of the two. |
+
 Every flag is in the [command-line reference](../reference/cli.md#export).

@@ -105,9 +105,10 @@ number of frames done and an estimated time remaining.
 
 Things to know:
 
-- The gain scales the pixel values as the files deliver them. It is a simple
-  brightness factor, not a correction in linear light, and it does not touch
-  your source files.
+- For camera RAW frames the gain corrects exposure in linear light, the way
+  a change of exposure time would. For TIFF and JPEG frames it scales the
+  pixel values as the files deliver them. Either way it does not touch your
+  source files.
 - With **Equalize brightness** off, the two sliders below it are greyed and
   have no effect. They keep their values, so switching equalization back on
   restores them.
@@ -403,9 +404,16 @@ the window.
 
 RAW input uses `rawler`. Put one compatible RAW format in a directory and run
 the same command as for TIFF; `focusforge-cli info` reports camera metadata
-before a stack run. TIFF and RAW frames form separate stacks, and a group that
+before a stack run. TIFF, JPEG and RAW frames form separate stacks, and a group that
 mixes them is refused before pixels are developed. A file the decoder cannot
 read reports an error; FocusForge has no alternate RAW decoder.
+
+RAW frames are developed to the camera's own linear colour and fused as
+unclipped 32-bit float samples, so highlights above white survive the blend.
+The result is clipped once, to 16 bits, when it is exported. A RAW project
+saved by an earlier version stored a clipped 16-bit result and is refused on
+open; stack its source frames again (see
+[A RAW project saved by an earlier version](../troubleshooting.md#a-raw-project-saved-by-an-earlier-version)).
 
 ### Brightness equalization flags
 
