@@ -7,7 +7,7 @@ The overlay holds an Optics switch (LENS (F-STOP) | OBJECTIVE (NA)), five entere
 
 This path never starts a fuse: leave **Fuse stack** alone. The window's own close button in the title bar (`FFTabStrip::window-close`) is also labelled "Close"; this path never presses it, and every **Close** step below names `AppWindow::calculator-overlay` as its search scope.
 
-A typed value replaces the old one only after the old text is cleared: click the box, press Ctrl+A, press Backspace, then type. An empty box counts as "Not a number".
+A typed value replaces the old one only after the old text is cleared: click the box, press Ctrl+a (lowercase a; the driver takes the key as written), press Backspace, then type. An empty box counts as "Not a number".
 
 ## Open and read the Lens defaults
 1. Click **Step calculator** (`AppWindow::icon-bar`).
@@ -41,7 +41,7 @@ A typed value replaces the old one only after the old text is cleared: click the
     Expect: the OBJECTIVE (NA) segment is highlighted; the label "Magnification (x)" is gone; the label "Numerical aperture (NA)" shows with a box reading 0.25; the ENTERED row reads Optics NA; the CALCULATED row has no Numerical aperture cell and reads Depth of field 8.8 µm, Step 6.6 µm, Frames 759, Duration 759 s.
 14. Click the Depth range box (`FFField::input` 3).
     Expect: the box reads 5 and the CALCULATED row is unchanged.
-15. Press Ctrl+A.
+15. Press Ctrl+a (lowercase a).
     Expect: the text in the Depth range box is drawn selected.
 16. Press Backspace.
     Expect: Must not: new calculated values; the Depth range box is empty with a red border, the line "Not a number" shows under it, and the CALCULATED row still reads Depth of field 8.8 µm, Step 6.6 µm, Frames 759, Duration 759 s.
@@ -54,7 +54,7 @@ A typed value replaces the old one only after the old text is cleared: click the
     Expect: the LENS (F-STOP) segment is highlighted; the label "Magnification (x)" and its box are back; the CALCULATED row reads Numerical aperture 0.031, Depth of field 563.2 µm, Step 422.4 µm, Frames 2, Duration 2 s (the range 0.1 mm was kept).
 20. Click the Overlap box (`FFField::input` 3).
     Expect: the box reads 0.25.
-21. Press Ctrl+A.
+21. Press Ctrl+a (lowercase a).
     Expect: the text in the Overlap box is drawn selected.
 22. Press Backspace.
     Expect: Must not: new calculated values; the Overlap box is empty with a red border, the line "Not a number" shows under it, and the CALCULATED row still reads Step 422.4 µm and Frames 2.
@@ -62,7 +62,7 @@ A typed value replaces the old one only after the old text is cleared: click the
     Expect: Must not: 0.95 is planned; the box reads 0.95 (point, not comma) with a red border, the line "value 0.95 is outside the allowed range [0, 0.9]" shows under it inside the inset card, the ENTERED row reads Overlap 0.9 (the last valid keystroke), and the CALCULATED row reads Numerical aperture 0.031, Depth of field 563.2 µm, Step 56.32 µm, Frames 3, Duration 3 s.
 24. Click the Overlap box (`FFField::input` 3).
     Expect: the box still reads 0.95 and the line is still shown.
-25. Press Ctrl+A.
+25. Press Ctrl+a (lowercase a).
     Expect: the text in the Overlap box is drawn selected.
 26. Press Backspace.
     Expect: the box is empty and the line under it reads "Not a number".
