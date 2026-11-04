@@ -1,0 +1,9 @@
+{
+  "timestamp": "2026-09-18T01:02:03Z",
+  "binary": "focusforge-gui",
+  "version": "0.1.0",
+  "pid": 4242,
+  "signal": 11,
+  "reason": "SIGSEGV",
+  "minidump": "20260918T010203Z-focusforge-gui-4242.dmp"
+}

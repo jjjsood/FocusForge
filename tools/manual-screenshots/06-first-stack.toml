@@ -1,0 +1,141 @@
+# Installing FocusForge and Your first stack (docs/getting-started.md, docs/guide/first-stack.md).
+# The plain main window right after opening mantis-512 is "main-window" in 00-intro.toml.
+# Every refusal is reached through the fixture that really raises it; each shot waits for the
+# dialog's own text, so a fixture that stops raising its dialog fails the run by name.
+
+[[shot]]
+name  = "first-stack-empty-window"
+args  = []
+steps = [
+  ["wait-id", "FFEmptyState::open", "60"],
+  ["wait-text", "Drop a folder or stack", "30"],
+  ["pause", "800"],
+]
+out   = "assets/manual/first-stack/empty-window.png"
+
+[[shot]]
+name  = "first-stack-grouping-question"
+args  = ["--open", "fixtures/open-two-stacks"]
+steps = [
+  ["wait-id", "AppWindow::grouping-question", "90"],
+  ["wait-text", "This folder reads as 2 stacks of 6 frames.", "30"],
+  ["wait-id", "FFGroupingQuestion::many-button", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/first-stack/grouping-question.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+[[shot]]
+name  = "first-stack-no-frames"
+args  = ["--open", "fixtures/retouch"]
+steps = [
+  ["wait-id", "FFRefusalDialog::pick-area", "90"],
+  ["wait-text", "This folder holds none.", "30"],
+  ["pause", "500"],
+]
+out   = "assets/manual/first-stack/refusal-no-frames.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+[[shot]]
+name  = "first-stack-not-a-project"
+args  = ["--open", "fixtures/projects/corrupt.ffp"]
+steps = [
+  ["wait-id", "FFRefusalDialog::pick-area", "90"],
+  ["wait-text", "This project cannot be opened", "30"],
+  ["wait-text", "This file is not a FocusForge project.", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/first-stack/refusal-not-a-project.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+[[shot]]
+name  = "first-stack-mismatch"
+args  = ["--open", "fixtures/projects/mismatch.ffp"]
+steps = [
+  ["wait-text", "The source frames are not the same", "90"],
+  ["wait-text", "different fingerprint", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/first-stack/mismatch.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+[[shot]]
+name  = "first-stack-sources-missing"
+args  = ["--open", "fixtures/projects/missing.ffp"]
+steps = [
+  ["wait-text", "The frames are no longer there", "90"],
+  ["wait-text", "cannot be found in this location", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/first-stack/sources-missing.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+# A fuse that is still working: run 1 is held in its fuse stage, so the toolbar shows
+# Pause and Cancel however fast the earlier stages go.
+[[shot]]
+name  = "first-stack-fuse-running"
+args  = ["--open", "fixtures/mantis-512", "--fuse-tabs", "0", "--slow-run", "1"]
+steps = [
+  ["wait-id", "FFToolbar::pause-button", "300"],
+  ["wait-id", "FFBottomBar::eta-text", "60"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/first-stack/fuse-running.png"
+
+[[shot]]
+name  = "first-stack-fuse-paused"
+args  = ["--open", "fixtures/mantis-64", "--fuse-tabs", "0", "--slow-run", "1"]
+steps = [
+  ["wait-text", "Fusing", "300"],
+  ["click-id", "FFToolbar::pause-button"],
+  ["wait-id", "FFToolbar::resume-button", "60"],
+  ["wait-text", "Paused", "30"],
+  ["pause", "800"],
+]
+out   = "assets/manual/first-stack/fuse-paused.png"
+crop  = "AppWindow::toolbar"
+pad   = 0
+
+# Tab 0 (mantis-64) runs and is held; tab 1 (mantis-512) waits its turn and stays selected.
+[[shot]]
+name  = "first-stack-fuse-queued"
+args  = ["--open", "fixtures/mantis-64", "--open", "fixtures/mantis-512", "--fuse-tabs", "0,1", "--slow-run", "1"]
+steps = [
+  ["wait-text", "Queued (2)", "300"],
+  ["wait-id", "FFToolbar::cancel-button", "30"],
+  ["wait-text", "8 frames", "30"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/first-stack/fuse-queued.png"
+
+[[shot]]
+name  = "first-stack-keep-question"
+args  = ["--open", "fixtures/mantis-64", "--fuse-tabs", "0"]
+steps = [
+  ["wait-id", "AppWindow::divergence-warning", "300"],
+  ["wait-text", "Keep this fused result?", "30"],
+  ["wait-text", "could not be aligned", "10"],
+  ["pause", "600"],
+]
+out   = "assets/manual/first-stack/keep-question.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+# A real failed run: 02.tif of open-rejected is cut inside its pixel data.
+[[shot]]
+name  = "first-stack-fuse-failed"
+args  = ["--open", "fixtures/open-rejected"]
+steps = [
+  ["wait-id", "FFToolbar::fuse-button", "90"],
+  ["wait-text", "3 frames", "30"],
+  ["click-id", "FFToolbar::fuse-button"],
+  ["wait-id", "FFToolbar::retry-button", "120"],
+  ["wait-text", "Failed", "10"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/first-stack/fuse-failed.png"

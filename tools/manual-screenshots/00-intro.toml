@@ -1,0 +1,22 @@
+# Book landing image and the plain main window.
+
+[[shot]]
+name  = "intro-landing"
+args  = ["--open", "fixtures/mantis-512/frames"]
+steps = [
+  ["wait-id", "FFToolbar::fuse-button"],
+  ["click-id", "FFToolbar::fuse-button"],
+  ["wait-id", "AppWindow::divergence-warning", "900"],
+  ["click-label", "Keep", "AppWindow::divergence-warning"],
+  ["wait-gone", "AppWindow::divergence-warning", "30"],
+  # Park the pointer on the inert status text so no brush cursor sits on the image.
+  ["click-id", "FFBottomBar::status-text"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/intro/landing.png"
+
+[[shot]]
+name  = "main-window"
+args  = ["--open", "fixtures/mantis-512/frames"]
+steps = [["wait-id", "FFToolbar::fuse-button"], ["wait-text", "8 frames"], ["pause", "1500"]]
+out   = "assets/manual/first-stack/main-window.png"
