@@ -158,7 +158,7 @@ enum Command {
     /// Compute the focus step, frame count, duration and disk need of a focus stack.
     ///
     /// Depth of field is DOF = 0.55 µm / NA². A lens has NA = 1 / (2 · N · (1 + m))
-    /// from its marked f-number N and the magnification m; an objective states its
+    /// from its marked f-stop N and the magnification m; an objective states its
     /// NA. The step is DOF · (1 − overlap).
     #[command(after_help = set::parameter_help(&focusforge_core::step_plan::PLAN_PARAMS))]
     StepPlan {

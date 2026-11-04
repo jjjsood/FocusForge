@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Step calculator: focus step, frame count, duration and disk need from the
 //! optics and a depth range. Depth of field is `DOF = 0.55 µm / NA²`; a lens's
-//! NA is `1 / (2 · N · (1 + m))` for marked f-number `N` and magnification `m`.
+//! NA is `1 / (2 · N · (1 + m))` for marked f-stop `N` and magnification `m`.
 //! The focus step is `DOF · (1 − overlap)`, rounded to whole nanometres.
 
 use std::sync::LazyLock;
@@ -52,14 +52,14 @@ pub static PLAN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "optics".to_string(),
             label: "Optics".to_string(),
-            help: "A lens is described by its marked f-number, an objective by its numerical \
+            help: "A lens is described by its marked f-stop, an objective by its numerical \
                    aperture."
                 .to_string(),
             kind: ParamKind::Enum {
                 variants: vec![
                     EnumVariant {
                         id: "lens".to_string(),
-                        label: "Lens (f-number)".to_string(),
+                        label: "Lens (f-stop)".to_string(),
                     },
                     EnumVariant {
                         id: "objective".to_string(),
@@ -74,8 +74,8 @@ pub static PLAN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         },
         float(
             "aperture",
-            "Marked f-number (N)",
-            "The f-number set on the lens. Used with the lens optics only.",
+            "f-stop",
+            "The f-stop set on the lens. Used with the lens optics only.",
             (0.7, 64.0, 0.1),
             false,
             8.0,

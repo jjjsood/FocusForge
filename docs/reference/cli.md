@@ -766,7 +766,7 @@ focusforge-cli step-plan [OPTIONS]
 | `--json` | print the plan as one JSON object |
 
 Computes how many frames a focus stack needs. The depth of field is
-`DOF = 0.55 µm / NA²`. A lens states its marked f-number `N` and the
+`DOF = 0.55 µm / NA²`. A lens states its marked f-stop `N` and the
 magnification `m`, which give `NA = 1 / (2 · N · (1 + m))` (the pupil
 magnification is taken as 1); an objective states its NA. The focus step is
 `DOF · (1 − overlap)`, rounded to a whole nanometre, and the frame count is
@@ -782,7 +782,7 @@ used.
 |---|---|---|---|
 | `magnification` | × | 1 | 0.01 to 100 |
 | `optics` | | `lens` | `lens`, `objective` |
-| `aperture` | marked f-number | 8 | 0.7 to 64 |
+| `aperture` | marked f-stop | 8 | 0.7 to 64 |
 | `na` | numerical aperture | 0.25 | 0.01 to 0.95 |
 | `overlap` | fraction of the depth of field | 0.25 | 0 to 0.9 |
 | `range_mm` | mm | 5 | 0 to 1000 (0 plans one frame) |

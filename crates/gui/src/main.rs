@@ -111,6 +111,17 @@ struct Args {
     /// load lands.
     #[arg(long)]
     projects_overlay: bool,
+    /// Opens the step calculator overlay at startup.
+    #[arg(long)]
+    calculator: bool,
+    /// With `--calculator`, selects the objective optics.
+    #[arg(long, requires = "calculator")]
+    calculator_objective: bool,
+    /// With `--calculator`, types TEXT into field slot SLOT (0 time per
+    /// frame, 1 magnification, 2 f-stop or numerical aperture, 3 overlap,
+    /// 4 depth range). Repeatable.
+    #[arg(long, requires = "calculator", value_name = "SLOT=TEXT")]
+    calculator_type: Vec<String>,
     /// Presses `Save project` once the last `--fuse-tabs` run settles,
     /// accepting the proposed path without a dialog -- for inspecting the
     /// saved state with no click sequence.
@@ -2047,6 +2058,20 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
         if args.projects_overlay && args.fuse_tabs.is_empty() {
             controller.lock().unwrap().toggle_projects_overlay();
+        }
+        if args.calculator {
+            let mut controller = controller.lock().unwrap();
+            controller.toggle_calculator();
+            if args.calculator_objective {
+                controller.calculator_set_optics("Objective (NA)");
+            }
+            for entry in &args.calculator_type {
+                if let Some((slot, text)) = entry.split_once('=')
+                    && let Ok(slot) = slot.parse::<usize>()
+                {
+                    controller.calculator_edit(slot, text);
+                }
+            }
         }
 
         if let Some(index) = args.frame_remove_warning {

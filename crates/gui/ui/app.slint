@@ -29,8 +29,9 @@ export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, 
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing } from "shell/dialogs.slint";
 import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
+import { FFCalculatorOverlay, CalculatorFieldView, SummaryCell } from "shell/calculator_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
-export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView }
+export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView, CalculatorFieldView, SummaryCell }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
@@ -649,6 +650,7 @@ export component AppWindow inherits Window {
         height: root.height - ShellGeometry.strip-height;
         unread: root.notifications-unread;
         center-open: root.notification-center-open;
+        calculator-open: root.calculator-open;
 
         bell-activated => {
             root.bell-activated();
@@ -657,6 +659,7 @@ export component AppWindow inherits Window {
             }
         }
         settings-requested => { root.settings-open-requested(); }
+        calculator-activated => { root.calculator-toggled(); }
     }
 
     bottom-bar := FFBottomBar {
@@ -734,6 +737,48 @@ export component AppWindow inherits Window {
         close-project-requested => { root.projects-close-project-requested(); }
         save-project-requested => { root.projects-save-project-requested(); }
         recent-clicked(i) => { root.projects-recent-clicked(i); }
+    }
+
+    in property <bool> calculator-open: false;
+    in property <bool> calculator-objective: false;
+    in property <[string]> calculator-optics-labels: [];
+    in property <string> calculator-optics-selected: "";
+    in property <[CalculatorFieldView]> calculator-fields: [];
+    in property <[SummaryCell]> calculator-entered: [];
+    in property <[SummaryCell]> calculator-calculated: [];
+    in property <string> calculator-step: "";
+    in property <string> calculator-depth-of-field: "";
+    in property <string> calculator-frames: "";
+    in property <string> calculator-duration: "";
+    in property <int> calculator-planes: 13;
+    in property <float> calculator-overlap: 0.25;
+    callback calculator-toggled();
+    callback calculator-optics-chosen(string);
+    callback calculator-field-edited(int, string);
+
+    calculator-overlay := FFCalculatorOverlay {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
+            - ShellGeometry.bottom-bar-height;
+        open: root.calculator-open;
+        objective: root.calculator-objective;
+        optics-labels: root.calculator-optics-labels;
+        optics-selected: root.calculator-optics-selected;
+        fields: root.calculator-fields;
+        entered: root.calculator-entered;
+        calculated: root.calculator-calculated;
+        step-text: root.calculator-step;
+        depth-of-field-text: root.calculator-depth-of-field;
+        frames-text: root.calculator-frames;
+        duration-text: root.calculator-duration;
+        planes: root.calculator-planes;
+        overlap: root.calculator-overlap;
+
+        close-requested => { root.calculator-toggled(); }
+        optics-chosen(label) => { root.calculator-optics-chosen(label); }
+        field-edited(slot, text) => { root.calculator-field-edited(slot, text); }
     }
 
     notification-center := FFNotificationCenter {

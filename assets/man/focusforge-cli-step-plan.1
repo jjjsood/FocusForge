@@ -8,7 +8,7 @@ focusforge\-cli\-step\-plan \- Compute the focus step, frame count, duration and
 .SH DESCRIPTION
 Compute the focus step, frame count, duration and disk need of a focus stack.
 .PP
-Depth of field is DOF = 0.55 µm / NA². A lens has NA = 1 / (2 · N · (1 + m)) from its marked f\-number N and the magnification m; an objective states its NA. The step is DOF · (1 − overlap).
+Depth of field is DOF = 0.55 µm / NA². A lens has NA = 1 / (2 · N · (1 + m)) from its marked f\-stop N and the magnification m; an objective states its NA. The step is DOF · (1 − overlap).
 .SH OPTIONS
 .TP
 \fB\-\-set\fR \fI<KEY=VALUE>\fR
@@ -29,7 +29,7 @@ Print help (see a summary with \*(Aq\-h\*(Aq)
 Parameters (\-\-set KEY=VALUE):
   magnification  Magnification (x) (default 1, 0.01 to 100)
   optics         Optics (default lens, one of lens, objective)
-  aperture       Marked f\-number (N) (default 8, 0.7 to 64)
+  aperture       f\-stop (default 8, 0.7 to 64)
   na             Numerical aperture (NA) (default 0.25, 0.01 to 0.95)
   overlap        Overlap (fraction of the depth of field) (default 0.25, 0 to 0.9)
   range_mm       Depth range (mm) (default 5, 0 to 1000)

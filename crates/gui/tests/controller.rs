@@ -331,6 +331,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("notification_center.slint"), "clicked")
             | (Some("notification_center.slint"), "changed selected")
             | (Some("notification_center.slint"), "key-pressed(event)")
+            | (Some("ff_field.slint"), "changed text")
+            | (Some("calculator_overlay.slint"), "key-pressed(event)")
     )
 }
 

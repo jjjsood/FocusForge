@@ -36,11 +36,11 @@ use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
 use crate::generated::{
-    AboutState, AppWindow, CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow,
-    ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView,
-    PerformanceCap, PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
-    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StoragePathState, StorageState,
+    AboutState, AppWindow, CalculatorFieldView, CheckpointEntryView as GeneratedCheckpointEntry,
+    ComparisonWindow, ExportRowView, FFManifestRow, ImageRowView as GeneratedImageRow,
+    NotificationRowView, PerformanceCap, PerformanceState, ProjectCardView as GeneratedProjectCard,
+    ProjectTabView, RecentRowView as GeneratedRecentRow, SectionHeadView,
+    SettingsRow as GeneratedSettingsRow, StoragePathState, StorageState, SummaryCell,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -827,6 +827,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::MismatchRaised
         | ShellEvent::LocateReady
         | ShellEvent::OverlayChanged
+        | ShellEvent::CalculatorChanged
         | ShellEvent::GalleryScrolled => InputSurface::Gallery,
         ShellEvent::SettingsChanged | ShellEvent::SettingsScrolled => InputSurface::Settings,
         ShellEvent::ImagesChanged | ShellEvent::ImagesScrolled => InputSurface::Images,
@@ -2357,6 +2358,48 @@ fn thumbnail_image(thumbnail: Option<&Arc<Thumbnail>>, cached: &PictureCache) ->
     slint::Image::from_rgba8(buffer)
 }
 
+/// Pushes the step calculator's open flag, entries and read-outs.
+pub fn push_calculator(app: &AppWindow, controller: &AppController) {
+    let view = controller.calculator_view();
+    let cells = |pairs: Vec<(String, String)>| {
+        let cells: Vec<SummaryCell> = pairs
+            .into_iter()
+            .map(|(caption, value)| SummaryCell {
+                caption: caption.into(),
+                value: value.into(),
+            })
+            .collect();
+        slint::ModelRc::new(slint::VecModel::from(cells))
+    };
+    let fields: Vec<CalculatorFieldView> = view
+        .fields
+        .into_iter()
+        .map(|field| match field {
+            Some(field) => CalculatorFieldView {
+                label: field.label.into(),
+                text: field.text.into(),
+                error: field.error.into(),
+                shown: true,
+            },
+            None => CalculatorFieldView::default(),
+        })
+        .collect();
+    app.set_calculator_open(controller.calculator_open());
+    app.set_calculator_objective(view.objective);
+    let labels: Vec<slint::SharedString> = view.optics_labels.into_iter().map(Into::into).collect();
+    app.set_calculator_optics_labels(slint::ModelRc::new(slint::VecModel::from(labels)));
+    app.set_calculator_optics_selected(view.optics_selected.into());
+    app.set_calculator_fields(slint::ModelRc::new(slint::VecModel::from(fields)));
+    app.set_calculator_entered(cells(view.entered));
+    app.set_calculator_calculated(cells(view.calculated));
+    app.set_calculator_step(view.step.into());
+    app.set_calculator_depth_of_field(view.depth_of_field.into());
+    app.set_calculator_frames(view.frames.into());
+    app.set_calculator_duration(view.duration.into());
+    app.set_calculator_planes(i32::try_from(view.planes).unwrap_or(i32::MAX));
+    app.set_calculator_overlap(view.overlap);
+}
+
 /// Pushes the projects overlay's whole state -- the one place
 /// `ShellEvent::OverlayChanged` is performed. A closed overlay publishes
 /// only that it is closed; opening it pushes again. Cards and Recent rows
@@ -3517,6 +3560,7 @@ pub fn install(
             if let Some(app) = app_weak.upgrade() {
                 refresh_toast(&app, &controller);
                 push_projects_overlay(&app, &controller.lock().unwrap());
+                push_calculator(&app, &controller.lock().unwrap());
             }
         }
     });
@@ -4455,6 +4499,38 @@ pub fn install(
             poll_if_work_pending(&app_weak, &controller, &canvas, &job_timer, &toast_timer);
         }
     });
+    push_calculator(app, &controller.lock().unwrap());
+    app.on_calculator_toggled({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
+                controller.toggle_calculator();
+            });
+        }
+    });
+    app.on_calculator_optics_chosen({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |label| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
+                controller.calculator_set_optics(label.as_str());
+            });
+        }
+    });
+    app.on_calculator_field_edited({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move |slot, text| {
+            dispatch_gallery(&controller, &canvas, &app_weak, |controller| {
+                controller
+                    .calculator_edit(usize::try_from(slot).unwrap_or_default(), text.as_str());
+            });
+        }
+    });
     // The projects overlay: the tab strip's own toggle, the gallery's
     // scroll -- `FFScrollbar`'s twin wiring above -- and its cards' own
     // click-through.
@@ -4924,6 +5000,11 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             let controller = controller.lock().unwrap();
             push_projects_overlay(app, &controller);
             push_project_dialogs(app, &controller);
+            push_calculator(app, &controller);
+        }
+        ShellEvent::CalculatorChanged => {
+            refresh_toast(app, controller);
+            push_calculator(app, &controller.lock().unwrap());
         }
         ShellEvent::GalleryScrolled => {
             app.set_gallery_scroll_y(controller.lock().unwrap().gallery_scroll_y());

@@ -664,8 +664,8 @@ fn gestures_come_from_the_input_map() {
     // `AppController`, the same as the canvas's own gesture table -- this
     // single-dispatch-point rule governs the canvas's rebindable zoom/pan/
     // drag gestures specifically, not every interactive widget in the crate.
-    // Every modal scrim and the Projects overlay's background swallow the
-    // wheel with a bare `accept`, forwarding nothing.
+    // Every modal scrim and the Projects and calculator overlays'
+    // backgrounds swallow the wheel with a bare `accept`, forwarding nothing.
     let raw_gesture_callback_exceptions = [
         "canvas.slint",
         "comparison_window.slint",
@@ -681,6 +681,7 @@ fn gestures_come_from_the_input_map() {
         "ff_manifest_list.slint",
         "ff_modal_panel.slint",
         "projects_overlay.slint",
+        "calculator_overlay.slint",
     ];
     for path in common::find_slint_files(&common::ui_dir()) {
         if path

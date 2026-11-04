@@ -201,15 +201,7 @@ fn step_plan_schema_matches_the_published_inputs() {
             true,
             1.0,
         ),
-        (
-            "aperture",
-            "Marked f-number (N)",
-            0.7,
-            64.0,
-            0.1,
-            false,
-            8.0,
-        ),
+        ("aperture", "f-stop", 0.7, 64.0, 0.1, false, 8.0),
         (
             "na",
             "Numerical aperture (NA)",
@@ -282,6 +274,6 @@ fn step_plan_schema_matches_the_published_inputs() {
         .collect();
     assert_eq!(
         variants,
-        [("lens", "Lens (f-number)"), ("objective", "Objective (NA)")]
+        [("lens", "Lens (f-stop)"), ("objective", "Objective (NA)")]
     );
 }

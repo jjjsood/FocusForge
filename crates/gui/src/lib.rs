@@ -130,3 +130,6 @@ pub mod recent;
 /// a project's saved history. No `use slint::` anywhere in it. `pub` so
 /// `tests/checkpoint_panel.rs` reaches its types directly.
 pub mod checkpoints;
+
+/// The step calculator's state and views.
+pub mod calculator;

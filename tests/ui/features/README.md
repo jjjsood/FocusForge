@@ -15,6 +15,7 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [projects](projects.md) | 11, 16, 18 | projects overview, cards, cancelled run, close from card, rail, overview opened at launch, held paused transport |
 | [open-and-refusals](open-and-refusals.md) | 12, 16 | RAW folder, compressed TIFF variants, empty start, not-a-project, mismatch and missing-frames projects, grouping question, skipped subfolder, failed fuse |
 | [notifications](notifications.md) | 15 | bell and unread count, notification center, toasts, crash record |
+| [step-calculator](step-calculator.md) | 20 | calculator button and overlay, Lens and Objective optics, entered boxes, SUMMARY read-out, violation line, one overlay at a time, no project open |
 
 ## Human only
 

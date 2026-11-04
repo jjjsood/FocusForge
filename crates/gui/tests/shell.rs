@@ -183,7 +183,8 @@ fn checkpoint_panel_touches_no_storage() {
     // panel lists, beside `job.rs`, which reads its planes, and `brush.rs`,
     // which builds the stored stroke's path in core's own point type.
     // `performance_settings.rs` parses its cap strings with core's size
-    // syntax. Excluded by name: this test's own subject is the checkpoint
+    // syntax. `calculator.rs` plans through core's step calculator.
+    // Excluded by name: this test's own subject is the checkpoint
     // panel, not the whole crate. Source preview reductions also read frames.
     let canvas_files = [
         "checkpoints.rs",
@@ -199,6 +200,7 @@ fn checkpoint_panel_touches_no_storage() {
         "source_previews.rs",
         "overlay.rs",
         "performance_settings.rs",
+        "calculator.rs",
         "recent.rs",
         "settings.rs",
     ];

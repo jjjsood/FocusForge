@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
+use crate::calculator::{Calculator, CalculatorView};
 use crate::canvas::{FrameView, OverlayDraw, PaneSource};
 use crate::checkpoints;
 use crate::diagnostics::{
@@ -289,6 +290,8 @@ pub enum ShellEvent {
     /// The projects overlay's own state moved: opened, closed, its gallery
     /// scrolled, or its failure cards changed.
     OverlayChanged,
+    /// The step calculator opened, closed or took an entry.
+    CalculatorChanged,
     /// Only the gallery's scroll offset or viewport height moved; no card
     /// changed.
     GalleryScrolled,
@@ -1409,6 +1412,9 @@ struct ShellState {
     drag_row: Option<DragRow>,
     /// Whether the projects overlay is open.
     overlay_open: bool,
+    /// Whether the step calculator overlay is open.
+    calculator_open: bool,
+    calculator: Calculator,
     /// The overlay was opened while a load ran, so that load's arrival
     /// leaves it open. Cleared whenever the overlay closes.
     overlay_survives_load: bool,
@@ -4795,6 +4801,9 @@ impl AppController {
     /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
+        if self.state.overlay_open {
+            self.close_calculator();
+        }
         self.state.overlay_survives_load = self.state.overlay_open && self.load_in_flight();
         self.notifications
             .set_projects_open(self.state.overlay_open);
@@ -4810,6 +4819,49 @@ impl AppController {
             self.notifications.set_projects_open(false);
             self.emit(ShellEvent::OverlayChanged);
         }
+    }
+
+    /// Whether the step calculator overlay is open.
+    pub fn calculator_open(&self) -> bool {
+        self.state.calculator_open
+    }
+
+    /// Opens the step calculator, closing the projects overlay and the
+    /// notification center, or closes it if it is open.
+    pub fn toggle_calculator(&mut self) {
+        if self.state.calculator_open {
+            self.close_calculator();
+            return;
+        }
+        self.close_projects_overlay();
+        self.notifications.close_center();
+        self.state.calculator_open = true;
+        self.emit(ShellEvent::CalculatorChanged);
+    }
+
+    /// Closes the step calculator if it is open; a no-op otherwise.
+    pub fn close_calculator(&mut self) {
+        if self.state.calculator_open {
+            self.state.calculator_open = false;
+            self.emit(ShellEvent::CalculatorChanged);
+        }
+    }
+
+    /// The calculator's entries and read-outs for display.
+    pub fn calculator_view(&self) -> CalculatorView {
+        self.state.calculator.view()
+    }
+
+    /// Selects the calculator's optics by its variant label.
+    pub fn calculator_set_optics(&mut self, label: &str) {
+        self.state.calculator.set_optics(label);
+        self.emit(ShellEvent::CalculatorChanged);
+    }
+
+    /// Takes `text` typed into the calculator's field slot `slot`.
+    pub fn calculator_edit(&mut self, slot: usize, text: &str) {
+        self.state.calculator.edit(slot, text);
+        self.emit(ShellEvent::CalculatorChanged);
     }
 
     /// A key press against the window's five fixed shortcuts -- `Esc` and
@@ -4831,6 +4883,10 @@ impl AppController {
             }
             if self.state.overlay_open {
                 self.close_projects_overlay();
+                return ChromeKey::Consumed;
+            }
+            if self.state.calculator_open {
+                self.close_calculator();
                 return ChromeKey::Consumed;
             }
             return ChromeKey::None;
@@ -7832,6 +7888,7 @@ impl AppController {
     /// same call, and marks every record read.
     pub fn open_center(&mut self) {
         self.close_projects_overlay();
+        self.close_calculator();
         self.notifications.open_center();
     }
 
@@ -7843,6 +7900,7 @@ impl AppController {
     /// Projects overview as [`open_center`](Self::open_center) does.
     pub fn open_center_at(&mut self, id: u64) {
         self.close_projects_overlay();
+        self.close_calculator();
         self.notifications.open_center_at(id);
     }
 
