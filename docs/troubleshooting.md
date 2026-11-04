@@ -65,7 +65,7 @@ See: ["This project cannot be opened"](guide/first-stack.md#this-project-cannot-
 ### A RAW project saved by an earlier version
 
 A RAW project saved by an earlier version stored a clipped 16-bit result.
-FocusForge now keeps a RAW result unclipped, so it refuses the old project.
+FocusForge keeps a RAW result unclipped, so it refuses the old project.
 The window shows the damaged-history message of
 ["This project cannot be opened"](#this-project-cannot-be-opened). The
 command line names the cause:
