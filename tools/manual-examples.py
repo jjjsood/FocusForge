@@ -36,6 +36,7 @@ Python standard library only. The image rights notice in
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -327,59 +328,96 @@ def encode_jpeg(image: Image, quality: int = JPEG_QUALITY) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+class Fused:
+    """A fused project and where its composite sits in the reference frame.
+
+    With alignment on, the composite is cropped to the area every frame
+    covers; `crop_x`/`crop_y` is that crop's corner in the alignment
+    reference frame's pixels, which is what lets two stacks over the same
+    reference be cut to the same window.
+    """
+
+    def __init__(self, project: str, crop_x: int, crop_y: int):
+        self.project = project
+        self.crop_x = crop_x
+        self.crop_y = crop_y
+
+
 class Runner:
     def __init__(self, cli: str, work: str):
         self.cli = cli
         self.work = work
+        self.fused: dict[str, Fused] = {}
 
-    def run(self, *args: str) -> None:
+    def run(self, *args: str) -> str:
         result = subprocess.run(
-            [self.cli, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False
+            [self.cli, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False
         )
         if result.returncode != 0:
-            sys.stderr.write(result.stdout)
+            sys.stderr.write(result.stdout + result.stderr)
             raise SystemExit(f"focusforge-cli {args[0]} exited {result.returncode}")
+        return result.stdout
 
-    def fuse(self, name: str, frames: list[tuple[int, int, int]], window: tuple[int, int], *flags: str) -> str:
-        """Cut `frames` into a fresh stack directory and fuse it; returns the project.
+    def fuse(self, name: str, frames: list[tuple[int, int, int]], size: tuple[int, int], *flags: str) -> Fused:
+        """Cut `frames` into a fresh stack directory and fuse it.
 
-        Each frame is (fixture index, x, y): a `window`-sized read starting at
-        (x, y) of `fixtures/mantis-512/frames/NN.tif`. Files keep the fixture's
+        Each frame is (fixture index, x, y): a `size` read starting at (x, y)
+        of `fixtures/mantis-512/frames/NN.tif`. Files keep the fixture's
         number, so a thinned stack still names its frames by focus position.
+        A name already fused in this run is reused.
         """
+        if name in self.fused:
+            return self.fused[name]
         stack_dir = os.path.join(self.work, name)
         out_dir = os.path.join(self.work, name + "-project")
         for path in (stack_dir, out_dir):
             shutil.rmtree(path, ignore_errors=True)
         os.makedirs(os.path.join(stack_dir, "frames"))
         os.makedirs(out_dir)
-        w, h = window
+        w, h = size
         for index, x, y in frames:
             source = os.path.join(FRAMES, f"{index:02d}.tif")
             info = rawtiff.read_info(source)
             pixels = rawtiff.read_rect(source, x, y, w, h, info)
             rawtiff.write_tiff(os.path.join(stack_dir, "frames", f"{index:02d}.tif"), w, h, pixels)
-        self.run("stack", stack_dir, "-o", out_dir, "--cpu", "--no-cache", "--no-progress", *flags)
-        projects = [f for f in os.listdir(out_dir) if f.endswith(".ffp")]
+        report = json.loads(
+            self.run("stack", stack_dir, "-o", out_dir, "--cpu", "--no-cache", "--no-progress", "--json", *flags)
+        )
+        projects = sorted(f for f in os.listdir(out_dir) if f.endswith(".ffp"))
         if len(projects) != 1:
             raise SystemExit(f"expected one project in {out_dir}, found {projects}")
-        return os.path.join(out_dir, projects[0])
+        crop = report.get("crop") or {"x": 0, "y": 0}
+        fused = Fused(os.path.join(out_dir, projects[0]), crop["x"], crop["y"])
+        self.fused[name] = fused
+        print(f"  fused {name}: {len(frames)} frames, crop at {crop['x']},{crop['y']}")
+        return fused
 
-    def composite(self, project: str) -> Image:
+    def composite(self, fused: Fused, project: str | None = None) -> Image:
+        project = project or fused.project
         path = project[:-4] + "-composite.tif"
         self.run("export", project, "-o", path, "--exif", "off", "--icc", "off")
         return read_tiff8(path)
 
-    def frame(self, project: str, position: int) -> Image:
+    def frame(self, fused: Fused, position: int) -> Image:
         """Source frame `position` (0-based, in the stack's order) as fused."""
-        path = project[:-4] + f"-frame{position:02d}.tif"
-        self.run("export", project, "--frame", str(position), "--frame-output", path)
+        path = fused.project[:-4] + f"-frame{position:02d}.tif"
+        self.run("export", fused.project, "--frame", str(position), "--frame-output", path)
         return read_tiff8(path)
 
-    def zmap(self, project: str) -> tuple[int, int, list[int]]:
-        path = project[:-4] + "-zmap.tif"
-        self.run("export", project, "--zmap", path)
+    def zmap(self, fused: Fused) -> tuple[int, int, list[int]]:
+        path = fused.project[:-4] + "-zmap.tif"
+        self.run("export", fused.project, "--zmap", path)
         return read_zmap(path)
+
+    def retouched(self, fused: Fused, ops: list) -> Image:
+        """The composite after `ops`, applied to a copy of the project."""
+        copy = fused.project[:-4] + "-retouched.ffp"
+        shutil.copyfile(fused.project, copy)
+        ops_path = fused.project[:-4] + "-ops.json"
+        with open(ops_path, "w", encoding="utf-8") as fh:
+            json.dump(ops, fh)
+        self.run("retouch", copy, "--ops", ops_path)
+        return self.composite(fused, copy)
 
 
 def colour_zmap(zmap: tuple[int, int, list[int]], colours: dict[int, tuple[int, int, int]], other: tuple) -> Image:
@@ -388,3 +426,167 @@ def colour_zmap(zmap: tuple[int, int, list[int]], colours: dict[int, tuple[int, 
     for value in values:
         pixels += bytes(colours.get(value, other))
     return Image(width, height, pixels)
+
+
+def enlarge(image: Image, factor: int) -> Image:
+    """Nearest-neighbour enlargement: every pixel becomes a factor x factor square."""
+    out = bytearray()
+    for row in range(image.height):
+        line = bytearray()
+        for col in range(image.width):
+            start = (row * image.width + col) * 3
+            line += image.pixels[start : start + 3] * factor
+        out += line * factor
+    return Image(image.width * factor, image.height * factor, out)
+
+
+def in_reference(fused: Fused, x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
+    """A window given in the reference frame's pixels, in the composite's own."""
+    return x - fused.crop_x, y - fused.crop_y, w, h
+
+
+# ---------------------------------------------------------------------------
+# The examples. Windows are (x, y, w, h); frames are fixture indices 00-07.
+# ---------------------------------------------------------------------------
+
+ORANGE = (240, 140, 30)
+BLUE = (40, 110, 220)
+GREY = (205, 205, 205)
+
+ALL_FRAMES = [(i, 0, 0) for i in range(8)]
+FULL = (512, 512)
+DETAILS = ("--algorithm", "laplacian")
+
+
+def depth_of_field(r: Runner, emit) -> None:
+    # Default settings (alignment and crop on), Details method. Window: the
+    # antenna (sharp in frame 02) and the rim of the head with its hairs
+    # (sharp in frame 03), above the soft part of the head.
+    fused = r.fuse("all-details", ALL_FRAMES, FULL, *DETAILS)
+    window = (45, 0, 320, 224)
+    frames = [r.frame(fused, i).crop(*window) for i in (2, 3, 5)]
+    emit("depth-of-field/source-frames.jpg", side_by_side(frames))
+    composite = r.composite(fused).crop(*window)
+    zmap = colour_zmap(r.zmap(fused), {2: ORANGE, 3: BLUE}, GREY).crop(*window)
+    emit("depth-of-field/composite.jpg", side_by_side([composite, zmap]))
+
+
+def halos(r: Runner, emit) -> None:
+    # The same eight frames under each fusion method, default settings. Window:
+    # the antenna against the dark background and the rim of the head, the two
+    # depth edges of this crop.
+    window = (109, 0, 256, 224)
+    panels = []
+    for algorithm in ("laplacian", "weighted-average", "depth-map"):
+        name = "all-details" if algorithm == "laplacian" else "all-" + algorithm
+        fused = r.fuse(name, ALL_FRAMES, FULL, "--algorithm", algorithm)
+        panels.append(r.composite(fused).crop(*window))
+    emit("failure-images/halo-methods.jpg", side_by_side(panels))
+    # Where the antenna (near) crosses the rim (far), Details keeps the rim from
+    # frame 03 over a soft antenna. One brush stroke from frame 02 along the
+    # antenna repairs it. Shown enlarged 2x.
+    fused = r.fuse("all-details", ALL_FRAMES, FULL, *DETAILS)
+    stroke = {
+        "brush-stroke": {
+            "source_id": 2,
+            "path": [{"x": 222, "y": 96}, {"x": 186, "y": 150}, {"x": 160, "y": 205}],
+            "radius": 16.0,
+            "softness": 0.5,
+        }
+    }
+    window = (120, 80, 160, 160)
+    before = r.composite(fused).crop(*window)
+    after = r.retouched(fused, [stroke]).crop(*window)
+    emit("failure-images/halo-retouch.jpg", side_by_side([enlarge(before, 2), enlarge(after, 2)]))
+
+
+def motion(r: Runner, emit) -> None:
+    # Simulated camera movement: frames 03-07 are read 12 px right and 8 px down
+    # of frames 00-02, so their content sits 12 px left and 8 px up. Fused once
+    # with alignment off (the movement shows) and once with the default
+    # alignment (it is corrected). Window in frame 03's pixels.
+    shifted = [(i, 16, 16) for i in range(3)] + [(i, 28, 24) for i in range(3, 8)]
+    size = (480, 480)
+    unaligned = r.fuse("motion-unaligned", shifted, size, *DETAILS, "--no-align")
+    aligned = r.fuse("motion-aligned", shifted, size, *DETAILS)
+    window = (150, 20, 288, 288)
+    panels = [r.composite(f).crop(*in_reference(f, *window)) for f in (unaligned, aligned)]
+    emit("failure-images/motion.jpg", side_by_side(panels))
+
+
+def gaps(r: Runner, emit) -> None:
+    # A real thinned subset: all eight frames against the same frames without
+    # frame 02, the only one with the antenna sharp. Alignment off for both, so
+    # the two windows match pixel for pixel. Window: the antenna, its base and
+    # the fine hair below it.
+    full = r.fuse("gap-all", ALL_FRAMES, FULL, *DETAILS, "--no-align")
+    thinned = r.fuse("gap-without-02", [(i, 0, 0) for i in (0, 1, 3, 4, 5, 6, 7)], FULL, *DETAILS, "--no-align")
+    window = (122, 2, 384, 384)
+    panels = [r.composite(f).crop(*in_reference(f, *window)) for f in (full, thinned)]
+    emit("failure-images/focus-gap.jpg", side_by_side(panels))
+
+
+GROUPS = {
+    "depth-of-field": depth_of_field,
+    "halos": halos,
+    "motion": motion,
+    "gaps": gaps,
+}
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Regenerate the manual's focus-stacking example images.")
+    parser.add_argument("groups", nargs="*", metavar="GROUP", help="one of: " + ", ".join(GROUPS) + " (default: all)")
+    parser.add_argument("--cli", default=os.path.join(REPO, "target", "debug", "focusforge-cli"))
+    parser.add_argument("--check", action="store_true", help="compare with the committed images, write nothing")
+    args = parser.parse_args(argv)
+    unknown = [g for g in args.groups if g not in GROUPS]
+    if unknown:
+        parser.error(f"unknown group {', '.join(unknown)}; choose from {', '.join(GROUPS)}")
+    if not (os.path.isfile(args.cli) and os.access(args.cli, os.X_OK)):
+        print(f"no focusforge-cli at {args.cli}: build it (cargo build -p focusforge-cli) or pass --cli", file=sys.stderr)
+        return 2
+    work = os.path.join(SCRATCH, "work")
+    out = os.path.join(SCRATCH, "out")
+    for path in (work, out):
+        shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(path)
+    written: list[str] = []
+
+    def emit(relative: str, image: Image) -> None:
+        path = os.path.join(out, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = encode_jpeg(image)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        written.append(relative)
+        print(f"  {relative}: {image.width}x{image.height}, {len(data) // 1024} KB")
+
+    runner = Runner(os.path.abspath(args.cli), work)
+    for group in args.groups or list(GROUPS):
+        print(group)
+        GROUPS[group](runner, emit)
+
+    differ = []
+    for relative in written:
+        source = os.path.join(out, relative)
+        target = os.path.join(ASSETS, relative)
+        if args.check:
+            with open(source, "rb") as a:
+                same = os.path.isfile(target) and a.read() == open(target, "rb").read()
+            if not same:
+                differ.append(relative)
+        else:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.move(source, target)
+    if args.check:
+        for relative in differ:
+            print(f"differs from docs/assets/manual/{relative}")
+        print("check: " + ("FAILED" if differ else f"all {len(written)} images match"))
+        return 1 if differ else 0
+    print(f"wrote {len(written)} images under docs/assets/manual/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

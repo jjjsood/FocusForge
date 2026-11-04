@@ -1,323 +1,362 @@
-# Using the window
+# The window
 
-`focusforge-gui` opens a window instead of running one command and exiting;
-everything below is reachable with a mouse once it's open.
+This chapter is a guided tour of the FocusForge window: what each area is
+for, how to move around a picture, how to keep several stacks open at once
+and how to give one image its own window on a second screen. It assumes you
+have opened a stack at least once; if not, start with
+[Your first stack](first-stack.md).
 
-```bash
-target/release/focusforge-gui --open path/to/frames/
-```
+The frame list on the right has a chapter of its own,
+[The Images panel](images-panel.md).
 
-A folder argument proposes a grouping the same way `focusforge-cli stack`
-would and opens each proposed stack as its own tab; a `*.ffp` path reopens a
-project that was already stacked. `--open` is repeatable — each path is
-opened in turn, the next one waiting for the one before it to finish rather
-than racing it. Leaving `--open` off starts with an empty window: click
-**Open…** to choose the TIFF or camera RAW frames of one stack, which start
-one new tab (sorted by name), or drop a folder or a set of frames onto the
-window. The empty window's caption reads "Drop a folder or stack", or
-"Dropping is unavailable on native Wayland" where drops do not work.
-Ctrl+N and the Projects rail's **New project** ask for a folder instead. A path that fails to open shows the same refusal dialog a failed
-drop or picker choice would, rather than closing the window. A folder with
-no readable frames is refused naming the formats read, 16-bit TIFF and camera
-RAW; Escape closes the dialog. Dialogs with a Cancel button also show an x at
-the top right that acts as Cancel.
+## The window at a glance
 
-Opening a folder, a project or a picker/drop result reads its frame headers
-and decodes a thumbnail off the window's own thread, so the window keeps
-responding while a large folder is scanned, and while an open, save or
-export file dialog is up; a loading indicator appears over
-the canvas once a load has been running for half a second.
+![The FocusForge window with two tabs open. The active tab, mantis-512-fused, shows the source frame 02.tif on the left and the fused composite on the right; the dock on the right lists the checkpoint Details and the eight frames.](../assets/manual/window/window-tour.png)
 
-On Linux, a launch that carries a startup-notification token
-(`DESKTOP_STARTUP_ID` or `XDG_ACTIVATION_TOKEN`) tells the desktop once the
-window has appeared, so the launcher's busy cursor ends.
+*Two projects open as tabs; the active one has already been fused.*
 
-## Launch options
+Going round the window clockwise from the top left:
 
-Other `focusforge-gui` flags start the window in a chosen state; `--help`
-lists them all.
+| # | Where | What it is |
+|---|---|---|
+| 1 | Top left corner | **Projects** button (four small squares): opens the projects overview, where every open project is a card. |
+| 2 | Top edge | The **tab strip**: one tab per open project, then a **+** tab for opening another. |
+| 3 | Top right corner | **Minimize**, **Maximize** and **Close** for the whole window. |
+| 4 | Below the tabs | The **toolbar**. In stacking it holds **Fuse stack** and, during a run, **Pause** and **Cancel**; in the editor it holds the brush controls. |
+| 5 | Middle left | The **Frame** pane. Its label shows the file name of the frame you selected, here `02.tif`. |
+| 6 | Middle right | The **Composite** pane: the fused result, once there is one. |
+| 7 | Right edge, top | The **STACKING** / **EDITOR** switch. |
+| 8 | Right edge | The **CHECKPOINTS** list with the **Export image** button. |
+| 9 | Right edge, lower half | The **Images** and **Settings** tabs of the dock, with the frame list showing. |
+| 10 | Bottom edge | The **bottom bar**: what the window is doing, the progress of a run, the **Overlay** switch and the zoom controls. |
+| 11 | Left edge, bottom | The **Notifications** bell and the **Settings** gear, which opens the settings window. |
 
-| flag | effect |
+The sections below take these areas one at a time.
+
+## Tabs: one project each
+
+Every stack you open becomes a project in its own tab. A tab shows the
+project's name and, on the right, an **x** that closes it. Next to the name
+you may see:
+
+- **UNSAVED** — the project holds something that is not yet written to a
+  project file. See [Checkpoints and saving](history.md).
+- A small **play** mark while that tab's stack is being fused, and a
+  **…** mark while it waits in line behind another tab's run. The
+  **UNSAVED** chip comes back once the run has finished.
+
+The last box in the strip, **+**, is a tab of its own: click it to get the
+empty start page with **Open…**, from which you open another stack (see
+[Your first stack](first-stack.md#open-a-folder)). When there are more
+tabs than fit, arrows appear at the ends of the strip to scroll through them.
+
+The tab strip is also the window's title bar: drag an empty part of it to
+move the window.
+
+### Work on two projects at once
+
+Each tab keeps its own frames, its own selected frame, its own settings, its
+own checkpoints and its own zoom. Switching tabs never mixes them up.
+
+1. Open the first stack, then open a second one (with **+** and **Open…**,
+   or by dropping a folder onto the **+** tab).
+2. Click a tab to bring it to the front. The dock, the panes and the bottom
+   bar now show that project only.
+3. Click the other tab to go back. The frame you had selected there is
+   still selected, and the view is where you left it.
+
+The screenshot above shows the same stack open twice: once as a saved,
+fused project (`mantis-512-fused`) and once freshly opened (`frames`, still
+**UNSAVED**). The tab title is the project's name; when two folders have the
+same name, the header of the frame list (for example "8 frames · 0
+excluded") is a quick way to tell the tabs apart.
+
+> **Tip:** Fusing runs one tab at a time. If you press **Fuse stack** on a
+> second tab while the first is still fusing, the second waits in line and
+> starts on its own when the first is done.
+
+For an overview of every open project as cards, and for closing tabs and
+quitting, see [Projects, notifications and quitting](batch-runs.md).
+
+## The toolbar
+
+The toolbar changes with what you are doing:
+
+- **In stacking**, it holds **Fuse stack**. While a run is going, the button
+  becomes **Pause** and **Cancel**, and **Resume** once paused; a failed run
+  offers **Retry**. [Your first stack](first-stack.md) walks through a run.
+- **In the editor**, it holds the brush: **Size**, **Soft**, the pipette,
+  undo and redo, and **Save checkpoint**. See [Retouching](retouch.md).
+
+> **Note:** In stacking, the right end of the toolbar shows a greyed-out
+> "Save checkpoint" caption. It is only a label: it does nothing when
+> clicked. Checkpoints are saved from the editor, and every fuse you keep
+> becomes one automatically.
+
+## The two panes
+
+The canvas in the middle of the window shows two images side by side:
+
+- **The Frame pane** (left) shows one source frame: the one selected in the
+  [Images panel](images-panel.md). Its label is the frame's file name, for
+  example `00.tif`. Click another row in the list to look at another frame.
+- **The Composite pane** (right) shows the [composite](../glossary.md#composite),
+  the fused result. Before the first fuse it shows "Not fused yet" and
+  "Fuse stack builds the composite here." After a fuse it shows the checkpoint
+  selected in **CHECKPOINTS**.
+
+The two panes always show the same part of the picture at the same zoom: pan
+or zoom in one, and the other follows. That makes it easy to compare a
+detail in one frame with the same detail in the result.
+
+While you zoom out or pan quickly, each pane first shows a coarse version of
+the whole image and sharpens it a moment later, so you never see empty edges.
+
+## The dock
+
+![The dock on the right side of the window: the STACKING and EDITOR switch at the top, the CHECKPOINTS list with one checkpoint named Details and the Export image button, then the Images and Settings tabs above the frame list.](../assets/manual/window/window-dock.png)
+
+*The dock of a fused project, in stacking.*
+
+The dock runs down the right side of the window. From top to bottom:
+
+1. **STACKING / EDITOR.** The two halves switch between preparing and fusing
+   a stack (**STACKING**) and retouching its result (**EDITOR**). **EDITOR**
+   stays dimmed until the tab holds a fused result. After you keep a fuse the
+   window changes to the editor by itself; click **STACKING** to get the
+   frame list and the settings back. See [Retouching](retouch.md).
+2. **CHECKPOINTS.** Every fused or retouched result you kept, newest first,
+   named after the [fusion method](../glossary.md#fusion-method) and the time.
+   Before the first fuse it reads "None yet — fuse a stack". Click a row to
+   show that result in the **Composite** pane. **Export image** saves the
+   result you are looking at as a TIFF, PNG or JPEG file. See
+   [Checkpoints and saving](history.md) and [Exporting an image](export.md).
+3. **Images** and **Settings.** Two tabs that share the lower part of the
+   dock:
+   - **Images** lists the frames of the stack. See
+     [The Images panel](images-panel.md).
+   - **Settings** holds everything the next fuse on this tab will use. See
+     [Stacking settings](stacking.md).
+
+   In the editor, these two tabs give way to a read-only list of the frames
+   (see [In the editor](images-panel.md#in-the-editor)).
+
+While a tab's stack is being fused, its **Images** and **Settings** tabs are
+dimmed: you can look, but changes wait until the run is over. With no
+project open (the **+** tab), the dock reads "No project open."
+
+## The bottom bar
+
+![The bottom bar during a run: the stage Aligning with the frames done, a progress bar and the ETA, then the dimmed Overlay switch and slider at 65%, and the zoom controls with the readout 90.2 % and Fit.](../assets/manual/window/window-bottom-bar.png)
+
+*The bottom bar while a stack is being aligned.*
+
+From left to right:
+
+- **Status.** "No project open" on the **+** tab, "No job running" when
+  nothing is happening, the current stage while a stack is fused (for example
+  "Aligning"), and "fused" with the time once a run you kept has finished.
+- **Progress.** During a run: frames done (such as "3 of 8"), a progress bar
+  and an estimated time remaining ("ETA"). [Your first stack](first-stack.md)
+  explains the stages.
+- **Overlay.** A switch and a strength slider for the Z-Map overlay; see
+  [See where each pixel came from](#see-where-each-pixel-came-from).
+- **Zoom.** **Zoom out**, the zoom readout, **Zoom in**, and **Fit**; see the
+  next section.
+
+## Zoom and pan
+
+The zoom controls sit at the right end of the bottom bar.
+
+| Control | What it does |
 |---|---|
-| `--fuse-tabs 0,1` | selects those tabs in turn and presses **Fuse stack** on each once `--open` has loaded, so give one `--open <folder>` per stack (a folder that reads as several stacks first asks how to group them, and until that is answered no tab exists for the flag to select); an index repeated, as in `0,0`, waits until the earlier run has settled and its **Keep** or **Discard** question is answered |
-| `--projects-overlay` | opens the projects overlay; with `--open` it stays open after the load lands, with `--fuse-tabs` it opens once the last run settles |
-| `--toolbar-state idle\|running\|paused\|cancelling\|failed` | shows that transport state until a real run starts |
-| `--save-folder <DIR>` | writes every project save and image export into this existing folder under its proposed name, with no save dialog |
-| `--settings-section <TAB>` | opens the settings window on that tab (see below) |
-| `--config-dir <DIR>` | reads and writes `<DIR>/focusforge/settings.toml` (see below) |
+| **Fit** | Shows the whole picture in both panes. The readout then shows the fit zoom, for example "90.2 %". |
+| **Zoom in** | One step closer, about the middle of the view. |
+| **Zoom out** | One step back, about the middle of the view. |
+| Readout | The current zoom in percent; "—" when no project is open. 100 % means one image pixel per screen pixel. |
 
-## The window
+Zoom moves along fixed steps. Below the fit zoom there is exactly one step,
+half of it, which shows the picture smaller with dark space around it.
+Above the fit zoom the steps are 100 %, 150 %, 200 %, 300 %, 400 % and
+500 % (those that are larger than the fit zoom). 500 % is the top: **Zoom in**
+does nothing more there, and **Zoom out** does nothing more at half the fit
+zoom. A very small image that already fits at more than 500 % cannot be
+zoomed in at all.
 
-A tab strip runs across the top, one tab per open project plus a `+` tab for
-starting another. Below it, the left canvas pane, **Frame**, shows the source frame
-selected in **Images**; the right pane, **Composite**, shows the result after
-a fuse. Both panes pan and zoom together. A dock along the side switches
-between two tabs of its own:
+![Both panes zoomed to 300 percent on the same detail: the frame 03.tif on the left, the composite on the right.](../assets/manual/window/window-zoomed.png)
 
-- **Images** lists every frame in fuse order, with its legend color and
-  capture time. A frame can be excluded from the next fuse without removing
-  it, removed outright, re-ordered by dragging its row, and sorted by name or
-  capture time. Its header adds more frames through a file picker, and
-  dropping a folder or a set of frames onto a tab that already holds a
-  project adds them to it the same way, rather than opening a second project;
-  a frame that would replace one already in the stack asks before doing so.
-  The panel dims while its own tab's fuse is running, the same as
-  **Settings**. The Appearance tab of the settings window sets whether the panel shows each frame as a
-  plain row, a row with a preview, or a large preview. The editor's source
-  list follows the same choice.
-- **Settings** holds every setting of the next fuse on this tab, in four
-  sections; see [Settings](#settings) below. A value outside its declared
-  range is flagged before the run starts.
+*Fit, then Zoom in three times: both panes at 300 %, showing the same spot.*
 
-Use the icon at the top right of either image to move that pane into a second
-window. Only one pane can be detached, and the remaining pane's icon stays
-hidden until the detached pane returns. The remaining pane fills the main
-canvas. Both images share the same visible area, zoom and pan; unused space
-stays black when the windows have different sizes. Each pane, the detached
-window included, shows a coarse whole-image backdrop under the sharp view, so
-zooming out or panning past the loaded region shows no blank edge while the
-sharp pixels catch up. Drag the second window by
-its title bar; its dock icon or close button returns the image to the main
-window. It can also be minimized or maximized. It draws sharply over its
-whole area and follows the display's scale factor. On Linux, the second window
-currently uses X11 or XWayland when `DISPLAY` is available, otherwise native
-Wayland when `WAYLAND_DISPLAY` is available. Starting with neither display
-reports a clear error instead of choosing a different backend.
+With the mouse:
 
-## Staying responsive
+- **Scroll wheel:** zooms in or out at the pointer, so the spot under the
+  pointer stays put. This is the quickest way to inspect a detail.
+- **Middle-button drag**, or **hold Space and drag** with the left button:
+  pans the picture. Both panes move together.
+- **Shift + scroll wheel:** pans sideways (in the editor, it changes the
+  brush size instead).
 
-Loading frame planes, saving a project, loading one and blending
-a brush stroke all run off the window's thread, so the window keeps
-responding while they work. While you pan, zoom or paint, a running fuse or
-alignment holds back to a quarter of the machine's threads (at least one) and
-lifts that cap once the canvas has been quiet for a quarter of a second.
+Click **Fit** at any time to get the whole picture back.
 
-## Fusing a stack
+### Step through the frames from the canvas
 
-The toolbar's transport button reads **Fuse stack** on a tab with two or
-more frames still to fuse; while a run is going it becomes **Pause**,
-**Cancel** and, once paused, **Resume**. A failed run offers **Retry**,
-which starts the same request again. Progress, the current stage and an ETA
-show along the bottom of the window while a run is live. Brightness
-preparation and a computed alignment each show frames done and an estimated
-time remaining; time spent paused is left out of the estimate. When alignment
-is reused from an earlier run, the bar reads "from cache" for that stage. A failed run raises
-a toast naming which step it failed at — setup, alignment or fusion —
-rather than a generic failure message.
+- **Ctrl + scroll wheel** over the canvas steps to the previous or next
+  frame in the **Frame** pane, without reaching for the list. A plain scroll
+  over a row of the Images list does the same.
+- **Alt + click** on the composite selects the frame that pixel came from,
+  so the **Frame** pane shows the source of that spot. This needs a fused
+  result.
 
-If the graphics device the window is using disappears (a driver reset, a
-GPU unplugged), the canvas stops updating and the window closes itself a
-moment later rather than hanging; see
-[`guide/diagnostics.md`](diagnostics.md) for where that is logged.
+## See where each pixel came from
 
-## Settings
+After a fuse, FocusForge knows which frame each pixel of the result was
+taken from. That record is the [Z-Map](../glossary.md#z-map). The
+**Overlay** switch in the bottom bar paints it over the **Composite** pane,
+one colour per frame. The colours are the same ones the
+[Images panel](images-panel.md#the-frame-list) shows next to each frame name.
 
-The **Settings** tab is generated from the same parameter schema
-`focusforge-cli algorithms` prints. It has four sections, top to bottom:
+![The two panes with the overlay switched on: the frame pane on the left is untouched, the composite on the right is tinted with patches of colour, one colour per source frame.](../assets/manual/window/window-overlay.png)
 
-- **PREPARE** — **Equalize brightness** (on by default), **Max brightness
-  gain** (1.01 to 2.0, default 1.25) and **Target brightness (stops)**, a
-  signed slider from -0.5 to 0.5 in steps of 0.1 (Left and Right step it from
-  the keyboard). Every frame gets one gain, bringing its mean to one target
-  shared by all frames, bounded by the max gain; the target sits at the
-  frames' average brightness at 0.0 and a stop higher or lower doubles or
-  halves it. While the gains are measured the bottom bar reads **Preparing** with the number of frames done and an
-  estimated time remaining.
-- **FUSE** — the fusion method and the parameters it declares. The picker
-  lists every method: **Details** (the default), **Soft transitions** and
-  **Focus map**. Each method remembers its own settings while the tab is open.
-- **ALIGN** — an **Enabled** switch, then the alignment algorithm and its
-  parameters. Switched off, the section dims and the next fuse uses the
-  frames as read.
-- **FINISH** — **Auto-crop**, which trims the result to the area every
-  aligned frame covers.
+*The overlay on at 65 %: each colour marks the frame that part of the result came from.*
 
-A section's heading carries a **DEFAULT** badge while nothing in it differs
-from the defaults; in **ALIGN** the **Enabled** switch counts, so switching
-alignment off or on removes the badge. Rarely changed parameters sit behind a **More...** strip at the foot of a
-section; click it to open the strip and click again to collapse it. Choosing a
-different method or editing a value changes what the next fuse on this tab
-runs with.
+1. Make sure the tab holds a fused result. Before the first fuse, the
+   **Overlay** switch and its slider are dimmed and do nothing.
+2. Click the **Overlay** switch. Its knob moves to the right and the
+   composite is tinted.
+3. Drag the slider beside it to change how strongly the colours cover the
+   picture. It starts at 65 %; the percentage is shown next to it.
+4. Click the switch again to turn the overlay off. The slider greys out but
+   keeps its position for next time.
 
-A fuse does not stop at a frame that fails to register: the run finishes with
-that frame unaligned and offers **Keep** or discard. After **Keep**, an info
-toast reads `N frames unaligned` (`1 frame unaligned`) when any frame fell
-back to identity. The same toast carries the run's other notices, such as a
-frame whose brightness gain was held at the bound. A re-fuse that changes only
-fusion settings reuses the stored alignment. See
-[`guide/alignment.md`](alignment.md) and
-[`guide/stacking.md`](stacking.md#brightness-equalization).
+Use it to check a fuse. Along the subject, each colour should cover the
+part of it that was sharp in that frame. A colour you did not expect on a
+fine edge points at a frame worth a closer look. Speckled patches in a
+smooth, blurred background are normal: no frame is sharp there, so the
+choice between them hardly matters.
+The overlay only tints the view; it is never part of a saved project's image
+or an exported file. The **Frame** pane is never tinted.
 
-## Saving a project
+> **Tip:** In the editor the same colours tell you which frame your brush
+> paints from. See [Retouching](retouch.md).
 
-A fuse in the window writes nothing next to the frames: the result is held
-in the tab only, and a re-fuse of an already-opened project holds its new
-result the same way rather than appending it on disk. A tab with anything
-held shows an `UNSAVED` chip in the tab strip; **Save project** (in the
-projects overlay's rail, and bound to Ctrl+S) writes every held checkpoint
-into one `.ffp`, in order, clearing the chip. On a tab's first save it
-proposes `<frames directory>/<group name>.ffp` through a save dialog; a tab
-already opened from a project writes back to that same file without asking.
-A failed save keeps every held checkpoint and reports why the write did not
-happen — nothing is lost.
+## Put a pane in its own window
 
-## Checkpoints
+On a second monitor it can help to see the source frame and the result at
+full size each. Either pane can move into a window of its own.
 
-The dock's **CHECKPOINTS** panel lists every checkpoint of the active tab,
-newest first. Click a row to restore it, hover one for its delete icon, and
-use the editor toolbar's **Save checkpoint** to keep unsaved strokes as a new
-row. Fusing, closing a tab and quitting each ask before they would drop
-unsaved strokes. See [`guide/history.md`](history.md).
+1. Click the small square icon with four corner marks at the top right of a
+   pane (**Undock pane**).
+2. A second window opens with that pane. Its title bar reads
+   "FocusForge — Frame" or "FocusForge — Composite".
+3. The other pane now fills the whole canvas of the main window.
 
-## Exporting an image
+![The main window's canvas after undocking: one pane labelled Composite fills it, and it has no undock icon.](../assets/manual/window/window-undocked-main.png)
 
-The panel's **Export image** button is enabled once the tab shows a fused
-or retouched result, and exports the position you are looking at: a saved
-checkpoint, an unsaved fuse result, or your current unsaved edits. The
-dialog offers:
+*The main window keeps the Composite pane; its undock icon is hidden while the other pane is out.*
 
-- **Format** — TIFF, PNG or JPEG.
-- That format's settings, listed from the same descriptors `focusforge-cli
-  export` takes: bit depth and compression for TIFF and PNG, quality and
-  chroma subsampling for JPEG (4:2:0 by default).
-- **Metadata** — one switch. On carries the EXIF and ICC profile of the
-  reference frame; off carries nothing.
+![The second window, titled FocusForge — Frame, showing the frame 00.tif with a Dock pane icon at its top right.](../assets/manual/window/window-undocked-second.png)
 
-**Export** then opens the system save dialog and writes the image, with
-progress shown in the dialog. The format and each format's last settings are remembered in
-`settings.toml`'s `[export]` table once an export succeeds. The image is
-rendered from the stored composite with any strokes blended over it; a
-retouched result reads the source frames again and checks them. An export that cannot proceed says why instead of writing, naming each
-missing or changed frame, an image too large for the format (JPEG is limited
-to 65,535 pixels per side), or a format the image cannot be saved in (PNG
-and JPEG hold grey or RGB images only). A refusal for missing or changed
-frames offers **Locate frames…**, after which the export is retried at the
-same path.
+*The Frame pane in its own window. The icon at the top right brings it back.*
 
-## Retouching a result
+Both windows still show the same part of the picture at the same zoom; when
+their shapes differ, the spare space stays black. Drag the second window by
+its title bar, and minimize or maximize it with the buttons at its top
+right.
 
-Once a tab has fused, the **STACKING / EDITOR** switch in the dock lights up
-its **EDITOR** half; switching to it turns the **Composite** pane into a paintable
-result with a brush, a pipette and a rainbow source legend. See
-[`guide/retouch.md`](retouch.md) for the full workflow.
+To bring the pane back, either click the icon at the top right of its pane
+(**Dock pane**) or close the second window with its **x**. The main window shows both panes again.
 
-## Switching between projects
+> **Note:** Only one pane can be in its own window at a time. While one is
+> out, the other pane's undock icon is hidden rather than dimmed.
 
-The projects overlay lists every open project as a card, plus a card for any
-stack that was proposed but never finished — one for a run that failed, was
-cancelled, or whose frames are no longer where the project recorded them.
-Clicking an open card switches to that tab; clicking a failed one offers
-**Run again**, and a card missing its frames offers **Locate frames…**. A
-rail down the side carries the file-level actions — **New project**,
-**Open project…**, **Close project**, **Save project** (enabled only once
-the active tab holds something unsaved) — and a list of recently opened
-projects. Clicking a Recent row opens that project, or switches to its tab if
-it is already open.
-
-The four file actions also have fixed shortcuts that work anywhere in the
-window, not only with the overlay open: Ctrl+N (**New project**), Ctrl+O
-(**Open project…**), Ctrl+S (**Save project**) and Ctrl+W (**Close
-project**). They are not part of the rebindable input map, and they do
-nothing while the settings panel or a close or quit question is open.
-Escape is fixed the same way: it closes a refusal dialog first, otherwise the
-projects overlay, and closes the settings window from any of its tabs.
-
-Closing a tab that holds unsaved checkpoints or strokes asks **Save this
-state first?** and offers **Save and close** or **Close anyway**. Quitting the
-window with unsaved work — including through the window manager, e.g.
-Alt+F4 — asks **Quit without saving?** and offers **Save all and quit** or
-**Quit without saving**. Dismissing either question leaves everything open.
-
-## Notifications
-
-Everything the window has to tell you outside a dialog is kept as a
-notification for the rest of the session: a failed run or save, a processing
-notice such as a held brightness gain, skipped subfolders on an open and a
-notice about crash reports left by an earlier session. Nothing is written to
-disk, so closing the window ends the history.
-
-A bell sits in the icon bar down the left edge, just above the **Settings** icon. Its badge
-counts the notifications you have not read and disappears at zero. Clicking
-the bell opens the **Notifications** center beside the bar; opening it marks
-every notification read, and it stays reachable with no project open and over
-the projects overlay (which it closes first). Each row shows a title, a
-context line with the source, project, file and time; select a row to read
-its full message.
-
-A new notification that arrives while the window is in front also appears as a
-toast: six seconds for most, ten for a crash notice, one at a time with the
-rest queued. Hovering a toast or focusing it from the keyboard pauses its
-timer, and clicking it opens the center on that notification. While the center
-or the projects overlay is open no toast is shown; what arrives meanwhile is
-kept, counted on the badge and never replayed as a toast.
-
-### Banners while the window is in the background
-
-When every FocusForge window is behind other applications, a new notification
-also appears once as a banner from your operating system, carrying only its
-title and a one-line context. The full message and any file paths stay in the
-center, which marks them read when you return to it. Switching between the
-main window and the detached pane does not count as leaving, no banner repeats
-when you come back, and none is shown while the projects overlay is open.
-Dismissing a banner, or the system refusing it, changes nothing in the app: the
-notification stays in the center and on the badge, and a send that fails is
-logged once and not retried.
-
-Banners use the identity `org.focusforge.FocusForge`. On Linux they go through
-the desktop's notification service, which attributes them to FocusForge when
-`assets/focusforge.desktop` is installed as
-`~/.local/share/applications/focusforge.desktop`. Without a running
-notification service there is no banner and everything else works as usual.
-
-## The settings window
-
-The **Settings** icon at the foot of the icon bar opens the settings window,
-which has six tabs:
-
-- **Performance** switches GPU processing on or off, shows the backend the
-  last run resolved, and takes an optional **Host memory cap** and **VRAM
-  cap** in the size syntax of `--max-host-memory` and `--max-vram` (for
-  example `8GiB`). A cap only lowers a budget; the **Host budget** and
-  **VRAM budget** rows show the budgets in effect. A field holding an
-  unparsable size is flagged. A changed VRAM cap applies from the next start.
-- **Appearance** chooses how the **Images** panel presents the source frames:
-  **List**, **Image list** (the default) or **Large previews**. The latter two
-  show a preview of each original source image beside its name. The choice is
-  saved in the `[appearance]` table of `settings.toml`.
-- **Storage** lists where the settings file, the logs, the crash reports and
-  the scratch directory live, and marks one that does not exist yet. **Clear
-  cache** deletes the cached fuse stages.
-- **Input map** lists every stacking and editor action alongside the input
-  bound to it, and where that binding came from: the shipped defaults or the
-  settings file. See [Keyboard and mouse bindings](#keyboard-and-mouse-bindings).
-- **Diagnostics** shows the file list a diagnostics bundle would hold and
-  creates it; see [`guide/diagnostics.md`](diagnostics.md).
-- **About** shows the version, the licence (GPL-3.0), the copyright and
-  warranty notice, and the source repository.
-
-`focusforge-gui --settings-section performance` opens the window on that tab
-at startup. The other accepted sections are `appearance`, `storage`,
-`input-map`, `diagnostics` and `about`.
+On Linux, the second window uses X11 or XWayland when `DISPLAY` is set,
+otherwise native Wayland when `WAYLAND_DISPLAY` is set.
 
 ## Keyboard and mouse bindings
 
-The **Input map** tab is the read-only view of the bindings that took
-effect. They live in the `[input]` table of `settings.toml`,
-edited by hand rather than through the window. A table with any problem is
-refused whole and the defaults apply, with the problem named: an unknown
-trigger or action, a duplicate trigger, or a trigger the map has no row for
-such as `alt+wheel`. Alt is not a wheel modifier; it is only the pipette.
+The canvas responds to these inputs by default:
 
-## The settings file
+| Input | In stacking | In the editor |
+|---|---|---|
+| Scroll wheel | Zoom at the pointer | Zoom at the pointer |
+| Ctrl + scroll wheel | Previous / next frame | Previous / next frame |
+| Shift + scroll wheel | Pan sideways | Brush size |
+| Middle-button drag, or Space + left drag | Pan | Pan |
+| Alt + left click | Select the frame under the pointer | Select the frame under the pointer |
+| Left drag | — | Paint |
+| Ctrl + Z / Ctrl + Shift + Z | — | Undo / redo |
 
-`settings.toml` in the platform's per-user config directory holds
-everything the window remembers, one table per concern: `[recent]` (the
-rail's recent projects, up to five, each row needing its `path`), `[appearance]`
-(`presentation = "list"|"image-list"|"large"`), `[input]`
-(the bindings above), `[export]` (the export dialog's last choice) and
-`[performance]` (`gpu = true|false`, and optional `max-host-memory` and
-`max-vram` size strings, as set on the Performance tab). The
-file has no version. Writing one table leaves the others, and any comments
-in them, as they were; a file that is not valid TOML is left untouched
-rather than overwritten. `--config-dir <DIR>` makes the window read and
-write `<DIR>/focusforge/settings.toml` instead.
+The settings window's **Input map** tab lists the bindings in effect and
+where each came from; you can change them in the settings file. See
+[The settings window](settings-window.md#input-map).
+
+A few keys are fixed and work anywhere in the window:
+
+| Key | Does |
+|---|---|
+| Ctrl + N | New project (asks for a folder) |
+| Ctrl + O | Open a project file |
+| Ctrl + S | Save the project |
+| Ctrl + W | Close the project in the active tab |
+| Escape | Closes the dialog in front, otherwise the projects overview, and closes the settings window |
+| Up / Down | Select the previous / next frame, when the frame list has the keyboard focus (click a row first) |
+
+While the settings window is open, the main window behind it does not react
+to clicks or zoom; close the settings window first.
+
+> **Note:** The window stays responsive while it loads frames, saves or
+> blends a brush stroke. While you pan, zoom or paint, a running fuse briefly
+> slows down so the view stays smooth, and picks up speed again a quarter of
+> a second after you stop.
+
+## Where to find the rest
+
+Earlier versions of this page also described launching, fusing, saving and
+the settings window. Those topics now have chapters of their own:
+
+### Launch options
+
+Opening folders and projects, the empty start page, dropping files and the
+`focusforge-gui` start-up flags: [Your first stack](first-stack.md).
+
+### Fusing a stack
+
+**Fuse stack**, the run's stages, **Pause**, **Cancel**, **Retry** and the
+**Keep** or **Discard** question: [Your first stack](first-stack.md).
+
+### Settings
+
+The dock's **Settings** tab (PREPARE, FUSE, ALIGN, FINISH):
+[Stacking settings](stacking.md) and [Alignment](alignment.md).
+
+### Retouching a result
+
+The editor, the brush and the pipette: [Retouching](retouch.md).
+
+### Saving a project
+
+### Checkpoints
+
+The **CHECKPOINTS** list, **Save project** and the **UNSAVED** chip:
+[Checkpoints and saving](history.md).
+
+### Exporting an image
+
+**Export image** and its dialog: [Exporting an image](export.md).
+
+### Switching between projects
+
+The projects overview, closing a tab and quitting with unsaved work:
+[Projects, notifications and quitting](batch-runs.md).
+
+### Notifications
+
+The bell, the notification center, toasts and desktop banners:
+[Projects, notifications and quitting](batch-runs.md).
+
+### The settings window
+
+### The settings file
+
+Performance, Appearance, Storage, Input map, Diagnostics and About, and the
+`settings.toml` file behind them: [The settings window](settings-window.md).

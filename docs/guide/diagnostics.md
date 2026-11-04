@@ -1,116 +1,204 @@
-# Diagnosing a failed or crashed run
+# Diagnostics and crash reports
 
-Every run of `focusforge-cli` or the GUI keeps a record of what it did, and
-if it crashes, keeps evidence of that too — all of it local to your own
-machine. This page covers reading that record and handing it to someone
-else without also handing over your home directory or your images.
+FocusForge keeps a record of what it does, and if it ever crashes, it keeps
+evidence of that too. All of it stays on your own computer: nothing is sent
+anywhere, ever. When you ask someone for help, for example in a bug report,
+you package that record into one ZIP file, the
+[diagnostics bundle](../glossary.md#diagnostics-bundle), and attach it
+yourself.
 
-## The log
+This page explains what FocusForge keeps, what happens after a crash, and how
+to make a bundle from the **Diagnostics** section of the
+[settings window](settings-window.md). The command-line way to make the same
+bundle is at the end.
 
-Alongside whatever `-v`/`-q` print on stderr, every run appends to a JSON
-Lines log file in the platform's per-user data directory, rotating once it
-reaches 8 MiB and keeping up to five rotated files. See
-[`reference/cli.md`](../reference/cli.md#global-options) for what each entry
-carries and how `-v`/`-q` change stderr's own detail.
+## What FocusForge keeps
 
-## When something crashes
+### The log
 
-A panic — the process catching its own failure and unwinding — writes a
-crash report next to the log: the panic message, a backtrace, and a short
-recording of the most recent log activity leading up to it, so a crash a
-user can't reproduce still comes with context.
+Every session of the window, and every run of `focusforge-cli`, adds to one
+log file, `focusforge.jsonl`, in the `logs` folder of FocusForge's data
+folder. It holds one line per event: every warning and refusal, what a fuse
+did and at which stage, which graphics adapter was used, and why a setting
+fell back to its default. When the file reaches 8 MiB it is renamed to
+`focusforge.1.jsonl` and a new one starts; at most five old files are kept,
+so the log never takes more than about 48 MiB.
 
-A crash the process cannot catch by unwinding — a segfault, a stack
-overflow, an abort — is captured a different way: the process restarts
-itself as a small watcher before doing any work, and if the crash happens,
-that watcher writes a minidump plus a JSON file naming the binary, its
-version, the process id and the signal.
+The data folder depends on your system:
 
-Either way, nothing is sent anywhere. The evidence sits in the data
-directory until you package it yourself.
+| System | Data folder |
+| --- | --- |
+| Linux | `~/.local/share/focusforge` (or `$XDG_DATA_HOME/focusforge`) |
+| macOS | `~/Library/Application Support/focusforge` |
+| Windows | `%APPDATA%\focusforge\data` |
 
-## The crash notice
+The **Storage** section of the settings window shows the exact folders on
+your computer; see [Storage](settings-window.md#storage).
 
-The next time you start `focusforge-cli` after a crash, it prints a one-line
-hint before doing anything else. The hint clears itself once you run
-`focusforge-cli diagnostics` — see
-below — which marks every crash it packages as reported.
+> **Tip:** When the settings window tells you a problem is "named in the
+> log" (a refused key binding, a cap in the settings file that does not
+> parse), search `focusforge.jsonl` for `WARN`. If you start
+> `focusforge-gui` from a terminal, the same warnings also appear there.
 
-The GUI records the same thing as a notification the next time you start it,
-naming how many crashes it found, and shows it as a toast and in the
-notification center (see [Notifications](gui.md#notifications)). Reading the
-notice, letting its toast expire or closing the center does not mark the
-evidence reported, and it stays in the center for the session. Two explicit
-actions on the selected crash notice do: **Acknowledge** marks every listed
-crash reported, and **Diagnostics** acknowledges them and opens
-Settings → Diagnostics. Creating a bundle there also marks that evidence
-reported, so it does not come back at the next start. If the mark cannot be
-written, the notice says so and the evidence stays unreported; if the crash
-folder itself cannot be read, the notice reads "Crash reports unavailable"
-and Diagnostics is still reachable. While the window is in the background the
-notice also arrives as an operating-system banner with the title and a short
-context only.
+### Crash reports
 
-## Packaging a diagnostics bundle
+If FocusForge fails in a way it can catch itself, it writes a crash report
+into the `crashes` folder next to `logs`: the error message, where in the
+program it happened, and a short recording of the most recent log activity,
+so a crash you cannot repeat still comes with context.
+
+A harder crash, one the program cannot catch (a segmentation fault, an
+abort), is recorded differently. Before doing any work, FocusForge starts a
+small watcher process beside itself. If the main process dies, the watcher
+writes a [minidump](../glossary.md#minidump) (a snapshot of the crashed
+program's memory) and a small file naming the program, its version, the
+process number and the signal that ended it.
+
+Either way, the evidence stays in the `crashes` folder until you package it.
+
+## After a crash
+
+The next time you start the window after a crash, FocusForge tells you once,
+as the notification **Previous session stopped**, for example "A previous
+session stopped unexpectedly. One crash report was detected at startup." It
+appears as a toast and stays in the notification center for the session.
+How the notification center works, and the notice's two actions, is in
+[Notifications](batch-runs.md#notifications). In short:
+
+- **Acknowledge** marks the listed crashes as reported, so the notice does
+  not come back.
+- **Diagnostics** does the same and opens the settings window on the
+  **Diagnostics** section, ready to make a bundle.
+- Reading the notice, letting its toast expire or closing the notification
+  center does not mark anything: the notice comes back at the next start.
+
+Creating a bundle also marks every crash it packaged as reported. If the
+crash folder cannot be read, the notice reads **Crash reports unavailable**
+instead; you can still make a bundle.
+
+`focusforge-cli` prints a one-line reminder before doing anything else
+instead, for example:
+
+```
+1 earlier run crashed -- run focusforge-cli diagnostics to package the evidence
+```
+
+## Make a diagnostics bundle
+
+1. Click **Settings** (the gear at the bottom of the icon bar on the left
+   edge of the window), then **Diagnostics**. Or start FocusForge with
+   `focusforge-gui --settings-section diagnostics`.
+2. Wait until the file list has filled in (see below).
+3. Leave **Include minidumps** off unless someone asks for minidumps.
+4. Check the **Save to** path, or type another one.
+5. Click **Create bundle**.
+6. Attach the ZIP file to your bug report or e-mail.
+
+![The Diagnostics section of the settings window, with the file list showing configuration.json, system.json, version.json and logs/focusforge.jsonl with their sizes, the Include minidumps switch off, a Save to path ending in a dated focusforge-diagnostics ZIP name, and the Create bundle button](../assets/manual/settings-window/settings-diagnostics.png)
+
+*The Diagnostics section once the file list has been gathered.*
+
+### Read the file list
+
+The list at the top shows exactly the files the bundle will hold, each with
+its size: in whole kilobytes below a megabyte (so a small file reads
+"0 KB"), with one decimal above. The list scrolls inside its box when it
+holds more rows than fit.
+
+FocusForge gathers the list in the background, so the section opens at once
+showing "Collecting…" and fills in a moment later. **Create bundle** stays
+unavailable until the list is complete; the switch and the **Save to** field
+can be used meanwhile.
+
+| Entry | What it holds |
+| --- | --- |
+| `adapter.json` | the graphics adapter FocusForge last selected and its limits, read from the log |
+| `configuration.json` | the settings a new run would use right now, and where each value came from |
+| `system.json` | the operating system, processor cores and memory figures |
+| `version.json` | the FocusForge version and build, the creation time, and any files left out |
+| `logs/…` | `focusforge.jsonl` and its older rotated files |
+| `crashes/…` | the crash reports and crash records, if there are any |
+
+If FocusForge finds neither a log nor a crash report, the list says "No logs
+or crash evidence were found." The four generated entries are still
+included.
+
+### Include minidumps
+
+Minidumps are left out by default, because they cannot be cleaned of
+personal information (see [What the bundle leaves out](#what-the-bundle-leaves-out)).
+Switch **Include minidumps** on only when the person helping you asks for
+them. FocusForge then gathers the list again, adds every minidump in the
+crash folder, and marks each one "· not redacted" after its size. A warning
+appears under the switch: "Not redacted — binary memory contents. Marked in
+the list above."
+
+![The Diagnostics section with Include minidumps switched on: the file list ends with a crash record and a .dmp file whose size is followed by "· not redacted", and the amber warning "Not redacted — binary memory contents. Marked in the list above." under the switch](../assets/manual/settings-window/settings-minidumps.png)
+
+*With **Include minidumps** on, every minidump is marked "not redacted".*
+
+### Choose where to save
+
+**Save to** proposes a new file named after the current date and time, such
+as `focusforge-diagnostics-20261104T093015Z.zip`, in a `diagnostics` folder
+inside the data folder. The field is narrower than the path; click into it
+and press End to see the file name. You can type any other path, for example
+one on your desktop. FocusForge creates missing folders when it writes.
+
+### Create the bundle
+
+Click **Create bundle**. The button reads **Writing…** and a progress bar
+runs while the file is written in the background; the window stays usable.
+Then the line under **Save to** says what happened:
+
+- "Bundle created successfully." — the ZIP is at the path shown. FocusForge
+  already proposes a new dated name for the next bundle, so clicking
+  **Create bundle** again never overwrites the one you just made.
+- "Could not write the bundle. Nothing was written." — the path could not be
+  written (a folder you may not write to, a full disk, a path without a file
+  name). Nothing is left behind; choose another path and try again.
+
+If the path you typed already exists, FocusForge says so before writing
+anything: the field turns amber, the line reads "This file already exists.
+Creating the bundle will overwrite it." and the button becomes **Overwrite
+and create**. Click it to replace the file, or change the path to keep the
+old one.
+
+![The Diagnostics section with an amber Save to field naming focusforge-diagnostics-support.zip, the amber line "This file already exists. Creating the bundle will overwrite it." and the button Overwrite and create](../assets/manual/settings-window/settings-bundle-overwrite.png)
+
+*A path that already exists: the button changes to **Overwrite and create**.*
+
+> **Note:** If you typed a path of your own, the field keeps showing it after
+> the bundle is written, but the next bundle goes to the newly proposed dated
+> name in the data folder. Type your path again if you want the next bundle
+> there.
+
+## What the bundle leaves out
+
+FocusForge builds the bundle from a fixed list: the log files, the crash
+folder's reports and, only when you ask, its minidumps, plus the four
+generated entries. Nothing else from the data folder goes in, and no image
+data is ever included, whatever else lies in those folders.
+
+Every text entry is cleaned on the way in: your home folder's path is
+replaced by `[home]` and your user name by `[user]`, wherever they occur.
+
+A minidump is binary memory from the crashed program. It can hold file and
+module paths, and fragments of whatever the program was handling, so it
+cannot be cleaned that way. That is why it is off by default and marked
+"not redacted" when you include it.
+
+## From the command line
+
+`focusforge-cli diagnostics` makes the same bundle without the window:
 
 ```
 focusforge-cli diagnostics [-o out.zip] [--include-minidumps] [--force]
 ```
 
-Collects the log files, any crash reports, a system summary, the graphics
-adapter record, the configuration a new run would resolve right now (with
-where each value came from), and the version and commit into one ZIP. It
-prints its planned contents before writing it.
-
-Every text entry has your home directory path and user name stripped out;
-no image data is ever included. Minidumps are left out by default — pass
-`--include-minidumps` to add them, and each one is marked unredacted in the
-listing, since a minidump holds module paths and raw stack memory from the
-crashed process. `-o` names the output path (default: a dated ZIP in the
-current directory), and `--force` overwrites a path that already exists.
-
-### From the window
-
-Settings → Diagnostics shows the same file list `focusforge-cli diagnostics`
-prints for your data directory, each row's size in kilobytes below a
-megabyte and one decimal above. The list gathers that in the background, so
-it opens showing "Collecting…" rather than blocking the window, and the
-export button stays unavailable until it finishes; the minidump toggle and
-destination field stay editable throughout. "Include minidumps" is off by
-default; switch it on to add them to the bundle -- doing so re-gathers the
-list, since which files it would collect just changed -- and every minidump
-row is marked not redacted in the list, with a warning line explaining why.
-
-The destination field defaults to a dated ZIP beside your logs, and is
-editable. Creating the bundle checks the path first: a destination that
-already exists asks you to overwrite it before writing anything, and a
-destination that cannot be created (a bad path, a full disk) reports the
-failure with nothing left behind. The write runs in the background, so the
-window stays responsive while it does. A finished bundle can be exported
-again immediately — a fresh destination is filled in automatically, so
-there is no extra step between one export and the next.
-
-## Profiling the window
-
-The GUI can write a Chrome-trace file of its own activity: input, redraws,
-canvas publication, saves and stroke renders. Build it with the `trace`
-feature and name the output file:
-
-```
-cargo build --release -p focusforge-gui --features trace
-FOCUSFORGE_TRACE_FILE=gui-trace.json target/release/focusforge-gui
-```
-
-Open the file in `ui.perfetto.dev` or `chrome://tracing`. Window spans draw
-on their own admission budget, so a long session cannot starve the
-processing spans of a fuse running in the same process. When the run ends,
-a `timing_summary` span records each budget, how many spans it admitted and
-how many it refused.
-
-To see Slint's own frame timing as well, set
-`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment. Slint
-collects and prints refresh statistics when a frame is rendered; `refresh_lazy`
-does not force frames while the window is idle.
-
-`focusforge-cli` takes the same feature and variable; see the repository's
-`CONTRIBUTING.md` for the command.
+It prints the planned file list first, then writes the ZIP: by default a
+dated `focusforge-diagnostics-….zip` in the current folder, or the path given
+with `-o`. `--include-minidumps` adds the minidumps with a warning. A path
+that already exists is refused unless you add `--force`. Like the window, it
+marks the crashes it packaged as reported. All flags are in the
+[command-line reference](../reference/cli.md#diagnostics).

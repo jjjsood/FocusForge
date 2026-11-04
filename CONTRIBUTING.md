@@ -195,10 +195,27 @@ attaches: start the binary, then connect Tracy from the same machine — the
 client listens on localhost and announces itself nowhere. Stage and tile
 zones appear live, named by their fields.
 
-`focusforge-gui` takes the same feature and reads the same variable; its
-`gui_`-prefixed spans draw on their own admission budget, apart from the
-processing spans, and the closing `timing_summary` span reports both. Add
-`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` to see Slint's frame timing.
+### Profiling the window
+
+`focusforge-gui` takes the same feature and reads the same variable. Its
+trace covers the window's own activity — input, redraws, canvas
+publication, saves and stroke renders — beside the processing spans of any
+fuse run in the same session:
+
+```
+cargo build --release -p focusforge-gui --features trace
+FOCUSFORGE_TRACE_FILE=gui-trace.json target/release/focusforge-gui
+```
+
+The window's `gui_`-prefixed spans draw on their own admission budget, so a
+long session cannot starve the processing spans of a fuse running in the
+same process. The closing `timing_summary` span records each budget, how
+many spans it admitted and how many it refused.
+
+To see Slint's own frame timing as well, set
+`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment.
+Slint collects and prints refresh statistics when a frame is rendered;
+`refresh_lazy` does not force frames while the window is idle.
 
 ## Before you send a change
 
