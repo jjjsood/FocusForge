@@ -62,17 +62,23 @@ impl Rig {
         slint::platform::update_timers_and_animations();
     }
 
-    /// Pushes the controller's calculator state to the window, as the
-    /// bridge does on the event loop this headless window does not run.
+    /// Pushes the controller's overlay state to the window, as the bridge
+    /// does on the event loop this headless window does not run.
     fn pump(&self) {
-        focusforge_gui::bridge::push_calculator(&self.app, &self.controller.lock().unwrap());
+        focusforge_gui::bridge::push_projects(&self.app, &self.controller);
+        focusforge_gui::bridge::push_overlays(&self.app, &self.controller);
         slint::platform::update_timers_and_animations();
     }
 
     fn click(&self, handle: &ElementHandle) {
         let (pos, size) = (handle.absolute_position(), handle.size());
-        let position =
-            slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0);
+        self.click_at(slint::LogicalPosition::new(
+            pos.x + size.width / 2.0,
+            pos.y + size.height / 2.0,
+        ));
+    }
+
+    fn click_at(&self, position: slint::LogicalPosition) {
         self.event(WindowEvent::PointerMoved { position });
         self.event(WindowEvent::PointerPressed {
             position,
@@ -484,5 +490,163 @@ fn calculator_has_no_apply_action() {
                 "unexpected {label:?}"
             );
         }
+    }
+}
+
+/// A window over two stacks, the second tab active.
+fn two_stack_rig(name: &str) -> Rig {
+    let mut controller = common::controller_with_two_stacks(name);
+    controller.set_analytics_hold(std::time::Duration::from_secs(30));
+    let rig = rig_with(controller);
+    rig.pump();
+    rig
+}
+
+/// The calculator's first entry box.
+fn first_entry_box(rig: &Rig) -> ElementHandle {
+    let (ox, oy, ow, oh) = rect(&rig.app, "AppWindow::calculator-overlay");
+    let mut boxes: Vec<_> = ElementQuery::from_root(&rig.app)
+        .match_id("FFField::input")
+        .find_all()
+        .into_iter()
+        .filter(|b| {
+            let p = b.absolute_position();
+            p.x >= ox && p.y >= oy && p.x < ox + ow && p.y < oy + oh && b.size().width > 0.0
+        })
+        .collect();
+    boxes.sort_by(|a, b| {
+        let (a, b) = (a.absolute_position(), b.absolute_position());
+        (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap()
+    });
+    boxes.remove(0)
+}
+
+#[test]
+fn escape_closes_after_a_tab_click() {
+    for bell_first in [false, true] {
+        for tab in 0..2 {
+            let at = format!("tab {tab}, notifications first: {bell_first}");
+            let rig = two_stack_rig("calculator_escape_tab");
+            if bell_first {
+                rig.click(&rig.button("Notifications"));
+                assert!(rig.app.get_notification_center_open(), "{at}: center opens");
+            }
+            rig.click(&rig.button("Step calculator"));
+            assert!(rig.open() && rig.app.get_calculator_open(), "{at}: opens");
+            assert!(
+                !rig.app.get_notification_center_open(),
+                "{at}: center closed"
+            );
+
+            rig.click(&common::tab(&rig.app, tab));
+            assert!(rig.open(), "{at}: a tab click keeps it open");
+            rig.escape();
+            assert!(!rig.open(), "{at}: Escape closes it");
+            assert!(!rig.app.get_calculator_open(), "{at}: button plain");
+        }
+    }
+
+    // Focus inside an entry box: the overlay's own scope hears Escape.
+    let rig = two_stack_rig("calculator_escape_entry");
+    rig.click(&rig.button("Step calculator"));
+    rig.click(&first_entry_box(&rig));
+    rig.escape();
+    assert!(!rig.open(), "Escape in an entry box closes the calculator");
+
+    // The calculator closed with focus left in the hidden box.
+    let rig = two_stack_rig("calculator_escape_entry_analytics");
+    rig.click(&rig.button("Step calculator"));
+    rig.click(&first_entry_box(&rig));
+    rig.click(&rig.button("Analytics"));
+    assert!(rig.controller.lock().unwrap().analytics_open());
+    assert!(!rig.open());
+    rig.escape();
+    assert!(
+        !rig.controller.lock().unwrap().analytics_open(),
+        "Escape closes Analytics opened from an entry box"
+    );
+
+    // Nothing open: nothing changes.
+    let rig = two_stack_rig("calculator_escape_nothing");
+    rig.click(&common::tab(&rig.app, 0));
+    rig.escape();
+    assert!(!rig.open() && !rig.controller.lock().unwrap().analytics_open());
+    assert!(!rig.app.get_calculator_open() && !rig.app.get_analytics_open());
+
+    // A dialog up after a tab click is dismissed first; the overlay stays.
+    let rig = two_stack_rig("calculator_escape_dialog");
+    rig.click(&rig.button("Step calculator"));
+    rig.click(&common::tab(&rig.app, 0));
+    // Set after the last pump: a pump resets the flag to the controller's.
+    rig.app.set_divergence_open(true);
+    rig.escape();
+    assert!(rig.open(), "the dialog takes the key, the calculator stays");
+    rig.app.set_divergence_open(false);
+    rig.pump();
+    rig.escape();
+    assert!(
+        !rig.open(),
+        "Escape reaches the calculator once the dialog is gone"
+    );
+}
+
+#[test]
+fn escape_closes_after_a_plus_click() {
+    for bell_first in [false, true] {
+        let at = format!("notifications first: {bell_first}");
+        let rig = two_stack_rig("calculator_escape_plus");
+        if bell_first {
+            rig.click(&rig.button("Notifications"));
+            assert!(rig.app.get_notification_center_open(), "{at}: center opens");
+            rig.click(&rig.button("Step calculator")); // opens, closes the center
+            rig.click(&rig.button("Step calculator")); // closes
+            assert!(!rig.open(), "{at}: calculator closed again");
+        }
+        rig.click(&common::plus_button(&rig.app));
+        rig.click(&rig.button("Step calculator"));
+        assert!(rig.open() && rig.app.get_calculator_open(), "{at}: opens");
+        rig.escape();
+        assert!(!rig.open(), "{at}: Escape closes it");
+        assert!(!rig.app.get_calculator_open(), "{at}: button plain");
+    }
+}
+
+#[test]
+fn tab_and_plus_clicks_start_no_window_move() {
+    use focusforge_gui::WindowTarget;
+
+    for width in [1440, 1200] {
+        let rig = two_stack_rig("calculator_no_window_move");
+        rig.app
+            .window()
+            .set_size(slint::PhysicalSize::new(width, 900));
+        rig.pump();
+        let calls: Arc<Mutex<Vec<WindowTarget>>> = Arc::new(Mutex::new(Vec::new()));
+        let hook = calls.clone();
+        rig.controller
+            .lock()
+            .unwrap()
+            .set_native_drag(Arc::new(move |target| hook.lock().unwrap().push(target)));
+
+        rig.click(&common::tab(&rig.app, 0));
+        rig.click(&common::tab(&rig.app, 1));
+        rig.click(&common::plus_button(&rig.app));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "width {width}: a tab or plus click moves no window"
+        );
+
+        // The bare strip between the plus box and the window controls.
+        let (x, y, w, h) = rect(&rig.app, "FFTabStrip::plus-button");
+        let (glyphs_x, ..) = rect(&rig.app, "FFTabStrip::window-glyphs");
+        rig.click_at(slint::LogicalPosition::new(
+            (x + w + glyphs_x) / 2.0,
+            y + h / 2.0,
+        ));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![WindowTarget::Main],
+            "width {width}: a left press on bare strip starts the move"
+        );
     }
 }

@@ -84,3 +84,5 @@ A typed value replaces the old one only after the old text is cleared: click the
     Expect: the canvas and the bottom bar read "No project open".
 34. Click **Step calculator** (`AppWindow::icon-bar`).
     Expect: the overlay titled "Step calculator" is open over the empty window and the calculator button is drawn selected; the Optics switch shows LENS (F-STOP) and OBJECTIVE (NA).
+35. Press Escape.
+    Expect: the overlay is gone and the calculator button is drawn plain.

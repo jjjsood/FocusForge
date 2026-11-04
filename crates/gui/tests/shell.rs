@@ -3371,7 +3371,7 @@ mod notification {
     }
 
     #[test]
-    fn center_keys_select_expand_and_escape_returns_focus_to_the_bell() {
+    fn center_keys_select_expand_and_escape_hands_focus_to_the_canvas() {
         let rig = rig(controller_with_refusals("shell_center_keys", 2), 1440, 900);
         let ids = rig.ids();
         let (x, y) = Rig::bell(900.0);
@@ -3399,8 +3399,8 @@ mod notification {
 
         rig.key(Key::Return);
         assert!(
-            rig.center_open(),
-            "focus is on the bell, so Return opens the center again"
+            !rig.center_open(),
+            "focus is on the canvas, so Return does not open the center again"
         );
     }
 

@@ -321,6 +321,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("appearance_tab.slint"), "dismissed")
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "changed dialog-open")
+            | (Some("app.slint"), "changed notification-center-open")
+            | (Some("app.slint"), "changed calculator-open")
             | (Some("app.slint"), "close-requested")
             | (Some("app.slint"), "key-pressed(event)")
             | (Some("app.slint"), "link-activated")

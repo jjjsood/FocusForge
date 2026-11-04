@@ -161,6 +161,47 @@ pub fn controller_with_frames(name: &str, count: usize) -> AppController {
     controller
 }
 
+/// `controller_with_frames` plus a second unsaved project of two frames, so
+/// the window has two tabs and the second one is active.
+#[allow(dead_code)]
+pub fn controller_with_two_stacks(name: &str) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    let second = tree(&format!("{name}_second_frames"));
+    for i in 0..2 {
+        copy_frame(&second, &format!("s{i}.tif"), i + 4);
+    }
+    assert!(matches!(
+        open_and_settle(&mut controller, &[second]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+/// The project tab at `index`, found by role and its `tab-<index>` label.
+#[allow(dead_code)]
+pub fn tab(
+    app: &focusforge_gui::AppWindow,
+    index: usize,
+) -> i_slint_backend_testing::ElementHandle {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    let label = format!("tab-{index}");
+    ElementQuery::from_root(app)
+        .match_accessible_role(AccessibleRole::Tab)
+        .find_all()
+        .into_iter()
+        .find(|t| t.accessible_label().as_deref() == Some(label.as_str()))
+        .unwrap_or_else(|| panic!("no tab labelled {label:?}"))
+}
+
+/// The "+" box at the end of the tab strip.
+#[allow(dead_code)]
+pub fn plus_button(app: &focusforge_gui::AppWindow) -> i_slint_backend_testing::ElementHandle {
+    i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFTabStrip::plus-button")
+        .find_first()
+        .expect("the tab strip has a plus button")
+}
+
 /// Polls `settle_job` until it returns or no work is pending any more,
 /// returning the materialized plane paths from the call that actually
 /// settled it (if any). Tracks the worker/queue directly, not the active

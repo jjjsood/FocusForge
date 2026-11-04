@@ -75,6 +75,7 @@ impl Rig {
     /// Pushes the controller's overlay state to the window, as the bridge
     /// does on the event loop this headless window does not run.
     fn pump(&self) {
+        focusforge_gui::bridge::push_projects(&self.app, &self.controller);
         focusforge_gui::bridge::push_overlays(&self.app, &self.controller);
         slint::platform::update_timers_and_animations();
     }
@@ -574,4 +575,33 @@ fn long_stack_lists_every_row() {
     let model = rig.app.get_analytics_rows();
     assert_eq!(model.row_count(), 61);
     assert_eq!(model.row_data(60).unwrap().name, "60.tif");
+}
+
+#[test]
+fn escape_closes_after_a_tab_click() {
+    for bell_first in [false, true] {
+        for tab in 0..2 {
+            let at = format!("tab {tab}, notifications first: {bell_first}");
+            let mut controller = common::controller_with_two_stacks("analytics_escape_tab");
+            controller.set_analytics_hold(Duration::from_secs(30));
+            let rig = rig_with(controller);
+            rig.pump();
+            if bell_first {
+                rig.click(&rig.button("Notifications"));
+                assert!(rig.app.get_notification_center_open(), "{at}: center opens");
+            }
+            rig.click(&rig.button("Analytics"));
+            assert!(rig.open() && rig.app.get_analytics_open(), "{at}: opens");
+            assert!(
+                !rig.app.get_notification_center_open(),
+                "{at}: center closed"
+            );
+
+            rig.click(&common::tab(&rig.app, tab));
+            assert!(rig.open(), "{at}: a tab click keeps it open");
+            rig.escape();
+            assert!(!rig.open(), "{at}: Escape closes it");
+            assert!(!rig.app.get_analytics_open(), "{at}: button plain");
+        }
+    }
 }

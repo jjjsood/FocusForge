@@ -819,10 +819,7 @@ export component AppWindow inherits Window {
         diagnostics-requested(id) => { root.notification-diagnostics-requested(id); }
         selection-moved(delta) => { root.notification-selection-moved(delta); }
         expansion-toggled => { root.notification-expansion-toggled(); }
-        close-requested => {
-            root.notification-center-close-requested();
-            icon-bar.focus-bell();
-        }
+        close-requested => { root.notification-center-close-requested(); }
     }
 
     settings-modal := FFSettingsModal {
@@ -991,6 +988,27 @@ export component AppWindow inherits Window {
             settings-modal.focus();
         } else {
             canvas-ground.focus();
+        }
+    }
+
+    // A closing notification center or calculator may hold keyboard focus
+    // (the center's key scope, an entry box); the canvas takes it back so
+    // Escape reaches `chrome_key`, unless a dialog or Settings owns it.
+    function return-focus-to-canvas() {
+        if !root.dialog-open && !root.settings-open {
+            canvas-ground.focus();
+        }
+    }
+
+    changed notification-center-open => {
+        if !root.notification-center-open {
+            root.return-focus-to-canvas();
+        }
+    }
+
+    changed calculator-open => {
+        if !root.calculator-open {
+            root.return-focus-to-canvas();
         }
     }
 
