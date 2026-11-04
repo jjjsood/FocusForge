@@ -8,6 +8,7 @@ mod common;
 
 use common::align::{open_fixture, resolved_defaults};
 
+use focusforge_core::algorithm::AlignStatus;
 use focusforge_core::align::{
     FailurePolicy, KERNEL_RADIUS, PyramidalEcc, Transform, align_stack, auto_crop,
 };
@@ -139,6 +140,34 @@ fn crop_under_strict_failure_policy_stays_inside_every_footprint() {
         FailurePolicy::Strict,
     )
     .expect("real fixture frames register");
+
+    assert_eq!(alignment.reference, 3, "middle of 8 frames is (8-1)/2 = 3");
+    assert_eq!(alignment.frames.len(), 8);
+    let reference_frame = &alignment.frames[3];
+    assert_eq!(reference_frame.transform, Transform::identity());
+    assert_eq!(
+        reference_frame.iterations, 0,
+        "the reference short-circuit reads no pixel"
+    );
+    // Frame 0 fails the off-centre validation; Strict reports it as it is
+    // instead of substituting a match.
+    assert!(
+        matches!(alignment.frames[0].status, AlignStatus::Diverged(_)),
+        "frame 0's own divergence must still be reported, not silently substituted: {:?}",
+        alignment.frames[0]
+    );
+    for frame in alignment
+        .frames
+        .iter()
+        .filter(|f| f.frame != 0 && f.frame != 3)
+    {
+        assert_ne!(
+            frame.transform,
+            Transform::identity(),
+            "frame {} must not report identity against a different reference: {frame:?}",
+            frame.frame
+        );
+    }
 
     let rect = auto_crop(&alignment, (width, height))
         .expect("every transform this driver produces is affine");

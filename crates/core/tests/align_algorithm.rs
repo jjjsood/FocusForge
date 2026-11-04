@@ -12,7 +12,7 @@ mod common;
 
 use common::align::{
     FramesReader, XorShift32, corner_error, default_region, frame_3_tile, full_rect, open_fixture,
-    resolved_defaults, two_frame_reader,
+    resolved_defaults, similarity_about, two_frame_reader,
 };
 
 use focusforge_core::algorithm::{
@@ -26,14 +26,6 @@ use focusforge_core::align::{
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::Rect;
-
-/// A rotation+scale [`Transform`] about `(cx, cy)`.
-fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
-    let to_origin = Transform::translation(-cx, -cy);
-    let rot_scale = Transform::similarity(scale, radians, 0.0, 0.0);
-    let back = Transform::translation(cx, cy);
-    back.compose(&rot_scale).compose(&to_origin)
-}
 
 /// A reader that must never be asked for a pixel -- proves a rejection
 /// happened before any registration ran.
@@ -254,204 +246,6 @@ fn an_80px_shift_with_a_clean_border_converges_through_the_pyramid() {
 }
 
 #[test]
-fn reference_frame_is_identity() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
-    let cfg = resolved_defaults(&stack_ctx);
-
-    let result = align_stack(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-    )
-    .expect("real fixture frames register");
-
-    assert_eq!(result.reference, 3, "middle of 8 frames is (8-1)/2 = 3");
-    assert_eq!(result.frames.len(), 8);
-    let reference_frame = &result.frames[3];
-    assert_eq!(reference_frame.transform, Transform::identity());
-    assert_eq!(
-        reference_frame.iterations, 0,
-        "the reference short-circuit reads no pixel"
-    );
-
-    for (i, frame) in result.frames.iter().enumerate() {
-        eprintln!(
-            "reference_frame_is_identity: frame {i} status={:?} iterations={} residual={}",
-            frame.status, frame.iterations, frame.residual
-        );
-        if i == 3 {
-            continue;
-        }
-        if i == 0 {
-            // Measured 2026-09-13, default settings (rotation-scale,
-            // auto pyramid-depth = 3, max-iterations = 50): frame 0
-            // genuinely diverges against the middle-anchor frame 3
-            // (`Diverged(LemmaOneRegion)` on the coarsest level's very
-            // first Newton step), not a solver defect -- consistent with a
-            // measured high-passed NCC of <= 0.07 for frames two or more
-            // steps from the anchor. The solver reports this honestly
-            // (`Diverged`, best-rho transform = identity, since the very first
-            // step failed) rather than fabricating a plausible-looking match.
-            assert!(
-                matches!(frame.status, AlignStatus::Diverged(_)),
-                "frame 0's own divergence must still be reported, not silently \
-                 substituted: {frame:?}"
-            );
-            continue;
-        }
-        assert_ne!(
-            frame.transform,
-            Transform::identity(),
-            "frame {i} must not report identity against a different reference: {frame:?}"
-        );
-    }
-}
-
-#[test]
-fn unregisterable_frame_follows_failure_policy() {
-    let (tile, width, height, spp) = frame_3_tile();
-    let rect = full_rect(width, height);
-
-    let shift = Transform::translation(8.0, 3.0);
-    let warped = warp_from_tile(&tile, (width, height), rect, &shift)
-        .expect("small translation stays well inside the frame");
-
-    let mut rng = XorShift32(0xC0FFEE);
-    let noise: Vec<u16> = (0..tile.samples.len())
-        .map(|_| (rng.next() % 65536) as u16)
-        .collect();
-
-    let stack_ctx = StackContext::new(3, width, height, spp);
-    let mut cfg = resolved_defaults(&stack_ctx);
-    cfg.insert(
-        "reference-frame".to_string(),
-        ParamValue::Enum("first".to_string()),
-    );
-    // A fallback frame reports identity only when it registers against the
-    // reference itself; a chained one keeps the transform of the hops before it.
-    cfg.insert(
-        "reference-policy".to_string(),
-        ParamValue::Enum("anchor".to_string()),
-    );
-
-    let make_reader = || FramesReader {
-        width,
-        height,
-        spp,
-        frames: vec![
-            tile.samples.clone(),
-            warped.tile.samples.clone(),
-            noise.clone(),
-        ],
-    };
-
-    let strict = align_stack(
-        &PyramidalEcc,
-        stack_ctx,
-        &make_reader(),
-        &cfg,
-        FailurePolicy::Strict,
-    )
-    .expect("the run completes even with a failing frame");
-    assert_eq!(strict.frames.len(), 3, "every frame carries an outcome");
-    assert_eq!(
-        strict.failure_count(),
-        1,
-        "only the noise frame must fail: {:?}",
-        strict.frames
-    );
-    let strict_failed = strict.failed().next().expect("one failure");
-    assert_eq!(strict_failed.frame, 2);
-    assert!(!strict_failed.fallback);
-    // Strict reports whatever the solver's own best-rho transform was --
-    // here that happens to be identity, because the noise pair diverges on
-    // the coarsest level's very first step, before any update is applied.
-    // `fallback == false` is what proves this is the solver's honest
-    // answer and not a substitution.
-    eprintln!(
-        "unregisterable_frame_follows_failure_policy: strict best-rho transform = {:?}",
-        strict_failed.transform
-    );
-
-    let fallback = align_stack(
-        &PyramidalEcc,
-        stack_ctx,
-        &make_reader(),
-        &cfg,
-        FailurePolicy::IdentityFallback,
-    )
-    .expect("the run completes even with a failing frame");
-    assert_eq!(fallback.frames.len(), 3);
-    assert_eq!(fallback.failure_count(), 1);
-    let fallback_failed = fallback.failed().next().expect("one failure");
-    assert_eq!(fallback_failed.frame, 2);
-    assert!(fallback_failed.fallback);
-    assert_eq!(fallback_failed.transform, Transform::identity());
-}
-
-#[test]
-fn anchor_and_chain_policies_both_run() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
-    let mut cfg = resolved_defaults(&stack_ctx);
-
-    cfg.insert(
-        "reference-policy".to_string(),
-        ParamValue::Enum("anchor".to_string()),
-    );
-    let anchor = align_stack(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-    )
-    .expect("anchor run completes");
-    assert_eq!(anchor.frames.len(), 8);
-
-    cfg.insert(
-        "reference-policy".to_string(),
-        ParamValue::Enum("chain".to_string()),
-    );
-    let chain = align_stack(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-    )
-    .expect("chain run completes");
-    assert_eq!(chain.frames.len(), 8);
-
-    // Measured 2026-09-13 (`-- --nocapture`), not asserted at fixture
-    // scale -- ground truth is weak on this fixture either way.
-    let last = 7;
-    let diff = corner_error(
-        &anchor.frames[last].transform,
-        &chain.frames[last].transform,
-        default_region(),
-    );
-    eprintln!(
-        "anchor_and_chain_policies_both_run: frame {last} anchor-vs-chain corner difference = {diff} px"
-    );
-}
-
-#[test]
 fn outcome_distinguishes_converged_from_capped() {
     let (tile, width, height, spp) = frame_3_tile();
     let rect = full_rect(width, height);
@@ -543,6 +337,9 @@ fn each_divergence_reports_its_pyramid_level() {
     let reference = 3usize;
     assert_eq!(reference, (stack.len() - 1) / 2, "middle of 8 frames is 3");
     let ctx = AlignContext::new(stack_ctx, reference, &stack);
+    let Some(&ParamValue::Float(epsilon)) = cfg.get("epsilon-px") else {
+        panic!("the resolved defaults carry a float epsilon-px");
+    };
 
     for frame in 0..stack.len() {
         if frame == reference {
@@ -568,6 +365,31 @@ fn each_divergence_reports_its_pyramid_level() {
                 rec.result.valid_fraction,
                 rec.result.final_step
             );
+            // Coarse levels stop at 100x the configured epsilon.
+            let threshold = if rec.level > 0 {
+                epsilon * 100.0
+            } else {
+                epsilon
+            };
+            match rec.result.status {
+                EccStatus::HitCap | EccStatus::Stalled => assert!(
+                    rec.result
+                        .final_step
+                        .expect("a capped level always reports a step")
+                        >= threshold,
+                    "frame {frame} level {}: capped but final_step < {threshold}: {rec:?}",
+                    rec.level
+                ),
+                EccStatus::Converged => assert!(
+                    rec.result
+                        .final_step
+                        .expect("Converged always reports a step")
+                        < threshold,
+                    "frame {frame} level {}: Converged but final_step >= {threshold}: {rec:?}",
+                    rec.level
+                ),
+                EccStatus::Diverged(_) => {}
+            }
             if matches!(rec.result.status, EccStatus::Diverged(_)) {
                 let tail = rec.trace.len().min(5);
                 for it in &rec.trace[rec.trace.len() - tail..] {

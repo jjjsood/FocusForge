@@ -15,18 +15,49 @@
 mod common;
 
 use common::align::{
-    FramesReader, XorShift32, frame_3_tile, full_rect, lowered_max_iterations, open_fixture,
+    CountingReader, ESCALATION_READS, FramesReader, PATCH_COUNT, XorShift32, frame_3_tile,
+    lowered_max_iterations, open_fixture, reference_reads, streamed_band_reads, uncached_outcomes,
 };
 
+use focusforge_core::algorithm::AlignOutcome;
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
-    AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
+    AlignDriverOptions, FailurePolicy, FrameAlignment, PyramidalEcc, Transform, align_stack_with,
 };
 use focusforge_core::params::{ParamValue, StackContext};
-use focusforge_core::tile::HostBudget;
+use focusforge_core::tile::{HostBudget, Rect};
 
+fn assert_frames_match_outcomes(frames: &[FrameAlignment], outcomes: &[AlignOutcome]) {
+    assert_eq!(frames.len(), outcomes.len());
+    for (frame, outcome) in frames.iter().zip(outcomes) {
+        assert_eq!(
+            frame.transform, outcome.transform,
+            "frame {}: transform must be byte-identical to the uncached loop",
+            frame.frame
+        );
+        assert_eq!(
+            frame.status, outcome.status,
+            "frame {}: status must match the uncached loop",
+            frame.frame
+        );
+        assert_eq!(
+            frame.iterations, outcome.iterations,
+            "frame {}: iterations must match the uncached loop",
+            frame.frame
+        );
+        assert_eq!(
+            frame.residual, outcome.residual,
+            "frame {}: residual must match the uncached loop",
+            frame.frame
+        );
+    }
+}
+
+/// One serial run through a counting reader, two parallel runs and an uncached
+/// per-frame loop over the same anchored input agree bit for bit; the cached
+/// reference frame is read once however many registrations use it.
 #[test]
-fn parallel_anchor_matches_serial_transforms() {
+fn anchored_runs_match_serial_parallel_and_uncached() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
     let stack_ctx = StackContext::new(
@@ -36,11 +67,12 @@ fn parallel_anchor_matches_serial_transforms() {
         stack.header(0).samples_per_pixel,
     );
     let cfg = lowered_max_iterations(&stack_ctx);
+    let reader = CountingReader::new(&stack, stack_ctx.frame_count);
 
     let serial = align_stack_with(
         &PyramidalEcc,
         stack_ctx,
-        &stack,
+        &reader,
         &cfg,
         FailurePolicy::Strict,
         &AlignDriverOptions {
@@ -52,67 +84,59 @@ fn parallel_anchor_matches_serial_transforms() {
     assert_eq!(serial.worker_limit, 1);
     assert_eq!(serial.peak_workers, 1);
 
-    let parallel = align_stack_with(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-        &AlignDriverOptions::default(),
-    )
-    .expect("parallel run completes");
-    assert!(
-        parallel.worker_limit > 1,
-        "the default budget must exercise the parallel arm on this 8-frame fixture: {}",
-        parallel.worker_limit
-    );
-
-    assert_eq!(serial.alignment.reference, parallel.alignment.reference);
-    assert_eq!(serial.alignment.policy, parallel.alignment.policy);
+    let bands = streamed_band_reads(&stack_ctx);
+    let reference = serial.alignment.reference;
+    // Several fixture frames diverge and escalate, yet the reference gains one
+    // read, not one per escalation.
     assert_eq!(
-        serial.alignment.frames, parallel.alignment.frames,
-        "a parallel anchored run must recover transforms byte-identical to the serial one -- \
-         every FrameAlignment field, including status/iterations/residual/fallback"
+        reader.reads_for(reference),
+        reference_reads(&stack_ctx) + ESCALATION_READS,
+        "the cached reference frame must be read once (bands, level-0 window, patch \
+         windows) plus its one shared escalation read, not once per registration"
     );
-}
+    for i in (0..stack_ctx.frame_count).filter(|&i| i != reference) {
+        // Bands always; a frame that reaches level 0 adds its window, one
+        // that converges there adds at most one window per patch, and one that
+        // diverges adds its own whole-frame escalation read.
+        let reads = reader.reads_for(i);
+        let most = bands + 1 + PATCH_COUNT + ESCALATION_READS;
+        assert!(
+            (bands..=most).contains(&reads),
+            "non-reference frame {i} made {reads} reads, expected {bands} to {most}"
+        );
+    }
 
-#[test]
-fn parallel_anchor_is_reproducible() {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
-    let cfg = lowered_max_iterations(&stack_ctx);
+    let parallel_runs: Vec<_> = (0..2)
+        .map(|n| {
+            align_stack_with(
+                &PyramidalEcc,
+                stack_ctx,
+                &stack,
+                &cfg,
+                FailurePolicy::Strict,
+                &AlignDriverOptions::default(),
+            )
+            .unwrap_or_else(|err| panic!("parallel run {n} completes: {err}"))
+        })
+        .collect();
+    for parallel in &parallel_runs {
+        assert!(
+            parallel.worker_limit > 1,
+            "the default budget must exercise the parallel arm on this 8-frame fixture: {}",
+            parallel.worker_limit
+        );
+        assert_eq!(serial.alignment.reference, parallel.alignment.reference);
+        assert_eq!(serial.alignment.policy, parallel.alignment.policy);
+        assert_eq!(
+            serial.alignment.frames, parallel.alignment.frames,
+            "a parallel anchored run must recover transforms byte-identical to the serial one, \
+             and two parallel runs must agree -- every FrameAlignment field, including \
+             status/iterations/residual/fallback"
+        );
+    }
 
-    let first = align_stack_with(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-        &AlignDriverOptions::default(),
-    )
-    .expect("first parallel run completes");
-    let second = align_stack_with(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-        &AlignDriverOptions::default(),
-    )
-    .expect("second parallel run completes");
-
-    assert!(first.worker_limit > 1, "must exercise the parallel arm");
-    assert_eq!(
-        first.alignment.frames, second.alignment.frames,
-        "two parallel runs over the same input must yield identical transforms -- rules out a \
-         scheduling-order dependence the serial comparison alone could miss"
-    );
+    let uncached = uncached_outcomes(stack_ctx, &stack, reference, &cfg);
+    assert_frames_match_outcomes(&serial.alignment.frames, &uncached);
 }
 
 #[test]
@@ -166,14 +190,28 @@ fn chain_mode_stays_serial() {
     );
 }
 
+/// The frames are a centred 128 px crop of fixture frame 3: frame 1 is the same
+/// crop of the frame shifted, frame 2 is noise that cannot register against
+/// frame 0.
+const CROP_SIZE: u32 = 128;
+
 #[test]
 fn parallel_anchor_failure_policy_is_unchanged() {
-    let (tile, width, height, spp) = frame_3_tile();
-    let rect = full_rect(width, height);
+    let (frame, full_width, full_height, spp) = frame_3_tile();
+    let crop = Rect {
+        x: (full_width - CROP_SIZE) / 2,
+        y: (full_height - CROP_SIZE) / 2,
+        width: CROP_SIZE,
+        height: CROP_SIZE,
+    };
+    let tile = open_fixture()
+        .read_tile(3, crop)
+        .expect("reading frame 3's crop");
 
     let shift = Transform::translation(8.0, 3.0);
-    let warped = warp_from_tile(&tile, (width, height), rect, &shift)
+    let warped = warp_from_tile(&frame, (full_width, full_height), crop, &shift)
         .expect("small translation stays well inside the frame");
+    let (width, height) = (CROP_SIZE, CROP_SIZE);
 
     let mut rng = XorShift32(0xC0FFEE);
     let noise: Vec<u16> = (0..tile.samples.len())
@@ -228,11 +266,31 @@ fn parallel_anchor_failure_policy_is_unchanged() {
             parallel.worker_limit
         );
 
-        assert_eq!(
-            serial.alignment.failure_count(),
-            parallel.alignment.failure_count(),
-            "policy {policy:?}"
-        );
+        for (arm, run) in [("serial", &serial), ("parallel", &parallel)] {
+            let alignment = &run.alignment;
+            assert_eq!(
+                alignment.frames.len(),
+                3,
+                "{arm}, policy {policy:?}: every frame carries an outcome"
+            );
+            assert_eq!(
+                alignment.failure_count(),
+                1,
+                "{arm}, policy {policy:?}: only the noise frame must fail: {:?}",
+                alignment.frames
+            );
+            let failed = alignment.failed().next().expect("one failure");
+            assert_eq!(failed.frame, 2, "{arm}, policy {policy:?}");
+            match policy {
+                // Strict keeps the solver's own best-rho transform.
+                FailurePolicy::Strict => assert!(!failed.fallback, "{arm}"),
+                FailurePolicy::IdentityFallback => {
+                    assert!(failed.fallback, "{arm}");
+                    assert_eq!(failed.transform, Transform::identity(), "{arm}");
+                }
+            }
+        }
+
         assert_eq!(
             serial.alignment.frames, parallel.alignment.frames,
             "policy {policy:?}: strict must keep the same best-rho transform and lax must \

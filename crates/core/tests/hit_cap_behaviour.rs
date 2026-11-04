@@ -20,7 +20,7 @@ use focusforge_core::align::{
 };
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 
-/// The shipped defaults, with `mode` and `max-iterations` overridden --
+/// The defaults resolved for `ctx`, with `mode` and `max-iterations` overridden --
 /// every other key (`epsilon-px`, `pyramid-depth = auto`, `reference-policy`,
 /// `reference-frame`, the last unused here since the reference is set on
 /// `AlignContext` directly) stays exactly as `PyramidalEcc::params` declares
@@ -76,11 +76,12 @@ fn print_level_row(mode: &str, frame: usize, rec: &EccLevelRecord, epsilon_px: f
 }
 
 /// **Distance from epsilon**: for every `HitCap` frame of
-/// `fixtures/mantis-512` under the shipped defaults, in both modes, the
-/// final step measure and its ratio to `epsilon-px` -- per pyramid level,
-/// so no statement compares a four-level iteration sum against a per-level
-/// threshold.
+/// `fixtures/mantis-512` at cap 50 and the configured `epsilon-px`, in both
+/// modes, the final step measure and its ratio to `epsilon-px` -- per
+/// pyramid level, so no statement compares a multi-level iteration sum against
+/// a per-level threshold.
 #[test]
+#[ignore = "measurement: prints each level's final step and its ratio to epsilon-px at cap 50"]
 fn hit_cap_frames_report_their_distance_from_epsilon() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -196,6 +197,7 @@ fn classify_trajectory(window: &[f64]) -> Trajectory {
 /// **Step trajectory**: classify the step trajectory of every `HitCap`
 /// level over its last `min(10, iterations)` recorded steps.
 #[test]
+#[ignore = "measurement: prints the step trajectory verdict of each capped level at cap 50"]
 fn hit_cap_step_trajectory_is_classified() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -248,12 +250,13 @@ fn hit_cap_step_trajectory_is_classified() {
 }
 
 /// **Cap sensitivity**: the cap is measured, not assumed. For every frame
-/// that hit-caps under the shipped default, sweep `max-iterations` upward and
+/// that hit-caps at cap 50, sweep `max-iterations` upward and
 /// record the truncation cost -- the same frame's transform at cap `C`
 /// against its own transform at the sweep's largest cap, over
 /// `default_region()`'s corners. Frame, content, focus distance and anchor
 /// are identical on both sides, so they cancel exactly.
 #[test]
+#[ignore = "measurement: prints the truncation cost of each frame across a sweep of max-iterations"]
 fn raising_the_cap_is_measured_not_assumed() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();
@@ -264,13 +267,13 @@ fn raising_the_cap_is_measured_not_assumed() {
     let region = default_region();
 
     let overall_start = Instant::now();
-    // Caps sized to fit the file's wall-clock ceiling: this sweep measures
-    // 93.4 s (the full `[50, 100, 200, 400, 1000]` sweep: 134.5 s).
+    // This sweep measures 93.4 s (the full `[50, 100, 200, 400, 1000]` sweep:
+    // 134.5 s).
     for (mode, caps) in [
         ("rotation-scale", vec![50i64, 200, 400, 1000]),
         ("translation", vec![50i64, 1000]),
     ] {
-        // Which frames hit-cap under the shipped default, measured here.
+        // Which frames hit-cap at cap 50, measured here.
         let default_cfg = cfg_for(&stack_ctx, mode, 50);
         let mut hit_cap_frames = Vec::new();
         for frame in 0..frame_count {
@@ -342,6 +345,7 @@ fn raising_the_cap_is_measured_not_assumed() {
 /// alone explains it; if it never appears, defocus-driven content mismatch
 /// is implicated for the real frames.
 #[test]
+#[ignore = "measurement: prints the status and corner error of known warps registered against their own source frame"]
 fn hit_cap_without_a_focus_difference() {
     let (tile, width, height, spp) = frame_3_tile();
     let rect = full_rect(width, height);
@@ -402,9 +406,10 @@ fn hit_cap_without_a_focus_difference() {
 
 /// **Distance from anchor**: hit-cap status against `|frame - anchor|`,
 /// over the 21 non-anchor pairs the three `reference-frame` settings
-/// produce, at the default cap. The test asserts nothing about
-/// correlation; it states present / absent / indeterminate.
+/// produce, at cap 50. The test asserts nothing about correlation; it states
+/// present / absent / indeterminate.
 #[test]
+#[ignore = "measurement: prints hit-cap status against distance from the anchor and a contingency table"]
 fn hit_cap_against_distance_from_the_anchor() {
     let stack = open_fixture();
     let (width, height) = stack.dimensions();

@@ -9,10 +9,13 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use focusforge_core::algorithm::{AlgorithmError, AlignAlgorithm, TileReader};
+use focusforge_core::algorithm::{
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, TileReader,
+};
 use focusforge_core::align::{PyramidalEcc, Transform};
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
+use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{Rect, Tile};
 
 /// The sharpest `fixtures/mantis-512` frame, the one the ground-truth tests
@@ -58,6 +61,14 @@ pub fn frame_3_tile() -> (Tile, u32, u32, u32) {
         .read_tile(FRAME_3, rect)
         .expect("reading frame 3's tile");
     (tile, width, height, spp)
+}
+
+/// A rotation+scale [`Transform`] about `(cx, cy)`.
+pub fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
+    let to_origin = Transform::translation(-cx, -cy);
+    let rot_scale = Transform::similarity(scale, radians, 0.0, 0.0);
+    let back = Transform::translation(cx, cy);
+    back.compose(&rot_scale).compose(&to_origin)
 }
 
 /// The region the ground-truth tests solve over: a 64px inset of the 512px
@@ -122,6 +133,46 @@ pub fn lowered_max_iterations(ctx: &StackContext) -> ParamValues {
     cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
     cfg
 }
+
+/// `PyramidalEcc::align_frame` called directly over a plain
+/// [`AlignContext::new`] with nothing prepared: the baseline a cached run must
+/// match bit for bit.
+pub fn uncached_outcomes(
+    stack_ctx: StackContext,
+    reader: &dyn TileReader,
+    reference: usize,
+    cfg: &ParamValues,
+) -> Vec<AlignOutcome> {
+    let ctx = AlignContext::new(stack_ctx, reference, reader);
+    (0..stack_ctx.frame_count)
+        .map(|i| {
+            PyramidalEcc
+                .align_frame(&ctx, i, cfg)
+                .expect("uncached align_frame must not error")
+        })
+        .collect()
+}
+
+/// The off-centre patches of a 512 px frame: a 3x3 grid without its middle.
+pub const PATCH_COUNT: usize = 8;
+
+/// Reads one registration makes of a frame's own pixels up to its solve: the
+/// level-1 bands (each output band of `DEFAULT_TILE_SIZE / 2` rows reads its
+/// rows plus halo), without the level-0 window or patches.
+pub fn streamed_band_reads(stack: &StackContext) -> usize {
+    stack.height.div_ceil(2).div_ceil(DEFAULT_TILE_SIZE / 2) as usize
+}
+
+/// The reference frame is read as bands, one level-0 template window and one
+/// window per patch template -- once per run, whatever the registration count.
+pub fn reference_reads(stack: &StackContext) -> usize {
+    streamed_band_reads(stack) + 1 + PATCH_COUNT
+}
+
+/// Reads one escalation adds for a frame no larger than the detector's 512 px
+/// proxy: the whole frame at level 0. The reference's is made by the first
+/// escalation of a run and shared by every later one.
+pub const ESCALATION_READS: usize = 1;
 
 /// Deterministic xorshift32 PRNG, reproducible across runs.
 pub struct XorShift32(pub u32);

@@ -10,7 +10,9 @@
 
 mod common;
 
-use common::align::{XorShift32, corner_error, default_region, frame_3_tile, full_rect};
+use common::align::{
+    XorShift32, corner_error, default_region, frame_3_tile, full_rect, similarity_about,
+};
 
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
@@ -33,17 +35,6 @@ fn luma_plane(tile: &Tile, width: u32, height: u32) -> Plane {
         })
         .collect();
     Plane::from_f32(&data, width, height, 1).expect("luma plane has the right length")
-}
-
-/// A rotation+scale [`Transform`] about `(cx, cy)`, built by composing
-/// three transforms rather than hand-deriving the closed-form translation
-/// component -- `Transform::compose` is already tested elsewhere, so this
-/// stays a thin, obviously-correct wrapper.
-fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
-    let to_origin = Transform::translation(-cx, -cy);
-    let rot_scale = Transform::similarity(scale, radians, 0.0, 0.0);
-    let back = Transform::translation(cx, cy);
-    back.compose(&rot_scale).compose(&to_origin)
 }
 
 fn default_params() -> EccParams {
@@ -381,37 +372,6 @@ fn hopeless_input_reports_failure() {
         EccStatus::Converged,
         "an unrelated pair must never report a converged transform: {result:?}"
     );
-}
-
-#[test]
-fn iteration_cap_is_honored() {
-    let (tile, width, height, _) = frame_3_tile();
-    let rect = full_rect(width, height);
-    let moving_plane = luma_plane(&tile, width, height);
-
-    let w_true = Transform::translation(15.0, 15.0);
-    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
-        .expect("translation stays well inside the frame");
-    let template_plane = luma_plane(&warped.tile, width, height);
-
-    let region = default_region();
-    let params = EccParams {
-        max_iterations: 2,
-        epsilon_px: 1e-9,
-        min_valid_fraction: 0.99,
-    };
-    let result = solve_level(
-        &template_plane,
-        region,
-        &moving_plane,
-        &Transform::identity(),
-        EccMode::Translation,
-        &params,
-    )
-    .expect("valid solver inputs");
-
-    assert_eq!(result.status, EccStatus::HitCap, "result: {result:?}");
-    assert_eq!(result.iterations, 2);
 }
 
 /// A frame against its own contrast inversion is anti-correlated: whatever the

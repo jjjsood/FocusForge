@@ -13,15 +13,11 @@ filter = 'binary_id(focusforge-core::fuse_algorithms) + binary_id(focusforge-cor
 test-group = 'fuse-fixture-writers'
 
 # A per-test kill on the default and quick profiles, so a hang ends as a named
-# TIMEOUT instead of a silent wait. Measured slowest tests: `hit_cap_behaviour`
-# 924 s and `queued_tab_runs_past_a_keep_question` 405 s, both on windows-2022.
-# 15 minutes bounds everything else, 40 minutes the hit-cap binary.
+# TIMEOUT instead of a silent wait. Measured slowest test:
+# `queued_tab_runs_past_a_keep_question`, 405 s on windows-2022. The default
+# kill is 15 minutes.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 15 }
-
-[[profile.default.overrides]]
-filter = 'binary_id(focusforge-core::hit_cap_behaviour)'
-slow-timeout = { period = "60s", terminate-after = 40 }
 
 # `stack_cli` spawns whole aligned laplacian stacks through the debug binary:
 # 42 s locally and 144-245 s on windows-2022, but one windows-2022 run took
