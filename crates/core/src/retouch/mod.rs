@@ -9,12 +9,12 @@ use crate::zmap::ZMapError;
 
 pub use blend::{footprint, overlay_colors, top_source};
 
-/// Failures validating or applying an op against a Z-Map.
+/// Failures validating a stroke against the fused map's extent and frame count.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RetouchError {
     /// `source_id` names no frame the map claims to have -- including
-    /// [`crate::zmap::NO_SOURCE`], which a stroke never writes.
+    /// [`crate::zmap::NO_SOURCE`], which is no frame to blend from.
     #[error("source_id {source_id} is out of range for a {frame_count}-frame map")]
     SourceOutOfRange { source_id: u16, frame_count: u32 },
 
