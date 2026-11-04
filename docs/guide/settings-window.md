@@ -56,7 +56,7 @@ the accepted values.
 on the graphics card or on the processor only, and how much memory it may
 take.
 
-![The Performance section: under PROCESSING the GPU processing switch is on and Backend is empty; under LIMITS the Host memory cap and VRAM cap fields show "No cap", Host budget reads 2.2 GiB and VRAM budget reads "Not probed yet"](../assets/manual/settings-window/settings-performance.png)
+![The Performance section: under PROCESSING the GPU processing switch is on and Backend is empty; under LIMITS the Host memory cap and VRAM cap fields show "No cap", Host budget shows a size in GiB and VRAM budget reads "Not probed yet"](../assets/manual/settings-window/settings-performance.png)
 
 *Performance before the first fuse of the session. Your budget figures
 depend on your computer.*

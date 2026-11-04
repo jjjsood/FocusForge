@@ -19,11 +19,21 @@ focus order) and from FocusForge's own fusion:
      `--cpu` keeps reruns byte-identical (a GPU adapter may differ by 1 LSB).
   3. `focusforge-cli export` writes the composite, the Z-Map and, with
      `--frame`, single source frames warped and cropped to the composite's own
-     geometry, all as 16-bit TIFF without EXIF or ICC.
+     geometry, as 16-bit TIFF; `focusforge-cli retouch` applies the one brush
+     stroke the halo repair example shows.
   4. This script crops the declared window, places panels side by side, and
      encodes a baseline JPEG itself (standard tables, no metadata segment
      beyond the JFIF header), so the bytes depend only on the pixels.
-  5. Finished images are moved into `docs/assets/manual/<chapter>/`.
+  5. Finished images are moved into `docs/assets/manual/<chapter>/`:
+       depth-of-field/source-frames.jpg   depth-of-field/composite.jpg
+       failure-images/halo-methods.jpg    failure-images/halo-retouch.jpg
+       failure-images/motion.jpg          failure-images/focus-gap.jpg
+
+Each group's function below declares its frames, windows and flags with the
+reason for them. A full run takes about ten minutes with a debug build (the
+alignment runs dominate); pass `--cli target/release/focusforge-cli` to use a
+release build instead, and `--check` to confirm that it reproduces the
+committed images.
 
 `--check` does steps 1-4 and compares the result with the committed images
 instead of moving anything; it exits 1 on any difference. `--cli` names the
@@ -571,6 +581,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--cli", default=os.path.join(REPO, "target", "debug", "focusforge-cli"))
     parser.add_argument("--check", action="store_true", help="compare with the committed images, write nothing")
     args = parser.parse_args(argv)
+    sys.stdout.reconfigure(line_buffering=True)
     unknown = [g for g in args.groups if g not in GROUPS]
     if unknown:
         parser.error(f"unknown group {', '.join(unknown)}; choose from {', '.join(GROUPS)}")

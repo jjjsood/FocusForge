@@ -153,27 +153,34 @@ slice, and the software assembles the sharp parts into one image, the
 ### An example
 
 The pictures below are 1:1 crops (one image pixel per screen pixel) of one
-window of a series of a praying mantis's head, shot with the focus moving
-from front to back. FocusForge's sample stack keeps eight frames of that
-series, numbered 00 to 07 in focus order.
+window of a 61-frame series of a praying mantis's head, shot with the focus
+moving from front to back. The examples in this book use eight of those
+frames, spread evenly over the series and numbered 00 to 07 in focus order.
 
 ![Three crops of the same window of the mantis's head, side by side. Left: the antenna is sharp, the rim of the head is soft. Middle: the rim of the head and its fine hairs are sharp, the antenna is a broad soft band. Right: nothing in the window is sharp.](../assets/manual/depth-of-field/source-frames.jpg)
 
-*Single frames 02, 03 and 05 of the sample stack: frame 02 is sharp on the antenna, frame 03 on the rim of the head, frame 05 is focused behind the head.*
+*Single frames 02, 03 and 05 of the eight: frame 02 is sharp on the antenna, frame 03 on the rim of the head, frame 05 is focused behind the head.*
 
 Each frame is sharp in a different band. In frame 02 the antenna stands out
 and the head behind it is soft; one step further, in frame 03, the rim of the
 head and its hairs are sharp and the antenna has dissolved into a pale band.
 By frame 05 the focus has moved past the head altogether.
 
-![Two images side by side. Left: the composite, with the antenna and the hairs on the rim of the head both sharp. Right: the same window coloured by source frame: orange along the antenna, blue along the rim of the head, grey elsewhere.](../assets/manual/depth-of-field/composite.jpg)
+![Two images side by side. Left: the composite, with the antenna and the hairs on the rim of the head both sharp. Right: the same window coloured by source frame: orange along the antenna, blue along the rim of the head and over much of the rest, with grey patches.](../assets/manual/depth-of-field/composite.jpg)
 
-*Left: the FocusForge composite of all eight frames (Details method, default settings). Right: its Z-Map, orange where a pixel came from frame 02, blue for frame 03, grey for any other frame.*
+*Left: the FocusForge composite of all eight frames (Details method, default settings). Right: its Z-Map, orange where a pixel came from frame 02, blue for frame 03, grey for any of the other six frames.*
 
 The composite has the antenna from frame 02 and the rim from frame 03, both
-sharp, in one picture. The Z-Map on the right shows how it was assembled. In
-the smooth background, where no frame has any detail, the choice of frame
-hardly matters, and the map there is a scatter of other frames.
+sharp, in one picture. The Z-Map on the right shows how it was assembled: the
+antenna is orange, the rim and its hairs blue. In the smooth background and
+on the soft surface of the head, where no frame has real detail, the choice
+of frame hardly matters, and the map there is a patchwork of frame 03 and
+other frames.
+
+Look closely where the antenna crosses the rim: there the sharp rim won, and
+the antenna looks soft and see-through for a short stretch. That is a typical
+depth-edge problem, and [Common failure images](failure-images.md#halos-at-depth-edges)
+shows how to repair it with one brush stroke.
 
 ## What stacking cannot do
 

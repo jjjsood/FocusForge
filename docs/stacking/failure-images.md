@@ -9,10 +9,11 @@ For each failure this chapter shows an example, then answers four questions:
 what you see, why it happens, how to avoid it when shooting, and how to
 repair it.
 
-The examples are 1:1 crops (one image pixel per screen pixel) fused by
-FocusForge from its sample stack: eight frames, numbered 00 to 07 in focus
-order, taken from a series of a praying mantis's head. The
-[previous chapter](depth-of-field.md#an-example) introduces them.
+The examples are crops fused by FocusForge from the eight frames of a
+praying mantis's head, numbered 00 to 07 in focus order, that the chapter
+[Depth of field and why stack](depth-of-field.md#an-example) introduces. They are shown at 1:1 (one image pixel per screen pixel) unless a
+caption says otherwise. The motion example is simulated by moving frames in
+software, and its caption says so.
 
 > **Tip:** Judge a composite at 100 %. All three failures are easy to miss
 > in a small preview. In the window, the bottom bar's **Overlay** colours the
@@ -22,7 +23,7 @@ order, taken from a series of a praying mantis's head. The
 
 ## Halos at depth edges
 
-![Three crops of the same window side by side: an antenna against a dark grey background, above the pale rim of the mantis's head. Left: clean edges. Middle: a dark band along the rim of the head and a softer antenna. Right: dark blotches beside the antenna and along the rim, and patches in the smooth areas.](../assets/manual/failure-images/halo-methods.jpg)
+![Three crops of the same window side by side: an antenna against a dark grey background, above the pale rim of the mantis's head. Left: the cleanest edges. Middle: a dark band along the rim of the head and a softer antenna. Right: dark blotches beside the antenna and along the rim, and patches in the smooth areas.](../assets/manual/failure-images/halo-methods.jpg)
 
 *The same eight frames fused with default settings by each method. Left: Details. Middle: Soft transitions, with a dark band along the rim. Right: Focus map, with dark blotches beside the antenna and the rim.*
 
@@ -154,10 +155,10 @@ series or calm moments. All of this is covered in
 
 *Left: all eight frames. Right: the same stack without frame 02, the only frame with the antenna in focus, so the step from frame 01 to frame 03 is twice as large. Alignment is off for both, so the two crops match pixel for pixel.*
 
-> **Note:** The sample stack itself is a thinned series: it keeps only every
-> eighth or ninth of the 61 frames the photographer took. That is why, in
-> every example on these pages, the face of the mantis below the rim stays
-> soft: the frames that held it sharp are not in the sample.
+> **Note:** The eight frames are themselves a thinned series: every eighth
+> or ninth of the 61 frames the photographer took. That is the most likely
+> reason why, in every example on these pages, the face of the mantis below
+> the rim stays soft: none of the eight has it in focus.
 
 ### What you see
 

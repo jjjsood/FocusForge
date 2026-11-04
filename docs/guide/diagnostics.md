@@ -105,10 +105,11 @@ its size: in whole kilobytes below a megabyte (so a small file reads
 "0 KB"), with one decimal above. The list scrolls inside its box when it
 holds more rows than fit.
 
-FocusForge gathers the list in the background, so the section opens at once
-showing "Collecting…" and fills in a moment later. **Create bundle** stays
-unavailable until the list is complete; the switch and the **Save to** field
-can be used meanwhile.
+FocusForge gathers the list in the background, from the moment it starts,
+so the section may show "Collecting…" for a moment before the list fills
+in. It gathers the list again when you switch **Include minidumps**.
+**Create bundle** stays unavailable until the list is complete; the switch
+and the **Save to** field can be used meanwhile.
 
 | Entry | What it holds |
 | --- | --- |
@@ -164,7 +165,7 @@ Creating the bundle will overwrite it." and the button becomes **Overwrite
 and create**. Click it to replace the file, or change the path to keep the
 old one.
 
-![The Diagnostics section with an amber Save to field naming focusforge-diagnostics-support.zip, the amber line "This file already exists. Creating the bundle will overwrite it." and the button Overwrite and create](../assets/manual/settings-window/settings-bundle-overwrite.png)
+![The Diagnostics section with an amber Save to field ending in focusforge-diagnostics-attached-to-my-bug-report.zip, the amber line "This file already exists. Creating the bundle will overwrite it." and the button Overwrite and create](../assets/manual/settings-window/settings-bundle-overwrite.png)
 
 *A path that already exists: the button changes to **Overwrite and create**.*
 
