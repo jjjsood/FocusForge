@@ -573,7 +573,9 @@ pub fn run(
     // `review` (which prefers a manifest over a directory glob whenever one
     // exists) would silently shrink to just the re-run subset after every
     // partial re-run, defeating the triage this supports.
-    if let Err(msg) = write_manifest(output, dir, manifest) {
+    if !preset_opts.dry_run
+        && let Err(msg) = write_manifest(output, dir, manifest)
+    {
         eprintln!("warning: {msg}");
         tracing::warn!(target: MIRRORED_OUTPUT_TARGET, "warning: {msg}");
     }
@@ -779,7 +781,8 @@ fn manifest_entry(group: &Group, identity: String, result: &GroupResult) -> grou
     }
 }
 
-/// The run-level manifest, written for every run, single-group included.
+/// The run-level manifest, written for every run but a dry run, single-group
+/// included.
 /// With `-o <dir>` it goes to `<dir>/manifest.json`; without `-o`, projects
 /// may land in several directories, so it goes to the input root as
 /// `<root-basename>-run.json` (a name that cannot collide with a project).

@@ -280,7 +280,8 @@ pub fn init(options: &Options) -> Diagnostics {
         }
         Err(NoFileSink::NoDataDir) => (None, None),
         Err(err) => {
-            eprintln!("{err}");
+            // A closed stderr must not end the run.
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{err}\n"));
             (None, None)
         }
     };

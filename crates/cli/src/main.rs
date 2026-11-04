@@ -45,6 +45,39 @@ macro_rules! println {
     }};
 }
 
+/// Set once a write to stderr finds its reader gone.
+#[cfg(not(test))]
+static STDERR_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shadows std's `eprintln!` and `eprint!` in every module below, the way
+/// `println!` is shadowed for stdout: output is dropped once stderr's reader
+/// has gone away, and any other write error panics as std's does.
+#[cfg(not(test))]
+macro_rules! write_stderr {
+    ($write:ident, $($arg:tt)*) => {{
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        if !$crate::STDERR_CLOSED.load(Relaxed) {
+            if let Err(err) = $write!(std::io::stderr().lock(), $($arg)*) {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    panic!("failed printing to stderr: {err}");
+                }
+                $crate::STDERR_CLOSED.store(true, Relaxed);
+            }
+        }
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => { write_stderr!(writeln, $($arg)*) };
+}
+
+#[cfg(not(test))]
+macro_rules! eprint {
+    ($($arg:tt)*) => { write_stderr!(write, $($arg)*) };
+}
+
 mod algorithms;
 mod align;
 mod diagnostics;

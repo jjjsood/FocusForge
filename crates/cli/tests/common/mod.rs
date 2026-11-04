@@ -462,3 +462,12 @@ pub fn write_synthetic_stack(dir: &Path, width: u32, height: u32, shifts: &[(f64
         writer.finish().expect("synthetic frame writer must finish");
     }
 }
+
+/// A temp directory `name` holding three 16x16 synthetic frames, the second
+/// shifted one pixel right and the third one pixel down.
+#[allow(dead_code)]
+pub fn synthetic_frames(name: &str) -> TmpDir {
+    let frames = tmp_dir(name);
+    write_synthetic_stack(&frames, 16, 16, &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]);
+    frames
+}
