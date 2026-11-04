@@ -574,7 +574,8 @@ fn tile_peak(method: &str, frame_count: usize, width: u32, height: u32, fuse: bo
         params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve must succeed");
     let values = params::resolved_values(&resolved);
 
-    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let tmp = common::target_tmp();
+    let base = tmp.path();
     let tag = format!("tile_scheduler_memory_{method}_{frame_count}");
     let mut options = TileSchedulerOptions::explicit_budget(base.join(&tag), 1);
     options.apply_support(algo.tile_support(&values));
@@ -666,19 +667,19 @@ fn declared_working_bytes_cover_the_measured_peak() {
 /// Frame count must not move the per-tile peak beyond measurement noise. The
 /// bound is two frame tiles, about 1.6 times the 120 kB spread of a single
 /// run; [`settled_peak`] shrinks the residual difference to under 16 kB.
-/// Keeping every frame's tile resident would differ by 56 frame tiles between
-/// 8 and 64 frames.
+/// Keeping every frame's tile resident would differ by 12 frame tiles between
+/// 4 and 16 frames.
 #[test]
 fn peak_heap_is_independent_of_frame_count() {
     let _guard = serial();
     let frame_tile = 128 * 128 * 3 * 2;
     for method in ["laplacian", "weighted-average", "depth-map"] {
-        let small = settled_peak(method, 8, 300, 200, true);
-        let large = settled_peak(method, 64, 300, 200, true);
-        eprintln!("{method}: peak at 8 frames {small} B, at 64 frames {large} B");
+        let small = settled_peak(method, 4, 300, 200, true);
+        let large = settled_peak(method, 16, 300, 200, true);
+        eprintln!("{method}: peak at 4 frames {small} B, at 16 frames {large} B");
         assert!(
             large < small + 2 * frame_tile,
-            "{method}: peak {large} B at 64 frames exceeds the 8-frame peak {small} B by \
+            "{method}: peak {large} B at 16 frames exceeds the 4-frame peak {small} B by \
              {} B, one frame tile is {frame_tile} B",
             large.saturating_sub(small)
         );

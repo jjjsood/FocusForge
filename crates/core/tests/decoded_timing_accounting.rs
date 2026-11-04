@@ -47,9 +47,8 @@ fn decoded_reads_count_real_miss_hit_copy_and_decode_error() {
     );
     assert_eq!(hit_stats.decodes, miss_stats.decodes);
 
-    let scratch = common::workspace_root().join(".scratch/decoded-timing-accounting");
-    std::fs::create_dir_all(&scratch).unwrap();
-    let malformed = scratch.join(format!("malformed-segment-{}.tif", std::process::id()));
+    let scratch = common::target_tmp();
+    let malformed = scratch.path().join("malformed-segment.tif");
     let mut bytes = std::fs::read(&source).unwrap();
     bytes.pop();
     std::fs::write(&malformed, bytes).unwrap();
@@ -73,5 +72,4 @@ fn decoded_reads_count_real_miss_hit_copy_and_decode_error() {
     assert!(matches!(error, TiffError::SegmentPastEof { .. }));
     assert_eq!(after_error.decoded_bytes, before_error.decoded_bytes);
     assert_eq!(after_error.copy_bytes, before_error.copy_bytes);
-    std::fs::remove_file(malformed).unwrap();
 }

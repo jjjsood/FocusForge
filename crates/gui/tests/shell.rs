@@ -17,15 +17,7 @@ use slint::ComponentHandle;
 /// otherwise reports 800 x 600 until set (`i-slint-backend-testing`
 /// 1.17.1's `TestingWindow`).
 fn app_at(width: u32, height: u32) -> AppWindow {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window()
         .set_size(slint::PhysicalSize::new(width, height));
@@ -1300,19 +1292,20 @@ fn input_map_rows_stay_inside_the_content_area() {
     }
 }
 
-/// Under the Projects overview a failure shows no toast and stays unread,
-/// and the closed toast never blocks a click on the card underneath it.
+/// A failure raised under the Projects overview shows no toast and stays
+/// unread, and the toast it leaves closed never blocks a click on the card
+/// underneath it.
 #[test]
-fn projects_suppresses_a_failure_toast_and_keeps_it_unread() {
+fn a_suppressed_toast_never_blocks_a_card_click() {
     let mut controller = common::controller_with_frames("shell_projects_failure", 3);
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_projects_overlay();
     assert!(controller.start_fuse());
+    let refused = controller
+        .add_frames(&[common::fixture_frame("mantis-64", 0)])
+        .expect_err("a running job refuses an add");
     assert!(
-        controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
-            .is_err(),
-        "a running job refuses an add"
+        matches!(refused, focusforge_gui::entry::ImportRefused::JobRunning),
+        "{refused:?}"
     );
     common::wait_for_settle(&mut controller, std::time::Duration::from_secs(60));
     let controller: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
@@ -3089,7 +3082,6 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
 
 mod notification {
     use super::*;
-    use focusforge_core::params::ParamValue;
     use focusforge_gui::notifications::Kind;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::cell::RefCell;
@@ -3194,15 +3186,15 @@ mod notification {
     /// settled afterwards: one failure record per refusal. The first toast is
     /// held while the run settles, so a slow settle cannot expire it.
     fn controller_with_refusals(name: &str, refusals: usize) -> AppController {
-        let mut controller = common::controller_with_frames(name, 4);
-        controller.set_align_algorithm("dummy-align");
+        let mut controller = common::controller_with_frames(name, 3);
         assert!(controller.start_fuse());
         for _ in 0..refusals {
+            let refused = controller
+                .add_frames(&[common::fixture_frame("mantis-64", 0)])
+                .expect_err("a running job refuses an add");
             assert!(
-                controller
-                    .add_frames(&[common::fixture_frame("mantis-64", 4)])
-                    .is_err(),
-                "a running job refuses an add"
+                matches!(refused, focusforge_gui::entry::ImportRefused::JobRunning),
+                "{refused:?}"
             );
             controller.hold_toast(true);
         }
@@ -3425,14 +3417,7 @@ mod notification {
 
     #[test]
     fn a_brightness_row_names_the_frame_file() {
-        let mut controller = common::controller_with_frames("shell_brightness_row", 4);
-        controller.set_align_algorithm("dummy-align");
-        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
-        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
-        controller.toggle_frame_excluded(0);
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let controller = common::every_frame_clamps("shell_brightness_row", Some(0));
         let project = controller.notifications()[0]
             .project_title
             .clone()
@@ -3460,10 +3445,10 @@ mod notification {
             .collect();
         assert_eq!(
             contexts.len(),
-            3,
+            2,
             "the excluded frame is not part of the run"
         );
-        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif", "03.tif"]) {
+        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif"]) {
             assert!(
                 context.starts_with(&format!("{project} · {file}")),
                 "{context:?} names {file}"
@@ -3911,7 +3896,6 @@ mod dialog_close {
     fn export_close_button_cancels_a_running_write() {
         let app = app_at(1440, 900);
         let mut fused = common::controller_with_frames("export_close_writing", 2);
-        fused.set_align_algorithm("dummy-align");
         assert!(fused.start_fuse());
         while common::wait_for_settle(&mut fused, std::time::Duration::from_secs(60)).is_some() {}
         assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
@@ -4092,7 +4076,6 @@ mod dialog_escape {
     /// open in the controller and pushed to the window.
     fn fused_export_rig(name: &str) -> Rig {
         let mut fused = common::controller_with_frames(name, 2);
-        fused.set_align_algorithm("dummy-align");
         assert!(fused.start_fuse());
         while common::wait_for_settle(&mut fused, Duration::from_secs(60)).is_some() {}
         assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");

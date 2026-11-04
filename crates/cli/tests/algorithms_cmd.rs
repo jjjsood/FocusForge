@@ -9,13 +9,9 @@
 
 mod common;
 
-use std::process::Command;
+use common::bin;
 
 use focusforge_core::registry;
-
-fn bin() -> Command {
-    common::cli_bin("algorithms_cmd")
-}
 
 /// All three real algorithms (`laplacian`, `weighted-average`,
 /// `depth-map`) reach the CLI with no id named in CLI source -- the test

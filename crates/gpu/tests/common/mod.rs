@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
+use focusforge_core::align::Transform;
 use focusforge_core::fuse::laplacian::{score_plane, score_radius};
 use focusforge_core::fuse::pyramid;
 use focusforge_core::io::TiffStack;
@@ -46,6 +47,41 @@ pub fn worst_delta<T: Copy + Into<i32>>(gpu: &[T], cpu: &[T]) -> (i32, usize) {
         }
     }
     (worst, worst_index)
+}
+
+/// Every frame but frame 0 gets the same mild non-identity similarity (~0.5%
+/// scale, ~0.43 degree rotation, sub-pixel translation), so the warp stage
+/// sits inside a compared pipeline without stacking near-ties and warp noise
+/// across too wide an interaction space.
+pub fn non_identity_transforms(frame_count: usize) -> Vec<Transform> {
+    let t = Transform::similarity(1.005, 0.0075, 0.4, -0.25);
+    (0..frame_count)
+        .map(|i| if i == 0 { Transform::identity() } else { t })
+        .collect()
+}
+
+/// A smooth scene on the 16-bit scale: gradients of a few thousand levels per
+/// pixel at most, so a sub-hundredth-pixel position error stays well under a
+/// level.
+pub fn texture(x: f64, y: f64, phase: f64) -> f32 {
+    (30_000.0
+        + 12_000.0 * (0.093 * x + 0.071 * y + phase).sin()
+        + 8_000.0 * (0.047 * x - 0.113 * y + 2.0 * phase).cos()) as f32
+}
+
+/// Worst `|gpu - cpu|` over two ECC sample readbacks. Panics when one side has
+/// a sample the other lacks: both must agree on which taps leave the window.
+pub fn worst_ecc_sample_delta(gpu: &[Option<f32>], cpu: &[Option<f32>]) -> f32 {
+    assert_eq!(gpu.len(), cpu.len());
+    let mut worst = 0.0f32;
+    for (i, (g, c)) in gpu.iter().zip(cpu).enumerate() {
+        match (g, c) {
+            (Some(g), Some(c)) => worst = worst.max((g - c).abs()),
+            (None, None) => {}
+            _ => panic!("sample {i}: gpu {g:?} against cpu {c:?}"),
+        }
+    }
+    worst
 }
 
 /// The `mantis-512` fixture served as `f32` on the 16-bit scale with `offset`

@@ -8,15 +8,10 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
-use common::mantis_512_dir;
-
-fn bin() -> Command {
-    common::cli_bin("cli")
-}
+use common::{bin, mantis_512_dir};
 
 /// Spawns the built CLI with `args`, in `dir` as its working directory.
 ///

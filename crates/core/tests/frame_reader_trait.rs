@@ -394,10 +394,8 @@ fn write_tiff_stack(label: &str, frames: &[Vec<u16>]) -> TiffStack {
 }
 
 fn run_pipeline(label: &str, reader: &dyn FrameReader) -> (Vec<u16>, Vec<u16>) {
-    let root = common::workspace_root()
-        .join(".scratch")
-        .join("frame-reader");
-    std::fs::create_dir_all(&root).expect("scratch directory must be creatable");
+    let temp = common::target_tmp();
+    let root = temp.path();
     let composite_path = root.join(format!("{label}.tif"));
     let zmap_path = root.join(format!("{label}-zmap.tif"));
     let mut options =

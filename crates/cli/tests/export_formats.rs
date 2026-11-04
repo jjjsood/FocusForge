@@ -7,11 +7,12 @@
 //! export band, gives compression and 8-bit rounding something to do.
 
 mod common;
+
+use common::{bin, partial_of};
 #[path = "../../core/tests/common/raw_dng.rs"]
 mod raw_dng;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use focusforge_core::align::{Registration, Transform};
 use focusforge_core::io::test_frames::{
@@ -25,10 +26,6 @@ use focusforge_core::project::export::to_8bit;
 use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, SealRequest};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use raw_dng::{DngSpec, write_dng};
-
-fn bin() -> Command {
-    common::cli_bin("export_formats")
-}
 
 struct CliOutput {
     success: bool,
@@ -47,12 +44,6 @@ fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
-}
-
-fn partial_of(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap().to_os_string();
-    name.push(".partial");
-    path.with_file_name(name)
 }
 
 fn assert_refused(dir: &Path, args: &[&str], out: &Path) {

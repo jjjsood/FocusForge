@@ -997,14 +997,18 @@ mod tests {
         }
     }
 
+    /// The (frame count, side, levels) cases of the constant-stack claims: the
+    /// drift needs many frames of a value, not large frames, so the 999-frame
+    /// case runs on the smallest plane that holds three levels.
+    const CONSTANT_CASES: [(usize, u32, i64); 3] = [(1, 128, 5), (61, 128, 5), (999, 32, 3)];
+
     #[test]
     fn constant_stack_exports_the_constant() {
-        let (w, h) = (128u32, 128u32);
         for triple in CONSTANT_TRIPLES {
-            let tiles = constant_tiles(triple, 999, w, h);
-            for n in [1usize, 61, 999] {
-                let ctx = TileCtx::new(rect(w, h), &tiles[..n]);
-                let out = Laplacian.fuse(&ctx, &cfg_with_levels(5)).unwrap();
+            for (n, side, levels) in CONSTANT_CASES {
+                let tiles = constant_tiles(triple, n, side, side);
+                let ctx = TileCtx::new(rect(side, side), &tiles);
+                let out = Laplacian.fuse(&ctx, &cfg_with_levels(levels)).unwrap();
                 assert_every_sample_is(&out, triple, &format!("{triple:?} at {n} frames"));
             }
         }
@@ -1012,20 +1016,19 @@ mod tests {
 
     #[test]
     fn constant_stack_masked_exports_the_constant() {
-        let (w, h) = (128u32, 128u32);
         for triple in CONSTANT_TRIPLES {
-            let tiles = constant_tiles(triple, 999, w, h);
-            let coverage: Vec<Option<Vec<bool>>> = (0..tiles.len())
-                .map(|f| {
-                    if f % 2 == 1 {
-                        columns_uncovered_below(w, h, 16)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for n in [1usize, 61, 999] {
-                let out = fuse_masked(&tiles[..n], &coverage[..n], 5, w, h);
+            for (n, side, levels) in CONSTANT_CASES {
+                let tiles = constant_tiles(triple, n, side, side);
+                let coverage: Vec<Option<Vec<bool>>> = (0..n)
+                    .map(|f| {
+                        if f % 2 == 1 {
+                            columns_uncovered_below(side, side, 16)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let out = fuse_masked(&tiles, &coverage, levels, side, side);
                 assert_every_sample_is(&out, triple, &format!("{triple:?} masked at {n} frames"));
             }
         }

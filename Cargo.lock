@@ -1780,6 +1780,7 @@ name = "focusforge-gpu"
 version = "0.1.0"
 dependencies = [
  "focusforge-core",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",

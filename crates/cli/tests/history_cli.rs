@@ -8,8 +8,9 @@
 
 mod common;
 
+use common::{bin, only_project};
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 
 use focusforge_core::align::Registration;
@@ -20,10 +21,6 @@ use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, Se
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use serde_json::Value;
-
-fn bin() -> Command {
-    common::cli_bin("history_cli")
-}
 
 struct CliOutput {
     success: bool,
@@ -46,24 +43,13 @@ fn run(dir: &Path, args: &[&str]) -> CliOutput {
     }
 }
 
-fn only_project(dir: &Path) -> PathBuf {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
-        .collect();
-    assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
-    found.pop().unwrap()
-}
-
 struct SharedStack {
     _cwd: common::TmpDir,
     project: PathBuf,
 }
 
-/// One `dummy-stack` run over `fixtures/mantis-512`, paid once for this
-/// whole binary.
+/// One `dummy-stack` run over `fixtures/mantis-512`. Each test process that
+/// reads it runs it once.
 fn shared_stack() -> &'static SharedStack {
     static ONCE: OnceLock<SharedStack> = OnceLock::new();
     ONCE.get_or_init(|| {

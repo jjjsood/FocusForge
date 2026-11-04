@@ -30,18 +30,13 @@ mod common;
 #[path = "../../core/tests/common/raw_dng.rs"]
 mod raw_dng;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use focusforge_core::io::TiffStack;
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
 use raw_dng::{DngSpec, write_dng};
 
-use common::CliOutput;
-
-fn bin() -> Command {
-    common::cli_bin("groups_cli")
-}
+use common::{CliOutput, bin, export_composite};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     common::run_in(&mut bin(), dir, args)
@@ -295,24 +290,6 @@ fn single_stack_directory_matches_the_plain_invocation() {
         read_whole(&plain),
         "a grouped one-stack run must produce the same composite, byte for byte"
     );
-}
-
-/// The composite of `project`, exported beside it -- the comparison a
-/// container makes necessary: what must be preserved is the payload, never
-/// the envelope.
-fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
-    let exported = project.with_extension("exported.tif");
-    let out = run_cli_in(
-        cwd,
-        &[
-            "export",
-            project.to_str().unwrap(),
-            "-o",
-            exported.to_str().unwrap(),
-        ],
-    );
-    assert!(out.success, "export stderr: {}", out.stderr);
-    exported
 }
 
 // --- the grouping file -----------------------------------------------------

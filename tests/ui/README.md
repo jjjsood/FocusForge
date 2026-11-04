@@ -34,6 +34,6 @@ Start: --open fixtures/mantis-64/frames
 3. A step whose `Expect:` does not hold is a failure; note its number and what the window showed, then carry on with the next step.
 4. Close the window when done.
 
-## Journeys that need local camera files
+## Journeys that need local camera files or a human
 
-`manual/` holds journeys whose input is not a checked-in fixture (real camera RAW files that are too large to commit). They use the same format and the same steps as the numbered journeys, start with a short list of files to copy into `.scratch/`, and are run by hand as above; the numbered journeys in this folder do not cover them.
+`manual/` holds journeys that cannot run unattended: their input is not a checked-in fixture (real camera RAW files that are too large to commit, or a folder built under `.scratch/`), or every step in a section needs a person (the mouse wheel, held mouse buttons, the window's own keyboard focus, a seeded crash report). They use the same format and the same steps as the numbered journeys, start with a short list of files to copy into `.scratch/` when they need any, and are run by hand as above; the numbered journeys in this folder do not cover them.

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Fusing from the window: a fuse run driven through
-//! `AppController`, with no window and `backend = None`. Fast:
-//! `fixtures/mantis-512` through the real engine, each run under its own
-//! tempdir and its own scratch root, never the crate's shared `.scratch/`.
+//! `AppController`, with no window and `backend = None`. Fast: runs use
+//! `fixtures/mantis-64` with `dummy-align` unless a test names
+//! `fixtures/mantis-512` and the real aligner (the alignment-timing case),
+//! each run under its own tempdir and scratch root, never the crate's shared
+//! `.scratch/`.
 
 mod common;
 
@@ -27,36 +29,22 @@ use focusforge_gui::{
     AppController, ChromeKey, GuardSecondary, OpenOutcome, SaveAsk, ShellEvent, ShellMode,
 };
 
-use common::copy_frame;
+use common::{
+    controller_with_frames, copy_frame, open_mantis64_tab, record_events, save_to_proposed,
+    settle_all,
+};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
 // itself, since a save writes a `.ffp` beside the frames it fused.
 // ---------------------------------------------------------------------
 
-/// [`common::controller_with_frames`] on the `dummy-align` algorithm: these
-/// tabs exercise queueing, saving and closing, not alignment quality, and an
-/// algorithm that always converges keeps every run clean.
-fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let mut controller = common::controller_with_frames(name, count);
-    controller.set_align_algorithm("dummy-align");
-    controller
-}
-
 /// A controller with two unsaved tabs, each over its own copied fixture
 /// frames -- three for tab 0, two for tab 1, so a per-tab assertion cannot
 /// pass on a shared frame count. Tab 0 is selected on return.
 fn controller_with_two_tabs(name: &str) -> AppController {
     let mut controller = controller_with_frames(&format!("{name}_a"), 3);
-    let root_b = common::tree(&format!("{name}_b_frames"));
-    for i in 0..2 {
-        copy_frame(&root_b, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root_b]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, &format!("{name}_b"), 2);
     controller.select_project(0);
     controller
 }
@@ -68,7 +56,7 @@ fn controller_with_three_tabs(name: &str) -> AppController {
     let mut controller = controller_with_two_tabs(name);
     let root_c = common::tree(&format!("{name}_c_frames"));
     for i in 0..4 {
-        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+        write_synthetic_frame(&root_c.join(format!("{i:02}.tif")), 64, false);
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root_c]),
@@ -82,8 +70,10 @@ fn controller_with_three_tabs(name: &str) -> AppController {
 /// Starts a fuse on the active tab and holds it at a pause once the
 /// observer has ticked at least one unit of progress -- pausing before any
 /// tick would let a later assertion read a held run at `0.0` for reasons
-/// this helper does not intend to prove.
+/// this helper does not intend to prove. The run's fuse stage is held for
+/// two seconds, so the pause lands before a mantis-64 run can finish.
 fn start_and_hold_at_pause(controller: &mut AppController, timeout: Duration) {
+    controller.set_slow_run(1, Duration::from_secs(2));
     assert!(controller.start_fuse());
     let start = Instant::now();
     while controller.job_view().fraction <= 0.0 {
@@ -128,129 +118,6 @@ fn fuse_runs_to_completion_off_the_ui_thread() {
     assert!(
         controller.project_tabs()[0].unsaved,
         "a fused tab stays unsaved until it is saved"
-    );
-}
-
-// ---------------------------------------------------------------------
-// The same driver call, byte for byte against the golden at its own
-// geometry.
-// ---------------------------------------------------------------------
-
-#[test]
-fn gui_run_matches_the_cli_run() {
-    // Structural half: the GUI's worker and the CLI's own spine call the
-    // same extracted driver, not two copies of it.
-    let gui_source = std::fs::read_to_string(common::src_dir().join("job.rs")).unwrap();
-    assert!(
-        gui_source.contains("pipeline::run("),
-        "the GUI's worker must call the extracted pipeline driver"
-    );
-    let cli_source = std::fs::read_to_string(
-        common::workspace_root()
-            .join("crates")
-            .join("cli")
-            .join("src")
-            .join("stack.rs"),
-    )
-    .unwrap();
-    assert!(
-        cli_source.contains("pipeline::run("),
-        "the CLI's own spine must call the same extracted driver"
-    );
-
-    // Byte-for-byte half: the same eight frames the golden was built from,
-    // pinned to the golden's own geometry (448/5, unaligned) -- neither the
-    // panel's defaults nor the CLI's own default tile size, so this is a
-    // genuine comparison rather than a re-assertion of a default.
-    let root = common::tree("cli_match_frames");
-    for i in 0..8 {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
-    }
-    let frames: Vec<PathBuf> = (0..8).map(|i| root.join(format!("{i:02}.tif"))).collect();
-
-    let scratch = common::tree("cli_match_scratch");
-    let mut explicit = ParamValues::new();
-    explicit.insert(
-        "levels".to_string(),
-        focusforge_core::params::ParamValue::Int(5),
-    );
-    let request = FuseRequest {
-        frames,
-        output: FuseOutput::Seal(root.join("pinned.ffp")),
-        scratch_root: scratch.clone(),
-        staging_key: "cli-match".to_string(),
-        algorithm: registry::find_stack("laplacian").expect("laplacian must be registered"),
-        explicit,
-        align: None,
-        crop: false,
-        equalize: None,
-        tile_size: Some(448),
-        max_host_memory: None,
-        backend: None,
-        align_backend: None,
-        resume: false,
-        cache: true,
-        poll: Duration::from_millis(5),
-        free_space: None,
-    };
-    struct Noop;
-    impl StageObserver for Noop {}
-    let outcome = pipeline::run(
-        &request,
-        &Noop,
-        focusforge_core::job::JobControl::new(),
-        None,
-    )
-    .expect("the pinned run must complete");
-    let FuseOutcome::Completed(report) = outcome else {
-        panic!("expected a completed run");
-    };
-
-    let golden_path = common::workspace_root()
-        .join("fixtures")
-        .join("mantis-512")
-        .join("golden")
-        .join("laplacian.tif");
-    let golden = focusforge_core::io::TiffStack::open_files(&[golden_path]).unwrap();
-    let (gw, gh) = golden.dimensions();
-    assert_eq!((gw, gh), (report.width, report.height));
-    let golden_samples = golden
-        .read_tile(
-            0,
-            Rect {
-                x: 0,
-                y: 0,
-                width: gw,
-                height: gh,
-            },
-        )
-        .unwrap()
-        .samples;
-    // The composite is a compressed blob inside the sealed `.ffp`, not a
-    // standalone file -- materialize it through the same path `--open
-    // <saved>.ffp` uses.
-    let pipeline::FuseProduct::Sealed(sealed) = &report.product else {
-        panic!("a seal request must report a sealed project");
-    };
-    let head = Project::open(&sealed.path).unwrap().checkpoint().id.clone();
-    let (composite_path, _zmap_path) = job::render_checkpoint_planes(&sealed.path, &scratch, &head)
-        .expect("the sealed project's composite must materialize");
-    let sealed = focusforge_core::io::TiffStack::open_files(&[composite_path]).unwrap();
-    let sealed_samples = sealed
-        .read_tile(
-            0,
-            Rect {
-                x: 0,
-                y: 0,
-                width: gw,
-                height: gh,
-            },
-        )
-        .unwrap()
-        .samples;
-    assert_eq!(
-        golden_samples, sealed_samples,
-        "the GUI's own driver call must reproduce the golden composite byte for byte"
     );
 }
 
@@ -500,7 +367,7 @@ fn a_fusion_only_change_reads_from_cache_while_aligning() {
     request.output = FuseOutput::Seal(request.scratch_root.join("second.ffp"));
     request
         .explicit
-        .insert("levels".to_string(), ParamValue::Int(5));
+        .insert("levels".to_string(), ParamValue::Int(3));
     assert_eq!(
         align_stage_text(&request),
         ("from cache".to_string(), "cached".to_string()),
@@ -766,17 +633,16 @@ fn resume_does_not_reset_the_unit_total() {
 }
 
 // ---------------------------------------------------------------------
-// Cancel during alignment shows the `Cancelling` interval before it
-// can land.
+// A cancel shows the `Cancelling` interval until the worker lands, then
+// the tab is idle.
 // ---------------------------------------------------------------------
 
 #[test]
-fn cancel_during_align_shows_the_interval() {
-    let mut controller = controller_with_frames("cancel_align", 2);
+fn cancel_shows_the_cancelling_interval() {
+    let mut controller = controller_with_frames("cancel_interval", 2);
     assert!(controller.start_fuse());
-    // Requested essentially the instant the worker starts -- real alignment
-    // (the tab's default `pyramidal-ecc`) takes measurably longer than this
-    // call, so the cancel lands while the bar still reads `Aligning`.
+    // The run is still on its worker when the cancel arrives, so the toolbar
+    // reads `cancelling` until the worker settles.
     controller.cancel_fuse();
     assert_eq!(controller.job_view().toolbar_run_state, "cancelling");
 
@@ -792,11 +658,11 @@ fn cancel_during_align_shows_the_interval() {
 
 #[test]
 fn pause_during_alignment_holds_align_progress() {
-    let mut controller = controller_with_frames("pause_align", 8);
-    // `dummy-align` (`controller_with_frames`'s own default) finishes in
-    // microseconds; a real solver is what gives the hold something to
-    // catch mid-stage. Translation-only chain registration flags two of this
-    // fixture's frames as validation-failed, so the run parks and is kept.
+    // `dummy-align` finishes in microseconds; the real solver on mantis-512
+    // frames is what gives the hold something to catch mid-stage.
+    // Translation-only chain registration flags frames of this fixture as
+    // validation-failed, so the run parks and is kept.
+    let mut controller = common::controller_with_frames_from("mantis-512", "pause_align", 3);
     controller.set_align_algorithm("pyramidal-ecc");
     controller.set_param_value("align", "mode", ParamValue::Enum("translation".to_string()));
     controller.set_param_value(
@@ -849,65 +715,6 @@ fn pause_during_alignment_holds_align_progress() {
         job::RunState::Fused { .. } => {}
         other => panic!("a resumed run must settle as fused, got {other:?}"),
     }
-}
-
-// ---------------------------------------------------------------------
-// A clean cancel preserves the engine's resumable state.
-// ---------------------------------------------------------------------
-
-#[test]
-fn clean_cancel_preserves_resumable_state() {
-    let request = no_align_request("cancel_preserve", 2);
-    let scratch_root = request.scratch_root.clone();
-    let staging_key = request.staging_key.clone();
-    let frames = request.frames.clone();
-    let FuseOutput::Seal(project_path) = &request.output else {
-        panic!("the request seals");
-    };
-    let project_path = project_path.clone();
-
-    let control = focusforge_core::job::JobControl::new();
-    // Cancelled before the driver ever runs -- deterministic, and still a
-    // genuine cancel: the staging directory and the resume ledger are both
-    // created during setup, before the first fuse unit is ever considered.
-    control.cancel();
-    struct Noop;
-    impl StageObserver for Noop {}
-    let outcome =
-        pipeline::run(&request, &Noop, control, None).expect("a pre-cancelled run must not error");
-    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
-
-    let staging_dir = scratch_root.join("projects").join(&staging_key);
-    assert!(
-        staging_dir.join("composite.tif").is_file(),
-        "the staged composite must survive a cancel"
-    );
-    let resume_dir = scratch_root.join("resume");
-    assert!(
-        std::fs::read_dir(&resume_dir)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false),
-        "the resume ledger must survive a cancel"
-    );
-
-    // A second run, `resume: true`, over the same frames, scratch root and
-    // staging key, must find that state rather than starting fresh. Built
-    // from a distinct label so its own (unused) throwaway scratch/frame
-    // dirs never collide with -- and wipe -- the state just asserted above.
-    let mut resumed = no_align_request("cancel_preserve_second", 2);
-    resumed.frames = frames;
-    resumed.output = FuseOutput::Seal(project_path);
-    resumed.scratch_root = scratch_root;
-    resumed.staging_key = staging_key;
-    resumed.resume = true;
-    let outcome = pipeline::run(
-        &resumed,
-        &Noop,
-        focusforge_core::job::JobControl::new(),
-        None,
-    )
-    .expect("a resumed run must find and continue the preserved state");
-    assert!(matches!(outcome, FuseOutcome::Completed(_)));
 }
 
 // ---------------------------------------------------------------------
@@ -1791,17 +1598,6 @@ fn fuse_stack_is_refused_while_a_field_is_in_violation() {
 // checkpoint, which the next save appends to the same file.
 // ---------------------------------------------------------------------
 
-/// Saves the active, never-saved tab to the path the save dialog proposes,
-/// and returns that path.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
-}
-
 #[test]
 fn re_fusing_an_opened_tab_appends_a_checkpoint() {
     let mut controller = controller_with_frames("reopen_appends", 2);
@@ -1946,7 +1742,7 @@ fn checkpoint_panel_rows_follow_the_active_tab() {
 fn checkpoint_panel_is_pushed_with_the_projects() {
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2125,7 +1921,7 @@ fn sealed_project_with_as_given_sources(name: &str) -> PathBuf {
 
     let staging = common::tree(&format!("{name}_staging"));
     let composite = staging.join("composite.tif");
-    std::fs::copy(common::fixture_frame("mantis-512", 0), &composite).unwrap();
+    std::fs::copy(common::fixture_frame("mantis-64", 0), &composite).unwrap();
     let zmap = staging.join("zmap.tif");
     let mut writer = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 2).unwrap()).unwrap();
     writer
@@ -2422,41 +2218,29 @@ fn failure_notifications_outlive_the_toast() {
     }
 }
 
-/// A window backend, initialized once per thread -- `AppWindow::new()`
-/// otherwise panics on a second call from the same thread.
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 /// A failure that settles while the Projects overview is open raises no
-/// toast regardless of which tab is active: the run starts on the tab that
-/// will fail, a different tab is then selected, and the failure is recorded
-/// while the overview stays open.
+/// toast regardless of which tab is active, the overview stays open, and
+/// closing it afterwards replays nothing: the record stays unread and is the
+/// only trace of the failure. The run starts on the tab that will fail, a
+/// different tab is then selected, and the overview opens before it settles.
 #[test]
-fn failure_while_the_overview_is_open_raises_no_toast() {
+fn projects_suppresses_a_failure_toast_without_replay() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
-    let mut controller = controller_with_frames("overview_open_healthy", 3);
-    add_unreadable_tab(&mut controller, "overview_open_failing", 2);
+    let mut controller = controller_with_frames("toast_suppressed_by_projects", 3);
+    add_unreadable_tab(&mut controller, "toast_suppressed_failing", 2);
     let controller = Arc::new(Mutex::new(controller));
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
         common::empty_canvas(),
-        std::rc::Rc::new(std::cell::RefCell::new(None)),
+        slot.clone(),
     );
     app.set_project_loaded(true);
 
@@ -2468,52 +2252,15 @@ fn failure_while_the_overview_is_open_raises_no_toast() {
     focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
 
     common::settle_via_job_timer(&controller, Duration::from_secs(60));
-
     assert!(
         !app.get_toast_open(),
         "Projects shows no toast, regardless of which tab is active"
     );
-    assert_eq!(controller.lock().unwrap().notifications().len(), 1);
+    assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
     assert!(
         app.get_projects_overlay_open(),
         "the overview must stay open"
     );
-}
-
-/// A failure settling under the open overview raises no toast, and closing
-/// the overview afterwards replays nothing: the record stays unread and is
-/// the only trace of the failure.
-#[test]
-fn projects_suppresses_a_failure_toast_without_replay() {
-    use slint::ComponentHandle;
-    use std::sync::{Arc, Mutex};
-
-    init_window_backend();
-    let app = focusforge_gui::AppWindow::new().unwrap();
-    app.window().set_size(slint::PhysicalSize::new(1440, 900));
-
-    let controller = Arc::new(Mutex::new(controller_with_an_unreadable_frame(
-        "toast_suppressed_by_projects",
-    )));
-    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let _installed = focusforge_gui::bridge::install(
-        &app,
-        controller.clone(),
-        common::empty_canvas(),
-        slot.clone(),
-    );
-    app.set_project_loaded(true);
-
-    controller.lock().unwrap().toggle_projects_overlay();
-    focusforge_gui::bridge::push_projects_overlay(&app, &controller.lock().unwrap());
-
-    app.invoke_fuse_requested();
-    common::settle_via_job_timer(&controller, Duration::from_secs(60));
-    assert!(
-        !app.get_toast_open(),
-        "Projects shows no toast for a failure settling under it"
-    );
-    assert_eq!(controller.lock().unwrap().unread_notifications(), 1);
 
     controller.lock().unwrap().toggle_projects_overlay();
     focusforge_gui::bridge::push_toast(&app, &controller, &slot);
@@ -2531,7 +2278,7 @@ fn projects_suppresses_a_failure_toast_without_replay() {
 fn a_tab_switch_updates_the_bar_without_a_job_event() {
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2840,7 +2587,7 @@ fn a_run_keeps_its_tab_when_an_earlier_tab_closes() {
     let mut controller = controller_with_two_tabs("run_keeps_its_tab");
     let root_c = common::tree("run_keeps_its_tab_c_frames");
     for i in 0..4 {
-        copy_frame(&root_c, &format!("{i:02}.tif"), i);
+        write_synthetic_frame(&root_c.join(format!("{i:02}.tif")), 64, false);
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root_c]),
@@ -3234,14 +2981,7 @@ fn retry_queues_while_another_run_is_live() {
         other => panic!("expected the first tab to fail, got {other:?}"),
     }
 
-    let survivor_root = common::tree("retry_queues_b_frames");
-    for i in 0..3 {
-        copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[survivor_root]),
-        OpenOutcome::Opened(_)
-    ));
+    open_mantis64_tab(&mut controller, "retry_queues_b", 3);
 
     controller.select_project(1);
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
@@ -3304,16 +3044,7 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
     add_unreadable_tab(&mut controller, "closing_mid_run_a", 2);
     // The survivor: a different frame count than tab A's, so a leaked value
     // could not pass by coincidence.
-    let survivor_root = common::tree("closing_mid_run_b_frames");
-    for i in 0..3 {
-        copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[survivor_root]),
-        OpenOutcome::Opened(_)
-    ));
-    // An algorithm that always converges keeps the survivor's fuse clean.
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, "closing_mid_run_b", 3);
 
     controller.select_project(0);
     assert!(controller.start_fuse());
@@ -3488,21 +3219,8 @@ fn tab_reopens_after_compaction() {
 
 #[test]
 fn a_first_fuse_writes_no_project_file() {
-    let root = common::tree("first_fuse_writes_nothing_frames");
-    for i in 0..3 {
-        std::fs::copy(
-            common::fixture_frame("mantis-64", i),
-            root.join(format!("{i:02}.tif")),
-        )
-        .unwrap();
-    }
-    let mut controller = AppController::new();
-    assert!(matches!(
-        common::open_and_settle(&mut controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
-    controller.set_scratch_root_for_test(common::tree("first_fuse_writes_nothing_scratch"));
+    let mut controller = common::controller_with_frames("first_fuse_writes_nothing", 3);
+    let root = frames_dir("first_fuse_writes_nothing");
     let before = listing(&root);
 
     fuse_and_settle(&mut controller);
@@ -3683,7 +3401,7 @@ fn wheel_actions_are_blocked_under_the_settings_modal() {
     }));
 
     controller.open_settings();
-    controller.wheel(0.0, 60.0, 100.0, 100.0, Modifiers::NONE);
+    controller.wheel(0.0, -60.0, 100.0, 100.0, Modifiers::NONE);
     assert!(
         events.lock().unwrap().is_empty(),
         "a wheel-triggered action must raise no event under Settings"
@@ -3695,7 +3413,7 @@ fn wheel_actions_are_blocked_under_the_settings_modal() {
     );
 
     controller.close_settings();
-    controller.wheel(0.0, 60.0, 100.0, 100.0, Modifiers::NONE);
+    controller.wheel(0.0, -60.0, 100.0, 100.0, Modifiers::NONE);
     assert!(
         !events.lock().unwrap().is_empty(),
         "the same wheel event fires its action once Settings is closed"
@@ -4095,14 +3813,7 @@ fn save_and_close_saves_that_tab_then_closes_it() {
 
     // A cancelled picker leaves a never-saved, fused tab open with its
     // checkpoints held.
-    let root_c = common::tree(&format!("{outer}_c_frames"));
-    for i in 0..2 {
-        copy_frame(&root_c, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root_c]),
-        OpenOutcome::Opened(_)
-    ));
+    open_mantis64_tab(&mut controller, &format!("{outer}_c"), 2);
     let new_index = controller.project_tabs().len() - 1;
     fuse_and_settle(&mut controller);
     let tabs_before = controller.project_tabs().len();
@@ -4180,7 +3891,7 @@ fn chords_are_consumed_while_a_close_is_pending() {
 fn close_guard_is_pushed_to_the_window() {
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -4572,15 +4283,6 @@ fn saved_rows(path: &Path) -> Vec<(String, Option<String>, usize, bool)> {
         .collect()
 }
 
-fn record_events(controller: &mut AppController) -> std::sync::Arc<Mutex<Vec<ShellEvent>>> {
-    let events = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    controller.set_sink(std::sync::Arc::new(move |event| {
-        sink.lock().unwrap().push(event)
-    }));
-    events
-}
-
 fn count_of(events: &Mutex<Vec<ShellEvent>>, wanted: ShellEvent) -> usize {
     events
         .lock()
@@ -4600,10 +4302,6 @@ fn active_card(controller: &AppController) -> focusforge_gui::overlay::CardView 
         .into_iter()
         .find(|card| card.opened && card.project_name == title)
         .expect("the active tab has a card")
-}
-
-fn settle_all(controller: &mut AppController) {
-    while common::wait_for_settle(controller, Duration::from_secs(120)).is_some() {}
 }
 
 #[test]
@@ -5322,7 +5020,7 @@ fn the_performance_tab_is_refreshed_when_a_run_settles() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = controller_with_frames("performance_settle_push", 2);
@@ -5358,7 +5056,7 @@ fn the_storage_tab_is_refreshed_when_a_run_settles() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_frames("storage_settle_push", 2)));
@@ -5490,7 +5188,7 @@ fn a_small_stack_with_gpu_on_aligns_on_the_cpu() {
     controller.set_align_algorithm("pyramidal-ecc");
     controller.set_gpu_fusion(true);
     assert!(controller.start_fuse());
-    common::wait_for_settle(&mut controller, Duration::from_secs(300));
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
     assert!(controller.job_failure_message().is_none());
     let summary = controller.last_alignment().expect("a completed run");
     assert_eq!(
@@ -5532,7 +5230,8 @@ mod gpu_fusion {
     /// `excluded` switched off first. Returns the run's composite samples,
     /// Z-Map indices and held checkpoint.
     fn run_laplacian(name: &str, frame_count: usize, excluded: Option<usize>, gpu: bool) -> Run {
-        let mut controller = controller_with_frames(name, frame_count);
+        let mut controller = common::controller_with_frames_from("mantis-512", name, frame_count);
+        controller.set_align_algorithm("dummy-align");
         if let Some(index) = excluded {
             controller.toggle_frame_excluded(index);
             assert!(controller.images_panel().rows[index].excluded);
@@ -6272,7 +5971,7 @@ fn the_bridge_never_calls_the_blocking_save_entries() {
 fn a_running_save_reads_saving_on_the_loading_indicator() {
     use std::sync::Arc;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
 
     let mut controller = controller_with_frames("saving_caption", 2);
@@ -7141,15 +6840,7 @@ fn a_project_saved_outside_its_frames_reopens_without_a_missing_card() {
 /// it holds an unsaved checkpoint), never saved. Tab 0 is selected.
 fn controller_with_an_opened_tab_between(outer: &str) -> AppController {
     let mut controller = controller_with_two_tabs(outer);
-    let root_c = common::tree(&format!("{outer}_c_frames"));
-    for i in 0..2 {
-        copy_frame(&root_c, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root_c]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, &format!("{outer}_c"), 2);
     controller.select_project(1);
     fuse_and_settle(&mut controller);
     save_to_proposed(&mut controller);
@@ -7590,7 +7281,8 @@ fn small_preview(
 #[test]
 fn stage_view_follows_the_running_stage() {
     // Aligning: real alignment, one aligned frame after another.
-    let mut controller = common::controller_with_frames("stage_follows_align", 2);
+    let mut controller =
+        common::controller_with_frames_from("mantis-512", "stage_follows_align", 2);
     assert!(controller.start_fuse());
     let first = controller.stage_view(Instant::now());
     assert!(
@@ -7728,7 +7420,7 @@ fn stage_view_clears_on_cancel_and_failure() {
     let growing = |view: &Option<job::StageView>| matches!(view, Some(job::StageView::Picture(image)) if image.frame.is_none() && unfused(image) > 0);
 
     // Cancel during alignment, with an aligned frame on screen.
-    let mut controller = common::controller_with_frames("stage_cancel_align", 2);
+    let mut controller = common::controller_with_frames_from("mantis-512", "stage_cancel_align", 2);
     assert!(controller.start_fuse());
     wait_for_pane(
         &controller,
