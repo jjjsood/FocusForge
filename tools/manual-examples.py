@@ -358,11 +358,13 @@ class Runner:
             raise SystemExit(f"focusforge-cli {args[0]} exited {result.returncode}")
         return result.stdout
 
-    def fuse(self, name: str, frames: list[tuple[int, int, int]], size: tuple[int, int], *flags: str) -> Fused:
+    def fuse(
+        self, name: str, frames: list[tuple[int, int, int]], size: tuple[int, int], *flags: str, source: str = FRAMES
+    ) -> Fused:
         """Cut `frames` into a fresh stack directory and fuse it.
 
-        Each frame is (fixture index, x, y): a `size` read starting at (x, y)
-        of `fixtures/mantis-512/frames/NN.tif`. Files keep the fixture's
+        Each frame is (index, x, y): a `size` read starting at (x, y) of
+        `<source>/NN.tif`, by default the fixture frames. Files keep that
         number, so a thinned stack still names its frames by focus position.
         A name already fused in this run is reused.
         """
@@ -376,9 +378,9 @@ class Runner:
         os.makedirs(out_dir)
         w, h = size
         for index, x, y in frames:
-            source = os.path.join(FRAMES, f"{index:02d}.tif")
-            info = rawtiff.read_info(source)
-            pixels = rawtiff.read_rect(source, x, y, w, h, info)
+            path = os.path.join(source, f"{index:02d}.tif")
+            info = rawtiff.read_info(path)
+            pixels = rawtiff.read_rect(path, x, y, w, h, info)
             rawtiff.write_tiff(os.path.join(stack_dir, "frames", f"{index:02d}.tif"), w, h, pixels)
         report = json.loads(
             self.run("stack", stack_dir, "-o", out_dir, "--cpu", "--no-cache", "--no-progress", "--json", *flags)
@@ -389,7 +391,12 @@ class Runner:
         crop = report.get("crop") or {"x": 0, "y": 0}
         fused = Fused(os.path.join(out_dir, projects[0]), crop["x"], crop["y"])
         self.fused[name] = fused
-        print(f"  fused {name}: {len(frames)} frames, crop at {crop['x']},{crop['y']}")
+        align = report.get("align") or {}
+        fallback = [a["name"] for a in align.get("alignments", []) if a.get("fallback")]
+        print(
+            f"  fused {name}: {len(frames)} frames, crop at {crop['x']},{crop['y']}"
+            + (f", not registered: {' '.join(fallback)}" if fallback else "")
+        )
         return fused
 
     def composite(self, fused: Fused, project: str | None = None) -> Image:
@@ -398,11 +405,15 @@ class Runner:
         self.run("export", project, "-o", path, "--exif", "off", "--icc", "off")
         return read_tiff8(path)
 
-    def frame(self, fused: Fused, position: int) -> Image:
-        """Source frame `position` (0-based, in the stack's order) as fused."""
-        path = fused.project[:-4] + f"-frame{position:02d}.tif"
+    def frame_tiff(self, fused: Fused, position: int, path: str | None = None) -> str:
+        """Writes source frame `position` (0-based, in the stack's order) as
+        fused: warped and cropped to the composite. Returns the TIFF's path."""
+        path = path or fused.project[:-4] + f"-frame{position:02d}.tif"
         self.run("export", fused.project, "--frame", str(position), "--frame-output", path)
-        return read_tiff8(path)
+        return path
+
+    def frame(self, fused: Fused, position: int) -> Image:
+        return read_tiff8(self.frame_tiff(fused, position))
 
     def zmap(self, fused: Fused) -> tuple[int, int, list[int]]:
         path = fused.project[:-4] + "-zmap.tif"
@@ -455,6 +466,7 @@ GREY = (205, 205, 205)
 
 ALL_FRAMES = [(i, 0, 0) for i in range(8)]
 FULL = (512, 512)
+MOVE_X, MOVE_Y = 20, 12
 DETAILS = ("--algorithm", "laplacian")
 
 
@@ -501,16 +513,35 @@ def halos(r: Runner, emit) -> None:
 
 
 def motion(r: Runner, emit) -> None:
-    # Simulated camera movement: frames 03-07 are read 12 px right and 8 px down
-    # of frames 00-02, so their content sits 12 px left and 8 px up. Fused once
-    # with alignment off (the movement shows) and once with the default
-    # alignment (it is corrected). Window in frame 03's pixels.
-    shifted = [(i, 16, 16) for i in range(3)] + [(i, 28, 24) for i in range(3, 8)]
-    size = (480, 480)
-    unaligned = r.fuse("motion-unaligned", shifted, size, *DETAILS, "--no-align")
-    aligned = r.fuse("motion-aligned", shifted, size, *DETAILS)
-    window = (120, 90, 256, 256)
-    panels = [r.composite(f).crop(*in_reference(f, *window)) for f in (unaligned, aligned)]
+    # Simulated camera movement between frames 02 and 03: frames 03-07 are
+    # read MOVE_X px right and MOVE_Y px down of frames 00-02, so their
+    # content sits that far left and up.
+    #
+    # Left panel: the movement alone. The frames are first lined up by the
+    # default stack (exported with `--frame`), then moved, then fused with
+    # alignment off.
+    # Right panel: the same movement on the fixture frames, fused with
+    # alignment on in its translation-only mode. (In its default
+    # rotation-and-scale mode the solver does not register frame 02 onto
+    # frame 03 in this small, mostly featureless window and falls back to
+    # identity.)
+    #
+    # The window is given in the default stack's composite pixels and mapped
+    # into each result through the reads above, so both panels show one scene.
+    base = r.fuse("all-details", ALL_FRAMES, FULL, *DETAILS)
+    lined_up = os.path.join(r.work, "motion-lined-up")
+    os.makedirs(lined_up, exist_ok=True)
+    for i in range(8):
+        r.frame_tiff(base, i, os.path.join(lined_up, f"{i:02d}.tif"))
+    moved = [(i, 2, 2) for i in range(3)] + [(i, 2 + MOVE_X, 2 + MOVE_Y) for i in range(3, 8)]
+    simulated = r.fuse("motion-unaligned", moved, (336, 336), *DETAILS, "--no-align", source=lined_up)
+    moved = [(i, 4, 4) for i in range(3)] + [(i, 4 + MOVE_X, 4 + MOVE_Y) for i in range(3, 8)]
+    realigned = r.fuse("motion-aligned", moved, (480, 480), *DETAILS, "--align-set", "mode=translation")
+    x, y, w, h = 55, 20, 240, 240
+    # Frame 03's pixel (x, y) of the lined-up frames, in each stack's reference.
+    left = in_reference(simulated, x - 2 - MOVE_X, y - 2 - MOVE_Y, w, h)
+    right = in_reference(realigned, x + base.crop_x - 4 - MOVE_X, y + base.crop_y - 4 - MOVE_Y, w, h)
+    panels = [r.composite(simulated).crop(*left), r.composite(realigned).crop(*right)]
     emit("failure-images/motion.jpg", side_by_side(panels))
 
 
