@@ -16,6 +16,7 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [open-and-refusals](open-and-refusals.md) | 12, 16 | RAW folder, compressed TIFF variants, empty start, not-a-project, mismatch and missing-frames projects, grouping question, skipped subfolder, failed fuse |
 | [notifications](notifications.md) | 15 | bell and unread count, notification center, toasts, crash record |
 | [step-calculator](step-calculator.md) | 20 | calculator button and overlay, Lens and Objective optics, entered boxes, SUMMARY read-out, violation line, one overlay at a time, no project open |
+| [analytics](analytics.md) | 21 | Analytics button and overlay, one row per frame (chip, name, bar, count), waiting caption, recount on tab switch, close and Escape, one overlay at a time, button greyed with no project |
 
 ## Human only
 
