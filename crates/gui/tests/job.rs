@@ -7281,7 +7281,8 @@ fn small_preview(
 #[test]
 fn stage_view_follows_the_running_stage() {
     // Aligning: real alignment, one aligned frame after another.
-    let mut controller = common::controller_with_frames("stage_follows_align", 2);
+    let mut controller =
+        common::controller_with_frames_from("mantis-512", "stage_follows_align", 2);
     assert!(controller.start_fuse());
     let first = controller.stage_view(Instant::now());
     assert!(
@@ -7419,7 +7420,7 @@ fn stage_view_clears_on_cancel_and_failure() {
     let growing = |view: &Option<job::StageView>| matches!(view, Some(job::StageView::Picture(image)) if image.frame.is_none() && unfused(image) > 0);
 
     // Cancel during alignment, with an aligned frame on screen.
-    let mut controller = common::controller_with_frames("stage_cancel_align", 2);
+    let mut controller = common::controller_with_frames_from("mantis-512", "stage_cancel_align", 2);
     assert!(controller.start_fuse());
     wait_for_pane(
         &controller,

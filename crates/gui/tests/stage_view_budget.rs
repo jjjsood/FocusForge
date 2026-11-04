@@ -315,7 +315,7 @@ fn measure(
 /// A run request over `count` fixture frames, with the GUI's default
 /// algorithms and flags.
 fn template(name: &str, count: usize, gpu: bool) -> JobRequest {
-    let mut request = common::controller_with_frames(name, count)
+    let mut request = common::controller_with_frames_from("mantis-512", name, count)
         .job_request_for(0)
         .expect("the project has a request");
     request.gpu = gpu;

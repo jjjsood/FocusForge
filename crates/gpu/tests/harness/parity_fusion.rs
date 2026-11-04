@@ -755,7 +755,7 @@ fn sharpness_heatmap_parity() {
     let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
         return;
     };
-    // The interior rect and golden tile 0 of the composite parity tests.
+    // A true-interior rect and the border-clamped tile-0 rect of the golden geometry.
     for (label, rect, levels) in [
         (
             "interior",
