@@ -523,21 +523,12 @@ def halos(r: Runner, emit) -> None:
 
 
 def motion(r: Runner, emit) -> None:
-    # Simulated camera movement between frames 02 and 03: frames 03-07 are
-    # read MOVE_X px right and MOVE_Y px down of frames 00-02, so their
-    # content sits that far left and up.
-    #
-    # Left panel: the movement alone. The frames are first lined up by the
-    # default stack (exported with `--frame`), then moved, then fused with
-    # alignment off.
-    # Right panel: the same movement on the fixture frames, fused with
-    # alignment on in its translation-only mode. (In its default
-    # rotation-and-scale mode the solver does not register frame 02 onto
-    # frame 03 in this small, mostly featureless window and falls back to
-    # identity.)
-    #
-    # The window is given in the default stack's composite pixels and mapped
-    # into each result through the reads above, so both panels show one scene.
+    # Simulated movement between frames 02 and 03: frames 03-07 are read MOVE_X px
+    # right and MOVE_Y px down, so their content sits that far left and up.
+    # Left: the default stack's lined-up frames (`--frame`), moved, fused with
+    # alignment off. Right: the same movement on the fixture frames, fused with
+    # translation-only alignment (rotation + scale falls back to identity in this
+    # small featureless window). The window is in default-stack composite pixels.
     base = r.fuse("all-details", ALL_FRAMES, FULL, *DETAILS)
     lined_up = os.path.join(r.work, "motion-lined-up")
     os.makedirs(lined_up, exist_ok=True)

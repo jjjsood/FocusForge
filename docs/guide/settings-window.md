@@ -387,7 +387,7 @@ terminal, there too. The warning names the file, the line and the problem,
 for example:
 
 ```
-settings.toml:7: trigger "shift+wheel" duplicates the one already read at line 2
+settings.toml:<line>: trigger "shift+wheel" duplicates the one already read at line <first line>
 ```
 
 FocusForge leaves the refused table in the file as you wrote it. Fix the line

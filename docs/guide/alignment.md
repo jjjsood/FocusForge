@@ -62,8 +62,8 @@ method, so the menu has one entry.
 | **Enabled** | on / off | on | Lines every frame up with the reference frame before fusing. Off fuses the frames exactly as they were read. |
 | **Algorithm** | **Pyramidal ECC** | **Pyramidal ECC** | The alignment method. |
 | **Mode** | **Translation only**, **Rotation + Scale** | **Rotation + Scale** | Which movements are corrected: a shift only, or a shift plus a change of size and a small rotation. |
-| **Max Iterations** | 1 to 1000 | 400 | How many refinement steps alignment may take at each size of the pyramid. |
-| **Epsilon (px)** | 0.000000001 to 1 | 0.0001 | How small, in pixels, the last refinement step must be before alignment counts a frame as settled. |
+| **Max Iterations** | 1 to 1000 | 400 | How many iterations alignment may take at each size of the pyramid. |
+| **Epsilon (px)** | 0.000000001 to 1 | 0.0001 | How small, in pixels, the last iteration's step must be before alignment counts a frame as settled. |
 | **Pyramid Depth** | 0 to 16 | worked out from the frame size | How many smaller versions of the frame are compared before the full-size one. |
 | **Reference Policy** | **Anchor**, **Chain** | **Chain** | Whether every frame is compared directly with the reference frame, or step by step through its neighbours. |
 | **Reference Frame** | **First**, **Middle**, **Last** | **Middle** | Which frame the others are lined up with. |
@@ -111,7 +111,7 @@ that frame.
 These three control how hard alignment works. Their defaults suit everything
 from small frames to very large ones; leave them unless you have a reason.
 
-- **Max Iterations** caps the refinement steps at each pyramid size. Frames
+- **Max Iterations** caps the iterations at each pyramid size. Frames
   that settle earlier stop early and cost nothing extra; on a 61-frame stack
   of 44.8-megapixel frames, no size ever needed more than 202 steps. A frame
   that reaches the cap is not rejected: it keeps the best position found so
