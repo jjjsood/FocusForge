@@ -38,6 +38,8 @@ fixtures/      small checked-in TIFF crops, a RAW DNG fixture, folders that open
                or are refused, and `.ffp` projects (valid, corrupt, mismatched,
                missing frames) used by the test suite and the UI journeys
 tests/ui/      end-to-end window journeys written as numbered steps
+docs/          the user manual, an mdBook (`book.toml` at the root); its
+               images live in `docs/assets/manual/`
 ```
 
 ## Tech stack
@@ -204,10 +206,54 @@ attaches: start the binary, then connect Tracy from the same machine — the
 client listens on localhost and announces itself nowhere. Stage and tile
 zones appear live, named by their fields.
 
-`focusforge-gui` takes the same feature and reads the same variable; its
-`gui_`-prefixed spans draw on their own admission budget, apart from the
-processing spans, and the closing `timing_summary` span reports both. Add
-`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` to see Slint's frame timing.
+### Profiling the window
+
+`focusforge-gui` takes the same feature and reads the same variable. Its
+trace covers the window's own activity — input, redraws, canvas
+publication, saves and stroke renders — beside the processing spans of any
+fuse run in the same session:
+
+```
+cargo build --release -p focusforge-gui --features trace
+FOCUSFORGE_TRACE_FILE=gui-trace.json target/release/focusforge-gui
+```
+
+The window's `gui_`-prefixed spans draw on their own admission budget, so a
+long session cannot starve the processing spans of a fuse running in the
+same process. The closing `timing_summary` span records each budget, how
+many spans it admitted and how many it refused.
+
+To see Slint's own frame timing as well, set
+`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment.
+Slint collects and prints refresh statistics when a frame is rendered;
+`refresh_lazy` does not force frames while the window is idle.
+
+## The user manual
+
+`docs/` is an mdBook: `docs/SUMMARY.md` is its table of contents and
+`book.toml` at the repository root configures it. The `book` workflow builds it
+with a pinned mdBook on every push and pull request and publishes it to GitHub
+Pages from `main`. To build it locally, fetch the same mdBook release the
+workflow pins (checking its SHA-256), run `mdbook build` from the repository
+root and check the links with `python3 -I tools/check-book-links.py book`.
+
+Every image in `docs/assets/manual/` is generated, never hand-taken:
+
+- Window screenshots: `python3 tools/manual-screenshots.py run` drives the
+  real window over Slint's MCP server for every entry in
+  `tools/manual-screenshots/*.toml`, each launch on its own Xvfb display at
+  1280x800, scale 1, with scratch config, data and save folders under
+  `.scratch/` and a free port. It needs the GUI built with
+  `cargo build -p focusforge-gui --features mcp`, Xvfb and Pillow; without a
+  GPU, Mesa's software Vulkan driver is enough. `--only NAME` redoes one shot;
+  `start`/`tree`/`click-id`/`shot` explore a state before you add an entry.
+  `--selftest` checks the shot lists without a display.
+- Part I example crops: `python3 -I tools/manual-examples.py` (standard
+  library, through `focusforge-cli`, byte for byte; `--check` compares).
+- The fusion-method comparison: `python3 -I tools/manual-fusion-compare.py`.
+
+A change to the window that moves a documented control or changes its text
+should come with the matching page edit and regenerated screenshots.
 
 ## Before you send a change
 
