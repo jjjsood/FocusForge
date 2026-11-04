@@ -72,6 +72,11 @@ depend on your computer.*
 
 ### GPU processing and the Backend line
 
+**GPU processing** governs fusing only. How the window itself is drawn is
+separate: on a machine without a GPU the window draws on a software adapter
+whatever this switch says (see [Machines without a
+GPU](../getting-started.md#machines-without-a-gpu)).
+
 With **GPU processing** on, FocusForge tries the graphics card for every
 fuse whose fusion method has a GPU version, and falls back to the processor
 when that is not possible. The result is the same either way; the GPU is

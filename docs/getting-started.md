@@ -101,6 +101,9 @@ session), logging a warning that names it. It runs there at software speed.
 When no adapter works at all it exits with an error; on Windows, started from
 the Start menu, it shows that error in a message box.
 
+`focusforge-gui --version` prints the program name and its version, for
+example `focusforge-gui 0.1.0`, and exits without opening a window.
+
 On Windows, `focusforge-gui --help`, `--version` and argument errors print to
 the terminal that started the program, including when its output is
 redirected. PowerShell does not wait for a windowed program, so there pipe

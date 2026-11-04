@@ -306,6 +306,24 @@ failure whose message names the file.
 before anything is fused; exclude or remove that frame and fuse again.
 See: [Projects, notifications and quitting](guide/batch-runs.md#cards-that-need-attention).
 
+### The window is slow on a machine without a GPU
+
+The log holds the warning:
+
+```
+no GPU-backed adapter works; rendering on the software adapter <name>
+```
+
+**Cause:** none of the graphics adapters in the computer can draw the
+window, as in a virtual machine or a Remote Desktop session, so
+FocusForge draws it on a software adapter. Panning, zooming and the live
+view are slower there; fusing is not affected.
+
+**Fix:** nothing is required. For a faster window, run FocusForge on the
+machine itself, or install a graphics driver. The **GPU processing**
+switch does not change this.
+See: [Machines without a GPU](getting-started.md#machines-without-a-gpu).
+
 ## Adding frames
 
 ### "No TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) or camera RAW images to add" and similar
