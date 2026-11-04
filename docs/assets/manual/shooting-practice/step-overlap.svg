@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 250" width="720" height="250" role="img" aria-labelledby="t d">
+<title id="t">Steps and overlap across a subject</title>
+<desc id="d">Seven frames whose sharp zones are each one depth of field long. Their centres are one step apart, so neighbouring zones overlap. The first zone is centred on the front of the subject and the last on its back.</desc>
+<style>
+text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;fill:#808080}
+.s{font-size:12px}
+.z{fill:#3d8bd9;fill-opacity:.35;stroke:#3d8bd9;stroke-width:1.5}
+.o{fill:#e08a1e;fill-opacity:.6}
+.l{stroke:#808080;stroke-width:1.5;fill:none}
+.d{stroke:#808080;stroke-width:1.2;stroke-dasharray:4 4;fill:none}
+.b{fill:#808080;fill-opacity:.28;stroke:#808080;stroke-width:1.5}
+</style>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#808080"/></marker></defs>
+<!-- sharp zones: width 80 (depth of field), centres 60 apart (step) -->
+<rect class="z" x="140" y="64" width="80" height="22" rx="3"/>
+<rect class="z" x="200" y="94" width="80" height="22" rx="3"/>
+<rect class="z" x="260" y="64" width="80" height="22" rx="3"/>
+<rect class="z" x="320" y="94" width="80" height="22" rx="3"/>
+<rect class="z" x="380" y="64" width="80" height="22" rx="3"/>
+<rect class="z" x="440" y="94" width="80" height="22" rx="3"/>
+<rect class="z" x="500" y="64" width="80" height="22" rx="3"/>
+<text x="180" y="80" text-anchor="middle" class="s" style="font-weight:600">1</text>
+<text x="240" y="110" text-anchor="middle" class="s" style="font-weight:600">2</text>
+<text x="300" y="80" text-anchor="middle" class="s" style="font-weight:600">3</text>
+<text x="360" y="110" text-anchor="middle" class="s" style="font-weight:600">4</text>
+<text x="420" y="80" text-anchor="middle" class="s" style="font-weight:600">5</text>
+<text x="480" y="110" text-anchor="middle" class="s" style="font-weight:600">6</text>
+<text x="540" y="80" text-anchor="middle" class="s" style="font-weight:600">7</text>
+<!-- overlap columns -->
+<rect class="o" x="200" y="62" width="20" height="56"/>
+<rect class="o" x="260" y="62" width="20" height="56"/>
+<rect class="o" x="320" y="62" width="20" height="56"/>
+<rect class="o" x="380" y="62" width="20" height="56"/>
+<rect class="o" x="440" y="62" width="20" height="56"/>
+<rect class="o" x="500" y="62" width="20" height="56"/>
+<!-- depth of field dimension -->
+<path class="l" d="M140 50V40M220 50V40"/>
+<path class="l" d="M142 45H218" marker-start="url(#a)" marker-end="url(#a)"/>
+<text x="180" y="30" text-anchor="middle">depth of field</text>
+<!-- step dimension -->
+<path class="l" d="M180 128H240" marker-start="url(#a)" marker-end="url(#a)"/>
+<path class="d" d="M180 86V136M240 116V136"/>
+<text x="210" y="152" text-anchor="middle">step</text>
+<!-- overlap label -->
+<path class="l" d="M290 40L272 60" marker-end="url(#a)"/>
+<text x="296" y="38">overlap (here 25%)</text>
+<!-- subject -->
+<path class="d" d="M180 162V86M540 162V86"/>
+<rect class="b" x="180" y="164" width="360" height="34" rx="17"/>
+<text x="360" y="186" text-anchor="middle">subject depth</text>
+<text x="180" y="218" text-anchor="middle" class="s">front</text>
+<text x="540" y="218" text-anchor="middle" class="s">back</text>
+<!-- axis -->
+<path class="l" d="M40 236H680" marker-end="url(#a)"/>
+<text x="40" y="228" class="s">camera side</text>
+<text x="680" y="228" text-anchor="end" class="s">farther away</text>
+</svg>
