@@ -1,7 +1,7 @@
 # Count the sharp areas of every frame in the Analytics overlay
-Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --analytics --analytics-hold-ms 8000
+Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --analytics --analytics-hold-ms 25000
 
-Use a fresh settings directory and a fresh data directory. Two folders are open: the first tab holds 3 frames, the second (selected) holds 8 frames. The overlay starts open once both folders are loaded. Every count is held back for 8 seconds, so the caption "Counting sharp areas..." stays on screen for a while after each opening. Steps that wait for the rows say `(within 30 s)`. Escape reaches the overlay only while the window's own keyboard focus is on the canvas, which it is at launch and after the Analytics button is clicked; after a tab or the "+" has been clicked it is not, so the later steps close the overlay with **Close**.
+Use a fresh settings directory and a fresh data directory. Two folders are open: the first tab holds 3 frames, the second (selected) holds 8 frames. The overlay starts open once both folders are loaded. Every count is held back for 25 seconds, so the caption "Counting sharp areas..." stays on screen for a while after each opening. Steps that wait for the rows say `(within 60 s)`. Escape reaches the overlay only while the window's own keyboard focus is on the canvas, which it is at launch and after the Analytics button is clicked; after a tab or the "+" has been clicked it is not, so the later steps close the overlay with **Close**.
 
 The Analytics button sits in the 48 px icon bar on the left edge, directly under the step calculator button, above the bell and Settings; it is reached by its label **Analytics** inside `AppWindow::icon-bar`, and it is greyed out while no project is selected. The overlay (`AppWindow::analytics-overlay`) covers the canvas below the toolbar and above the bottom bar; the right dock stays visible. While it is open the button is drawn selected: an accent-coloured icon and a thin accent bar on the icon bar's left edge. The overlay is titled "Analytics", has the heading "SHARP AREAS PER IMAGE" with the subtitle "Image areas that are sharpest in this image", and lists one row per frame in the dock's order: a coloured chip, the file name, a bar and the count at the right edge.
 
@@ -13,7 +13,7 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 1. Hover **Analytics** (`AppWindow::icon-bar`).
    Expect: the overlay titled "Analytics" covers the canvas with the heading "SHARP AREAS PER IMAGE" and the subtitle "Image areas that are sharpest in this image"; the caption "Counting sharp areas..." shows centred in the body; the toolbar row, the right dock and the bottom bar are still drawn and the dock header reads "8 frames · 0 excluded"; the Analytics button is drawn selected (accent icon, accent bar at the icon bar's left edge).
 2. Hover **Close** (`AppWindow::analytics-overlay`).
-   Expect: (within 30 s) the caption "Counting sharp areas..." is gone and eight rows are listed in the order 00.tif, 01.tif, 02.tif, 03.tif, 04.tif, 05.tif, 06.tif, 07.tif, each row with a small coloured chip left of its name and its count at the right edge reading 0, 0, 4, 11, 0, 0, 0, 1.
+   Expect: (within 60 s) the caption "Counting sharp areas..." is gone and eight rows are listed in the order 00.tif, 01.tif, 02.tif, 03.tif, 04.tif, 05.tif, 06.tif, 07.tif, each row with a small coloured chip left of its name and its count at the right edge reading 0, 0, 4, 11, 0, 0, 0, 1.
 3. Hover **Analytics** (`AppWindow::icon-bar`).
    Expect: the bar of 03.tif fills its track to the right end; the bar of 02.tif is shorter than that of 03.tif and longer than that of 07.tif; the rows 00.tif, 01.tif, 04.tif, 05.tif and 06.tif show an empty track; Must not: any row shows a figure in millimetres.
 4. (human only) Look at the rows.
@@ -30,14 +30,14 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 9. Press Escape.
    Expect: the overlay is gone and the button is drawn plain.
 10. Click **Analytics** (`AppWindow::icon-bar`).
-    Expect: (within 30 s) the overlay titled "Analytics" lists eight rows whose counts read 0, 0, 4, 11, 0, 0, 0, 1 and the caption "Counting sharp areas..." is gone.
+    Expect: (within 60 s) the overlay titled "Analytics" lists eight rows whose counts read 0, 0, 4, 11, 0, 0, 0, 1 and the caption "Counting sharp areas..." is gone.
 ## The count follows the selected tab
 11. Click the first tab (`FFTab::area` 0).
     Expect: the dock header reads "3 frames · 0 excluded"; the overlay titled "Analytics" is still open with the button drawn selected and the caption "Counting sharp areas..." again; Must not: the eight rows of the other folder stay listed.
 12. Hover **Close** (`AppWindow::analytics-overlay`).
-    Expect: (within 30 s) three rows are listed, 00.tif, 01.tif and 02.tif, each with the count 0 and an empty track; Must not: the rows 03.tif to 07.tif are listed.
+    Expect: (within 60 s) three rows are listed, 00.tif, 01.tif and 02.tif, each with the count 0 and an empty track; Must not: the rows 03.tif to 07.tif are listed.
 13. Click the second tab (`FFTab::area` 1).
-    Expect: (within 30 s) the dock header reads "8 frames · 0 excluded" and eight rows are listed whose counts read 0, 0, 4, 11, 0, 0, 0, 1.
+    Expect: (within 60 s) the dock header reads "8 frames · 0 excluded" and eight rows are listed whose counts read 0, 0, 4, 11, 0, 0, 0, 1.
 ## One overlay at a time
 14. Click **Projects** (`FFTabStrip::projects-button`).
     Expect: the projects overview (`AppWindow::projects-overlay`) shows the heading "Open projects"; the title "Analytics" is gone and the Analytics button is drawn plain.
@@ -61,6 +61,6 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 23. Click the first tab (`FFTab::area` 0).
     Expect: the dock header reads "3 frames · 0 excluded" and the Analytics button is no longer greyed out (`buttons AppWindow::icon-bar` lists **Analytics** without a leading `x`).
 24. Click **Analytics** (`AppWindow::icon-bar`).
-    Expect: (within 30 s) the overlay titled "Analytics" lists three rows, 00.tif, 01.tif and 02.tif, each with the count 0.
+    Expect: (within 60 s) the overlay titled "Analytics" lists three rows, 00.tif, 01.tif and 02.tif, each with the count 0.
 25. Click **Close** (`AppWindow::analytics-overlay`).
     Expect: the overlay is gone and the Analytics button is drawn plain.
