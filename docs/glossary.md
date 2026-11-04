@@ -184,6 +184,14 @@ Leaving a frame out of the next fuse without removing it from the project,
 with **Exclude** in the **Images** panel.
 See: [Leave a frame out of the next fuse](guide/images-panel.md#leave-a-frame-out-of-the-next-fuse).
 
+## F-number
+
+The number that names how far a lens is opened, written f/8: the focal length
+divided by the diameter of the opening. A larger number is a smaller opening,
+which gives a deeper zone of sharpness and lets in less light. Each
+[stop](#stop) changes it by a factor of about 1.4.
+See: [What makes it deep or shallow](stacking/depth-of-field.md#what-makes-it-deep-or-shallow).
+
 ## `.ffp`
 
 The extension of a FocusForge [project](#project) file. One `.ffp` file holds
@@ -351,7 +359,7 @@ See: [Choose the reference frame](guide/alignment.md#choose-the-reference-frame)
 ## Soft transitions
 
 A [fusion method](#fusion-method) (`weighted-average` on the command line,
-listed there as "Weighted Average"). Instead of picking one frame per pixel
+which prints it as "Soft transitions"). Instead of picking one frame per pixel
 it blends all of them, giving sharper frames more weight.
 See: [Soft transitions](guide/stacking.md#soft-transitions).
 
@@ -384,6 +392,13 @@ depth of field minus the [overlap](#overlap) keeps the stack free of
 [focus gaps](#focus-gap).
 See: [Step and overlap](stacking/shooting-practice.md#step-and-overlap)
 and [Step size](stacking/shooting-practice.md#step-size).
+
+## Stop
+
+One step on the aperture scale (f/2.8, f/4, f/5.6, f/8, f/11, f/16). Moving
+one stop doubles or halves the light that reaches the sensor, and changes the
+[f-number](#f-number) by a factor of about 1.4.
+See: [Effective aperture](stacking/shooting-practice.md#effective-aperture).
 
 ## Tab
 

@@ -439,7 +439,8 @@ focusforge-cli export path/to/frames/frames.ffp -o out.tif --zmap zmap.tif
 ```
 
 `export` reads a project and writes the image (`-o`), the Z-Map (`--zmap`),
-or both; at least one of the two is required. The image is rendered from the
+or both in one invocation. `--frame`/`--frame-output` also count; at least
+one output is required. The image is rendered from the
 project's stored [composite](../glossary.md#composite), so it reflects the checkpoint you ask for (the
 newest by default; `--checkpoint <id>` picks another). An unretouched
 checkpoint needs no [source frames](../glossary.md#source-frame); a retouched one reads them again and checks
@@ -468,7 +469,10 @@ lists every flag.
 
 Every project already carries its Z-Map, a single-channel 16-bit TIFF naming,
 per pixel, which source frame contributed. Pass `--zmap` to `export` to write
-it out:
+it out. Retouch strokes are not included in an exported Z-Map: it is the one
+the fusion produced, so on a retouched checkpoint it does not match the
+exported image, while the overlay and the pipette in the window do count the
+strokes.
 
 ```bash
 focusforge-cli stack path/to/frames/ --algorithm depth-map

@@ -196,7 +196,8 @@ focusforge-cli history compact frames.ffp
   [Retouching](retouch.md#from-the-command-line)) to the head, or to the
   checkpoint `--from` names, which starts a [branch](../glossary.md#branch).
 - `export --checkpoint <id>` writes any checkpoint as an image, and with
-  `--zmap` its [Z-Map](../glossary.md#z-map).
+  `--zmap` its [Z-Map](../glossary.md#z-map). Retouch strokes are not
+  included in an exported Z-Map: it is the one the fusion produced.
 
 Every flag and exit code is in the
 [command-line reference](../reference/cli.md#history).

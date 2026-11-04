@@ -79,6 +79,18 @@ is refused by name before anything is read.
 > Without `-o`, that is a file named `<folder>-run.json` inside the folder you
 > pointed the run at.
 
+## Status records and resource limits
+
+A batch on a shared machine often needs to be watched and kept small. These
+`stack` flags are described in [`reference/cli.md`](cli.md#stack):
+
+- `--status <PATH>` appends one NDJSON status record for each stack to this
+  file, which is what a script polls.
+- `--tile-size <PX>` overrides the scheduler's outer tile size, in pixels.
+- `--max-host-memory <SIZE>` and `--max-vram <SIZE>` are ceilings on the host
+  and the device (VRAM) memory budgets. A ceiling only lowers a budget,
+  never raises it. Sizes take a unit, for example `8GiB` or `512MiB`.
+
 ## Re-running one stack
 
 `--only <name>` restricts a run to the named group(s) — matched by group
@@ -186,4 +198,5 @@ field list.
 project once you know which ones you want, as described in
 [Getting an image back](../guide/stacking.md#getting-an-image-back) and in
 the [`export` reference](cli.md#export). In the window, the same step is
-[Exporting an image](../guide/export.md).
+[Exporting an image](../guide/export.md). The Z-Map that `--zmap` writes is
+the fusion's own: retouch strokes are not included in it.

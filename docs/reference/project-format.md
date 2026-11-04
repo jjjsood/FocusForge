@@ -78,7 +78,8 @@ the content hash recorded when the project was written:
 
 - A frame that cannot be found makes a retouched `export -o` refuse, naming
   every missing frame. An unretouched `export -o`, `export --zmap` alone and
-  the `history` subcommands need no frames.
+  the `history` subcommands need no frames. Retouch strokes are not
+  included in an exported Z-Map.
 - A frame whose content changed makes a retouched `export -o` refuse, naming
   it. The strokes would blend frames the project was not stacked from.
   `history list` and `history delete` refuse the same way with exit code 9

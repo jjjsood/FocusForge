@@ -311,9 +311,10 @@ describes the cache.
 
 Large pyramid levels run on the GPU when a usable adapter is present; the rest
 of the solve is on the CPU. `--cpu` keeps everything on the CPU and
-`--max-vram <SIZE>` lowers the device memory budget. If the device is lost
-mid-run, the whole alignment is redone on the CPU, so every frame comes from
-one backend. Both JSON reports name the backend in `align_backend`.
+`--max-vram <SIZE>` lowers the device memory budget. `--max-host-memory
+<SIZE>` lowers the host-memory budget the alignment workers are sized from.
+If the device is lost mid-run, the whole alignment is redone on the CPU, so
+every frame comes from one backend. Both JSON reports name the backend in `align_backend`.
 
 ### Checking a result visually
 

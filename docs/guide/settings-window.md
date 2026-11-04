@@ -121,6 +121,10 @@ once, which can make a fuse slower but never changes the result.
   only at the next start, and the line "Caps only lower the probed budgets.
   Changes apply from the next start." appears under the rows.
 
+On the command line, the same two caps are the `--max-host-memory <SIZE>` and
+`--max-vram <SIZE>` options of `stack` and `align`; they take the sizes
+described below and lower the budget in the same way.
+
 ### Type a cap
 
 Click into a cap field and type a whole number with a unit, without spaces

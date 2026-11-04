@@ -39,14 +39,15 @@ before exporting: the dialog writes exactly what the **Composite** pane shows.
 
 ## Choose a format
 
-Click **TIFF**, **PNG** or **JPEG** in the **Format** row. The settings below
-it change to that format's own.
+Click **TIFF**, **PNG**, **JPEG** or **DNG** in the **Format** row. The
+settings below it change to that format's own.
 
 | Format | Choose it for | Keeps every detail? |
 |---|---|---|
 | TIFF | Further editing, archiving, printing. The safest choice. | Yes (at 16-bit) |
 | PNG | Lossless files that web browsers and most programs open. | Yes (at 16-bit) |
 | JPEG | Sharing, the web, e-mail. Small files. | No: always 8-bit, compressed with some loss |
+| DNG | A stack of camera RAW files that you want to develop in a raw converter. | Yes (see [A DNG of a RAW project](#a-dng-of-a-raw-project)) |
 
 ### TIFF settings
 
@@ -84,6 +85,13 @@ list without closing the dialog.
 > or a large web image, choose 4:4:4. Fine coloured detail (iridescent scales,
 > thin coloured hairs) survives it better. For a small web image 4:2:0 is
 > fine.
+
+### DNG settings
+
+DNG has no settings. Under DNG SETTINGS the dialog says "No settings: 16-bit,
+uncompressed, in the camera's own colour." It is for a project stacked from
+camera RAW files; [A DNG of a RAW project](#a-dng-of-a-raw-project) says what
+the file holds.
 
 ## Metadata
 
@@ -170,6 +178,8 @@ checkpoint was fused".
 |---|---|
 | "JPEG can't be bigger than 65,535 pixels on a side. This image is …" | JPEG cannot store larger images. Export as TIFF or PNG. |
 | "PNG and JPEG can only save grey or colour (RGB) images; this one has extra channels." | Export as TIFF. |
+| "DNG needs a project stacked from camera RAW files; this one was stacked from TIFF or JPEG images." | Export as TIFF, PNG or JPEG. |
+| "DNG can't describe this image's colour: …" followed by the reason | The first source frame has no camera colour description, for example a monochrome sensor. Export as TIFF. |
 | "Can't write …" followed by the path and the reason | Choose another folder or free some disk space, then export again. |
 | "Some export settings aren't valid: …" | Close the dialog, open it again and choose the settings again. |
 
@@ -191,6 +201,7 @@ focusforge-cli export frames.ffp -o result.png --png-bits 8 --zmap zmap.tif
 - Metadata is chosen piece by piece: `--exif` and `--icc` (on by default),
   `--xmp` and `--iptc` (off by default; IPTC is never written to PNG).
 - `--zmap` writes the [Z-Map](../glossary.md#z-map) as an image as well.
+  Retouch strokes are not included in it: it is the fusion's own map.
 
 ### A DNG of a RAW project
 
@@ -205,8 +216,8 @@ The file holds the fused result in the camera's own colour space, with the
 camera's colour matrices and as-shot white balance, and with the highlights
 above white kept as they are. A raw converter opens it and develops it with
 exposure, white balance and highlight recovery still open. A DNG has no
-format options. The window's export dialog offers TIFF, PNG and JPEG only;
-a DNG is written from the command line.
+format options. The window's export dialog offers DNG too, in the **Format**
+row.
 
 `export` refuses a DNG it cannot write, before any pixel is rendered, and
 writes nothing:
