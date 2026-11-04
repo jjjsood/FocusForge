@@ -124,6 +124,7 @@ run_gate "lock directory selftest" tools/with-lock-selftest.sh
 run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 run_gate "image-metrics selftest" python3 tools/image-metrics.py --selftest
 run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
+run_gate "manual screenshot lists" python3 tools/manual-screenshots.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
