@@ -60,11 +60,11 @@ run dry-run "$cli" stack "$out/input" --algorithm laplacian --cpu --no-align --d
 import json, pathlib, sys
 report = json.load(open(sys.argv[1]))
 groups = report.get("groups")
-assert isinstance(groups, list) and len(groups) == 2
+assert isinstance(groups, list) and len(groups) == 2, "dry run: the report does not plan exactly two groups"
 outputs = [item.get("would_write") for item in groups]
-assert all(isinstance(item, list) and len(item) == 1 for item in outputs)
-assert len({item[0] for item in outputs}) == 2
-assert pathlib.Path(sys.argv[2]).is_file()
+assert all(isinstance(item, list) and len(item) == 1 for item in outputs), "dry run: a group does not plan exactly one output"
+assert len({item[0] for item in outputs}) == 2, "dry run: the groups plan the same output"
+assert pathlib.Path(sys.argv[2]).is_file(), "dry run: the groups file was not written"
 PY
 
 run stack "$cli" stack "$out/input" --algorithm laplacian --cpu --no-align --json --groups "$out/groups.toml" --status "$out/status.ndjson" -o "$out/projects"
@@ -74,15 +74,15 @@ import json, pathlib, sys
 manifest = json.load(open(sys.argv[1]))["groups"]
 status = [json.loads(line) for line in open(sys.argv[2]) if line.strip()]
 review = json.load(open(sys.argv[3]))["results"]
-assert len(manifest) == len(status) == len(review) == 2
+assert len(manifest) == len(status) == len(review) == 2, "stack run: manifest, status and review do not each report two groups"
 expected = {item["identity"] for item in manifest}
-assert len(expected) == 2
+assert len(expected) == 2, "stack run: group identities are not distinct"
 for records in (manifest, status, review):
     by_identity = {item["identity"]: item for item in records}
-    assert set(by_identity) == expected and len(by_identity) == 2
-    assert {item["outcome"] for item in by_identity.values()} == {"completed"}
+    assert set(by_identity) == expected and len(by_identity) == 2, "stack run: group identities differ between manifest, status and review"
+    assert {item["outcome"] for item in by_identity.values()} == {"completed"}, "stack run: a group did not complete"
 for item in manifest:
-    assert len(item["outputs"]) == 1 and pathlib.Path(item["outputs"][0]).is_file()
+    assert len(item["outputs"]) == 1 and pathlib.Path(item["outputs"][0]).is_file(), "stack run: a group has no project file"
 PY
 
 project=$(find "$out/projects" -maxdepth 1 -name '*.ffp' -type f -print -quit)
@@ -95,16 +95,16 @@ import json, pathlib, sys
 stack = json.load(open(sys.argv[1]))
 project = pathlib.Path(sys.argv[2]).resolve()
 groups = stack.get("groups")
-assert isinstance(groups, list)
+assert isinstance(groups, list), "export: the stack report has no groups list"
 matches = [group for group in groups if isinstance(group.get("outputs"), list) and any(pathlib.Path(output).resolve() == project for output in group["outputs"])]
-assert len(matches) == 1
+assert len(matches) == 1, "export: the project is not in exactly one stack report group"
 width, height = matches[0].get("output_width"), matches[0].get("output_height")
-assert type(width) is int and type(height) is int and width > 0 and height > 0
+assert type(width) is int and type(height) is int and width > 0 and height > 0, "export: the stack report group has no positive output size"
 report = json.load(open(sys.argv[3]))
 files = report.get("files")
-assert report.get("frame_count") == 1 and report.get("unreadable_count") == 0
-assert isinstance(files, list) and len(files) == 1
-assert (files[0].get("width"), files[0].get("height")) == (width, height)
+assert report.get("frame_count") == 1 and report.get("unreadable_count") == 0, "export: the info report is not one readable frame"
+assert isinstance(files, list) and len(files) == 1, "export: the info report does not list exactly one file"
+assert (files[0].get("width"), files[0].get("height")) == (width, height), "export: the TIFF size differs from the stack report output size"
 PY
 
 mkdir -p "$out/mixed/good" "$out/mixed/bad"
@@ -121,17 +121,17 @@ import json, sys
 manifest = json.load(open(sys.argv[1]))["groups"]
 status = [json.loads(line) for line in open(sys.argv[2]) if line.strip()]
 review = json.load(open(sys.argv[3]))["results"]
-assert len(manifest) == len(status) == len(review) == 2
+assert len(manifest) == len(status) == len(review) == 2, "mixed run: manifest, status and review do not each report two groups"
 expected = {item["identity"] for item in manifest}
 expected_outcomes = {item["identity"]: item["outcome"] for item in manifest}
-assert len(expected) == 2
-assert set(expected_outcomes.values()) == {"completed", "failed"}
+assert len(expected) == 2, "mixed run: group identities are not distinct"
+assert set(expected_outcomes.values()) == {"completed", "failed"}, "mixed run: the groups are not one completed and one failed"
 for records in (manifest, status, review):
     by_identity = {item["identity"]: item for item in records}
-    assert set(by_identity) == expected and len(by_identity) == 2
-    assert {identity: item["outcome"] for identity, item in by_identity.items()} == expected_outcomes
+    assert set(by_identity) == expected and len(by_identity) == 2, "mixed run: group identities differ between manifest, status and review"
+    assert {identity: item["outcome"] for identity, item in by_identity.items()} == expected_outcomes, "mixed run: outcomes differ between manifest, status and review"
     failed = [item for item in by_identity.values() if item["outcome"] == "failed"]
-    assert len(failed) == 1 and isinstance(failed[0].get("error"), str) and failed[0]["error"]
+    assert len(failed) == 1 and isinstance(failed[0].get("error"), str) and failed[0]["error"], "mixed run: the failed group has no error message"
 PY
 
 echo "release smoke passed: $out"

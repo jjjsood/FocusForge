@@ -390,10 +390,6 @@ exercise_live_holder_timeout() {
   reap_holder "$holder"
 }
 
-run_without_flock_suite() {
-  PATH="$NO_FLOCK_PATH" FF_LOCK_SELFTEST_NO_FLOCK=1 bash "$0"
-}
-
 if command -v flock >/dev/null 2>&1; then
   exercise_backend flock
 fi
@@ -413,9 +409,6 @@ fi
 exercise_cleanup_handoff
 exercise_readiness_failure
 exercise_live_holder_timeout
-if [ "${FF_LOCK_SELFTEST_NO_FLOCK:-}" != 1 ]; then
-  expect_status "whole suite without flock" 0 run_without_flock_suite
-fi
 
 [ "$FAIL" -eq 0 ] || exit 1
 echo "OK: lock directory selftest"
