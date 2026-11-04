@@ -45,7 +45,7 @@ Three things set the depth of field:
 
 | factor | deeper zone | shallower zone |
 |---|---|---|
-| **Aperture** (the f-number) | smaller aperture, larger f-number (f/11) | wider aperture, smaller f-number (f/2.8) |
+| **Aperture** (the [f-number](../glossary.md#f-number)) | smaller aperture, larger f-number (f/11) | wider aperture, smaller f-number (f/2.8) |
 | **Magnification** (how large the subject is on the sensor) | subject small on the sensor | subject large on the sensor |
 | **Sensor and viewing size** (through the circle of confusion) | small prints, the whole frame on screen | large prints, 100 % crops |
 
@@ -68,14 +68,19 @@ For close-up work, a good approximation of the total depth of field is:
 depth of field ≈ 2 · N · c · (1 + m) / m²
 ```
 
-- `N` is the f-number set on the lens (for example 8 for f/8).
-- `c` is the circle of confusion in millimetres (0.03 for full frame).
+- `N` is the [f-number](../glossary.md#f-number) set on the lens (for example 8 for f/8).
+- `c` is the circle of confusion in millimetres (0.03 for full frame). The
+  chapter on [shooting a stack](shooting-practice.md#the-model-behind-the-numbers)
+  uses half that, 0.015 mm, because a stack is judged at 100 %.
 - `m` is the magnification (1 for 1:1, 0.5 for 1:2, 2 for 2:1).
 
 Read the formula from the outside in. The f-number is on top, so stopping
-down deepens the zone in proportion: f/16 gives twice the depth of f/8. The
-magnification is squared underneath, so it dominates: double the
-magnification and the depth shrinks to roughly a quarter.
+down (one [stop](../glossary.md#stop) is a factor of 1.4 in the f-number)
+deepens the zone in proportion: f/16 gives twice the depth of f/8. The
+magnification is squared underneath, so it dominates: going from 1:1 to 2:1
+shrinks the depth to about three eighths (0.96 mm to 0.36 mm in the table
+below). At low magnification, where the `(1 + m)` term barely matters,
+doubling the magnification comes close to a quarter.
 
 Work it through for a full-frame camera at f/8 and 1:1:
 

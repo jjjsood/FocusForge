@@ -66,7 +66,8 @@ depth-of-field approximation that the
 
 > depth of field ≈ 2 · N · c · (m + 1) / m²
 
-- **N** is the f-number set on the lens (the marked aperture, such as f/8).
+- **N** is the [f-number](../glossary.md#f-number) set on the lens (the
+  marked aperture, such as f/8).
 - **m** is the magnification (1 for 1:1).
 - **c** is the [circle of confusion](../glossary.md#circle-of-confusion):
   the largest blur spot that still counts as sharp. This chapter uses
@@ -199,7 +200,7 @@ were stopped down further. This **[effective aperture](../glossary.md#effective-
 
 > effective aperture = N × (1 + m)
 
-At 1:1, f/8 on the lens works like f/16: two stops less light, and the
+At 1:1, f/8 on the lens works like f/16: two [stops](../glossary.md#stop) less light, and the
 diffraction of f/16.
 
 | Magnification | f/2.8 | f/4 | f/5.6 | f/8 | f/11 | f/16 |

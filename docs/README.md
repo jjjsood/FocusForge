@@ -50,8 +50,9 @@ TIFF files FocusForge reads and writes.
    **Fuse stack**, keep the result and export it.
 
 > **Tip:** The screenshots in this manual all show the same eight-frame stack
-> of a praying mantis that ships with FocusForge's source code, so what you
-> see on the page is what you get when you open those frames yourself.
+> of a praying mantis: 512 × 512 pixel crops from a 61-frame series, kept in
+> the source tree as `fixtures/mantis-512`. The series itself does not ship
+> with the program. Open the eight crops and what you see matches the page.
 
 ## Conventions
 
