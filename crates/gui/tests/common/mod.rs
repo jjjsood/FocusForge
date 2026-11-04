@@ -133,6 +133,24 @@ pub fn copy_frame_from(set: &str, dest_dir: &Path, name: &str, source_index: usi
         .expect("fixture frame must copy");
 }
 
+/// Runs the calling test again alone in a child process -- timing
+/// accounting is process-global. Returns true in the parent, which is done.
+#[allow(dead_code)]
+pub fn ran_in_child(test: &str) -> bool {
+    const CHILD: &str = "FOCUSFORGE_GUI_ISOLATED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("the test binary has a path"))
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated test starts");
+    assert!(status.success(), "the isolated test passes: {status}");
+    true
+}
+
 /// A fresh, empty renderer cell for `bridge::install`, with no project's
 /// planes loaded yet.
 #[allow(dead_code)]

@@ -1489,26 +1489,6 @@ fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::Log
     slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
 }
 
-/// Runs the calling test again alone in a child process -- timing
-/// accounting is process-global. Returns true in the parent, which is done.
-fn ran_in_child(test: &str) -> bool {
-    const CHILD: &str = "FOCUSFORGE_GUI_OVERLAY_ACCOUNTING_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        return false;
-    }
-    let status =
-        std::process::Command::new(std::env::current_exe().expect("the test binary has a path"))
-            .args(["--exact", test, "--test-threads=1"])
-            .env(CHILD, "1")
-            .status()
-            .expect("the isolated accounting test starts");
-    assert!(
-        status.success(),
-        "the isolated accounting test passes: {status}"
-    );
-    true
-}
-
 /// `(row_updates, thumbnail_bytes)` so far.
 fn overlay_counters() -> (u64, u64) {
     let snapshot = focusforge_core::timing::timing_snapshot().expect("trace accounting is enabled");
@@ -1571,7 +1551,7 @@ fn gallery_scrolling_and_progress_reuse_every_picture() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use slint::{ComponentHandle, Model};
 
-    if ran_in_child("gallery_scrolling_and_progress_reuse_every_picture") {
+    if common::ran_in_child("gallery_scrolling_and_progress_reuse_every_picture") {
         return;
     }
     let (app, controller, events, _installed) = overlay_window("gallery_reuse", None);
@@ -1719,7 +1699,7 @@ fn gallery_scrolling_and_progress_reuse_every_picture() {
 fn a_hidden_overlay_publishes_nothing_until_reopened() {
     use slint::Model;
 
-    if ran_in_child("a_hidden_overlay_publishes_nothing_until_reopened") {
+    if common::ran_in_child("a_hidden_overlay_publishes_nothing_until_reopened") {
         return;
     }
     let recent_dir = tree("hidden_overlay_recent");
