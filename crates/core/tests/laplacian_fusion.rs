@@ -487,12 +487,9 @@ fn composite_similarity_to_reference_is_recorded() {
         aligned_best_shift.0, aligned_best_shift.1, unaligned_best_shift.0, unaligned_best_shift.1
     );
 
-    // The aligned path resamples through bicubic Catmull-Rom while the
-    // unaligned path never resamples, which could make the aligned
-    // composite the blurrier one. Printed over the same crop window, it comes
-    // out the other way: the aligned composite is sharper, not blurrier, so
-    // that is not what makes the unaligned composite closer to `reference.tif`
-    // on PSNR.
+    // The aligned path resamples through bicubic Catmull-Rom and the
+    // unaligned path never resamples, which could blur the aligned composite.
+    // The Laplacian variances below, over the same crop window, show whether it does.
     let frame03_lapvar = sharpest_frame_lapvar(crop);
     let aligned_lapvar =
         metrics::laplacian_variance(&aligned.composite, crop.width, crop.height, aligned.spp);
@@ -503,8 +500,8 @@ fn composite_similarity_to_reference_is_recorded() {
     println!(
         "composite_similarity_to_reference_is_recorded: lapvar(aligned)={aligned_lapvar:.1} \
          lapvar(unaligned)={unaligned_lapvar:.1} lapvar(frame03 window)={frame03_lapvar:.1} \
-         ratio(aligned)={aligned_ratio:.4} ratio(unaligned)={unaligned_ratio:.4} -- aligned is \
-         sharper by {:.2}% (refutes the bicubic-resample-blurs hypothesis)",
+         ratio(aligned)={aligned_ratio:.4} ratio(unaligned)={unaligned_ratio:.4} -- aligned \
+         sharpness relative to unaligned: {:+.2}%",
         (aligned_ratio / unaligned_ratio - 1.0) * 100.0
     );
 }

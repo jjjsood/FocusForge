@@ -34,7 +34,7 @@ struct FusionResult {
 /// Runs `algo_id` at `(tile_size, levels)` over `fixtures/mantis-512` into a
 /// per-call temporary directory (`<label>.tif` + `-zmap.tif`), and reads both
 /// back. `levels` comes from `algo.tile_support(&values)` unless
-/// `levels_override` is given -- the seam demonstration's only reason to exist.
+/// `levels_override` is given, which only the seam demonstration uses.
 fn run_fusion(
     algo_id: &str,
     label: &str,
