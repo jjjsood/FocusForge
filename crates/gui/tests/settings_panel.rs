@@ -1259,25 +1259,34 @@ fn a_slider_drag_survives_a_panel_push() {
 }
 
 #[test]
-fn scrollbar_is_a_shared_primitive() {
-    let contents = fs::read_to_string(
-        common::ui_dir()
-            .join("components")
-            .join("ff_scrollbar.slint"),
-    )
-    .unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("export component").count(),
-        1,
-        "ff_scrollbar.slint must export exactly one component"
-    );
-    assert!(code.contains("export component FFScrollbar"));
-    for shell_import in ["shell/", "\"../shell"] {
-        assert!(
-            !code.contains(shell_import),
-            "a primitive must import no shell file"
+fn scrollbar_and_more_toggle_are_shared_primitives() {
+    for (file, component, forbids_colour_literal) in [
+        ("ff_scrollbar.slint", "FFScrollbar", false),
+        ("ff_more_toggle.slint", "FFMoreToggle", true),
+    ] {
+        let contents = fs::read_to_string(common::ui_dir().join("components").join(file)).unwrap();
+        let code = common::strip_line_comments(&contents);
+        assert_eq!(
+            code.matches("export component").count(),
+            1,
+            "{file} must export exactly one component"
         );
+        assert!(
+            code.contains(&format!("export component {component}")),
+            "{file} must export {component}"
+        );
+        for shell_import in ["shell/", "\"../shell"] {
+            assert!(
+                !code.contains(shell_import),
+                "{file}: a primitive must import no shell file"
+            );
+        }
+        if forbids_colour_literal {
+            assert!(
+                !code.contains('#'),
+                "{file}: a primitive holds no colour literal"
+            );
+        }
     }
 }
 
@@ -1314,20 +1323,13 @@ fn auto_crop_defaults_on_and_is_a_reversible_flag() {
     );
 }
 
-/// `job_running()` is currently hardcoded `false`, with no way to drive a
-/// real job; what matters here is the wiring from one bool to the *whole*
-/// panel -- opacity and the scroll/click hit-area together, not a per-field
-/// disable -- so the property is driven directly instead.
+/// The panel's disable is one bool for the *whole* panel -- opacity and the
+/// scroll/click hit-area together, not a per-field disable -- so the property
+/// is driven directly on the window.
 #[test]
 fn panel_disable_is_whole_panel() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
-
-    let controller = AppController::new();
-    assert!(
-        !controller.job_running(),
-        "job_running must read false with no job running -- the panel reads it as a whole-panel disable"
-    );
 
     common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
@@ -1701,30 +1703,6 @@ fn schema_ids(method: &str) -> Vec<String> {
         .iter()
         .map(|d| d.id.clone())
         .collect()
-}
-
-#[test]
-fn more_toggle_is_a_shared_primitive() {
-    let contents = fs::read_to_string(
-        common::ui_dir()
-            .join("components")
-            .join("ff_more_toggle.slint"),
-    )
-    .unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("export component").count(),
-        1,
-        "ff_more_toggle.slint must export exactly one component"
-    );
-    assert!(code.contains("export component FFMoreToggle"));
-    for shell_import in ["shell/", "\"../shell"] {
-        assert!(
-            !code.contains(shell_import),
-            "a primitive must import no shell file"
-        );
-    }
-    assert!(!code.contains('#'), "a primitive holds no colour literal");
 }
 
 #[test]

@@ -17,6 +17,25 @@ use std::time::{Duration, Instant};
 
 use common::has_display;
 
+/// Spawns every command before awaiting any, so the windows open together,
+/// and returns the outputs in command order.
+fn run_together(commands: Vec<std::process::Command>) -> Vec<std::process::Output> {
+    let children: Vec<_> = commands
+        .into_iter()
+        .map(|mut command| {
+            command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("launch focusforge-gui")
+        })
+        .collect();
+    children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("await focusforge-gui"))
+        .collect()
+}
+
 #[test]
 fn comparison_window_geometry() {
     use focusforge_gui::ComparisonWindow;
@@ -260,12 +279,16 @@ fn refused_slow_down_values_are_logged_and_the_window_opens() {
         (&["--slow-run-seconds", "x"], "--slow-run-seconds expects"),
         (&["--slow-open", "x"], "--slow-open expects"),
     ];
-    for (i, (args, expected)) in cases.into_iter().enumerate() {
-        let output = common::gui_bin(&format!("refused_slow_down_{i}"))
-            .args(args)
-            .args(["--exit-after", "500"])
-            .output()
-            .expect("launch focusforge-gui");
+    let commands = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (args, _))| {
+            let mut command = common::gui_bin(&format!("refused_slow_down_{i}"));
+            command.args(*args).args(["--exit-after", "500"]);
+            command
+        })
+        .collect();
+    for ((args, expected), output) in cases.into_iter().zip(run_together(commands)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -300,13 +323,19 @@ fn refused_save_folder_is_logged_and_the_window_opens() {
             refused.push(locked);
         }
     }
-    for (i, path) in refused.iter().enumerate() {
-        let output = common::gui_bin(&format!("refused_save_folder_{i}"))
-            .arg("--save-folder")
-            .arg(path)
-            .args(["--exit-after", "500"])
-            .output()
-            .expect("launch focusforge-gui");
+    let commands = refused
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let mut command = common::gui_bin(&format!("refused_save_folder_{i}"));
+            command
+                .arg("--save-folder")
+                .arg(path)
+                .args(["--exit-after", "500"]);
+            command
+        })
+        .collect();
+    for (path, output) in refused.iter().zip(run_together(commands)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -331,16 +360,22 @@ fn both_sides_open_a_real_comparison_window() {
         return;
     }
     let dir = common::tree("both_comparison_sides");
-    for side in ["frame", "composite"] {
+    let sides = ["frame", "composite"];
+    let commands = sides
+        .iter()
+        .map(|side| {
+            let mut command = common::gui_bin(&format!("comparison_{side}"));
+            command
+                .arg("--open")
+                .arg(common::fixture_frame("mantis-64", 0))
+                .args(["--undock-pane", side, "--exit-after", "8000"])
+                .args(["--screenshot-window", "comparison", "--screenshot"])
+                .arg(dir.join(format!("{side}.png")));
+            command
+        })
+        .collect();
+    for (side, output) in sides.into_iter().zip(run_together(commands)) {
         let capture = dir.join(format!("{side}.png"));
-        let output = common::gui_bin(&format!("comparison_{side}"))
-            .arg("--open")
-            .arg(common::fixture_frame("mantis-64", 0))
-            .args(["--undock-pane", side, "--exit-after", "8000"])
-            .args(["--screenshot-window", "comparison", "--screenshot"])
-            .arg(&capture)
-            .output()
-            .expect("launch comparison window");
         assert!(
             output.status.success(),
             "{side} failed: {}",
@@ -361,7 +396,8 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
         return;
     }
     let capture = common::tree("comparison_reopen").join("reopened.png");
-    let output = common::gui_bin("comparison_reopen")
+    let mut reopen = common::gui_bin("comparison_reopen");
+    reopen
         .arg("--open")
         .arg(common::fixture_frame("mantis-64", 0))
         .args([
@@ -377,18 +413,11 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "comparison",
             "--screenshot",
         ])
-        .arg(&capture)
-        .output()
-        .expect("launch reopened comparison");
-    assert!(
-        output.status.success(),
-        "reopen failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(capture.exists(), "reopened comparison was not captured");
+        .arg(&capture);
 
     let watchdog_capture = common::tree("comparison_main_close").join("watchdog.png");
-    let output = common::gui_bin("comparison_main_close")
+    let mut main_close = common::gui_bin("comparison_main_close");
+    main_close
         .arg("--open")
         .arg(common::fixture_frame("mantis-64", 0))
         .args([
@@ -400,13 +429,21 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "15000",
             "--screenshot",
         ])
-        .arg(&watchdog_capture)
-        .output()
-        .expect("launch comparison and close main");
+        .arg(&watchdog_capture);
+
+    let mut outputs = run_together(vec![reopen, main_close]).into_iter();
+    let (output, main_close_output) = (outputs.next().unwrap(), outputs.next().unwrap());
     assert!(
         output.status.success(),
-        "main close failed: {}",
+        "reopen failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(capture.exists(), "reopened comparison was not captured");
+
+    assert!(
+        main_close_output.status.success(),
+        "main close failed: {}",
+        String::from_utf8_lossy(&main_close_output.stderr)
     );
     assert!(
         !watchdog_capture.exists(),
