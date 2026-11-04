@@ -168,6 +168,15 @@ pub fn tree(name: &str) -> PathBuf {
     dir
 }
 
+/// A controller with nothing open whose ledger, staging and held checkpoints
+/// live under a fresh directory named for `name`.
+#[allow(dead_code)]
+pub fn scratch_controller(name: &str) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller
+}
+
 /// A controller with one unsaved project open over `count` copied
 /// `mantis-64` frames (`00.tif`, `01.tif`, ... in fixture order), its own
 /// scratch root under `CARGO_TARGET_TMPDIR`, aligning with `dummy-align`,

@@ -2,7 +2,8 @@
 
 //! A stack that did not open is a visible failure: the overlay's card model
 //! driven through `AppController`, with no window, over copies of
-//! `fixtures/mantis-512` under `CARGO_TARGET_TMPDIR`.
+//! `fixtures/mantis-64` (and `mantis-512` where a test reads real-size
+//! content) under `CARGO_TARGET_TMPDIR`.
 
 mod common;
 
@@ -18,28 +19,28 @@ use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
-use common::{controller_with_frames_from, copy_frame_from, open_frames_from, tree};
+use common::{controller_with_frames, copy_frame_from, open_frames_from, open_mantis64_tab, tree};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, mirroring `tests/job.rs` and
 // `tests/entry.rs`.
 // ---------------------------------------------------------------------
 
-/// [`controller_with_frames_from`], plus the frames directory itself -- for a
+/// [`controller_with_frames`] over fixture set `set`, plus the frames directory itself -- for a
 /// test that needs to reach back into the project a fuse seals there.
-fn controller_with_frames_and_dir(name: &str, count: usize) -> (AppController, PathBuf) {
+fn controller_with_frames_and_dir(set: &str, name: &str, count: usize) -> (AppController, PathBuf) {
     let mut controller = AppController::new();
-    let dir = open_frames_from(&mut controller, "mantis-512", name, count);
+    let dir = open_frames_from(&mut controller, set, name, count);
+    controller.set_align_algorithm("dummy-align");
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     (controller, dir)
 }
 
-/// [`open_frames_from`] over two `mantis-512` frames, then overwrites the
+/// [`open_mantis64_tab`] over two frames, then overwrites the
 /// second with bytes the TIFF reader refuses, so a fuse of it fails inside the
 /// pipeline.
 fn open_unreadable_frames(controller: &mut AppController, name: &str) -> PathBuf {
-    let root = open_frames_from(controller, "mantis-512", name, 2);
-    controller.set_align_algorithm("dummy-align");
+    let root = open_mantis64_tab(controller, name, 2);
     std::fs::write(root.join("01.tif"), b"not a tiff").unwrap();
     root
 }
@@ -53,7 +54,7 @@ fn seal_as_given_project(name: &str) -> PathBuf {
     let project_dir = tree(&format!("{name}_project"));
     let frames_dir = tree(&format!("{name}_source_frames"));
     for i in 0..2 {
-        copy_frame_from("mantis-512", &frames_dir, &format!("{i:02}.tif"), i);
+        copy_frame_from("mantis-64", &frames_dir, &format!("{i:02}.tif"), i);
     }
     let sources: Vec<PathBuf> = (0..2)
         .map(|i| frames_dir.join(format!("{i:02}.tif")))
@@ -61,7 +62,7 @@ fn seal_as_given_project(name: &str) -> PathBuf {
 
     let staging = tree(&format!("{name}_staging"));
     let composite = staging.join("composite.tif");
-    std::fs::copy(common::fixture_frame("mantis-512", 0), &composite).unwrap();
+    std::fs::copy(common::fixture_frame("mantis-64", 0), &composite).unwrap();
     let zmap = staging.join("zmap.tif");
     let mut writer = ZMapWriter::create(&zmap, ZMapInfo::new(4, 4, 2).unwrap()).unwrap();
     writer
@@ -102,7 +103,7 @@ fn seal_as_given_project(name: &str) -> PathBuf {
 /// TIFF at all -- `propose`'s own skip, opened in a single call.
 fn open_folder_with_a_skipped_subfolder(controller: &mut AppController, name: &str) -> PathBuf {
     let root = tree(name);
-    copy_frame_from("mantis-512", &root.join("subject"), "00.tif", 0);
+    copy_frame_from("mantis-64", &root.join("subject"), "00.tif", 0);
     std::fs::create_dir_all(root.join("thumbs")).unwrap();
     std::fs::write(root.join("thumbs").join("readme.txt"), b"not a frame").unwrap();
     assert!(matches!(
@@ -177,8 +178,8 @@ fn toggle_and_escape_both_close() {
 
 #[test]
 fn every_open_project_has_a_card() {
-    let mut controller = controller_with_frames_from("mantis-512", "every_open", 3);
-    open_frames_from(&mut controller, "mantis-512", "every_open_second", 2);
+    let mut controller = controller_with_frames("every_open", 3);
+    open_mantis64_tab(&mut controller, "every_open_second", 2);
     controller.select_project(1);
 
     let cards = controller.project_cards();
@@ -206,7 +207,7 @@ fn every_open_project_has_a_card() {
 
 #[test]
 fn running_project_shows_progress_on_its_card() {
-    let mut controller = controller_with_frames_from("mantis-512", "running_progress", 2);
+    let mut controller = controller_with_frames("running_progress", 2);
     assert!(controller.start_fuse());
     assert!(controller.job_running());
 
@@ -281,7 +282,7 @@ fn live_card_meta_names_the_phase() {
         Some("writing")
     );
 
-    let mut controller = controller_with_frames_from("mantis-512", "live_card_meta", 2);
+    let mut controller = controller_with_frames("live_card_meta", 2);
     assert!(controller.start_fuse());
     let cards = controller.project_cards();
     let card = card_by_kind(&cards, "open");
@@ -301,8 +302,8 @@ fn live_card_meta_names_the_phase() {
 
 #[test]
 fn clicking_a_card_switches_to_it() {
-    let mut controller = controller_with_frames_from("mantis-512", "click_switch", 2);
-    open_frames_from(&mut controller, "mantis-512", "click_switch_second", 2);
+    let mut controller = controller_with_frames("click_switch", 2);
+    open_mantis64_tab(&mut controller, "click_switch_second", 2);
     controller.select_project(0);
     controller.toggle_projects_overlay();
     assert!(controller.projects_overlay_open());
@@ -335,7 +336,7 @@ fn clicking_a_card_switches_to_it() {
 
 #[test]
 fn card_picture_is_the_projects_composite() {
-    let mut a = controller_with_frames_from("mantis-512", "picture_a", 3);
+    let mut a = controller_with_frames("picture_a", 3);
     // An algorithm that always converges keeps the alignment check out of the test.
     a.set_align_algorithm("dummy-align");
     assert!(a.start_fuse());
@@ -345,7 +346,7 @@ fn card_picture_is_the_projects_composite() {
         .clone()
         .expect("a fused project must carry a picture");
 
-    let mut b = controller_with_frames_from("mantis-512", "picture_b", 4);
+    let mut b = controller_with_frames("picture_b", 2);
     // An algorithm that always converges keeps the alignment check out of the test.
     b.set_align_algorithm("dummy-align");
     assert!(b.start_fuse());
@@ -363,7 +364,8 @@ fn card_picture_is_the_projects_composite() {
 
 #[test]
 fn thumbnail_is_downsampled_once_and_cached() {
-    let (mut controller, project_dir) = controller_with_frames_and_dir("cached_once", 3);
+    let (mut controller, project_dir) =
+        controller_with_frames_and_dir("mantis-512", "cached_once", 3);
     // An algorithm that always converges keeps the alignment check out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
@@ -393,7 +395,7 @@ fn thumbnail_is_downsampled_once_and_cached() {
 
 #[test]
 fn an_unfused_card_shows_its_first_frame() {
-    let controller = controller_with_frames_from("mantis-512", "unfused_picture", 3);
+    let controller = controller_with_frames("unfused_picture", 3);
     let cards = controller.project_cards();
     let card = card_by_kind(&cards, "open");
     let picture = card
@@ -410,7 +412,8 @@ fn an_unfused_card_shows_its_first_frame() {
 
 #[test]
 fn overlay_writes_nothing_to_the_project() {
-    let (mut controller, project_dir) = controller_with_frames_and_dir("writes_nothing", 3);
+    let (mut controller, project_dir) =
+        controller_with_frames_and_dir("mantis-64", "writes_nothing", 3);
     // An algorithm that always converges keeps the alignment check out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
@@ -466,7 +469,7 @@ fn four_failure_cards_have_their_shapes() {
     assert!(controller.start_fuse());
     settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
-    open_frames_from(&mut controller, "mantis-512", "four_kinds_cancel", 2);
+    open_mantis64_tab(&mut controller, "four_kinds_cancel", 2);
     controller.select_project(controller.project_tabs().len() - 1);
     assert!(controller.start_fuse());
     controller.cancel_fuse();
@@ -532,9 +535,9 @@ fn a_failed_stack_updates_the_open_tab_not_a_second_card() {
 fn a_failed_run_updates_its_own_card() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("abc_scratch"));
-    open_frames_from(&mut controller, "mantis-512", "abc_a", 2);
-    let mid_dir = open_frames_from(&mut controller, "mantis-512", "abc_mid", 3);
-    open_frames_from(&mut controller, "mantis-512", "abc_c", 2);
+    open_mantis64_tab(&mut controller, "abc_a", 2);
+    let mid_dir = open_mantis64_tab(&mut controller, "abc_mid", 3);
+    open_mantis64_tab(&mut controller, "abc_c", 2);
     std::fs::write(mid_dir.join("01.tif"), b"not a tiff").unwrap();
 
     controller.select_project(1);
@@ -556,7 +559,7 @@ fn a_failed_run_updates_its_own_card() {
 
 #[test]
 fn a_failure_keeps_earlier_checkpoints() {
-    let (mut controller, dir) = controller_with_frames_and_dir("keeps_checkpoints", 2);
+    let (mut controller, dir) = controller_with_frames_and_dir("mantis-64", "keeps_checkpoints", 2);
     assert!(controller.start_fuse());
     settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -580,7 +583,7 @@ fn a_failure_keeps_earlier_checkpoints() {
 fn run_again_stays_on_one_card_until_success() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("run_again_scratch"));
-    open_frames_from(&mut controller, "mantis-512", "run_again_healthy", 2);
+    open_mantis64_tab(&mut controller, "run_again_healthy", 2);
     let fail_dir = open_unreadable_frames(&mut controller, "run_again_fail");
     assert!(controller.start_fuse());
     settle_with_thumbnails(&mut controller, Duration::from_secs(60));
@@ -612,7 +615,7 @@ fn run_again_stays_on_one_card_until_success() {
     );
 
     std::fs::copy(
-        common::fixture_frame("mantis-512", 1),
+        common::fixture_frame("mantis-64", 1),
         fail_dir.join("01.tif"),
     )
     .unwrap();
@@ -639,12 +642,7 @@ fn run_again_failure_over_the_overview_raises_no_toast() {
 
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("run_again_over_overview_scratch"));
-    open_frames_from(
-        &mut controller,
-        "mantis-512",
-        "run_again_over_overview_healthy",
-        2,
-    );
+    open_mantis64_tab(&mut controller, "run_again_over_overview_healthy", 2);
     open_unreadable_frames(&mut controller, "run_again_over_overview_failing");
     let controller = Arc::new(Mutex::new(controller));
     let _installed = focusforge_gui::bridge::install(
@@ -700,8 +698,8 @@ fn run_again_failure_over_the_overview_raises_no_toast() {
 fn a_cancelled_run_stays_on_its_own_card() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("cancel_scratch"));
-    open_frames_from(&mut controller, "mantis-512", "cancel_a", 2);
-    open_frames_from(&mut controller, "mantis-512", "cancel_b", 2);
+    open_mantis64_tab(&mut controller, "cancel_a", 2);
+    open_mantis64_tab(&mut controller, "cancel_b", 2);
     controller.select_project(1);
     assert!(controller.start_fuse());
     controller.cancel_fuse();
@@ -721,7 +719,7 @@ fn a_cancelled_run_stays_on_its_own_card() {
 
 #[test]
 fn a_failure_survives_a_save_and_leaves_with_its_tab() {
-    let (mut controller, dir) = controller_with_frames_and_dir("survives_save", 2);
+    let (mut controller, dir) = controller_with_frames_and_dir("mantis-64", "survives_save", 2);
     assert!(controller.start_fuse());
     settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(controller.checkpoint_count(), Some(1));
@@ -768,7 +766,7 @@ fn sources_missing_is_located_on_its_own_card() {
     // recreating it here reproduces the same content hash.
     std::fs::create_dir_all(&frames_dir).unwrap();
     for i in 0..2 {
-        copy_frame_from("mantis-512", &frames_dir, &format!("{i:02}.tif"), i);
+        copy_frame_from("mantis-64", &frames_dir, &format!("{i:02}.tif"), i);
     }
     let tab_id = controller.tab_id_at(0).unwrap();
     common::locate_and_settle(
@@ -887,7 +885,7 @@ fn no_control_acts_on_several_cards() {
 
 #[test]
 fn rail_actions_and_shortcuts() {
-    let mut controller = controller_with_frames_from("mantis-512", "rail_actions", 2);
+    let mut controller = controller_with_frames("rail_actions", 2);
     controller.toggle_projects_overlay();
 
     assert_eq!(
@@ -944,7 +942,7 @@ fn rail_actions_and_shortcuts() {
 
 #[test]
 fn a_rebind_cannot_shadow_a_chrome_key() {
-    let mut controller = controller_with_frames_from("mantis-512", "rebind_shadow", 2);
+    let mut controller = controller_with_frames("rebind_shadow", 2);
     let ctrl = Modifiers {
         ctrl: true,
         ..Modifiers::NONE
@@ -982,7 +980,7 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
     // A fresh tab for the overlay-open half of the test. Past
     // `AppController::CLOSE_DEBOUNCE`, so this close is not the first one's
     // double-click guard swallowing it.
-    open_frames_from(&mut controller, "mantis-512", "rebind_shadow_reopen", 2);
+    open_mantis64_tab(&mut controller, "rebind_shadow_reopen", 2);
     std::thread::sleep(Duration::from_millis(350));
 
     controller.toggle_projects_overlay();
@@ -1005,7 +1003,7 @@ fn chrome_keys_work_with_the_overlay_closed() {
         ctrl: true,
         ..Modifiers::NONE
     };
-    let mut controller = controller_with_frames_from("mantis-512", "closed_chords", 2);
+    let mut controller = controller_with_frames("closed_chords", 2);
     assert!(!controller.projects_overlay_open());
 
     assert_eq!(controller.chrome_key("n", ctrl), ChromeKey::NewProject);
@@ -1100,7 +1098,7 @@ fn opening_a_folder_group_records_nothing_in_recent() {
     let config_dir = tree("recent_folder_group_config");
     let mut controller = AppController::new();
     controller.install_recent(recent::load(&config_dir), config_dir.clone());
-    open_frames_from(&mut controller, "mantis-512", "recent_folder_group", 2);
+    open_mantis64_tab(&mut controller, "recent_folder_group", 2);
     assert!(controller.recent_rows(0).is_empty());
     assert!(!config_dir.join("settings.toml").exists());
 
@@ -1190,7 +1188,7 @@ fn recent_row_opens_its_target() {
 fn frames_dir(name: &str, count: usize) -> PathBuf {
     let root = tree(&format!("{name}_frames"));
     for i in 0..count {
-        copy_frame_from("mantis-512", &root, &format!("{i:02}.tif"), i);
+        copy_frame_from("mantis-64", &root, &format!("{i:02}.tif"), i);
     }
     root
 }
@@ -1259,8 +1257,9 @@ fn overlay_opened_before_a_load_still_closes_when_it_lands() {
 
 #[test]
 fn recent_row_switches_to_an_open_tab() {
-    let (mut controller, first_dir) = controller_with_frames_and_dir("recent_switch", 2);
-    open_frames_from(&mut controller, "mantis-512", "recent_switch_second", 2);
+    let (mut controller, first_dir) =
+        controller_with_frames_and_dir("mantis-64", "recent_switch", 2);
+    open_mantis64_tab(&mut controller, "recent_switch_second", 2);
     assert_eq!(controller.active_project(), Some(1));
 
     controller.install_recent(
@@ -1296,7 +1295,7 @@ fn recent_row_switches_to_an_open_tab() {
 
 #[test]
 fn recent_row_missing_target_is_refused() {
-    let mut controller = controller_with_frames_from("mantis-512", "recent_missing_target", 1);
+    let mut controller = controller_with_frames("recent_missing_target", 1);
     let missing_dir = tree("recent_missing_target_gone");
     std::fs::remove_dir_all(&missing_dir).expect("the target must exist, then vanish");
     controller.install_recent(
@@ -1338,7 +1337,7 @@ fn recent_row_missing_target_is_refused() {
 
 #[test]
 fn recent_row_out_of_range_or_busy_is_ignored() {
-    let mut controller = controller_with_frames_from("mantis-512", "recent_out_of_range", 1);
+    let mut controller = controller_with_frames("recent_out_of_range", 1);
     let only_dir = tree("recent_out_of_range_folder");
     controller.install_recent(
         vec![RecentEntry {
@@ -1360,9 +1359,9 @@ fn recent_row_out_of_range_or_busy_is_ignored() {
     assert_eq!(controller.active_project(), active_before);
 
     let busy_dir = tree("recent_out_of_range_busy_target");
-    copy_frame_from("mantis-512", &busy_dir, "00.tif", 0);
+    copy_frame_from("mantis-64", &busy_dir, "00.tif", 0);
     let second_dir = tree("recent_out_of_range_second_target");
-    copy_frame_from("mantis-512", &second_dir, "00.tif", 1);
+    copy_frame_from("mantis-64", &second_dir, "00.tif", 1);
     let mut busy_controller = AppController::new();
     busy_controller.set_scratch_root_for_test(tree("recent_out_of_range_busy_scratch"));
     busy_controller.install_recent(
@@ -1449,14 +1448,9 @@ fn gallery_lays_out_and_scrolls() {
         (CARD_WIDTH + CARD_GAP, CARD_HEIGHT + CARD_GAP)
     );
 
-    let mut controller = controller_with_frames_from("mantis-512", "gallery_scroll", 1);
+    let mut controller = controller_with_frames("gallery_scroll", 1);
     for i in 0..5 {
-        open_frames_from(
-            &mut controller,
-            "mantis-512",
-            &format!("gallery_scroll_{i}"),
-            1,
-        );
+        open_mantis64_tab(&mut controller, &format!("gallery_scroll_{i}"), 1);
     }
     controller.set_gallery_width(width);
     controller.set_gallery_viewport_height(300.0);
@@ -1521,7 +1515,7 @@ fn overlay_window(
     }
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     for i in 0..3 {
-        open_frames_from(&mut controller, "mantis-512", &format!("{name}_{i}"), 2);
+        open_mantis64_tab(&mut controller, &format!("{name}_{i}"), 2);
     }
     controller.select_project(0);
     let controller = Arc::new(Mutex::new(controller));
@@ -1852,7 +1846,7 @@ fn bell_in_projects_opens_the_center_with_focus_inside() {
     app.window()
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
 
-    let mut controller = controller_with_frames_from("mantis-512", "bell_in_projects", 4);
+    let mut controller = controller_with_frames("bell_in_projects", 3);
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     for _ in 0..2 {

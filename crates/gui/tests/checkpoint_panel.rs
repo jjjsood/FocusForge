@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Days, Local, NaiveDate};
-use common::{enter_editor, fused_tab, paint, record_events, settle_all};
+use common::{enter_editor, fused_tab, paint, record_events, scratch_controller, settle_all};
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
@@ -35,7 +35,7 @@ use slint::{ComponentHandle, Model};
 /// `cargo test -p focusforge-gui --test checkpoint_panel
 /// writes_a_long_history_project -- --ignored`.
 #[test]
-#[ignore]
+#[ignore = "writes .scratch/checkpoint-long-history/long.ffp for a manual scroll check"]
 fn writes_a_long_history_project() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -436,12 +436,6 @@ fn wait_for_render(controller: &mut AppController) {
         std::thread::sleep(Duration::from_millis(5));
     }
     common::settle_session(controller);
-}
-
-fn scratch_controller(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    controller
 }
 
 #[test]
@@ -1087,6 +1081,10 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
     paint(&mut controller, stroke(3, 1, 1));
     click(&mut controller, &project.root);
     let copy = controller.pending_restore_copy().expect("the dialog is up");
+    assert!(
+        !events.lock().unwrap().is_empty(),
+        "opening the question emits, so the empty recorder above was connected"
+    );
     let target = controller
         .checkpoints_panel()
         .entries
@@ -1149,6 +1147,11 @@ fn an_open_restore_question_blocks_closing() {
     assert!(controller.pending_close().is_none());
     assert_eq!(controller.project_tabs().len(), tabs);
     assert!(controller.pending_restore_copy().is_some());
+
+    // Answering the question does emit, so the empty recorder above is not
+    // an unconnected one.
+    controller.close_guard_confirmed();
+    assert!(!events.lock().unwrap().is_empty());
 }
 
 /// Switching, in editor mode, to a tab whose current row still renders keeps
@@ -2045,12 +2048,10 @@ fn a_new_checkpoint_row_is_the_only_fresh_row() {
     assert!(generation > snapshot);
 
     // The parked divergence's `Keep`.
-    let mut parked = AppController::new();
-    parked.set_scratch_root_for_test(common::tree("checkpoint_panel_fresh_keep_scratch"));
-    let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
-    common::open_and_settle(&mut parked, &[mantis_512]);
+    let mut parked = scratch_controller("checkpoint_panel_fresh_keep");
+    common::open_frames_from(&mut parked, "mantis-64", "checkpoint_panel_fresh_keep", 3);
     assert!(parked.start_fuse());
-    common::wait_for_settle(&mut parked, Duration::from_secs(300));
+    common::wait_for_settle(&mut parked, Duration::from_secs(60));
     assert!(parked.pending_divergence().is_some());
     assert!(
         fresh_entries(&parked).is_empty(),

@@ -26,15 +26,9 @@ use focusforge_core::zmap::ZMapInfo;
 use focusforge_gui::AppController;
 use focusforge_gui::checkpoints::local_date_and_time;
 
-use common::{open_mantis64_tab, save_to_proposed, settle_all};
+use common::{open_mantis64_tab, save_to_proposed, scratch_controller, settle_all};
 
 const SETTLE: Duration = Duration::from_secs(60);
-
-fn scratch_controller(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    controller
-}
 
 /// [`open_mantis64_tab`], then fuses it into one held checkpoint.
 fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) {

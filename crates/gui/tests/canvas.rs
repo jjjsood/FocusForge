@@ -413,7 +413,7 @@ fn two_sealed_tabs(name: &str) -> AppController {
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60))
         .expect("the small fixture must fuse");
-    open_fixture_tab(&mut controller, name, "mantis-512", 3);
+    open_fixture_tab(&mut controller, name, "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the large fixture must fuse");
@@ -448,11 +448,11 @@ fn load_path(controller: &mut AppController, loaded: Option<usize>) -> PathBuf {
 fn background_run_leaves_canvas_alone(name: &str, background_set: &str, foreground_set: &str) {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    open_fixture_tab(&mut controller, name, background_set, 3);
+    open_fixture_tab(&mut controller, name, background_set, 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60))
         .expect("the background tab's first fuse must complete");
-    open_fixture_tab(&mut controller, name, foreground_set, 3);
+    open_fixture_tab(&mut controller, name, foreground_set, 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the foreground tab's first fuse must complete");
@@ -552,7 +552,7 @@ fn switching_to_an_unfused_tab_shows_no_stale_planes() {
     let _ = load_path(&mut controller, None);
 
     // A second tab, opened but never fused -- nothing sealed to show yet.
-    open_fixture_tab(&mut controller, "unfused", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "unfused", "mantis-512", 2);
     assert_eq!(controller.active_project(), Some(1));
     assert!(matches!(controller.canvas_feed(Some(0)), CanvasFeed::Clear));
 }
@@ -567,7 +567,7 @@ fn closing_the_active_tab_feeds_the_neighbour() {
     open_fixture_tab(&mut controller, "close_active", "mantis-64", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 0 must fuse");
-    open_fixture_tab(&mut controller, "close_active", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "close_active", "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("tab 1 must fuse");
     open_fixture_tab(&mut controller, "close_active", "mantis-64", 3);
@@ -607,7 +607,7 @@ fn closing_the_active_tab_feeds_the_neighbour() {
     open_fixture_tab(&mut controller, "close_bg", "mantis-64", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(60)).expect("tab 1 must fuse");
-    open_fixture_tab(&mut controller, "close_bg", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "close_bg", "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("tab 2 must fuse");
 
@@ -666,7 +666,7 @@ fn composite_ready_follows_the_active_tabs_own_fuse() {
         CanvasFeed::Load { tab: 0, .. }
     ));
 
-    open_fixture_tab(&mut controller, "composite_ready", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "composite_ready", "mantis-512", 2);
     assert!(
         !controller.composite_ready(),
         "a second, never-fused tab being active must read false, even though tab 0 is fused"
@@ -704,7 +704,7 @@ fn opening_a_saved_project_feeds_its_own_planes() {
     assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     assert!(ffp.is_file());
 
-    open_fixture_tab(&mut controller, "saved", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "saved", "mantis-512", 2);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the second fuse must complete");
@@ -768,7 +768,7 @@ fn controller_over(scratch: &Path, ffps: &[&Path]) -> AppController {
 
 #[test]
 fn an_opened_project_feeds_its_planes_once_the_render_settles() {
-    let ffp = sealed_project("render_settles", "mantis-512", 3);
+    let ffp = sealed_project("render_settles", "mantis-64", 3);
     let scratch = common::tree("render_settles_scratch");
     let mut controller = controller_over(&scratch, &[&ffp]);
 
@@ -802,7 +802,7 @@ fn an_opened_project_feeds_its_planes_once_the_render_settles() {
 #[test]
 fn a_saved_rows_planes_never_feed_a_tab_switched_to_meanwhile() {
     let small = sealed_project("switched_meanwhile", "mantis-64", 3);
-    let large = sealed_project("switched_meanwhile", "mantis-512", 3);
+    let large = sealed_project("switched_meanwhile", "mantis-512", 2);
     let scratch = common::tree("switched_meanwhile_scratch");
     let mut controller = controller_over(&scratch, &[&small, &large]);
 
@@ -857,7 +857,7 @@ fn a_refused_saved_row_is_not_rendered_again() {
 }
 
 /// Both panes draw at the sealed composite's own extent once a tab holds
-/// one, not the raw source frames': fuses a `mantis-512` tab (512x512
+/// one, not the raw source frames': fuses a `mantis-64` tab (64x64
 /// frames), whose alignment crop makes the composite smaller, and asserts
 /// `frame_draw` and `plane_draw` return the identical source rect, bounded
 /// by the composite's own dimensions.
@@ -865,7 +865,7 @@ fn a_refused_saved_row_is_not_rendered_again() {
 fn right_pane_uses_composite_extent() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(common::tree("right_pane_extent_scratch"));
-    open_fixture_tab(&mut controller, "right_pane_extent", "mantis-512", 3);
+    open_fixture_tab(&mut controller, "right_pane_extent", "mantis-64", 3);
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120))
         .expect("the fuse must complete");
@@ -874,8 +874,8 @@ fn right_pane_uses_composite_extent() {
     let composite_header =
         TiffHeader::open(&composite_path).expect("the sealed composite must have a real header");
     assert!(
-        composite_header.width < 512 || composite_header.height < 512,
-        "the alignment crop must make the composite smaller than the 512x512 frames, got {}x{}",
+        composite_header.width < 64 || composite_header.height < 64,
+        "the alignment crop must make the composite smaller than the 64x64 frames, got {}x{}",
         composite_header.width,
         composite_header.height
     );

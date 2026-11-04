@@ -21,7 +21,7 @@ use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation
 use focusforge_gui::canvas::PaneSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
-use common::{open_mantis64_tab, record_events, save_to_proposed, settle_all};
+use common::{open_mantis64_tab, record_events, save_to_proposed, scratch_controller, settle_all};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
 /// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
@@ -384,14 +384,6 @@ fn controller_api_is_slint_free() {
 // needs well over a minute to fuse the 512 px fixture, and a settled run returns at once.
 const SETTLE: Duration = Duration::from_secs(300);
 
-/// A controller whose ledger, staging and held checkpoints live under a
-/// fresh directory named for `name`.
-fn controller_with_scratch(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    controller
-}
-
 #[test]
 #[should_panic(expected = "no fixture frame at")]
 fn fixture_frame_refuses_a_missing_frame() {
@@ -454,7 +446,7 @@ fn open_fused_tab_on(
 
 #[test]
 fn alignment_off_and_crop_off_survive_save_and_reopen() {
-    let mut controller = controller_with_scratch("align_crop_off");
+    let mut controller = scratch_controller("align_crop_off");
     open_mantis64_tab(&mut controller, "align_crop_off", 3);
     controller.set_param_value(
         "align-switch",
@@ -481,7 +473,7 @@ fn alignment_off_and_crop_off_survive_save_and_reopen() {
     assert!(manifest.registration.crop.is_none(), "no crop applied");
     assert_eq!(manifest.composite.width, 64, "the full frame extent");
 
-    let mut reopened = controller_with_scratch("align_crop_off_reopened");
+    let mut reopened = scratch_controller("align_crop_off_reopened");
     assert!(matches!(
         common::open_and_settle(&mut reopened, std::slice::from_ref(&path)),
         OpenOutcome::Opened(_)
@@ -576,7 +568,7 @@ fn assert_editor_refused(controller: &mut AppController, case: &str) {
 
 #[test]
 fn editor_mode_enters_on_a_fused_tab() {
-    let mut controller = controller_with_scratch("editor_enters");
+    let mut controller = scratch_controller("editor_enters");
     open_fused_tab(&mut controller, "editor_enters_held", 2);
     let events = record_events(&mut controller);
     assert!(controller.editor_enabled(), "a held checkpoint is editable");
@@ -589,7 +581,7 @@ fn editor_mode_enters_on_a_fused_tab() {
 
     assert!(controller.set_mode(ShellMode::Stacking));
     let project_path = save_to_proposed(&mut controller);
-    let mut reopened = controller_with_scratch("editor_enters_reopened");
+    let mut reopened = scratch_controller("editor_enters_reopened");
     assert!(matches!(
         common::open_and_settle(&mut reopened, &[project_path]),
         OpenOutcome::Opened(_)
@@ -606,7 +598,7 @@ fn editor_mode_enters_on_a_fused_tab() {
 
 #[test]
 fn fuse_auto_enters_editor_on_the_viewed_tab() {
-    let mut controller = controller_with_scratch("fuse_auto_editor");
+    let mut controller = scratch_controller("fuse_auto_editor");
     open_fused_tab(&mut controller, "fuse_auto_editor", 3);
     assert_eq!(
         controller.mode(),
@@ -617,7 +609,7 @@ fn fuse_auto_enters_editor_on_the_viewed_tab() {
 
 #[test]
 fn editor_mode_is_refused_without_fused_planes() {
-    let mut controller = controller_with_scratch("editor_refused");
+    let mut controller = scratch_controller("editor_refused");
     assert!(!controller.editor_enabled(), "no active tab");
     assert_editor_refused(&mut controller, "no active tab");
 
@@ -633,7 +625,7 @@ fn editor_mode_is_refused_without_fused_planes() {
     assert!(controller.start_fuse());
     settle_all(&mut controller);
     let project_path = save_to_proposed(&mut controller);
-    let mut reopened = controller_with_scratch("editor_refused_reopened");
+    let mut reopened = scratch_controller("editor_refused_reopened");
     assert!(matches!(
         common::open_and_settle(&mut reopened, std::slice::from_ref(&project_path)),
         OpenOutcome::Opened(_)
@@ -644,7 +636,7 @@ fn editor_mode_is_refused_without_fused_planes() {
 
 #[test]
 fn editor_mode_requires_the_fused_frame_set() {
-    let mut controller = controller_with_scratch("editor_frame_set");
+    let mut controller = scratch_controller("editor_frame_set");
     let root = open_fused_tab(&mut controller, "editor_frame_set", 3);
     // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
     // so this test's own frame-management calls below (Stacking-only) run.
@@ -693,7 +685,7 @@ fn editor_mode_requires_the_fused_frame_set() {
 
 #[test]
 fn editor_mode_refuses_during_the_tabs_own_run() {
-    let mut controller = controller_with_scratch("editor_own_run");
+    let mut controller = scratch_controller("editor_own_run");
     open_fused_tab(&mut controller, "editor_own_run_a", 2);
     open_fused_tab(&mut controller, "editor_own_run_b", 3);
 
@@ -737,7 +729,7 @@ fn editor_mode_refuses_during_the_tabs_own_run() {
 
 #[test]
 fn edit_session_is_per_tab_and_survives_mode_switches() {
-    let mut controller = controller_with_scratch("edit_session_per_tab");
+    let mut controller = scratch_controller("edit_session_per_tab");
     open_fused_tab(&mut controller, "edit_session_per_tab_a", 2);
     controller.set_mode(ShellMode::Stacking);
     open_fused_tab(&mut controller, "edit_session_per_tab_b", 3);
@@ -799,7 +791,7 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
 
 #[test]
 fn edit_session_follows_the_newest_planes() {
-    let mut controller = controller_with_scratch("edit_session_newest");
+    let mut controller = scratch_controller("edit_session_newest");
     open_fused_tab(&mut controller, "edit_session_newest", 3);
     assert!(controller.set_mode(ShellMode::Editor));
     controller
@@ -825,7 +817,7 @@ fn edit_session_follows_the_newest_planes() {
 
 #[test]
 fn brush_source_is_the_selected_frame() {
-    let mut controller = controller_with_scratch("brush_source");
+    let mut controller = scratch_controller("brush_source");
     assert_eq!(controller.brush_source(), None, "no active tab");
 
     open_mantis64_tab(&mut controller, "brush_source", 3);
@@ -839,7 +831,7 @@ fn brush_source_is_the_selected_frame() {
 
 #[test]
 fn editor_mode_falls_back_when_the_tab_cannot_edit() {
-    let mut controller = controller_with_scratch("editor_fallback");
+    let mut controller = scratch_controller("editor_fallback");
     open_fused_tab(&mut controller, "editor_fallback_a", 2);
     open_fused_tab(&mut controller, "editor_fallback_b", 3);
     open_mantis64_tab(&mut controller, "editor_fallback_unsaved", 3);
@@ -1015,14 +1007,14 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
         assert_close_tail(&events);
     }
 
-    let mut discard = controller_with_scratch("detached_quit_without_saving");
+    let mut discard = scratch_controller("detached_quit_without_saving");
     open_fused_tab(&mut discard, "detached_quit_without_saving", 3);
     discard.undock_requested(PaneSource::Composite);
     let events = record_events(&mut discard);
     discard.quit_without_saving();
     assert_close_tail(&events);
 
-    let mut save = controller_with_scratch("detached_save_all_quit");
+    let mut save = scratch_controller("detached_save_all_quit");
     open_fused_tab(&mut save, "detached_save_all_quit", 3);
     save.undock_requested(PaneSource::Frame);
     let events = record_events(&mut save);
@@ -1031,7 +1023,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
     assert!(save.close_guard_secondary_pressed(|_| Some(target.clone())));
     assert_close_tail(&events);
 
-    let mut headless = controller_with_scratch("detached_save_all_quit_sync");
+    let mut headless = scratch_controller("detached_save_all_quit_sync");
     open_fused_tab(&mut headless, "detached_save_all_quit_sync", 3);
     headless.undock_requested(PaneSource::Composite);
     let events = record_events(&mut headless);
@@ -1044,7 +1036,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
 fn quit_asks_only_when_work_would_be_lost() {
     for tabs in 0..=2 {
         let name = format!("quit_asks_unfused_{tabs}");
-        let mut controller = controller_with_scratch(&name);
+        let mut controller = scratch_controller(&name);
         for tab in 0..tabs {
             open_mantis64_tab(&mut controller, &format!("{name}_{tab}"), 3);
         }
@@ -1058,7 +1050,7 @@ fn quit_asks_only_when_work_would_be_lost() {
         assert!(controller.pending_quit_copy().is_none(), "{tabs} tabs");
     }
 
-    let mut controller = controller_with_scratch("quit_asks_fused_added");
+    let mut controller = scratch_controller("quit_asks_fused_added");
     open_mantis64_tab(&mut controller, "quit_asks_fused_added_a", 3);
     open_fused_tab(&mut controller, "quit_asks_fused_added_b", 3);
     let events = record_events(&mut controller);
@@ -1078,7 +1070,7 @@ fn quit_asks_only_when_work_would_be_lost() {
 
 #[test]
 fn cancelling_a_guarded_quit_keeps_the_detached_pane() {
-    let mut controller = controller_with_scratch("detached_guarded_quit");
+    let mut controller = scratch_controller("detached_guarded_quit");
     open_mantis64_tab(&mut controller, "detached_guarded_quit", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -1099,7 +1091,7 @@ fn cancelling_a_guarded_quit_keeps_the_detached_pane() {
 
 #[test]
 fn cancelling_the_guarded_save_picker_keeps_the_detached_pane() {
-    let mut controller = controller_with_scratch("detached_save_picker_cancel");
+    let mut controller = scratch_controller("detached_save_picker_cancel");
     open_mantis64_tab(&mut controller, "detached_save_picker_cancel", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -1118,7 +1110,7 @@ fn cancelling_the_guarded_save_picker_keeps_the_detached_pane() {
 
 #[test]
 fn failed_guarded_quit_save_keeps_the_detached_pane() {
-    let mut controller = controller_with_scratch("detached_failed_quit_save");
+    let mut controller = scratch_controller("detached_failed_quit_save");
     open_mantis64_tab(&mut controller, "detached_failed_quit_save", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -1135,7 +1127,7 @@ fn failed_guarded_quit_save_keeps_the_detached_pane() {
 
 #[test]
 fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
-    let mut controller = controller_with_scratch("independent_detached_geometry");
+    let mut controller = scratch_controller("independent_detached_geometry");
     open_mantis64_tab(&mut controller, "independent_detached_geometry", 3);
     let left = PaneRect {
         x: 16.0,
@@ -1185,7 +1177,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
 #[test]
 fn main_resize_keeps_each_detached_panes_last_geometry() {
     for detached in [PaneSource::Frame, PaneSource::Composite] {
-        let mut controller = controller_with_scratch(&format!("preserve_detached_{detached:?}"));
+        let mut controller = scratch_controller(&format!("preserve_detached_{detached:?}"));
         open_mantis64_tab(
             &mut controller,
             &format!("preserve_detached_{detached:?}"),
@@ -1247,7 +1239,7 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
 
 #[test]
 fn detached_side_survives_resize_and_valid_mode_switches() {
-    let mut controller = controller_with_scratch("detached_mode_switch");
+    let mut controller = scratch_controller("detached_mode_switch");
     open_fused_tab(&mut controller, "detached_mode_switch", 3);
     let left = PaneRect {
         x: 0.0,
@@ -1287,7 +1279,7 @@ fn side_geometry_arrives_before_open_in_either_order() {
         (PaneSource::Composite, PaneSource::Frame),
     ] {
         let name = format!("geometry_order_{first:?}");
-        let mut controller = controller_with_scratch(&name);
+        let mut controller = scratch_controller(&name);
         let frame = PaneRect {
             x: 0.0,
             y: 0.0,
@@ -1320,7 +1312,7 @@ fn side_geometry_arrives_before_open_in_either_order() {
 
 #[test]
 fn detached_input_uses_its_own_local_coordinates() {
-    let mut controller = controller_with_scratch("detached_local_input");
+    let mut controller = scratch_controller("detached_local_input");
     open_mantis64_tab(&mut controller, "detached_local_input", 3);
     controller.set_pane_geometry(
         PaneRect {
@@ -1387,7 +1379,7 @@ fn detached_input_uses_its_own_local_coordinates() {
 
 #[test]
 fn detached_pan_uses_the_input_table_and_modal_guard() {
-    let mut controller = controller_with_scratch("detached_pan_modal_guard");
+    let mut controller = scratch_controller("detached_pan_modal_guard");
     open_mantis64_tab(&mut controller, "detached_pan_modal_guard", 3);
     let pane = PaneRect {
         x: 0.0,
@@ -1427,7 +1419,7 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
 
 #[test]
 fn detached_drag_ignores_another_windows_move_and_release() {
-    let mut controller = controller_with_scratch("detached_cross_window_drag");
+    let mut controller = scratch_controller("detached_cross_window_drag");
     open_mantis64_tab(&mut controller, "detached_cross_window_drag", 3);
     let pane = PaneRect {
         x: 0.0,
@@ -2294,7 +2286,7 @@ fn settle_fuse_only(controller: &mut AppController) {
 
 #[test]
 fn a_duplicated_tab_gets_its_picture_off_thread() {
-    let mut controller = controller_with_scratch("dup_picture");
+    let mut controller = scratch_controller("dup_picture");
     open_fused_tab(&mut controller, "dup_picture", 3);
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.remove_frame(0);
@@ -2313,7 +2305,7 @@ fn a_duplicated_tab_gets_its_picture_off_thread() {
 
 #[test]
 fn a_fused_checkpoint_picture_is_dropped_for_a_closed_tab() {
-    let mut controller = controller_with_scratch("closed_picture");
+    let mut controller = scratch_controller("closed_picture");
     open_mantis64_tab(&mut controller, "closed_picture_a", 2);
     let before = last_open_card(&controller)
         .picture
@@ -2335,7 +2327,7 @@ fn a_fused_checkpoint_picture_is_dropped_for_a_closed_tab() {
 #[test]
 fn an_older_picture_never_replaces_a_newer_one() {
     let fused_picture = |name: &str, frames: usize| {
-        let mut controller = controller_with_scratch(name);
+        let mut controller = scratch_controller(name);
         open_fused_tab(&mut controller, name, frames);
         common::settle_thumbnails(&mut controller);
         last_open_card(&controller)
@@ -2346,7 +2338,7 @@ fn an_older_picture_never_replaces_a_newer_one() {
     let second = fused_picture("older_picture_second", 2);
     assert_ne!(first.rgba, second.rgba, "the two fuses must look different");
 
-    let mut controller = controller_with_scratch("older_picture");
+    let mut controller = scratch_controller("older_picture");
     open_mantis64_tab(&mut controller, "older_picture", 3);
     // The reference pictures above are fused without gains; fuse the same way.
     controller.set_param_value(
@@ -3311,7 +3303,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
 // under the default aligner.
 #[test]
 fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
-    let mut controller = controller_with_scratch("default_fuse_mantis_512");
+    let mut controller = scratch_controller("default_fuse_mantis_512");
     let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
     assert!(matches!(
         common::open_and_settle(&mut controller, &[mantis_512]),
@@ -3389,7 +3381,7 @@ const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
 /// default aligner. Checks the queue head runs while tab 0 waits and every
 /// tab settles to an outcome of its own, then answers each question.
 fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
-    let mut c = controller_with_scratch(name);
+    let mut c = scratch_controller(name);
     common::open_frames_from(&mut c, "mantis-64", &format!("{name}_head"), 3);
     for (i, dummy) in tails.iter().enumerate() {
         let tab = format!("{name}_{i}");
@@ -3487,7 +3479,7 @@ fn queued_tab_runs_past_a_keep_question() {
 
 /// Tab 0 parked, tab 1 running slowly, tabs 2 and 3 queued behind it.
 fn parked_tab_with_two_queued(name: &str) -> AppController {
-    let mut c = controller_with_scratch(name);
+    let mut c = scratch_controller(name);
     common::open_frames_from(&mut c, "mantis-64", &format!("{name}_head"), 3);
     for i in 0..3 {
         open_mantis64_tab(&mut c, &format!("{name}_{i}"), 3);
@@ -3544,7 +3536,7 @@ fn queue_survives_cancelling_a_queued_tab() {
 
 #[test]
 fn a_clean_run_raises_no_unaligned_notice() {
-    let mut controller = controller_with_scratch("clean_run_no_notice");
+    let mut controller = scratch_controller("clean_run_no_notice");
     open_mantis64_tab(&mut controller, "clean_run_no_notice", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -3566,7 +3558,7 @@ fn a_clean_run_raises_no_unaligned_notice() {
 
 #[test]
 fn an_unresolved_align_id_is_refused_before_any_run() {
-    let mut controller = controller_with_scratch("unresolved_align_id");
+    let mut controller = scratch_controller("unresolved_align_id");
     open_mantis64_tab(&mut controller, "unresolved_align_id", 2);
     controller.set_align_algorithm("");
     assert!(!controller.start_fuse());
@@ -3607,7 +3599,7 @@ fn assert_panes_correspond(controller: &AppController, case: &str) {
 /// still uses the raw frame's size.
 #[test]
 fn frame_and_plane_panes_share_one_size_and_rect() {
-    let mut controller = controller_with_scratch("shared_pane_geometry");
+    let mut controller = scratch_controller("shared_pane_geometry");
     open_mantis64_tab(&mut controller, "shared_pane_geometry", 3);
     let left = PaneRect {
         x: 0.0,
@@ -3679,7 +3671,7 @@ fn frame_and_plane_panes_share_one_size_and_rect() {
 /// still share one size.
 #[test]
 fn post_fuse_frame_uses_identity_at_the_composite_crop() {
-    let mut controller = controller_with_scratch("post_fuse_frame");
+    let mut controller = scratch_controller("post_fuse_frame");
     let root = open_fused_tab(&mut controller, "post_fuse_frame", 3);
     // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
     // so `add_frames` below (Stacking-only) actually extends the frame set.
@@ -3856,7 +3848,7 @@ fn open_editor(name: &str) -> (AppController, PathBuf) {
 
 /// [`open_editor`] over a run of fuse method `method` instead of the default.
 fn open_editor_on(name: &str, method: Option<&str>) -> (AppController, PathBuf) {
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     controller.set_resident_tile_size_for_test(16);
     let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_pane_geometry(LEFT, RIGHT);
@@ -4340,7 +4332,7 @@ fn brush_controls_convert_to_storage_units() {
     c.wheel(0.0, 120.0, 0.0, 0.0, CTRL);
     assert_eq!(c.brush_source(), Some(0), "clamped to the frame list");
 
-    let mut narrow = controller_with_scratch("brush_units_narrow");
+    let mut narrow = scratch_controller("brush_units_narrow");
     open_cropped_tab(&mut narrow, "brush_units_narrow", 40, 24);
     narrow.set_align_algorithm("dummy-align");
     assert!(narrow.start_fuse());
@@ -4363,7 +4355,7 @@ fn brush_controls_convert_to_storage_units() {
 
 #[test]
 fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
-    let mut stacking = controller_with_scratch("images_wheel_stacking");
+    let mut stacking = scratch_controller("images_wheel_stacking");
     open_mantis64_tab(&mut stacking, "images_wheel_stacking", 3);
     stacking.select_frame(2);
     stacking.images_list_wheel(60.0);
@@ -4392,7 +4384,7 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
 
 #[test]
 fn image_preview_opening_a_short_list_after_a_scrolled_long_list_keeps_bounds_valid() {
-    let mut controller = controller_with_scratch("image_preview_tab_window");
+    let mut controller = scratch_controller("image_preview_tab_window");
     open_many_timed_frames(&mut controller, "image_preview_first", 1_000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
@@ -4408,7 +4400,7 @@ fn image_preview_opening_a_short_list_after_a_scrolled_long_list_keeps_bounds_va
 
 #[test]
 fn image_preview_opening_an_empty_list_after_a_scrolled_long_list_keeps_bounds_valid() {
-    let mut controller = controller_with_scratch("image_preview_empty_tab_window");
+    let mut controller = scratch_controller("image_preview_empty_tab_window");
     open_many_timed_frames(&mut controller, "image_preview_empty_first", 1_000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
@@ -4429,7 +4421,7 @@ fn image_preview_opening_an_empty_list_after_a_scrolled_long_list_keeps_bounds_v
 
 #[test]
 fn tab_switches_and_active_closes_reanchor_image_preview_windows() {
-    let mut controller = controller_with_scratch("image_preview_tab_window");
+    let mut controller = scratch_controller("image_preview_tab_window");
     open_many_timed_frames(&mut controller, "image_preview_first", 1_000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
@@ -4462,7 +4454,7 @@ use focusforge_gui::images::FrameSort;
 
 #[test]
 fn legend_rows_carry_the_z_map_palette() {
-    let mut c = controller_with_scratch("legend_palette");
+    let mut c = scratch_controller("legend_palette");
     open_fused_tab(&mut c, "legend_palette", 3);
     // Excluded after the fuse: the Z-Map is unchanged, so the legend must
     // still list, number and colour this frame like any other source.
@@ -4491,7 +4483,7 @@ fn legend_rows_carry_the_z_map_palette() {
 
 #[test]
 fn legend_header_states() {
-    let mut c = controller_with_scratch("legend_header");
+    let mut c = scratch_controller("legend_header");
     open_fused_tab(&mut c, "legend_header", 3);
     // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
     // so the "before" half of this test observes the Stacking-mode legend.
@@ -4524,7 +4516,7 @@ fn legend_header_states() {
 
 #[test]
 fn legend_lists_only_frames_and_rejects_a_position_past_them() {
-    let mut c = controller_with_scratch("legend_no_source");
+    let mut c = scratch_controller("legend_no_source");
     open_fused_tab(&mut c, "legend_no_source", 3);
     c.set_mode(ShellMode::Stacking);
     assert!(c.set_mode(ShellMode::Editor));
@@ -4650,7 +4642,7 @@ fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
 
 #[test]
 fn overlay_draws_in_stacking_on_a_fused_tab() {
-    let mut c = controller_with_scratch("overlay_stacking");
+    let mut c = scratch_controller("overlay_stacking");
     open_fused_tab(&mut c, "overlay_stacking", 3);
     assert!(c.set_mode(ShellMode::Editor));
     c.set_overlay_opacity_fraction(0.3);
@@ -4670,7 +4662,7 @@ fn overlay_draws_in_stacking_on_a_fused_tab() {
 
 #[test]
 fn overlay_unavailable_without_a_finished_fuse() {
-    let mut c = controller_with_scratch("overlay_unavailable");
+    let mut c = scratch_controller("overlay_unavailable");
     c.set_overlay_on(true);
     assert!(!c.overlay_available(), "no tab");
     assert_eq!(c.overlay_draw(), None, "no tab, toggle on");
@@ -4690,7 +4682,7 @@ fn overlay_unavailable_without_a_finished_fuse() {
 
 #[test]
 fn overlay_follows_the_active_tab() {
-    let mut c = controller_with_scratch("overlay_tabs");
+    let mut c = scratch_controller("overlay_tabs");
     open_fused_tab(&mut c, "overlay_tabs_fused", 3);
     assert!(c.set_mode(ShellMode::Stacking));
     c.set_overlay_on(true);
@@ -4713,7 +4705,7 @@ fn overlay_follows_the_active_tab() {
 
 #[test]
 fn overlay_counts_fused_sources_not_frames() {
-    let mut c = controller_with_scratch("overlay_sources");
+    let mut c = scratch_controller("overlay_sources");
     open_fused_tab(&mut c, "overlay_sources", 2);
     assert!(c.set_mode(ShellMode::Stacking));
     c.set_overlay_on(true);
@@ -4732,7 +4724,7 @@ fn overlay_counts_fused_sources_not_frames() {
 
 #[test]
 fn overlay_controls_match_the_render_parameters() {
-    let mut c = controller_with_scratch("overlay_params");
+    let mut c = scratch_controller("overlay_params");
     open_fused_tab(&mut c, "overlay_params", 3);
     assert!(c.set_mode(ShellMode::Stacking));
     assert_eq!(c.mode(), ShellMode::Stacking);
@@ -4838,7 +4830,7 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
 
 #[test]
 fn pipette_reads_and_appends_nothing() {
-    let mut c = controller_with_scratch("brush_pipette");
+    let mut c = scratch_controller("brush_pipette");
     // Fused with a decoy tab active at settle time, so the auto-entry into
     // Editor a commit now triggers skips tab 0 (it isn't the viewed tab) --
     // its edit session must open fresh below, after the Z-Map is rewritten,
@@ -4975,7 +4967,7 @@ fn pipette_reads_and_appends_nothing() {
 fn zmap_unreadable_leaves_the_image_working() {
     use focusforge_gui::canvas::CanvasFeed;
 
-    let mut c = controller_with_scratch("zmap_unreadable");
+    let mut c = scratch_controller("zmap_unreadable");
     open_fused_tab(&mut c, "zmap_unreadable_frames", 3);
     let (path, older, _head) = common::save_two_fuses(&mut c);
     common::corrupt_blob(&path, &saved_zmap_blob(&path, &older));
@@ -5706,7 +5698,7 @@ fn mirrored_cursor_marks_the_pipette_point() {
 /// the unfitted-viewport case and the no-panes-installed case at once.
 #[test]
 fn mirrored_cursor_absent_without_geometry() {
-    let mut c = controller_with_scratch("mirrored_cursor_absent");
+    let mut c = scratch_controller("mirrored_cursor_absent");
     assert!(c.brush_cursor_view().is_none(), "no active tab");
 
     open_fused_tab(&mut c, "mirrored_cursor_absent", 3);
@@ -6057,7 +6049,7 @@ fn stroke_matches_left_pane() {
 fn open_equalized_editor(name: &str, count: usize) -> AppController {
     use focusforge_core::params::ParamValue;
 
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     controller.set_resident_tile_size_for_test(16);
     open_mantis64_tab(&mut controller, name, count);
     controller.set_fuse_algorithm("depth-map");
@@ -6941,7 +6933,7 @@ fn brush_cursor_hidden_under_every_modal() {
     // divergent run on a tab already holding a checkpoint, and
     // `brush_cursor_view` has no mode check either way.
     {
-        let mut c = controller_with_scratch("cursor_divergence");
+        let mut c = scratch_controller("cursor_divergence");
         common::open_frames_from(&mut c, "mantis-64", "cursor_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(
@@ -7077,7 +7069,7 @@ fn canvas_input_blocked_under_every_modal() {
         c.toggle_projects_overlay();
     }
     {
-        let mut c = controller_with_scratch("blocked_divergence");
+        let mut c = scratch_controller("blocked_divergence");
         common::open_frames_from(&mut c, "mantis-64", "blocked_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(c.start_fuse());
@@ -7128,7 +7120,7 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
 
 #[test]
 fn refusal_dialog_counts_as_modal() {
-    let mut controller = controller_with_scratch("refusal_modal");
+    let mut controller = scratch_controller("refusal_modal");
     open_mantis64_tab(&mut controller, "refusal_modal", 2);
     controller.set_align_algorithm("");
     assert!(!controller.modal_open(), "nothing raised yet");
@@ -7230,7 +7222,7 @@ fn paint(controller: &mut AppController, x: i32) {
 }
 
 fn reopen(path: &Path, name: &str) -> AppController {
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     assert!(matches!(
         common::open_and_settle(&mut controller, &[path.to_path_buf()]),
         OpenOutcome::Opened(_)
@@ -7277,7 +7269,7 @@ fn added_checkpoint(path: &Path, known: &[String]) -> project::Checkpoint {
 /// Fuses two frames, saves, then paints and saves once more per entry of
 /// `strokes`. Returns the project file and its checkpoint ids, oldest first.
 fn saved_chain(name: &str, strokes: &[i32]) -> (PathBuf, Vec<String>) {
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     open_fused_tab(&mut controller, &format!("{name}_frames"), 2);
     let path = save_to_proposed(&mut controller);
     let mut chain = vec![saved(&path).checkpoint().id.clone()];
@@ -7292,7 +7284,7 @@ fn saved_chain(name: &str, strokes: &[i32]) -> (PathBuf, Vec<String>) {
 #[test]
 fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     // A never-saved project: fuse, paint, save.
-    let mut controller = controller_with_scratch("auto_checkpoint_new");
+    let mut controller = scratch_controller("auto_checkpoint_new");
     open_fused_tab(&mut controller, "auto_checkpoint_new_frames", 2);
     paint(&mut controller, 20);
     let painted_ops = ops(&controller);
@@ -7372,7 +7364,7 @@ fn a_fuse_records_the_current_row_as_its_parent() {
 
 #[test]
 fn save_is_enabled_only_with_something_to_write() {
-    let mut controller = controller_with_scratch("save_enabled_rule");
+    let mut controller = scratch_controller("save_enabled_rule");
     open_mantis64_tab(&mut controller, "save_enabled_rule_frames", 2);
     assert!(!controller.save_enabled(), "never fused");
 
@@ -7555,7 +7547,7 @@ fn a_snapshot_during_a_fuse_holds_no_files() {
 
 #[test]
 fn a_save_that_does_not_write_loses_nothing() {
-    let mut controller = controller_with_scratch("save_loses_nothing");
+    let mut controller = scratch_controller("save_loses_nothing");
     open_fused_tab(&mut controller, "save_loses_nothing_frames", 2);
     paint(&mut controller, 20);
     let painted_ops = ops(&controller);
@@ -7598,7 +7590,7 @@ fn a_save_that_does_not_write_loses_nothing() {
 #[test]
 fn an_older_checkpoint_edits_through_its_own_registration() {
     let name = "older_registration";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     let frames = open_fused_tab(&mut controller, name, 3);
     let path = save_to_proposed(&mut controller);
     let mut controller = reopen(&path, "older_registration_reopened");
@@ -7673,7 +7665,7 @@ fn editor_changes(events: &Mutex<Vec<ShellEvent>>) -> usize {
 #[test]
 fn entering_the_editor_opens_its_session_off_thread() {
     let name = "session_off_thread";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     controller.set_resident_tile_size_for_test(16);
     fused_twice_without_session(&mut controller, name);
     let (_, zmap) = controller
@@ -7736,7 +7728,7 @@ fn entering_the_editor_opens_its_session_off_thread() {
 fn a_session_lands_only_on_its_own_tab_and_generation() {
     // Closing the tab mid-open drops the result.
     let name = "session_closed_tab";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     let events = record_events(&mut controller);
     assert!(controller.set_mode(ShellMode::Editor));
@@ -7748,7 +7740,7 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
     // Restoring another row mid-open drops the result; the replacement
     // installs.
     let name = "session_restored_row";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     open_fused_tab(&mut controller, name, 2);
     paint(&mut controller, 20);
     let painted_ops = ops(&controller);
@@ -7777,7 +7769,7 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
     // A tab switch mid-open leaves the new tab without a session; the first
     // tab keeps its own.
     let name = "session_switched_tab";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     open_mantis64_tab(&mut controller, &format!("{name}_unfused"), 2);
     controller.select_project(0);
@@ -7798,7 +7790,7 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
 #[test]
 fn a_failed_session_open_drops_back_to_stacking() {
     let name = "session_open_fails";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     let (composite, _) = controller
         .materialize_active_tab_planes()
@@ -7824,7 +7816,7 @@ fn a_failed_session_open_drops_back_to_stacking() {
 #[test]
 fn a_save_settling_mid_open_restarts_the_session() {
     let name = "session_save_mid_open";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     let events = record_events(&mut controller);
     assert!(controller.set_mode(ShellMode::Editor));
@@ -8558,7 +8550,7 @@ fn performance_vram_cap_pending_note() {
     use focusforge_core::algorithm::AlignAlgorithm;
 
     let config = tempfile::tempdir().unwrap();
-    let mut controller = controller_with_scratch("performance_vram_note");
+    let mut controller = scratch_controller("performance_vram_note");
     open_mantis64_tab(&mut controller, "performance_vram_note", 2);
     controller.install_recent(Vec::new(), config.path().to_path_buf());
 
