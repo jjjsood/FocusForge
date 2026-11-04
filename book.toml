@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# The FocusForge user manual. Build with `mdbook build` from the repository root;
+# the output lands in book/, which is not committed.
+
+[book]
+title = "FocusForge Manual"
+authors = ["The FocusForge project"]
+description = "Focus stacking in practice, and every function of the FocusForge window."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/FocusForge/"
+git-repository-url = "https://github.com/jjjsood/FocusForge"
+edit-url-template = "https://github.com/jjjsood/FocusForge/edit/main/{path}"
+default-theme = "light"
+preferred-dark-theme = "ayu"
+
+[output.html.search]
+limit-results = 30

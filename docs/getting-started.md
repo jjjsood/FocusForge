@@ -2,7 +2,7 @@
 
 FocusForge is always available from source. Release artifacts are optional:
 use one only when its matching release provides it, otherwise follow the
-[source build](../README.md#build).
+[source build](https://github.com/jjjsood/FocusForge#build).
 
 ## Linux
 
