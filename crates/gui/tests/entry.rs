@@ -763,18 +763,6 @@ fn drop_caption_names_the_drop_and_the_wayland_line() {
 // The tab strip scrolls to every tab (nine projects at the 1200 minimum).
 // ---------------------------------------------------------------------
 
-fn init_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn push_tabs(app: &focusforge_gui::AppWindow, controller: &AppController) {
     let tabs: Vec<focusforge_gui::ProjectTabView> = controller
         .project_tabs()
@@ -798,7 +786,7 @@ fn push_tabs(app: &focusforge_gui::AppWindow, controller: &AppController) {
 
 #[test]
 fn tab_strip_scrolls_to_every_tab() {
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1200, 760));
 
@@ -1331,7 +1319,7 @@ fn a_close_after_the_debounce_window_closes() {
 /// selected, and the canvas shows the empty state with it.
 #[test]
 fn plus_shows_the_selected_marker_only_when_selected() {
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1384,7 +1372,7 @@ fn plus_shows_the_selected_marker_only_when_selected() {
 fn selecting_plus_and_back_flips_project_loaded_without_a_canvas_gesture() {
     use std::sync::{Arc, Mutex};
 
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1417,7 +1405,7 @@ fn selecting_plus_and_back_flips_project_loaded_without_a_canvas_gesture() {
 fn answering_the_question_closes_its_dialog() {
     use std::sync::{Arc, Mutex};
 
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1897,7 +1885,7 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
     use std::sync::{Arc, Mutex};
 
     for (case, close, active) in [(0, 1, 0), (1, 0, 0), (2, 1, 1), (3, 3, 3)] {
-        init_backend();
+        common::init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
         app.window().set_size(slint::PhysicalSize::new(1440, 900));
 

@@ -7,8 +7,8 @@
 //! No display server and no GPU: `i_slint_backend_testing::init_no_event_loop()`
 //! simulates a windowing system without one and renders no pixels. The
 //! backend is per-thread and a second `init` on the same thread is an error,
-//! so every test reaches the probe through [`probe`], which guards the
-//! `init` call behind a `thread_local!`.
+//! so every test reaches the probe through [`probe`], which installs the
+//! backend with the shared per-thread guard.
 
 mod common;
 
@@ -17,18 +17,10 @@ use std::fs;
 use focusforge_gui::{Theme, ThemeProbe};
 use slint::{Color, Global};
 
-/// A headless `ThemeProbe` instance; the `thread_local!` guard makes a
-/// repeat call on the same thread safe.
+/// A headless `ThemeProbe` instance; the shared per-thread backend guard
+/// makes a repeat call on the same thread safe.
 fn probe() -> ThemeProbe {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     ThemeProbe::new().unwrap()
 }
 

@@ -21,6 +21,8 @@ use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation
 use focusforge_gui::canvas::PaneSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
+use common::{open_mantis64_tab, record_events, save_to_proposed, settle_all};
+
 /// True when `body` (already trimmed) is exactly one statement of the form
 /// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
 /// and the key handlers return an `EventResult`), a bare `accept`/`reject`
@@ -390,34 +392,6 @@ fn controller_with_scratch(name: &str) -> AppController {
     controller
 }
 
-/// Opens the first `count` `fixtures/mantis-64` frames, copied under a fresh
-/// directory, as a new active tab with no checkpoint. Returns that directory.
-fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
-    let root = open_mantis64_frames(controller, name, count);
-    // Editor entry is under test, not alignment quality; an algorithm that
-    // always converges keeps every run clean.
-    controller.set_align_algorithm("dummy-align");
-    root
-}
-
-/// [`open_mantis64_tab`] on the default aligner, which parks these frames
-/// at its Keep/Discard question.
-fn open_mantis64_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
-    let root = common::tree(&format!("{name}_frames"));
-    for i in 0..count {
-        fs::copy(
-            common::fixture_frame("mantis-64", i),
-            root.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    root
-}
-
 #[test]
 #[should_panic(expected = "no fixture frame at")]
 fn fixture_frame_refuses_a_missing_frame() {
@@ -448,11 +422,6 @@ fn open_many_timed_frames(controller: &mut AppController, name: &str, count: usi
         OpenOutcome::Opened(_)
     ));
     controller.set_align_algorithm("dummy-align");
-}
-
-/// Settles every run, the live one and each one promoted from the queue.
-fn settle_all(controller: &mut AppController) {
-    while common::wait_for_settle(controller, SETTLE).is_some() {}
 }
 
 /// [`open_mantis64_tab`], then fuses it into one held checkpoint.
@@ -543,26 +512,6 @@ fn alignment_off_and_crop_off_survive_save_and_reopen() {
     let manifest = head(&path);
     assert!(manifest.align.is_none() && manifest.registration.crop.is_none());
     assert_eq!(manifest.composite.width, 64);
-}
-
-/// Saves the active, never-saved tab to the path the save dialog proposes.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
-}
-
-/// Every event the controller emits from here on.
-fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
-    let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink_events = events.clone();
-    controller.set_sink(Arc::new(move |event| {
-        sink_events.lock().unwrap().push(event)
-    }));
-    events
 }
 
 /// Drains `events`, keeping only the modes each `ModeChanged` carried.
@@ -3441,13 +3390,13 @@ const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
 /// tab settles to an outcome of its own, then answers each question.
 fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
     let mut c = controller_with_scratch(name);
-    open_mantis64_frames(&mut c, &format!("{name}_head"), 3);
+    common::open_frames_from(&mut c, "mantis-64", &format!("{name}_head"), 3);
     for (i, dummy) in tails.iter().enumerate() {
         let tab = format!("{name}_{i}");
         if *dummy {
             open_mantis64_tab(&mut c, &tab, 3);
         } else {
-            open_mantis64_frames(&mut c, &tab, 3);
+            common::open_frames_from(&mut c, "mantis-64", &tab, 3);
         }
     }
     c.set_slow_run(2, Duration::from_secs(3));
@@ -3539,7 +3488,7 @@ fn queued_tab_runs_past_a_keep_question() {
 /// Tab 0 parked, tab 1 running slowly, tabs 2 and 3 queued behind it.
 fn parked_tab_with_two_queued(name: &str) -> AppController {
     let mut c = controller_with_scratch(name);
-    open_mantis64_frames(&mut c, &format!("{name}_head"), 3);
+    common::open_frames_from(&mut c, "mantis-64", &format!("{name}_head"), 3);
     for i in 0..3 {
         open_mantis64_tab(&mut c, &format!("{name}_{i}"), 3);
     }
@@ -6993,7 +6942,7 @@ fn brush_cursor_hidden_under_every_modal() {
     // `brush_cursor_view` has no mode check either way.
     {
         let mut c = controller_with_scratch("cursor_divergence");
-        open_mantis64_frames(&mut c, "cursor_divergence", 3);
+        common::open_frames_from(&mut c, "mantis-64", "cursor_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(
             c.brush_cursor_view().is_some(),
@@ -7129,7 +7078,7 @@ fn canvas_input_blocked_under_every_modal() {
     }
     {
         let mut c = controller_with_scratch("blocked_divergence");
-        open_mantis64_frames(&mut c, "blocked_divergence", 3);
+        common::open_frames_from(&mut c, "mantis-64", "blocked_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(c.start_fuse());
         settle_all(&mut c);
@@ -9010,22 +8959,8 @@ fn storage_clear_failure_line_names_the_cause_without_the_os_error_code() {
 
 mod notification {
     use super::{AppController, SETTLE, common};
-    use focusforge_core::params::ParamValue;
     use focusforge_gui::entry::ImportRefused;
     use focusforge_gui::notifications::{Kind, Notification};
-
-    fn every_frame_clamps(name: &str, excluded: Option<usize>) -> AppController {
-        let mut controller = common::controller_with_frames(name, 3);
-        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
-        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
-        if let Some(index) = excluded {
-            controller.toggle_frame_excluded(index);
-        }
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, SETTLE);
-        controller
-    }
 
     fn warnings(controller: &AppController) -> Vec<Notification> {
         controller
@@ -9038,7 +8973,7 @@ mod notification {
 
     #[test]
     fn every_brightness_warning_becomes_its_own_record() {
-        let controller = every_frame_clamps("notification_every_warning", None);
+        let controller = common::every_frame_clamps("notification_every_warning", None);
         let records = warnings(&controller);
         assert_eq!(records.len(), 3, "one record per clamped frame");
         for (i, record) in records.iter().enumerate() {
@@ -9053,7 +8988,7 @@ mod notification {
 
     #[test]
     fn a_brightness_record_names_its_frame_file() {
-        let controller = every_frame_clamps("notification_frame_file", Some(0));
+        let controller = common::every_frame_clamps("notification_frame_file", Some(0));
         let records = warnings(&controller);
         assert_eq!(
             records.len(),
@@ -9070,7 +9005,7 @@ mod notification {
 
     #[test]
     fn a_settled_run_publishes_once_across_polls() {
-        let mut controller = every_frame_clamps("notification_once", None);
+        let mut controller = common::every_frame_clamps("notification_once", None);
         let before = controller.notifications().len();
         assert!(before > 0);
         for _ in 0..5 {

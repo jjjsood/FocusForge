@@ -17,15 +17,7 @@ use slint::ComponentHandle;
 /// otherwise reports 800 x 600 until set (`i-slint-backend-testing`
 /// 1.17.1's `TestingWindow`).
 fn app_at(width: u32, height: u32) -> AppWindow {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window()
         .set_size(slint::PhysicalSize::new(width, height));
@@ -3069,7 +3061,6 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
 
 mod notification {
     use super::*;
-    use focusforge_core::params::ParamValue;
     use focusforge_gui::notifications::Kind;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::cell::RefCell;
@@ -3405,13 +3396,7 @@ mod notification {
 
     #[test]
     fn a_brightness_row_names_the_frame_file() {
-        let mut controller = common::controller_with_frames("shell_brightness_row", 3);
-        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
-        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
-        controller.toggle_frame_excluded(0);
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let controller = common::every_frame_clamps("shell_brightness_row", Some(0));
         let project = controller.notifications()[0]
             .project_title
             .clone()

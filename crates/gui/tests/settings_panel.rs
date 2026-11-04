@@ -899,15 +899,7 @@ fn layout_survives_a_long_label() {
     use i_slint_backend_testing::ElementQuery;
     use slint::{ComponentHandle, Model as _};
 
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
 
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
@@ -972,18 +964,6 @@ fn panel_scrolls_and_the_heading_sticks() {
     );
 }
 
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn mounted(app: &focusforge_gui::AppWindow, id: &str) -> i_slint_backend_testing::ElementHandle {
     i_slint_backend_testing::ElementQuery::from_root(app)
         .match_id(id)
@@ -1038,7 +1018,7 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     }
 
     enable_trace_accounting();
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -1220,7 +1200,7 @@ fn a_slider_drag_survives_a_panel_push() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -1349,15 +1329,7 @@ fn panel_disable_is_whole_panel() {
         "job_running must read false with no job running -- the panel reads it as a whole-panel disable"
     );
 
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -2316,7 +2288,7 @@ impl MountedPanel {
         use slint::ComponentHandle;
         use std::sync::{Arc, Mutex};
 
-        init_window_backend();
+        common::init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
         // Tall enough that every strip stays inside the panel's viewport with
         // the Prepare and Fuse sections open: a strip below the viewport's edge
@@ -2543,7 +2515,7 @@ fn reset_all_and_switches_report_their_state() {
     use i_slint_backend_testing::{AccessibleRole, ElementQuery};
     use slint::{ComponentHandle, Model as _};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     // Tall enough that no row is clipped out of the panel's viewport, where
     // an element query does not look.
@@ -2826,7 +2798,7 @@ fn keyboard_step_moves_the_target_by_one_step_and_clamps() {
 
 #[test]
 fn the_panel_is_disabled_without_a_project() {
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     let mut controller = AppController::new();
     focusforge_gui::bridge::push_settings_panel(&app, &controller);

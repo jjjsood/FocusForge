@@ -19,7 +19,7 @@ use focusforge_gui::job;
 use focusforge_gui::source_previews::{self, PreviewError};
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
-use common::{controller_with_frames_from, copy_frame_from, tree};
+use common::{controller_with_frames_from, copy_frame_from, save_to_proposed, tree};
 
 fn write_timed(dir: &Path, name: &str, when: Option<&str>) -> PathBuf {
     let path = dir.join(name);
@@ -246,7 +246,7 @@ fn live_processing_reserves_cached_native_preview_growth_during_resize() {
         std::thread::yield_now();
     }
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
@@ -325,7 +325,7 @@ fn an_idle_tab_cannot_schedule_source_previews_while_another_tab_processes() {
     assert_eq!(snapshot.admission_bytes, 0);
 }
 
-fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
+fn settle_to_stacking(controller: &mut AppController, timeout: Duration) {
     let start = Instant::now();
     loop {
         if controller.settle_job().is_some() {
@@ -345,17 +345,6 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     // baseline (`controller_in_editor_mode` still enters Editor itself,
     // right after this call, for the few tests that want it).
     controller.set_mode(ShellMode::Stacking);
-}
-
-/// Saves the active, never-saved tab to the path the save dialog proposes,
-/// and returns that path.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
 }
 
 /// Seals a project directly (no real fuse) over `sources`, returning its
@@ -550,29 +539,12 @@ fn rows_carry_no_index() {
 // identity, driving the left canvas pane.
 // ---------------------------------------------------------------------
 
-fn mantis64_frame(index: usize) -> PathBuf {
-    common::fixture_frame("mantis-64", index)
-}
-
-fn controller_with_mantis64_frames(name: &str) -> AppController {
-    let root = tree(&format!("{name}_frames"));
-    for i in 0..3 {
-        std::fs::copy(mantis64_frame(i), root.join(format!("{i:02}.tif")))
-            .expect("fixture frame must copy");
-    }
-    let mut controller = AppController::new();
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
-    controller
-}
-
 /// The selected position, the path the canvas is fed and the panel's own
 /// `selected` flags are one value -- never index 0, the last row instead.
 #[test]
 fn frame_selection_drives_left_pane() {
-    let mut controller = controller_with_mantis64_frames("frame_selection_drives_left_pane");
+    let mut controller =
+        controller_with_frames_from("mantis-64", "frame_selection_drives_left_pane", 3);
     let last = 2;
     controller.select_frame(last);
 
@@ -641,10 +613,10 @@ fn selection_is_always_exactly_one() {
     // An algorithm that always converges keeps the fuse out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.select_frame(2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(selected_count(&controller), 1, "after the post-run re-seed");
     assert!(
         controller.images_panel().rows[0].selected,
@@ -692,7 +664,7 @@ fn confirming_a_reorder_keeps_the_selected_source_visible() {
         controller_with_frames_from("mantis-512", "confirmed_reorder_selection_visibility", 3);
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.set_images_viewport_height(10.0);
     controller.select_frame(0);
     controller.images_viewport_scrolled(0.0);
@@ -711,7 +683,7 @@ fn confirming_a_reorder_keeps_the_selected_source_visible() {
         controller.source_preview_row_visible(2),
         "confirmation keeps the moved selected source visible"
     );
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 }
 
 // ---------------------------------------------------------------------
@@ -786,7 +758,7 @@ fn curating_is_free_before_the_first_fuse() {
 fn frame_set_change_warns_with_a_count() {
     let mut controller = controller_with_frames_from("mantis-512", "frame_set_change_warns", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -805,7 +777,7 @@ fn frame_set_change_warns_with_a_count() {
 fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
     let mut controller = controller_with_frames_from("mantis-512", "add_reorder_new_project", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     let extra = write_timed(&tree("add_reorder_extra"), "extra.tif", None);
     common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
@@ -824,7 +796,7 @@ fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
 fn remove_offers_exclude_instead_and_mentions_a_new_project() {
     let mut controller = controller_with_frames_from("mantis-512", "remove_offers_exclude", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     controller.remove_frame(0);
     let warning = controller.pending_frame_change().unwrap();
@@ -837,7 +809,7 @@ fn remove_offers_exclude_instead_and_mentions_a_new_project() {
 fn confirm_button_is_not_the_default() {
     let mut controller = controller_with_frames_from("mantis-512", "confirm_not_default", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     controller.remove_frame(0);
     let warning = controller.pending_frame_change().unwrap();
@@ -857,7 +829,7 @@ fn confirm_button_is_not_the_default() {
 fn confirming_a_pending_change_applies_it_and_re_fuses() {
     let mut controller = controller_with_frames_from("mantis-512", "confirm_applies", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -865,7 +837,7 @@ fn confirming_a_pending_change_applies_it_and_re_fuses() {
     assert!(controller.confirm_frame_change());
     assert!(controller.pending_frame_change().is_none());
     assert_eq!(controller.images_panel().rows.len(), 1);
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(
         controller.checkpoint_count(),
         Some(2),
@@ -1058,7 +1030,7 @@ fn import_cancel_leaves_the_project_unchanged() {
 fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
     let mut controller = controller_with_frames_from("mantis-512", "import_all_declined", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let extra_dir = tree("import_all_declined_extra");
@@ -1083,7 +1055,7 @@ fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
 fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
     let mut controller = controller_with_frames_from("mantis-512", "import_same_paths_accepted", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let same_path = controller
@@ -1109,7 +1081,7 @@ fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
 fn import_with_a_checkpoint_shows_the_duplicate_question_before_the_add_warning() {
     let mut controller = controller_with_frames_from("mantis-512", "import_checkpoint_order", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let extra_dir = tree("import_checkpoint_order_extra");
@@ -1204,7 +1176,7 @@ fn import_settled_after_a_frame_was_removed_meanwhile_changes_nothing() {
 fn import_wiring_shows_the_duplicate_question_and_keep_existing_button() {
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
 
     let mut controller = controller_with_frames_from("mantis-512", "import_wiring_duplicate", 2);
@@ -1270,7 +1242,7 @@ fn import_wiring_keep_existing_click_adds_the_new_frame_and_closes_the_question(
     use slint::{ComponentHandle, Model};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1365,15 +1337,15 @@ fn manual_order_clears_the_sort_selection() {
 // Stacking-mode-only.
 // ---------------------------------------------------------------------
 
-/// [`controller_with_mantis64_frames`], fused once and switched into editor
-/// mode through `set_mode`, the same path the mode switch takes.
+/// [`controller_with_frames_from`] over `mantis-64`, fused once and switched
+/// into editor mode through `set_mode`, the same path the mode switch takes.
 fn controller_in_editor_mode(name: &str) -> AppController {
-    let mut controller = controller_with_mantis64_frames(name);
+    let mut controller = controller_with_frames_from("mantis-64", name, 3);
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     // An algorithm that always converges keeps the fuse out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert!(
         controller.set_mode(ShellMode::Editor),
         "a fused tab enters editor mode"
@@ -1425,7 +1397,7 @@ fn mutations_are_refused_while_this_tabs_job_is_running() {
         "a drag must not even start while the job is running"
     );
 
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 }
 
 // ---------------------------------------------------------------------
@@ -1499,7 +1471,7 @@ fn a_sealed_tab_reads_as_having_a_checkpoint() {
     // fused -- the point already made above is that `Some(0)` gates nothing.
     let mut controller = controller_with_frames_from("mantis-512", "sealed_tab_checkpoint_gate", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.remove_frame(0);
     let warning = controller
         .pending_frame_change()
@@ -1878,18 +1850,6 @@ fn sort_menu_and_drag_are_stacking_mode_only() {
 // pointer capture outlive the row it started on.
 // ---------------------------------------------------------------------
 
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
     let pos = handle.absolute_position();
     let size = handle.size();
@@ -1911,7 +1871,7 @@ fn row_hover_survives_image_name_timestamp_and_action_surfaces_in_every_presenta
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_list_preview_active(true);
@@ -2033,7 +1993,7 @@ fn source_rows_take_keyboard_focus_and_select_the_next_resolved_source() {
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -2283,7 +2243,7 @@ fn editor_legend_rows_stay_read_only_in_every_presentation() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_in_editor_mode(
@@ -2418,7 +2378,7 @@ fn selecting_a_hovered_source_keeps_its_hover_actions_mounted() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -2529,7 +2489,7 @@ fn elided_filename_tooltip_uses_available_window_width_before_wrapping() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(720, 480));
     app.set_list_preview_active(true);
@@ -2592,7 +2552,7 @@ fn constrained_filename_tooltip_balances_wrapped_lines_within_the_viewport() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(360, 480));
     app.set_list_preview_active(true);
@@ -2654,7 +2614,7 @@ fn dragging_a_row_by_its_source_reorders_it_through_the_real_window() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2741,7 +2701,7 @@ fn installed_drag_callback_publishes_capture_before_the_next_motion() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -2788,7 +2748,7 @@ fn dragging_a_row_by_its_source_floats_a_copy_that_follows_the_cursor() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2966,7 +2926,7 @@ fn dragging_at_images_viewport_edges_auto_scrolls_and_keeps_the_selected_source_
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     for (presentation, at_bottom) in [
         (SourcePresentation::List, false),
         (SourcePresentation::List, true),
@@ -3180,7 +3140,7 @@ fn a_stationary_source_press_near_an_edge_does_not_auto_scroll_or_reorder() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let loaded = controller_with_list_frames("images_stationary_edge_press", 40);
@@ -3349,7 +3309,7 @@ fn source_drag_retirement_paths_leave_no_stale_edge_scroll() {
     running.set_align_algorithm("dummy-align");
     assert!(running.start_fuse());
     assert_retired(&mut running, "starting a job retires the drag");
-    wait_for_settle(&mut running, Duration::from_secs(120));
+    settle_to_stacking(&mut running, Duration::from_secs(120));
 }
 
 #[test]
@@ -3357,7 +3317,7 @@ fn images_panel_disable_is_whole_panel() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3427,7 +3387,7 @@ fn images_panel_editor_mode_is_read_only_not_dimmed() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3472,7 +3432,7 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -3643,7 +3603,7 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
     }
 
     enable_trace_accounting();
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_timed_frames(
@@ -3930,7 +3890,7 @@ fn a_thousand_rows_instantiate_only_the_visible_window() {
         .name
         .clone();
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
@@ -3992,7 +3952,7 @@ fn a_source_drag_survives_leaving_the_viewport_and_row_recycling() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -4114,7 +4074,7 @@ fn a_source_drag_survives_leaving_the_viewport_and_row_recycling() {
 fn exclude_instead_excludes_the_frame_and_clears_the_warning() {
     let mut controller = controller_with_frames_from("mantis-512", "exclude_instead_excludes", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     controller.remove_frame(0);
     assert!(controller.pending_frame_change().is_some());
@@ -4139,7 +4099,7 @@ fn exclude_instead_excludes_the_frame_and_clears_the_warning() {
 fn exclude_instead_is_a_no_op_off_a_remove_warning() {
     let mut controller = controller_with_frames_from("mantis-512", "exclude_instead_wrong_kind", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     let extra = write_timed(&tree("exclude_instead_wrong_kind_extra"), "extra.tif", None);
     common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
@@ -4155,7 +4115,7 @@ fn exclude_instead_is_a_no_op_off_a_remove_warning() {
 fn new_project_instead_opens_a_second_tab_and_leaves_the_first_alone() {
     let mut controller = controller_with_frames_from("mantis-512", "new_project_instead", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -4187,7 +4147,7 @@ fn switching_tabs_dismisses_a_stale_frame_set_warning() {
     let mut controller =
         controller_with_frames_from("mantis-512", "switching_tabs_dismisses_warning", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -4227,13 +4187,13 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let mut controller = controller_with_frames_from("mantis-512", "dialog_footer_pinned", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.remove_frame(0);
     assert!(controller.pending_frame_change().is_some());
 
@@ -4311,7 +4271,7 @@ fn write_the_61_frame_manual_evidence_tree() {
 fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     let mut controller = controller_with_frames_from("mantis-512", "frame_change_refuse_window", 3);
     controller.set_align_algorithm("dummy-align");
@@ -4351,7 +4311,7 @@ fn source_row_actions_and_panel_header_buttons_carry_their_names() {
     use i_slint_backend_testing::{AccessibleRole, ElementQuery};
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_list_preview_active(true);

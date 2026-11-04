@@ -4,15 +4,16 @@
 //! from `CARGO_MANIFEST_DIR`, the idiom `crates/core/tests/common/mod.rs`
 //! already established -- never a literal `../..` string.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use focusforge_core::params::ParamValue;
 use focusforge_gui::job::Op;
-use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
+use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellEvent, ShellMode};
 
 #[path = "../../../core/tests/common/reference_stack.rs"]
 mod reference_stack;
@@ -164,18 +165,135 @@ pub fn controller_with_frames(name: &str, count: usize) -> AppController {
 /// aligner.
 #[allow(dead_code)]
 pub fn controller_with_frames_from(set: &str, name: &str, count: usize) -> AppController {
+    let mut controller = AppController::new();
+    open_frames_from(&mut controller, set, name, count);
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller
+}
+
+/// Copies the first `count` frames of fixture set `set` into a fresh
+/// `{name}_frames` directory and opens it as a new active tab on the default
+/// aligner. Returns that directory.
+#[allow(dead_code)]
+pub fn open_frames_from(
+    controller: &mut AppController,
+    set: &str,
+    name: &str,
+    count: usize,
+) -> PathBuf {
     let root = tree(&format!("{name}_frames"));
     for i in 0..count {
         copy_frame_from(set, &root, &format!("{i:02}.tif"), i);
     }
-    let mut controller = AppController::new();
     assert!(matches!(
-        open_and_settle(&mut controller, &[root]),
+        open_and_settle(controller, std::slice::from_ref(&root)),
         OpenOutcome::Opened(_)
     ));
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    root
+}
+
+/// [`open_frames_from`] over `mantis-64`, then `dummy-align`: an algorithm
+/// that always converges keeps every run clean, so a test that is not about
+/// alignment never parks on an unaligned frame.
+#[allow(dead_code)]
+pub fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    let root = open_frames_from(controller, "mantis-64", name, count);
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// [`open_frames_from`] over `set` into `{name}_{set}_frames`, then
+/// `dummy-align`. The set is part of the directory so one `name` opens on two
+/// sets.
+#[allow(dead_code)]
+pub fn open_fixture_tab(
+    controller: &mut AppController,
+    name: &str,
+    set: &str,
+    count: usize,
+) -> PathBuf {
+    let root = open_frames_from(controller, set, &format!("{name}_{set}"), count);
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// An unsaved tab over three copied `mantis-64` frames with `fuses` in-memory
+/// fused checkpoints, the newest one current.
+#[allow(dead_code)]
+pub fn fused_tab(name: &str, fuses: usize) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    for _ in 0..fuses {
+        assert!(controller.start_fuse());
+        settle_all(&mut controller);
+    }
+    assert_eq!(controller.checkpoint_count(), Some(fuses));
     controller
 }
+
+/// A controller over three `mantis-64` frames, brightness equalization on
+/// with target 0.5 and max gain 1.25 (so every frame clamps), `excluded`
+/// frame left out, and one fuse started and settled.
+#[allow(dead_code)]
+pub fn every_frame_clamps(name: &str, excluded: Option<usize>) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
+    if let Some(index) = excluded {
+        controller.toggle_frame_excluded(index);
+    }
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, SETTLE);
+    controller
+}
+
+/// Settles every run, the live one and each one promoted from the queue.
+#[allow(dead_code)]
+pub fn settle_all(controller: &mut AppController) {
+    while wait_for_settle(controller, SETTLE).is_some() {}
+}
+
+/// Saves the active, never-saved tab to the path the save dialog proposes.
+#[allow(dead_code)]
+pub fn save_to_proposed(controller: &mut AppController) -> PathBuf {
+    let mut target = None;
+    assert!(save_and_settle(controller, |proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
+}
+
+/// Every event the controller emits from here on.
+#[allow(dead_code)]
+pub fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
+    let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+    events
+}
+
+/// Installs the headless testing backend on this thread once; a second
+/// `init_no_event_loop` call on one thread panics.
+#[allow(dead_code)]
+pub fn init_window_backend() {
+    thread_local! {
+        static INIT: Cell<bool> = const { Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+}
+
+/// Upper bound on a hang for [`settle_all`] and [`every_frame_clamps`]: a debug
+/// build on a loaded runner needs well over a minute to fuse the 512 px
+/// fixture, and a settled run returns at once.
+const SETTLE: Duration = Duration::from_secs(300);
 
 /// Polls `settle_job` until it returns or no work is pending any more,
 /// returning the materialized plane paths from the call that actually

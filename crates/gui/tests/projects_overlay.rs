@@ -18,41 +18,27 @@ use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
-use common::{controller_with_frames_from, copy_frame_from, tree};
+use common::{controller_with_frames_from, copy_frame_from, open_frames_from, tree};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, mirroring `tests/job.rs` and
 // `tests/entry.rs`.
 // ---------------------------------------------------------------------
 
-/// A fresh directory of `count` copied fixture frames, opened as one
-/// unsaved project on `controller`. Returns the frames' own directory --
-/// also where a save of this tab proposes its `.ffp`, beside the frames.
-fn open_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
-    let root = tree(&format!("{name}_frames"));
-    for i in 0..count {
-        copy_frame_from("mantis-512", &root, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    root
-}
-
 /// [`controller_with_frames_from`], plus the frames directory itself -- for a
 /// test that needs to reach back into the project a fuse seals there.
 fn controller_with_frames_and_dir(name: &str, count: usize) -> (AppController, PathBuf) {
     let mut controller = AppController::new();
-    let dir = open_frames(&mut controller, name, count);
+    let dir = open_frames_from(&mut controller, "mantis-512", name, count);
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     (controller, dir)
 }
 
-/// [`open_frames`] over two frames, then overwrites the second with bytes
-/// the TIFF reader refuses, so a fuse of it fails inside the pipeline.
+/// [`open_frames_from`] over two `mantis-512` frames, then overwrites the
+/// second with bytes the TIFF reader refuses, so a fuse of it fails inside the
+/// pipeline.
 fn open_unreadable_frames(controller: &mut AppController, name: &str) -> PathBuf {
-    let root = open_frames(controller, name, 2);
+    let root = open_frames_from(controller, "mantis-512", name, 2);
     controller.set_align_algorithm("dummy-align");
     std::fs::write(root.join("01.tif"), b"not a tiff").unwrap();
     root
@@ -126,7 +112,7 @@ fn open_folder_with_a_skipped_subfolder(controller: &mut AppController, name: &s
     root
 }
 
-fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
+fn settle_with_thumbnails(controller: &mut AppController, timeout: Duration) {
     let start = std::time::Instant::now();
     loop {
         if controller.settle_job().is_some()
@@ -192,7 +178,7 @@ fn toggle_and_escape_both_close() {
 #[test]
 fn every_open_project_has_a_card() {
     let mut controller = controller_with_frames_from("mantis-512", "every_open", 3);
-    open_frames(&mut controller, "every_open_second", 2);
+    open_frames_from(&mut controller, "mantis-512", "every_open_second", 2);
     controller.select_project(1);
 
     let cards = controller.project_cards();
@@ -233,7 +219,7 @@ fn running_project_shows_progress_on_its_card() {
         card.fusing_fraction
     );
 
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
 }
 
 fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job::JobProgress {
@@ -310,13 +296,13 @@ fn live_card_meta_names_the_phase() {
         card.meta_text
     );
 
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
 }
 
 #[test]
 fn clicking_a_card_switches_to_it() {
     let mut controller = controller_with_frames_from("mantis-512", "click_switch", 2);
-    open_frames(&mut controller, "click_switch_second", 2);
+    open_frames_from(&mut controller, "mantis-512", "click_switch_second", 2);
     controller.select_project(0);
     controller.toggle_projects_overlay();
     assert!(controller.projects_overlay_open());
@@ -353,7 +339,7 @@ fn card_picture_is_the_projects_composite() {
     // An algorithm that always converges keeps the alignment check out of the test.
     a.set_align_algorithm("dummy-align");
     assert!(a.start_fuse());
-    wait_for_settle(&mut a, Duration::from_secs(120));
+    settle_with_thumbnails(&mut a, Duration::from_secs(120));
     let picture_a = card_by_kind(&a.project_cards(), "open")
         .picture
         .clone()
@@ -363,7 +349,7 @@ fn card_picture_is_the_projects_composite() {
     // An algorithm that always converges keeps the alignment check out of the test.
     b.set_align_algorithm("dummy-align");
     assert!(b.start_fuse());
-    wait_for_settle(&mut b, Duration::from_secs(120));
+    settle_with_thumbnails(&mut b, Duration::from_secs(120));
     let picture_b = card_by_kind(&b.project_cards(), "open")
         .picture
         .clone()
@@ -381,7 +367,7 @@ fn thumbnail_is_downsampled_once_and_cached() {
     // An algorithm that always converges keeps the alignment check out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
 
     controller.toggle_projects_overlay();
     let first_open = card_by_kind(&controller.project_cards(), "open")
@@ -428,7 +414,7 @@ fn overlay_writes_nothing_to_the_project() {
     // An algorithm that always converges keeps the alignment check out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
 
     assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
     let project_file = find_project_file(&project_dir);
@@ -478,13 +464,13 @@ fn four_failure_cards_have_their_shapes() {
     open_unreadable_frames(&mut controller, "four_kinds_fail");
     controller.select_project(controller.project_tabs().len() - 1);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
-    open_frames(&mut controller, "four_kinds_cancel", 2);
+    open_frames_from(&mut controller, "mantis-512", "four_kinds_cancel", 2);
     controller.select_project(controller.project_tabs().len() - 1);
     assert!(controller.start_fuse());
     controller.cancel_fuse();
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
 
     let cards = controller.project_cards();
     assert_eq!(
@@ -530,7 +516,7 @@ fn a_failed_stack_updates_the_open_tab_not_a_second_card() {
     controller.set_scratch_root_for_test(tree("present_not_absent_scratch"));
     open_unreadable_frames(&mut controller, "present_not_absent");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
     // The tab itself stays open; its own card takes on the failure instead
     // of a second card appearing for the same attempt.
@@ -546,14 +532,14 @@ fn a_failed_stack_updates_the_open_tab_not_a_second_card() {
 fn a_failed_run_updates_its_own_card() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("abc_scratch"));
-    open_frames(&mut controller, "abc_a", 2);
-    let mid_dir = open_frames(&mut controller, "abc_mid", 3);
-    open_frames(&mut controller, "abc_c", 2);
+    open_frames_from(&mut controller, "mantis-512", "abc_a", 2);
+    let mid_dir = open_frames_from(&mut controller, "mantis-512", "abc_mid", 3);
+    open_frames_from(&mut controller, "mantis-512", "abc_c", 2);
     std::fs::write(mid_dir.join("01.tif"), b"not a tiff").unwrap();
 
     controller.select_project(1);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
     let cards = controller.project_cards();
     assert_eq!(cards.len(), 3, "one card per open tab, no duplicate");
@@ -572,12 +558,12 @@ fn a_failed_run_updates_its_own_card() {
 fn a_failure_keeps_earlier_checkpoints() {
     let (mut controller, dir) = controller_with_frames_and_dir("keeps_checkpoints", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     std::fs::write(dir.join("01.tif"), b"not a tiff").unwrap();
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
     assert_eq!(
         controller.checkpoint_count(),
@@ -594,10 +580,10 @@ fn a_failure_keeps_earlier_checkpoints() {
 fn run_again_stays_on_one_card_until_success() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("run_again_scratch"));
-    open_frames(&mut controller, "run_again_healthy", 2);
+    open_frames_from(&mut controller, "mantis-512", "run_again_healthy", 2);
     let fail_dir = open_unreadable_frames(&mut controller, "run_again_fail");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
     assert!(
         !controller.run_gallery_action(0),
@@ -605,7 +591,7 @@ fn run_again_stays_on_one_card_until_success() {
     );
 
     assert!(controller.run_gallery_action(1));
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(
         controller.active_project(),
         Some(1),
@@ -618,7 +604,7 @@ fn run_again_stays_on_one_card_until_success() {
     );
 
     assert!(controller.run_gallery_action(1));
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(
         controller.project_cards().len(),
         2,
@@ -631,25 +617,11 @@ fn run_again_stays_on_one_card_until_success() {
     )
     .unwrap();
     assert!(controller.run_gallery_action(1));
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     let cards = controller.project_cards();
     assert_eq!(cards.len(), 2);
     assert_eq!(cards[1].kind, "open");
     assert_eq!(controller.checkpoint_count(), Some(1));
-}
-
-/// A window backend, initialized once per thread -- `AppWindow::new()`
-/// otherwise panics on a second call from the same thread.
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
 }
 
 /// Run again on a failed card, started from inside the open overview,
@@ -661,13 +633,18 @@ fn run_again_failure_over_the_overview_raises_no_toast() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("run_again_over_overview_scratch"));
-    open_frames(&mut controller, "run_again_over_overview_healthy", 2);
+    open_frames_from(
+        &mut controller,
+        "mantis-512",
+        "run_again_over_overview_healthy",
+        2,
+    );
     open_unreadable_frames(&mut controller, "run_again_over_overview_failing");
     let controller = Arc::new(Mutex::new(controller));
     let _installed = focusforge_gui::bridge::install(
@@ -723,12 +700,12 @@ fn run_again_failure_over_the_overview_raises_no_toast() {
 fn a_cancelled_run_stays_on_its_own_card() {
     let mut controller = AppController::new();
     controller.set_scratch_root_for_test(tree("cancel_scratch"));
-    open_frames(&mut controller, "cancel_a", 2);
-    open_frames(&mut controller, "cancel_b", 2);
+    open_frames_from(&mut controller, "mantis-512", "cancel_a", 2);
+    open_frames_from(&mut controller, "mantis-512", "cancel_b", 2);
     controller.select_project(1);
     assert!(controller.start_fuse());
     controller.cancel_fuse();
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
 
     let cards = controller.project_cards();
     assert_eq!(
@@ -746,12 +723,12 @@ fn a_cancelled_run_stays_on_its_own_card() {
 fn a_failure_survives_a_save_and_leaves_with_its_tab() {
     let (mut controller, dir) = controller_with_frames_and_dir("survives_save", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     std::fs::write(dir.join("01.tif"), b"not a tiff").unwrap();
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     assert_eq!(
         card_by_kind(&controller.project_cards(), "failed").project_name,
         "survives_save_frames"
@@ -848,7 +825,7 @@ fn no_card_shows_a_measure() {
     open_unreadable_frames(&mut controller, "no_measure_fail");
     controller.select_project(controller.project_tabs().len() - 1);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
 
     let forbidden = ["%", "ratio", "sharpn", "coheren"];
     let mut found = Vec::new();
@@ -1005,7 +982,7 @@ fn a_rebind_cannot_shadow_a_chrome_key() {
     // A fresh tab for the overlay-open half of the test. Past
     // `AppController::CLOSE_DEBOUNCE`, so this close is not the first one's
     // double-click guard swallowing it.
-    open_frames(&mut controller, "rebind_shadow_reopen", 2);
+    open_frames_from(&mut controller, "mantis-512", "rebind_shadow_reopen", 2);
     std::thread::sleep(Duration::from_millis(350));
 
     controller.toggle_projects_overlay();
@@ -1042,7 +1019,7 @@ fn chrome_keys_work_with_the_overlay_closed() {
     );
 
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.chrome_key("s", ctrl), ChromeKey::SaveProject);
     assert_eq!(controller.chrome_key("S", ctrl), ChromeKey::SaveProject);
     assert!(controller.save_active_project(|proposed| Some(proposed.to_path_buf())));
@@ -1123,7 +1100,7 @@ fn opening_a_folder_group_records_nothing_in_recent() {
     let config_dir = tree("recent_folder_group_config");
     let mut controller = AppController::new();
     controller.install_recent(recent::load(&config_dir), config_dir.clone());
-    open_frames(&mut controller, "recent_folder_group", 2);
+    open_frames_from(&mut controller, "mantis-512", "recent_folder_group", 2);
     assert!(controller.recent_rows(0).is_empty());
     assert!(!config_dir.join("settings.toml").exists());
 
@@ -1283,7 +1260,7 @@ fn overlay_opened_before_a_load_still_closes_when_it_lands() {
 #[test]
 fn recent_row_switches_to_an_open_tab() {
     let (mut controller, first_dir) = controller_with_frames_and_dir("recent_switch", 2);
-    open_frames(&mut controller, "recent_switch_second", 2);
+    open_frames_from(&mut controller, "mantis-512", "recent_switch_second", 2);
     assert_eq!(controller.active_project(), Some(1));
 
     controller.install_recent(
@@ -1474,7 +1451,12 @@ fn gallery_lays_out_and_scrolls() {
 
     let mut controller = controller_with_frames_from("mantis-512", "gallery_scroll", 1);
     for i in 0..5 {
-        open_frames(&mut controller, &format!("gallery_scroll_{i}"), 1);
+        open_frames_from(
+            &mut controller,
+            "mantis-512",
+            &format!("gallery_scroll_{i}"),
+            1,
+        );
     }
     controller.set_gallery_width(width);
     controller.set_gallery_viewport_height(300.0);
@@ -1550,7 +1532,7 @@ fn overlay_window(
     use std::sync::{Arc, Mutex};
 
     focusforge_core::timing::enable_trace_accounting();
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1100, 500));
     let mut controller = AppController::new();
@@ -1559,7 +1541,7 @@ fn overlay_window(
     }
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     for i in 0..3 {
-        open_frames(&mut controller, &format!("{name}_{i}"), 2);
+        open_frames_from(&mut controller, "mantis-512", &format!("{name}_{i}"), 2);
     }
     controller.select_project(0);
     let controller = Arc::new(Mutex::new(controller));
@@ -1828,7 +1810,7 @@ fn rail_entries_are_labelled_buttons() {
     use i_slint_backend_testing::{AccessibleRole, ElementQuery};
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_projects_overlay_open(true);
@@ -1884,7 +1866,7 @@ fn bell_in_projects_opens_the_center_with_focus_inside() {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.window()
@@ -1901,7 +1883,7 @@ fn bell_in_projects_opens_the_center_with_focus_inside() {
             "a running job refuses an add"
         );
     }
-    wait_for_settle(&mut controller, Duration::from_secs(60));
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     let newest = controller.notifications().last().unwrap().id;
     let controller = Arc::new(Mutex::new(controller));
     let slot = Rc::new(RefCell::new(None));

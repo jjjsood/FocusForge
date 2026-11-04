@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use common::open_fixture_tab;
 use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
@@ -153,7 +154,7 @@ fn undo_and_redo_refresh_window_without_another_pointer_event() {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     let controller = Arc::new(Mutex::new(AppController::new()));
     let canvas = Rc::new(RefCell::new(focusforge_gui::bridge::Canvas::default()));
@@ -400,34 +401,6 @@ fn pending_pan_keeps_retained_coverage_inside_current_crop_until_latest_publish(
 // driven through `AppController` with no window and no GPU, asserting on
 // `canvas_feed`'s answer.
 // ---------------------------------------------------------------------
-
-/// Opens `fixtures/<set>`'s first `count` frames, copied under a fresh
-/// directory (never the committed fixture itself, since a fuse seals a
-/// `.ffp` beside its frames), as a new tab -- the newly opened tab becomes
-/// active. Returns the folder the tab was opened from.
-fn open_fixture_tab(
-    controller: &mut AppController,
-    name: &str,
-    set: &str,
-    count: usize,
-) -> PathBuf {
-    let root = common::tree(&format!("{name}_{set}_frames"));
-    for i in 0..count {
-        std::fs::copy(
-            common::fixture_frame(set, i),
-            root.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    // Canvas feeding is under test, not alignment quality; an algorithm that
-    // always converges keeps every run clean.
-    controller.set_align_algorithm("dummy-align");
-    root
-}
 
 /// A controller with two sealed tabs open -- tab 0 from `fixtures/mantis-64`
 /// (64x64), tab 1 from `fixtures/mantis-512` (512x512), the size mismatch
@@ -1233,15 +1206,7 @@ const GEOMETRY_EPS: f32 = 0.5;
 
 #[test]
 fn pane_chrome_geometry() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     // The label and undock control are hidden until a project is open --
@@ -1300,15 +1265,7 @@ fn pane_chrome_geometry() {
 /// yet run `bridge::repaint`.
 #[test]
 fn pane_chrome_hidden_without_a_project() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1325,15 +1282,7 @@ fn pane_chrome_hidden_without_a_project() {
 
 #[test]
 fn current_crop_bounds_each_main_pane() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_frame_crop_x(21.0);
@@ -1383,15 +1332,7 @@ fn current_crop_bounds_each_main_pane() {
 /// no run state at all.
 #[test]
 fn pane_placeholder_shows_only_until_the_first_fuse() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
 
     for (label, width, height) in [("base", 1440, 900), ("minimum", 1200, 760)] {
@@ -1504,15 +1445,7 @@ fn pane_placeholder_shows_only_until_the_first_fuse() {
 /// pane's rect exactly.
 #[test]
 fn both_brush_cursors_follow_either_pane() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3657,7 +3590,7 @@ fn a_stroke_does_not_swallow_the_next_click() {
         .expect("the fixture must fuse");
     common::enter_editor(&mut controller);
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3770,7 +3703,7 @@ fn scale_factor_change_without_resize_reaches_the_next_draw() {
     let mut controller = AppController::new();
     open_fixture_tab(&mut controller, "scale_factor_change", "mantis-512", 3);
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1200, 760));
     app.set_project_loaded(true);

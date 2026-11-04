@@ -23,8 +23,10 @@ use focusforge_core::project::{
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::ZMapInfo;
+use focusforge_gui::AppController;
 use focusforge_gui::checkpoints::local_date_and_time;
-use focusforge_gui::{AppController, OpenOutcome};
+
+use common::{open_mantis64_tab, save_to_proposed, settle_all};
 
 const SETTLE: Duration = Duration::from_secs(60);
 
@@ -34,45 +36,12 @@ fn scratch_controller(name: &str) -> AppController {
     controller
 }
 
-fn settle_all(controller: &mut AppController) {
-    while common::wait_for_settle(controller, SETTLE).is_some() {}
-}
-
-/// Opens the first `count` `fixtures/mantis-64` frames, copied under a fresh
-/// directory, as a new active tab with no checkpoint.
-fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
-    let root = common::tree(&format!("{name}_frames"));
-    for i in 0..count {
-        fs::copy(
-            common::fixture_frame("mantis-64", i),
-            root.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
-    root
-}
-
 /// [`open_mantis64_tab`], then fuses it into one held checkpoint.
 fn open_fused_tab(controller: &mut AppController, name: &str, count: usize) {
     open_mantis64_tab(controller, name, count);
     assert!(controller.start_fuse());
     settle_all(controller);
     assert_eq!(controller.checkpoint_count(), Some(1), "{name} must fuse");
-}
-
-/// Saves the active, never-saved tab to the path the save dialog proposes.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
 }
 
 fn wait_export(controller: &mut AppController) {

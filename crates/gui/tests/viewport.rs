@@ -972,7 +972,7 @@ fn wheel_repaints_once_on_the_next_idle_turn() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().expect("the window builds");
     let controller = Arc::new(Mutex::new(opened_controller()));
     let canvas = common::empty_canvas();

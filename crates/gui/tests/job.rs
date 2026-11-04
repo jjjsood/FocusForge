@@ -29,7 +29,10 @@ use focusforge_gui::{
     AppController, ChromeKey, GuardSecondary, OpenOutcome, SaveAsk, ShellEvent, ShellMode,
 };
 
-use common::{controller_with_frames, copy_frame};
+use common::{
+    controller_with_frames, copy_frame, open_mantis64_tab, record_events, save_to_proposed,
+    settle_all,
+};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, never the committed fixture directory
@@ -41,15 +44,7 @@ use common::{controller_with_frames, copy_frame};
 /// pass on a shared frame count. Tab 0 is selected on return.
 fn controller_with_two_tabs(name: &str) -> AppController {
     let mut controller = controller_with_frames(&format!("{name}_a"), 3);
-    let root_b = common::tree(&format!("{name}_b_frames"));
-    for i in 0..2 {
-        copy_frame(&root_b, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root_b]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, &format!("{name}_b"), 2);
     controller.select_project(0);
     controller
 }
@@ -1603,17 +1598,6 @@ fn fuse_stack_is_refused_while_a_field_is_in_violation() {
 // checkpoint, which the next save appends to the same file.
 // ---------------------------------------------------------------------
 
-/// Saves the active, never-saved tab to the path the save dialog proposes,
-/// and returns that path.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
-}
-
 #[test]
 fn re_fusing_an_opened_tab_appends_a_checkpoint() {
     let mut controller = controller_with_frames("reopen_appends", 2);
@@ -1758,7 +1742,7 @@ fn checkpoint_panel_rows_follow_the_active_tab() {
 fn checkpoint_panel_is_pushed_with_the_projects() {
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2234,20 +2218,6 @@ fn failure_notifications_outlive_the_toast() {
     }
 }
 
-/// A window backend, initialized once per thread -- `AppWindow::new()`
-/// otherwise panics on a second call from the same thread.
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 /// A failure that settles while the Projects overview is open raises no
 /// toast regardless of which tab is active, the overview stays open, and
 /// closing it afterwards replays nothing: the record stays unread and is the
@@ -2258,7 +2228,7 @@ fn projects_suppresses_a_failure_toast_without_replay() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2308,7 +2278,7 @@ fn projects_suppresses_a_failure_toast_without_replay() {
 fn a_tab_switch_updates_the_bar_without_a_job_event() {
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -3011,15 +2981,7 @@ fn retry_queues_while_another_run_is_live() {
         other => panic!("expected the first tab to fail, got {other:?}"),
     }
 
-    let survivor_root = common::tree("retry_queues_b_frames");
-    for i in 0..3 {
-        copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[survivor_root]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, "retry_queues_b", 3);
 
     controller.select_project(1);
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
@@ -3082,16 +3044,7 @@ fn closing_the_owning_tab_mid_run_promotes_nothing() {
     add_unreadable_tab(&mut controller, "closing_mid_run_a", 2);
     // The survivor: a different frame count than tab A's, so a leaked value
     // could not pass by coincidence.
-    let survivor_root = common::tree("closing_mid_run_b_frames");
-    for i in 0..3 {
-        copy_frame(&survivor_root, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[survivor_root]),
-        OpenOutcome::Opened(_)
-    ));
-    // An algorithm that always converges keeps the survivor's fuse clean.
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, "closing_mid_run_b", 3);
 
     controller.select_project(0);
     assert!(controller.start_fuse());
@@ -3860,15 +3813,7 @@ fn save_and_close_saves_that_tab_then_closes_it() {
 
     // A cancelled picker leaves a never-saved, fused tab open with its
     // checkpoints held.
-    let root_c = common::tree(&format!("{outer}_c_frames"));
-    for i in 0..2 {
-        copy_frame(&root_c, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root_c]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, &format!("{outer}_c"), 2);
     let new_index = controller.project_tabs().len() - 1;
     fuse_and_settle(&mut controller);
     let tabs_before = controller.project_tabs().len();
@@ -3946,7 +3891,7 @@ fn chords_are_consumed_while_a_close_is_pending() {
 fn close_guard_is_pushed_to_the_window() {
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -4338,15 +4283,6 @@ fn saved_rows(path: &Path) -> Vec<(String, Option<String>, usize, bool)> {
         .collect()
 }
 
-fn record_events(controller: &mut AppController) -> std::sync::Arc<Mutex<Vec<ShellEvent>>> {
-    let events = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    controller.set_sink(std::sync::Arc::new(move |event| {
-        sink.lock().unwrap().push(event)
-    }));
-    events
-}
-
 fn count_of(events: &Mutex<Vec<ShellEvent>>, wanted: ShellEvent) -> usize {
     events
         .lock()
@@ -4366,10 +4302,6 @@ fn active_card(controller: &AppController) -> focusforge_gui::overlay::CardView 
         .into_iter()
         .find(|card| card.opened && card.project_name == title)
         .expect("the active tab has a card")
-}
-
-fn settle_all(controller: &mut AppController) {
-    while common::wait_for_settle(controller, Duration::from_secs(120)).is_some() {}
 }
 
 #[test]
@@ -5088,7 +5020,7 @@ fn the_performance_tab_is_refreshed_when_a_run_settles() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = controller_with_frames("performance_settle_push", 2);
@@ -5124,7 +5056,7 @@ fn the_storage_tab_is_refreshed_when_a_run_settles() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_frames("storage_settle_push", 2)));
@@ -6039,7 +5971,7 @@ fn the_bridge_never_calls_the_blocking_save_entries() {
 fn a_running_save_reads_saving_on_the_loading_indicator() {
     use std::sync::Arc;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
 
     let mut controller = controller_with_frames("saving_caption", 2);
@@ -6908,15 +6840,7 @@ fn a_project_saved_outside_its_frames_reopens_without_a_missing_card() {
 /// it holds an unsaved checkpoint), never saved. Tab 0 is selected.
 fn controller_with_an_opened_tab_between(outer: &str) -> AppController {
     let mut controller = controller_with_two_tabs(outer);
-    let root_c = common::tree(&format!("{outer}_c_frames"));
-    for i in 0..2 {
-        copy_frame(&root_c, &format!("{i:02}.tif"), i);
-    }
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root_c]),
-        OpenOutcome::Opened(_)
-    ));
-    controller.set_align_algorithm("dummy-align");
+    open_mantis64_tab(&mut controller, &format!("{outer}_c"), 2);
     controller.select_project(1);
     fuse_and_settle(&mut controller);
     save_to_proposed(&mut controller);

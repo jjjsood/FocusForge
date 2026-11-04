@@ -23,7 +23,7 @@ fn comparison_window_geometry() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     let rect = |id| {
@@ -45,7 +45,7 @@ fn comparison_current_crop_matches_the_visible_draw() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     window.set_crop_x(18.0);
@@ -80,7 +80,7 @@ fn comparison_backdrop_sits_under_the_exact_image_outside_its_crop() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     let images = |window: &ComparisonWindow| {
@@ -129,7 +129,7 @@ fn comparison_window_forwards_focused_keys_and_focus_loss() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let focus_changes = Rc::new(Cell::new(0));
@@ -167,7 +167,7 @@ fn comparison_hover_ends_outside_its_pane() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     window.window().dispatch_event(WindowEvent::PointerMoved {
@@ -188,7 +188,7 @@ fn undock_without_project_is_empty() {
     use focusforge_gui::{AppController, ComparisonWindow};
     use i_slint_backend_testing::ElementQuery;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let mut controller = AppController::new();
     controller.undock_requested(PaneSource::Frame);
     assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
@@ -212,7 +212,7 @@ fn dock_back_restores_two_panes() {
     use focusforge_gui::{AppController, AppWindow};
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
