@@ -35,7 +35,8 @@ component FieldSlot inherits Rectangle {
     in property <string> label-side: "above";
     callback edited(string);
 
-    property <length> line-height: Theme.space-4;
+    property <length> line-height: ShellGeometry.violation-line-height;
+    property <length> line-gap: ShellGeometry.violation-line-gap;
 
     visible: root.view.shown;
     width: Theme.space-12 + Theme.space-2;
@@ -47,7 +48,7 @@ component FieldSlot inherits Rectangle {
         height: self.preferred-height;
         x: root.label-side == "right" ? root.width + Theme.space-2 : (root.width - self.width) / 2;
         y: root.label-side == "above" ? -11px - self.height / 2
-            : root.label-side == "below" ? 37px - self.height / 2 + (root.view.error != "" ? root.line-height : 0px)
+            : root.label-side == "below" ? 37px - self.height / 2 + (root.view.error != "" ? root.line-height + root.line-gap : 0px)
             : (root.height - self.height) / 2;
     }
     FFField {
@@ -61,7 +62,7 @@ component FieldSlot inherits Rectangle {
     }
     if root.view.error != "": FFStatusText {
         x: root.label-side == "right" ? 0px : (root.width - self.width) / 2;
-        y: root.height + 2px;
+        y: root.height + root.line-gap;
         width: self.preferred-width;
         height: root.line-height;
         text: root.view.error;
@@ -89,6 +90,10 @@ export component FFCalculatorOverlay inherits Rectangle {
     callback optics-chosen(string);
     callback field-edited(int, string);
 
+    // While a field whose caption sits below its box shows a violation line, that
+    // caption moves down and the footer gives the same height to the summary band.
+    property <bool> below-line-shown: root.fields[2].error != "" || root.fields[4].error != "";
+
     visible: root.open;
 
     TouchArea {
@@ -105,6 +110,8 @@ export component FFCalculatorOverlay inherits Rectangle {
 
         frame := FFOverlayFrame {
             title: "Step calculator";
+            footer-height: Theme.space-12 + Theme.space-2
+                - (root.below-line-shown ? ShellGeometry.violation-line-height + ShellGeometry.violation-line-gap : 0px);
             close-requested => { root.close-requested(); }
 
             FFRowLabel {
