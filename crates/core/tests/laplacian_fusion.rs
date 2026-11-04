@@ -262,14 +262,8 @@ fn algorithm_is_registered_and_lists_its_schema() {
 
 #[test]
 fn every_parameter_is_declared() {
-    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (stack, stack_ctx) = common::align::open_stack_context("mantis-64");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
     let algo = registry::find_stack("laplacian").expect("laplacian must resolve by id");
 
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)

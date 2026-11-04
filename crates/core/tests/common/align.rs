@@ -31,14 +31,19 @@ pub fn open_fixture() -> TiffStack {
 pub fn open_stack_context(name: &str) -> (TiffStack, StackContext) {
     let stack = TiffStack::open(super::fixtures_dir().join(name))
         .unwrap_or_else(|err| panic!("{name} must open: {err}"));
+    let ctx = stack_context(&stack);
+    (stack, ctx)
+}
+
+/// The [`StackContext`] `stack`'s first frame describes.
+pub fn stack_context(stack: &TiffStack) -> StackContext {
     let (width, height) = stack.dimensions();
-    let ctx = StackContext::new(
+    StackContext::new(
         stack.len(),
         width,
         height,
         stack.header(0).samples_per_pixel,
-    );
-    (stack, ctx)
+    )
 }
 
 pub fn full_rect(width: u32, height: u32) -> Rect {

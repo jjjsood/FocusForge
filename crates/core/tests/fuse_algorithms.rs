@@ -10,6 +10,8 @@ mod common;
 
 use std::path::PathBuf;
 
+use common::align::stack_context;
+
 use focusforge_core::algorithm::{AlgorithmError, TileCtx, TileReader};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry, Plane, build, metrics};
@@ -143,16 +145,6 @@ fn run_fusion_over(
 
 fn no_explicit() -> ParamValues {
     ParamValues::new()
-}
-
-fn stack_context(stack: &TiffStack) -> StackContext {
-    let (width, height) = stack.dimensions();
-    StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    )
 }
 
 /// Full frames held in memory, served as a [`TileReader`].

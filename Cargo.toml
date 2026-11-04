@@ -38,3 +38,6 @@ minidump-writer = { path = "vendor/minidump-writer" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+[workspace.lints.clippy]
+ignore_without_reason = "deny"

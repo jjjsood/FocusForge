@@ -10,7 +10,7 @@ mod common;
 
 use common::align::{
     CountingReader, ESCALATION_READS, anchor_defaults, lowered_max_iterations, open_fixture,
-    open_stack_context, reference_reads, uncached_outcomes,
+    open_stack_context, reference_reads, stack_context, uncached_outcomes,
 };
 
 use std::sync::Arc;
@@ -23,18 +23,8 @@ use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
 };
 use focusforge_core::io::TiffStack;
-use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, StackContext};
+use focusforge_core::params::{ParamDesc, ParamValue, ParamValues};
 use focusforge_core::tile::HostBudget;
-
-fn stack_context(stack: &TiffStack) -> StackContext {
-    let (width, height) = stack.dimensions();
-    StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    )
-}
 
 /// A stub [`AlignAlgorithm`] that counts its own `prepare_run` calls and
 /// otherwise produces a trivial, always-converged outcome -- identity for

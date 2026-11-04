@@ -256,7 +256,7 @@ fn comparison_capture_requires_detached_pane() {
     let output = common::gui_bin("comparison_capture_requires_detached_pane")
         .args(["--exit-after", "500", "--screenshot-window", "comparison"])
         .arg("--screenshot")
-        .arg(common::workspace_root().join(".scratch/gui-screenshots/no-detached-pane.png"))
+        .arg(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-detached-pane.png"))
         .output()
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
@@ -704,8 +704,7 @@ fn screenshot_is_not_uniform() {
         return;
     }
 
-    let out_path = common::workspace_root()
-        .join(".scratch")
+    let out_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("gui-screenshots")
         .join("screenshot_is_not_uniform.png");
     if let Some(parent) = out_path.parent() {

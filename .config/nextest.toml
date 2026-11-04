@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# A per-test kill on the default and quick profiles, so a hang ends as a named
+# The default profile's per-test kill, 15 minutes, so a hang ends as a named
 # TIMEOUT instead of a silent wait. Measured slowest test:
-# `queued_tab_runs_past_a_keep_question`, 405 s on windows-2022. The default
-# kill is 15 minutes.
+# `queued_tab_runs_past_a_keep_question`, 405 s on windows-2022.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 15 }
 
@@ -31,15 +30,25 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 [profile.gpu.junit]
 path = "junit.xml"
 
-# The fast workspace run `tools/check-all.sh --quick` uses: everything except
-# the binaries that measure memory peaks, the hit cap and the reference cache
-# over real stacks. Each of those runs for minutes and sets the wall time of
-# the whole suite on its own; the full gate still runs them.
+# The fast workspace run `tools/check-all.sh --quick` uses. Any test running
+# past 180 s ends as a named TIMEOUT: the slowest test of this profile measured
+# 72.1 s under the gate's parallel load (`align_cli
+# write_warped_writes_one_tiff_per_frame_and_times_it`), so 180 s is 2.5x that.
+# An override rather than a base `slow-timeout`, because the default profile's
+# `stack_cli` override above would win over a base setting.
+[[profile.quick.overrides]]
+filter = 'all()'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Left to the full gate, one reason per binary:
+#   align_parallel_memory: peak heap of the parallel aligner (counting allocator).
+#   align_reference_cache: pyramid reads and per-frame outcomes of real aligner runs.
+#   tile_scheduler_memory: peak in-flight tile memory (counting allocator).
+#   checkpoint_render_memory: peak memory of a full-size checkpoint render and encode.
 [profile.quick]
 default-filter = '''
 not (
-  binary_id(focusforge-core::hit_cap_behaviour)
-  | binary_id(focusforge-core::align_parallel_memory)
+  binary_id(focusforge-core::align_parallel_memory)
   | binary_id(focusforge-core::align_reference_cache)
   | binary_id(focusforge-core::tile_scheduler_memory)
   | binary_id(focusforge-core::checkpoint_render_memory)
