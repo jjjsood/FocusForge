@@ -29,12 +29,19 @@ The same dialog title appears with other messages:
 
 | Message | Cause and fix |
 |---|---|
-| "These files mix camera RAW and TIFF. A stack is one kind of file." | Pick files of one kind. The message names the kinds you mixed: "camera RAW and JPEG", "JPEG and TIFF" or "camera RAW, JPEG and TIFF". |
-| "These files are in different folders. A stack's frames share one folder." | Move the frames into one folder, or open the folder with **New project**. |
 | "`<path>`: not a folder of frames or a FocusForge project" | You opened a single file that is neither a frame nor a project file. Open the folder of frames or the `.ffp` file instead. |
 | "`<path>` is no longer on disk. This project cannot be fused again until it is back." | You pressed **Fuse stack** on a project whose frames were moved or deleted. See [The frames are no longer there](#the-frames-are-no-longer-there). |
 
 See: ["No frames here"](guide/first-stack.md#no-frames-here) in *Your first stack*.
+
+### "These images are not one stack"
+
+The dialog title for a set of files that cannot form one stack:
+
+| Message | Cause and fix |
+|---|---|
+| "These files mix camera RAW and TIFF. A stack is one kind of file." | Pick files of one kind. The message names the kinds you mixed: "camera RAW and JPEG", "JPEG and TIFF" or "camera RAW, JPEG and TIFF". |
+| "These files are in different folders. A stack's frames share one folder." | Move the frames into one folder, or open the folder with **New project**. |
 
 ### "This project cannot be opened"
 
