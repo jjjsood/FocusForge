@@ -3,13 +3,15 @@ Start: --open fixtures/mantis-64/frames
 
 Use a fresh settings directory and a fresh data directory. The calculator button sits at the top of the 48 px icon bar on the left edge, above the bell and Settings; it is reached by its label **Step calculator** inside `AppWindow::icon-bar`. The overlay (`AppWindow::calculator-overlay`) covers the canvas below the toolbar and above the bottom bar; the right dock stays visible. While it is open the button is drawn selected: an accent-coloured icon and a thin accent bar on the icon bar's left edge.
 
-The overlay holds an Optics switch (LENS (F-STOP) | OBJECTIVE (NA)), five entered boxes, a SUMMARY band with an ENTERED row and a CALCULATED row, and the **Close** button (label "Close", top right). The five boxes are `FFField::input` 0 to 4 in layout order: Time per frame (s), Magnification (x), f-stop (Numerical aperture (NA) with the objective), Overlap (fraction of the depth of field), Depth range (mm). With the objective the Magnification box and its label are hidden but keep their place in the count. Defaults: 1, 1, 8, 0.25, 5 (objective NA 0.25). A box shows what was typed; a comma counts as the decimal point and the box then shows a point. Every keystroke re-plans: a value outside the allowed range or text that is not a number draws the box red and a line under it, and the calculated values keep the last valid plan.
+The overlay holds an Optics switch (LENS (F-STOP) | OBJECTIVE (NA)), five entered boxes, a SUMMARY band with an ENTERED row and a CALCULATED row, and the **Close** button (label "Close", top right). With the lens the five boxes are `FFField::input` 0 to 4 in layout order: Time per frame (s), Magnification (x), f-stop, Overlap (fraction of the depth of field), Depth range (mm). With the objective the Magnification box and its label are gone and do not count: the four boxes are `FFField::input` 0 Time per frame, 1 Numerical aperture (NA), 2 Overlap, 3 Depth range. Defaults: 1, 1, 8, 0.25, 5 (objective NA 0.25). A box shows what was typed; a comma counts as the decimal point and the box then shows a point. Every keystroke re-plans: a value outside the allowed range or text that is not a number draws the box red and a line under it, and the calculated values keep the last valid plan, which can be an earlier keystroke of the same entry.
+
+This path never starts a fuse: leave **Fuse stack** alone. The window's own close button in the title bar (`FFTabStrip::window-close`) is also labelled "Close"; this path never presses it, and every **Close** step below names `AppWindow::calculator-overlay` as its search scope.
 
 A typed value replaces the old one only after the old text is cleared: click the box, press Ctrl+A, press Backspace, then type. An empty box counts as "Not a number".
 
 ## Open and read the Lens defaults
 1. Click **Step calculator** (`AppWindow::icon-bar`).
-   Expect: the overlay titled "Step calculator" covers the canvas; **Fuse stack** is still visible in the toolbar above it and the dock header still reads "3 frames · 0 excluded"; the calculator button is drawn selected (accent icon, accent bar at the icon bar's left edge).
+   Expect: the overlay titled "Step calculator" covers the canvas; the toolbar row above it and the right dock are still drawn and the dock header still reads "3 frames · 0 excluded"; the calculator button is drawn selected (accent icon, accent bar at the icon bar's left edge).
 2. Click **Lens (f-stop)** (`AppWindow::calculator-overlay`).
    Expect: the LENS (F-STOP) segment is highlighted; the CALCULATED row reads Numerical aperture 0.031, Depth of field 563.2 µm, Step 422.4 µm, Frames 13, Duration 13 s.
 3. Click the Time per frame box (`FFField::input` 0).
@@ -37,13 +39,13 @@ A typed value replaces the old one only after the old text is cleared: click the
 ## Objective optics
 13. Click **Objective (NA)** (`AppWindow::calculator-overlay`).
     Expect: the OBJECTIVE (NA) segment is highlighted; the label "Magnification (x)" is gone; the label "Numerical aperture (NA)" shows with a box reading 0.25; the ENTERED row reads Optics NA; the CALCULATED row has no Numerical aperture cell and reads Depth of field 8.8 µm, Step 6.6 µm, Frames 759, Duration 759 s.
-14. Click the Depth range box (`FFField::input` 4).
+14. Click the Depth range box (`FFField::input` 3).
     Expect: the box reads 5 and the CALCULATED row is unchanged.
 15. Press Ctrl+A.
     Expect: the text in the Depth range box is drawn selected.
 16. Press Backspace.
     Expect: Must not: new calculated values; the Depth range box is empty with a red border, the line "Not a number" shows under it, and the CALCULATED row still reads Depth of field 8.8 µm, Step 6.6 µm, Frames 759, Duration 759 s.
-17. Type "0.1" into the Depth range box (`FFField::input` 4).
+17. Type "0.1" into the Depth range box (`FFField::input` 3).
     Expect: the line under the box is gone; the box reads 0.1; the ENTERED row reads Depth range 0.1 mm; the CALCULATED row reads Depth of field 8.8 µm, Step 6.6 µm, Frames 17, Duration 17 s.
 18. (human only) Look at the illustration.
     Expect: the objective illustration (an objective in place of the lens) shows 17 evenly spaced focus planes and has no leader line to a Magnification box.
@@ -57,7 +59,7 @@ A typed value replaces the old one only after the old text is cleared: click the
 22. Press Backspace.
     Expect: Must not: new calculated values; the Overlap box is empty with a red border, the line "Not a number" shows under it, and the CALCULATED row still reads Step 422.4 µm and Frames 2.
 23. Type "0,95" into the Overlap box (`FFField::input` 3).
-    Expect: Must not: new calculated values; the box reads 0.95 (point, not comma) with a red border, the line "value 0.95 is outside the allowed range [0, 0.9]" shows under it inside the inset card, the ENTERED row still reads Overlap 0.25, and the CALCULATED row still reads Numerical aperture 0.031, Depth of field 563.2 µm, Step 422.4 µm, Frames 2, Duration 2 s.
+    Expect: Must not: 0.95 is planned; the box reads 0.95 (point, not comma) with a red border, the line "value 0.95 is outside the allowed range [0, 0.9]" shows under it inside the inset card, the ENTERED row reads Overlap 0.9 (the last valid keystroke), and the CALCULATED row reads Numerical aperture 0.031, Depth of field 563.2 µm, Step 56.32 µm, Frames 3, Duration 3 s.
 24. Click the Overlap box (`FFField::input` 3).
     Expect: the box still reads 0.95 and the line is still shown.
 25. Press Ctrl+A.
