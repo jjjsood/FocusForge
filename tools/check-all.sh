@@ -124,6 +124,7 @@ run_gate "lock directory selftest" tools/with-lock-selftest.sh
 run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 run_gate "image-metrics selftest" python3 tools/image-metrics.py --selftest
 run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
+run_gate "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
@@ -147,6 +148,11 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # The long background stage, started now and joined at the end. Not a
   # cargo command -- see the header.
   run_logged_bg "fixture e2e" tools/with-lock.sh build -- tools/fixture-e2e.sh
+
+  # Cargo-free, so no lock. Linux only: several groups feed /bin/true to a
+  # parser that accepts only x86-64 ELF, and shell out to bash. The two PowerShell groups stay in
+  # the full run before package builds.
+  [ "$(uname -s)" = Linux ] && run_logged_bg "packaging selftest" python3 tools/check-packaging-selftest.py --no-pwsh
 
   # Foreground and BEFORE `cargo test`, never a background stage: `cargo
   # test` reads what this writes (.scratch/synth-align/measurement.json), so
