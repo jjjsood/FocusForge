@@ -175,7 +175,8 @@ fn checkpoint_panel_touches_no_storage() {
     // panel lists, beside `job.rs`, which reads its planes, and `brush.rs`,
     // which builds the stored stroke's path in core's own point type.
     // `performance_settings.rs` parses its cap strings with core's size
-    // syntax. Excluded by name: this test's own subject is the checkpoint
+    // syntax. `calculator.rs` plans through core's step calculator.
+    // Excluded by name: this test's own subject is the checkpoint
     // panel, not the whole crate. Source preview reductions also read frames.
     let canvas_files = [
         "checkpoints.rs",
@@ -191,6 +192,8 @@ fn checkpoint_panel_touches_no_storage() {
         "source_previews.rs",
         "overlay.rs",
         "performance_settings.rs",
+        "calculator.rs",
+        "analytics.rs",
         "recent.rs",
         "settings.rs",
     ];
@@ -3248,6 +3251,55 @@ mod notification {
         }
     }
 
+    fn button_rect(app: &AppWindow, label: &str) -> (f32, f32, f32, f32) {
+        let found: Vec<_> = ElementQuery::from_root(app)
+            .match_accessible_role(AccessibleRole::Button)
+            .find_all()
+            .into_iter()
+            .filter(|b| b.accessible_label().as_deref() == Some(label))
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one button named {label:?}");
+        let (pos, size) = (found[0].absolute_position(), found[0].size());
+        (pos.x, pos.y, size.width, size.height)
+    }
+
+    #[test]
+    fn analytics_button_sits_under_the_calculator_button() {
+        for height in [600u32, 760, 900] {
+            let controller =
+                common::controller_with_frames(&format!("shell_analytics_{height}"), 2);
+            let rig = rig(controller, 1440, height);
+            let h = height as f32;
+            let calculator = button_rect(&rig.app, "Step calculator");
+            let analytics = button_rect(&rig.app, "Analytics");
+            assert_eq!(analytics.0, calculator.0, "same x at {height}");
+            assert_eq!(
+                (analytics.2, analytics.3),
+                (calculator.2, calculator.3),
+                "same size at {height}"
+            );
+            assert_eq!(analytics.1, calculator.1 + 40.0, "40 px below at {height}");
+
+            assert_rect(&rig.app, "FFIconBar::bell", (8.0, h - 80.0, 32.0, 32.0));
+            assert_rect(&rig.app, "FFIconBar::settings", (8.0, h - 40.0, 32.0, 32.0));
+
+            // Declared after the rail, the button takes the click the rail's
+            // ground would otherwise get.
+            rig.controller
+                .lock()
+                .unwrap()
+                .set_analytics_hold(Duration::from_secs(30));
+            rig.click(
+                analytics.0 + analytics.2 / 2.0,
+                analytics.1 + analytics.3 / 2.0,
+            );
+            assert!(
+                rig.controller.lock().unwrap().analytics_open(),
+                "the click reaches the button at {height}"
+            );
+        }
+    }
+
     #[test]
     fn unread_badge_counts_and_hides_at_zero() {
         let rig = rig(controller_with_refusals("shell_badge", 3), 1440, 900);
@@ -3337,7 +3389,7 @@ mod notification {
     }
 
     #[test]
-    fn center_keys_select_expand_and_escape_returns_focus_to_the_bell() {
+    fn center_keys_select_expand_and_escape_hands_focus_to_the_canvas() {
         let rig = rig(controller_with_refusals("shell_center_keys", 2), 1440, 900);
         let ids = rig.ids();
         let (x, y) = Rig::bell(900.0);
@@ -3365,8 +3417,8 @@ mod notification {
 
         rig.key(Key::Return);
         assert!(
-            rig.center_open(),
-            "focus is on the bell, so Return opens the center again"
+            !rig.center_open(),
+            "focus is on the canvas, so Return does not open the center again"
         );
     }
 
@@ -3493,7 +3545,11 @@ mod notification {
     /// unread bell glyph and the muted close glyph are `FFIconButton`'s own.
     #[test]
     fn icon_bar_and_center_set_no_colour_themselves() {
-        for file in ["shell/icon_bar.slint", "shell/notification_center.slint"] {
+        for file in [
+            "shell/icon_bar.slint",
+            "shell/notification_center.slint",
+            "shell/analytics_overlay.slint",
+        ] {
             let source = ui_source(file);
             for needle in [
                 "color:",

@@ -117,6 +117,23 @@ struct Args {
     /// load lands.
     #[arg(long)]
     projects_overlay: bool,
+    /// Opens the step calculator overlay at startup.
+    #[arg(long)]
+    calculator: bool,
+    /// Opens the Analytics overlay once the `--open` load has landed.
+    #[arg(long, requires = "open")]
+    analytics: bool,
+    /// With `--analytics`, holds the count's worker for MS milliseconds.
+    #[arg(long, requires = "analytics", value_name = "MS")]
+    analytics_hold_ms: Option<u64>,
+    /// With `--calculator`, selects the objective optics.
+    #[arg(long, requires = "calculator")]
+    calculator_objective: bool,
+    /// With `--calculator`, types TEXT into field slot SLOT (0 time per
+    /// frame, 1 magnification, 2 f-stop or numerical aperture, 3 overlap,
+    /// 4 depth range). Repeatable.
+    #[arg(long, requires = "calculator", value_name = "SLOT=TEXT")]
+    calculator_type: Vec<String>,
     /// Presses `Save project` once the last `--fuse-tabs` run settles,
     /// accepting the proposed path without a dialog -- for inspecting the
     /// saved state with no click sequence.
@@ -2069,6 +2086,36 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
             );
         }
 
+        let analytics_timer = Rc::new(slint::Timer::default());
+        if args.analytics {
+            if let Some(ms) = args.analytics_hold_ms {
+                controller
+                    .lock()
+                    .unwrap()
+                    .set_analytics_hold(Duration::from_millis(ms));
+            }
+            let controller = controller.clone();
+            let timer = analytics_timer.clone();
+            let tabs = args.open.len();
+            analytics_timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(50),
+                move || {
+                    let mut controller = controller.lock().unwrap();
+                    // Every `--open` has produced a tab; a later load would
+                    // switch tabs and close the overlay.
+                    if controller.load_in_flight()
+                        || !controller.analytics_enabled()
+                        || controller.project_tabs().len() < tabs
+                    {
+                        return;
+                    }
+                    controller.toggle_analytics();
+                    timer.stop();
+                },
+            );
+        }
+
         let undock_timer = Rc::new(slint::Timer::default());
         if let Some(pane) = args.undock_pane {
             let app_weak = app.as_weak();
@@ -2145,6 +2192,20 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
         if args.projects_overlay && args.fuse_tabs.is_empty() {
             controller.lock().unwrap().toggle_projects_overlay();
+        }
+        if args.calculator {
+            let mut controller = controller.lock().unwrap();
+            controller.toggle_calculator();
+            if args.calculator_objective {
+                controller.calculator_set_optics("Objective (NA)");
+            }
+            for entry in &args.calculator_type {
+                if let Some((slot, text)) = entry.split_once('=')
+                    && let Ok(slot) = slot.parse::<usize>()
+                {
+                    controller.calculator_edit(slot, text);
+                }
+            }
         }
 
         if let Some(index) = args.frame_remove_warning {

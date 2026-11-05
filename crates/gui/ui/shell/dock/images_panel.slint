@@ -76,6 +76,9 @@ export component FFImagesPanel inherits Rectangle {
     callback sort-selected(string);
     callback frame-selected(int);
     callback frame-keyboard-moved(int);
+    // Every key the list does not take, for the window's own key handling.
+    callback other-key-pressed(KeyEvent) -> EventResult;
+    callback other-key-released(KeyEvent) -> EventResult;
     callback frame-excluded-toggled(int);
     callback frame-remove-requested(int);
     // The filename's raw pointer stream: row, kind (0 = down, 1 = up,
@@ -253,8 +256,9 @@ export component FFImagesPanel inherits Rectangle {
                 root.frame-keyboard-moved(1);
                 return accept;
             }
-            return reject;
+            return root.other-key-pressed(event);
         }
+        key-released(event) => { return root.other-key-released(event); }
     }
 
     // Drawn last, over the row list -- the sort button's own two-entry

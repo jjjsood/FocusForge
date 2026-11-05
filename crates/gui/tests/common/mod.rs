@@ -177,6 +177,73 @@ pub fn scratch_controller(name: &str) -> AppController {
     controller
 }
 
+/// `controller_with_frames` plus a second unsaved project of two frames, so
+/// the window has two tabs and the second one is active.
+#[allow(dead_code)]
+pub fn controller_with_two_stacks(name: &str) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    let second = tree(&format!("{name}_second_frames"));
+    for i in 0..2 {
+        copy_frame(&second, &format!("s{i}.tif"), i + 1);
+    }
+    assert!(matches!(
+        open_and_settle(&mut controller, &[second]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+/// The project tab at `index`, found by role and its `tab-<index>` label.
+#[allow(dead_code)]
+pub fn tab(
+    app: &focusforge_gui::AppWindow,
+    index: usize,
+) -> i_slint_backend_testing::ElementHandle {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    let label = format!("tab-{index}");
+    ElementQuery::from_root(app)
+        .match_accessible_role(AccessibleRole::Tab)
+        .find_all()
+        .into_iter()
+        .find(|t| t.accessible_label().as_deref() == Some(label.as_str()))
+        .unwrap_or_else(|| panic!("no tab labelled {label:?}"))
+}
+
+/// The `index`-th image row of the images pane, counted from the top.
+#[allow(dead_code)]
+pub fn image_row(
+    app: &focusforge_gui::AppWindow,
+    index: usize,
+) -> i_slint_backend_testing::ElementHandle {
+    let mut rows: Vec<_> = i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFImageRow::area")
+        .find_all()
+        .into_iter()
+        .filter(|r| r.size().width > 0.0)
+        .collect();
+    rows.sort_by(|a, b| {
+        a.absolute_position()
+            .y
+            .partial_cmp(&b.absolute_position().y)
+            .unwrap()
+    });
+    assert!(
+        index < rows.len(),
+        "no image row {index}, {} mounted",
+        rows.len()
+    );
+    rows.remove(index)
+}
+
+/// The "+" box at the end of the tab strip.
+#[allow(dead_code)]
+pub fn plus_button(app: &focusforge_gui::AppWindow) -> i_slint_backend_testing::ElementHandle {
+    i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFTabStrip::plus-button")
+        .find_first()
+        .expect("the tab strip has a plus button")
+}
+
 /// A controller with one unsaved project open over `count` copied
 /// `mantis-64` frames (`00.tif`, `01.tif`, ... in fixture order), its own
 /// scratch root under `CARGO_TARGET_TMPDIR`, aligning with `dummy-align`,

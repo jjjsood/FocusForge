@@ -1944,3 +1944,70 @@ fn bell_in_projects_opens_the_center_with_focus_inside() {
     key(Key::DownArrow);
     assert_ne!(selection(), before, "Down moves the center's selection");
 }
+
+/// Escape closes the overview opened by its button after the notification
+/// center was open: the center must not keep the key.
+#[test]
+fn escape_closes_the_overview_after_the_center() {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    use slint::ComponentHandle;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::sync::{Arc, Mutex};
+
+    common::init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    let controller = Arc::new(Mutex::new(controller_with_frames(
+        "projects_escape_center",
+        2,
+    )));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    let event = |event: WindowEvent| {
+        app.window().dispatch_event(event);
+        slint::platform::update_timers_and_animations();
+        focusforge_gui::bridge::push_projects(&app, &controller);
+        focusforge_gui::bridge::push_overlays(&app, &controller);
+    };
+    let click = |label: &str| {
+        let found: Vec<_> = ElementQuery::from_root(&app)
+            .match_accessible_role(AccessibleRole::Button)
+            .find_all()
+            .into_iter()
+            .filter(|b| b.accessible_label().as_deref() == Some(label))
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one button named {label:?}");
+        let (pos, size) = (found[0].absolute_position(), found[0].size());
+        let position =
+            slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0);
+        event(WindowEvent::PointerMoved { position });
+        event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+        event(WindowEvent::PointerReleased {
+            position,
+            button: PointerEventButton::Left,
+        });
+    };
+
+    click("Notifications");
+    assert!(app.get_notification_center_open());
+    click("Projects");
+    assert!(controller.lock().unwrap().projects_overlay_open());
+    assert!(!app.get_notification_center_open());
+
+    let text: slint::SharedString = Key::Escape.into();
+    event(WindowEvent::KeyPressed { text: text.clone() });
+    event(WindowEvent::KeyReleased { text });
+    assert!(
+        !controller.lock().unwrap().projects_overlay_open(),
+        "Escape closes the overview"
+    );
+}

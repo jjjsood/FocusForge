@@ -121,6 +121,7 @@ fn tokens_match_the_recorded_values() {
     assert_eq!(theme.get_space_12(), 48.0, "space-12");
 
     // Radii.
+    assert_eq!(theme.get_radius_xs(), 2.0, "radius-xs");
     assert_eq!(theme.get_radius_sm(), 3.0, "radius-sm");
     assert_eq!(theme.get_radius_md(), 5.0, "radius-md");
     assert_eq!(theme.get_radius_lg(), 8.0, "radius-lg");

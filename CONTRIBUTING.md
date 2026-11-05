@@ -143,7 +143,7 @@ reference-cache binaries and kills any test after 180 s. The
 `hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
 `--ignored`.
 
-`tests/ui/` holds 20 journeys, each one whole path through the window as
+`tests/ui/` holds 22 journeys, each one whole path through the window as
 numbered clicks, keys and hovers with an `Expect:` line per step, plus
 `features/` files listing which journey covers which feature. They are run by
 hand or by a script against `focusforge-gui`; `tests/ui/README.md` gives the

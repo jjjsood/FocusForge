@@ -39,8 +39,8 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 11. Press Return.
     Expect: the selected row shows its full message.
 12. Press Escape.
-    Expect: the center closes, the Projects overview does not open, and the bell has an orange outline.
-13. Press Return.
+    Expect: the center closes and the Projects overview does not open.
+13. Click **Notifications** (`FFIconBar::bell`).
     Expect: the center opens again.
 
 ## Close, then Projects hides the center

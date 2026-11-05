@@ -54,6 +54,29 @@ _arguments "${_arguments_options[@]}" : \
 '::id -- Algorithm id. Omit to list every registered algorithm:_default' \
 && ret=0
 ;;
+(step-plan)
+_arguments "${_arguments_options[@]}" : \
+'*--set=[Set a parameter\: \`--set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--json[Print the plan as one JSON object]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(sharp-areas)
+_arguments "${_arguments_options[@]}" : \
+'*--set=[Set a parameter\: \`--set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--json[Print the counts as one JSON object]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':dir -- Directory of frames to count (non-recursive, descending into a `frames` subdirectory):_files' \
+&& ret=0
+;;
 (stack)
 _arguments "${_arguments_options[@]}" : \
 '-o+[Directory to collect this run'\''s projects into. Omit to write each project beside its own frames]:DIR:_files' \
@@ -351,6 +374,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(step-plan)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(sharp-areas)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (stack)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -445,6 +476,8 @@ _focusforge-cli_commands() {
     local commands; commands=(
 'info:Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory' \
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
+'step-plan:Compute the focus step, frame count, duration and disk need of a focus stack' \
+'sharp-areas:Count the areas of the image that are sharpest in each frame of a stack' \
 'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
@@ -519,6 +552,8 @@ _focusforge-cli__subcmd__help_commands() {
     local commands; commands=(
 'info:Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory' \
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
+'step-plan:Compute the focus step, frame count, duration and disk need of a focus stack' \
+'sharp-areas:Count the areas of the image that are sharpest in each frame of a stack' \
 'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
@@ -613,10 +648,20 @@ _focusforge-cli__subcmd__help__subcmd__review_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli help review commands' commands "$@"
 }
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__sharp-areas_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__sharp-areas_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help sharp-areas commands' commands "$@"
+}
 (( $+functions[_focusforge-cli__subcmd__help__subcmd__stack_commands] )) ||
 _focusforge-cli__subcmd__help__subcmd__stack_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli help stack commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__step-plan_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__step-plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help step-plan commands' commands "$@"
 }
 (( $+functions[_focusforge-cli__subcmd__history_commands] )) ||
 _focusforge-cli__subcmd__history_commands() {
@@ -688,10 +733,20 @@ _focusforge-cli__subcmd__review_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli review commands' commands "$@"
 }
+(( $+functions[_focusforge-cli__subcmd__sharp-areas_commands] )) ||
+_focusforge-cli__subcmd__sharp-areas_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli sharp-areas commands' commands "$@"
+}
 (( $+functions[_focusforge-cli__subcmd__stack_commands] )) ||
 _focusforge-cli__subcmd__stack_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli stack commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__step-plan_commands] )) ||
+_focusforge-cli__subcmd__step-plan_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli step-plan commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_focusforge-cli" ]; then

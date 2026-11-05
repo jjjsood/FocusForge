@@ -13,9 +13,12 @@ export component FFProgressBar inherits Rectangle {
     // A fixed-width segment sweeps back and forth instead of the
     // fractional fill, for work whose length is unknown ahead of time.
     in property <bool> indeterminate: false;
+    in property <length> thickness: ShellGeometry.progress-bar-height;
+    // Defaults to a pill.
+    in property <length> corner-radius: root.thickness / 2;
 
-    height: ShellGeometry.progress-bar-height;
-    border-radius: self.height / 2;
+    height: root.thickness;
+    border-radius: root.corner-radius;
     background: Theme.surface-overlay;
     clip: true;
 

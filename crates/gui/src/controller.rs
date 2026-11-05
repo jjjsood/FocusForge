@@ -23,8 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::analytics::{self, AnalyticsView, CountError};
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
+use crate::calculator::{Calculator, CalculatorView};
 use crate::canvas::{FrameView, OverlayDraw, PaneSource};
 use crate::checkpoints;
 use crate::diagnostics::{
@@ -293,6 +295,12 @@ pub enum ShellEvent {
     /// The projects overlay's own state moved: opened, closed, its gallery
     /// scrolled, or its failure cards changed.
     OverlayChanged,
+    /// The step calculator opened, closed or took an entry.
+    CalculatorChanged,
+    /// The Analytics overlay opened, closed, started counting or took a result.
+    AnalyticsChanged,
+    /// The Analytics count finished on its worker; [`AppController::settle_analytics`] applies it.
+    AnalyticsReady,
     /// Only the gallery's scroll offset or viewport height moved; no card
     /// changed.
     GalleryScrolled,
@@ -1303,6 +1311,25 @@ pub struct CloseGuardCopy {
     pub confirm_label: String,
 }
 
+/// A finished count's generation and its counts or error text, parked for settle.
+type AnalyticsOutcome = Arc<Mutex<Option<(u64, Result<Vec<u32>, String>)>>>;
+
+/// The Analytics overlay's open flag, rows and the count in flight.
+#[derive(Default)]
+struct AnalyticsState {
+    open: bool,
+    view: AnalyticsView,
+    /// Bumped whenever a count starts or is abandoned; a parked result of an
+    /// older generation is dropped.
+    generation: u64,
+    /// The tab being counted, and the frames it was counted over.
+    tab: Option<u64>,
+    frames: Vec<PathBuf>,
+    control: Option<Arc<job::JobControl>>,
+    outcome: AnalyticsOutcome,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
 /// seam rather than re-cutting it.
 #[derive(Default)]
@@ -1413,6 +1440,10 @@ struct ShellState {
     drag_row: Option<DragRow>,
     /// Whether the projects overlay is open.
     overlay_open: bool,
+    /// Whether the step calculator overlay is open.
+    calculator_open: bool,
+    calculator: Calculator,
+    analytics: AnalyticsState,
     /// The overlay was opened while a load ran, so that load's arrival
     /// leaves it open. Cleared whenever the overlay closes.
     overlay_survives_load: bool,
@@ -1805,6 +1836,8 @@ pub struct AppController {
     toolbar_preview: Option<JobView>,
     /// How long every folder or project load waits before it reads anything.
     open_hold: Duration,
+    /// How long every Analytics count waits before it reads anything.
+    analytics_hold: Duration,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
@@ -4588,6 +4621,7 @@ impl AppController {
         self.state.active = active;
         self.leave_editor_if_unfit();
         self.keep_selected_image_visible();
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
     }
 
@@ -4759,6 +4793,7 @@ impl AppController {
         self.state.canvas_dirty = true;
         self.settle_tab_scroll();
         self.settle_settings_scroll();
+        self.sync_analytics_to_active_tab();
         self.emit(ShellEvent::ProjectsChanged);
     }
 
@@ -4879,6 +4914,10 @@ impl AppController {
     /// four-square button's own toggle, and `Esc`'s.
     pub fn toggle_projects_overlay(&mut self) {
         self.state.overlay_open = !self.state.overlay_open;
+        if self.state.overlay_open {
+            self.close_calculator();
+            self.close_analytics();
+        }
         self.state.overlay_survives_load = self.state.overlay_open && self.load_in_flight();
         self.notifications
             .set_projects_open(self.state.overlay_open);
@@ -4894,6 +4933,185 @@ impl AppController {
             self.notifications.set_projects_open(false);
             self.emit(ShellEvent::OverlayChanged);
         }
+    }
+
+    /// Whether the step calculator overlay is open.
+    pub fn calculator_open(&self) -> bool {
+        self.state.calculator_open
+    }
+
+    /// Opens the step calculator, closing the projects overlay and the
+    /// notification center, or closes it if it is open.
+    pub fn toggle_calculator(&mut self) {
+        if self.state.calculator_open {
+            self.close_calculator();
+            return;
+        }
+        self.close_projects_overlay();
+        self.close_analytics();
+        self.notifications.close_center();
+        self.state.calculator_open = true;
+        self.emit(ShellEvent::CalculatorChanged);
+    }
+
+    /// Closes the step calculator if it is open; a no-op otherwise.
+    pub fn close_calculator(&mut self) {
+        if self.state.calculator_open {
+            self.state.calculator_open = false;
+            self.emit(ShellEvent::CalculatorChanged);
+        }
+    }
+
+    /// Whether the Analytics overlay is open.
+    pub fn analytics_open(&self) -> bool {
+        self.state.analytics.open
+    }
+
+    /// Whether there is a stack to count: the Analytics button's `enabled`.
+    pub fn analytics_enabled(&self) -> bool {
+        self.state.active().is_some()
+    }
+
+    /// What the Analytics overlay shows.
+    pub fn analytics_view(&self) -> &AnalyticsView {
+        &self.state.analytics.view
+    }
+
+    /// Makes every Analytics count wait `hold` before it reads anything.
+    pub fn set_analytics_hold(&mut self, hold: Duration) {
+        self.analytics_hold = hold;
+    }
+
+    /// Opens the Analytics overlay over the active stack and starts counting
+    /// on a worker, closing the projects overlay, the calculator and the
+    /// notification center; closes it when it is open. Returns the worker's
+    /// join handle when a count started; [`Self::settle_analytics`] applies
+    /// its result.
+    pub fn toggle_analytics(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if self.state.analytics.open {
+            self.close_analytics();
+            return None;
+        }
+        if !self.analytics_enabled() {
+            return None;
+        }
+        self.close_projects_overlay();
+        self.close_calculator();
+        self.notifications.close_center();
+        self.state.analytics.open = true;
+        self.start_analytics_count();
+        self.state.analytics.worker.take()
+    }
+
+    /// Closes the Analytics overlay and stops its count; a no-op while closed.
+    pub fn close_analytics(&mut self) {
+        let analytics = &mut self.state.analytics;
+        if !analytics.open {
+            return;
+        }
+        analytics.open = false;
+        analytics.generation += 1;
+        analytics.tab = None;
+        if let Some(control) = analytics.control.take() {
+            control.cancel();
+        }
+        self.emit(ShellEvent::AnalyticsChanged);
+    }
+
+    /// Takes the worker started by a tab switch while the overlay was open.
+    pub fn take_analytics_worker(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.state.analytics.worker.take()
+    }
+
+    /// Applies the parked count of the current generation; a result of a
+    /// closed or replaced count changes nothing.
+    pub fn settle_analytics(&mut self) {
+        let analytics = &mut self.state.analytics;
+        let parked = analytics
+            .outcome
+            .lock()
+            .expect("no thread panicked while holding the analytics outcome")
+            .take();
+        let Some((generation, result)) = parked else {
+            return;
+        };
+        if !analytics.open || generation != analytics.generation {
+            return;
+        }
+        analytics.view = match result {
+            Ok(counts) => AnalyticsView::Rows(analytics::build_rows(&analytics.frames, &counts)),
+            Err(message) => AnalyticsView::Failed(message),
+        };
+        self.emit(ShellEvent::AnalyticsChanged);
+    }
+
+    fn start_analytics_count(&mut self) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let (id, frames) = (tab.id, tab.frames.clone());
+        let sink = self.sink.clone();
+        let hold = self.analytics_hold;
+        let analytics = &mut self.state.analytics;
+        if let Some(previous) = analytics.control.take() {
+            previous.cancel();
+        }
+        analytics.generation += 1;
+        analytics.tab = Some(id);
+        analytics.frames = frames.clone();
+        analytics.view = AnalyticsView::Computing;
+        let control = job::JobControl::new();
+        analytics.control = Some(Arc::clone(&control));
+        let generation = analytics.generation;
+        let slot = Arc::clone(&analytics.outcome);
+        analytics.worker = Some(std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            // A stopped count parks nothing, so it cannot replace the result
+            // of the count that superseded it.
+            let result = match analytics::count_frames(&frames, &*control) {
+                Ok(counts) => Ok(counts),
+                Err(CountError::Failed(message)) => Err(message),
+                Err(CountError::Stopped) => return,
+            };
+            *slot
+                .lock()
+                .expect("no thread panicked while holding the analytics outcome") =
+                Some((generation, result));
+            if let Some(sink) = &sink {
+                sink(ShellEvent::AnalyticsReady);
+            }
+        }));
+        self.emit(ShellEvent::AnalyticsChanged);
+    }
+
+    /// Follows the active tab while the overlay is open: recounts for a
+    /// different tab, closes when none is left.
+    fn sync_analytics_to_active_tab(&mut self) {
+        if !self.state.analytics.open {
+            return;
+        }
+        match self.state.active().map(|tab| tab.id) {
+            None => self.close_analytics(),
+            Some(id) if Some(id) != self.state.analytics.tab => self.start_analytics_count(),
+            Some(_) => {}
+        }
+    }
+
+    /// The calculator's entries and read-outs for display.
+    pub fn calculator_view(&self) -> CalculatorView {
+        self.state.calculator.view()
+    }
+
+    /// Selects the calculator's optics by its variant label.
+    pub fn calculator_set_optics(&mut self, label: &str) {
+        self.state.calculator.set_optics(label);
+        self.emit(ShellEvent::CalculatorChanged);
+    }
+
+    /// Takes `text` typed into the calculator's field slot `slot`.
+    pub fn calculator_edit(&mut self, slot: usize, text: &str) {
+        self.state.calculator.edit(slot, text);
+        self.emit(ShellEvent::CalculatorChanged);
     }
 
     /// A key press against the window's five fixed shortcuts -- `Esc` and
@@ -4915,6 +5133,14 @@ impl AppController {
             }
             if self.state.overlay_open {
                 self.close_projects_overlay();
+                return ChromeKey::Consumed;
+            }
+            if self.state.calculator_open {
+                self.close_calculator();
+                return ChromeKey::Consumed;
+            }
+            if self.state.analytics.open {
+                self.close_analytics();
                 return ChromeKey::Consumed;
             }
             return ChromeKey::None;
@@ -7955,6 +8181,8 @@ impl AppController {
     /// same call, and marks every record read.
     pub fn open_center(&mut self) {
         self.close_projects_overlay();
+        self.close_calculator();
+        self.close_analytics();
         self.notifications.open_center();
     }
 
@@ -7966,6 +8194,8 @@ impl AppController {
     /// Projects overview as [`open_center`](Self::open_center) does.
     pub fn open_center_at(&mut self, id: u64) {
         self.close_projects_overlay();
+        self.close_calculator();
+        self.close_analytics();
         self.notifications.open_center_at(id);
     }
 

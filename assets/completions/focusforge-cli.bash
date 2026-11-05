@@ -49,8 +49,14 @@ _focusforge__cli() {
             focusforge__cli,review)
                 cmd="focusforge__cli__subcmd__review"
                 ;;
+            focusforge__cli,sharp-areas)
+                cmd="focusforge__cli__subcmd__sharp__subcmd__areas"
+                ;;
             focusforge__cli,stack)
                 cmd="focusforge__cli__subcmd__stack"
+                ;;
+            focusforge__cli,step-plan)
+                cmd="focusforge__cli__subcmd__step__subcmd__plan"
                 ;;
             focusforge__cli__subcmd__cache,clear)
                 cmd="focusforge__cli__subcmd__cache__subcmd__clear"
@@ -97,8 +103,14 @@ _focusforge__cli() {
             focusforge__cli__subcmd__help,review)
                 cmd="focusforge__cli__subcmd__help__subcmd__review"
                 ;;
+            focusforge__cli__subcmd__help,sharp-areas)
+                cmd="focusforge__cli__subcmd__help__subcmd__sharp__subcmd__areas"
+                ;;
             focusforge__cli__subcmd__help,stack)
                 cmd="focusforge__cli__subcmd__help__subcmd__stack"
+                ;;
+            focusforge__cli__subcmd__help,step-plan)
+                cmd="focusforge__cli__subcmd__help__subcmd__step__subcmd__plan"
                 ;;
             focusforge__cli__subcmd__help__subcmd__cache,clear)
                 cmd="focusforge__cli__subcmd__help__subcmd__cache__subcmd__clear"
@@ -143,7 +155,7 @@ _focusforge__cli() {
 
     case "${cmd}" in
         focusforge__cli)
-            opts="-v -q -h -V --quiet --help --version info algorithms stack export retouch history align review cache diagnostics check-update help"
+            opts="-v -q -h -V --quiet --help --version info algorithms step-plan sharp-areas stack export retouch history align review cache diagnostics check-update help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -409,7 +421,7 @@ _focusforge__cli() {
             return 0
             ;;
         focusforge__cli__subcmd__help)
-            opts="info algorithms stack export retouch history align review cache diagnostics check-update help"
+            opts="info algorithms step-plan sharp-areas stack export retouch history align review cache diagnostics check-update help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -632,7 +644,35 @@ _focusforge__cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        focusforge__cli__subcmd__help__subcmd__sharp__subcmd__areas)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         focusforge__cli__subcmd__help__subcmd__stack)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        focusforge__cli__subcmd__help__subcmd__step__subcmd__plan)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -830,6 +870,24 @@ _focusforge__cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        focusforge__cli__subcmd__sharp__subcmd__areas)
+            opts="-v -q -h --set --json --quiet --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --set)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         focusforge__cli__subcmd__stack)
             opts="-o -v -q -h --output --algorithm --json --set --groups --write-groups --only --no-align --no-crop --strict --align-algorithm --align-set --resume --no-progress --tile-size --max-host-memory --max-vram --preset --write-preset --status --dry-run --cpu --no-cache --quiet --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -894,6 +952,24 @@ _focusforge__cli() {
                     return 0
                     ;;
                 --status)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        focusforge__cli__subcmd__step__subcmd__plan)
+            opts="-v -q -h --set --json --quiet --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --set)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
