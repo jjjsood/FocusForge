@@ -5,8 +5,7 @@
 
 mod common;
 
-use std::io::ErrorKind;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::process::Output;
 use std::thread::{self, JoinHandle};
@@ -227,6 +226,6 @@ fn one_request_per_run_to_the_configured_path() {
     );
     assert_eq!(
         listener.accept().expect_err("no second connection").kind(),
-        std::io::ErrorKind::WouldBlock
+        ErrorKind::WouldBlock
     );
 }
