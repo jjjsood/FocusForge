@@ -9,3 +9,4 @@ Gotchas:
 - Not covered by the journey: the failed state (a frame deleted after the folder was opened, reachable only by deleting a file during the hold), a list taller than the body with its scrollbar (needs a stack of more frames than fits, none is checked in, and the wheel is a human-only input), and the editor mode. Check them by hand with a copy of a fixture under `.scratch/`.
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
 Guides: 22-analytics.md
+Book: guide/gui.md#count-the-sharp-areas-of-each-frame

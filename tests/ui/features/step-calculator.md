@@ -9,3 +9,4 @@ Gotchas:
 - The illustration (planes, leader lines, inset, dimension marks) is judged by eye and is `(human only)`.
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
 Guides: 21-step-calculator.md
+Book: guide/gui.md#plan-a-stack-with-the-step-calculator

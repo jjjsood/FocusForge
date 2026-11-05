@@ -97,6 +97,30 @@ steps = [
 out   = "assets/manual/window/window-undocked-second.png"
 window = 1
 
+# The step calculator over the canvas, Lens defaults.
+[[shot]]
+name  = "window-step-calculator"
+args  = ["--open", "fixtures/mantis-512/frames"]
+steps = [
+  ["wait-text", "8 frames · 0 excluded", "120"],
+  ["click-label", "Step calculator", "AppWindow::icon-bar"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/window/step-calculator.png"
+crop  = "AppWindow::calculator-overlay"
+
+# Analytics opened at launch, with the counted rows of mantis-512.
+[[shot]]
+name  = "window-analytics"
+args  = ["--open", "fixtures/mantis-512/frames", "--analytics"]
+steps = [
+  ["wait-text", "8 frames · 0 excluded", "120"],
+  ["wait-text", "11", "120"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/window/analytics.png"
+crop  = "AppWindow::analytics-overlay"
+
 # ---------------------------------------------------------------- the Images panel
 
 # List, with 03.tif excluded and the pointer still on its row (eye and trash showing).
