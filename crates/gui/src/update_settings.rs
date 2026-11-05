@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The `[updates]` table in `settings.toml`.
+//! The `[updates]` table in `settings.toml`, and the release source behind the
+//! hidden update-notice preview.
 
 use std::path::Path;
 
