@@ -125,6 +125,44 @@ pub fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
     copy_frame_from("mantis-64", dest_dir, name, source_index);
 }
 
+/// A `width` x `height` classic little-endian TIFF of 8-bit RGBA samples
+/// (`ExtraSamples` = unassociated alpha): one uncompressed strip, chunky.
+#[allow(dead_code)]
+pub fn write_rgba8_frame(path: &Path, width: u32, height: u32) {
+    const ENTRIES: u16 = 11;
+    let bits_at = 8 + 2 + u32::from(ENTRIES) * 12 + 4;
+    let strip_at = bits_at + 8;
+    let strip_len = width * height * 4;
+    let mut bytes = b"II*\0".to_vec();
+    bytes.extend(8u32.to_le_bytes());
+    bytes.extend(ENTRIES.to_le_bytes());
+    // (tag, type, count, value): type 3 = SHORT, 4 = LONG.
+    for (tag, kind, count, value) in [
+        (256u16, 4u16, 1u32, width),
+        (257, 4, 1, height),
+        (258, 3, 4, bits_at),
+        (259, 3, 1, 1),
+        (262, 3, 1, 2),
+        (273, 4, 1, strip_at),
+        (277, 3, 1, 4),
+        (278, 4, 1, height),
+        (279, 4, 1, strip_len),
+        (284, 3, 1, 1),
+        (338, 3, 1, 2),
+    ] {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend(count.to_le_bytes());
+        bytes.extend(value.to_le_bytes());
+    }
+    bytes.extend(0u32.to_le_bytes());
+    for _ in 0..4 {
+        bytes.extend(8u16.to_le_bytes());
+    }
+    bytes.extend((0..strip_len).map(|i| (i % 251) as u8));
+    std::fs::write(path, bytes).expect("the RGBA frame must write");
+}
+
 /// [`copy_frame`] from the fixture set `set`.
 #[allow(dead_code)]
 pub fn copy_frame_from(set: &str, dest_dir: &Path, name: &str, source_index: usize) {

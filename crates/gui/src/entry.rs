@@ -14,8 +14,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{
-    Group, GroupSignal, JPEG_EXTENSIONS, TiffError, all_frame_paths, has_extension, is_frame_path,
-    one_group, open_frame_set, propose_with_progress,
+    Group, GroupSignal, JPEG_EXTENSIONS, TiffError, TiffHeader, all_frame_paths, classify_header,
+    has_extension, is_frame_path, one_group, open_frame_set, propose_with_progress,
 };
 use focusforge_core::params::StackContext;
 use focusforge_core::project::{
@@ -189,6 +189,12 @@ pub enum EntryError {
     /// A file set spread over several folders.
     #[error("These files are in different folders. A stack's frames share one folder.")]
     SeveralFolders { path: PathBuf },
+    /// A TIFF frame no reader here can open, found by its header when the
+    /// folder or file set is opened. `path` is what the refusal's Projects
+    /// card is made for: the opened folder, or the refused file of a file
+    /// set.
+    #[error("{message}")]
+    UnreadableFrame { path: PathBuf, message: String },
 }
 
 /// [`EntryError::ProjectRefused`]'s own cause text: one sentence per group
@@ -210,6 +216,50 @@ fn refusal_message(source: &ProjectError) -> String {
               was written."
             .to_string(),
     }
+}
+
+/// [`EntryError::UnreadableFrame`]'s sentence for `file`: its name, what is
+/// wrong in the user's words and the way out -- no tag, field or magic
+/// number, and not the folder's path.
+fn unreadable_frame_message(file: &Path, err: &TiffError) -> String {
+    let name = file.file_name().map_or_else(
+        || file.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    match err {
+        TiffError::BigTiff { .. } => format!(
+            "{name} is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again."
+        ),
+        TiffError::UnsupportedDecoded { .. } | TiffError::SegmentLayout { .. } => format!(
+            "{name} uses a TIFF layout FocusForge cannot read. Save the frames as standard 8- or 16-bit TIFF and open them again."
+        ),
+        TiffError::NotATiff { .. } | TiffError::BadMagic { .. } => {
+            format!("{name} is not a TIFF file, though its name says so.")
+        }
+        TiffError::Io { source, .. } => format!("{name} could not be read: {source}."),
+        _ => format!("{name} is damaged: its TIFF header does not read."),
+    }
+}
+
+/// Reads the header of every TIFF in `frames` -- never its pixels -- and
+/// refuses at the first one the frame-set opener would refuse by header.
+/// The refusal's card is made for `card`, or for the refused file itself.
+fn probe_tiff_frames<'a>(
+    frames: impl IntoIterator<Item = &'a PathBuf>,
+    card: Option<&Path>,
+) -> Result<(), EntryError> {
+    for file in frames
+        .into_iter()
+        .filter(|file| FrameKind::of(file) == Some(FrameKind::Tiff))
+    {
+        if let Err(err) = TiffHeader::open(file).and_then(|header| classify_header(&header)) {
+            return Err(EntryError::UnreadableFrame {
+                path: card.unwrap_or(file).to_path_buf(),
+                message: unreadable_frame_message(file, &err),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Why an additive import refused, each carrying an already-rendered
@@ -418,14 +468,20 @@ pub fn diff_import(
 ///
 /// `Folder` proposes a grouping over `dir`, reading one frame header per
 /// report; one group opens straight through, more than one raises the one
-/// question. `Frames` and `Project` read no frame headers at all, so each
-/// reports exactly once, already done. `Frames` builds its project from
-/// exactly the files given, no sibling scan. `Project` reopens a saved
-/// `.ffp`.
+/// question. `Frames` and `Project` each report exactly once, already
+/// done. `Frames` builds its project from exactly the files given, no
+/// sibling scan. `Project` reopens a saved `.ffp`. `Folder` and `Frames`
+/// refuse, before any question and with no progress of their own, a TIFF
+/// frame whose header the frame-set opener refuses.
 pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenOutcome {
     match target {
         OpenTarget::Folder(dir) => match propose_with_progress(&dir, &mut progress) {
             Ok(proposal) => {
+                if let Err(refused) =
+                    probe_tiff_frames(proposal.groups.iter().flat_map(|g| &g.frames), Some(&dir))
+                {
+                    return OpenOutcome::Refused(refused);
+                }
                 if proposal.groups.len() == 1 {
                     OpenOutcome::Opened(Opened {
                         projects: proposal
@@ -453,6 +509,9 @@ pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenO
             }),
         },
         OpenTarget::Frames { dir, frames } => {
+            if let Err(refused) = probe_tiff_frames(&frames, None) {
+                return OpenOutcome::Refused(refused);
+            }
             progress(frames.len(), frames.len());
             OpenOutcome::Opened(Opened {
                 projects: vec![GuiProject::Unsaved(one_group(&dir, frames))],

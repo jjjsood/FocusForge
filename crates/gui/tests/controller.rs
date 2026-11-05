@@ -9635,6 +9635,72 @@ fn fixture_root_and_subfolder_reports_the_skipped_subfolder() {
     assert_eq!(skipped.project_name, "notes");
 }
 
+/// What the open tab's folder shows through the GUI: each row's source
+/// preview state once the previews settle, whether each frame opens in the
+/// frame pane, and whether a fuse completes.
+fn exercise_open_folder(controller: &mut AppController) -> (Vec<&'static str>, Vec<bool>, bool) {
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
+    });
+    controller.set_images_viewport_height(600.0);
+    let rows = controller.images_panel().rows;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let previews = loop {
+        controller.poll_source_previews();
+        let states: Vec<_> = rows
+            .iter()
+            .map(|row| controller.source_preview_state(&row.path, row.unresolved))
+            .collect();
+        if !states.contains(&"loading") {
+            break states;
+        }
+        assert!(Instant::now() < deadline, "previews never settled");
+        std::thread::yield_now();
+    };
+    let pane = rows
+        .iter()
+        .map(|row| {
+            focusforge_gui::canvas::FrameSource::default()
+                .set(&row.path, None, job::host_budget())
+                .is_ok()
+        })
+        .collect();
+    assert!(controller.start_fuse(), "the fuse must start");
+    common::wait_for_settle(controller, Duration::from_secs(60));
+    let fused = matches!(controller.job_view().state, job::RunState::Fused { .. });
+    (previews, pane, fused)
+}
+
+#[test]
+fn eight_bit_tiff_folder_previews_and_fuses() {
+    for set in ["mantis8-64", "mantis8-64-lzw-p1-tile-mm"] {
+        let mut controller = AppController::new();
+        controller.set_scratch_root_for_test(tree(&format!("eight_bit_{set}_scratch")));
+        common::open_fixture_tab(&mut controller, "eight_bit", set, 3);
+        let (previews, pane, fused) = exercise_open_folder(&mut controller);
+        assert_eq!(previews, ["ready"; 3], "{set}: source previews");
+        assert_eq!(pane, [true; 3], "{set}: frame pane opens every frame");
+        assert!(fused, "{set}: the fuse completes");
+    }
+
+    let root = tree("eight_bit_rgba_frames");
+    for i in 0..3 {
+        common::write_rgba8_frame(&root.join(format!("{i:02}.tif")), 16, 16);
+    }
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("eight_bit_rgba_scratch"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    let (previews, pane, fused) = exercise_open_folder(&mut controller);
+    assert_eq!(previews, ["ready"; 3], "RGBA: source previews");
+    assert_eq!(pane, [true; 3], "RGBA: frame pane opens every frame");
+    assert!(fused, "RGBA: the fuse completes");
+}
+
 #[test]
 fn fixture_rejected_stack_opens_then_fails_and_retries() {
     let root = fixture_copy("open-rejected", "fixture_rejected");

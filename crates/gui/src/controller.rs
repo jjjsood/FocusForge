@@ -4519,7 +4519,8 @@ impl AppController {
             EntryError::Unreadable { path }
             | EntryError::NoReadableFrames { path }
             | EntryError::MixedKinds { path, .. }
-            | EntryError::SeveralFolders { path } => {
+            | EntryError::SeveralFolders { path }
+            | EntryError::UnreadableFrame { path, .. } => {
                 self.record_failure(not_a_project_card(path.clone()));
             }
             _ => {}
@@ -4530,6 +4531,7 @@ impl AppController {
             EntryError::MixedKinds { .. } | EntryError::SeveralFolders { .. } => {
                 Some("These images are not one stack".to_string())
             }
+            EntryError::UnreadableFrame { .. } => Some("These frames cannot be read".to_string()),
             _ => None,
         };
         OpenOutcome::Refused(err)
