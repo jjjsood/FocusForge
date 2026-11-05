@@ -13,3 +13,4 @@ Gotchas:
 - The "Sharpness heatmap" row (Settings window, Appearance) switches the sharpness inset off. No journey flips it: its effect shows only on the growing result, which no step can reach (see "Not covered yet" in the feature index).
 - The run is held at its first fuse tile for `--slow-run-seconds` of running time (journey 20 sets 600: slower runners reach Cancel only after several minutes, and the default 150 s let the run finish into the Keep question first), pauses excluded; cancelling ends it at once.
 Guides: 20-fuse-stage-view.md
+Book: guide/gui.md#the-two-panes
