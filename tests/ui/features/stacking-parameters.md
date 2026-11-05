@@ -14,3 +14,4 @@ Gotchas:
 - The FUSE picker lists exactly "Details", "Soft transitions" and "Focus map" in every build, so "Soft transitions" is option 1 and "Focus map" option 2; test-only algorithms never appear in it. The guide names the entries by their grey ids.
 - Human only: the scroll wheel in the panel, judging that a changed parameter changes the fused pixels.
 Guides: 09-stacking-parameters.md, 14-pre-brightness-target.md
+Book: guide/stacking.md#fuse-choose-how-the-frames-are-combined, guide/stacking.md#reset-all-to-default

@@ -14,3 +14,4 @@ Gotchas:
 - Scrolling, keyboard and edge-drag visibility need a list long enough to scroll and the mouse wheel; `manual/13-source-scroll-and-drag-edges.md` (not a numbered journey) covers them, with a drag that leaves the viewport.
 - Human only: dragging a row in List, the native file dialog behind the add icon, wheel scrolling the list, judging the frame thumbnails.
 Guides: 10-images-panel.md, 13-source-image-views.md, 19-editor-source-list.md
+Book: guide/images-panel.md#the-frame-list, guide/images-panel.md#choose-how-the-list-looks

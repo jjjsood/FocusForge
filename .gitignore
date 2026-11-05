@@ -8,3 +8,4 @@ crates/*/.scratch/
 /tools/lib/__pycache__
 *.code-workspace
 /.locks/
+/book/

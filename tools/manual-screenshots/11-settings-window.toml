@@ -1,0 +1,155 @@
+# The settings window chapter (docs/guide/settings-window.md) and its
+# Diagnostics sub-chapter (docs/guide/diagnostics.md).
+#
+# Every shot except the first is cropped to the settings panel. The storage
+# shot sets HOME to its own scratch folder so the paths read "~/...". The
+# bundle shots write only into their own scratch data folder.
+
+[[shot]]
+name  = "settings-window"
+args  = ["--open", "fixtures/mantis-512/frames"]
+steps = [
+  ["wait-id", "FFToolbar::fuse-button"],
+  ["wait-text", "8 frames"],
+  ["click-id", "FFIconBar::settings"],
+  ["wait-id", "AppWindow::settings-modal"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/settings-window/settings-window.png"
+
+[[shot]]
+name  = "settings-performance"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "performance"]
+steps = [["wait-id", "AppWindow::settings-modal"], ["wait-text", "Not probed yet"], ["pause", "800"]]
+out   = "assets/manual/settings-window/settings-performance.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "settings-invalid-cap"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "performance"]
+steps = [
+  ["wait-id", "AppWindow::settings-modal"],
+  ["wait-text", "Not probed yet"],
+  ["click-id", "FFTextField::input", "0"],
+  ["type", "8G"],
+  ["pause", "800"],
+]
+out   = "assets/manual/settings-window/settings-invalid-cap.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "settings-appearance"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "appearance"]
+steps = [
+  ["wait-id", "AppWindow::settings-modal"],
+  ["wait-text", "Previews show original source images."],
+  ["click-id", "FFMenu::area"],
+  ["wait-text", "Large previews"],
+  ["pause", "800"],
+]
+out   = "assets/manual/settings-window/settings-appearance.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "settings-storage"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "storage"]
+env   = { HOME = "{run}" }
+steps = [["wait-id", "AppWindow::settings-modal"], ["wait-text", "Clear cache"], ["pause", "800"]]
+out   = "assets/manual/settings-window/settings-storage.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "settings-input-map"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "input-map"]
+steps = [["wait-id", "AppWindow::settings-modal"], ["wait-text", "pick-source-under-pointer"], ["pause", "800"]]
+out   = "assets/manual/settings-window/settings-input-map.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+# Waits for the gathered list (never "Collecting…"), scrolls it to the log
+# row and shows the end of the proposed file name. The field is clicked
+# through its wrapper: the text inside is wider than the field, so its own
+# centre lies outside it.
+[[shot]]
+name  = "settings-diagnostics"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "diagnostics"]
+steps = [
+  ["wait-id", "AppWindow::settings-modal"],
+  ["wait-text", "8 frames"],
+  ["wait-text", "version.json"],
+  ["pause", "2000"],
+  ["drag-id", "FFManifestList::thumb", "942", "360"],
+  ["wait-text", "logs/focusforge.jsonl"],
+  ["click-id", "FFDiagnosticsPanel::dest-field"],
+  ["pause", "500"],
+  ["key", "End"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/settings-window/settings-diagnostics.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+# A crash left a minidump (seeded); switching minidumps on adds it to the
+# list, marked not redacted, and shows the warning.
+[[shot]]
+name  = "settings-minidumps"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "diagnostics"]
+data_seed = "seeds/minidump"
+steps = [
+  ["wait-id", "AppWindow::settings-modal"],
+  ["wait-text", "8 frames"],
+  ["wait-text", "version.json"],
+  ["click-id", "FFToggle::area", "1"],
+  ["pause", "1500"],
+  ["wait-text", "version.json"],
+  ["drag-id", "FFManifestList::thumb", "942", "420"],
+  ["wait-text", "· not redacted"],
+  ["click-id", "FFDiagnosticsPanel::dest-field"],
+  ["pause", "500"],
+  ["key", "End"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/settings-window/settings-minidumps.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+# Writes one bundle under a chosen name into the shot's own scratch data
+# folder, then names that file again: the overwrite question. The long file
+# name keeps the scratch part of the path out of the visible field.
+[[shot]]
+name  = "settings-bundle-overwrite"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "diagnostics"]
+steps = [
+  ["wait-id", "AppWindow::settings-modal"],
+  ["wait-text", "8 frames"],
+  ["wait-text", "version.json"],
+  ["pause", "2000"],
+  ["click-id", "FFDiagnosticsPanel::dest-field"],
+  ["pause", "500"],
+  ["set-value", "FFTextField::input", "{run}/data/focusforge/diagnostics/focusforge-diagnostics-attached-to-my-bug-report.zip", "0"],
+  ["pause", "1000"],
+  ["click-id", "FFDiagnosticsPanel::bundle-primary"],
+  ["wait-text", "Bundle created successfully.", "60"],
+  ["pause", "1000"],
+  ["set-value", "FFTextField::input", "{run}/data/focusforge/diagnostics/focusforge-diagnostics-attached-to-my-bug-report.zip", "0"],
+  ["wait-text", "This file already exists", "30"],
+  ["click-id", "FFDiagnosticsPanel::dest-field"],
+  ["pause", "500"],
+  ["key", "End"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/settings-window/settings-bundle-overwrite.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "settings-about"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about"]
+steps = [["wait-id", "AppWindow::settings-modal"], ["wait-text", "github.com/jjjsood/FocusForge"], ["pause", "800"]]
+out   = "assets/manual/settings-window/settings-about.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
