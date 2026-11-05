@@ -55,10 +55,7 @@ pub fn parse_version(tag: &str) -> Result<Version, semver::Error> {
 /// `skipped`, when it parses, suppresses the release with that version
 /// (compared by precedence). `running` must be a valid version.
 pub fn check(source: &dyn ReleaseSource, running: &str, skipped: Option<&str>) -> UpdateCheck {
-    match check_inner(source, running, skipped) {
-        Ok(outcome) => outcome,
-        Err(failure) => UpdateCheck::Failed(failure),
-    }
+    check_inner(source, running, skipped).unwrap_or_else(UpdateCheck::Failed)
 }
 
 #[derive(serde::Deserialize)]
