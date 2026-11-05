@@ -23,6 +23,8 @@ export { AboutState, FFManifestRow, InputRow, PerformanceCap, PerformanceState, 
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
     in property <string> settings-section: "performance";
     callback settings-close-requested();
     callback settings-section-selected(string);
@@ -276,6 +278,8 @@ export component FFSettingsModal inherits FFModalPanel {
 
             FFInputMapTab {
                 input-rows: root.input-rows;
+                input-source: root.input-source;
+                input-problems: root.input-problems;
             }
         }
 

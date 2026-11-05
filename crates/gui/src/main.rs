@@ -65,8 +65,9 @@ struct Args {
     /// order, one `open_paths` call per path.
     #[arg(long, action = clap::ArgAction::Append)]
     open: Vec<PathBuf>,
-    /// Read and write the input map at `<DIR>/focusforge/settings.toml`'s
-    /// `[input]` table instead of the platform config directory.
+    /// Read and write `<DIR>/focusforge/settings.toml` -- recent projects,
+    /// appearance, input map, export choice and performance -- instead of
+    /// the one in the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Opens the settings modal on the named section at startup:
@@ -1075,17 +1076,8 @@ fn install_input_table(
 
     let mut controller = controller.lock().unwrap();
     controller.install_input_table(loaded.table);
-
-    let rows: Vec<focusforge_gui::InputRow> = controller
-        .input_rows()
-        .into_iter()
-        .map(|r| focusforge_gui::InputRow {
-            input: r.input.into(),
-            stacking: r.stacking.into(),
-            editor: r.editor.into(),
-        })
-        .collect();
-    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    controller.install_input_source(&loaded.provenance, &loaded.problems);
+    focusforge_gui::bridge::push_input_map_view(app, &controller);
 
     if let Some(section) = &args.settings_section {
         controller.open_settings();
@@ -1744,10 +1736,10 @@ fn install_diagnostics(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
     app: &AppWindow,
 ) {
-    controller.lock().unwrap().set_diagnostics_dirs(
-        focusforge_diagnostics::data_dir_from_env(),
-        focusforge_diagnostics::config_dir_from_env(),
-    );
+    controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(focusforge_diagnostics::data_dir_from_env());
     let _ = controller.lock().unwrap().start_manifest_scan();
     focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
@@ -2001,9 +1993,9 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
         install_input_table(&controller, &app, args);
         apply_appearance_preview(&app, args.appearance_preview);
+        install_recent(&controller, &app, args);
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
-        install_recent(&controller, &app, args);
         install_slow_down(&controller, args);
         install_save_folder(args);
         bridge::push_performance_view(&app, &controller);

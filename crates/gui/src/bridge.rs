@@ -310,6 +310,25 @@ pub fn push_busy(app: &AppWindow, controller: &AppController) {
     app.set_load_active(controller.load_in_flight() || saving);
 }
 
+/// Fills the Input map tab: its rows, its provenance line and the lines
+/// naming a refused `[input]` table.
+pub fn push_input_map_view(app: &AppWindow, controller: &AppController) {
+    let rows: Vec<crate::InputRow> = controller
+        .input_rows()
+        .into_iter()
+        .map(|r| crate::InputRow {
+            input: r.input.into(),
+            stacking: r.stacking.into(),
+            editor: r.editor.into(),
+        })
+        .collect();
+    app.set_input_rows(Rc::new(slint::VecModel::from(rows)).into());
+    let (source, problems) = controller.input_source();
+    app.set_input_source(source.into());
+    let problems: Vec<slint::SharedString> = problems.into_iter().map(Into::into).collect();
+    app.set_input_problems(Rc::new(slint::VecModel::from(problems)).into());
+}
+
 /// Publishes the worker's completed reads and shows every pane where the
 /// controller's current view puts it.
 fn publish_completed(

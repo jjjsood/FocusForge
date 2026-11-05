@@ -584,6 +584,8 @@ export component AppWindow inherits Window {
     // `AppController::open_settings`/`close_settings`.
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
     in property <string> settings-section: "performance";
     callback settings-open-requested();
     // The unread count on the bell, and whether the notification center is
@@ -806,6 +808,8 @@ export component AppWindow inherits Window {
         height: root.height;
         settings-open: root.settings-open;
         input-rows: root.input-rows;
+        input-source: root.input-source;
+        input-problems: root.input-problems;
         settings-section: root.settings-section;
         performance: root.performance;
         appearance-presentation: root.appearance-presentation;

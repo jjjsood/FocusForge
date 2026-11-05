@@ -332,6 +332,7 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("performance_tab.slint"), "unit-accepted")
             | (Some("performance_tab.slint"), "unit-dismissed")
             | (Some("performance_tab.slint"), "option-selected(unit)")
+            | (Some("diagnostics_panel.slint"), "changed destination")
             | (Some("ff_size_field.slint"), "option-selected(picked)")
             | (Some("ff_text_field.slint"), "accepted")
             | (Some("ff_text_field.slint"), "changed has-focus")
@@ -2493,7 +2494,7 @@ fn diagnostics_bundle_manifest() {
         for include_minidumps in [false, true] {
             let mut controller = AppController::new();
             let events = install_recording_sink(&mut controller);
-            controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+            controller.set_diagnostics_dirs(Some(data_dir.clone()));
             // Joined so its own scan report has already landed before
             // `run_scan` takes its "since here" snapshot below -- otherwise
             // a straggling report can land in an unrelated later window.
@@ -2541,11 +2542,61 @@ fn diagnostics_bundle_manifest() {
 
 #[test]
 fn diagnostics_bundle_manifest_value_column_units() {
-    assert_eq!(size_text(0), "0 KB");
+    assert_eq!(size_text(0), "0 B");
+    assert_eq!(size_text(312), "312 B");
+    assert_eq!(size_text(1023), "1023 B");
     assert_eq!(size_text(1024), "1 KB");
     assert_eq!(size_text(1024 * 1024 - 1), "1024 KB");
     assert_eq!(size_text(1024 * 1024), "1.0 MB");
     assert_eq!(size_text(1024 * 1024 + 1024 * 512), "1.5 MB");
+}
+
+/// The `input_map` entry of the `configuration.json` a bundle written by
+/// `controller` holds, as `(path, exists)`.
+fn bundle_input_map(
+    controller: &mut AppController,
+    events: &Arc<Mutex<Vec<ShellEvent>>>,
+    out: &Path,
+) -> (serde_json::Value, serde_json::Value) {
+    controller.set_destination(out.to_str().unwrap());
+    assert_eq!(run_write(controller, events), DiagnosticsStatus::Written);
+    let mut archive = zip::ZipArchive::new(fs::File::open(out).unwrap()).unwrap();
+    let configuration: serde_json::Value =
+        serde_json::from_reader(archive.by_name("configuration.json").unwrap()).unwrap();
+    let input_map = &configuration["input_map"];
+    (input_map["path"].clone(), input_map["exists"].clone())
+}
+
+#[test]
+fn diagnostics_bundle_records_the_installed_settings_file() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_diagnostics_dir(root.path());
+    let config_dir = root.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let settings = config_dir.join("settings.toml");
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
+    let (path, _) = bundle_input_map(&mut controller, &events, &root.path().join("none.zip"));
+    assert!(path.is_null(), "no installed directory records no path");
+
+    controller.install_recent(vec![], config_dir.clone());
+    // A bundle replaces the user's home prefix with `[home]`, so the recorded
+    // path is compared by its tail.
+    let names_installed_file = |path: &serde_json::Value| {
+        Path::new(path.as_str().expect("a path string")).ends_with("config/settings.toml")
+    };
+    let (path, exists) =
+        bundle_input_map(&mut controller, &events, &root.path().join("absent.zip"));
+    assert!(names_installed_file(&path), "recorded path: {path}");
+    assert_eq!(exists, false, "the settings file is not there yet");
+
+    fs::write(&settings, "").unwrap();
+    let (path, exists) =
+        bundle_input_map(&mut controller, &events, &root.path().join("present.zip"));
+    assert!(names_installed_file(&path), "recorded path: {path}");
+    assert_eq!(exists, true);
 }
 
 #[test]
@@ -2556,7 +2607,7 @@ fn diagnostics_bundle_write() {
     for include_minidumps in [false, true] {
         let mut controller = AppController::new();
         let events = install_recording_sink(&mut controller);
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         // Joined for the same reason as `diagnostics_bundle_manifest`: its
         // own scan must land before `run_scan`'s window, or `run_write`'s
         // later one can catch the straggler instead.
@@ -2597,7 +2648,7 @@ fn diagnostics_bundle_write_repeats_without_an_extra_click() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     // A destination outside `default_destination()`'s own
     // `<data_dir>/diagnostics/` tree, so the fresh path finish derives next
     // can never collide with it regardless of the clock's granularity.
@@ -2650,7 +2701,7 @@ fn diagnostics_bundle_destination() {
     fs::write(&existing, b"placeholder").unwrap();
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(existing.to_str().unwrap());
     assert_eq!(
         controller.diagnostics_status(),
@@ -2672,7 +2723,7 @@ fn diagnostics_bundle_destination() {
     let unwritable = blocked_parent.join("bundle.zip");
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(unwritable.to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Failed);
@@ -2692,7 +2743,7 @@ fn diagnostics_bundle_marks_reported() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(root.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Written);
@@ -2730,7 +2781,7 @@ fn diagnostics_bundle_marks_reported() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir2.clone()));
     controller.set_destination(root2.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
 
@@ -2769,7 +2820,7 @@ fn diagnostics_scan_off_the_main_thread() {
     for data_dir in [&seeded, &empty] {
         let mut controller = AppController::new();
         let start = std::time::Instant::now();
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         let view = controller.diagnostics_view();
         let elapsed = start.elapsed();
         assert!(
@@ -2798,7 +2849,7 @@ fn diagnostics_scan_reports_through_the_sink() {
 
     for include_minidumps in [false, true] {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         // Sets the choice and lets its own scan finish unobserved, so the
         // sink installed below records only the scan this test starts.
         controller
@@ -2850,7 +2901,7 @@ fn diagnostics_rescan_on_minidump_choice() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     run_scan(&mut controller, &events);
     assert!(
         !controller.diagnostics_view().entries.is_empty(),
@@ -2900,7 +2951,7 @@ fn diagnostics_scan_unreadable_dir() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(unreadable), None);
+    controller.set_diagnostics_dirs(Some(unreadable));
     run_scan(&mut controller, &events);
     let view = controller.diagnostics_view();
 
@@ -2934,7 +2985,7 @@ fn diagnostics_scan_outlives_its_controller() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     let handle = controller.start_manifest_scan();
     drop(controller);
 
@@ -3039,7 +3090,7 @@ fn crash_notice_counts_and_acknowledges() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     let record = crash_record(&controller).expect("unreported evidence is announced");
     assert_eq!(record.title, "Previous session stopped");
@@ -3063,7 +3114,7 @@ fn crash_notice_counts_and_acknowledges() {
     assert_eq!(crash.reports, 2, "the count outlives the cleared ids");
 
     let mut after = AppController::new();
-    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.set_diagnostics_dirs(Some(data_dir));
     after.scan_crash_notice();
     assert!(
         crash_record(&after).is_none(),
@@ -3073,7 +3124,7 @@ fn crash_notice_counts_and_acknowledges() {
     let empty_root = tempfile::tempdir().unwrap();
     fs::create_dir_all(empty_root.path().join("focusforge/crashes")).unwrap();
     let mut empty = AppController::new();
-    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")), None);
+    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")));
     empty.scan_crash_notice();
     assert!(empty.notifications().is_empty());
 }
@@ -3090,7 +3141,7 @@ fn crash_notice_unreadable_dir() {
     fs::set_permissions(&crashes, fs::Permissions::from_mode(0o000)).unwrap();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     controller.scan_crash_notice();
 
     fs::set_permissions(&crashes, writable).unwrap();
@@ -3107,7 +3158,7 @@ fn crash_record_survives_expiry_and_reading() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     assert!(controller.visible_toast().is_some(), "the crash is toasted");
 
@@ -3129,7 +3180,7 @@ fn crash_record_survives_expiry_and_reading() {
     );
 
     let mut after = AppController::new();
-    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.set_diagnostics_dirs(Some(data_dir));
     after.scan_crash_notice();
     assert!(
         crash_record(&after).is_some(),
@@ -3148,7 +3199,7 @@ fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
     let writable = fs::metadata(&crashes).unwrap().permissions();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     controller.scan_crash_notice();
     let id = crash_record(&controller).unwrap().id;
 
@@ -3181,7 +3232,7 @@ fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
 #[test]
 fn missing_crash_directory_keeps_the_center_usable() {
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(None, None);
+    controller.set_diagnostics_dirs(None);
     controller.scan_crash_notice();
     let record = crash_record(&controller).expect("the unavailable state is announced");
     assert!(record.crash.as_ref().unwrap().unavailable);
@@ -3240,7 +3291,7 @@ fn crash_notice_diagnostics_acknowledges_and_opens_settings() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     let id = crash_record(&controller).unwrap().id;
 
@@ -3281,7 +3332,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     assert_eq!(
         crash_record(&controller).unwrap().crash.unwrap().ids.len(),
@@ -3302,7 +3353,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
     let data_dir2 = seed_two_crashes(root2.path());
     let mut controller2 = AppController::new();
     let events2 = install_recording_sink(&mut controller2);
-    controller2.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller2.set_diagnostics_dirs(Some(data_dir2.clone()));
     controller2.scan_crash_notice();
 
     let blocked_parent = data_dir2.parent().unwrap().join("blocked");
@@ -9024,7 +9075,7 @@ fn storage_view_takes_its_rows_from_the_installed_directories() {
     let (config, data) = storage_dirs(&root.path().join("installed-marker"));
     let mut controller = AppController::new();
     controller.install_recent(Vec::new(), config.clone());
-    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_diagnostics_dirs(Some(data.clone()));
     controller.set_scratch_root_for_test(data.join("scratch"));
 
     let view = controller.storage_view();
@@ -9368,7 +9419,7 @@ mod notification {
     fn bell_over_projects_closes_projects_and_opens_the_center() {
         let mut controller = AppController::new();
         controller.toggle_projects_overlay();
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         assert_eq!(controller.unread_notifications(), 1);
         assert!(
@@ -9387,7 +9438,7 @@ mod notification {
         let mut controller = AppController::new();
         controller.open_center();
         controller.set_window_focused(1, false);
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         assert_eq!(
             controller.unread_notifications(),
@@ -9404,7 +9455,7 @@ mod notification {
     fn closing_projects_shows_unread_without_toast_replay() {
         let mut controller = AppController::new();
         controller.toggle_projects_overlay();
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         controller.toggle_projects_overlay();
         assert!(
@@ -9424,7 +9475,7 @@ mod native_delivery {
     use std::cell::Cell;
 
     fn crash_notice(controller: &mut AppController) {
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
     }
 

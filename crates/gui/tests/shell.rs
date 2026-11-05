@@ -1130,16 +1130,7 @@ fn px_for_rows(rows: usize) -> f32 {
 /// way the running app fills them.
 fn input_map_window(width: u32, height: u32, controller: &AppController) -> AppWindow {
     let app = app_at(width, height);
-    let rows: Vec<focusforge_gui::InputRow> = controller
-        .input_rows()
-        .into_iter()
-        .map(|r| focusforge_gui::InputRow {
-            input: r.input.into(),
-            stacking: r.stacking.into(),
-            editor: r.editor.into(),
-        })
-        .collect();
-    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    focusforge_gui::bridge::push_input_map_view(&app, controller);
     app.set_settings_open(true);
     app.set_settings_section("input-map".into());
     app
@@ -1233,6 +1224,124 @@ fn input_map_tab_shows_the_controller_rows() {
                 .map(|row| [row.input, row.stacking, row.editor]),
         );
         assert_eq!(input_map_cells(&tab), expected);
+    }
+}
+
+/// The status lines at the top of the tab, top to bottom: the provenance
+/// line, then one per refusal.
+fn input_map_status_lines(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFStatusText"))
+        .iter()
+        .map(|line| line.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Installs what `input_config::load` made of `config_dir` on `controller`
+/// the way the running app does.
+fn install_loaded(controller: &mut AppController, config_dir: &std::path::Path) {
+    let loaded = focusforge_gui::input_config::load(config_dir);
+    controller.install_input_table(loaded.table);
+    controller.install_input_source(&loaded.provenance, &loaded.problems);
+}
+
+/// A controller never given a source shows the built-in line; one given a
+/// settings file with a changed binding names that file and the count.
+#[test]
+fn input_map_tab_shows_where_the_bindings_come_from() {
+    let fresh = AppController::new();
+    let app = input_map_window(1440, 900, &fresh);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        ["Built-in bindings."]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    fs::write(
+        &path,
+        "[input]\n[[input.bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\n",
+    )
+    .unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, dir.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        [format!(
+            "Read from {}: 1 binding differs from the built-in ones.",
+            path.display()
+        )]
+    );
+
+    let no_table = tempfile::tempdir().unwrap();
+    fs::write(no_table.path().join("settings.toml"), "[recent]\n").unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, no_table.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        ["Built-in bindings."],
+        "a settings file without an [input] table supplies no bindings"
+    );
+
+    let unchanged = tempfile::tempdir().unwrap();
+    fs::write(unchanged.path().join("settings.toml"), "[input]\n").unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, unchanged.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        [format!(
+            "Read from {}: 0 bindings differ from the built-in ones.",
+            unchanged.path().join("settings.toml").display()
+        )]
+    );
+}
+
+/// A refused `[input]` table opens on the built-in rows with the built-in
+/// line and one failure line per problem, as `load` words it.
+#[test]
+fn input_map_tab_names_a_refused_table() {
+    let cases = [
+        (
+            "unknown trigger",
+            "[input]\n[[input.bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
+        ),
+        (
+            "duplicate trigger",
+            "[input]\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n\
+             [[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n",
+        ),
+        ("unparsable TOML", "[input\n"),
+    ];
+    let tab_source =
+        fs::read_to_string(common::ui_dir().join("shell/settings_modal/input_map_tab.slint"))
+            .unwrap();
+    assert!(
+        tab_source.contains("tone: \"failure\""),
+        "the refusal lines draw in the failure tone"
+    );
+
+    for (label, body) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.toml"), body).unwrap();
+        let loaded = focusforge_gui::input_config::load(dir.path());
+        assert!(!loaded.problems.is_empty(), "{label}: the table is refused");
+        let mut expected = vec!["Built-in bindings.".to_string()];
+        expected.extend(loaded.problems.iter().map(ToString::to_string));
+
+        let mut controller = AppController::new();
+        install_loaded(&mut controller, dir.path());
+        let app = input_map_window(1440, 900, &controller);
+        let tab = input_map_tab(&app);
+        assert_eq!(input_map_status_lines(&tab), expected, "{label}");
+
+        let rows: Vec<[String; 3]> = AppController::new()
+            .input_rows()
+            .into_iter()
+            .map(|row| [row.input, row.stacking, row.editor])
+            .collect();
+        assert_eq!(&input_map_cells(&tab)[1..], rows, "{label}: built-in rows");
     }
 }
 
@@ -2335,7 +2444,7 @@ fn storage_tab_shows_the_controller_view() {
     fs::write(config.join("settings.toml"), "").unwrap();
     let mut controller = AppController::new();
     controller.install_recent(Vec::new(), config);
-    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_diagnostics_dirs(Some(data.clone()));
     controller.set_scratch_root_for_test(data.join("scratch"));
 
     let view = controller.storage_view();
@@ -3660,7 +3769,7 @@ mod notification {
     #[test]
     fn a_crash_toast_carries_the_crash_kind() {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")), None);
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         assert!(rig.app.get_toast_open());
@@ -3673,7 +3782,7 @@ mod notification {
     #[test]
     fn crash_diagnostics_opens_settings_on_the_diagnostics_section() {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")), None);
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         assert_eq!(rig.app.get_settings_section().as_str(), "performance");
@@ -3714,7 +3823,7 @@ mod notification {
         let crashes = data.join("crashes");
         let writable = fs::metadata(&crashes).unwrap().permissions();
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(data), None);
+        controller.set_diagnostics_dirs(Some(data));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         let id = rig.ids()[0];
@@ -4948,4 +5057,92 @@ mod fading_overlays {
             Theme::get(&app).set_reduce_motion(false);
         }
     }
+}
+
+/// The "Save to" field keeps showing the controller's destination after
+/// the user has typed into it: the fresh name after a write and the
+/// re-derived default after the data folder changes.
+#[test]
+fn diagnostics_destination_field_follows_the_controller_after_an_edit() {
+    use focusforge_gui::SettingsSection;
+    use focusforge_gui::diagnostics::DiagnosticsStatus;
+    use i_slint_backend_testing::mock_elapsed_time;
+    use std::time::Duration;
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let rig = settings_escape::rig();
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(Some(first.path().to_path_buf()));
+    rig.open_settings(SettingsSection::Diagnostics);
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+
+    let field_text = |rig: &settings_escape::Rig| {
+        mock_elapsed_time(Duration::from_millis(50));
+        ElementQuery::from_root(&rig.app)
+            .match_id("FFDiagnosticsPanel::dest-field")
+            .find_first()
+            .expect("the Save to field")
+            .query_descendants()
+            .match_id("FFTextField::input")
+            .find_first()
+            .expect("the field's input")
+            .accessible_value()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let destination = |rig: &settings_escape::Rig| {
+        rig.controller
+            .lock()
+            .unwrap()
+            .diagnostics_view()
+            .destination
+    };
+
+    rig.click_element("FFDiagnosticsPanel::dest-field");
+    type_into(&rig.app, "-first");
+    assert_eq!(
+        field_text(&rig),
+        destination(&rig),
+        "typing edits the field"
+    );
+    let typed = destination(&rig);
+    assert!(typed.contains("-first"), "{typed}");
+
+    rig.controller
+        .lock()
+        .unwrap()
+        .finish_bundle_write(DiagnosticsStatus::Written);
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+    let fresh = destination(&rig);
+    assert_ne!(fresh, typed, "a write moves the destination on");
+    assert_eq!(field_text(&rig), fresh, "the field shows the fresh name");
+
+    rig.click_element("FFDiagnosticsPanel::dest-field");
+    type_into(&rig.app, "-second");
+    assert_eq!(field_text(&rig), destination(&rig));
+    let typed_again = destination(&rig);
+
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(Some(second.path().to_path_buf()));
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+    let rederived = destination(&rig);
+    assert_ne!(rederived, typed_again);
+    assert!(rederived.starts_with(second.path().to_str().unwrap()));
+    assert_eq!(
+        field_text(&rig),
+        rederived,
+        "the field shows the new default"
+    );
+
+    type_into(&rig.app, "x");
+    assert_eq!(
+        field_text(&rig),
+        destination(&rig),
+        "typing after a push still edits the field"
+    );
 }

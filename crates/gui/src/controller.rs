@@ -351,6 +351,9 @@ struct DragState {
 #[derive(Debug, Clone, Default)]
 struct InputState {
     table: InputTable,
+    /// The provenance line and one line per refused `[input]` problem;
+    /// `None` until a source is installed.
+    source: Option<(String, Vec<String>)>,
     space_held: bool,
     /// `Alt` as the last hover move reported it -- shows the pipette cursor
     /// while held; it arms nothing.
@@ -482,14 +485,13 @@ pub struct BrushCursorView {
     pub composite_position: (f32, f32),
 }
 
-/// The diagnostics panel's own state: the two directories a bundle is
+/// The diagnostics panel's own state: the data directory a bundle is
 /// built from, the include-minidumps choice, the write destination and
 /// where a write attempt stands. The message shown for each status is
 /// fixed wording, not stored state -- `diagnostics_view()` derives it.
 #[derive(Debug, Clone, Default)]
 struct DiagnosticsState {
     data_dir: Option<PathBuf>,
-    config_dir: Option<PathBuf>,
     include_minidumps: bool,
     destination: PathBuf,
     status: DiagnosticsStatus,
@@ -3083,6 +3085,30 @@ impl AppController {
         self.state.input.table = table;
     }
 
+    /// Installs the provenance line and one line per problem that
+    /// `input_config::load` (or the defaults write) reported.
+    pub fn install_input_source(
+        &mut self,
+        provenance: &crate::input_config::Provenance,
+        problems: &[crate::input_config::ConfigError],
+    ) {
+        let line = match provenance {
+            crate::input_config::Provenance::Defaults => "Built-in bindings.".to_string(),
+            crate::input_config::Provenance::File { path, overridden } => {
+                let differ = match overridden {
+                    1 => "1 binding differs".to_string(),
+                    n => format!("{n} bindings differ"),
+                };
+                format!(
+                    "Read from {}: {differ} from the built-in ones.",
+                    path.display()
+                )
+            }
+        };
+        let problems = problems.iter().map(ToString::to_string).collect();
+        self.state.input.source = Some((line, problems));
+    }
+
     /// Applies `event` ([`Self::apply_action`]) and raises
     /// [`ShellEvent::Input`].
     fn emit_action(&mut self, event: ActionEvent) {
@@ -4140,6 +4166,16 @@ impl AppController {
 
     pub fn input_rows(&self) -> Vec<InputRowView> {
         self.state.input.table.display_rows()
+    }
+
+    /// The Input map's provenance line and its refusal lines; the built-in
+    /// line and no refusals until a source is installed.
+    pub fn input_source(&self) -> (String, Vec<String>) {
+        self.state
+            .input
+            .source
+            .clone()
+            .unwrap_or_else(|| ("Built-in bindings.".to_string(), Vec::new()))
     }
 
     pub fn open_settings(&mut self) -> bool {
@@ -9443,13 +9479,13 @@ impl AppController {
         self.close_unit_lists();
     }
 
-    /// Feeds the diagnostics panel its data and configuration directories
-    /// and derives the default destination from the data directory:
-    /// `<data_dir>/diagnostics/<default file name>`, or the file name alone
-    /// when no data directory resolves.
-    pub fn set_diagnostics_dirs(&mut self, data_dir: Option<PathBuf>, config_dir: Option<PathBuf>) {
+    /// Feeds the diagnostics panel its data directory and derives the
+    /// default destination from it: `<data_dir>/diagnostics/<default file
+    /// name>`, or the file name alone when no data directory resolves. A
+    /// bundle's configuration entry reads the settings file under the
+    /// directory `install_recent` installed.
+    pub fn set_diagnostics_dirs(&mut self, data_dir: Option<PathBuf>) {
         self.state.diagnostics.data_dir = data_dir;
-        self.state.diagnostics.config_dir = config_dir;
         let destination = self.default_destination();
         self.set_diagnostics_destination(destination);
     }
@@ -9506,7 +9542,7 @@ impl AppController {
         let sink = self.sink.clone();
         let options = focusforge_diagnostics::bundle::Options {
             data_dir: self.state.diagnostics.data_dir.clone(),
-            config_dir: self.state.diagnostics.config_dir.clone(),
+            config_dir: self.state.config_dir.clone(),
             include_minidumps: self.state.diagnostics.include_minidumps,
         };
         let destination = self.state.diagnostics.destination.clone();
@@ -9563,7 +9599,7 @@ impl AppController {
         let sink = self.sink.clone();
         let options = focusforge_diagnostics::bundle::Options {
             data_dir: self.state.diagnostics.data_dir.clone(),
-            config_dir: self.state.diagnostics.config_dir.clone(),
+            config_dir: self.state.config_dir.clone(),
             include_minidumps: self.state.diagnostics.include_minidumps,
         };
 

@@ -37,7 +37,7 @@ Start: --open fixtures/mantis-64/frames
     Expect: Must not: the line under the row reads "Cleared"; the heading "CACHE" shows the row "Stage cache" with the grey text "Deletes cached fuse stages." and an enabled **Clear cache** button (read with `buttons AppWindow::settings-modal`), and the line under the row is empty.
 ## Input map
 17. Click **Input map** (`FFNavRailEntry::area` 3).
-    Expect: the heading "BINDINGS" shows a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds six rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z" and "alt+left-click" (within 1 s).
+    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds six rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z" and "alt+left-click" (within 1 s).
 18. Click the header "STACKING" (`FFInputTableRow::stacking-cell` 0).
     Expect: the STACKING column holds six rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—" and "pick-source-under-pointer".
 19. Click the header "EDITOR" (`FFInputTableRow::editor-cell` 0).
