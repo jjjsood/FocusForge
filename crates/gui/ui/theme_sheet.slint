@@ -410,7 +410,7 @@ export component ThemeSheet inherits Window {
             FFHeatLegend { }
         }
 
-        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
+        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus, custom link label"; }
         VerticalLayout {
             spacing: Theme.space-4;
             HorizontalLayout {
@@ -426,6 +426,11 @@ export component ThemeSheet inherits Window {
                 FFToast { toast-open: true; kind: "crash"; title: "Previous session stopped"; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; hovered: true; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; focused: true; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "info"; title: "FocusForge 1.2.3 is available"; link-label: "Open download page"; }
             }
             HorizontalLayout {
                 spacing: Theme.space-6;

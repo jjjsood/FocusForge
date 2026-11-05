@@ -48,6 +48,7 @@ use crate::settings_panel::{
 use crate::source_previews::{
     MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
 };
+use crate::update_settings::UpdateSettings;
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 use focusforge_gpu::blend::Blender;
 
@@ -248,6 +249,9 @@ pub enum ShellEvent {
         generation: u64,
         scan: DiagnosticsScan,
     },
+    /// Raised by [`AppController::start_update_check`]'s background thread
+    /// once the check has settled.
+    UpdateChecked(job::UpdateCheck),
     /// The open project set changed: a tab opened, closed or was selected.
     ProjectsChanged,
     /// Only the tab strip's scroll state moved -- its offset, overflow
@@ -1751,6 +1755,9 @@ fn clamp_field_scroll(cursor_x: f32, current_offset: f32, viewport_width: f32) -
     }
 }
 
+/// Opens a URL in the system browser.
+type UrlOpener = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The plain-Rust controller every Slint callback in the crate forwards to.
 /// No method signature here names a Slint type.
 #[derive(Default)]
@@ -1763,6 +1770,7 @@ pub struct AppController {
     /// press, never through the sink: macOS reads the current event, which is
     /// the mouse-down only while the press is still being dispatched.
     native_drag: Option<Arc<dyn Fn(WindowTarget) + Send + Sync>>,
+    url_opener: Option<UrlOpener>,
     job: JobSlot,
     /// Test-only override for the window's scratch root: unset, a run's
     /// ledger, staging, held checkpoints and plane cache live under the
@@ -2074,6 +2082,11 @@ impl AppController {
     /// Installs the hook that starts a native window move for `target`.
     pub fn set_native_drag(&mut self, drag: Arc<dyn Fn(WindowTarget) + Send + Sync>) {
         self.native_drag = Some(drag);
+    }
+
+    /// Installs the hook that opens a URL in the system browser.
+    pub fn set_url_opener(&mut self, opener: UrlOpener) {
+        self.url_opener = Some(opener);
     }
 
     fn emit(&self, event: ShellEvent) {
@@ -7956,6 +7969,20 @@ impl AppController {
         self.notifications.open_center_at(id);
     }
 
+    /// Follows a toast's link: a record with a download page hands it to the
+    /// URL opener and closes the toast; any other record opens the center on
+    /// it.
+    pub fn activate_toast(&mut self, id: u64) {
+        let Some(url) = self.notifications.get(id).and_then(|n| n.url.clone()) else {
+            self.open_center_at(id);
+            return;
+        };
+        if let Some(opener) = &self.url_opener {
+            opener(&url);
+        }
+        self.notifications.dismiss(id, Instant::now());
+    }
+
     /// Selects record `id` and shows its full message.
     pub fn select_notification(&mut self, id: u64) {
         if self.notifications.get(id).is_some() {
@@ -9461,6 +9488,58 @@ impl AppController {
                 sink(ShellEvent::DiagnosticsScanFinished { generation, scan });
             }
         })
+    }
+
+    /// Asks the release source once, on a background thread, whether a newer
+    /// release than the running version exists, then reports through the
+    /// sink. Returns `None` and makes no request when `settings` switch the
+    /// check off.
+    pub fn start_update_check(
+        &self,
+        settings: &UpdateSettings,
+        source: Box<dyn job::ReleaseSource + Send>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        if !settings.check_on_start {
+            return None;
+        }
+        let sink = self.sink.clone();
+        let skipped = settings.skipped_version.clone();
+        let spawned = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let outcome =
+                    job::check_for_update(&*source, env!("CARGO_PKG_VERSION"), skipped.as_deref());
+                if let Some(sink) = sink {
+                    sink(ShellEvent::UpdateChecked(outcome));
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::debug!("update check not started: {err}");
+                None
+            }
+        }
+    }
+
+    /// Publishes the notice for a newer release; every other outcome is
+    /// logged and dropped.
+    pub fn finish_update_check(&mut self, outcome: job::UpdateCheck) {
+        use job::UpdateCheck;
+        match outcome {
+            UpdateCheck::Newer { version, url } => {
+                let mut record = Notification::new(
+                    Kind::Info,
+                    Source::Startup,
+                    format!("FocusForge {version} is available"),
+                    format!("FocusForge {version} has been released. Download page: {url}"),
+                );
+                record.url = Some(url);
+                self.publish_notification(record);
+            }
+            UpdateCheck::UpToDate => tracing::debug!("update check: up to date"),
+            UpdateCheck::Failed(reason) => tracing::debug!("update check failed: {reason}"),
+        }
     }
 
     /// Stores a background write's outcome -- called once

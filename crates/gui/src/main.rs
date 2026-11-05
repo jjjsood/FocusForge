@@ -69,6 +69,10 @@ struct Args {
     /// `[input]` table instead of the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
+    /// Shows the notice for a newer release of this version without asking
+    /// the release server; nothing with the start-up check switched off.
+    #[arg(long, hide = true, value_name = "VERSION")]
+    update_notice_preview: Option<String>,
     /// Opens the settings modal on the named section at startup:
     /// `performance`, `appearance`, `storage`, `input-map`, `diagnostics` or `about`.
     #[arg(long)]
@@ -1784,6 +1788,32 @@ fn install_recent(
     controller.install_recent(entries, config_dir);
 }
 
+/// Starts the once-per-start update check from the `[updates]` settings: the
+/// preview release when `--update-notice-preview` names a version, else the
+/// latest GitHub release.
+fn start_update_check(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    let settings = resolve_config_dir(args)
+        .map(|dir| focusforge_gui::update_settings::load(&dir))
+        .unwrap_or_default();
+    let source: Box<dyn focusforge_gui::job::ReleaseSource + Send> =
+        match &args.update_notice_preview {
+            Some(version) => Box::new(focusforge_gui::update_settings::PreviewRelease::new(
+                version,
+            )),
+            None => Box::new(focusforge_gui::job::HttpReleaseSource::new()),
+        };
+    // The thread reports through the sink and needs no join.
+    drop(
+        controller
+            .lock()
+            .unwrap()
+            .start_update_check(&settings, source),
+    );
+}
+
 /// Parses a whole number of at least 1; `None` for anything else, including
 /// a negative or non-numeric value.
 fn parse_positive(spec: &str) -> Option<u64> {
@@ -2004,6 +2034,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
         install_recent(&controller, &app, args);
+        start_update_check(&controller, args);
         install_slow_down(&controller, args);
         install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
@@ -2175,6 +2206,17 @@ mod tests {
         let text = error.render().to_string();
         assert!(text.starts_with("focusforge-gui "), "{text}");
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    }
+
+    #[test]
+    fn update_notice_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        let args =
+            Args::try_parse_from(["focusforge-gui", "--update-notice-preview", "999.0.0"]).unwrap();
+        assert_eq!(args.update_notice_preview.as_deref(), Some("999.0.0"));
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("update-notice-preview"), "{help}");
     }
 
     #[test]

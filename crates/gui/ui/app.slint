@@ -911,6 +911,7 @@ export component AppWindow inherits Window {
     // "info" | "warning" | "failure" | "crash".
     in property <string> toast-kind: "info";
     in property <string> toast-title: "";
+    in property <string> toast-link-label: "Open notification";
     callback toast-dismissed();
     callback toast-activated(int);
     // The pointer or the keyboard is on the toast.
@@ -1108,6 +1109,7 @@ export component AppWindow inherits Window {
         toast-open: root.toast-open;
         title: root.toast-title;
         kind: root.toast-kind;
+        link-label: root.toast-link-label;
         dismissed => { root.toast-dismissed(); }
         link-activated => {
             root.toast-activated(root.toast-id);

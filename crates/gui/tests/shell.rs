@@ -3288,6 +3288,11 @@ mod notification {
             "the first record is up"
         );
         assert_eq!(rig.app.get_toast_kind(), "failure");
+        assert_eq!(
+            rig.app.get_toast_link_label(),
+            "Open notification",
+            "a record without a url keeps the default link text"
+        );
 
         // The `Open notification` link.
         rig.click(64.0 + 80.0, 92.0 + 44.0);
