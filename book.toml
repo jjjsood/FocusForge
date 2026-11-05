@@ -19,7 +19,14 @@ site-url = "/FocusForge/"
 git-repository-url = "https://github.com/jjjsood/FocusForge"
 edit-url-template = "https://github.com/jjjsood/FocusForge/edit/main/{path}"
 default-theme = "light"
-preferred-dark-theme = "ayu"
+preferred-dark-theme = "coal"
+additional-css = ["theme/focusforge.css"]
+additional-js = ["theme/focusforge.js"]
+
+# Chapters with sub-chapters fold; the path to the open page stays expanded.
+[output.html.fold]
+enable = true
+level = 0
 
 [output.html.search]
 limit-results = 30
