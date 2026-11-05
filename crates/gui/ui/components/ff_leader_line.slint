@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A 1 px line from a label to the part it names, ending in an accent dot.
+// Vertical by default; the caller sets the span as `height` (`width` when
+// `horizontal`) and the cross size as the dot's.
+
+import { Theme } from "../theme.slint";
+
+export component FFLeaderLine inherits Rectangle {
+    in property <bool> horizontal: false;
+    // The dot sits at the bottom (right) end rather than the top (left).
+    in property <bool> dot-at-end: true;
+    // Draws the accent dot; off for a segment that continues into another.
+    in property <bool> show-dot: true;
+    // A row of 1 px dots, 3 px apart, instead of the solid line.
+    in property <bool> dotted: false;
+    property <length> dot: Theme.space-1 + 1px;
+
+    property <int> dots: root.dotted ? Math.ceil((root.horizontal ? root.width : root.height) / 3px) : 0;
+
+    for k in root.dots: Rectangle {
+        x: root.horizontal ? k * 3px : (root.width - self.width) / 2;
+        y: root.horizontal ? (root.height - self.height) / 2 : k * 3px;
+        width: 1px;
+        height: 1px;
+        background: Theme.border-strong;
+    }
+    if !root.dotted: Rectangle {
+        x: root.horizontal ? 0px : (root.width - self.width) / 2;
+        y: root.horizontal ? (root.height - self.height) / 2 : 0px;
+        width: root.horizontal ? root.width : 1px;
+        height: root.horizontal ? 1px : root.height;
+        background: Theme.border-strong;
+    }
+    if root.show-dot: Rectangle {
+        x: root.horizontal ? (root.dot-at-end ? root.width - self.width : 0px) : (root.width - self.width) / 2;
+        y: root.horizontal ? (root.height - self.height) / 2 : (root.dot-at-end ? root.height - self.height : 0px);
+        width: root.dot;
+        height: root.dot;
+        border-radius: Theme.radius-full;
+        background: Theme.accent-default;
+    }
+}

@@ -24,8 +24,9 @@ use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_
 use common::{open_mantis64_tab, record_events, save_to_proposed, scratch_controller, settle_all};
 
 /// True when `body` (already trimmed) is exactly one statement of the form
-/// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
-/// and the key handlers return an `EventResult`), a bare `accept`/`reject`
+/// `root.<ident>(...)` (optionally behind a leading `return `), an optional
+/// trailing `accept`/`reject` (`scroll-event` and the key handlers return an
+/// `EventResult`), a bare `accept`/`reject`
 /// alone (a scrim swallowing the event with nothing to forward), a bare
 /// literal assignment (`self.<ident> = <literal>;` or
 /// `<child-id>.<ident> = <literal>;`), or one
@@ -42,7 +43,9 @@ fn is_single_root_call(body: &str) -> bool {
         return true;
     }
     let body = stripped.unwrap_or(body);
-    if body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1 {
+    let forward = body.strip_prefix("return ").unwrap_or(body);
+    if forward.starts_with("root.") && forward.ends_with(");") && forward.matches(';').count() == 1
+    {
         return true;
     }
     is_bare_literal_assignment(body) || is_conditional_literal_reset(body)
@@ -136,6 +139,14 @@ fn is_single_root_call_allows_one_trailing_accept_or_reject() {
         !is_single_root_call("let x = 1; root.foo(); accept"),
         "a non-forward statement before the trailing token must still fail"
     );
+}
+
+#[test]
+fn is_single_root_call_allows_a_leading_return() {
+    assert!(is_single_root_call("return root.x(event);"));
+    assert!(!is_single_root_call("return"));
+    assert!(!is_single_root_call("return 1;"));
+    assert!(!is_single_root_call("return root.x(a); b"));
 }
 
 #[test]
@@ -327,6 +338,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("appearance_tab.slint"), "dismissed")
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "changed dialog-open")
+            | (Some("app.slint"), "changed notification-center-open")
+            | (Some("app.slint"), "changed calculator-open")
             | (Some("app.slint"), "changed settings-open")
             | (Some("app.slint"), "close-requested")
             | (Some("app.slint"), "key-pressed(event)")
@@ -338,6 +351,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("notification_center.slint"), "clicked")
             | (Some("notification_center.slint"), "changed selected")
             | (Some("notification_center.slint"), "key-pressed(event)")
+            | (Some("ff_field.slint"), "changed text")
+            | (Some("calculator_overlay.slint"), "key-pressed(event)")
     )
 }
 

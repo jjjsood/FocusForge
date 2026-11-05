@@ -19,6 +19,8 @@ focusforge-cli [OPTIONS] <COMMAND>
 |---|---|
 | [`info`](#info) | prints project, TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
+| [`step-plan`](#step-plan) | computes the focus step, frame count, duration and disk need of a focus stack from the optics and a depth range |
+| [`sharp-areas`](#sharp-areas) | counts the areas of the image that are sharpest in each frame of a directory |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
 | [`export`](#export) | renders a checkpoint to a TIFF, PNG, JPEG or (for RAW projects) DNG image, and/or writes its Z-Map or one source frame |
 | [`retouch`](#retouch) | appends an op list of brush strokes to a project as new checkpoints |
@@ -29,8 +31,8 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
 
 Root help groups `stack`, `align`, `retouch` and `export` under Processing;
-`info`, `review` and `algorithms` under Inspection; and `history`, `cache`
-and `diagnostics` under Maintenance.
+`info`, `review`, `algorithms`, `step-plan` and `sharp-areas` under Inspection; and
+`history`, `cache` and `diagnostics` under Maintenance.
 
 ## Global options
 
@@ -761,6 +763,145 @@ and the command exits without printing a schema.
 
 `--json` emits the same per-parameter facts described above, one element in
 `{"algorithms": [...]}`.
+
+## `step-plan`
+
+```
+focusforge-cli step-plan [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set a parameter; repeatable, and a repeated key is last-wins |
+| `--json` | print the plan as one JSON object |
+
+Computes how many frames a focus stack needs. The depth of field is
+`DOF = 0.55 µm / NA²`. A lens states its marked f-stop `N` and the
+magnification `m`, which give `NA = 1 / (2 · N · (1 + m))` (the pupil
+magnification is taken as 1); an objective states its NA. The focus step is
+`DOF · (1 − overlap)`, rounded to a whole nanometre, and the frame count is
+`ceil(range / step) + 1`, so both ends of the depth range are covered. The
+duration is the frame count times the time per frame, and the disk need is
+the frame count times the size per frame.
+
+A parameter the chosen optics does not use is ignored: `na` with a lens,
+`aperture` with an objective. The output names the optics input that was
+used.
+
+| parameter | unit | default | allowed |
+|---|---|---|---|
+| `magnification` | × | 1 | 0.01 to 100 |
+| `optics` | | `lens` | `lens`, `objective` |
+| `aperture` | marked f-stop | 8 | 0.7 to 64 |
+| `na` | numerical aperture | 0.25 | 0.01 to 0.95 |
+| `overlap` | fraction of the depth of field | 0.25 | 0 to 0.9 |
+| `range_mm` | mm | 5 | 0 to 1000 (0 plans one frame) |
+| `frame_seconds` | s | 1 | 0 to 3600 |
+| `frame_mb` | MB | 50 | 0 to 2000 |
+
+A value outside its range, an unknown key or an unparsable value is
+reported on stderr, one line per violation, and the exit code is 1.
+
+```
+$ focusforge-cli step-plan --set magnification=1 --set aperture=8 --set frame_seconds=3
+optics:    lens, f/8
+NA:        0.031
+DOF:       563.2 µm
+step:      422.4 µm (422400 nm)
+frames:    13
+duration:  39 s
+disk:      650 MB
+```
+
+`--json` prints the same plan as one object. Its `optics` object carries
+only the input that was used (`aperture` for a lens, `na` for an objective):
+
+```
+$ focusforge-cli step-plan --set optics=objective --set na=0.25 --set range_mm=1 --json
+{
+  "optics": {
+    "kind": "objective",
+    "na": 0.25
+  },
+  "na": 0.25,
+  "dof_um": 8.8,
+  "step_nm": 6600,
+  "frames": 153,
+  "duration_s": 153.0,
+  "disk_mb": 7650.0
+}
+```
+
+## `sharp-areas`
+
+```
+focusforge-cli sharp-areas [OPTIONS] <DIR>
+```
+
+| flag | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set a parameter; repeatable, and a repeated key is last-wins |
+| `--json` | print the counts as one JSON object |
+
+Counts, for each frame of a directory, how many areas of the image are
+sharpest in that frame. `<DIR>` is read like `info`'s: the frames directly
+inside it, or inside its `frames/` subdirectory when that exists.
+
+The image is divided into square cells from the top left corner, smaller at
+the right and bottom edges. A cell's score in a frame is the mean focus
+score of its pixels (the score `depth-map` fuses by). A cell is counted in the
+frame where its score peaks, the lowest index on a tie, when that peak is
+more than `contrast` times the cell's lowest score over the stack; every
+other cell is counted in no frame, so the counts add up to at most the
+number of cells. A cell counts in the first or the last frame like any other.
+Frames are read tile by tile and counted as they are, without alignment. A
+single frame, or a stack with no detail, gives a count of 0 for every frame.
+
+| parameter | unit | default | allowed |
+|---|---|---|---|
+| `cell-size` | px | 64 | 16 to 512 |
+| `contrast` | peak-to-floor ratio | 2 | 1 to 10 |
+
+A value outside its range, an unknown key or an unparsable value is
+reported on stderr, one line per violation, and the exit code is 1. So are
+a directory without frames, a frame that cannot be read, and frames of
+different sizes.
+
+The text output is one row per frame: its index, its file name and its count.
+
+```
+$ focusforge-cli sharp-areas fixtures/mantis-512/frames
+0  00.tif  0
+1  01.tif  0
+2  02.tif  4
+3  03.tif  11
+4  04.tif  0
+5  05.tif  0
+6  06.tif  0
+7  07.tif  1
+```
+
+`--json` prints the resolved parameters, the number of cells and the same
+rows (here with `--set cell-size=256`):
+
+```
+$ focusforge-cli sharp-areas fixtures/mantis-512/frames --set cell-size=256 --json
+{
+  "cells": 4,
+  "frames": [
+    {
+      "count": 0,
+      "file": "00.tif",
+      "index": 0
+    },
+    ...
+  ],
+  "params": {
+    "cell-size": 256,
+    "contrast": 2.0
+  }
+}
+```
 
 ## `export`
 

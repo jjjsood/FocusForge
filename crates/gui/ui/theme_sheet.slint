@@ -63,6 +63,15 @@ import { FFSettingsPathRow } from "components/ff_settings_path_row.slint";
 import { FFSettingsActionRow } from "components/ff_settings_action_row.slint";
 import { FFStatusText } from "components/ff_status_text.slint";
 import { FFInputTableRow } from "components/ff_input_table_row.slint";
+import { FFOverlayFrame } from "components/ff_overlay_frame.slint";
+import { FFCalculatorIllustration } from "components/ff_calculator_illustration.slint";
+import { FFLeaderLine } from "components/ff_leader_line.slint";
+import { FFDimensionMark } from "components/ff_dimension_mark.slint";
+import { FFCalculatorInset } from "components/ff_calculator_inset.slint";
+import { FFSummaryBand } from "components/ff_summary_band.slint";
+import { FFCalculatorLegend } from "components/ff_calculator_legend.slint";
+import { FFAnalyticsRow } from "components/ff_analytics_row.slint";
+import { FFStatusText } from "components/ff_status_text.slint";
 
 // The settings modal's own ground, content width plus its padding.
 component SettingsGround inherits Rectangle {
@@ -263,6 +272,112 @@ export component ThemeSheet inherits Window {
         padding: Theme.space-4;
         spacing: Theme.space-3;
         alignment: start;
+
+        GroupHeading { text: "Icon button: current (icon bar), at rest, hover-free"; }
+        FFNavRail {
+            width: ShellGeometry.icon-bar-width;
+            height: 240px;
+            raised: true;
+            FFIconButton { icon: @image-url("../../../assets/icons/calculator.svg"); focusable: true; current: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/chart-bar.svg"); focusable: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/chart-bar.svg"); focusable: true; current: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/chart-bar.svg"); focusable: true; enabled: false; }
+            FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; }
+        }
+
+        GroupHeading { text: "Segmented: section variant"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            FFSegmented { width: 240px; section: true; segments: ["Lens (f-stop)", "Objective (NA)"]; selected: "Lens (f-stop)"; }
+            FFSegmented { width: 240px; section: true; segments: ["Lens (f-stop)", "Objective (NA)"]; selected: "Objective (NA)"; }
+        }
+
+        GroupHeading { text: "Field: editable at rest, focused, invalid with its violation line"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            FFField { width: 56px; text: "1"; editable: true; text-alignment: right; }
+            FFField { width: 56px; text: "1"; editable: true; focused: true; text-alignment: right; }
+            VerticalLayout {
+                spacing: Theme.space-1;
+                FFField { width: 56px; text: "0.95"; editable: true; invalid: true; text-alignment: right; }
+                Text { text: "value 0.95 is outside the allowed range [0, 0.9]"; color: Theme.status-failure; font-size: Theme.text-body.size; }
+            }
+        }
+
+        GroupHeading { text: "Leader line (dot at end, at start, horizontal, dotted), dimension mark, bracket"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFLeaderLine { width: 5px; height: 60px; }
+            FFLeaderLine { width: 5px; height: 60px; dot-at-end: false; }
+            FFLeaderLine { width: 60px; height: 5px; horizontal: true; }
+            FFLeaderLine { width: 1px; height: 60px; dotted: true; show-dot: false; }
+            FFDimensionMark { width: 52px; height: 5px; bracket: true; }
+            FFDimensionMark { width: 200px; label: "Frames"; value: "13"; }
+            FFDimensionMark { width: 240px; label: "Depth of field"; value: "563.2 \u{00B5}m"; }
+        }
+
+        GroupHeading { text: "Overlay frame; calculator illustration, lens 13 planes, objective 17 planes, then 1, 2, 7, 30 planes"; }
+        FFOverlayFrame {
+            width: 520px;
+            height: 160px;
+            title: "Step calculator";
+        }
+        FFOverlayFrame {
+            width: 520px;
+            height: 160px;
+            title: "Analytics";
+            footer-height: 0px;
+        }
+
+        GroupHeading { text: "Analytics rows: heading, subtitle, rows without and with a rail position (2 of 58, count 0, largest 58)"; }
+        Rectangle {
+            width: 892px;
+            height: 5 * ShellGeometry.analytics-row-height + 2 * ShellGeometry.analytics-row-height + 3 * Theme.space-6;
+            background: Theme.surface-canvas;
+            FFSectionHeading { x: Theme.space-4; y: Theme.space-3; width: 400px; flat: true; strong: true; label: "SHARP AREAS PER IMAGE"; }
+            FFStatusText { x: Theme.space-4; y: Theme.space-6; width: 400px; height: 16px; text: "Image areas that are sharpest in this image"; }
+            VerticalLayout {
+                y: Theme.space-8 + Theme.space-6;
+                alignment: start;
+                FFAnalyticsRow { chip: Theme.status-failure; name: "00.tif"; fraction: 2.0 / 58.0; count: 2; }
+                FFAnalyticsRow { chip: Theme.status-warning; name: "01.tif"; fraction: 1.0; count: 58; }
+                FFAnalyticsRow { chip: Theme.status-success; name: "frame-with-a-long-file-name-0003.tif"; fraction: 0.0; count: 0; }
+                FFAnalyticsRow { chip: Theme.accent-default; name: "03.tif"; mm-text: "1.250 mm"; fraction: 14.0 / 72.0; count: 14; }
+                FFAnalyticsRow { chip: Theme.status-failure; name: "04.tif"; mm-text: "-10.000 mm"; fraction: 1.0; count: 72; }
+            }
+        }
+        FFCalculatorIllustration { plane-count: 13; }
+        FFCalculatorIllustration { objective: true; plane-count: 17; }
+        FFCalculatorIllustration { plane-count: 1; }
+        FFCalculatorIllustration { objective: true; plane-count: 2; }
+        FFCalculatorIllustration { plane-count: 7; }
+        FFCalculatorIllustration { objective: true; plane-count: 30; }
+
+        GroupHeading { text: "Calculator inset (overlap 0.25, 0.9 with a violation line room), summary band, legend"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFCalculatorInset { step-text: "422.4 \u{00B5}m"; depth-of-field-text: "563.2 \u{00B5}m"; }
+            FFCalculatorInset { step-text: "56.3 \u{00B5}m"; depth-of-field-text: "563.2 \u{00B5}m"; overlap: 0.9; extra-height: Theme.space-4 + Theme.space-1; }
+        }
+        FFSummaryBand {
+            width: 960px;
+            entered: [
+                { caption: "Optics", value: "f-stop" },
+                { caption: "Magnification", value: "1\u{00D7}" },
+                { caption: "Overlap", value: "0.25" },
+                { caption: "Depth range", value: "5 mm" },
+            ];
+            calculated: [
+                { caption: "Depth of field", value: "563.2 \u{00B5}m" },
+                { caption: "Step", value: "422.4 \u{00B5}m" },
+                { caption: "Frames", value: "13" },
+            ];
+        }
+        FFCalculatorLegend { }
 
         GroupHeading { text: "Motion: FFAppear enter-only, fade-out, slow fade-out; modal panel; toast"; }
         HorizontalLayout {
@@ -1187,6 +1302,7 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "Radius"; }
         HorizontalLayout {
             spacing: Theme.space-4;
+            RadiusSample { corner: Theme.radius-xs; label: "radius-xs"; }
             RadiusSample { corner: Theme.radius-sm; label: "radius-sm"; }
             RadiusSample { corner: Theme.radius-md; label: "radius-md"; }
             RadiusSample { corner: Theme.radius-lg; label: "radius-lg"; }
@@ -1558,6 +1674,8 @@ export component ThemeSheet inherits Window {
             FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
             FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
             FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
+            FFProgressBar { width: 400px; thickness: ShellGeometry.analytics-bar-height; corner-radius: Theme.radius-xs; fraction: 0.62; }
+            FFProgressBar { width: 400px; thickness: ShellGeometry.analytics-bar-height; fraction: 0.62; }
         }
 
         GroupHeading { text: "Loading indicator"; }

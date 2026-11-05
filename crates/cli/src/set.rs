@@ -8,7 +8,9 @@
 //! `align`.
 
 use clap::Args;
-use focusforge_core::params::{self, ParamDesc, ParamValue, ParamValues, ParamViolation};
+use focusforge_core::params::{
+    self, ParamDesc, ParamKind, ParamValue, ParamValues, ParamViolation,
+};
 
 /// A repeatable `--set key=value` argument.
 ///
@@ -81,6 +83,53 @@ pub fn parse_settings(
     } else {
         Err(violations)
     }
+}
+
+/// Parses `set` against `schema` and resolves every parameter to a value,
+/// defaults included. The error is the message to print: one line per
+/// violation.
+pub(crate) fn resolve_settings(schema: &[ParamDesc], set: &SetArgs) -> Result<ParamValues, String> {
+    let explicit = parse_settings(schema, &set.set).map_err(|violations| {
+        violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+    let resolved = params::resolve_in(schema, &explicit, None, &focusforge_core::host::snapshot())
+        .map_err(|err| err.to_string())?;
+    Ok(params::resolved_values(&resolved))
+}
+
+/// One line per parameter, generated from the schema.
+pub(crate) fn parameter_help(schema: &[ParamDesc]) -> String {
+    let mut text = String::from("Parameters (--set KEY=VALUE):\n");
+    for desc in schema {
+        let default = match &desc.default {
+            ParamValue::Float(value) => value.to_string(),
+            ParamValue::Int(value) => value.to_string(),
+            ParamValue::Bool(value) => value.to_string(),
+            ParamValue::Enum(value) => value.clone(),
+        };
+        let range = match &desc.kind {
+            ParamKind::Float { min, max, .. } => format!("{min} to {max}"),
+            ParamKind::Int { min, max } => format!("{min} to {max}"),
+            ParamKind::Bool => "true or false".to_string(),
+            ParamKind::Enum { variants } => format!(
+                "one of {}",
+                variants
+                    .iter()
+                    .map(|variant| variant.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        text.push_str(&format!(
+            "  {:<14} {} (default {default}, {range})\n",
+            desc.id, desc.label
+        ));
+    }
+    text
 }
 
 /// Validates a preset's `[stack]` or `[align]` table against `schema` with
