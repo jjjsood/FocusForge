@@ -37,8 +37,8 @@
 #
 # The build lock is per target directory: checkouts with separate targets
 # build side by side. With flock, a build also takes one of FF_BUILD_SLOTS
-# machine-wide slots (default 3), and only while used RAM (MemTotal minus
-# MemAvailable) is below FF_BUILD_RAM_CAP_GB (default 50, 0 disables). The
+# machine-wide slots (default 2), and only while used RAM (MemTotal minus
+# MemAvailable) is below FF_BUILD_RAM_CAP_GB (default 40, 0 disables). The
 # native backend takes the per-target lock only.
 
 # The lock directory has to be the ONE physical location every checkout's
@@ -71,8 +71,8 @@ _lock_dir() {
 }
 
 FF_LOCK_TIMEOUT="${FF_LOCK_TIMEOUT:-1800}"
-FF_BUILD_SLOTS="${FF_BUILD_SLOTS:-3}"
-FF_BUILD_RAM_CAP_GB="${FF_BUILD_RAM_CAP_GB:-50}"
+FF_BUILD_SLOTS="${FF_BUILD_SLOTS:-2}"
+FF_BUILD_RAM_CAP_GB="${FF_BUILD_RAM_CAP_GB:-40}"
 
 # The target directory below `cargo-target/`, with `/` as `-`; empty without
 # a `target` symlink, which keeps the plain `build.lock` name.
