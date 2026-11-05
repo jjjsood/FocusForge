@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A full-canvas overlay: title and close x over a rule, the body, and a
+// footer band under a rule, drawn only while `footer-height` is above 0.
+// Children fill the body; `footer-y` and `footer-height` place the
+// caller's footer content.
+
+import { Theme } from "../theme.slint";
+import { FFIconButton } from "ff_icon_button.slint";
+
+export component FFOverlayFrame inherits Rectangle {
+    in property <string> title: "";
+    in property <length> footer-height: Theme.space-12 + Theme.space-2;
+    out property <length> header-height: Theme.space-8 + Theme.space-2;
+    out property <length> footer-y: root.height - root.footer-height;
+    callback close-requested();
+
+    background: Theme.surface-canvas;
+    clip: true;
+
+    Text {
+        x: Theme.space-4;
+        y: 0px;
+        height: root.header-height;
+        text: root.title;
+        color: Theme.text-primary;
+        font-size: Theme.text-title.size;
+        font-weight: Theme.text-title.weight;
+        vertical-alignment: center;
+    }
+    FFIconButton {
+        x: root.width - self.width - Theme.space-2;
+        y: (root.header-height - self.height) / 2;
+        icon: @image-url("../../../../assets/icons/x.svg");
+        quiet: true;
+        focusable: true;
+        name: "Close";
+        triggered => { root.close-requested(); }
+    }
+    Rectangle {
+        y: root.header-height;
+        width: 100%;
+        height: 1px;
+        background: Theme.border-default;
+    }
+    Rectangle {
+        y: root.header-height + 1px;
+        width: 100%;
+        height: root.footer-y - root.header-height - 1px;
+
+        @children
+    }
+    if root.footer-height > 0px: Rectangle {
+        y: root.footer-y;
+        width: 100%;
+        height: root.footer-height;
+        background: Theme.surface-base;
+        border-width: 1px;
+        border-color: Theme.border-default;
+    }
+}

@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A dimension span: a 1 px line with a tick at each end and a caption of
+// muted labels and primary values, centred in a gap of the line on the
+// ground it sits over, or after the span's end with `caption-outside`. With
+// no caption it is the bare span.
+
+import { Theme } from "../theme.slint";
+
+export component FFDimensionMark inherits Rectangle {
+    in property <string> label: "";
+    in property <string> value: "";
+    // A second label and value after the first pair.
+    in property <string> label2: "";
+    in property <string> value2: "";
+    in property <bool> caption-outside: false;
+    // An open bracket: the line along the top, the ticks hanging from it.
+    in property <bool> bracket: false;
+
+    height: Theme.space-4;
+
+    Rectangle {
+        y: root.bracket ? 0px : (root.height - self.height) / 2;
+        width: 100%;
+        height: 1px;
+        background: Theme.border-strong;
+    }
+    Rectangle {
+        x: 0px;
+        width: 1px;
+        height: 100%;
+        background: Theme.border-strong;
+    }
+    Rectangle {
+        x: root.width - self.width;
+        width: 1px;
+        height: 100%;
+        background: Theme.border-strong;
+    }
+    if root.label != "" || root.value != "": Rectangle {
+        x: root.caption-outside ? root.width + Theme.space-2 : (root.width - self.width) / 2;
+        width: caption.preferred-width + (root.caption-outside ? 0px : 2 * Theme.space-2);
+        height: 100%;
+        background: root.caption-outside ? transparent : Theme.surface-canvas;
+
+        caption := HorizontalLayout {
+            spacing: Theme.space-2;
+            alignment: center;
+            Text {
+                text: root.label;
+                color: Theme.text-muted;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.value;
+                color: Theme.text-primary;
+                font-size: Theme.text-value.size;
+                font-weight: Theme.text-value.weight;
+                vertical-alignment: center;
+            }
+            if root.label2 != "": Text {
+                text: root.label2;
+                color: Theme.text-muted;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                vertical-alignment: center;
+            }
+            if root.label2 != "": Text {
+                text: root.value2;
+                color: Theme.text-primary;
+                font-size: Theme.text-value.size;
+                font-weight: Theme.text-value.weight;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

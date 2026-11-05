@@ -39,7 +39,7 @@ Every stack you open becomes a [project](../glossary.md#project) in its own [tab
 project's name and, on the right, an **x** that closes it. Next to the name
 you may see:
 
-- **UNSAVED** — the project holds something that is not yet written to a
+- **UNSAVED** — the project holds something that is not written to a
   project file. See [Checkpoints and saving](history.md).
 - A small **play** mark while that tab's stack is being fused, and a
   **…** mark while it waits in line behind another tab's run. The
@@ -322,7 +322,7 @@ A few keys are fixed and work anywhere in the window:
 | Ctrl + O | Open a project file |
 | Ctrl + S | Save the project |
 | Ctrl + W | Close the project in the active tab |
-| Escape | Closes the dialog in front, otherwise the projects overview, and closes the settings window |
+| Escape | Closes the dialog in front, otherwise the projects overview, the step calculator or Analytics, and closes the settings window |
 | Up / Down | Select the previous / next frame, when the frame list has the keyboard focus (click a row first) |
 
 While the settings window is open, the main window behind it does not react
@@ -332,6 +332,77 @@ to clicks or zoom; close the settings window first.
 > blends a brush stroke. While you pan, zoom or paint, a running fuse briefly
 > slows down so the view stays smooth, and picks up speed again a quarter of
 > a second after you stop.
+
+## Plan a stack with the step calculator
+
+The **Step calculator** button at the top of the icon bar, on the left edge
+of the window, opens the calculator over the canvas. It works with or
+without a project. The toolbar, the dock and the bottom bar stay visible.
+
+![The Step calculator overlay: an Optics switch, five boxes around a camera and a mantis, and the SUMMARY band below.](../assets/manual/window/step-calculator.png)
+
+*The Step calculator with its default values.*
+
+The **Optics** switch at the top left chooses what the lens is described by:
+**Lens (f-stop)** or **Objective (NA)**. The boxes on the illustration take
+the values of your setup:
+
+- **Time per frame (s)**
+- **Magnification (x)**, hidden while **Objective (NA)** is chosen
+- **f-stop**, or the numerical aperture with **Objective (NA)**
+- **Overlap (fraction of the depth of field)**
+- **Depth range (mm)**
+
+The plan updates on every keystroke. A comma works as the decimal point. To
+replace a value, clear the box first, then type the new one. A box holding
+a value that is out of range or is not a number shows a line of text under
+it. The calculated values keep the last valid plan until the box is fixed.
+
+The **SUMMARY** band repeats the plan in two rows. **ENTERED** lists your
+values. **CALCULATED** lists the numerical aperture (with the lens only),
+the depth of field, the step between frames, the number of frames and the
+total duration of the shoot.
+
+To close the calculator, click the **Step calculator** button again, click
+**Close** at the top right of the overlay, or press Escape. Only one
+full-canvas overlay is open at a time: opening the projects overview, the
+notification center or Analytics closes the calculator.
+
+## Count the sharp areas of each frame
+
+The **Analytics** button sits under the **Step calculator** button in the
+icon bar. It is dimmed while no project is selected. It opens Analytics
+over the canvas for the frames of the selected tab.
+
+![The Analytics overlay: eight rows from 00.tif to 07.tif, each with a coloured chip, a bar and a count.](../assets/manual/window/analytics.png)
+
+*Analytics for the eight frames of the mantis stack.*
+
+The heading **SHARP AREAS PER IMAGE** is followed by the line "Image areas
+that are sharpest in this image". Each frame has one row, in the order of
+the frame list (excluded frames are listed too):
+
+- the frame's colour chip,
+- its file name,
+- a bar, as long as the frame's count compared with the largest count; all
+  bars stay empty when every count is 0,
+- the count itself: the number of image areas where this frame is the
+  sharpest.
+
+While the counting runs, the overlay shows "Counting sharp areas..." and no
+rows. Selecting another tab starts a new count, and closing the overlay
+stops it.
+
+To close Analytics, click the **Analytics** button again, click **Close**
+at the top right of the overlay, or press Escape. As with the step
+calculator, opening another full-canvas overlay closes it.
+
+To open Analytics when the program starts, add `--analytics` to the folder
+you open:
+
+```bash
+focusforge-gui --open <folder> --analytics
+```
 
 ## Where to find the rest
 
