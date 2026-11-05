@@ -130,11 +130,12 @@ per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 
 ## Documentation
 
-See [`docs/`](docs/README.md) for [getting started](docs/getting-started.md)
-and the guides (the window, stacking, alignment, retouching, checkpoint
-history, batch runs, diagnostics) and the
-reference for every `focusforge-cli` subcommand, the project format and the
-TIFF layouts it reads and writes.
+The user manual is an mdBook whose source is in [`docs/`](docs/README.md). It
+covers focus stacking and shooting practice, [getting started](docs/getting-started.md),
+the window, stacking, alignment, retouching, checkpoints, export and
+settings, troubleshooting and a glossary. The appendix is the reference for
+every `focusforge-cli` subcommand, the project format and the TIFF layouts it
+reads and writes.
 
 ## Contributing
 
