@@ -1,0 +1,121 @@
+# Projects, notifications and quitting (docs/guide/batch-runs.md).
+# The crash shot copies seeds/crash-record (one panic report under
+# focusforge/crashes/) into its own scratch data folder; no other shot sees it.
+
+[[shot]]
+name  = "projects-overview"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp", "--open", "fixtures/mantis-512/frames", "--projects-overlay"]
+steps = [
+  ["wait-text", "2 open", "120"],
+  ["wait-text", "8 frames · 1 checkpoint", "60"],
+  ["wait-text", "8 frames · no checkpoint yet", "60"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/projects/overview.png"
+
+[[shot]]
+name  = "projects-two-stacks"
+args  = ["--open", "fixtures/open-two-stacks"]
+steps = [
+  ["wait-id", "FFGroupingQuestion::many-button", "120"],
+  ["click-id", "FFGroupingQuestion::many-button"],
+  ["wait-text", "3 frames · 0 excluded", "60"],
+  ["click-id", "FFTabStrip::projects-button"],
+  ["wait-text", "2 open", "30"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/projects/two-stacks.png"
+crop  = "FFProjectsGallery::cards-layer"
+pad   = 16
+
+[[shot]]
+name  = "projects-failure-cards"
+args  = ["--open", "fixtures/open-rejected", "--open", "fixtures/open-root-and-subfolder", "--open", "fixtures/projects/missing.ffp", "--fuse-tabs", "0"]
+steps = [
+  ["wait-id", "AppWindow::sources-missing-dialog", "120"],
+  ["click-label", "Close dialog", "AppWindow::sources-missing-dialog"],
+  ["wait-gone", "AppWindow::sources-missing-dialog", "10"],
+  ["wait-text", "Failed", "120"],
+  ["click-id", "FFTabStrip::projects-button"],
+  ["wait-text", "4 · 1 did not open", "30"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/projects/failure-cards.png"
+crop  = "FFProjectsGallery::cards-layer"
+pad   = 16
+
+[[shot]]
+name  = "projects-cancelled"
+args  = ["--open", "fixtures/mantis-512/frames", "--fuse-tabs", "0", "--slow-run", "1"]
+steps = [
+  ["wait-id", "FFToolbar::cancel-button", "120"],
+  ["wait-text", "Fusing", "600"],
+  ["click-id", "FFToolbar::cancel-button"],
+  ["wait-id", "FFToolbar::fuse-button", "60"],
+  ["click-id", "FFTabStrip::projects-button"],
+  ["wait-text", "You stopped this one. Nothing was written.", "30"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/projects/cancelled.png"
+crop  = "FFProjectCard::body:0"
+pad   = 16
+
+[[shot]]
+name  = "notify-center"
+args  = ["--open", "fixtures/open-root-and-subfolder", "--open", "fixtures/open-rejected", "--fuse-tabs", "1"]
+steps = [
+  ["wait-text", "Failed", "120"],
+  ["click-id", "FFIconBar::bell"],
+  ["wait-id", "AppWindow::notification-center", "10"],
+  ["wait-text", "2 notifications · this session", "10"],
+  ["click-id", "FFNotificationRow::card", "0"],
+  ["pause", "800"],
+]
+out   = "assets/manual/notifications/center.png"
+crop  = "AppWindow::notification-center"
+
+[[shot]]
+name  = "notify-crash"
+args  = ["--open", "fixtures/mantis-512/frames"]
+data_seed = "seeds/crash-record"
+steps = [
+  ["wait-id", "FFToolbar::fuse-button", "120"],
+  ["click-id", "FFIconBar::bell"],
+  ["wait-id", "AppWindow::notification-center", "10"],
+  ["wait-text", "Previous session stopped", "10"],
+  ["click-id", "FFNotificationRow::card", "0"],
+  ["wait-text", "Acknowledge", "10"],
+  ["pause", "800"],
+]
+out   = "assets/manual/notifications/crash-notice.png"
+crop  = "FFNotificationRow::card:0"
+pad   = 16
+
+[[shot]]
+name  = "quit-close-tab"
+args  = ["--open", "fixtures/mantis-64/frames", "--fuse-tabs", "0", "--request-close"]
+steps = [
+  ["wait-id", "AppWindow::divergence-warning", "300"],
+  ["click-label", "Keep", "AppWindow::divergence-warning"],
+  ["wait-id", "AppWindow::close-guard", "60"],
+  ["wait-text", "Save this state first?", "10"],
+  ["pause", "800"],
+]
+out   = "assets/manual/close-and-quit/close-tab.png"
+crop  = "FFModalPanel::panel"
+pad   = 16
+
+[[shot]]
+name  = "quit-quit-question"
+args  = ["--open", "fixtures/mantis-512/frames", "--open", "fixtures/mantis-64/frames", "--fuse-tabs", "0,1", "--request-quit"]
+steps = [
+  ["wait-id", "AppWindow::divergence-warning", "900"],
+  ["wait-text", "00.tif and 02.tif could not be aligned", "60"],
+  ["click-label", "Keep", "AppWindow::divergence-warning"],
+  ["wait-id", "AppWindow::close-guard", "60"],
+  ["wait-text", "2 projects have unsaved work.", "10"],
+  ["pause", "800"],
+]
+out   = "assets/manual/close-and-quit/quit-question.png"
+crop  = "FFModalPanel::panel"
+pad   = 16

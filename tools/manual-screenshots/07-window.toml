@@ -1,0 +1,207 @@
+# The window (tour, navigation) and the Images panel.
+# Presentation seeds live next to this file in seeds/appearance/ (list.toml, large.toml).
+# A fresh settings folder shows Image list, so that presentation needs no seed.
+
+# ---------------------------------------------------------------- the window
+
+# Two tabs: the fused seed project (active) and mantis-512 freshly opened.
+[[shot]]
+name  = "window-tour"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp", "--open", "fixtures/mantis-512/frames"]
+steps = [
+  ["wait-text", "mantis-512-fused", "120"],
+  ["wait-text", "UNSAVED", "120"],
+  ["click-id", "FFTab::area", "0"],
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFImageRow::area", "2"],
+  ["wait-text", "02.tif"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/window/window-tour.png"
+
+[[shot]]
+name  = "window-dock"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["wait-text", "8 frames · 0 excluded", "60"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/window/window-dock.png"
+crop  = "AppWindow::dock"
+
+# The bottom bar while a run is live (the slow run keeps it live long enough).
+[[shot]]
+name  = "window-bottom-bar"
+args  = ["--open", "fixtures/mantis-512/frames", "--fuse-tabs", "0", "--slow-run", "1"]
+steps = [
+  ["wait-text", "ETA", "240"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/window/window-bottom-bar.png"
+crop  = "AppWindow::bottom-bar"
+
+# Both panes at 300 %: Fit, then three Zoom in steps (126.6 % -> 150 -> 200 -> 300).
+[[shot]]
+name  = "window-zoomed"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+config = "seeds/appearance/list.toml"
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFImageRow::area", "3"],
+  ["wait-text", "03.tif"],
+  ["click-id", "FFZoomCluster::zoom-fit"],
+  ["click-id", "FFZoomCluster::zoom-in"],
+  ["click-id", "FFZoomCluster::zoom-in"],
+  ["click-id", "FFZoomCluster::zoom-in"],
+  ["wait-text", "300 %"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/window/window-zoomed.png"
+crop  = "AppWindow::canvas"
+
+# The Z-Map overlay switched on at its starting strength (65 %).
+[[shot]]
+name  = "window-overlay"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["pause", "1500"],
+  ["click-id", "FFToggle::area", "0"],
+  ["wait-text", "65%"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/window/window-overlay.png"
+crop  = "AppWindow::canvas"
+
+# The Frame pane moved into its own window: the main window keeps Composite.
+[[shot]]
+name  = "window-undocked-main"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp", "--undock-pane", "frame"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["wait-windows", "2", "30"],
+  ["pause", "2500"],
+]
+out   = "assets/manual/window/window-undocked-main.png"
+crop  = "AppWindow::canvas"
+
+[[shot]]
+name  = "window-undocked-second"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp", "--undock-pane", "frame"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["wait-windows", "2", "30"],
+  ["pause", "2500"],
+]
+out   = "assets/manual/window/window-undocked-second.png"
+window = 1
+
+# ---------------------------------------------------------------- the Images panel
+
+# List, with 03.tif excluded and the pointer still on its row (eye and trash showing).
+[[shot]]
+name  = "images-list"
+args  = ["--open", "fixtures/mantis-512/frames"]
+size  = "1280x600"
+config = "seeds/appearance/list.toml"
+steps = [
+  ["wait-text", "8 frames · 0 excluded", "120"],
+  ["click-id", "FFImageRow::area", "3"],
+  ["wait-id", "FFImageRow::list-exclude-button"],
+  ["click-id", "FFImageRow::list-exclude-button", "0"],
+  ["wait-text", "8 frames · 1 excluded"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/images-panel/images-list.png"
+crop  = "FFDock::images-panel"
+pad   = 6
+
+[[shot]]
+name  = "images-image-list"
+args  = ["--open", "fixtures/mantis-512/frames"]
+steps = [
+  ["wait-text", "8 frames · 0 excluded", "120"],
+  ["click-id", "FFImageRow::area", "1"],
+  ["wait-id", "FFImageRow::image-list-exclude-button"],
+  ["pause", "2500"],
+]
+out   = "assets/manual/images-panel/images-image-list.png"
+crop  = "FFDock::images-panel"
+pad   = 6
+
+[[shot]]
+name  = "images-large"
+args  = ["--open", "fixtures/mantis-512/frames"]
+config = "seeds/appearance/large.toml"
+steps = [
+  ["wait-text", "8 frames · 0 excluded", "120"],
+  ["pause", "3000"],
+]
+out   = "assets/manual/images-panel/images-large.png"
+crop  = "FFDock::images-panel"
+pad   = 6
+
+# The sort menu after choosing Name once: the check mark sits on Name.
+[[shot]]
+name  = "images-sort-menu"
+args  = ["--open", "fixtures/mantis-512/frames"]
+size  = "1280x600"
+config = "seeds/appearance/list.toml"
+steps = [
+  ["wait-text", "8 frames · 0 excluded", "120"],
+  ["click-id", "FFImagesPanel::sort-button"],
+  ["wait-id", "FFMenuList::option-area"],
+  ["click-id", "FFMenuList::option-area", "0"],
+  ["wait-gone", "FFMenuList::option-area", "10"],
+  ["click-id", "FFImagesPanel::sort-button"],
+  ["wait-id", "FFMenuList::option-area"],
+  ["pause", "800"],
+]
+out   = "assets/manual/images-panel/images-sort-menu.png"
+crop  = "FFDock::images-panel"
+pad   = 6
+
+# Removing a frame from a project that already holds a checkpoint.
+[[shot]]
+name  = "images-remove-warning"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["wait-text", "8 frames · 0 excluded", "60"],
+  ["click-id", "FFImageRow::area", "1"],
+  ["wait-id", "FFImageRow::image-list-remove-button"],
+  ["click-id", "FFImageRow::image-list-remove-button", "0"],
+  ["wait-text", "Remove and fuse again?"],
+  ["pause", "800"],
+]
+out   = "assets/manual/images-panel/images-remove-warning.png"
+crop  = "FFModalPanel::panel"
+
+# The editor's read-only legend (List presentation: numbers instead of times).
+[[shot]]
+name  = "images-editor-legend"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+config = "seeds/appearance/list.toml"
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFImageRow::area", "4"],
+  ["wait-text", "04.tif"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/images-panel/images-editor-legend.png"
+crop  = "AppWindow::dock"
+
+# The dock while the tab's own run is live: dimmed, no add or sort icon.
+[[shot]]
+name  = "images-running"
+args  = ["--open", "fixtures/mantis-512/frames", "--fuse-tabs", "0", "--slow-run", "1"]
+config = "seeds/appearance/list.toml"
+steps = [
+  ["wait-text", "Pause", "240"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/images-panel/images-running.png"
+crop  = "AppWindow::dock"

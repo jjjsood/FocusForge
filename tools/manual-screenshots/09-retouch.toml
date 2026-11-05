@@ -1,0 +1,223 @@
+# Retouching, checkpoints and saving, exporting an image.
+# Every shot opens the fused seed project and changes nothing on disk:
+# strokes and checkpoints stay held in the tab, exports go to the scratch save folder.
+
+# ---------------------------------------------------------------- retouch
+
+[[shot]]
+name  = "retouch-editor"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/retouch/retouch-editor.png"
+
+[[shot]]
+name  = "retouch-source-list"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFImageRow::area", "2"],
+  ["wait-text", "02.tif"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/retouch/retouch-source-list.png"
+crop  = "FFDock::images-panel"
+pad   = 4
+
+[[shot]]
+name  = "retouch-toolbar"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["pause", "1000"],
+]
+out   = "assets/manual/retouch/retouch-toolbar.png"
+crop  = "AppWindow::editor-toolbar"
+pad   = 0
+
+[[shot]]
+name  = "retouch-stroke"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFToggle::area", "0"],
+  ["click-id", "FFImageRow::area", "1"],
+  ["pause", "500"],
+  ["drag-id", "FFCanvas::pane-right", "830", "470"],
+  ["pause", "1500"],
+]
+out   = "assets/manual/retouch/retouch-stroke.png"
+crop  = "AppWindow::canvas"
+pad   = 0
+
+# ------------------------------------------------------------ checkpoints
+
+[[shot]]
+name  = "checkpoints-list"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFImageRow::area", "2"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["pause", "800"],
+  ["click-label", "Save checkpoint", "AppWindow::editor-toolbar"],
+  ["wait-id", "FFCheckpointRow::area", "10"],
+  ["pause", "1500"],
+  ["click-id", "FFCheckpointRow::area", "0"],
+  ["wait-id", "FFCheckpointRow::trash", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/checkpoints/checkpoints-list.png"
+crop  = "FFDock::checkpoint-panel"
+pad   = 4
+
+[[shot]]
+name  = "checkpoints-unsaved"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["wait-text", "UNSAVED", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/checkpoints/checkpoints-unsaved.png"
+crop  = "FFTabStrip::tabs-row"
+pad   = 6
+
+[[shot]]
+name  = "checkpoints-fuse-question"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["pause", "800"],
+  ["click-id", "FFModeSwitch::stacking-half"],
+  ["wait-id", "FFToolbar::fuse-button", "10"],
+  ["click-id", "FFToolbar::fuse-button"],
+  ["wait-text", "Save your edits first?", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/checkpoints/checkpoints-fuse-question.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "checkpoints-restore-question"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["pause", "800"],
+  ["click-label", "Save checkpoint", "AppWindow::editor-toolbar"],
+  ["pause", "800"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["pause", "800"],
+  ["click-id", "FFCheckpointRow::area", "1"],
+  ["wait-text", "Save this state first?", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/checkpoints/checkpoints-restore-question.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "checkpoints-delete-question"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFModeSwitch::editor-half"],
+  ["wait-text", "Soft", "30"],
+  ["click-id", "FFCanvas::pane-right"],
+  ["pause", "800"],
+  ["click-label", "Save checkpoint", "AppWindow::editor-toolbar"],
+  ["pause", "800"],
+  ["click-id", "FFCheckpointRow::area", "0"],
+  ["wait-id", "FFCheckpointRow::trash", "10"],
+  ["click-id", "FFCheckpointRow::trash"],
+  ["wait-id", "AppWindow::checkpoint-delete", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/checkpoints/checkpoints-delete-question.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+# ----------------------------------------------------------------- export
+
+[[shot]]
+name  = "export-tiff"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFCheckpointPanel::checkpoint-export"],
+  ["wait-id", "AppWindow::export-dialog", "10"],
+  ["wait-text", "TIFF SETTINGS", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/export/export-tiff.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "export-png"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFCheckpointPanel::checkpoint-export"],
+  ["wait-id", "AppWindow::export-dialog", "10"],
+  ["click-id", "FFSegmented::segment", "1"],
+  ["wait-text", "PNG SETTINGS", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/export/export-png.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "export-jpeg"
+args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp"]
+steps = [
+  ["wait-text", "Details", "60"],
+  ["click-id", "FFCheckpointPanel::checkpoint-export"],
+  ["wait-id", "AppWindow::export-dialog", "10"],
+  ["click-id", "FFSegmented::segment", "2"],
+  ["wait-text", "JPEG SETTINGS", "10"],
+  ["pause", "500"],
+]
+out   = "assets/manual/export/export-jpeg.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "export-writing"
+args  = ["--export-dialog-preview", "writing"]
+steps = [["wait-text", "Writing image", "30"], ["pause", "800"]]
+out   = "assets/manual/export/export-writing.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "export-refused"
+args  = ["--export-dialog-preview", "refused"]
+steps = [["wait-text", "Can't export this position", "30"], ["pause", "800"]]
+out   = "assets/manual/export/export-refused.png"
+crop  = "FFModalPanel::panel"
+pad   = 8

@@ -26,6 +26,8 @@
 # `build`'s GPU-enabled binary is written last, the one later stages use.
 # Cargo and direct binary runs go through tools/with-lock.sh build; clippy
 # stays out of --static because it compiles; RUSTFLAGS is never set here.
+# `manual book` (mdBook build plus link check) runs only when mdbook is on PATH;
+# otherwise it prints a SKIP line.
 #
 # Exit code: 0 all gates passed, 1 at least one failed.
 set -uo pipefail  # deliberately not -e: every gate runs, then the summary
@@ -107,6 +109,19 @@ test_tmp_residue() {
   return 1
 }
 
+# The manual build, as book.yml runs it: any mdBook warning fails, then every
+# relative link and anchor in the output is checked. Writes book/ (not committed).
+manual_book() {
+  local out
+  out="$(mdbook build 2>&1)" || { echo "$out"; return 1; }
+  echo "$out"
+  if grep -qE '(WARN|ERROR)' <<<"$out"; then
+    echo "mdBook reported warnings or errors" >&2
+    return 1
+  fi
+  python3 -I tools/check-book-links.py book
+}
+
 # --- static checks: seconds each, no side effects ---------------------------
 run_gate "rustfmt"          cargo fmt --all --check
 run_gate "licenses"         tools/check-licenses.sh
@@ -127,6 +142,9 @@ run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
 run_gate "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 run_gate "test bodies selftest" python3 tools/check-test-bodies.py --selftest
+run_gate "manual screenshot lists" python3 tools/manual-screenshots.py --selftest
+run_gate "manual coverage" python3 tools/check-manual-coverage.py
+run_gate "manual coverage selftest" python3 tools/check-manual-coverage.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
@@ -200,6 +218,14 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # that can turn red without this repository changing, so it must not be able
   # to block a commit through the pre-commit hook.
   [ "$QUICK" -eq 1 ] || run_gate "advisories"     tools/check-licenses.sh --advisories
+
+  # Needs the mdbook pinned in .github/workflows/book.yml; without it the book
+  # job in CI is the only check.
+  if command -v mdbook >/dev/null 2>&1; then
+    run_gate "manual book"  manual_book
+  else
+    echo "SKIP manual book: mdbook not on PATH (see MDBOOK_VERSION in .github/workflows/book.yml)"
+  fi
 
   runlog_join || true
 fi

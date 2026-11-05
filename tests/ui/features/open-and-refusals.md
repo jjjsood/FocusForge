@@ -21,3 +21,4 @@ Gotchas:
 Needs (not yet in `fixtures/`):
 - Crash record: the launcher sets `FOCUSFORGE_DATA_DIR=<scratch>` (the app reads `<scratch>/focusforge/crashes/`) with one file `20260918T010203Z-focusforge-7.json` holding `{"format":1,"payload":"boom"}` and no `.reported` marker, as a copy per run: **Acknowledge** in the notification center writes `<stem>.reported` beside it, so the checked-in seed must not be the folder used. Every other run needs `FOCUSFORGE_DATA_DIR` pointing at an empty scratch folder, else a real crash left on the machine raises the crash record over it. Unlocks: **Diagnostics** on the record opens "Settings" on Diagnostics with the label "Save to".
 Guides: 12-open-and-refusals.md, 16-project-and-folder-refusals.md
+Book: guide/first-stack.md#when-a-folder-or-project-will-not-open, guide/first-stack.md#damaged-or-moved-projects
