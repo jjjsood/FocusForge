@@ -10,6 +10,8 @@ TMP="$(cd -P "$(mktemp -d)" && pwd)"
 trap 'rm -rf "$TMP"' EXIT
 
 FAIL=0
+# The host's real RAM use must not queue these cases; exercise_build_slots fakes it.
+export FF_BUILD_RAM_CAP_GB=0
 
 lock_dir() {
   local checkout="$1"
@@ -390,8 +392,28 @@ exercise_live_holder_timeout() {
   reap_holder "$holder"
 }
 
+# Separate targets build side by side; the slot cap and the RAM cap still queue them.
+exercise_build_slots() {
+  local pool="$TMP/slot pool" ready="$TMP/slot-ready" meminfo="$TMP/meminfo" holder
+  mkdir -p "$pool/a" "$pool/b"
+  make_link "$pool/a" "$pool/cargo-target/a"
+  make_link "$pool/b" "$pool/cargo-target/b"
+  run_lock "$pool/a" flock 5 build -- sh -c 'printf held >"$1"; sleep 1' sh "$ready" >/dev/null 2>&1 &
+  holder=$!
+  require_ready "slot holder" "$holder" "$ready" || { reap_holder "$holder"; return; }
+  expect_status "separate target builds alongside" 0 run_lock "$pool/b" flock 0 build -- true
+  FF_BUILD_SLOTS=1 expect_status "slot cap queues separate target" 4 run_lock "$pool/b" flock 0 build -- true
+  wait "$holder"
+  printf 'MemTotal: %s kB\nMemAvailable: %s kB\n' 62914560 10485760 >"$meminfo"
+  FF_LOCK_MEMINFO="$meminfo" FF_BUILD_RAM_CAP_GB=50 \
+    expect_status "RAM cap queues build" 4 run_lock "$pool/b" flock 0 build -- true
+  FF_LOCK_MEMINFO="$meminfo" FF_BUILD_RAM_CAP_GB=51 \
+    expect_status "RAM below cap builds" 0 run_lock "$pool/b" flock 0 build -- true
+}
+
 if command -v flock >/dev/null 2>&1; then
   exercise_backend flock
+  exercise_build_slots
 fi
 if [ ! -x "$REPO/tools/lib/native-lock.py" ]; then
   echo "FAIL [native helper]: tools/lib/native-lock.py is not executable" >&2
