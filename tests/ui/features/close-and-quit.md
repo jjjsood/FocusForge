@@ -6,3 +6,4 @@ Gotchas: `--request-close` acts on the active tab (the last index in `--fuse-tab
 Escape: pressing Escape while a close question (`AppWindow::close-guard`) is open dismisses it as **Cancel** does: the window and the tabs stay (06 step 11). No click is needed before the `Press Escape` step.
 Corner control: Every modal dialog except "Keep this fused result?" and the refusal dialog (`AppWindow::refusal-dialog`, titled "This project cannot be opened", "No frames here" or "These are not the project's frames") also has a **Close dialog** icon button (`FFIconButton`) at its top-right corner that does what the dialog's own Cancel (or Close) does; click it by that label within the dialog's id (`click "Close dialog" AppWindow::close-guard`); a footer button named "Close" is a different element.
 Guides: 06-close-quit.md
+Book: guide/batch-runs.md#close-a-project, guide/batch-runs.md#quit-focusforge

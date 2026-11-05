@@ -143,6 +143,8 @@ run_gate "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 run_gate "test bodies selftest" python3 tools/check-test-bodies.py --selftest
 run_gate "manual screenshot lists" python3 tools/manual-screenshots.py --selftest
+run_gate "manual coverage" python3 tools/check-manual-coverage.py
+run_gate "manual coverage selftest" python3 tools/check-manual-coverage.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.

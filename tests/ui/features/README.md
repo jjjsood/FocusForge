@@ -17,6 +17,8 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [open-and-refusals](open-and-refusals.md) | 12, 16 | RAW folder, compressed TIFF variants, empty start, not-a-project, mismatch and missing-frames projects, grouping question, skipped subfolder, failed fuse |
 | [notifications](notifications.md) | 15 | bell and unread count, notification center, toasts, crash record |
 
+Each feature file carries a `Book:` line after `Guides:`: the manual sections (`page.md#anchor` under `docs/`) that show the feature, each holding an image. `tools/check-manual-coverage.py` checks it.
+
 ## Human only
 
 Races against a running fuse (pause, resume, cancel, queued tab, controls inert while running: journey 02 steps 17-25, journey 09 steps 2-5) are driven: `--slow-run N` holds the Nth run of the launch in its running state for `--slow-run-seconds` (default 150 s). Key presses, typed text, hover and clicks in a second window are driven steps (`Press`, `Type`, `Hover`, `--window N`). Native dialogs (Open folder, + add frames, Save choosers), wheel and pan, pixel judgements, window manager moves, spinner motion and what needs the window's own keyboard focus (toasts, `manual/15-toasts-and-crash-record.md`) are `(human only)` steps, or listed in the feature's Gotchas when no journey can reach them. The pictures a running fuse draws in the Composite pane (the aligned frame, the result growing tile by tile with its sharpness inset, the growth over a kept composite) pass in seconds and are `(human only)` steps (journey 20 steps 3, 14 and 22). The crash-record steps (`manual/15-toasts-and-crash-record.md`) stay human only too: they need a crash report seeded into the data folder before launch.

@@ -51,7 +51,9 @@ def book_errors(text: str) -> list[str]:
     if not re.search(r"^permissions:\n  contents: read\n", text, re.M):
         found.append("book: top-level permissions must be contents: read")
     for required in ("if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
-                     "python3 -I tools/check-book-links.py"):
+                     "python3 -I tools/check-book-links.py",
+                     "python3 -I tools/manual-screenshots.py --selftest",
+                     "python3 -I tools/check-manual-coverage.py"):
         if required not in text:
             found.append(f"book: missing {required!r}")
     for uses in re.findall(r"^\s*-?\s*uses:\s*(\S+)", text, re.M):
@@ -95,7 +97,9 @@ def main() -> int:
     for label, bad in (("book mutable action", book.replace("@fc324d3547104276b827a68afc52ff2a11cc49c9", "@v5")),
                        ("book unverified download", book.replace("sha256sum --check --strict", "true")),
                        ("book permissions", book.replace("permissions:\n  contents: read\n\nconcurrency", "concurrency")),
-                       ("book tag trigger", book.replace("    branches:\n      - '**'\n", ""))):
+                       ("book tag trigger", book.replace("    branches:\n      - '**'\n", "")),
+                       ("book without screenshot lists", book.replace("python3 -I tools/manual-screenshots.py --selftest", "true")),
+                       ("book without feature coverage", book.replace("python3 -I tools/check-manual-coverage.py", "true"))):
         expect_rejected(label, bad, book_errors)
     print("OK: workflow keeps one pinned canonical gate and narrow diagnostics")
     return 0

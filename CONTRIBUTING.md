@@ -237,6 +237,8 @@ Pages from `main`. To build it locally, fetch the same mdBook release the
 workflow pins (checking its SHA-256), run `mdbook build` from the repository
 root and check the links with `python3 -I tools/check-book-links.py book`.
 
+Each feature file in `tests/ui/features/` has a `Book:` line naming the manual sections that show the feature; `python3 tools/check-manual-coverage.py` fails when one is missing, has no image, or points at a renamed heading.
+
 Every image in `docs/assets/manual/` is generated, never hand-taken:
 
 - Window screenshots: `python3 tools/manual-screenshots.py run` drives the
