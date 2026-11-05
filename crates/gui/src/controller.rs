@@ -168,6 +168,7 @@ pub struct StorageView {
 
 /// Shown while a run is live and the clear is refused.
 const STORAGE_REFUSAL: &str = "A run is active.";
+const BUILT_IN_BINDINGS_LINE: &str = "Built-in bindings.";
 
 /// An error's text without a trailing ` (os error N)` and a closing period,
 /// so a line built from it ends in exactly one period.
@@ -3093,7 +3094,7 @@ impl AppController {
         problems: &[crate::input_config::ConfigError],
     ) {
         let line = match provenance {
-            crate::input_config::Provenance::Defaults => "Built-in bindings.".to_string(),
+            crate::input_config::Provenance::Defaults => BUILT_IN_BINDINGS_LINE.to_string(),
             crate::input_config::Provenance::File { path, overridden } => {
                 let differ = match overridden {
                     1 => "1 binding differs".to_string(),
@@ -4175,7 +4176,7 @@ impl AppController {
             .input
             .source
             .clone()
-            .unwrap_or_else(|| ("Built-in bindings.".to_string(), Vec::new()))
+            .unwrap_or_else(|| (BUILT_IN_BINDINGS_LINE.to_string(), Vec::new()))
     }
 
     pub fn open_settings(&mut self) -> bool {
