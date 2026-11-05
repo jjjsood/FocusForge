@@ -2,10 +2,14 @@
 
 //! Decides whether a newer final release than the running one exists.
 //!
-//! The release answer arrives through [`ReleaseSource`]; this module does no
-//! network I/O itself.
+//! The release answer arrives through [`ReleaseSource`]; the check itself does
+//! no network I/O. [`HttpReleaseSource`] is the HTTPS source.
+
+mod http;
 
 use semver::Version;
+
+pub use http::{HttpReleaseSource, RELEASE_URL};
 
 /// Supplies the body of the latest-release answer (one GitHub release object).
 pub trait ReleaseSource {

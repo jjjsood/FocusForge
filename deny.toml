@@ -55,6 +55,13 @@ allow = ["LGPL-2.1"]
 name = "jpeg-encoder"
 allow = ["IJG"]
 
+# Certificate data of the update check's HTTPS client, under a permissive data
+# licence with no copyleft and no restriction on combining, so it is
+# GPL-compatible.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 # Reached only through Slint; no fixed version exists. Revisit on a Slint bump.
 [advisories]
 ignore = [
