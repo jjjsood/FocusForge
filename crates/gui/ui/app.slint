@@ -353,22 +353,8 @@ export component AppWindow inherits Window {
         height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
             - ShellGeometry.bottom-bar-height;
 
-        // `reject` so the chrome accelerators still reach the parent;
-        // `key-pressed` auto-repeats while a key is held, which
-        // `AppController::set_space_held`'s idempotence absorbs.
-        key-pressed(event) => {
-            if event.text == Key.Escape && root.dismiss-front-dialog() {
-                return accept;
-            }
-            root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
-                event.modifiers.alt);
-            reject
-        }
-        key-released(event) => {
-            root.canvas-key-released(event.text, event.modifiers.control, event.modifiers.shift,
-                event.modifiers.alt);
-            reject
-        }
+        key-pressed(event) => { return root.window-key-pressed(event); }
+        key-released(event) => { return root.window-key-released(event); }
         focus-changed-event(reason) => { root.canvas-focus-changed(); }
 
         canvas := FFCanvas {
@@ -571,6 +557,8 @@ export component AppWindow inherits Window {
         images-sort-selected(picked) => { root.images-sort-selected(picked); }
         images-frame-selected(i) => { root.images-frame-selected(i); }
         images-frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
+        images-other-key-pressed(event) => { return root.window-key-pressed(event); }
+        images-other-key-released(event) => { return root.window-key-released(event); }
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
@@ -1059,6 +1047,25 @@ export component AppWindow inherits Window {
         if !root.calculator-open {
             root.return-focus-to-canvas();
         }
+    }
+
+    // The window's key handling for the canvas and for every focus holder
+    // that rejects a key. `reject` so the chrome accelerators still reach the
+    // parent; `key-pressed` auto-repeats while a key is held, which
+    // `AppController::set_space_held`'s idempotence absorbs.
+    function window-key-pressed(event: KeyEvent) -> EventResult {
+        if event.text == Key.Escape && root.dismiss-front-dialog() {
+            return accept;
+        }
+        root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
+            event.modifiers.alt);
+        return reject;
+    }
+
+    function window-key-released(event: KeyEvent) -> EventResult {
+        root.canvas-key-released(event.text, event.modifiers.control, event.modifiers.shift,
+            event.modifiers.alt);
+        return reject;
     }
 
     // Raises the cancel of the front-most dialog, in paint order, and

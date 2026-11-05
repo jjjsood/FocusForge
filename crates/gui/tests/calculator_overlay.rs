@@ -642,3 +642,20 @@ fn tab_and_plus_clicks_start_no_window_move() {
         );
     }
 }
+
+#[test]
+fn escape_closes_after_an_image_row_click() {
+    for row in 0..2 {
+        let rig = two_stack_rig("calculator_escape_row");
+        rig.click(&common::image_row(&rig.app, row));
+        rig.click(&rig.button("Step calculator"));
+        assert!(
+            rig.open() && rig.app.get_calculator_open(),
+            "row {row}: opens"
+        );
+
+        rig.escape();
+        assert!(!rig.open(), "row {row}: Escape closes it");
+        assert!(!rig.app.get_calculator_open(), "row {row}: button plain");
+    }
+}

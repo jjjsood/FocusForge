@@ -99,10 +99,24 @@ impl Rig {
         found.remove(0)
     }
 
+    fn press(&self, key: slint::SharedString) {
+        self.event(WindowEvent::KeyPressed { text: key.clone() });
+        self.event(WindowEvent::KeyReleased { text: key });
+        self.pump();
+    }
+
     fn escape(&self) {
-        let text: slint::SharedString = Key::Escape.into();
-        self.event(WindowEvent::KeyPressed { text: text.clone() });
-        self.event(WindowEvent::KeyReleased { text });
+        self.press(Key::Escape.into());
+    }
+
+    /// `key` pressed and released while Control is held.
+    fn chord(&self, key: &str) {
+        let control: slint::SharedString = Key::Control.into();
+        self.event(WindowEvent::KeyPressed {
+            text: control.clone(),
+        });
+        self.press(key.into());
+        self.event(WindowEvent::KeyReleased { text: control });
         self.pump();
     }
 
@@ -599,4 +613,95 @@ fn escape_closes_after_a_tab_click() {
             assert!(!rig.app.get_analytics_open(), "{at}: button plain");
         }
     }
+}
+
+#[test]
+fn escape_closes_after_an_image_row_click() {
+    for row in 0..2 {
+        let mut controller = common::controller_with_two_stacks("analytics_escape_row");
+        controller.set_analytics_hold(Duration::from_secs(30));
+        let rig = rig_with(controller);
+        rig.pump();
+        rig.click(&common::image_row(&rig.app, row));
+        rig.click(&rig.button("Analytics"));
+        assert!(
+            rig.open() && rig.app.get_analytics_open(),
+            "row {row}: opens"
+        );
+
+        rig.escape();
+        assert!(!rig.open(), "row {row}: Escape closes it");
+        assert!(!rig.app.get_analytics_open(), "row {row}: button plain");
+    }
+}
+
+#[test]
+fn ctrl_chords_reach_after_an_image_row_click() {
+    let rig = rig_with(common::controller_with_two_stacks("analytics_chords_row"));
+    rig.pump();
+    let tabs = || rig.controller.lock().unwrap().project_tabs().len();
+    assert_eq!(tabs(), 2);
+    rig.click(&common::image_row(&rig.app, 0));
+    rig.chord("w");
+    assert_eq!(tabs(), 1, "Ctrl+W closes the active project");
+
+    // N, O and an unsaved S open a native picker past the bridge, so
+    // recorders stand in for it.
+    let pressed = Rc::new(RefCell::new(Vec::new()));
+    let released = Rc::new(RefCell::new(Vec::new()));
+    rig.app.on_canvas_key_pressed({
+        let pressed = pressed.clone();
+        move |text, ctrl, _, _| pressed.borrow_mut().push((text.to_string(), ctrl))
+    });
+    rig.app.on_canvas_key_released({
+        let released = released.clone();
+        move |text, _, _, _| released.borrow_mut().push(text.to_string())
+    });
+    rig.click(&common::image_row(&rig.app, 0));
+    for key in ["n", "o", "s"] {
+        rig.chord(key);
+    }
+    let pressed = pressed.borrow();
+    for key in ["n", "o", "s"] {
+        assert!(
+            pressed.contains(&(key.to_string(), true)),
+            "Ctrl+{key} reaches canvas-key-pressed, saw {pressed:?}"
+        );
+    }
+    assert!(
+        released.borrow().iter().any(|k| k == "s"),
+        "a release reaches canvas-key-released, saw {:?}",
+        released.borrow()
+    );
+}
+
+#[test]
+fn image_row_click_keeps_arrows_and_escape_order() {
+    let mut controller = common::controller_with_two_stacks("analytics_row_boundary");
+    controller.set_analytics_hold(Duration::from_secs(30));
+    let rig = rig_with(controller);
+    rig.pump();
+    let label = || rig.controller.lock().unwrap().frame_pane_label();
+
+    rig.click(&common::image_row(&rig.app, 0));
+    rig.press(Key::DownArrow.into());
+    assert_eq!(label(), "s1.tif", "Down moves to the next row");
+    rig.press(Key::UpArrow.into());
+    assert_eq!(label(), "s0.tif", "Up moves back");
+
+    rig.escape();
+    assert!(!rig.open() && !rig.app.get_analytics_open());
+    assert!(!rig.app.get_calculator_open());
+    assert_eq!(rig.controller.lock().unwrap().project_tabs().len(), 2);
+
+    rig.click(&rig.button("Analytics"));
+    rig.click(&common::image_row(&rig.app, 0));
+    // Set after the last pump: a pump resets the flag to the controller's.
+    rig.app.set_divergence_open(true);
+    rig.escape();
+    assert!(rig.open(), "the dialog takes the key, Analytics stays");
+    rig.app.set_divergence_open(false);
+    rig.pump();
+    rig.escape();
+    assert!(!rig.open(), "a second Escape closes Analytics");
 }

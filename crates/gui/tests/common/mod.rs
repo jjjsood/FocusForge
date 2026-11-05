@@ -209,6 +209,32 @@ pub fn tab(
         .unwrap_or_else(|| panic!("no tab labelled {label:?}"))
 }
 
+/// The `index`-th image row of the images pane, counted from the top.
+#[allow(dead_code)]
+pub fn image_row(
+    app: &focusforge_gui::AppWindow,
+    index: usize,
+) -> i_slint_backend_testing::ElementHandle {
+    let mut rows: Vec<_> = i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFImageRow::area")
+        .find_all()
+        .into_iter()
+        .filter(|r| r.size().width > 0.0)
+        .collect();
+    rows.sort_by(|a, b| {
+        a.absolute_position()
+            .y
+            .partial_cmp(&b.absolute_position().y)
+            .unwrap()
+    });
+    assert!(
+        index < rows.len(),
+        "no image row {index}, {} mounted",
+        rows.len()
+    );
+    rows.remove(index)
+}
+
 /// The "+" box at the end of the tab strip.
 #[allow(dead_code)]
 pub fn plus_button(app: &focusforge_gui::AppWindow) -> i_slint_backend_testing::ElementHandle {
