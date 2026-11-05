@@ -445,6 +445,16 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Ask the release server whether a newer FocusForge release exists.
+    ///
+    /// Makes one request that carries only the program version. Exit status:
+    /// 0 when this version is up to date, 3 when a newer release is
+    /// available, 1 when the check failed.
+    CheckUpdate {
+        /// Emit the JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -466,13 +476,17 @@ fn command_name(command: &Command) -> &'static str {
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
         Command::Diagnostics { .. } => "diagnostics",
+        Command::CheckUpdate { .. } => "check-update",
     }
 }
 
 const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
     ("Processing", &["stack", "align", "retouch", "export"]),
     ("Inspection", &["info", "review", "algorithms"]),
-    ("Maintenance", &["history", "cache", "diagnostics"]),
+    (
+        "Maintenance",
+        &["history", "cache", "diagnostics", "check-update"],
+    ),
 ];
 
 fn categorized_root_help_template(
@@ -697,6 +711,79 @@ fn main() -> ExitCode {
             include_minidumps,
             force,
         } => diagnostics::run(output.as_deref(), include_minidumps, force),
+        Command::CheckUpdate { json } => check_update(json),
+    }
+}
+
+/// The `check-update --json` report.
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+enum CheckUpdateReport {
+    UpToDate {
+        running: &'static str,
+    },
+    Newer {
+        running: &'static str,
+        version: String,
+        url: String,
+    },
+    Failed {
+        running: &'static str,
+        reason: String,
+    },
+}
+
+/// The override value when it names an endpoint; unset and empty mean none.
+fn release_url_override(value: Option<String>) -> Option<String> {
+    value.filter(|url| !url.is_empty())
+}
+
+fn check_update(json: bool) -> ExitCode {
+    use focusforge_core::update::{HttpReleaseSource, UpdateCheck, check};
+
+    let running = env!("CARGO_PKG_VERSION");
+    let source = match release_url_override(std::env::var("FOCUSFORGE_RELEASE_URL").ok()) {
+        Some(url) => HttpReleaseSource::with_url(url),
+        None => HttpReleaseSource::new(),
+    };
+    let (report, text, code) = match check(&source, running, None) {
+        UpdateCheck::UpToDate => (
+            CheckUpdateReport::UpToDate { running },
+            format!("FocusForge {running} is up to date"),
+            0,
+        ),
+        UpdateCheck::Newer { version, url } => (
+            CheckUpdateReport::Newer {
+                running,
+                version: version.to_string(),
+                url: url.clone(),
+            },
+            format!("FocusForge {version} is available (running {running}): {url}"),
+            3,
+        ),
+        UpdateCheck::Failed(failure) => (
+            CheckUpdateReport::Failed {
+                running,
+                reason: failure.to_string(),
+            },
+            format!("update check failed: {failure}"),
+            1,
+        ),
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    }
+    match code {
+        1 => fail(text),
+        _ => {
+            if !json {
+                println!("{text}");
+            }
+            ExitCode::from(code)
+        }
     }
 }
 
@@ -1322,6 +1409,16 @@ fn fail_with_code(message: impl std::fmt::Display, code: u8) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_url_override_ignores_unset_and_empty() {
+        assert_eq!(release_url_override(None), None);
+        assert_eq!(release_url_override(Some(String::new())), None);
+        assert_eq!(
+            release_url_override(Some("http://127.0.0.1:9/x".to_string())),
+            Some("http://127.0.0.1:9/x".to_string())
+        );
+    }
 
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {
         FrameDesc {
@@ -2271,7 +2368,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            15
+            16
         );
         let manuals = first
             .keys()
@@ -2292,6 +2389,7 @@ mod tests {
                 std::path::Path::new("man/focusforge-cli-review.1"),
                 std::path::Path::new("man/focusforge-cli-cache.1"),
                 std::path::Path::new("man/focusforge-cli-diagnostics.1"),
+                std::path::Path::new("man/focusforge-cli-check-update.1"),
                 std::path::Path::new("man/focusforge-cli-history-list.1"),
                 std::path::Path::new("man/focusforge-cli-history-delete.1"),
                 std::path::Path::new("man/focusforge-cli-history-compact.1"),
@@ -2382,7 +2480,7 @@ mod tests {
             .keys()
             .filter(|path| path.starts_with("man"))
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 16);
+        assert_eq!(manuals.len(), 17);
         assert!(assets.contains_key(std::path::Path::new("man/focusforge-cli-visible-test.1")));
         assert!(!assets.contains_key(std::path::Path::new("man/focusforge-cli-hidden-test.1")));
         assert!(manuals.iter().all(|path| {
@@ -2429,7 +2527,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            15
+            16
         );
         assert!(first.contains_key(std::path::Path::new("completions/_focusforge-cli.ps1")));
         #[cfg(not(feature = "gpu"))]

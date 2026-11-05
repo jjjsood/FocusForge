@@ -27,10 +27,11 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
 | [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
+| [`check-update`](#check-update) | reports whether a newer release exists |
 
 Root help groups `stack`, `align`, `retouch` and `export` under Processing;
-`info`, `review` and `algorithms` under Inspection; and `history`, `cache`
-and `diagnostics` under Maintenance.
+`info`, `review` and `algorithms` under Inspection; and `history`, `cache`,
+`diagnostics` and `check-update` under Maintenance.
 
 ## Global options
 
@@ -1052,3 +1053,55 @@ crash leaves behind, and the notice printed on the next start after one.
 
 Exits non-zero if the output path exists without `--force`, or if the
 bundle could not be written.
+
+## `check-update`
+
+```
+focusforge-cli check-update [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
+
+Asks the release server once whether a newer final release than the running
+version exists, and reports the one outcome. Pre-releases and drafts are
+never offered. The request waits at most 5 seconds in total and carries only
+`User-Agent: FocusForge/<version>` and `Accept`: no identifier, setting or
+file data is sent, and nothing is downloaded or installed.
+
+```
+$ focusforge-cli check-update
+FocusForge 0.1.0 is up to date
+$ focusforge-cli check-update
+FocusForge 0.2.0 is available (running 0.1.0): https://github.com/jjjsood/FocusForge/releases/tag/v0.2.0
+$ focusforge-cli check-update
+error: update check failed: could not reach the release server: <reason>
+```
+
+`--json` emits one document on stdout whose `outcome` field is one of:
+
+- `"up-to-date"`, with `running`, the running version;
+- `"newer"`, with `running`, `version` (the newer release's version) and
+  `url` (its download page);
+- `"failed"`, with `running` and `reason`, the same text the error line
+  carries.
+
+Exit status tells the outcome without parsing the output:
+
+| status | meaning |
+|---|---|
+| `0` | the running version is up to date |
+| `3` | a newer release is available |
+| `1` | the check failed: no network, a timeout, a refused connection, an answer other than HTTP 200, an answer that could not be read, or an answer that names no final release |
+
+A failure also prints `error: update check failed: <reason>` on stderr, in
+both modes. The `reason` is one of:
+
+| failure | reason |
+|---|---|
+| no network, a timeout, a refused connection, an answer other than HTTP 200 | `could not reach the release server: <detail>`, for example `<detail>` = `unexpected HTTP status 404` |
+| an answer that is not a usable release | `the release answer could not be read: <detail>` |
+| a draft or pre-release answer | `no final release is published` |
+
+A usage error exits `2`, as for every command.

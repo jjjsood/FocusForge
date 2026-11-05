@@ -321,6 +321,16 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(check-update)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit the JSON report instead of human-readable text]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_focusforge-cli__subcmd__help_commands" \
@@ -413,6 +423,10 @@ esac
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(check-update)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -439,6 +453,7 @@ _focusforge-cli_commands() {
 'review:Report one record per result found under a directory of projects, or a batch run'\''s output directory\: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of \`*.ffp\` files; never groups frames itself and writes nothing' \
 'cache:Remove every entry from the stage cache under \`.scratch/stage-cache/\`. Never touches \`.scratch/resume/\` or any project' \
 'diagnostics:Package this installation'\''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere' \
+'check-update:Ask the release server whether a newer FocusForge release exists' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'focusforge-cli commands' commands "$@"
@@ -484,6 +499,11 @@ _focusforge-cli__subcmd__cache__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli cache help help commands' commands "$@"
 }
+(( $+functions[_focusforge-cli__subcmd__check-update_commands] )) ||
+_focusforge-cli__subcmd__check-update_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli check-update commands' commands "$@"
+}
 (( $+functions[_focusforge-cli__subcmd__diagnostics_commands] )) ||
 _focusforge-cli__subcmd__diagnostics_commands() {
     local commands; commands=()
@@ -507,6 +527,7 @@ _focusforge-cli__subcmd__help_commands() {
 'review:Report one record per result found under a directory of projects, or a batch run'\''s output directory\: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of \`*.ffp\` files; never groups frames itself and writes nothing' \
 'cache:Remove every entry from the stage cache under \`.scratch/stage-cache/\`. Never touches \`.scratch/resume/\` or any project' \
 'diagnostics:Package this installation'\''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere' \
+'check-update:Ask the release server whether a newer FocusForge release exists' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'focusforge-cli help commands' commands "$@"
@@ -532,6 +553,11 @@ _focusforge-cli__subcmd__help__subcmd__cache_commands() {
 _focusforge-cli__subcmd__help__subcmd__cache__subcmd__clear_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli help cache clear commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__check-update_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__check-update_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help check-update commands' commands "$@"
 }
 (( $+functions[_focusforge-cli__subcmd__help__subcmd__diagnostics_commands] )) ||
 _focusforge-cli__subcmd__help__subcmd__diagnostics_commands() {

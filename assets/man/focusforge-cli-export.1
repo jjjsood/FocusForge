@@ -4,7 +4,7 @@
 .SH NAME
 focusforge\-cli\-export \- Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
 .SH SYNOPSIS
-\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-v \fR]... [\fB\-\-icc\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-\-frame\fR] [\fB\-\-frame\-output\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-\-icc\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-\-frame\fR] [\fB\-\-frame\-output\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
 .SH DESCRIPTION
 Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
 .SH OPTIONS
@@ -42,11 +42,11 @@ JPEG chroma subsampling: `420` (default) or `444`. JPEG only
 \fB\-\-exif\fR \fI<EXIF>\fR
 Carry the alignment reference frame\*(Aqs EXIF: `on` (default) or `off`
 .TP
-\fB\-v\fR
-Increase log detail (repeatable)
-.TP
 \fB\-\-icc\fR \fI<ICC>\fR
 Embed an ICC profile: `on` (default) or `off`. Has no effect on a DNG, whose colour is defined by its camera matrices
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Log errors only
