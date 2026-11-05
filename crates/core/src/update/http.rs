@@ -72,17 +72,13 @@ impl ReleaseSource for HttpReleaseSource {
             return Err(format!("unexpected HTTP status {status}"));
         }
         // The reader's limit fails a body that is exactly at it, so it sits one
-        // byte above the cap and the cap itself is checked here.
-        let body = response
+        // byte above the cap and a body of exactly the cap is accepted.
+        response
             .body_mut()
             .with_config()
             .limit(MAX_BODY + 1)
             .read_to_string()
-            .map_err(|e| e.to_string())?;
-        if body.len() as u64 > MAX_BODY {
-            return Err(format!("the response body exceeds {MAX_BODY} bytes"));
-        }
-        Ok(body)
+            .map_err(|e| e.to_string())
     }
 }
 
