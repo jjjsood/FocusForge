@@ -1359,6 +1359,10 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT
   Targets: Linux x86_64
+- Package: semver 1.0.28
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: MIT OR Apache-2.0
+  Targets: Linux x86_64, Windows x86_64, macOS arm64
 - Package: serde 1.0.229
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0

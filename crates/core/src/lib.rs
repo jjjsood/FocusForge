@@ -27,6 +27,7 @@ pub mod registry;
 pub mod retouch;
 pub mod tile;
 pub mod timing;
+pub mod update;
 pub mod zmap;
 
 #[cfg(feature = "test-algorithms")]
