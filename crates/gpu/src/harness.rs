@@ -651,10 +651,25 @@ pub fn align_backend_for(
     (Some(lazy), String::new())
 }
 
-/// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
-/// serve the minimum budget) falls back here exactly like a missing adapter.
+/// One short stderr line naming the reason class only: a missing adapter and
+/// [`GpuError::VramExhausted`] (an adapter that cannot serve the minimum
+/// budget) fall back alike. The driver's full text goes to the log, and to
+/// stderr at `-v`.
 fn cpu_fallback_line(reason: &GpuError) -> String {
-    format!("{reason}; continuing on the CPU path")
+    tracing::info!(%reason, "falling back to the CPU path");
+    let class = match reason {
+        GpuError::NoAdapter { .. } => "no usable GPU adapter".to_string(),
+        GpuError::LimitsShort { .. } => "adapter is short on required limits".to_string(),
+        GpuError::RequestDevice(_) => "failed to create wgpu device".to_string(),
+        GpuError::TileTooLarge { .. } => "tile exceeds a device limit".to_string(),
+        GpuError::KernelValidation { kernel, .. } => format!("kernel {kernel} failed validation"),
+        GpuError::Readback { .. } => "readback failed".to_string(),
+        GpuError::DeviceOutOfMemory { .. } => "GPU ran out of device memory mid-run".to_string(),
+        GpuError::VramExhausted { floor_bytes, .. } => {
+            format!("device cannot serve even the minimum VRAM budget of {floor_bytes} bytes")
+        }
+    };
+    format!("{class}; continuing on the CPU path")
 }
 
 #[cfg(test)]
@@ -669,23 +684,42 @@ mod tests {
     use focusforge_core::fuse::laplacian::Laplacian;
 
     #[test]
-    fn cpu_fallback_line_leads_with_the_reason() {
+    fn cpu_fallback_line_names_the_reason_class_without_detail() {
         let exhausted = GpuError::VramExhausted {
             floor_bytes: 268_435_456,
             detail: "allocation refused".to_string(),
         };
         assert_eq!(
             cpu_fallback_line(&exhausted),
-            "device cannot serve even the minimum VRAM budget of 268435456 bytes: \
-             allocation refused; continuing on the CPU path"
+            "device cannot serve even the minimum VRAM budget of 268435456 bytes; \
+             continuing on the CPU path"
+        );
+        let limits = GpuError::LimitsShort {
+            detail: "max_buffer_size 1024 < 2048".to_string(),
+        };
+        assert_eq!(
+            cpu_fallback_line(&limits),
+            "adapter is short on required limits; continuing on the CPU path"
         );
         let no_adapter = GpuError::NoAdapter {
             reason: "no backend available".to_string(),
         };
         assert_eq!(
             cpu_fallback_line(&no_adapter),
-            "no usable GPU adapter: no backend available; continuing on the CPU path"
+            "no usable GPU adapter; continuing on the CPU path"
         );
+    }
+
+    #[test]
+    fn cpu_fallback_line_is_one_short_line_for_a_long_driver_message() {
+        let reason = (1..=12)
+            .map(|n| format!("backend {n}: Err(NotFound) while enumerating adapters"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(reason.len() > 500);
+        let line = cpu_fallback_line(&GpuError::NoAdapter { reason });
+        assert_eq!(line, "no usable GPU adapter; continuing on the CPU path");
+        assert!(!line.contains('\n') && line.len() <= 120, "{line}");
     }
 
     #[test]

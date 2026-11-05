@@ -53,7 +53,7 @@ pub fn run(
     let from_id = {
         let project = match Project::open(project_path) {
             Ok(project) => project,
-            Err(err) => return fail(err),
+            Err(err) => return crate::fail_with_code(&err, crate::history::exit_code_for(&err)),
         };
         match from {
             Some(prefix) => match resolve_checkpoint(project.history(), project_path, prefix) {
@@ -72,7 +72,7 @@ pub fn run(
         project::now_unix(),
     ) {
         Ok(ids) => ids,
-        Err(err) => return fail(err),
+        Err(err) => return crate::fail_with_code(&err, crate::history::exit_code_for(&err)),
     };
     compact_after_save(project_path);
 

@@ -360,7 +360,7 @@ pub fn run(
 
     let mut project = match Project::open(project_path) {
         Ok(project) => project,
-        Err(err) => return fail(err),
+        Err(err) => return crate::fail_with_code(&err, crate::history::exit_code_for(&err)),
     };
 
     // Reported before anything is written: a user who is about to discover

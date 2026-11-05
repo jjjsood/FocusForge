@@ -94,8 +94,10 @@ does not read source frames or render a composite.
   `error: ...` to stderr and exits 1.
 - Inside a directory, a file that fails to parse is *not* fatal to the whole
   command: it is reported as one entry with an `error` field and counted in
-  `unreadable`, while every readable sibling still gets a full report. A
-  directory with zero matching files is a hard error.
+  `unreadable`, while every readable sibling still gets a full report. When
+  any file was unreadable, `info` exits 5 after printing the report (an
+  `info`-only code; a file that merely falls outside the fast read path
+  still exits 0). A directory with zero matching files is a hard error.
 - A file that parses but falls outside the fast read path (see
   [`tiff-fast-path.md`](tiff-fast-path.md)) is reported normally, with
   `mmap fast path: no` and the reason named — this is not an error. Supported
@@ -128,7 +130,7 @@ uniform layout: yes
 When the frames disagree on layout, the summary names the odd one out and
 what differs, for example `uniform layout: no — reference.tif is MM/rps=8, others II/rps=1`.
 A directory report also prints `unreadable: N` when any file failed to
-parse.
+parse, and the command then exits 5.
 
 ### `--json`
 
@@ -846,7 +848,9 @@ for what a checkpoint is and how hidden checkpoints are handled.
 A project is validated when it is opened. A damaged one is refused by name
 with its own exit code (3 not a project, 4 truncated, 6 a missing entry, 7 a
 blob hash mismatch, 8 a broken link between checkpoints, `1` anything
-else). If a source frame's content changed since the project was written,
+else, including a project saved by a newer FocusForge). Those codes hold
+for every command that opens a project: `export`, `history`, `info` and
+`retouch`. If a source frame's content changed since the project was written,
 `list` and `delete` refuse with exit 9 naming the frames; their
 `--accept-changed-sources` flag proceeds with a warning instead. `compact`
 never accepts that flag. Frames that

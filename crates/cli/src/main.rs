@@ -882,11 +882,12 @@ fn byte_order_str(order: ByteOrder) -> &'static str {
     }
 }
 
-/// `info`'s two report-don't-refuse exceptions: a single named file that
-/// fails to parse structurally, and a directory with zero frames. Both exit
-/// 1 with `error: <TiffError>`; every other case -- a member of a listing,
-/// a policy refusal like an unsupported compression -- stays exit 0,
-/// refusal or failure carried as data instead.
+/// `info` reports rather than refuses: a single named file that fails to
+/// parse structurally, and a directory with zero frames, exit 1 with
+/// `error: <TiffError>`. A directory listing prints every member, then exits
+/// 5 when any member could not be read (`unreadable_count`), so a script can
+/// tell a partial listing from a clean one. A policy refusal like an
+/// unsupported compression is carried as data and exits 0.
 fn info(path: &Path, json: bool) -> ExitCode {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -929,6 +930,9 @@ fn info(path: &Path, json: bool) -> ExitCode {
         print_human(&report);
     }
 
+    if is_directory && report.unreadable_count > 0 {
+        return ExitCode::from(5);
+    }
     ExitCode::SUCCESS
 }
 

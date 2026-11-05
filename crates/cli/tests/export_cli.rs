@@ -264,6 +264,35 @@ fn export_needs_at_least_one_output_flag() {
     );
 }
 
+/// A TIFF frame handed over as the project is refused as "not a project",
+/// with the exit code `history` gives the same file and one line on stderr.
+#[test]
+fn export_of_a_non_project_exits_not_a_project() {
+    let dir = common::tmp_dir("export_cli_non_project");
+    let frame = common::fixtures_dir().join("mantis-64/frames/00.tif");
+    let out = dir.join("out.tif");
+    let result = run_cli_in(
+        &dir,
+        &[
+            "export",
+            "-o",
+            out.to_str().unwrap(),
+            frame.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(result.code, Some(3), "stderr: {}", result.stderr);
+    assert!(result.stdout.is_empty(), "stdout: {}", result.stdout);
+    let lines: Vec<&str> = result.stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "stderr: {}", result.stderr);
+    assert!(lines[0].starts_with("error: "), "stderr: {}", result.stderr);
+    assert!(
+        lines[0].ends_with(&format!("{}: is not a FocusForge project", frame.display())),
+        "stderr: {}",
+        result.stderr
+    );
+    assert!(!out.exists(), "a refused export wrote {}", out.display());
+}
+
 // `--checkpoint`: every history below is built directly through `core`'s
 // append surface -- no CLI command produces a re-fuse, so a branched,
 // re-fused history is a synthetic project rather than a `stack` run.
