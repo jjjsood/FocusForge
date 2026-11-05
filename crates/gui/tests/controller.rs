@@ -325,6 +325,16 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("appearance_tab.slint"), "next-requested")
             | (Some("appearance_tab.slint"), "accepted")
             | (Some("appearance_tab.slint"), "dismissed")
+            | (Some("performance_tab.slint"), "changed host-unit-open")
+            | (Some("performance_tab.slint"), "changed vram-unit-open")
+            | (Some("performance_tab.slint"), "unit-previous-requested")
+            | (Some("performance_tab.slint"), "unit-next-requested")
+            | (Some("performance_tab.slint"), "unit-accepted")
+            | (Some("performance_tab.slint"), "unit-dismissed")
+            | (Some("performance_tab.slint"), "option-selected(unit)")
+            | (Some("ff_size_field.slint"), "option-selected(picked)")
+            | (Some("ff_text_field.slint"), "accepted")
+            | (Some("ff_text_field.slint"), "changed has-focus")
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "changed dialog-open")
             | (Some("app.slint"), "changed settings-open")
@@ -8546,11 +8556,27 @@ fn performance_readout_does_not_probe() {
         focusforge_gpu::harness::settled_backend().is_none(),
         "building the view must not bring a backend up"
     );
-    assert_eq!(view.vram_budget, performance_settings::NOT_PROBED);
+    assert_eq!(view.vram_cap.text, "");
+    assert_eq!(view.vram_cap.placeholder, performance_settings::NOT_PROBED);
     assert_eq!(view.backend, "");
-    assert!(view.host_budget.ends_with("iB"), "{}", view.host_budget);
+    assert_budget_default(&view.host_cap);
     assert!(view.vram_cap.enabled && view.gpu_enabled);
     assert_eq!(view.note, "");
+}
+
+/// The row shows a budget as a whole number of MiB or GiB and no failure mark.
+fn assert_budget_default(row: &performance_settings::CapField) {
+    assert!(
+        !row.text.is_empty() && row.text.bytes().all(|b| b.is_ascii_digit()),
+        "{:?}",
+        row.text
+    );
+    assert!(
+        matches!(row.unit.label(), "MiB" | "GiB"),
+        "{}",
+        row.unit.label()
+    );
+    assert!(row.enabled && !row.invalid);
 }
 
 #[test]
@@ -8601,6 +8627,308 @@ fn performance_vram_cap_pending_note() {
         performance_settings::load(config.path()).max_vram_bytes(),
         Some(2 << 30),
         "text that does not parse leaves the stored cap"
+    );
+}
+
+const SIBLING_TABLE: &str = "# my notes\n[recent]\nentries = [] # none yet\n\n";
+
+/// Points `controller` at a fresh config directory whose settings file holds
+/// only a hand-edited table beside the one the Performance tab writes.
+fn install_hand_edited_settings(controller: &mut AppController) -> tempfile::TempDir {
+    let config = tempfile::tempdir().unwrap();
+    fs::write(config.path().join("settings.toml"), SIBLING_TABLE).unwrap();
+    controller.install_recent(Vec::new(), config.path().to_path_buf());
+    config
+}
+
+fn settings_text(config: &tempfile::TempDir) -> String {
+    fs::read_to_string(config.path().join("settings.toml")).unwrap()
+}
+
+/// `settings.toml` lines of the form `<key> = ...`.
+fn settings_lines<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+    text.lines().filter(|line| line.starts_with(key)).collect()
+}
+
+#[test]
+fn host_cap_row_shows_the_default_then_the_committed_cap() {
+    use performance_settings::CapUnit;
+
+    let mut controller = scratch_controller("host_cap_row");
+    open_mantis64_tab(&mut controller, "host_cap_row", 2);
+    let config = install_hand_edited_settings(&mut controller);
+    let before = settings_text(&config);
+
+    let row = controller.performance_view().host_cap;
+    assert_budget_default(&row);
+    assert!(row.limit.is_empty());
+    assert_eq!(
+        settings_text(&config),
+        before,
+        "showing the default saves nothing"
+    );
+    assert_eq!(controller.job_request_for(0).unwrap().max_host_memory, None);
+
+    controller.set_host_cap_unit("MiB");
+    controller.edit_host_memory_cap("512");
+    controller.commit_cap_drafts();
+    let row = controller.performance_view().host_cap;
+    assert_eq!((row.text.as_str(), row.unit), ("512", CapUnit::Mib));
+    assert!(row.limit.is_empty() && !row.invalid);
+    assert_eq!(
+        controller.job_request_for(0).unwrap().max_host_memory,
+        Some(512 << 20)
+    );
+    let saved = settings_text(&config);
+    assert!(saved.starts_with(SIBLING_TABLE), "{saved:?}");
+    assert_eq!(
+        settings_lines(&saved, "max-host-memory"),
+        ["max-host-memory = \"512MiB\""]
+    );
+
+    controller.edit_host_memory_cap("100");
+    let row = controller.performance_view().host_cap;
+    assert_eq!(row.text, "512", "an unconfirmed number changes nothing");
+    assert_eq!(settings_text(&config), saved);
+
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(512 << 20)
+    );
+}
+
+#[test]
+fn host_cap_over_the_maximum_shows_the_limit_and_stores_no_cap() {
+    use focusforge_gui::SettingsSection;
+
+    let mut controller = scratch_controller("host_cap_limit");
+    let config = install_hand_edited_settings(&mut controller);
+    controller.set_host_memory_cap("200MiB");
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20)
+    );
+    let over_the_maximum = |controller: &mut AppController| {
+        controller.edit_host_memory_cap("1000000");
+        controller.set_host_cap_unit("GiB");
+        controller.performance_view().host_cap
+    };
+
+    let row = over_the_maximum(&mut controller);
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        None,
+        "a number above the maximum stores no cap"
+    );
+    assert!(settings_lines(&settings_text(&config), "max-host-memory").is_empty());
+    assert!(settings_text(&config).starts_with(SIBLING_TABLE));
+    assert_budget_default(&row);
+    assert_ne!(
+        row.text, "1000000",
+        "the field shows the default, not the typed digits"
+    );
+    let named = row
+        .limit
+        .strip_prefix("Max ")
+        .and_then(|rest| rest.strip_suffix(" possible."))
+        .unwrap_or_else(|| panic!("a line naming the maximum, got {:?}", row.limit));
+    assert!(
+        named.ends_with(" MiB") || named.ends_with(" GiB"),
+        "the maximum is in format_bytes form: {named:?}"
+    );
+
+    controller.edit_host_memory_cap("200");
+    controller.set_host_cap_unit("MiB");
+    let row = controller.performance_view().host_cap;
+    assert_eq!(row.limit, "", "the next commit clears the line");
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20)
+    );
+
+    assert!(!over_the_maximum(&mut controller).limit.is_empty());
+    controller.select_settings_section(SettingsSection::About);
+    assert_eq!(controller.performance_view().host_cap.limit, "");
+
+    assert!(!over_the_maximum(&mut controller).limit.is_empty());
+    controller.close_settings();
+    assert_eq!(controller.performance_view().host_cap.limit, "");
+}
+
+#[test]
+fn vram_cap_row_mirrors_the_host_row() {
+    use performance_settings::CapUnit;
+
+    let mut controller = scratch_controller("vram_cap_row");
+    let config = install_hand_edited_settings(&mut controller);
+    let vram = |controller: &AppController| {
+        let row = controller.performance_view().vram_cap;
+        (row.text, row.unit, row.limit)
+    };
+    assert!(focusforge_gpu::harness::settled_backend().is_none());
+    let row = controller.performance_view().vram_cap;
+    assert_eq!(row.text, "");
+    assert_eq!(row.placeholder, performance_settings::NOT_PROBED);
+    assert!(row.enabled && !row.invalid);
+
+    controller.edit_vram_cap("8");
+    controller.commit_cap_drafts();
+    assert_eq!(vram(&controller), ("8".into(), CapUnit::Gib, String::new()));
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"8GiB\""]
+    );
+
+    controller.set_vram_cap_unit("MiB");
+    assert_eq!(vram(&controller), ("8".into(), CapUnit::Mib, String::new()));
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"8MiB\""],
+        "a unit change commits at once with the number as shown"
+    );
+
+    controller.edit_vram_cap("1000000");
+    controller.set_vram_cap_unit("GiB");
+    assert_eq!(
+        vram(&controller),
+        ("1000000".into(), CapUnit::Gib, String::new()),
+        "no maximum is known before a probe, so nothing is clamped"
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(1_000_000 << 30)
+    );
+
+    controller.edit_vram_cap("");
+    controller.commit_cap_drafts();
+    controller.set_vram_cap_unit("MiB");
+    assert_eq!(
+        vram(&controller),
+        (String::new(), CapUnit::Mib, String::new()),
+        "an empty number keeps the unit picked beside it"
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        None
+    );
+    assert!(settings_text(&config).starts_with(SIBLING_TABLE));
+}
+
+#[test]
+fn cap_row_commits_only_on_confirm() {
+    fn host_row(controller: &AppController) -> performance_settings::CapField {
+        controller.performance_view().host_cap
+    }
+    fn vram_row(controller: &AppController) -> performance_settings::CapField {
+        controller.performance_view().vram_cap
+    }
+    type Rows = (
+        &'static str,
+        fn(&mut AppController, &str),
+        fn(&mut AppController, &str),
+        fn(&AppController) -> performance_settings::CapField,
+    );
+    let rows: [Rows; 2] = [
+        (
+            "max-host-memory",
+            AppController::edit_host_memory_cap,
+            AppController::set_host_cap_unit,
+            host_row,
+        ),
+        (
+            "max-vram",
+            AppController::edit_vram_cap,
+            AppController::set_vram_cap_unit,
+            vram_row,
+        ),
+    ];
+
+    for (key, edit, pick_unit, row) in rows {
+        let mut controller = scratch_controller(&format!("cap_row_{key}"));
+        let config = install_hand_edited_settings(&mut controller);
+        pick_unit(&mut controller, "MiB");
+        let before = settings_text(&config);
+        let shown = row(&controller);
+        assert!(before.starts_with(SIBLING_TABLE), "{key}: {before:?}");
+
+        for draft in ["5", "51", "512"] {
+            edit(&mut controller, draft);
+            assert_eq!(
+                settings_text(&config),
+                before,
+                "{key}: draft {draft:?} saved"
+            );
+            assert_eq!(
+                row(&controller).text,
+                shown.text,
+                "{key}: draft {draft:?} shown"
+            );
+        }
+
+        controller.commit_cap_drafts();
+        let committed = settings_text(&config);
+        assert_eq!(
+            settings_lines(&committed, key),
+            [format!("{key} = \"512MiB\"")],
+            "{key}"
+        );
+        assert!(committed.starts_with(SIBLING_TABLE), "{key}: {committed:?}");
+        assert_eq!(row(&controller).text, "512", "{key}");
+
+        controller.commit_cap_drafts();
+        assert_eq!(
+            settings_text(&config),
+            committed,
+            "{key}: a second commit changes nothing"
+        );
+
+        edit(&mut controller, "0");
+        controller.commit_cap_drafts();
+        assert_eq!(settings_text(&config), committed, "{key}: zero is refused");
+        assert!(
+            row(&controller).invalid,
+            "{key}: zero marks the row invalid"
+        );
+
+        edit(&mut controller, "");
+        controller.commit_cap_drafts();
+        let cleared = settings_text(&config);
+        assert!(
+            settings_lines(&cleared, key).is_empty(),
+            "{key}: {cleared:?}"
+        );
+        assert!(cleared.starts_with(SIBLING_TABLE), "{key}: {cleared:?}");
+        assert!(!row(&controller).invalid, "{key}");
+    }
+}
+
+#[test]
+fn cap_drafts_commit_when_settings_close_or_the_section_changes() {
+    use focusforge_gui::SettingsSection;
+
+    let mut controller = scratch_controller("cap_drafts_leave");
+    let config = install_hand_edited_settings(&mut controller);
+    controller.set_host_cap_unit("MiB");
+    controller.set_vram_cap_unit("MiB");
+
+    controller.edit_host_memory_cap("200");
+    controller.close_settings();
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20),
+        "closing commits the host number"
+    );
+
+    controller.edit_vram_cap("512");
+    controller.select_settings_section(SettingsSection::About);
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(512 << 20),
+        "a section change commits the VRAM number"
+    );
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"512MiB\""]
     );
 }
 

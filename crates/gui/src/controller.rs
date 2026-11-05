@@ -40,7 +40,7 @@ use crate::input_map::{
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
 use crate::notifications::{Banner, CrashEvidence, Kind, Notification, Notifications, Source};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
-use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
+use crate::performance_settings::{self, CapNotes, CapUnit, DeviceState, PerformanceSettings};
 use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
@@ -1729,6 +1729,16 @@ fn display_image(tab: &ProjectTab) -> Option<ImageSize> {
     fused_image_size(tab).or(tab.image)
 }
 
+/// The device budget as this session has learned it. Reads settled state
+/// only: it never opens an adapter.
+fn device_state() -> DeviceState {
+    match focusforge_gpu::harness::settled_backend() {
+        None => DeviceState::NotProbed,
+        Some(Ok(backend)) => DeviceState::Ready(backend.probed_budget().bytes()),
+        Some(Err(_)) => DeviceState::NoAdapter,
+    }
+}
+
 /// A one-sided margin so a scrolled cursor never sits flush against the
 /// field's own edge, capped at half the visible width for a very narrow
 /// field.
@@ -1815,9 +1825,14 @@ pub struct AppController {
     preview_failures: HashMap<PreviewRequest, String>,
     published_preview_bytes: AtomicU64,
     peak_published_preview_bytes: AtomicU64,
-    /// Cap field text that did not parse, shown until the next edit; the
-    /// cap in `performance` stays as it was.
-    rejected_caps: RejectedCaps,
+    /// What each Performance cap row shows beyond the stored cap: refused
+    /// text, the limit line, a unit picked with no number. The cap in
+    /// `performance` stays as it was.
+    host_notes: CapNotes,
+    vram_notes: CapNotes,
+    /// A cap row's unit list is open; at most one is.
+    host_unit_open: bool,
+    vram_unit_open: bool,
     /// The VRAM cap was edited after this session's device budget settled,
     /// so the edit applies from the next launch.
     vram_pending: bool,
@@ -1827,6 +1842,9 @@ pub struct AppController {
     /// [`Self::host_memory_cap_cursor_moved`] and [`Self::vram_cap_cursor_moved`].
     host_cap_scroll_x: f32,
     vram_cap_scroll_x: f32,
+    /// Cap number typed since the last commit; see [`Self::commit_cap_drafts`].
+    host_cap_draft: Option<String>,
+    vram_cap_draft: Option<String>,
     /// The Storage tab's newest clear result: its status line and tone.
     storage_result: Option<(String, StorageTone)>,
     /// The blend kernel on the display device, handed to every edit session
@@ -4130,6 +4148,7 @@ impl AppController {
     }
 
     pub fn close_settings(&mut self) -> bool {
+        self.leave_cap_rows();
         self.state.settings_open = false;
         false
     }
@@ -7402,18 +7421,125 @@ impl AppController {
         self.save_performance();
     }
 
-    /// Applies the host-memory cap field's text to the next run and saves it.
-    /// Empty means no cap; text that does not parse as a size leaves the
-    /// stored cap and marks the field invalid.
+    /// Holds the host-memory number as typed; nothing is stored or saved
+    /// until [`Self::commit_cap_drafts`].
+    pub fn edit_host_memory_cap(&mut self, number: &str) {
+        self.host_cap_draft = Some(number.to_string());
+    }
+
+    /// [`Self::edit_host_memory_cap`] for the VRAM cap.
+    pub fn edit_vram_cap(&mut self, number: &str) {
+        self.vram_cap_draft = Some(number.to_string());
+    }
+
+    /// Commits each cap number typed since the last commit, in the unit its
+    /// row shows. Runs when a number is confirmed, when the settings section
+    /// changes and when the settings window closes; with nothing typed it
+    /// does nothing.
+    pub fn commit_cap_drafts(&mut self) {
+        if let Some(number) = self.host_cap_draft.take() {
+            let unit = self.performance_view().host_cap.unit;
+            self.commit_host_cap(&number, unit);
+        }
+        if let Some(number) = self.vram_cap_draft.take() {
+            let unit = self.performance_view().vram_cap.unit;
+            self.commit_vram_cap(&number, unit);
+        }
+    }
+
+    /// Commits the host row in `label`'s unit at once, with the number it
+    /// shows or, when one was typed and not yet confirmed, that number.
+    pub fn set_host_cap_unit(&mut self, label: &str) {
+        self.host_unit_open = false;
+        if let Some(unit) = CapUnit::from_label(label) {
+            let number = match self.host_cap_draft.take() {
+                Some(number) => number,
+                None => self.performance_view().host_cap.text,
+            };
+            self.commit_host_cap(&number, unit);
+        }
+    }
+
+    /// [`Self::set_host_cap_unit`] for the VRAM row.
+    pub fn set_vram_cap_unit(&mut self, label: &str) {
+        self.vram_unit_open = false;
+        if let Some(unit) = CapUnit::from_label(label) {
+            let number = match self.vram_cap_draft.take() {
+                Some(number) => number,
+                None => self.performance_view().vram_cap.text,
+            };
+            self.commit_vram_cap(&number, unit);
+        }
+    }
+
+    /// Opens the host row's unit list, or closes it when open.
+    pub fn toggle_host_unit_list(&mut self) {
+        self.host_unit_open = !self.host_unit_open;
+        self.vram_unit_open = false;
+    }
+
+    /// [`Self::toggle_host_unit_list`] for the VRAM row.
+    pub fn toggle_vram_unit_list(&mut self) {
+        self.vram_unit_open = !self.vram_unit_open;
+        self.host_unit_open = false;
+    }
+
+    /// Closes whichever unit list is open; the key that does it is not the
+    /// one that closes Settings.
+    pub fn close_unit_lists(&mut self) {
+        self.host_unit_open = false;
+        self.vram_unit_open = false;
+    }
+
+    /// Whether a cap row's unit list is open.
+    pub fn unit_list_open(&self) -> bool {
+        self.host_unit_open || self.vram_unit_open
+    }
+
+    /// Stores the host cap a confirmed `number` in `unit` makes. A number at
+    /// or above the host budget is no cap; one above it also sets the line
+    /// naming the budget. A number that is not a cap marks the row invalid.
+    fn commit_host_cap(&mut self, number: &str, unit: CapUnit) {
+        self.host_notes = CapNotes::default();
+        let fitted = performance_settings::fit_cap(number, unit, Some(job::host_budget().bytes()));
+        match fitted {
+            Ok(fitted) => {
+                self.set_host_memory_cap(fitted.cap.as_ref().map_or("", |cap| &cap.text));
+                self.host_notes.limit = fitted.limit;
+            }
+            Err(_) => self.set_host_memory_cap(&format!("{}{}", number.trim(), unit.label())),
+        }
+    }
+
+    /// [`Self::commit_host_cap`] for the VRAM cap, whose maximum is the
+    /// probed device budget once a run has probed it.
+    fn commit_vram_cap(&mut self, number: &str, unit: CapUnit) {
+        self.vram_notes = CapNotes::default();
+        let fitted = performance_settings::fit_cap(number, unit, device_state().maximum());
+        match fitted {
+            Ok(fitted) => {
+                self.set_vram_cap(fitted.cap.as_ref().map_or("", |cap| &cap.text));
+                self.vram_notes.limit = fitted.limit;
+                if number.trim().is_empty() {
+                    self.vram_notes.unit = Some(unit);
+                }
+            }
+            Err(_) => self.set_vram_cap(&format!("{}{}", number.trim(), unit.label())),
+        }
+    }
+
+    /// Applies the host-memory cap text to the next run and saves it. Empty
+    /// means no cap; text that does not parse as a size leaves the stored cap
+    /// and marks the row invalid.
     pub fn set_host_memory_cap(&mut self, text: &str) {
         match performance_settings::parse_cap(text) {
             Ok(cap) => {
                 self.performance.max_host_memory = cap;
-                self.rejected_caps.host_memory = None;
+                self.host_notes.rejected = None;
                 self.save_performance();
                 self.refresh_source_previews();
             }
-            Err(_) => self.rejected_caps.host_memory = Some(text.to_string()),
+            Err(_) => self.host_notes.rejected = Some(text.to_string()),
         }
     }
 
@@ -7424,11 +7550,11 @@ impl AppController {
         match performance_settings::parse_cap(text) {
             Ok(cap) => {
                 self.performance.max_vram = cap;
-                self.rejected_caps.vram = None;
+                self.vram_notes.rejected = None;
                 self.vram_pending |= focusforge_gpu::harness::vram_cap_settled();
                 self.save_performance();
             }
-            Err(_) => self.rejected_caps.vram = Some(text.to_string()),
+            Err(_) => self.vram_notes.rejected = Some(text.to_string()),
         }
     }
 
@@ -7531,24 +7657,22 @@ impl AppController {
     /// budget is `NotProbed` until a run has brought the backend up, and
     /// building the view never opens an adapter.
     pub fn performance_view(&self) -> performance_settings::PerformanceView {
-        let device = match focusforge_gpu::harness::settled_backend() {
-            None => DeviceState::NotProbed,
-            Some(Ok(backend)) => DeviceState::Ready(backend.device_budget().bytes()),
-            Some(Err(_)) => DeviceState::NoAdapter,
-        };
         let backend_line = self
             .fusion_backend()
             .or_else(|| self.last_backend_line.clone());
         let mut view = performance_settings::view(
             &self.performance,
-            &self.rejected_caps,
+            &self.host_notes,
+            &self.vram_notes,
             job::host_budget().bytes(),
-            device,
+            device_state(),
             backend_line.as_deref(),
             self.vram_pending,
         );
         view.host_cap.scroll_offset = self.host_cap_scroll_x;
         view.vram_cap.scroll_offset = self.vram_cap_scroll_x;
+        view.host_cap.unit_open = self.host_unit_open;
+        view.vram_cap.unit_open = self.vram_unit_open;
         view
     }
 
@@ -9304,7 +9428,17 @@ impl AppController {
     }
 
     pub fn select_settings_section(&mut self, section: SettingsSection) {
+        self.leave_cap_rows();
         self.state.settings_section = section;
+    }
+
+    /// Commits a number typed in a cap row, then clears the limit lines and
+    /// closes the unit lists: the rows are being left.
+    fn leave_cap_rows(&mut self) {
+        self.commit_cap_drafts();
+        self.host_notes.limit = None;
+        self.vram_notes.limit = None;
+        self.close_unit_lists();
     }
 
     /// Feeds the diagnostics panel its data and configuration directories

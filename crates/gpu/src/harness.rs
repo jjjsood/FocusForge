@@ -52,12 +52,19 @@ pub struct GpuBackend {
     /// The settled budget and its provenance, reported through
     /// [`Self::device_budget`].
     device_budget: DeviceBudget,
+    /// The budget before any ceiling, reported through
+    /// [`Self::probed_budget`].
+    probed_budget: DeviceBudget,
     /// The ECC alignment kernels and the templates their sessions share.
     ecc: EccState,
 }
 
 impl GpuBackend {
-    fn with_budget(device: &'static SharedDevice, device_budget: DeviceBudget) -> Self {
+    fn with_budget(
+        device: &'static SharedDevice,
+        device_budget: DeviceBudget,
+        probed_budget: DeviceBudget,
+    ) -> Self {
         GpuBackend {
             device,
             pipeline: OnceLock::new(),
@@ -65,6 +72,7 @@ impl GpuBackend {
             warp_pipelines: WarpPipelines::new(),
             budget: Arc::new(VramBudget::new(device_budget.bytes())),
             device_budget,
+            probed_budget,
             ecc: EccState::default(),
         }
     }
@@ -91,6 +99,7 @@ impl GpuBackend {
         Ok(GpuBackend::with_budget(
             device,
             device_budget.capped_to(ceiling),
+            device_budget,
         ))
     }
 
@@ -101,10 +110,8 @@ impl GpuBackend {
     /// like a flag-capped `HostBudget` one crate over.
     pub fn with_max_device_bytes(max_device_bytes: u64) -> Result<GpuBackend, &'static GpuError> {
         let device = shared_device()?;
-        Ok(GpuBackend::with_budget(
-            device,
-            DeviceBudget::explicit(max_device_bytes),
-        ))
+        let budget = DeviceBudget::explicit(max_device_bytes);
+        Ok(GpuBackend::with_budget(device, budget, budget))
     }
 
     /// The budget wrapping [`Self::warp_fuse_tile`]'s dispatch -- the
@@ -116,6 +123,13 @@ impl GpuBackend {
     /// The settled device-byte budget and where it came from.
     pub fn device_budget(&self) -> DeviceBudget {
         self.device_budget
+    }
+
+    /// The device-byte budget the probe settled on, before any ceiling: the
+    /// most a ceiling can usefully name. [`Self::device_budget`] is this
+    /// lowered by the ceiling the backend was built with.
+    pub fn probed_budget(&self) -> DeviceBudget {
+        self.probed_budget
     }
 
     /// Refuses a `width x height` read rect at `samples_per_pixel` whose

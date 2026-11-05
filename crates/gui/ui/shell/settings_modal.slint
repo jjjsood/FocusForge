@@ -31,8 +31,14 @@ export component FFSettingsModal inherits FFModalPanel {
     callback performance-gpu-toggled(bool);
     callback performance-host-cap-edited(string);
     callback performance-vram-cap-edited(string);
+    callback performance-cap-committed();
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+    callback performance-host-unit-toggled();
+    callback performance-vram-unit-toggled();
+    callback performance-host-unit-selected(string);
+    callback performance-vram-unit-selected(string);
+    callback performance-unit-dismissed();
 
     in property <string> appearance-presentation: "image-list";
     in property <bool> appearance-menu-open: false;
@@ -166,7 +172,11 @@ export component FFSettingsModal inherits FFModalPanel {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
-                root.settings-close-requested();
+                if root.performance.host-cap.unit-open || root.performance.vram-cap.unit-open {
+                    root.performance-unit-dismissed();
+                } else {
+                    root.settings-close-requested();
+                }
                 return accept;
             }
             return reject;
@@ -215,8 +225,14 @@ export component FFSettingsModal inherits FFModalPanel {
                 gpu-toggled(on) => { root.performance-gpu-toggled(on); }
                 host-cap-edited(t) => { root.performance-host-cap-edited(t); }
                 vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+                cap-committed => { root.performance-cap-committed(); }
                 host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
                 vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+                host-unit-toggled => { root.performance-host-unit-toggled(); }
+                vram-unit-toggled => { root.performance-vram-unit-toggled(); }
+                host-unit-selected(u) => { root.performance-host-unit-selected(u); }
+                vram-unit-selected(u) => { root.performance-vram-unit-selected(u); }
+                unit-dismissed => { root.performance-unit-dismissed(); }
             }
         }
 

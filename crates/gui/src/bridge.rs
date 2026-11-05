@@ -1447,6 +1447,20 @@ pub fn push_performance_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
     push_performance(app, controller, None);
 }
 
+/// Applies `change` to the controller, then pushes the Performance view.
+fn performance_change(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    change: impl FnOnce(&mut AppController),
+) {
+    record_surface_input(InputSurface::Other);
+    change(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        push_performance_view(&app, controller);
+        direct_publication_scope(InputSurface::Other);
+    }
+}
+
 /// [`push_performance_view`] that leaves the text of the field being typed in
 /// as the window has it, so a push never rewrites what the user is typing.
 fn push_performance(
@@ -1458,9 +1472,12 @@ fn push_performance(
     let cap = |field: &crate::performance_settings::CapField| PerformanceCap {
         text: field.text.as_str().into(),
         placeholder: field.placeholder.into(),
+        unit: field.unit.label().into(),
         invalid: field.invalid,
         enabled: field.enabled,
         scroll_offset: field.scroll_offset,
+        limit: field.limit.as_str().into(),
+        unit_open: field.unit_open,
     };
     let mut state = PerformanceState {
         gpu: view.gpu,
@@ -1468,9 +1485,6 @@ fn push_performance(
         backend: view.backend.into(),
         host_cap: cap(&view.host_cap),
         vram_cap: cap(&view.vram_cap),
-        host_budget: view.host_budget.into(),
-        vram_budget: view.vram_budget.into(),
-        vram_budget_known: view.vram_budget_known,
         note: view.note.into(),
     };
     let shown = app.get_performance();
@@ -3818,30 +3832,52 @@ pub fn install(
     });
     app.on_performance_host_cap_edited({
         let controller = controller.clone();
-        let app_weak = app.as_weak();
         move |text| {
             record_surface_input(InputSurface::Other);
             controller
                 .lock()
                 .unwrap()
-                .set_host_memory_cap(text.as_str());
-            if let Some(app) = app_weak.upgrade() {
-                push_performance(&app, &controller, Some(EditedCap::HostMemory));
-                direct_publication_scope(InputSurface::Other);
-            }
+                .edit_host_memory_cap(text.as_str());
+            direct_publication_scope(InputSurface::Other);
         }
     });
     app.on_performance_vram_cap_edited({
         let controller = controller.clone();
-        let app_weak = app.as_weak();
         move |text| {
             record_surface_input(InputSurface::Other);
-            controller.lock().unwrap().set_vram_cap(text.as_str());
-            if let Some(app) = app_weak.upgrade() {
-                push_performance(&app, &controller, Some(EditedCap::Vram));
-                direct_publication_scope(InputSurface::Other);
-            }
+            controller.lock().unwrap().edit_vram_cap(text.as_str());
+            direct_publication_scope(InputSurface::Other);
         }
+    });
+    app.on_performance_cap_committed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.commit_cap_drafts())
+    });
+    app.on_performance_host_unit_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.toggle_host_unit_list())
+    });
+    app.on_performance_vram_unit_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.toggle_vram_unit_list())
+    });
+    app.on_performance_host_unit_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |unit| performance_change(&app_weak, &controller, |c| c.set_host_cap_unit(&unit))
+    });
+    app.on_performance_vram_unit_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |unit| performance_change(&app_weak, &controller, |c| c.set_vram_cap_unit(&unit))
+    });
+    app.on_performance_unit_dismissed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.close_unit_lists())
     });
     app.on_performance_host_cap_cursor_moved({
         let controller = controller.clone();

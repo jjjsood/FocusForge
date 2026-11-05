@@ -2136,9 +2136,36 @@ fn performance_placeholders(tab: &ElementHandle) -> Vec<String> {
     .collect()
 }
 
-/// The tab draws what the controller's view holds: the switch, both cap
-/// fields (or their placeholders) and the three read-only figures, whichever
-/// way the stored settings are.
+fn performance_unit_menus(tab: &ElementHandle) -> Vec<ElementHandle> {
+    by_position(
+        tab.query_descendants()
+            .match_accessible_role(AccessibleRole::Combobox),
+    )
+}
+
+/// The row of an open unit list that reads `label`.
+fn open_unit_option(tab: &ElementHandle, label: &str) -> ElementHandle {
+    tab.query_descendants()
+        .match_id("FFMenuList::option-row")
+        .find_all()
+        .into_iter()
+        .find(|row| row.accessible_label().as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("no {label:?} row in an open unit list"))
+}
+
+fn performance_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(
+        tab.query_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|text| text.accessible_label().unwrap_or_default().to_string())
+    .collect()
+}
+
+/// The tab draws what the controller's view holds: the switch, a number and a
+/// unit for each memory limit (or the placeholder), and the backend row,
+/// whichever way the stored settings are.
 #[test]
 fn performance_tab_shows_the_controller_view() {
     let mut on = AppController::new();
@@ -2148,7 +2175,10 @@ fn performance_tab_shows_the_controller_view() {
     capped.set_host_memory_cap("2GiB");
     capped.set_vram_cap("512MiB");
 
-    for (controller, gpu, caps) in [(on, true, ["", ""]), (capped, false, ["2GiB", "512MiB"])] {
+    for (controller, gpu, caps, placeholders) in [
+        (on, true, None, vec!["Not probed yet"]),
+        (capped, false, Some((["2", "512"], ["GiB", "MiB"])), vec![]),
+    ] {
         let view = controller.performance_view();
         assert_eq!(view.gpu, gpu);
         let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
@@ -2156,26 +2186,65 @@ fn performance_tab_shows_the_controller_view() {
         let tab = performance_tab(&app);
 
         assert_eq!(performance_switch_is_on(&tab), gpu);
-        let texts: Vec<String> = performance_cap_inputs(&tab)
+        let numbers: Vec<String> = performance_cap_inputs(&tab)
             .iter()
             .map(|input| input.accessible_value().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(texts, caps);
-        let placeholders = performance_placeholders(&tab);
-        if gpu {
-            assert_eq!(placeholders, ["No cap", "No cap"]);
-        } else {
-            assert!(placeholders.is_empty(), "{placeholders:?}");
-        }
         assert_eq!(
-            performance_row_texts(&tab),
+            numbers,
+            [view.host_cap.text.clone(), view.vram_cap.text.clone()]
+        );
+        let units: Vec<(String, String)> = performance_unit_menus(&tab)
+            .iter()
+            .map(|menu| {
+                (
+                    menu.accessible_label().unwrap_or_default().to_string(),
+                    menu.accessible_value().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            units,
             [
-                view.backend.as_str(),
-                view.host_budget.as_str(),
-                view.vram_budget.as_str()
+                (
+                    "Host memory unit".to_string(),
+                    view.host_cap.unit.label().to_string()
+                ),
+                (
+                    "VRAM unit".to_string(),
+                    view.vram_cap.unit.label().to_string()
+                ),
             ]
         );
-        assert_eq!(view.vram_budget, "Not probed yet");
+        match caps {
+            Some((expected_numbers, expected_units)) => {
+                assert_eq!(numbers, expected_numbers);
+                assert_eq!(
+                    [view.host_cap.unit.label(), view.vram_cap.unit.label()],
+                    expected_units
+                );
+            }
+            None => {
+                assert!(
+                    !numbers[0].is_empty() && numbers[0].bytes().all(|b| b.is_ascii_digit()),
+                    "the host row shows the default budget: {numbers:?}"
+                );
+                assert_eq!(numbers[1], "", "the VRAM row has no number before a probe");
+            }
+        }
+        assert_eq!(performance_placeholders(&tab), placeholders);
+        assert_eq!(performance_row_texts(&tab), [view.backend.as_str()]);
+        let texts = performance_texts(&tab);
+        for label in ["Host memory", "VRAM"] {
+            assert!(
+                texts.iter().any(|text| text == label),
+                "no {label:?} in {texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().all(|text| !text.contains("budget")),
+            "the tab has no budget row: {texts:?}"
+        );
     }
 }
 
@@ -2200,11 +2269,16 @@ fn performance_tab_composes_only_shared_components() {
         "FFSettingsSection {",
         "FFSettingsRow {",
         "FFToggle {",
-        "FFTextField {",
+        "FFSizeField {",
+        "FFErrorRow {",
+        "FFMenuList {",
         "FFRowText {",
         "FFStatusText {",
     ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+    for gone in ["FFTextField {", "Host budget", "VRAM budget"] {
+        assert!(!tab.contains(gone), "the tab still has {gone}");
     }
 }
 
@@ -2370,13 +2444,28 @@ fn type_into(app: &AppWindow, text: &str) {
     }
 }
 
-/// Clicking the switch asks for the opposite setting, and typing in a cap
-/// field reports every edit with the cursor's new position.
+fn press_key(app: &AppWindow, key: slint::platform::Key) {
+    use slint::platform::WindowEvent;
+    let text: slint::SharedString = key.into();
+    app.window()
+        .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+    app.window()
+        .dispatch_event(WindowEvent::KeyReleased { text });
+}
+
+/// Clicking the switch asks for the opposite setting. Typing in a number
+/// reports every accepted digit with the cursor's new position and commits
+/// nothing; leaving the number or pressing Enter commits once each, and
+/// picking a unit reports it.
 #[test]
 fn performance_controls_report_to_their_callbacks() {
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+
     let controller = AppController::new();
     let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
     let app = performance_window(&shared);
+    app.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
     let tab = performance_tab(&app);
 
     let toggled = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
@@ -2394,6 +2483,16 @@ fn performance_controls_report_to_their_callbacks() {
         let edits = vram_edits.clone();
         move |text| edits.borrow_mut().push(text.to_string())
     });
+    let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+    app.on_performance_cap_committed({
+        let commits = commits.clone();
+        move || commits.set(commits.get() + 1)
+    });
+    let host_units = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_host_unit_selected({
+        let units = host_units.clone();
+        move |unit| units.borrow_mut().push(unit.to_string())
+    });
     let cursors = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(char, f32, f32)>::new()));
     app.on_performance_host_cap_cursor_moved({
         let cursors = cursors.clone();
@@ -2409,16 +2508,36 @@ fn performance_controls_report_to_their_callbacks() {
         .match_id("FFToggle::area")
         .find_first()
         .expect("the switch has a touch area")
-        .mock_single_click(slint::platform::PointerEventButton::Left);
+        .mock_single_click(PointerEventButton::Left);
     assert_eq!(*toggled.borrow(), [!before]);
 
     let inputs = performance_cap_inputs(&tab);
-    inputs[0].mock_single_click(slint::platform::PointerEventButton::Left);
-    type_into(&app, "2G");
-    inputs[1].mock_single_click(slint::platform::PointerEventButton::Left);
+    let shown = inputs[0].accessible_value().unwrap_or_default();
+    inputs[0].mock_single_click(PointerEventButton::Left);
+    type_into(&app, "2G5");
+    assert_eq!(
+        *host_edits.borrow(),
+        [format!("{shown}2"), format!("{shown}25")],
+        "the letter is not accepted into the number"
+    );
+    slint::platform::update_timers_and_animations();
+    assert_eq!(commits.get(), 0, "typing commits nothing");
+
+    inputs[1].mock_single_click(PointerEventButton::Left);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(commits.get(), 1, "leaving the host number commits once");
     type_into(&app, "5");
-    assert_eq!(*host_edits.borrow(), ["2", "2G"]);
     assert_eq!(*vram_edits.borrow(), ["5"]);
+    assert_eq!(commits.get(), 1, "typing commits nothing");
+    press_key(&app, Key::Return);
+    assert_eq!(commits.get(), 2, "Enter commits once");
+
+    assert!(host_units.borrow().is_empty(), "no unit was picked yet");
+    let mut state = app.get_performance();
+    state.host_cap.unit_open = true;
+    app.set_performance(state);
+    open_unit_option(&tab, "GiB").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*host_units.borrow(), ["GiB"]);
 
     let cursors = cursors.borrow();
     let host: Vec<_> = cursors.iter().filter(|c| c.0 == 'h').collect();
@@ -2431,10 +2550,92 @@ fn performance_controls_report_to_their_callbacks() {
         vram.last().is_some_and(|c| c.1 > 0.0),
         "typing moves the VRAM cursor right: {vram:?}"
     );
-    let visible = 136.0 - 2.0 * 6.0;
+    let visible = 112.0 - 2.0 * 6.0;
     assert!(
         cursors.iter().all(|c| (c.2 - visible).abs() < EPS),
         "the visible width is the field less its two insets: {cursors:?}"
+    );
+}
+
+/// Confirming a number the system cannot give clamps the row, and the field
+/// shows the clamped value rather than the digits that were typed.
+#[test]
+fn cap_field_shows_the_clamped_value_after_an_edit() {
+    use focusforge_gui::SettingsSection;
+    use slint::platform::{Key, PointerEventButton};
+
+    let rig = settings_escape::rig();
+    rig.open_settings(SettingsSection::Performance);
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    let tab = performance_tab(&rig.app);
+    let host = performance_cap_inputs(&tab).remove(0);
+
+    let shown = host.accessible_value().unwrap_or_default();
+    host.mock_single_click(PointerEventButton::Left);
+    type_into(&rig.app, "99999999");
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(format!("{shown}99999999").as_str())
+    );
+    press_key(&rig.app, Key::Return);
+
+    let view = rig.controller.lock().unwrap().performance_view();
+    assert_ne!(view.host_cap.text, "99999999", "the number was clamped");
+    assert!(
+        view.host_cap.limit.starts_with("Max "),
+        "{:?}",
+        view.host_cap.limit
+    );
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(view.host_cap.text.as_str()),
+        "the field shows the view's number, not the typed digits"
+    );
+    let lines: Vec<String> = by_position(
+        tab.query_descendants()
+            .match_type_name("FFErrorRow")
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|line| line.accessible_label().unwrap_or_default().to_string())
+    .collect();
+    assert_eq!(
+        lines,
+        [view.host_cap.limit.as_str()],
+        "the line names the maximum"
+    );
+}
+
+/// A unit picked while a typed number is unconfirmed commits it in that unit;
+/// a clamp there shows the clamped value in the field too.
+#[test]
+fn cap_field_shows_the_clamped_value_after_a_unit_pick() {
+    use focusforge_gui::SettingsSection;
+    use slint::platform::PointerEventButton;
+
+    let rig = settings_escape::rig();
+    rig.open_settings(SettingsSection::Performance);
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    let tab = performance_tab(&rig.app);
+    let host = performance_cap_inputs(&tab).remove(0);
+
+    host.mock_single_click(PointerEventButton::Left);
+    type_into(&rig.app, "99999999");
+    rig.controller.lock().unwrap().toggle_host_unit_list();
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    open_unit_option(&tab, "GiB").mock_single_click(PointerEventButton::Left);
+
+    let view = rig.controller.lock().unwrap().performance_view();
+    assert!(
+        view.host_cap.limit.starts_with("Max "),
+        "{:?}",
+        view.host_cap.limit
+    );
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(view.host_cap.text.as_str()),
+        "the field shows the view's number, not the typed digits"
     );
 }
 
@@ -3643,6 +3844,63 @@ mod settings_escape {
         assert!(
             !rig.app.get_settings_open(),
             "Escape closes Settings after the Save to field held focus and About was selected"
+        );
+    }
+
+    #[test]
+    fn escape_from_a_cap_field_closes_settings_and_commits_it() {
+        let rig = rig();
+        rig.controller.lock().unwrap().set_host_cap_unit("MiB");
+        rig.open_settings(SettingsSection::Performance);
+        focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+        let tab = performance_tab(&rig.app);
+        let host = performance_cap_inputs(&tab).remove(0);
+
+        host.mock_single_click(PointerEventButton::Left);
+        for _ in 0..12 {
+            press_key(&rig.app, Key::Backspace);
+            press_key(&rig.app, Key::Delete);
+        }
+        type_into(&rig.app, "200");
+        assert!(rig.app.get_settings_open());
+        rig.escape();
+
+        assert!(
+            !rig.app.get_settings_open(),
+            "Escape closes Settings while a number holds focus"
+        );
+        let row = rig.controller.lock().unwrap().performance_view().host_cap;
+        assert_eq!(
+            (row.text.as_str(), row.unit.label(), row.invalid),
+            ("200", "MiB", false)
+        );
+    }
+
+    #[test]
+    fn escape_closes_an_open_unit_list_before_settings() {
+        let rig = rig();
+        rig.open_settings(SettingsSection::Performance);
+        focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+        let tab = performance_tab(&rig.app);
+        performance_unit_menus(&tab)[0].invoke_accessible_default_action();
+        assert!(rig.controller.lock().unwrap().unit_list_open());
+        assert!(
+            rig.app.get_performance().host_cap.unit_open,
+            "the list is drawn open"
+        );
+
+        rig.escape();
+        assert!(
+            rig.app.get_settings_open(),
+            "the first Escape keeps Settings"
+        );
+        assert!(!rig.controller.lock().unwrap().unit_list_open());
+        assert!(!rig.app.get_performance().host_cap.unit_open);
+
+        rig.escape();
+        assert!(
+            !rig.app.get_settings_open(),
+            "the second Escape closes Settings"
         );
     }
 
