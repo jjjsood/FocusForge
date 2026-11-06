@@ -9658,7 +9658,7 @@ fn fixture_two_stacks_ask_the_grouping_question() {
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _) => {
-            assert_eq!(question.frame_count, 6);
+            assert_eq!(question.stack_sizes, vec![3, 3]);
             assert_eq!(question.project_count, 2);
         }
         _ => panic!("two stacks in one folder must raise the grouping question"),
@@ -9846,7 +9846,7 @@ fn fixture_project_without_its_frames_opens_as_sources_missing() {
         .sources_notice()
         .expect("the missing frames raise the notice");
     assert_eq!(title, "The frames are no longer there");
-    assert_eq!(file_name, "missing");
+    assert_eq!(file_name, "missing.ffp");
 }
 
 #[test]

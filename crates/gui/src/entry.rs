@@ -56,7 +56,8 @@ pub enum OpenAs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupingQuestion {
     pub root: PathBuf,
-    pub frame_count: usize,
+    /// Each stack's frame count, in the order the stacks open.
+    pub stack_sizes: Vec<usize>,
     pub project_count: usize,
 }
 
@@ -91,12 +92,16 @@ pub struct PendingOpen {
     pub sources: Vec<SourceRef>,
 }
 
+/// A project file's name with its extension, as both source dialogs show it.
+pub(crate) fn project_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 impl PendingOpen {
     fn new(path: PathBuf, pending: PendingProject) -> Self {
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        let file_name = project_file_name(&path);
         // A second, cheap reopen just for the manifest's own sources --
         // `PendingProject` exposes no manifest access, only its mismatch.
         let sources = Project::open(&path)
@@ -493,7 +498,7 @@ pub fn open(target: OpenTarget, mut progress: impl FnMut(usize, usize)) -> OpenO
                     })
                 } else {
                     let question = GroupingQuestion {
-                        frame_count: proposal.groups.iter().map(|g| g.frames.len()).sum(),
+                        stack_sizes: proposal.groups.iter().map(|g| g.frames.len()).collect(),
                         project_count: proposal.groups.len(),
                         root: proposal.root.clone(),
                     };

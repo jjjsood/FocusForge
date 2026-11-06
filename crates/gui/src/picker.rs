@@ -19,11 +19,15 @@ use std::sync::OnceLock;
 use crate::entry::RAW_EXTENSIONS;
 use crate::job::{DNG_EXTENSIONS, ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 
+/// The folder chooser's title -- true for every caller of
+/// [`DialogRequest::Entry`], since none of them picks a project file.
+const FOLDER_CHOOSER_TITLE: &str = "Choose a folder";
+
 /// Opens the OS folder picker. `None` on cancel (or a missing dialog
 /// backend, rfd#320).
 pub fn pick_entry() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Open folder or project")
+        .set_title(FOLDER_CHOOSER_TITLE)
         .pick_folder()
 }
 
@@ -293,6 +297,11 @@ mod tests {
                 "{given} under {format:?}"
             );
         }
+    }
+
+    #[test]
+    fn folder_chooser_title_names_a_folder() {
+        assert_eq!(FOLDER_CHOOSER_TITLE, "Choose a folder");
     }
 
     #[test]

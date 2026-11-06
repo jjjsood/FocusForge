@@ -657,6 +657,23 @@ struct TabFailure {
     reason: String,
 }
 
+/// What a refusal dialog offers beside dismissing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalAction {
+    /// Choose another folder to open.
+    PickFolder,
+    /// Locate the frames of the tab with this id.
+    LocateTab(u64),
+    /// Nothing beyond closing the dialog.
+    Close,
+}
+
+/// A refusal's own title and the action its dialog offers.
+struct Refusal {
+    title: String,
+    action: RefusalAction,
+}
+
 /// The missing-sources dialog's own payload: which tab it names, its
 /// counts ([`overlay::sources_missing_body`]) and the project's file name
 /// for its context line.
@@ -1373,11 +1390,9 @@ struct ShellState {
     pending_mismatch: Option<PendingOpen>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
-    /// The most recent refusal's own title, `Some` only for a project or
-    /// locate refusal -- `None` keeps the folder-empty dialog's fixed
-    /// "No frames here" title and `Pick another folder…` action.
-    refusal_title: Option<String>,
-    /// Whether the "No frames here" refusal dialog is open -- raised by
+    /// The most recent refusal's title and the action its dialog offers.
+    refusal: Option<Refusal>,
+    /// Whether the refusal dialog is open -- raised by
     /// [`AppController::refuse_message`], cleared by
     /// [`AppController::dismiss_refusal`].
     refusal_open: bool,
@@ -4393,16 +4408,18 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
-    /// The active refusal's own title, `None` while the folder-empty
-    /// refusal is showing -- it keeps its own fixed "No frames here" title
-    /// and `Pick another folder…` action; every other refusal shows this
-    /// title with a `Close` button instead.
+    /// The most recent refusal's own title, `Some` once any refusal was raised.
     pub fn refusal_title(&self) -> Option<&str> {
-        self.state.refusal_title.as_deref()
+        self.state.refusal.as_ref().map(|r| r.title.as_str())
     }
 
-    /// Closes the refusal dialog -- its own "Pick another folder…" button,
-    /// or `Close` for every other refusal; `Esc` closes either.
+    /// The action the most recent refusal's dialog offers beside dismissing it.
+    pub fn refusal_action(&self) -> Option<RefusalAction> {
+        self.state.refusal.as_ref().map(|r| r.action)
+    }
+
+    /// Closes the refusal dialog -- `Cancel`, `Close` or `Esc`; the action's
+    /// own button closes it first.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -4532,12 +4549,17 @@ impl AppController {
                 let missing = if let GuiProject::Opened(p) = &project {
                     self.record_saved_project(p.path());
                     let (missing, total) = entry::missing_sources(p);
-                    (missing > 0)
-                        .then(|| (missing, total, p.validation().accepted_mismatch.is_some()))
+                    (missing > 0).then(|| {
+                        (
+                            missing,
+                            total,
+                            p.validation().accepted_mismatch.is_some(),
+                            entry::project_file_name(p.path()),
+                        )
+                    })
                 } else {
                     None
                 };
-                let file_name = entry::tab_title(&project);
                 let preloaded = thumbnails.next();
                 let decode = preloaded.is_none();
                 let (picture, meta) = match preloaded {
@@ -4547,7 +4569,7 @@ impl AppController {
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
                 let mut tab = ProjectTab::new(project, id, picture, meta);
-                if let Some((missing, total, accepted_mismatch)) = missing {
+                if let Some((missing, total, accepted_mismatch, file_name)) = missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
                         stage: "NOTHING TO SHOW".to_string(),
@@ -4595,26 +4617,33 @@ impl AppController {
             }
             _ => {}
         }
-        self.refuse_message(message);
-        self.state.refusal_title = match &err {
-            EntryError::ProjectRefused { .. } => Some("This project cannot be opened".to_string()),
-            EntryError::MixedKinds { .. } | EntryError::SeveralFolders { .. } => {
-                Some("These images are not one stack".to_string())
+        let (title, action) = match &err {
+            EntryError::NoReadableFrames { .. } | EntryError::Unreadable { .. } => {
+                ("No frames here", RefusalAction::PickFolder)
             }
-            EntryError::UnreadableFrame { .. } => Some("These frames cannot be read".to_string()),
-            _ => None,
+            EntryError::Read { .. } => ("This folder cannot be read", RefusalAction::PickFolder),
+            EntryError::ProjectRefused { .. } => {
+                ("This project cannot be opened", RefusalAction::Close)
+            }
+            EntryError::MixedKinds { .. } | EntryError::SeveralFolders { .. } => {
+                ("These images are not one stack", RefusalAction::Close)
+            }
+            EntryError::UnreadableFrame { .. } => {
+                ("These frames cannot be read", RefusalAction::Close)
+            }
         };
+        self.refuse_message(title, action, message);
         OpenOutcome::Refused(err)
     }
 
-    /// Refuses with an already-rendered message and no [`EntryError`] behind
-    /// it -- what a re-fuse's own frame-reachability check uses, since
-    /// nothing there is an entry-path failure. Clears any earlier refusal's
-    /// own title, so a caller with one of its own sets it right after this
-    /// call; every other refusal keeps the folder-empty dialog's fixed copy.
-    pub fn refuse_message(&mut self, message: String) {
+    /// Raises the refusal dialog with its own `title`, the `action` it
+    /// offers and an already-rendered `message`.
+    fn refuse_message(&mut self, title: &str, action: RefusalAction, message: String) {
         self.state.last_refusal = Some(message.clone());
-        self.state.refusal_title = None;
+        self.state.refusal = Some(Refusal {
+            title: title.to_string(),
+            action,
+        });
         self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
@@ -5485,12 +5514,14 @@ impl AppController {
                                 );
                             }
                             None => {
-                                self.refuse_message(format!(
-                                    "{} could not be reopened after its frames were located.",
-                                    pending.file_name
-                                ));
-                                self.state.refusal_title =
-                                    Some("This project cannot be opened".to_string());
+                                self.refuse_message(
+                                    "This project cannot be opened",
+                                    RefusalAction::Close,
+                                    format!(
+                                        "{} could not be reopened after its frames were located.",
+                                        pending.file_name
+                                    ),
+                                );
                             }
                         }
                     }
@@ -5520,8 +5551,11 @@ impl AppController {
                 }
             },
             Err(refused) => {
-                self.refuse_message(refused.message());
-                self.state.refusal_title = Some("These are not the project's frames".to_string());
+                self.refuse_message(
+                    "These are not the project's frames",
+                    RefusalAction::Close,
+                    refused.message(),
+                );
             }
         }
     }
@@ -7999,12 +8033,26 @@ impl AppController {
     /// Refuses a run whose recorded frame is no longer on disk, naming it
     /// in the message -- shared by [`Self::start_fuse`] and the queue
     /// promotion [`Self::settle_job`] runs. Every tab holding that frame
-    /// shows it unresolved from then on.
-    fn refuse_missing_frame(&mut self, missing: &Path) {
-        self.refuse_message(format!(
-            "{} is no longer on disk. This project cannot be fused again until it is back.",
-            missing.display()
-        ));
+    /// shows it unresolved from then on. A saved tab `id` offers to locate
+    /// its frames; a never-saved tab has no recorded hashes to check a folder
+    /// against, so it offers only `Close`.
+    fn refuse_missing_frame(&mut self, id: u64, missing: &Path) {
+        let saved = self
+            .tab_index(id)
+            .and_then(|index| self.state.projects.get(index))
+            .is_some_and(|tab| matches!(tab.project, GuiProject::Opened(_)));
+        self.refuse_message(
+            "A frame is no longer there",
+            if saved {
+                RefusalAction::LocateTab(id)
+            } else {
+                RefusalAction::Close
+            },
+            format!(
+                "{} is no longer on disk. This project cannot be fused again until it is back.",
+                missing.display()
+            ),
+        );
         for tab in &mut self.state.projects {
             if let Some(meta) = tab.meta.get_mut(missing) {
                 meta.unresolved = true;
@@ -8082,7 +8130,7 @@ impl AppController {
         let id = tab.id;
         let frames = tab.included_frames();
         if let Some(missing) = frames.iter().find(|path| !path.is_file()) {
-            self.refuse_missing_frame(missing);
+            self.refuse_missing_frame(id, missing);
             return false;
         }
         if !confirmed && self.ask_before_fuse(index, FuseEntry::Fuse) {
@@ -8205,7 +8253,7 @@ impl AppController {
         let algorithms = match job::resolve_request(&request) {
             Ok(algorithms) => algorithms,
             Err(message) => {
-                self.refuse_message(message);
+                self.refuse_message("This run cannot start", RefusalAction::Close, message);
                 return false;
             }
         };
@@ -8217,7 +8265,11 @@ impl AppController {
             .bytes()
             .saturating_sub(retained_preview_bytes);
         if processing_budget == 0 {
-            self.refuse_message("Source previews use the available host memory. Close or change the source view before starting processing.".to_string());
+            self.refuse_message(
+                "This run cannot start",
+                RefusalAction::Close,
+                "Source previews use the available host memory. Close or change the source view before starting processing.".to_string(),
+            );
             return false;
         }
         self.cancel_frame_drag();
@@ -8763,7 +8815,7 @@ impl AppController {
                 .get(index)
                 .and_then(|tab| tab.included_frames().into_iter().find(|p| !p.is_file()));
             if let Some(missing) = missing {
-                self.refuse_missing_frame(&missing);
+                self.refuse_missing_frame(id, &missing);
                 continue;
             }
             let Some(request) = self.job_request_for(index) else {

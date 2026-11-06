@@ -923,16 +923,19 @@ export component AppWindow inherits Window {
     // The one grouping question and the two refusals the entry path can
     // produce.
     in property <bool> question-open: false;
-    in property <int> question-frame-count: 0;
+    in property <string> question-body;
     in property <int> question-project-count: 0;
     callback question-open-as-one();
     callback question-open-as-many();
     callback question-cancelled();
     in property <bool> refusal-open: false;
-    in property <string> refusal-title: "No frames here";
+    in property <string> refusal-title: "";
     in property <string> refusal-body: "";
-    in property <string> refusal-button-label: "Pick another folder…";
-    callback refusal-pick-another-folder();
+    in property <string> refusal-dismiss-label: "Close";
+    // Empty for a refusal that offers nothing beyond closing.
+    in property <string> refusal-confirm-label: "";
+    callback refusal-dismissed();
+    callback refusal-confirmed();
 
     // A saved project's source content disagrees with its recorded
     // fingerprint; the project stays unopened until a choice is made.
@@ -1135,7 +1138,7 @@ export component AppWindow inherits Window {
         width: root.width;
         height: root.height;
         question-open: root.question-open;
-        frame-count: root.question-frame-count;
+        body: root.question-body;
         project-count: root.question-project-count;
         open-as-one => { root.question-open-as-one(); }
         open-as-many => { root.question-open-as-many(); }
@@ -1205,11 +1208,13 @@ export component AppWindow inherits Window {
         y: 0px;
         width: root.width;
         height: root.height;
-        refusal-open: root.refusal-open;
+        open: root.refusal-open;
         title: root.refusal-title;
         body: root.refusal-body;
-        button-label: root.refusal-button-label;
-        pick-another-folder => { root.refusal-pick-another-folder(); }
+        cancel-label: root.refusal-dismiss-label;
+        confirm-label: root.refusal-confirm-label;
+        cancelled => { root.refusal-dismissed(); }
+        confirmed => { root.refusal-confirmed(); }
     }
 
     toast := FFToast {

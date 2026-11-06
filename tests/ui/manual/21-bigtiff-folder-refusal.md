@@ -13,7 +13,7 @@ The window opens the three inputs in order: the 8-bit stack becomes a project, a
    Expect: (within 30 s) Must not: the Projects overview opens; a dialog titled "These frames cannot be read" with the text "00.tif is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again." and a **Close** button stays on top; the text holds no folder path.
 2. Click **Fuse stack** (`FFToolbar::fuse-button`) while the dialog is up.
    Expect: Must not: a fuse starts; the dialog stays on screen and the bottom bar status still reads "No job running".
-3. Click **Close** by its id (`FFRefusalDialog::pick-area`; it is not listed by label).
+3. Click **Close** within the refusal (`click "Close" AppWindow::refusal-dialog`).
    Expect: the dialog is gone and the tab strip shows one tab, "mantis8-64", and no tab for either BigTIFF folder.
 4. Click **Projects** (`FFTabStrip::projects-button`).
    Expect: the overview shows the count "3 · 2 did not open"; the card "mantis8-64" reads "3 frames · no checkpoint yet" and carries the "CURRENT" chip; two cards are headed "Not a project", named "one-bigtiff" and "all-bigtiff", each with the line "not read · not changed".

@@ -69,7 +69,7 @@ fn ambiguous_folder_asks_once() {
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _proposal) => {
             assert_eq!(question.project_count, 2);
-            assert_eq!(question.frame_count, 2);
+            assert_eq!(question.stack_sizes, vec![1, 1]);
         }
         OpenOutcome::Opened(_) => panic!("two directories must ask, not open straight through"),
         OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
@@ -87,6 +87,47 @@ fn ambiguous_folder_asks_once() {
         "cancel clears the question's own vocabulary"
     );
     assert!(controller.project_tabs().is_empty());
+}
+
+#[test]
+fn grouping_question_counts_frames_per_stack() {
+    for (label, sizes, body) in [
+        (
+            "equal",
+            [3, 3],
+            "This folder holds 2 stacks of 3 frames each.",
+        ),
+        (
+            "unequal",
+            [3, 4],
+            "This folder holds 2 stacks (3 and 4 frames).",
+        ),
+    ] {
+        let root = tree(&format!("entry_per_stack_{label}"));
+        for (stack, count) in ["subject-a", "subject-b"].into_iter().zip(sizes) {
+            for i in 0..count {
+                // mantis-64 holds three frames; a stack longer than that reuses them.
+                copy_frame_from(
+                    "mantis-64",
+                    &root.join(stack),
+                    &format!("{i:02}.tif"),
+                    i % 3,
+                );
+            }
+        }
+        let mut controller = AppController::new();
+        match common::open_and_settle(&mut controller, &[root]) {
+            OpenOutcome::Question(question, _) => {
+                assert_eq!(question.stack_sizes, sizes, "{label}");
+                assert_eq!(
+                    focusforge_gui::overlay::grouping_body(&question.stack_sizes),
+                    body,
+                    "{label}"
+                );
+            }
+            _ => panic!("{label}: two stacks must raise the question"),
+        }
+    }
 }
 
 #[test]
@@ -457,15 +498,16 @@ fn picked_images_refusals_change_nothing() {
     let tabs = controller.project_tabs();
 
     let not_one_stack = Some("These images are not one stack");
+    let no_frames = Some("No frames here");
     let mut refusals = Vec::new();
     for (set, title) in [
-        (vec![root.join("00.tif"), note.clone()], None),
+        (vec![root.join("00.tif"), note.clone()], no_frames),
         (
             vec![root.join("00.tif"), other.join("00.tif")],
             not_one_stack,
         ),
         (vec![root.join("00.tif"), raw.clone()], not_one_stack),
-        (vec![jpeg_a.clone(), png], None),
+        (vec![jpeg_a.clone(), png], no_frames),
         (vec![jpeg_a, jpeg_b], not_one_stack),
     ] {
         assert!(
@@ -476,7 +518,7 @@ fn picked_images_refusals_change_nothing() {
         assert_eq!(
             controller.refusal_title(),
             title,
-            "{set:?}: a set that is not one stack says so; an unreadable file keeps the dialog's own title"
+            "{set:?}: a set that is not one stack says so; an unreadable file says no frames are here"
         );
         refusals.push(
             controller
@@ -977,8 +1019,9 @@ fn no_grouping_vocabulary_after_the_answer() {
     match common::open_and_settle(&mut controller, &[ambiguous_root]) {
         OpenOutcome::Question(question, _) => {
             let rendered = format!(
-                "This folder reads as {} stacks of {} frames. Open as one project. Open as {} projects. Cancel",
-                question.project_count, question.frame_count, question.project_count,
+                "{} Open as one project. Open as {} projects. Cancel",
+                focusforge_gui::overlay::grouping_body(&question.stack_sizes),
+                question.project_count,
             );
             assert!(!rendered.to_lowercase().contains("group"));
         }
