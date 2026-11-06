@@ -86,16 +86,13 @@ pub fn sources_missing_body(missing: usize, total: usize) -> String {
 /// frames)".
 pub fn grouping_body(stack_sizes: &[usize]) -> String {
     let stacks = stack_sizes.len();
-    let Some((&first, rest)) = stack_sizes.split_first() else {
+    let Some((&last, head)) = stack_sizes.split_last() else {
         return "This folder holds no stacks.".to_owned();
     };
-    if rest.iter().all(|&size| size == first) {
-        let word = if first == 1 { "frame" } else { "frames" };
-        return format!("This folder holds {stacks} stacks of {first} {word} each.");
+    if head.iter().all(|&size| size == last) {
+        let word = if last == 1 { "frame" } else { "frames" };
+        return format!("This folder holds {stacks} stacks of {last} {word} each.");
     }
-    let (last, head) = stack_sizes
-        .split_last()
-        .expect("non-empty after split_first");
     let head = head
         .iter()
         .map(usize::to_string)
