@@ -7967,7 +7967,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         active_fuse_value(&controller, "weight-exponent"),
-        "4",
+        "4.0",
         "the copy carries the values remembered for other methods"
     );
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(6.0));
@@ -7978,7 +7978,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         active_fuse_value(&controller, "weight-exponent"),
-        "4",
+        "4.0",
         "editing the copy leaves the original's remembered values alone"
     );
 }

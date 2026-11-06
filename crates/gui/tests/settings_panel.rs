@@ -681,7 +681,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     ));
     controller.toggle_section_more("prepare");
     assert_eq!(row(&controller, "equalize").selected, "true");
-    assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
+    assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.50");
     assert_eq!(row(&controller, "equalize-target").value_text, "+0.3");
 
     let mut plain = AppController::new();
@@ -1258,6 +1258,52 @@ fn a_slider_drag_survives_a_panel_push() {
     assert_ne!(second, first, "the move after the push still drags");
 }
 
+/// The non-compact slider reads its value as plain text, never as a field.
+#[test]
+fn ff_slider_readout_is_plain_text() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    common::init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = AppController::new();
+    common::open_mantis64_tab(&mut controller, "slider_readout", 3);
+    controller.set_fuse_algorithm("weighted-average");
+    controller.toggle_section_more("fuse");
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+    focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+
+    let readouts: Vec<String> = i_slint_backend_testing::ElementQuery::from_root(&app)
+        .match_id("FFSlider::readout")
+        .find_all()
+        .iter()
+        .filter_map(|e| e.accessible_label().map(|l| l.to_string()))
+        .collect();
+    for shown in ["4.0", "16"] {
+        assert!(
+            readouts.iter().any(|r| r == shown),
+            "no slider readout reads {shown}: {readouts:?}"
+        );
+    }
+    let inside_slider = i_slint_backend_testing::ElementQuery::from_root(&app)
+        .match_type_name("FFSlider")
+        .find_all()
+        .iter()
+        .flat_map(|s| s.query_descendants().match_type_name("FFField").find_all())
+        .count();
+    assert_eq!(inside_slider, 0, "a slider contains a field box");
+}
+
 #[test]
 fn scrollbar_and_more_toggle_are_shared_primitives() {
     for (file, component, forbids_colour_literal) in [
@@ -1452,7 +1498,8 @@ fn fuse_value(controller: &AppController, id: &str) -> String {
         .clone()
 }
 
-/// A fuse parameter's declared default, as the row shows it.
+/// A fuse parameter's declared default, as the row shows it (a float at its
+/// 0.1 step).
 fn fuse_default_text(algorithm: &str, id: &str) -> String {
     let desc = registry::find(algorithm)
         .expect("registered")
@@ -1464,7 +1511,7 @@ fn fuse_default_text(algorithm: &str, id: &str) -> String {
         .clone();
     match desc {
         ParamValue::Int(v) => v.to_string(),
-        ParamValue::Float(v) => format!("{v}"),
+        ParamValue::Float(v) => format!("{v:.1}"),
         other => panic!("unexpected default {other:?}"),
     }
 }
@@ -1523,7 +1570,7 @@ fn switching_methods_remembers_each_methods_values() {
         controller.set_fuse_algorithm("laplacian");
         assert_eq!(fuse_value(&controller, "levels"), "3");
         controller.set_fuse_algorithm("weighted-average");
-        assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
+        assert_eq!(fuse_value(&controller, "weight-exponent"), "3.0");
         assert_eq!(
             fuse_value(&controller, "radius"),
             fuse_default_text("weighted-average", "radius"),
@@ -1628,7 +1675,7 @@ fn reopened_project_remembers_only_its_sealed_method() {
 
     controller.toggle_section_more("fuse");
     assert_eq!(picked_ids(&controller).0, "weighted-average");
-    assert_eq!(fuse_value(&controller, "weight-exponent"), "5");
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "5.0");
 
     controller.set_fuse_algorithm("laplacian");
     assert_eq!(
@@ -1644,7 +1691,7 @@ fn reopened_project_remembers_only_its_sealed_method() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         fuse_value(&controller, "weight-exponent"),
-        "5",
+        "5.0",
         "the sealed method's values come back"
     );
 }
@@ -2635,7 +2682,7 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
     );
     assert_eq!(
         prepare_row(&controller, "equalize-max-gain").value_text,
-        "1.5"
+        "1.50"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
@@ -2646,7 +2693,7 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
     );
     assert_eq!(
         prepare_row(&controller, "equalize-max-gain").value_text,
-        "1.5"
+        "1.50"
     );
 }
 
@@ -2694,11 +2741,11 @@ fn signed_readout_formats_negative_zero_and_positive() {
         );
     }
 
-    // A range that stays non-negative keeps the plain number.
+    // A range that stays non-negative reads unsigned, at the step's decimals.
     controller.toggle_section_more("fuse");
     controller.set_fuse_algorithm("weighted-average");
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
-    assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "3.0");
 }
 
 #[test]

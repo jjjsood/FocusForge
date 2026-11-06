@@ -1569,6 +1569,16 @@ export component ThemeSheet inherits Window {
         }
         FFRowLabel {
             width: 320px;
+            label-text: "Score Radius (invalid)";
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; invalid: true; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Sharp-source preference";
+            FFSlider { scale: "linear"; fraction: 0.4286; value-text: "4.0"; }
+        }
+        FFRowLabel {
+            width: 320px;
             label-text: "Epsilon (px)";
             FFSlider { scale: "logarithmic"; fraction: 0.5556; value-text: "0.0001"; }
         }

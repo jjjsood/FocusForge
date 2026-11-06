@@ -13,9 +13,9 @@ Use a fresh settings directory. The PREPARE section of the Settings dock holds t
 
 ## Keyboard and snapping
 4. Click **Target brightness track** (`FFSlider::drag-area`, instance 1).
-   Expect: the target readout reads 0.0 and has an orange border.
+   Expect: the target readout reads 0.0 in orange.
 5. Press Right once.
-   Expect: the target readout reads +0.1 and keeps its orange border.
+   Expect: the target readout reads +0.1 and stays orange.
 6. Press Left three times.
    Expect: the target readout reads −0.2.
 7. Drag **Target brightness track** (`FFSlider::drag-area`, instance 1) to its 37% point.
