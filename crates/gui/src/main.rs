@@ -31,6 +31,10 @@ use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 #[derive(Parser)]
 #[command(name = "focusforge-gui", version)]
 struct Args {
+    /// Frames, a folder or a `*.ffp` to open together, as dropping them on the
+    /// window would. A file manager's "Open with" passes its selection here.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
     /// Exit this many milliseconds after the window is shown.
     #[arg(long)]
     exit_after: Option<u64>,
@@ -41,7 +45,7 @@ struct Args {
     /// Choose the main or detached window for `--screenshot`.
     #[arg(long, value_enum, default_value = "main", requires = "screenshot")]
     screenshot_window: ScreenshotWindow,
-    /// Undock a pane once a project loads, for window inspection.
+    /// Undock a pane once the `--open` project loads, for window inspection.
     #[arg(long, value_enum, requires = "open")]
     undock_pane: Option<UndockPane>,
     /// Dock the inspected pane this many milliseconds after undocking.
@@ -155,9 +159,9 @@ struct Args {
     /// the editor surface with no click sequence.
     #[arg(long, requires = "fuse_tabs")]
     enter_editor: bool,
-    /// Requests removing the frame at this index right after `--open`, for
-    /// inspecting the frame-set warning it raises on a checkpointed project
-    /// with no click sequence.
+    /// Presses the remove control of the frame at this index once the opened
+    /// project has loaded, for inspecting the frame-set warning it raises on
+    /// a checkpointed project with no click sequence.
     #[arg(long)]
     frame_remove_warning: Option<usize>,
     /// Presses `Export image` on the active tab's current row once `--open`
@@ -399,6 +403,50 @@ fn start_fuse_tabs_timer(
         }
     });
     *slot.borrow_mut() = Some(timer);
+}
+
+/// Presses the remove control of frame `index` once every `--open` load has
+/// settled (`open_timer` is the load timer starting them), so the press acts
+/// on the last-opened project and raises its frame-set warning. With nothing
+/// to open it fires on the first tick.
+fn start_frame_remove_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    slot: &Rc<RefCell<Option<slint::Timer>>>,
+    index: usize,
+    open_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let timer_slot = slot.clone();
+    let open_timer = open_timer.clone();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().load_in_flight()
+            || open_timer
+                .borrow()
+                .as_ref()
+                .is_some_and(slint::Timer::running)
+        {
+            return;
+        }
+        app.invoke_images_frame_remove_requested(index as i32);
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *slot.borrow_mut() = Some(timer);
+}
+
+/// The first load a launch starts and the `--open` paths queued behind it:
+/// the positional paths together, else the first `--open` path alone.
+fn startup_loads(args: &Args) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if !args.paths.is_empty() {
+        return Some((args.paths.clone(), args.open.clone()));
+    }
+    let (first, rest) = args.open.split_first()?;
+    Some((vec![first.clone()], rest.to_vec()))
 }
 
 /// Presses `Export image` and confirms with the proposed destination once
@@ -2029,21 +2077,18 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         }
 
         // Each load runs on its own worker thread; a refusal reaches the
-        // window's own refusal dialog. Only the first `--open` path starts
-        // here -- the load timer starts each of the rest in turn once the
-        // one before it settles, and repaints once the last one has.
+        // window's own refusal dialog. Only the first load starts here -- the
+        // load timer starts each queued `--open` path in turn once the one
+        // before it settles, and repaints once the last one has.
         let open_wait_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
-        if let Some((first, rest)) = args.open.split_first() {
-            controller
-                .lock()
-                .unwrap()
-                .open_paths(std::slice::from_ref(first));
+        if let Some((first, queued)) = startup_loads(args) {
+            controller.lock().unwrap().open_paths(&first);
             bridge::start_load_timer(
                 app.as_weak(),
                 controller.clone(),
                 canvas.clone(),
                 &open_wait_timer,
-                rest.to_vec(),
+                queued,
             );
         }
 
@@ -2057,7 +2102,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
             }
             let controller = controller.clone();
             let timer = analytics_timer.clone();
-            let tabs = args.open.len();
+            let tabs = args.open.len() + usize::from(!args.paths.is_empty());
             analytics_timer.start(
                 slint::TimerMode::Repeated,
                 Duration::from_millis(50),
@@ -2169,8 +2214,15 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
             }
         }
 
+        let frame_remove_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
         if let Some(index) = args.frame_remove_warning {
-            controller.lock().unwrap().remove_frame(index);
+            start_frame_remove_timer(
+                app.as_weak(),
+                controller.clone(),
+                &frame_remove_timer,
+                index,
+                &open_wait_timer,
+            );
         }
 
         let export_active_row_timer: Rc<RefCell<Option<slint::Timer>>> =
@@ -2218,6 +2270,56 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// `count` of the mantis-64 frames copied into `<parent>/<name>`.
+    fn mantis_folder(parent: &Path, name: &str, count: usize) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir(&root).unwrap();
+        for index in 0..count {
+            let frame = format!("{index:02}.tif");
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/mantis-64/frames")
+                    .join(&frame),
+                root.join(frame),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    /// Advances the timers and the load worker's completion, which this
+    /// backend has no event loop to deliver, until no load or run is pending
+    /// and every timer in `slots` has stopped.
+    fn pump_until_settled(
+        app: &AppWindow,
+        controller: &Arc<Mutex<AppController>>,
+        slots: &[&Rc<RefCell<Option<slint::Timer>>>],
+    ) {
+        let started = std::time::Instant::now();
+        loop {
+            i_slint_backend_testing::mock_elapsed_time(job::POLL);
+            if controller.lock().unwrap().settle_open().is_some() {
+                bridge::push_projects(app, controller);
+            }
+            let idle = {
+                let controller = controller.lock().unwrap();
+                !controller.load_in_flight() && !controller.work_pending()
+            };
+            if idle
+                && !slots
+                    .iter()
+                    .any(|slot| slot.borrow().as_ref().is_some_and(slint::Timer::running))
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "runs never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn version_flag_prints_the_binary_name_and_workspace_version() {
         let error = Args::try_parse_from(["focusforge-gui", "--version"])
@@ -2250,22 +2352,10 @@ mod tests {
         let app = AppWindow::new().unwrap();
         app.window().set_size(slint::PhysicalSize::new(1440, 900));
         let dir = tempfile::tempdir().unwrap();
-        let folder = |name: &str| {
-            let root = dir.path().join(name);
-            std::fs::create_dir(&root).unwrap();
-            for index in 0..3 {
-                let frame = format!("{index:02}.tif");
-                std::fs::copy(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../fixtures/mantis-64/frames")
-                        .join(&frame),
-                    root.join(frame),
-                )
-                .unwrap();
-            }
-            root
-        };
-        let (first, second) = (folder("first"), folder("second"));
+        let (first, second) = (
+            mantis_folder(dir.path(), "first", 3),
+            mantis_folder(dir.path(), "second", 3),
+        );
         let mut state = AppController::new();
         state.set_scratch_root_for_test(dir.path().join("scratch"));
         let controller = Arc::new(Mutex::new(state));
@@ -2311,30 +2401,7 @@ mod tests {
             &open_slot,
         );
 
-        let running = |slot: &Rc<RefCell<Option<slint::Timer>>>| {
-            slot.borrow().as_ref().is_some_and(slint::Timer::running)
-        };
-        let started = std::time::Instant::now();
-        loop {
-            i_slint_backend_testing::mock_elapsed_time(job::POLL);
-            // The load worker's completion event, which this backend has no
-            // event loop to deliver.
-            if controller.lock().unwrap().settle_open().is_some() {
-                bridge::push_projects(&app, &controller);
-            }
-            let idle = {
-                let controller = controller.lock().unwrap();
-                !controller.load_in_flight() && !controller.work_pending()
-            };
-            if idle && !running(&open_slot) && !running(&press_slot) {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "runs never settled"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        pump_until_settled(&app, &controller, &[&open_slot, &press_slot]);
 
         let mut controller = controller.lock().unwrap();
         assert_eq!(controller.project_tabs().len(), 2);
@@ -2345,6 +2412,126 @@ mod tests {
                 "tab {tab} fused and parked at its own question"
             );
         }
+    }
+
+    /// With two `--open` folders, a frame-remove press must wait until the
+    /// last one has loaded and then act on that tab, not on the first.
+    #[test]
+    fn frame_remove_press_waits_for_every_queued_open() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let dir = tempfile::tempdir().unwrap();
+        let first = mantis_folder(dir.path(), "first", 3);
+        let second = mantis_folder(dir.path(), "second", 2);
+        let mut state = AppController::new();
+        state.set_scratch_root_for_test(dir.path().join("scratch"));
+        let controller = Arc::new(Mutex::new(state));
+        let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+        let _installed = bridge::install(
+            &app,
+            controller.clone(),
+            canvas.clone(),
+            Rc::new(RefCell::new(None)),
+        );
+
+        let load = controller
+            .lock()
+            .unwrap()
+            .open_paths(std::slice::from_ref(&first))
+            .expect("the first load starts");
+        load.join().unwrap();
+        controller.lock().unwrap().settle_open().unwrap();
+        let open_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        bridge::start_load_timer(
+            app.as_weak(),
+            controller.clone(),
+            canvas,
+            &open_slot,
+            vec![second],
+        );
+        let press_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        start_frame_remove_timer(
+            app.as_weak(),
+            controller.clone(),
+            &press_slot,
+            1,
+            &open_slot,
+        );
+
+        pump_until_settled(&app, &controller, &[&open_slot, &press_slot]);
+
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(controller.project_tabs().len(), 2);
+        let frames = |controller: &mut AppController, tab: usize| {
+            controller.select_project(tab);
+            controller.images_panel().rows.len()
+        };
+        assert_eq!(
+            frames(&mut controller, 1),
+            1,
+            "the last-opened tab lost frame 1"
+        );
+        assert_eq!(frames(&mut controller, 0), 3, "the first tab is untouched");
+    }
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("focusforge-gui").chain(args.iter().copied()))
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn positional_paths_open_as_one_drop() {
+        let args = parse(&["a.tif", "b.tif", "c.tif", "--exit-after", "5"]).unwrap();
+        assert_eq!(args.paths, paths(&["a.tif", "b.tif", "c.tif"]));
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["a.tif", "b.tif", "c.tif"]), Vec::new()))
+        );
+        let folder = parse(&["frames"]).unwrap();
+        assert_eq!(
+            startup_loads(&folder),
+            Some((paths(&["frames"]), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn positional_paths_load_before_the_open_queue() {
+        let args = parse(&["a.tif", "b.tif", "--open", "x", "--open", "y"]).unwrap();
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["a.tif", "b.tif"]), paths(&["x", "y"])))
+        );
+        // `--open` takes one value, so the second word is a positional.
+        let args = parse(&["--open", "a", "b"]).unwrap();
+        assert_eq!(args.open, paths(&["a"]));
+        assert_eq!(args.paths, paths(&["b"]));
+        assert!(parse(&["--frame-remove-warning", "1", "x.ffp"]).is_ok());
+    }
+
+    #[test]
+    fn positional_paths_leave_open_alone_unchanged() {
+        let args = parse(&["--open", "x", "--open", "y", "--open", "z"]).unwrap();
+        assert!(args.paths.is_empty());
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["x"]), paths(&["y", "z"])))
+        );
+        assert_eq!(startup_loads(&parse(&[]).unwrap()), None);
+    }
+
+    #[test]
+    fn positional_paths_do_not_unlock_flags_that_need_open() {
+        let error = parse(&["x.ffp", "--undock-pane", "frame"])
+            .err()
+            .expect("--undock-pane still requires --open");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[cfg(target_os = "linux")]
