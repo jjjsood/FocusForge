@@ -120,6 +120,7 @@ pub mod performance_settings;
 
 pub mod appearance_settings;
 pub mod source_previews;
+pub mod update_settings;
 
 /// The `Recent` list's own file format, mirroring `crate::input_config`. No
 /// `use slint::` anywhere in it. `pub` so `src/main.rs` and

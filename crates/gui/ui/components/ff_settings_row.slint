@@ -15,13 +15,16 @@ export component FFSettingsRow inherits Rectangle {
     in property <bool> align-end: false;
     // The last row of a section has no rule.
     in property <bool> divider: true;
+    // The label may run past its column into the value column; for a row
+    // whose control sits at the far end (`align-end`).
+    in property <bool> wide-label: false;
 
     height: ShellGeometry.settings-row-height + (root.divider ? 1px : 0px);
 
     FFRowLabel {
         x: 0px;
         y: (ShellGeometry.settings-row-height - self.height) / 2;
-        width: ShellGeometry.settings-label-width;
+        width: root.wide-label ? parent.width : ShellGeometry.settings-label-width;
         height: ShellGeometry.param-label-height;
         label-text: root.label;
     }

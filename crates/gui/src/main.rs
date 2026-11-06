@@ -69,6 +69,19 @@ struct Args {
     /// `[input]` table instead of the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
+    /// Shows the notice for a newer release of this version without asking
+    /// the release server; nothing with the start-up check switched off.
+    #[arg(long, hide = true, value_name = "VERSION")]
+    update_notice_preview: Option<String>,
+    /// Shows one state of the About tab's update controls without asking the
+    /// release server; use with `--settings-section about`.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "STATE",
+        value_parser = ["idle", "checking", "up-to-date", "newer", "skipped", "failed", "save-error"]
+    )]
+    about_preview: Option<String>,
     /// Opens the settings modal on the named section at startup:
     /// `performance`, `appearance`, `storage`, `input-map`, `diagnostics` or `about`.
     #[arg(long)]
@@ -1780,25 +1793,52 @@ fn install_recent(
     args: &Args,
 ) {
     let Some(config_dir) = resolve_config_dir(args) else {
-        controller.lock().unwrap().install_performance(
+        let mut controller = controller.lock().unwrap();
+        controller.install_performance(
             focusforge_gui::performance_settings::PerformanceSettings::default(),
         );
+        controller.install_updates(focusforge_gui::update_settings::UpdateSettings::default());
         return;
     };
     let entries = focusforge_gui::recent::load(&config_dir);
     let choice = focusforge_gui::export_settings::load(&config_dir);
     let performance = focusforge_gui::performance_settings::load(&config_dir);
     let appearance = focusforge_gui::appearance_settings::load(&config_dir);
+    let updates = focusforge_gui::update_settings::load(&config_dir);
     let mut controller = controller.lock().unwrap();
     controller.install_export_choice(choice);
     controller.install_performance(performance);
     controller.install_appearance(appearance);
+    controller.install_updates(updates);
     app.set_appearance_presentation(controller.source_presentation().slug().into());
     app.set_appearance_sharpness_heatmap(controller.sharpness_heatmap());
     app.set_appearance_reduce_motion(controller.reduce_motion());
     app.global::<Theme>()
         .set_reduce_motion(controller.reduce_motion());
     controller.install_recent(entries, config_dir);
+}
+
+/// Installs the release source behind Check now and starts the
+/// once-per-start update check from the installed `[updates]` settings: the
+/// preview release when `--update-notice-preview` names a version, else the
+/// latest GitHub release.
+fn start_update_check(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    let preview = args.update_notice_preview.clone();
+    let factory: focusforge_gui::ReleaseSourceFactory =
+        std::sync::Arc::new(move || match &preview {
+            Some(version) => Box::new(focusforge_gui::update_settings::PreviewRelease::new(
+                version,
+            )) as Box<dyn focusforge_gui::job::ReleaseSource + Send>,
+            None => Box::new(focusforge_gui::job::HttpReleaseSource::new()),
+        });
+    let mut controller = controller.lock().unwrap();
+    let settings = controller.update_settings().clone();
+    controller.set_release_source(factory.clone());
+    // The thread reports through the sink and needs no join.
+    drop(controller.start_update_check(&settings, factory()));
 }
 
 /// Parses a whole number of at least 1; `None` for anything else, including
@@ -2021,11 +2061,17 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
         install_recent(&controller, &app, args);
+        match &args.about_preview {
+            // The check reports through the sink and needs no join.
+            Some(state) => drop(controller.lock().unwrap().set_about_preview(state)),
+            None => start_update_check(&controller, args),
+        }
         install_slow_down(&controller, args);
         install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);
+        bridge::push_update_controls_view(&app, &controller);
 
         if let Some(state) = &args.toolbar_state {
             let mut controller = controller.lock().unwrap();
@@ -2236,6 +2282,41 @@ mod tests {
         let text = error.render().to_string();
         assert!(text.starts_with("focusforge-gui "), "{text}");
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    }
+
+    #[test]
+    fn update_notice_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        let args =
+            Args::try_parse_from(["focusforge-gui", "--update-notice-preview", "999.0.0"]).unwrap();
+        assert_eq!(args.update_notice_preview.as_deref(), Some("999.0.0"));
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("update-notice-preview"), "{help}");
+    }
+
+    #[test]
+    fn about_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        for state in [
+            "idle",
+            "checking",
+            "up-to-date",
+            "newer",
+            "skipped",
+            "failed",
+            "save-error",
+        ] {
+            let args = Args::try_parse_from(["focusforge-gui", "--about-preview", state]).unwrap();
+            assert_eq!(args.about_preview.as_deref(), Some(state));
+        }
+        let rejected = Args::try_parse_from(["focusforge-gui", "--about-preview", "bogus"])
+            .err()
+            .expect("an unknown state is refused at parse time");
+        assert_eq!(rejected.kind(), clap::error::ErrorKind::InvalidValue);
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("about-preview"), "{help}");
     }
 
     #[test]

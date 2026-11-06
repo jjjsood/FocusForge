@@ -384,6 +384,12 @@ def launch(checkout: Path, name: str, gui_args: list[str], size: str = DEFAULT_S
         dest = scratch / "config" / "focusforge"
         dest.mkdir(parents=True, exist_ok=True)
         shutil.copy(resolve(checkout, config_seed), dest / "settings.toml")
+    # Keep every shot off the network: the start-up update check must not run or raise its notice.
+    settings = scratch / "config" / "focusforge" / "settings.toml"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    text = settings.read_text() if settings.exists() else ""
+    if "[updates]" not in text:
+        settings.write_text(text + ("\n" if text and not text.endswith("\n") else "") + "[updates]\ncheck_on_start = false\n")
     if data_seed:
         shutil.copytree(resolve(checkout, data_seed), scratch / "data", dirs_exist_ok=True)
     w, h = (int(v) for v in size.lower().split("x"))

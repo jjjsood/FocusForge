@@ -54,6 +54,10 @@ pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
 pub use focusforge_core::retouch::{footprint, top_source};
+pub use focusforge_core::update::{
+    CheckFailure, HttpReleaseSource, ReleaseSource, UpdateCheck, check as check_for_update,
+    parse_version,
+};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
 /// Which operation a failure belongs to, classified from the typed

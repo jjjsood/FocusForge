@@ -29,6 +29,7 @@ pub mod sharp_areas;
 pub mod step_plan;
 pub mod tile;
 pub mod timing;
+pub mod update;
 pub mod zmap;
 
 #[cfg(feature = "test-algorithms")]

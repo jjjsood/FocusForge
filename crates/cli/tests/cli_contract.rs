@@ -214,6 +214,7 @@ fn quiet_is_global_before_or_after_subcommand() {
         &["review"][..],
         &["cache", "clear"][..],
         &["diagnostics"][..],
+        &["check-update"][..],
     ] {
         for quiet in ["-q", "--quiet"] {
             let mut before = vec![quiet];
@@ -266,6 +267,7 @@ fn root_help_groups_product_commands_from_metadata() {
             "history",
             "cache",
             "diagnostics",
+            "check-update",
         ] {
             let listed = help
                 .lines()

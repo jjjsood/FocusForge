@@ -42,7 +42,7 @@ use crate::generated::{
     FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap,
     PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
     RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StageTile, StoragePathState, StorageState, SummaryCell, Theme,
+    StageTile, StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -816,6 +816,8 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::DockTabSelected(_)
         | ShellEvent::DiagnosticsWriteFinished(_)
         | ShellEvent::DiagnosticsScanFinished { .. }
+        | ShellEvent::UpdateChecked(_)
+        | ShellEvent::UpdateCheckedNow(_)
         | ShellEvent::JobChanged
         | ShellEvent::LoadStarted
         | ShellEvent::LoadReady
@@ -1508,6 +1510,23 @@ pub fn push_storage_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>
     });
 }
 
+/// Rebuilds the About tab's update controls from the controller and pushes
+/// them into the window.
+pub fn push_update_controls_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let view = controller.lock().unwrap().update_controls_view();
+    app.set_update_controls(UpdateControlsState {
+        check_on_start: view.check_on_start,
+        check_enabled: view.check_enabled,
+        checking: view.checking,
+        status: view.status.into(),
+        status_tone: view.status_tone.as_str().into(),
+        result_text: view.result_text.into(),
+        skip_enabled: view.skip_enabled,
+        failure: view.failure.into(),
+        save_error: view.save_error.into(),
+    });
+}
+
 /// Pushes the About tab's view into the window: the build's version and
 /// repository, the repository shown without its scheme.
 pub fn push_about_view(app: &AppWindow) {
@@ -1724,7 +1743,7 @@ fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
         let banners = controller.take_native_notifications();
         let shown = controller
             .visible_toast()
-            .map(|n| (n.id, kind_word(n.kind), n.title.clone()));
+            .map(|n| (n.id, kind_word(n.kind), n.title.clone(), n.url.is_some()));
         let wait = controller
             .toast_deadline()
             .map(|deadline| deadline.saturating_duration_since(now));
@@ -1734,10 +1753,18 @@ fn refresh_toast(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
         crate::native_notify::spawn(banners);
     }
     match shown {
-        Some((id, kind, title)) => {
+        Some((id, kind, title, has_page)) => {
             app.set_toast_id(i32::try_from(id).unwrap_or(i32::MAX));
             app.set_toast_kind(kind.into());
             app.set_toast_title(title.into());
+            app.set_toast_link_label(
+                if has_page {
+                    "Open download page"
+                } else {
+                    "Open notification"
+                }
+                .into(),
+            );
             app.set_toast_open(true);
         }
         None => app.set_toast_open(false),
@@ -3091,6 +3118,12 @@ pub fn install(
             }));
     }
 
+    controller.lock().unwrap().set_url_opener(Arc::new(|url| {
+        if let Err(err) = webbrowser::open(url) {
+            tracing::warn!("could not open {url} in the browser: {err}");
+        }
+    }));
+
     {
         let app_weak = app.as_weak();
         let controller_for_sink = controller.clone();
@@ -3743,7 +3776,7 @@ pub fn install(
             controller
                 .lock()
                 .unwrap()
-                .open_center_at(u64::try_from(id).unwrap_or_default());
+                .activate_toast(u64::try_from(id).unwrap_or_default());
             if let Some(app) = app_weak.upgrade() {
                 refresh_toast(&app, &controller);
                 push_projects_overlay(&app, &controller.lock().unwrap());
@@ -3893,6 +3926,50 @@ pub fn install(
                 push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Other);
             }
+        }
+    });
+    app.on_update_check_on_start_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().set_update_check_on_start(on);
+            if let Some(app) = app_weak.upgrade() {
+                push_update_controls_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_update_check_now_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_surface_input(InputSurface::Other);
+            // The check reports through the sink and needs no join.
+            drop(controller.lock().unwrap().check_for_updates_now());
+            if let Some(app) = app_weak.upgrade() {
+                push_update_controls_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_update_skip_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().skip_update_version();
+            if let Some(app) = app_weak.upgrade() {
+                push_update_controls_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_update_page_requested({
+        let controller = controller.clone();
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().open_update_page();
         }
     });
     app.on_performance_gpu_toggled({
@@ -5194,6 +5271,14 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
                 .unwrap()
                 .finish_manifest_scan(generation, scan);
             push_diagnostics_view(app, controller);
+        }
+        ShellEvent::UpdateChecked(outcome) => {
+            controller.lock().unwrap().finish_update_check(outcome);
+            refresh_toast(app, controller);
+        }
+        ShellEvent::UpdateCheckedNow(outcome) => {
+            controller.lock().unwrap().finish_check_now(outcome);
+            push_update_controls_view(app, controller);
         }
         // The three entry-path events. `EntryRefused`'s
         // message is already rendered by `AppController::refuse`, never
