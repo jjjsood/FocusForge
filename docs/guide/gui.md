@@ -343,6 +343,9 @@ without a project. The toolbar, the dock and the bottom bar stay visible.
 
 *The Step calculator with its default values.*
 
+The drawing stays centred in the overlay and grows with the window, up to
+a limit; the boxes keep their size.
+
 The **Optics** switch at the top left chooses what the lens is described by:
 **Lens (f-stop)** or **Objective (NA)**. The boxes on the illustration take
 the values of your setup:

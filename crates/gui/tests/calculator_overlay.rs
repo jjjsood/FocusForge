@@ -659,3 +659,241 @@ fn escape_closes_after_an_image_row_click() {
         assert!(!rig.app.get_calculator_open(), "row {row}: button plain");
     }
 }
+
+type Rect = (f32, f32, f32, f32);
+
+/// A window of `size` with the calculator open, `objective` optics chosen and
+/// each `(slot, text)` entered.
+fn calculator_rig(size: (u32, u32), objective: bool, entries: &[(usize, &str)]) -> Rig {
+    let rig = rig_with(AppController::new());
+    rig.app
+        .window()
+        .set_size(slint::PhysicalSize::new(size.0, size.1));
+    {
+        let mut controller = rig.controller.lock().unwrap();
+        controller.toggle_calculator();
+        if objective {
+            controller.calculator_set_optics("Objective (NA)");
+        }
+        for (slot, text) in entries {
+            controller.calculator_edit(*slot, text);
+        }
+    }
+    rig.pump();
+    rig
+}
+
+fn drawing_scale(rig: &Rig) -> f32 {
+    rig.app.get_calculator_drawing_scale()
+}
+
+fn shown(rig: &Rig, slot: usize) -> bool {
+    use slint::Model;
+    rig.app
+        .get_calculator_fields()
+        .row_data(slot)
+        .unwrap()
+        .shown
+}
+
+fn intersects(a: Rect, b: Rect) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+fn inside(inner: Rect, outer: Rect) -> bool {
+    inner.0 >= outer.0
+        && inner.1 >= outer.1
+        && inner.0 + inner.2 <= outer.0 + outer.2
+        && inner.1 + inner.3 <= outer.1 + outer.3
+}
+
+/// The inset's drawn rectangle: its mapped corner, its size times the scale.
+fn drawn(rect: Rect, scale: f32) -> Rect {
+    (rect.0, rect.1, rect.2 * scale, rect.3 * scale)
+}
+
+#[test]
+fn calculator_drawing_is_centred_at_two_window_sizes() {
+    // (window, scale): the drawing is height-bound at 1440 x 900 (683 / 543)
+    // and clamped at the maximum at 1920 x 1200.
+    for (window, expected) in [((1440, 900), 1.2578), ((1920, 1200), 1.3)] {
+        for objective in [false, true] {
+            // The Overlap error grows the card by 20 px and the centred box with it.
+            for (entries, grow) in [(vec![], 0.0), (vec![(3, "0.95")], 20.0)] {
+                let at = format!("{window:?} objective {objective} grow {grow}");
+                let rig = calculator_rig(window, objective, &entries);
+                let s = drawing_scale(&rig);
+                assert!((s - expected).abs() < 0.001, "{at}: scale {s}");
+
+                // The overlay is the window minus the dock and icon bar
+                // (308 px) and the strip, toolbar and bottom bar (120 px).
+                let overlay = rect(&rig.app, "AppWindow::calculator-overlay");
+                assert_eq!(overlay.2, window.0 as f32 - 308.0, "{at}");
+                assert_eq!(overlay.3, window.1 as f32 - 120.0, "{at}");
+
+                let illustration = rect(&rig.app, "FFCalculatorOverlay::illustration");
+                let inset = rect(&rig.app, "FFCalculatorOverlay::inset");
+                assert_eq!(inset.3, 159.0 + grow, "{at}: card height");
+
+                let left = illustration.0;
+                let right = inset.0 + 415.0 * s;
+                assert!(
+                    ((left + right) / 2.0 - (overlay.0 + overlay.2 / 2.0)).abs() <= 1.0,
+                    "{at}: horizontal centre {left}..{right} in {overlay:?}"
+                );
+
+                // Body: below the 41 px header and rule, above the 56 px footer;
+                // free: above the 84 px summary band.
+                let free_height = overlay.3 - 41.0 - 56.0 - 84.0;
+                let top = overlay.1 + 41.0 + (free_height - s * (435.0 + grow)) / 2.0;
+                assert!(
+                    (inset.1 - top).abs() <= 1.0,
+                    "{at}: inset top {} against {top}",
+                    inset.1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn calculator_fields_keep_their_size_while_the_drawing_scales() {
+    let mut widths = Vec::new();
+    for window in [(1200, 760), (1440, 900), (1920, 1200)] {
+        let rig = calculator_rig(window, false, &[]);
+        let s = drawing_scale(&rig);
+        let illustration = rect(&rig.app, "FFCalculatorOverlay::illustration");
+        widths.push(illustration.2 * s);
+
+        for slot in 0..5 {
+            let at = format!("{window:?} slot {slot}");
+            let slot_rect = rect(&rig.app, &format!("FFCalculatorOverlay::slot-{slot}"));
+            assert_eq!((slot_rect.2, slot_rect.3), (56.0, 28.0), "{at}: box");
+        }
+        let (ox, oy, ow, oh) = rect(&rig.app, "AppWindow::calculator-overlay");
+        let inputs: Vec<_> = ElementQuery::from_root(&rig.app)
+            .match_id("FFField::input")
+            .find_all()
+            .into_iter()
+            .filter(|b| {
+                let p = b.absolute_position();
+                p.x >= ox && p.y >= oy && p.x < ox + ow && p.y < oy + oh
+            })
+            .collect();
+        assert_eq!(inputs.len(), 5, "{window:?}: five entry boxes");
+        for input in inputs {
+            assert_eq!(input.size().height, 28.0, "{window:?}: entry box height");
+        }
+    }
+    assert!(
+        (widths[0] - 770.0).abs() < 0.01,
+        "{widths:?}: 770 at the minimum"
+    );
+    assert!(widths[1] > widths[0], "{widths:?}");
+    assert!(widths[2] > widths[1], "{widths:?}");
+}
+
+#[test]
+fn calculator_fields_stay_on_their_leader_lines() {
+    // (leader, field end is the bottom end, slot): a leader's 1 px stroke sits
+    // 2 px right of its element's left edge.
+    let rows = [
+        (0, false, 0),
+        (2, false, 1),
+        (3, true, 2),
+        (5, true, 3),
+        (4, true, 4),
+    ];
+    for window in [(1200, 760), (1440, 900), (1600, 760), (1920, 1200)] {
+        for objective in [false, true] {
+            for entries in [vec![], vec![(3, "0.95")]] {
+                let at = format!("{window:?} objective {objective} entries {entries:?}");
+                let rig = calculator_rig(window, objective, &entries);
+                let s = drawing_scale(&rig);
+                for (leader, bottom, slot) in rows {
+                    let found = ElementQuery::from_root(&rig.app)
+                        .match_id(format!("FFCalculatorOverlay::leader-{leader}"))
+                        .find_first();
+                    if objective && slot == 1 {
+                        assert!(found.is_none(), "{at}: no magnification leader");
+                        assert!(!shown(&rig, slot), "{at}: no magnification field");
+                        continue;
+                    }
+                    let line = found.unwrap_or_else(|| panic!("{at}: leader-{leader}"));
+                    let (pos, size) = (line.absolute_position(), line.size());
+                    let end = (
+                        pos.x + 2.0 * s,
+                        pos.y + if bottom { size.height * s } else { 0.0 },
+                    );
+                    let slot_rect = rect(&rig.app, &format!("FFCalculatorOverlay::slot-{slot}"));
+                    let grown = (
+                        slot_rect.0 - 1.0,
+                        slot_rect.1 - 1.0,
+                        slot_rect.2 + 2.0,
+                        slot_rect.3 + 2.0,
+                    );
+                    assert!(
+                        inside((end.0, end.1, 0.0, 0.0), grown),
+                        "{at}: leader-{leader} end {end:?} outside slot {slot} box {slot_rect:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn calculator_scale_is_clamped_and_nothing_overlaps() {
+    // Overlap and Depth range violation lines at once.
+    let entries = [(3, "0.95"), (4, "abc")];
+    for (window, expected) in [((1200, 760), 1.0), ((3840, 2160), 1.3)] {
+        for objective in [false, true] {
+            let at = format!("{window:?} objective {objective}");
+            let rig = calculator_rig(window, objective, &entries);
+            let s = drawing_scale(&rig);
+            assert_eq!(s, expected, "{at}: scale");
+
+            let inset = drawn(rect(&rig.app, "FFCalculatorOverlay::inset"), s);
+            let optics = rect(&rig.app, "FFCalculatorOverlay::optics");
+            let summary = rect(&rig.app, "FFCalculatorOverlay::summary");
+            for slot in (0..5).filter(|slot| shown(&rig, *slot)) {
+                let handle = ElementQuery::from_root(&rig.app)
+                    .match_id(format!("FFCalculatorOverlay::slot-{slot}"))
+                    .find_first()
+                    .unwrap();
+                let part = |id: &str| {
+                    handle
+                        .query_descendants()
+                        .match_id(id)
+                        .find_first()
+                        .map(|h| {
+                            let (p, z) = (h.absolute_position(), h.size());
+                            (p.x, p.y, z.width, z.height)
+                        })
+                };
+                let pieces = [
+                    (
+                        "box",
+                        Some(rect(&rig.app, &format!("FFCalculatorOverlay::slot-{slot}"))),
+                    ),
+                    ("caption", part("FieldSlot::caption")),
+                    ("violation", part("FieldSlot::violation")),
+                ];
+                for (name, piece) in pieces {
+                    let Some(piece) = piece else { continue };
+                    let at = format!("{at}: slot {slot} {name} {piece:?}");
+                    assert!(!intersects(piece, optics), "{at}: optics {optics:?}");
+                    assert!(!intersects(piece, summary), "{at}: summary {summary:?}");
+                    if slot == 3 {
+                        // The Overlap field is drawn inside the grown card.
+                        if name != "caption" {
+                            assert!(inside(piece, inset), "{at}: inside the card {inset:?}");
+                        }
+                    } else {
+                        assert!(!intersects(piece, inset), "{at}: card {inset:?}");
+                    }
+                }
+            }
+        }
+    }
+}

@@ -7,6 +7,7 @@ Gotchas:
 - A box keeps the typed text and replaces the old value only after the old text is cleared: click the box, `Press` Ctrl+A, `Press` Backspace, then `Type`. An empty box shows "Not a number".
 - Calculated values keep the last valid plan while a box holds a violation; the ENTERED row shows the last valid value too.
 - The illustration (planes, leader lines, inset, dimension marks) is judged by eye and is `(human only)`.
+- The drawing is centred and grows with the window (1.0 at 1200 x 760 up to 1.3), the entered boxes keep their size. The default window is one size; the larger window is a second guide run started with `--size` (23-step-calculator-large-window.md), since the driver cannot resize a window.
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
-Guides: 21-step-calculator.md
+Guides: 21-step-calculator.md, 23-step-calculator-large-window.md
 Book: guide/gui.md#plan-a-stack-with-the-step-calculator

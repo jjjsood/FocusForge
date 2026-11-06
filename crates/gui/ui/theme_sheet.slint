@@ -356,6 +356,20 @@ export component ThemeSheet inherits Window {
         FFCalculatorIllustration { plane-count: 7; }
         FFCalculatorIllustration { objective: true; plane-count: 30; }
 
+        GroupHeading { text: "Calculator illustration art-scale: 1.0 as drawn, and 1.3 under a 1.3 scale"; }
+        Rectangle {
+            width: 770px + Theme.space-6 + 770px * 1.3;
+            height: 240px * 1.3;
+            FFCalculatorIllustration { x: 0px; y: 0px; art-scale: 1.0; }
+            FFCalculatorIllustration {
+                x: 770px + Theme.space-6;
+                y: 0px;
+                art-scale: 1.3;
+                transform-scale: 1.3;
+                transform-origin: { x: 0px, y: 0px };
+            }
+        }
+
         GroupHeading { text: "Calculator inset (overlap 0.25, 0.9 with a violation line room), summary band, legend"; }
         HorizontalLayout {
             spacing: Theme.space-6;

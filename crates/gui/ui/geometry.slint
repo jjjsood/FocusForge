@@ -223,6 +223,15 @@ export global ShellGeometry {
     // The calculator's inset card.
     out property <length> calculator-inset-width: 415px;
     out property <length> calculator-inset-height: 159px;
+    // The calculator's drawing board (the overlay body at the smallest window), the
+    // box of it that is centred, and the largest scale.
+    out property <length> calculator-board-width: 892px;
+    out property <length> calculator-board-height: 543px;
+    out property <length> calculator-drawing-x: 62px;
+    out property <length> calculator-drawing-y: 11.5px;
+    out property <length> calculator-drawing-width: 809.5px;
+    out property <length> calculator-drawing-height: 435px;
+    out property <float> calculator-max-scale: 1.3;
     // The icon bar's top group: one button slot's height.
     out property <length> icon-bar-slot-height: 40px;
     // The Analytics rows: pitch, the inset from the overlay's edges, the

@@ -782,6 +782,9 @@ export component AppWindow inherits Window {
     in property <string> calculator-duration: "";
     in property <int> calculator-planes: 13;
     in property <float> calculator-overlap: 0.25;
+    out property <float> calculator-drawing-scale: calculator-overlay.drawing-scale;
+    out property <length> calculator-drawing-x: calculator-overlay.drawing-x;
+    out property <length> calculator-drawing-y: calculator-overlay.drawing-y;
     callback calculator-toggled();
     callback calculator-optics-chosen(string);
     callback calculator-field-edited(int, string);
