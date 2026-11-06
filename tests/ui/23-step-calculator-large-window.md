@@ -31,7 +31,7 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 10. Press Backspace.
     Expect: Must not: new calculated values; the Overlap box is empty with a red border, the line "Not a number" shows under it, and the CALCULATED row still reads Step 422.4 µm and Frames 13.
 11. Type "0,95" into the Overlap box (`FFField::input` 3).
-    Expect: Must not: 0.95 is planned; the box reads 0.95 (point, not comma) with a red border and the line "value 0.95 is outside the allowed range [0, 0.9]" shows under it inside the inset card; the CALCULATED row still reads Step 422.4 µm and Frames 13.
+    Expect: Must not: 0.95 is planned; the box reads 0.95 (point, not comma) with a red border and the line "value 0.95 is outside the allowed range [0, 0.9]" shows under it inside the inset card, the ENTERED row reads Overlap 0.9 (the last valid keystroke), and the CALCULATED row reads Step 56.32 µm, Frames 90 and Duration 90 s.
 12. (human only) Look at the overlay.
     Expect: the inset card is taller to hold the line, the dotted line from the card to the bracket below it keeps its length, and the Frames and Depth range captions stay clear of the SUMMARY band.
 13. Press Ctrl+a (lowercase a).
