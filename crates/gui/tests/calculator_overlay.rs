@@ -707,7 +707,7 @@ fn inside(inner: Rect, outer: Rect) -> bool {
         && inner.1 + inner.3 <= outer.1 + outer.3
 }
 
-/// The inset's drawn rectangle: its mapped corner, its size times the scale.
+/// `rect` with its size multiplied by `scale`; the origin is kept.
 fn drawn(rect: Rect, scale: f32) -> Rect {
     (rect.0, rect.1, rect.2 * scale, rect.3 * scale)
 }
