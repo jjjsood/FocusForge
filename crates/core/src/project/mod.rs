@@ -268,6 +268,7 @@ pub static ALIGN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }]
 });
 
@@ -285,6 +286,7 @@ pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }]
 });
 
@@ -306,6 +308,7 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "equalize-max-gain".to_string(),
@@ -324,6 +327,7 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "equalize-target".to_string(),
@@ -343,6 +347,7 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });

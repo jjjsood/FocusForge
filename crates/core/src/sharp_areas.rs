@@ -34,6 +34,7 @@ pub static SHARP_AREA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "contrast".to_string(),
@@ -51,6 +52,7 @@ pub static SHARP_AREA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });

@@ -35,6 +35,7 @@ fn float(
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }
 }
 
@@ -71,6 +72,7 @@ pub static PLAN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         float(
             "aperture",

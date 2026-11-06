@@ -929,6 +929,7 @@ mod tests {
                     ParamValue::Float(ctx.frame_count as f64)
                 })),
                 host_default: None,
+                stack_max: None,
             },
             ParamDesc {
                 id: "mode".to_string(),
@@ -950,6 +951,7 @@ mod tests {
                 advanced: false,
                 auto: None,
                 host_default: None,
+                stack_max: None,
             },
         ]
     });
