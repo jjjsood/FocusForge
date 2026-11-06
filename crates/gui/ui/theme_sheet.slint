@@ -1861,6 +1861,14 @@ export component ThemeSheet inherits Window {
             confirm-label: "Add and re-fuse";
         }
 
+        GroupHeading { text: "Dialog footer: both secondary buttons"; }
+        FFDialogFooter {
+            width: 640px;
+            tertiary-label: "New project instead";
+            secondary-label: "Exclude instead";
+            confirm-label: "Remove and re-fuse";
+        }
+
         GroupHeading { text: "Dialog footer: renamed cancel button"; }
         FFDialogFooter {
             width: 480px;
@@ -1888,7 +1896,7 @@ export component ThemeSheet inherits Window {
 
         GroupHeading { text: "Dialog: warning, Remove's own footer"; }
         Rectangle {
-            width: 500px;
+            width: 640px;
             height: 320px;
             clip: true;
             FFDialog {
@@ -1896,9 +1904,11 @@ export component ThemeSheet inherits Window {
                 height: 100%;
                 open: true;
                 tone: "warning";
+                panel-width: 640px;
                 title: "Remove and fuse again?";
                 body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
                 info: "You can also start a new project with the same settings instead.";
+                tertiary-label: "New project instead";
                 secondary-label: "Exclude instead";
                 confirm-label: "Remove and re-fuse";
             }

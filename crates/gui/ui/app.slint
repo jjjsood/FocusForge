@@ -998,8 +998,10 @@ export component AppWindow inherits Window {
     in property <string> frame-warning-info: "";
     in property <string> frame-warning-confirm-label: "Confirm";
     in property <string> frame-warning-secondary-label: "";
+    in property <string> frame-warning-tertiary-label: "";
     callback frame-warning-cancelled();
     callback frame-warning-secondary-pressed();
+    callback frame-warning-tertiary-pressed();
     callback frame-warning-confirmed();
 
     // Keep or discard a run whose alignment left some frames unregistered.
@@ -1244,8 +1246,10 @@ export component AppWindow inherits Window {
         info: root.frame-warning-info;
         confirm-label: root.frame-warning-confirm-label;
         secondary-label: root.frame-warning-secondary-label;
+        tertiary-label: root.frame-warning-tertiary-label;
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
+        tertiary-pressed => { root.frame-warning-tertiary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
     }
 

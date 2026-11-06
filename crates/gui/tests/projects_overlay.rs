@@ -19,7 +19,10 @@ use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
-use common::{controller_with_frames, copy_frame_from, open_frames_from, open_mantis64_tab, tree};
+use common::{
+    controller_with_frames, copy_frame_from, element_center, open_frames_from, open_mantis64_tab,
+    tree,
+};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, mirroring `tests/job.rs` and
@@ -1468,12 +1471,6 @@ fn gallery_lays_out_and_scrolls() {
 // Scrolling and progress reuse every picture; a hidden overlay publishes
 // nothing until it opens again.
 // ---------------------------------------------------------------------
-
-fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
-    let pos = handle.absolute_position();
-    let size = handle.size();
-    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
-}
 
 /// `(row_updates, thumbnail_bytes)` so far.
 fn overlay_counters() -> (u64, u64) {

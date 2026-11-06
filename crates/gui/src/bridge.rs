@@ -2351,12 +2351,14 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     match controller.pending_frame_change() {
         Some(copy) => {
             let secondary = copy.secondary_label();
+            let tertiary = copy.tertiary_label();
             app.set_frame_warning_open(true);
             app.set_frame_warning_title(copy.title.into());
             app.set_frame_warning_body(copy.body.into());
             app.set_frame_warning_info(copy.info.into());
             app.set_frame_warning_confirm_label(copy.confirm_label.into());
             app.set_frame_warning_secondary_label(secondary.into());
+            app.set_frame_warning_tertiary_label(tertiary.into());
         }
         None => app.set_frame_warning_open(false),
     }
@@ -4740,6 +4742,13 @@ pub fn install(
                 record_gallery_input();
                 controller.new_project_instead();
             }
+        }
+    });
+    app.on_frame_warning_tertiary_pressed({
+        let controller = controller.clone();
+        move || {
+            record_gallery_input();
+            controller.lock().unwrap().new_project_instead();
         }
     });
     app.on_divergence_discarded({

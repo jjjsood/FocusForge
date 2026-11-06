@@ -252,7 +252,7 @@ pub fn move_order(len: usize, from: usize, to: usize) -> Vec<usize> {
 pub enum FrameSetChangeKind {
     Add,
     Move,
-    Sort,
+    Sort(FrameSort),
     Remove,
 }
 
@@ -274,8 +274,7 @@ pub struct FrameSetWarningCopy {
     pub info: String,
     pub confirm_label: String,
     pub default_button: DefaultButton,
-    /// `Add`, `Move` and `Sort` offer this as a literal footer button;
-    /// `Remove` mentions it on the info line instead.
+    /// `Add`, `Move`, `Sort` and `Remove` offer this as a footer button.
     pub new_project_button: bool,
     /// `Remove` only.
     pub exclude_instead_button: bool,
@@ -284,6 +283,17 @@ pub struct FrameSetWarningCopy {
 }
 
 impl FrameSetWarningCopy {
+    /// The extra footer button's label, placed before the secondary one:
+    /// "New project instead" on a question that also offers
+    /// "Exclude instead", empty otherwise.
+    pub fn tertiary_label(&self) -> &'static str {
+        if self.exclude_instead_button && self.new_project_button {
+            "New project instead"
+        } else {
+            ""
+        }
+    }
+
     /// The secondary footer button's label -- empty when none applies,
     /// which never happens for a real warning.
     pub fn secondary_label(&self) -> &'static str {
@@ -325,8 +335,12 @@ pub fn frame_set_warning_copy(
             false,
             "Or start a new project with the same settings instead.".to_string(),
         ),
-        FrameSetChangeKind::Sort => (
-            "Sort by capture time and fuse again?".to_string(),
+        FrameSetChangeKind::Sort(order) => (
+            match order {
+                FrameSort::Name => "Sort by name and fuse again?",
+                FrameSort::CaptureTime => "Sort by capture time and fuse again?",
+            }
+            .to_string(),
             "Sort and re-fuse".to_string(),
             true,
             false,
@@ -335,7 +349,7 @@ pub fn frame_set_warning_copy(
         FrameSetChangeKind::Remove => (
             "Remove and fuse again?".to_string(),
             "Remove and re-fuse".to_string(),
-            false,
+            true,
             true,
             "You can also start a new project with the same settings instead.".to_string(),
         ),
@@ -526,15 +540,59 @@ mod tests {
         assert_eq!(move_order(4, 3, 0), vec![3, 0, 1, 2]);
     }
 
+    // tier: synthetic; layer: GUI controller
     #[test]
-    fn remove_offers_exclude_instead_and_mentions_a_new_project() {
-        let copy = frame_set_warning_copy(FrameSetChangeKind::Remove, 2);
-        assert!(copy.exclude_instead_button);
-        assert!(!copy.new_project_button);
-        assert!(copy.info.contains("new project"));
-        assert!(copy.body.contains('2'));
-        assert_eq!(copy.default_button, DefaultButton::Cancel);
-        assert_eq!(copy.secondary_label(), "Exclude instead");
+    fn remove_offers_exclude_instead_and_a_new_project_button() {
+        for count in [1, 4] {
+            let copy = frame_set_warning_copy(FrameSetChangeKind::Remove, count);
+            assert_eq!(
+                copy.secondary_label(),
+                "Exclude instead",
+                "{count} checkpoints"
+            );
+            assert_eq!(
+                copy.tertiary_label(),
+                "New project instead",
+                "{count} checkpoints"
+            );
+            assert_eq!(
+                copy.info,
+                "You can also start a new project with the same settings instead."
+            );
+            assert!(copy.body.contains(&count.to_string()));
+            assert_eq!(copy.default_button, DefaultButton::Cancel);
+        }
+        for kind in [
+            FrameSetChangeKind::Add,
+            FrameSetChangeKind::Move,
+            FrameSetChangeKind::Sort(FrameSort::Name),
+            FrameSetChangeKind::Sort(FrameSort::CaptureTime),
+        ] {
+            let copy = frame_set_warning_copy(kind, 2);
+            assert_eq!(copy.secondary_label(), "New project instead", "{kind:?}");
+            assert_eq!(copy.tertiary_label(), "", "{kind:?}");
+        }
+        let duplicate = duplicate_question_copy(&["00.tif".to_string()]);
+        assert_eq!(duplicate.secondary_label(), "Keep existing");
+        assert_eq!(duplicate.tertiary_label(), "");
+    }
+
+    // tier: synthetic; layer: GUI controller
+    #[test]
+    fn sort_question_title_names_the_chosen_order() {
+        for count in [1, 3] {
+            let by_name = frame_set_warning_copy(FrameSetChangeKind::Sort(FrameSort::Name), count);
+            let by_time =
+                frame_set_warning_copy(FrameSetChangeKind::Sort(FrameSort::CaptureTime), count);
+            assert_eq!(by_name.title, "Sort by name and fuse again?");
+            assert_eq!(by_time.title, "Sort by capture time and fuse again?");
+            assert_eq!(by_name.body, by_time.body);
+            assert_eq!(by_name.confirm_label, "Sort and re-fuse");
+            assert_eq!(by_name.confirm_label, by_time.confirm_label);
+            assert_eq!(by_name.secondary_label(), "New project instead");
+            assert_eq!(by_name.secondary_label(), by_time.secondary_label());
+            assert_eq!(by_name.info, by_time.info);
+        }
     }
 
     #[test]
@@ -576,7 +634,7 @@ mod tests {
         for kind in [
             FrameSetChangeKind::Add,
             FrameSetChangeKind::Move,
-            FrameSetChangeKind::Sort,
+            FrameSetChangeKind::Sort(FrameSort::CaptureTime),
         ] {
             let copy = frame_set_warning_copy(kind, 1);
             assert!(copy.new_project_button);

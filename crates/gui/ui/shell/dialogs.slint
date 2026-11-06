@@ -113,6 +113,7 @@ export component FFRefusalDialog inherits FFDialog {
 // supplies every string and flag below, already rendered.
 export component FFFrameSetWarning inherits FFDialog {
     tone: "warning";
+    panel-width: root.tertiary-label != "" ? 640px : 480px;
     confirm-kind: "primary";
 }
 

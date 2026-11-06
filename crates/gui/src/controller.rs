@@ -1713,7 +1713,7 @@ impl PendingFrameChange {
                 crate::images::FrameSetChangeKind::Add
             }
             PendingFrameChange::Move { .. } => crate::images::FrameSetChangeKind::Move,
-            PendingFrameChange::Sort(_) => crate::images::FrameSetChangeKind::Sort,
+            PendingFrameChange::Sort(order) => crate::images::FrameSetChangeKind::Sort(*order),
             PendingFrameChange::Remove(_) => crate::images::FrameSetChangeKind::Remove,
         }
     }

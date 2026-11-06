@@ -4126,6 +4126,7 @@ mod dialog_close {
             on_export_cancelled => "export-cancelled",
             on_frame_warning_cancelled => "frame-warning-cancelled",
             on_frame_warning_secondary_pressed => "frame-warning-secondary-pressed",
+            on_frame_warning_tertiary_pressed => "frame-warning-tertiary-pressed",
             on_frame_warning_confirmed => "frame-warning-confirmed",
             on_divergence_discarded => "divergence-discarded",
             on_divergence_kept => "divergence-kept",

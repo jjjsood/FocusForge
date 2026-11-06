@@ -6,6 +6,8 @@
 
 mod common;
 
+use common::element_center;
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -969,12 +971,6 @@ fn mounted(app: &focusforge_gui::AppWindow, id: &str) -> i_slint_backend_testing
         .match_id(id)
         .find_first()
         .unwrap_or_else(|| panic!("{id} is mounted"))
-}
-
-fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
-    let pos = handle.absolute_position();
-    let size = handle.size();
-    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
 }
 
 /// Indices whose shown row differs between `old` and `new`, over the rows

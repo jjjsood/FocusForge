@@ -840,3 +840,11 @@ pub fn enter_editor(controller: &mut AppController) {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// The centre of `handle` in window coordinates.
+#[allow(dead_code)]
+pub fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
+}
