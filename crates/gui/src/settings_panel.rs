@@ -872,7 +872,7 @@ fn section_rows(
 
 /// The violation of `desc`'s explicitly stored value in `values` against the
 /// range `ctx`'s stack allows, `None` when nothing is stored or it fits.
-pub(crate) fn stored_violation(
+fn stored_violation(
     desc: &ParamDesc,
     values: &ParamValues,
     ctx: Option<&StackContext>,
