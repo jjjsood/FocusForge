@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The stacking-mode toolbar: the run's transport at the left, two dim,
-// inert labels at the right end.
+// The stacking-mode toolbar: the run's transport.
 
 import { FFAppear } from "../components/ff_appear.slint";
 import { Theme } from "../theme.slint";
@@ -100,20 +99,6 @@ export component FFToolbar inherits FFAppear {
         text: root.would-queue ? "Queued" : "Fuse stack";
         enabled: root.fuse-enabled;
         clicked => { root.fuse-requested(); }
-    }
-
-    // Right-aligned, muted, and reached by no `TouchArea` -- neither label
-    // does anything yet.
-    right-end := Text {
-        x: parent.width - Theme.space-3 - self.width;
-        y: 0px;
-        height: parent.height;
-        horizontal-alignment: right;
-        vertical-alignment: center;
-        text: root.is-idle ? "Save checkpoint" : "Fuse stack · Save checkpoint";
-        color: Theme.text-disabled;
-        font-size: Theme.text-body.size;
-        font-weight: Theme.text-body.weight;
     }
 
     // The 1 px rule along the toolbar's bottom edge, over the canvas width

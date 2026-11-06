@@ -8888,7 +8888,8 @@ impl AppController {
         if let Some(line) = observer.backend_line() {
             self.last_backend_line = Some(line);
         }
-        let settled = job::settle(handle.join(), &observer);
+        let run_frames = std::mem::take(&mut self.job.frames);
+        let settled = job::settle(handle.join(), &run_frames, &observer);
         self.landing = Landing::after(run_tab_id, &settled.state, &observer, Instant::now());
         self.job.control = None;
         // With the owning tab gone (closed mid-run), this writes nothing --
@@ -8906,17 +8907,22 @@ impl AppController {
             // checkpoint just changed.
             self.state.canvas_dirty = true;
         }
-        let run_frames = std::mem::take(&mut self.job.frames);
         // Preparation finishes before any later failure, so every notice is
         // published, ahead of the failure itself.
         for (frame, text) in run_notices {
             let frame = frame
                 .and_then(|i| run_frames.get(i))
                 .map(|p| images::file_name(p));
-            let title = if frame.is_some() {
-                "Brightness target limited"
-            } else {
-                "Processing notice"
+            // The core text, with its numbers, reaches the log through the
+            // observer; the record says what happened in plain words.
+            let (title, text) = match &frame {
+                Some(file) => (
+                    "Brightness not fully matched",
+                    format!(
+                        "{file} could not be brought to the same brightness as the other frames."
+                    ),
+                ),
+                None => ("Processing notice", text),
             };
             let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
             record.frame = frame;
@@ -8929,18 +8935,19 @@ impl AppController {
                 let operation = settled
                     .operation
                     .expect("settle() sets operation exactly when state is Failed");
+                let copy = job::failure_copy(operation, phase, settled.failed_file.as_deref());
                 let mut record = Notification::new(
                     Kind::Failure,
                     Source::Run,
-                    operation.summary(),
-                    message.clone(),
+                    copy.title,
+                    format!("{}\n{message}", copy.lead),
                 );
                 self.fill_project(&mut record, tab_index);
                 self.publish_notification(record);
                 if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
-                        stage: format!("FAILED WHILE {}", phase.name().to_uppercase()),
+                        stage: copy.stage,
                         reason: message.clone(),
                     });
                 }

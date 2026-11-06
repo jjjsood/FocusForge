@@ -283,7 +283,7 @@ fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     let open = (variant == "menu").then_some("tiff-compression");
     focusforge_gui::bridge::push_export_view(app, &choice.view(open));
     app.set_export_open(true);
-    app.set_export_context("mantis-512.ffp · ORB · 2026-09-28 14:32".into());
+    app.set_export_context("mantis-512.ffp · Details · 2026-09-28 14:32".into());
     app.set_export_what("Exporting the saved checkpoint you selected.".into());
     app.set_export_stage(stage.into());
     app.set_export_writing_file_name(if stage == "writing" {
@@ -2746,5 +2746,28 @@ mod tests {
         let error =
             first_working_adapter::<(), ()>(Vec::new(), |_| Ok(())).expect_err("nothing to try");
         assert!(error.contains("no wgpu adapter"), "{error}");
+    }
+
+    #[test]
+    fn export_preview_names_a_fusion_method() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        let methods: Vec<&str> = focusforge_core::registry::stack_algorithms()
+            .iter()
+            .map(|a| a.display_name())
+            .collect();
+        for spec in ["ready", "writing", "refused", "refused-format"] {
+            apply_export_dialog_preview(&app, spec);
+            let context = app.get_export_context().to_string();
+            let method = context
+                .split(" · ")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{context:?} has no method field"));
+            assert!(
+                methods.contains(&method),
+                "{method:?} in {context:?} is not a registered display name ({methods:?})"
+            );
+            assert!(!context.contains("ORB"), "{context:?}");
+        }
     }
 }

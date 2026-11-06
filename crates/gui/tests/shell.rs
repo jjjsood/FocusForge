@@ -1987,6 +1987,33 @@ fn transport() {
     assert_rect(&app, "FFToolbar::cancel-button", (186.0, 43.0, 116.0, 26.0));
 }
 
+/// The stacking toolbar carries the run's transport only: no "Save checkpoint"
+/// text in any run state, while the editor toolbar keeps its real button.
+#[test]
+fn stacking_toolbar_has_no_save_checkpoint_caption() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_mode("stacking".into());
+    for state in ["idle", "running", "paused", "failed", "queued"] {
+        app.set_toolbar_run_state(state.into());
+        for label in ["Save checkpoint", "Fuse stack · Save checkpoint"] {
+            assert_eq!(
+                ElementHandle::find_by_accessible_label(&app, label).count(),
+                0,
+                "{label:?} must not be drawn in the {state} state"
+            );
+        }
+    }
+    app.set_mode("editor".into());
+    let buttons = ElementHandle::find_by_accessible_label(&app, "Save checkpoint")
+        .filter(|e| e.accessible_role() == Some(AccessibleRole::Button))
+        .count();
+    assert_eq!(
+        buttons, 1,
+        "the editor toolbar keeps its Save checkpoint button"
+    );
+}
+
 /// The bottom bar's progress track, in reading order (stage -> step -> bar
 /// -> ETA), at the base width and at the 1200px minimum: the bar's width is
 /// dynamic, always ending `Theme.space-4` before the ETA.
@@ -3962,8 +3989,20 @@ mod notification {
                 .all(|n| n.kind == Kind::Warning)
         );
 
+        for (note, file) in controller.notifications().iter().zip(["01.tif", "02.tif"]) {
+            assert_eq!(note.title, "Brightness not fully matched");
+            assert_eq!(
+                note.message,
+                format!("{file} could not be brought to the same brightness as the other frames.")
+            );
+            let lower = note.message.to_lowercase();
+            for banned in ["target limited", "bound", "residual", "gain of", "frame 0"] {
+                assert!(!lower.contains(banned), "{banned:?} in {:?}", note.message);
+            }
+        }
+
         let rig = rig(controller, 1440, 900);
-        assert_eq!(rig.app.get_toast_title(), "Brightness target limited");
+        assert_eq!(rig.app.get_toast_title(), "Brightness not fully matched");
         assert_eq!(rig.app.get_toast_kind(), "warning");
         let (x, y) = Rig::bell(900.0);
         rig.click(x, y);

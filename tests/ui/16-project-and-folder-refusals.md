@@ -44,6 +44,6 @@ Start: --open fixtures/open-rejected --open fixtures/open-root-and-subfolder --o
 19. Click **Retry** (`FFToolbar::retry-button`).
     Expect: (within 30 s) the bottom bar status reads "Failed", the toolbar button still reads "Retry" and the bell shows the number 2; Must not: a composite is filled or the dialog "Keep this fused result?" appears.
 20. Click **Notifications** (`FFIconBar::bell`).
-    Expect: the center reads "3 notifications · this session" and lists two rows titled "Fusion failed" above the row "Some images were skipped".
+    Expect: the center reads "3 notifications · this session" and lists two rows titled "Preparing failed" above the row "Some images were skipped".
 21. Click **Notifications** (`FFIconBar::bell`).
     Expect: the center is gone, **Retry** is still shown and no dialog is on screen.

@@ -186,6 +186,7 @@ enum Row<'a> {
         index: usize,
         created_at: i64,
         algorithm: String,
+        retouch: bool,
     },
 }
 
@@ -208,6 +209,14 @@ impl Row<'_> {
         match self {
             Row::Saved(c) => &c.algorithm,
             Row::Held { algorithm, .. } => algorithm,
+        }
+    }
+
+    /// Whether the row holds retouch ops rather than a fuse of its own.
+    fn is_retouch(&self) -> bool {
+        match self {
+            Row::Saved(c) => !c.ops.is_empty(),
+            Row::Held { retouch, .. } => *retouch,
         }
     }
 }
@@ -265,6 +274,7 @@ pub fn build_model(
                 index,
                 created_at: entry.created_at(),
                 algorithm: held_algorithm(index, held, checkpoints),
+                retouch: matches!(entry.kind, InMemoryKind::Ops { .. }),
             }),
     );
     // On a `created_at` tie a held row sorts before a saved one (`false <
@@ -311,7 +321,11 @@ pub fn build_model(
         let id = row.id();
         entries.push(CheckpointEntry {
             separator_label: None,
-            algorithm: algorithm_label(row.algorithm()),
+            algorithm: if row.is_retouch() {
+                format!("Retouch on {}", algorithm_label(row.algorithm()))
+            } else {
+                algorithm_label(row.algorithm())
+            },
             time_text: local_hhmmss(row.created_at()),
             top,
             selected: selected == Some(id.as_str()),
@@ -402,6 +416,50 @@ mod tests {
     }
 
     #[test]
+    fn a_retouch_row_is_labelled_as_a_retouch() {
+        let noon = 1_756_468_800;
+        let mut fused = checkpoint("fused", noon - 400);
+        fused.algorithm = "laplacian".to_string();
+        let mut retouched = checkpoint("retouched", noon - 300);
+        retouched.algorithm = "laplacian".to_string();
+        retouched.parent = Some("fused".to_string());
+        retouched.ops = vec![stroke(1)];
+        let held = [
+            ops_entry(vec![stroke(2)], Some(ParentRef::Saved("fused".to_string()))),
+            fused_entry(),
+            ops_entry(vec![stroke(3)], Some(ParentRef::Entry(1))),
+        ];
+        let today = local_datetime(noon).unwrap().date_naive();
+        let model = build_model(&[&fused, &retouched], &held, &[], today, None, 0.0);
+        let label = |id: &str| {
+            model
+                .entries
+                .iter()
+                .find(|e| e.id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("no row {id}"))
+                .algorithm
+                .clone()
+        };
+        assert_eq!(label("fused"), "Details");
+        assert_eq!(label("retouched"), "Retouch on Details");
+        assert_eq!(
+            label("held:0"),
+            "Retouch on Details",
+            "held ops on a saved parent"
+        );
+        assert_eq!(
+            label("held:1"),
+            "a-stack-algorithm",
+            "a held fuse is not a retouch"
+        );
+        assert_eq!(
+            label("held:2"),
+            "Retouch on a-stack-algorithm",
+            "held ops on a held fuse, unregistered id verbatim"
+        );
+    }
+
+    #[test]
     fn each_separator_carries_the_next_ones_top() {
         let noon = 1_756_468_800;
         let today_cp = checkpoint("a", noon);
@@ -474,8 +532,8 @@ mod tests {
         assert_eq!(ids, ["held:1", "held:0", "a"], "newest first");
         assert_eq!(rows[0].time_text, local_hhmmss(map_at));
         assert_eq!(rows[1].time_text, local_hhmmss(ops_at));
-        assert_eq!(rows[0].algorithm, "saved-algorithm");
-        assert_eq!(rows[1].algorithm, "saved-algorithm");
+        assert_eq!(rows[0].algorithm, "Retouch on saved-algorithm");
+        assert_eq!(rows[1].algorithm, "Retouch on saved-algorithm");
         let labels: Vec<&str> = model
             .entries
             .iter()
@@ -518,7 +576,7 @@ mod tests {
         assert_eq!(ids, ["held:2", "held:0", "b"]);
         assert_eq!(model.row_count, 3);
         assert_eq!(
-            rows[1].algorithm, "hidden-algorithm",
+            rows[1].algorithm, "Retouch on hidden-algorithm",
             "an op row names its hidden parent's algorithm"
         );
     }

@@ -6206,9 +6206,8 @@ fn equalize_rows_reach_the_run() {
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
-/// A frame the equalization bound clamps is reported on the window's info
-/// toast, naming the frame, the bound and the bound that would cover it; a
-/// bound wide enough for the stack raises nothing.
+/// A frame the equalization bound clamps is reported as a record naming its
+/// file in plain words; a bound wide enough for the stack raises nothing.
 #[test]
 fn settings_journey_equalization_reports_a_clamped_frame() {
     use focusforge_core::equalize::UNIT_GAIN;
@@ -6238,17 +6237,21 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
     );
     let notices = controller.notifications();
     assert!(notices.len() > 1, "each clamped frame has its own record");
-    let notice = notices[0].message.as_str();
-    assert!(notice.contains("frame "), "{notice}");
-    assert!(notice.contains("1.01"), "{notice}");
-    assert!(notice.contains("would cover it"), "{notice}");
-    assert!(!notice.contains(" more)"), "no collapsed count: {notice}");
+    let notice = &notices[0];
+    let file = notice
+        .frame
+        .as_deref()
+        .expect("the record names its frame file");
+    assert_eq!(notice.title, "Brightness not fully matched");
+    assert_eq!(
+        notice.message,
+        format!("{file} could not be brought to the same brightness as the other frames.")
+    );
 
-    let named: usize = notice
-        .strip_prefix("frame ")
-        .and_then(|rest| rest.split(':').next())
+    let named: usize = file
+        .strip_suffix(".tif")
         .and_then(|index| index.parse().ok())
-        .unwrap_or_else(|| panic!("the notice starts with its frame: {notice}"));
+        .unwrap_or_else(|| panic!("the frame file is its index: {file}"));
     let recorded = controller
         .held_checkpoints()
         .last()
@@ -9371,12 +9374,13 @@ mod notification {
         let records = warnings(&controller);
         assert_eq!(records.len(), 3, "one record per clamped frame");
         for (i, record) in records.iter().enumerate() {
-            assert!(
-                record.message.starts_with(&format!("frame {i}:")),
-                "{}",
-                record.message
+            assert_eq!(record.title, "Brightness not fully matched");
+            assert_eq!(
+                record.message,
+                format!(
+                    "{i:02}.tif could not be brought to the same brightness as the other frames."
+                )
             );
-            assert!(record.message.contains("1.25"), "{}", record.message);
         }
     }
 
@@ -9391,9 +9395,10 @@ mod notification {
         );
         let files: Vec<_> = records.iter().map(|r| r.frame.as_deref()).collect();
         assert_eq!(files, [Some("01.tif"), Some("02.tif")]);
-        assert!(
-            records[0].message.starts_with("frame 0:"),
-            "the index is the run's own"
+        assert_eq!(
+            records[0].message,
+            "01.tif could not be brought to the same brightness as the other frames.",
+            "the message names the file, not the run's own index"
         );
     }
 
