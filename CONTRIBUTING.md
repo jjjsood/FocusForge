@@ -9,7 +9,9 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                over tile-sized work units), the stage cache, grouping
                proposals, the `.ffp` project container and its
                checkpoint history (op log, render from the stored
-               composite, image export in TIFF, PNG and JPEG)
+               composite, image export in TIFF, PNG and JPEG), the update check
+               (`update`: version comparison and one HTTPS GET through `ureq`;
+               tests and `FOCUSFORGE_RELEASE_URL` point it at a local server)
 crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
