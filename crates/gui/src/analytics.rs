@@ -53,6 +53,17 @@ pub enum AnalyticsView {
     Failed(String),
 }
 
+/// How hard the live count works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountPriority {
+    /// All the host's workers.
+    Normal,
+    /// One worker.
+    Low,
+    /// Waiting for a stacking or export job to end.
+    Held,
+}
+
 /// Why a count produced no counts.
 #[derive(Debug, PartialEq)]
 pub(crate) enum CountError {

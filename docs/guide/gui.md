@@ -397,8 +397,13 @@ While the counting runs, every frame is already listed. A row whose count
 is not final shows a bar and a turning marker in place of its count: the bar
 sweeps until the first results arrive, then fills as the counts grow, and the
 marker stays until the count is complete. If the count fails, the rows give
-way to the red heading "Counting failed" and the error message. Selecting
-another tab starts a new count, and closing the overlay stops it.
+way to the red heading "Counting failed" and the error message. The count
+starts as soon as a stack is loaded, quietly in the background, and speeds up
+when Analytics opens; a finished count is kept for the stack and shown at once
+when the overlay opens, until the stack's frame list changes or the stack is
+closed. Selecting another tab starts a count for it when it has none yet, and
+closing the overlay does not stop the count. While a stacking or export job
+runs, the background count waits for it.
 
 To close Analytics, click the **Analytics** button again, click **Close**
 at the top right of the overlay, or press Escape. As with the step

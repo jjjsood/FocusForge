@@ -19,7 +19,7 @@ use focusforge_core::sharp_areas::{count_sharp_areas, count_sharp_areas_reportin
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, NoControl};
 use focusforge_core::zmap::source_color;
-use focusforge_gui::analytics::{AnalyticsRow, AnalyticsView, RowValue};
+use focusforge_gui::analytics::{AnalyticsRow, AnalyticsView, CountPriority, RowValue};
 use focusforge_gui::input_map::Modifiers;
 use focusforge_gui::{AppController, AppWindow, ChromeKey, ShellMode};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
@@ -592,46 +592,30 @@ fn opening_analytics_replaces_what_the_window_draws() {
 }
 
 #[test]
-fn close_cancels_the_count() {
-    // A count held asleep is stopped by the close; the stack then counted by
-    // the next open keeps its result, which the stopped worker, finishing
-    // later, must not replace.
-    let mut controller = common::controller_with_frames("analytics_cancel", 3);
+fn closing_lowers_the_count_and_keeps_it() {
+    let mut controller = common::controller_with_frames("analytics_close_keeps", 3);
     controller.set_analytics_hold(HOLD);
-    let stopped = controller.toggle_analytics().expect("a count started");
+    let worker = controller.toggle_analytics().expect("a count started");
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Normal)
+    );
     controller.close_analytics();
     assert!(!controller.analytics_open());
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Low)
+    );
 
-    controller.set_analytics_hold(Duration::ZERO);
-    let current = controller.toggle_analytics().expect("a count started");
-    current.join().unwrap();
-    stopped.join().unwrap();
+    // The count finishes and lands while the overlay is closed.
+    worker.join().unwrap();
     controller.settle_analytics();
     assert_eq!(rows_of(&controller).len(), 3);
-}
 
-#[test]
-fn close_cancels_the_count_stale_result_dropped() {
-    let mut controller = common::controller_with_frames("analytics_stale", 3);
-
-    // A finished count parked before the close is not shown after it.
-    controller.set_analytics_hold(Duration::ZERO);
-    let finished = controller.toggle_analytics().expect("a count started");
-    finished.join().unwrap();
-    controller.close_analytics();
-    controller.settle_analytics();
-    assert_pending(&controller, 3);
-
-    // Nor after the overlay opened again over a new, still running count.
-    let finished = controller.toggle_analytics().expect("a count started");
-    finished.join().unwrap();
-    controller.close_analytics();
-    controller.set_analytics_hold(HOLD);
-    let running = controller.toggle_analytics().expect("a count started");
-    controller.settle_analytics();
-    assert_pending(&controller, 3);
-    controller.close_analytics();
-    running.join().unwrap();
+    // Opening again shows the kept rows and starts nothing.
+    assert!(controller.toggle_analytics().is_none());
+    assert!(controller.take_analytics_worker().is_none());
+    assert_eq!(rows_of(&controller).len(), 3);
 }
 
 #[test]
@@ -915,4 +899,204 @@ fn image_row_click_keeps_arrows_and_escape_order() {
     rig.pump();
     rig.escape();
     assert!(!rig.open(), "a second Escape closes Analytics");
+}
+
+/// A controller with the background count on and every count held asleep for
+/// `hold`, over `count` freshly loaded `mantis-64` frames.
+fn background_controller(name: &str, count: usize, hold: Duration) -> AppController {
+    let mut controller = AppController::new();
+    controller.set_analytics_background(true);
+    controller.set_analytics_hold(hold);
+    common::open_mantis64_tab(&mut controller, name, count);
+    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+    controller
+}
+
+/// Joins the count worker the last load or edit started, then applies it.
+fn finish_count(controller: &mut AppController) {
+    controller
+        .take_analytics_worker()
+        .expect("a count is running")
+        .join()
+        .expect("the count worker did not panic");
+    controller.settle_analytics();
+}
+
+fn names_of(controller: &AppController) -> Vec<String> {
+    rows_of(controller).into_iter().map(|r| r.name).collect()
+}
+
+#[test]
+fn background_count_starts_on_load() {
+    let mut off = common::controller_with_frames("analytics_bg_off", 3);
+    assert!(off.take_analytics_worker().is_none());
+    assert_eq!(off.analytics_count_priority(), None);
+    assert_eq!(*off.analytics_view(), AnalyticsView::Waiting);
+
+    let mut on = background_controller("analytics_bg_on", 3, HOLD);
+    assert!(!on.analytics_open());
+    assert_eq!(on.analytics_count_priority(), Some(CountPriority::Low));
+    assert_pending(&on, 3);
+    let worker = on.take_analytics_worker().expect("loading started a count");
+    on.close_project(0);
+    worker.join().unwrap();
+}
+
+#[test]
+fn opening_analytics_boosts_the_running_count() {
+    let mut controller = background_controller("analytics_bg_boost", 3, HOLD);
+    let worker = controller.take_analytics_worker().expect("a count runs");
+
+    assert!(controller.toggle_analytics().is_none(), "no restart");
+    assert!(
+        controller.take_analytics_worker().is_none(),
+        "no new worker"
+    );
+    assert!(controller.analytics_open());
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Normal)
+    );
+    assert_pending(&controller, 3);
+
+    controller.close_analytics();
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Low)
+    );
+
+    worker.join().unwrap();
+    controller.settle_analytics();
+    let rows = rows_of(&controller);
+    assert!(rows.iter().all(|r| r.value == RowValue::Final), "{rows:?}");
+}
+
+#[test]
+fn cached_counts_show_at_once() {
+    let mut controller = background_controller("analytics_bg_cache", 3, Duration::ZERO);
+    finish_count(&mut controller);
+    let counted = rows_of(&controller);
+
+    assert!(controller.toggle_analytics().is_none(), "no new worker");
+    assert!(controller.take_analytics_worker().is_none());
+    let rig = rig_with(controller);
+    rig.pump();
+    assert_eq!(rig.app.get_analytics_state(), "rows");
+    assert_eq!(row_states(&rig), ["final"; 3]);
+    assert_eq!(spinners(&rig), 0);
+
+    // A second stack counts on its own; the first shows its kept rows again.
+    {
+        let mut controller = rig.controller.lock().unwrap();
+        common::open_frames_from(&mut controller, "mantis-64", "analytics_bg_cache_b", 2);
+        assert_eq!(controller.active_project(), Some(1));
+        controller.select_project(0);
+        assert_eq!(rows_of(&controller), counted);
+        if let Some(stale) = controller.take_analytics_worker() {
+            stale.join().unwrap();
+        }
+        controller.settle_analytics();
+        assert_eq!(
+            rows_of(&controller),
+            counted,
+            "the cancelled count lands nowhere"
+        );
+    }
+    rig.pump();
+    assert_eq!(row_states(&rig), ["final"; 3]);
+    assert_eq!(spinners(&rig), 0);
+}
+
+#[test]
+fn frame_list_change_drops_the_cache() {
+    let mut controller = background_controller("analytics_bg_edit", 3, Duration::ZERO);
+    finish_count(&mut controller);
+    assert!(controller.toggle_analytics().is_none());
+    assert_eq!(rows_of(&controller).len(), 3);
+
+    controller.remove_frame(0);
+    assert!(
+        matches!(controller.analytics_view(), AnalyticsView::Counting(_)),
+        "the old rows are not shown"
+    );
+    finish_count(&mut controller);
+    assert_eq!(names_of(&controller), ["01.tif", "02.tif"]);
+
+    controller.move_frame(0, 1);
+    assert!(matches!(
+        controller.analytics_view(),
+        AnalyticsView::Counting(_)
+    ));
+    finish_count(&mut controller);
+    assert_eq!(names_of(&controller), ["02.tif", "01.tif"]);
+}
+
+#[test]
+fn opening_another_stack_restarts_the_count() {
+    let mut controller = background_controller("analytics_bg_other_a", 3, HOLD);
+    let first = controller.take_analytics_worker().expect("a count for A");
+
+    common::open_frames_from(&mut controller, "mantis-64", "analytics_bg_other_b", 2);
+    let second = controller
+        .take_analytics_worker()
+        .expect("opening B started a count");
+    assert_pending(&controller, 2);
+
+    // A's cancelled worker parks nothing into B's view.
+    first.join().unwrap();
+    controller.settle_analytics();
+    assert_pending(&controller, 2);
+
+    // Nothing of A was cached: going back to it counts again.
+    controller.select_project(0);
+    assert_pending(&controller, 3);
+    let again = controller
+        .take_analytics_worker()
+        .expect("A has no cached counts");
+    second.join().unwrap();
+    again.join().unwrap();
+    controller.settle_analytics();
+    assert_eq!(names_of(&controller), ["00.tif", "01.tif", "02.tif"]);
+}
+
+#[test]
+fn stacking_holds_the_background_count() {
+    let mut controller = background_controller("analytics_bg_job", 3, HOLD);
+    let worker = controller.take_analytics_worker().expect("a count runs");
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Low)
+    );
+
+    controller.set_slow_run(1, Duration::from_secs(3));
+    assert!(controller.start_fuse());
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Held)
+    );
+    assert!(
+        controller.take_analytics_worker().is_none(),
+        "not restarted"
+    );
+
+    assert!(controller.toggle_analytics().is_none());
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Low)
+    );
+    controller.close_analytics();
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Held)
+    );
+
+    common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("the run settles");
+    assert_eq!(
+        controller.analytics_count_priority(),
+        Some(CountPriority::Low)
+    );
+    worker.join().unwrap();
+    controller.settle_analytics();
+    let rows = rows_of(&controller);
+    assert!(rows.iter().all(|r| r.value == RowValue::Final), "{rows:?}");
 }

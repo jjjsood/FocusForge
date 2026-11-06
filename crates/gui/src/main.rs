@@ -2026,7 +2026,8 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     // Built before `select_backend`: the drop route (`bridge::DropHandler`)
     // installs on the `BackendSelector` chain before any window exists, and
     // needs the same renderer cell every other open path feeds.
-    let controller_state = AppController::new();
+    let mut controller_state = AppController::new();
+    controller_state.set_analytics_background(true);
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));

@@ -1,7 +1,7 @@
 # Count the sharp areas of every frame in the Analytics overlay
 Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --analytics --analytics-hold-ms 25000
 
-Use a fresh settings directory and a fresh data directory. Two folders are open: the first tab holds 3 frames, the second (selected) holds 8 frames. The overlay starts open once both folders are loaded. Every count is held back for 25 seconds, so the rows stay pending (a sweeping bar and a spinner in place of the count, no number) for a while after each opening. Steps that wait for the rows say `(within 60 s)`.
+Use a fresh settings directory and a fresh data directory. Two folders are open: the first tab holds 3 frames, the second (selected) holds 8 frames. The overlay starts open once both folders are loaded. Every count is held back for 25 seconds, so the rows stay pending (a sweeping bar and a spinner in place of the count, no number) until a count has finished once; a stack's count starts when it is loaded and, once finished, is kept and shown at once on every later opening. Steps that wait for the rows say `(within 60 s)`.
 
 The Analytics button sits in the 48 px icon bar on the left edge, directly under the step calculator button, above the bell and Settings; it is reached by its label **Analytics** inside `AppWindow::icon-bar`, and it is never greyed out. The overlay (`AppWindow::analytics-overlay`) covers the canvas below the toolbar and above the bottom bar; the right dock stays visible. While it is open the button is drawn selected: an accent-coloured icon and a thin accent bar on the icon bar's left edge. The overlay is titled "Analytics", has the heading "SHARP AREAS PER IMAGE" with the subtitle "Image areas that are sharpest in this image", and lists one row per frame in the dock's order: a coloured chip, the file name, a bar and the count at the right edge. While a count is not final the row shows a spinner in place of the count. With no project open the overlay shows the centred panel "No stack loaded" over "Load a stack to count its sharp areas." and no rows.
 
@@ -22,11 +22,11 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 5. Click **Close** (`AppWindow::analytics-overlay`).
    Expect: the overlay is gone, the canvas shows the frame again, and the Analytics button is drawn plain (no accent bar).
 6. Click **Analytics** (`AppWindow::icon-bar`).
-   Expect: the overlay titled "Analytics" is open with the button drawn selected and eight rows listed with a spinner in place of each count; Must not: any count figure is shown yet, or the panel "No stack loaded".
+   Expect: the overlay titled "Analytics" is open with the button drawn selected and eight rows listed at once whose counts read 0, 0, 4, 11, 0, 0, 0, 1; Must not: a spinner is shown, or the panel "No stack loaded".
 7. Click **Analytics** (`AppWindow::icon-bar`).
    Expect: the overlay is gone and the button is drawn plain.
 8. Click **Analytics** (`AppWindow::icon-bar`).
-   Expect: the overlay titled "Analytics" is open again with eight rows listed, each with a spinner in place of its count and no number.
+   Expect: the overlay titled "Analytics" is open again with eight rows listed at once whose counts read 0, 0, 4, 11, 0, 0, 0, 1 and no spinner.
 9. Press Escape.
    Expect: the overlay is gone and the button is drawn plain.
 10. Click **Analytics** (`AppWindow::icon-bar`).
@@ -59,8 +59,8 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 22. Click **Analytics** (`AppWindow::icon-bar`).
     Expect: the Analytics button is enabled (`buttons AppWindow::icon-bar` lists **Analytics** without a leading `x`); the overlay titled "Analytics" opens with the heading "SHARP AREAS PER IMAGE" and the subtitle, and below them a centred panel with the bold line "No stack loaded" over the line "Load a stack to count its sharp areas."; Must not: any row is listed, or a spinner is shown.
 23. Click the first tab (`FFTab::area` 0).
-    Expect: the dock header reads "3 frames · 0 excluded"; the overlay titled "Analytics" is still open, the panel "No stack loaded" is gone and three rows are listed, 00.tif, 01.tif and 02.tif, each with a spinner in place of its count.
+    Expect: the dock header reads "3 frames · 0 excluded"; the overlay titled "Analytics" is still open, the panel "No stack loaded" is gone and three rows are listed, 00.tif, 01.tif and 02.tif, each with the count 0 and no spinner, shown at once from the count kept in step 12.
 24. Hover **Close** (`AppWindow::analytics-overlay`).
-    Expect: (within 60 s) the three rows 00.tif, 01.tif and 02.tif each show the count 0 and no spinner is left.
+    Expect: the three rows 00.tif, 01.tif and 02.tif each still show the count 0 and no spinner is left.
 25. Press Escape.
     Expect: the overlay is gone and the Analytics button is drawn plain.

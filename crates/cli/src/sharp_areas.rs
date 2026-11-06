@@ -7,13 +7,23 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use focusforge_core::io::open_frame_set;
+use focusforge_core::job::JobControl;
 use focusforge_core::sharp_areas::{SHARP_AREA_PARAMS, count_sharp_areas};
+use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
-use focusforge_core::tile::{HostBudget, NoControl};
 
 use crate::set::{SetArgs, resolve_settings};
 
-pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool) -> ExitCode {
+/// How many frames the count reads at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Priority {
+    /// One frame at a time, leaving the other cores to other work.
+    Low,
+    /// As many frames at once as the host has threads.
+    Normal,
+}
+
+pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> ExitCode {
     let values = match resolve_settings(&SHARP_AREA_PARAMS, set) {
         Ok(values) => values,
         Err(message) => return crate::fail(message),
@@ -30,6 +40,10 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool) -> ExitCode {
         Err(err) => return crate::fail(err),
     };
     let reader = frames.reader.as_ref();
+    let control = JobControl::new();
+    if priority == Priority::Low {
+        control.set_admission_cap(Some(1));
+    }
     let result = match count_sharp_areas(
         reader,
         reader.len(),
@@ -37,7 +51,7 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool) -> ExitCode {
         reader.frame(0).samples_per_pixel,
         &values,
         DEFAULT_TILE_SIZE,
-        &NoControl,
+        &*control,
     ) {
         Ok(result) => result,
         Err(err) => return crate::fail(err),
