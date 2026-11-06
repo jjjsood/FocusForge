@@ -2957,8 +2957,7 @@ fn ask_save(ask: SaveAsk, then: impl FnOnce(u64, Option<PathBuf>) + 'static) {
     }
 }
 
-/// `Save project` on the active tab, from the toolbar, `Ctrl+S` or the
-/// projects rail.
+/// `Save project` on the active tab, from `Ctrl+S` or the projects rail.
 fn save_active_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
