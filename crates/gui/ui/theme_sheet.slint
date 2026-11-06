@@ -21,6 +21,7 @@ import { FFResetAll } from "components/ff_reset_all.slint";
 import { FFMoreToggle } from "components/ff_more_toggle.slint";
 import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
+import { FFLinkText } from "components/ff_link_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
@@ -525,7 +526,7 @@ export component ThemeSheet inherits Window {
             FFHeatLegend { }
         }
 
-        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
+        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus, custom link label"; }
         VerticalLayout {
             spacing: Theme.space-4;
             HorizontalLayout {
@@ -541,6 +542,11 @@ export component ThemeSheet inherits Window {
                 FFToast { toast-open: true; kind: "crash"; title: "Previous session stopped"; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; hovered: true; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; focused: true; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "info"; title: "FocusForge 1.2.3 is available"; link-label: "Open download page"; }
             }
             HorizontalLayout {
                 spacing: Theme.space-6;
@@ -856,7 +862,7 @@ export component ThemeSheet inherits Window {
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, states (toggle off, long backend elided, cap typed, cap failure tone, budget not probed yet)"; }
+        GroupHeading { text: "Settings: Performance rows, states (toggle off, wide label, long backend elided, cap typed, cap failure tone, budget not probed yet)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -867,6 +873,12 @@ export component ThemeSheet inherits Window {
                         label: "GPU processing";
                         align-end: true;
                         FFToggle { }
+                    }
+                    FFSettingsRow {
+                        label: "A label longer than its column";
+                        align-end: true;
+                        wide-label: true;
+                        FFToggle { on: true; }
                     }
                     FFSettingsRow {
                         label: "Backend";
@@ -974,6 +986,12 @@ export component ThemeSheet inherits Window {
                     enabled: false;
                 }
                 FFSettingsActionRow {
+                    button-text: "Check now";
+                    enabled: false;
+                    busy: true;
+                    status-text: "Checking for updates…";
+                }
+                FFSettingsActionRow {
                     label: "Stage cache";
                     helper: "Deletes cached fuse stages.";
                     button-text: "Clear cache";
@@ -1038,6 +1056,26 @@ export component ThemeSheet inherits Window {
                     label: "Accent";
                     divider: false;
                     FFRowText { text: "example.org/project"; accent: true; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: link text, rest / hover / focus"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LINK TEXT";
+                FFSettingsRow {
+                    label: "Rest";
+                    FFLinkText { text: "Open download page"; }
+                }
+                FFSettingsRow {
+                    label: "Hover";
+                    FFLinkText { text: "Open download page"; hovered: true; }
+                }
+                FFSettingsRow {
+                    label: "Focus";
+                    divider: false;
+                    FFLinkText { text: "Open download page"; focused: true; }
                 }
             }
         }

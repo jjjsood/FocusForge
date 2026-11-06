@@ -4,7 +4,7 @@
 .SH NAME
 focusforge\-cli\-export \- Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
 .SH SYNOPSIS
-\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-\-icc\fR] [\fB\-v \fR]... [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-frame\fR] [\fB\-\-frame\-output\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-\-icc\fR] [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-v \fR]... [\fB\-\-frame\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-frame\-output\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
 .SH DESCRIPTION
 Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
 .SH OPTIONS
@@ -45,20 +45,20 @@ Carry the alignment reference frame\*(Aqs EXIF: `on` (default) or `off`
 \fB\-\-icc\fR \fI<ICC>\fR
 Embed an ICC profile: `on` (default) or `off`. Has no effect on a DNG, whose colour is defined by its camera matrices
 .TP
-\fB\-v\fR
-Increase log detail (repeatable)
-.TP
 \fB\-\-xmp\fR \fI<XMP>\fR
 Carry the source frame\*(Aqs XMP packet, with any `tiff:Orientation` set to 1: `on` or `off` (default)
 .TP
 \fB\-\-iptc\fR \fI<IPTC>\fR
 Carry the source frame\*(Aqs IPTC block verbatim: `on` or `off` (default). Never written to PNG
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-Log errors only
+\fB\-v\fR
+Increase log detail (repeatable)
 .TP
 \fB\-\-frame\fR \fI<INDEX>\fR
 Write this source frame "as fused" \-\- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint\*(Aqs own composite width and height. Requires `\-\-frame\-output`
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
 .TP
 \fB\-\-frame\-output\fR \fI<FILE>\fR
 Where to write the frame `\-\-frame` names
