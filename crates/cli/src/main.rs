@@ -106,11 +106,18 @@ fn resolve_align_backend(
     }
 }
 
+/// Package version and build profile, as `--version` prints them.
+const VERSION_WITH_PROFILE: &str = if cfg!(debug_assertions) {
+    concat!(env!("CARGO_PKG_VERSION"), " (debug)")
+} else {
+    concat!(env!("CARGO_PKG_VERSION"), " (release)")
+};
+
 /// FocusForge command-line interface.
 #[derive(Parser)]
 #[command(
     name = "focusforge-cli",
-    version,
+    version = VERSION_WITH_PROFILE,
     about = "FocusForge command-line interface"
 )]
 struct Cli {
