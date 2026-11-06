@@ -84,7 +84,7 @@ pub enum SharpAreasError {
 /// `reader`. The result does not depend on `tile_size`.
 ///
 /// `values` are checked against [`SHARP_AREA_PARAMS`] before any read.
-/// `control` is asked to stop before each tile and told of each finished one.
+/// `control` is asked to stop before each tile read and told of each finished one.
 pub fn count_sharp_areas(
     reader: &dyn TileReader,
     frames: usize,
