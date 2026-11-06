@@ -57,10 +57,12 @@ This path never starts a fuse: leave **Fuse stack** alone. The window's own clos
 21. Click the "+" after the last tab (`FFTabStrip::plus-button`).
     Expect: the canvas and the bottom bar read "No project open".
 22. Click **Analytics** (`AppWindow::icon-bar`).
-    Expect: the Analytics button is enabled (`buttons AppWindow::icon-bar` lists **Analytics** without a leading `x`); the overlay titled "Analytics" opens with the heading "SHARP AREAS PER IMAGE" and the subtitle, and below them a centred panel with the bold line "No stack loaded" over the line "Load a stack to count its sharp areas."; Must not: any row is listed, or a spinner is shown.
-23. Click the first tab (`FFTab::area` 0).
+    Expect: the Analytics button is enabled (`buttons AppWindow::icon-bar` lists **Analytics** without a leading `x`); the overlay titled "Analytics" opens with the heading "SHARP AREAS PER IMAGE" and the subtitle, and below them a centred panel with the bold line "No stack loaded" over the line "Load a stack to count its sharp areas.".
+23. Hover **Close** (`AppWindow::analytics-overlay`).
+    Expect: Must not: any row is listed, a spinner is shown or a count figure is shown; the panel "No stack loaded" stays.
+24. Click the first tab (`FFTab::area` 0).
     Expect: the dock header reads "3 frames · 0 excluded"; the overlay titled "Analytics" is still open, the panel "No stack loaded" is gone and three rows are listed, 00.tif, 01.tif and 02.tif, each with a spinner in place of its count.
-24. Hover **Close** (`AppWindow::analytics-overlay`).
+25. Hover **Close** (`AppWindow::analytics-overlay`).
     Expect: (within 60 s) the three rows 00.tif, 01.tif and 02.tif each show the count 0 and no spinner is left.
-25. Press Escape.
+26. Press Escape.
     Expect: the overlay is gone and the Analytics button is drawn plain.
