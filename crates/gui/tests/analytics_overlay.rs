@@ -15,11 +15,11 @@ use std::time::Duration;
 use focusforge_core::host;
 use focusforge_core::io::open_frame_set;
 use focusforge_core::params::ParamValues;
-use focusforge_core::sharp_areas::count_sharp_areas;
+use focusforge_core::sharp_areas::{count_sharp_areas, count_sharp_areas_reporting};
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, NoControl};
 use focusforge_core::zmap::source_color;
-use focusforge_gui::analytics::{AnalyticsRow, AnalyticsView};
+use focusforge_gui::analytics::{AnalyticsRow, AnalyticsView, RowValue};
 use focusforge_gui::input_map::Modifiers;
 use focusforge_gui::{AppController, AppWindow, ChromeKey, ShellMode};
 use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
@@ -166,6 +166,51 @@ fn rows_of(controller: &AppController) -> Vec<AnalyticsRow> {
     }
 }
 
+/// The rows of a counting view, which holds the stack's rows before the
+/// count is done.
+fn counting_rows_of(controller: &AppController) -> Vec<AnalyticsRow> {
+    match controller.analytics_view() {
+        AnalyticsView::Counting(rows) => rows.clone(),
+        other => panic!("expected the counting view, got {other:?}"),
+    }
+}
+
+/// How many `FFSpinner`s the Analytics overlay draws.
+fn spinners(rig: &Rig) -> usize {
+    ElementHandle::find_by_element_id(&rig.app, "AppWindow::analytics-overlay")
+        .next()
+        .expect("the window has the Analytics overlay")
+        .query_descendants()
+        .match_type_name("FFSpinner")
+        .find_all()
+        .len()
+}
+
+/// How many elements of the window carry exactly `text` as their label.
+fn labelled(rig: &Rig, text: &str) -> usize {
+    ElementHandle::find_by_accessible_label(&rig.app, text).count()
+}
+
+/// The value state the window holds for each row.
+fn row_states(rig: &Rig) -> Vec<String> {
+    rig.app
+        .get_analytics_rows()
+        .iter()
+        .map(|row| row.value_state.to_string())
+        .collect()
+}
+
+/// Asserts `controller` shows `count` rows no count has reported for.
+fn assert_pending(controller: &AppController, count: usize) {
+    let rows = counting_rows_of(controller);
+    assert_eq!(rows.len(), count);
+    assert!(
+        rows.iter()
+            .all(|r| r.value == RowValue::Pending && r.count == 0 && r.fraction == 0.0),
+        "{rows:?}"
+    );
+}
+
 /// A tab over `count` frames named `00.tif`.. that are all copies of
 /// `mantis-64` frame 0.
 fn controller_with_identical_frames(name: &str, count: usize) -> AppController {
@@ -205,6 +250,7 @@ fn rows_match_the_core_counts() {
         assert_eq!(rows.len(), count);
         for (i, row) in rows.iter().enumerate() {
             let at = format!("row {i} of {count}");
+            assert_eq!(row.value, RowValue::Final, "{at}: value");
             assert_eq!(row.count, expected[i], "{at}: count");
             assert_eq!(row.name, format!("{i:02}.tif"), "{at}: name");
             assert_eq!(row.chip, source_color(i as u16, count as u32), "{at}: chip");
@@ -267,26 +313,141 @@ fn count_runs_off_the_ui_thread() {
         .toggle_analytics()
         .expect("opening over a stack starts a count");
 
-    // The call returned while the worker still sleeps: the overlay waits.
+    // The call returned while the worker still sleeps: the rows wait.
     assert!(!worker.is_finished());
     assert!(controller.analytics_open());
-    assert_eq!(*controller.analytics_view(), AnalyticsView::Computing);
+    assert_pending(&controller, 3);
     controller.settle_analytics();
-    assert_eq!(
-        *controller.analytics_view(),
-        AnalyticsView::Computing,
-        "settling with nothing parked shows nothing new"
-    );
+    assert_pending(&controller, 3);
     let rig = rig_with(controller);
     rig.pump();
-    assert_eq!(rig.app.get_analytics_state(), "computing");
-    assert_eq!(rig.app.get_analytics_rows().row_count(), 0);
+    assert_eq!(rig.app.get_analytics_state(), "counting");
+    assert_eq!(rig.app.get_analytics_rows().row_count(), 3);
+    assert_eq!(row_states(&rig), ["pending"; 3]);
+    assert_eq!(spinners(&rig), 3, "one spinner per pending row");
 
     worker.join().expect("the count worker did not panic");
     rig.controller.lock().unwrap().settle_analytics();
     rig.pump();
     assert_eq!(rig.app.get_analytics_state(), "rows");
     assert_eq!(rig.app.get_analytics_rows().row_count(), 3);
+    assert_eq!(row_states(&rig), ["final"; 3]);
+    assert_eq!(
+        spinners(&rig),
+        0,
+        "no spinner is left when the count is done"
+    );
+}
+
+#[test]
+fn rows_show_while_the_count_loads() {
+    let mut controller = common::controller_with_frames("analytics_loading_rows", 3);
+    controller.set_analytics_hold(HOLD);
+    let worker = controller.toggle_analytics().expect("a count started");
+
+    let rows = counting_rows_of(&controller);
+    assert_eq!(rows.len(), 3);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.name, format!("{i:02}.tif"), "row {i}");
+        assert_eq!(row.chip, source_color(i as u16, 3), "row {i}");
+        assert_eq!(row.value, RowValue::Pending, "row {i}");
+    }
+    assert_pending(&controller, 3);
+
+    controller.close_analytics();
+    worker.join().unwrap();
+}
+
+#[test]
+fn partial_counts_grow_with_the_tiles() {
+    const TILE_SIZE: u32 = 96;
+    const FRAMES: usize = 4;
+    let mut controller =
+        common::controller_with_frames_from("mantis-512", "analytics_partial", FRAMES);
+    controller.set_analytics_tile_size(TILE_SIZE);
+
+    // The core's own reports, one per tile, are what the window must step through.
+    let paths = fixture_frames(FRAMES);
+    let set = open_frame_set(&paths, HostBudget::host_derived(&host::snapshot())).unwrap();
+    let reader = set.reader.as_ref();
+    let mut reports: Vec<Vec<u32>> = Vec::new();
+    let done = count_sharp_areas_reporting(
+        reader,
+        reader.len(),
+        reader.dimensions(),
+        reader.frame(0).samples_per_pixel,
+        &ParamValues::new(),
+        TILE_SIZE,
+        &NoControl,
+        &mut |counts| reports.push(counts.to_vec()),
+    )
+    .unwrap();
+    assert!(reports.len() > 1, "the tile size is below the frame");
+
+    // The worker parks one snapshot per event and waits for the test to
+    // settle it before reading on.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let rig = rig_with(controller);
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_sink(Arc::new(move |event| {
+            if matches!(event, focusforge_gui::ShellEvent::AnalyticsReady) {
+                ready_tx.send(()).ok();
+                go_rx.lock().unwrap().recv().ok();
+            }
+        }));
+    let worker = rig
+        .controller
+        .lock()
+        .unwrap()
+        .toggle_analytics()
+        .expect("a count started");
+
+    for (i, expected) in reports.iter().enumerate() {
+        ready_rx.recv().expect("the worker reports");
+        let rows = {
+            let mut controller = rig.controller.lock().unwrap();
+            controller.settle_analytics();
+            counting_rows_of(&controller)
+        };
+        rig.pump();
+        assert_eq!(rig.app.get_analytics_state(), "counting", "report {i}");
+        assert_eq!(row_states(&rig), ["partial"; FRAMES], "report {i}");
+        assert_eq!(spinners(&rig), FRAMES, "report {i}: the spinners stay");
+        let largest = expected.iter().copied().max().unwrap();
+        assert_eq!(rows.len(), FRAMES);
+        for (row, &count) in rows.iter().zip(expected) {
+            assert_eq!(row.value, RowValue::Partial, "report {i}");
+            assert_eq!(row.count, count, "report {i}");
+            let fraction = if largest == 0 {
+                0.0
+            } else {
+                count as f32 / largest as f32
+            };
+            assert_eq!(row.fraction, fraction, "report {i}");
+        }
+        go_tx.send(()).unwrap();
+    }
+
+    ready_rx.recv().expect("the worker finishes");
+    let rows = {
+        let mut controller = rig.controller.lock().unwrap();
+        controller.settle_analytics();
+        rows_of(&controller)
+    };
+    rig.pump();
+    assert_eq!(row_states(&rig), ["final"; FRAMES]);
+    assert_eq!(spinners(&rig), 0);
+    assert!(rows.iter().all(|r| r.value == RowValue::Final));
+    assert_eq!(
+        rows.iter().map(|r| r.count).collect::<Vec<_>>(),
+        done.counts
+    );
+    go_tx.send(()).unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -314,6 +475,13 @@ fn unreadable_frame_shows_the_error() {
     assert_eq!(rig.app.get_analytics_state(), "failed");
     assert_eq!(rig.app.get_analytics_error(), message.as_str());
     assert_eq!(rig.app.get_analytics_rows().row_count(), 0);
+    assert_eq!(labelled(&rig, "Counting failed"), 1);
+    assert_eq!(
+        labelled(&rig, &message),
+        1,
+        "the core message is the caption"
+    );
+    assert_eq!(spinners(&rig), 0);
 
     rig.app.invoke_analytics_toggled(); // the close x
     rig.pump();
@@ -452,7 +620,7 @@ fn close_cancels_the_count_stale_result_dropped() {
     finished.join().unwrap();
     controller.close_analytics();
     controller.settle_analytics();
-    assert_eq!(*controller.analytics_view(), AnalyticsView::Computing);
+    assert_pending(&controller, 3);
 
     // Nor after the overlay opened again over a new, still running count.
     let finished = controller.toggle_analytics().expect("a count started");
@@ -461,34 +629,78 @@ fn close_cancels_the_count_stale_result_dropped() {
     controller.set_analytics_hold(HOLD);
     let running = controller.toggle_analytics().expect("a count started");
     controller.settle_analytics();
-    assert_eq!(
-        *controller.analytics_view(),
-        AnalyticsView::Computing,
-        "the earlier count's result belongs to a closed overlay"
-    );
+    assert_pending(&controller, 3);
     controller.close_analytics();
     running.join().unwrap();
 }
 
 #[test]
-fn analytics_button_needs_a_stack() {
+fn analytics_opens_without_a_stack() {
     let rig = rig_with(AppController::new());
     rig.pump();
-    assert!(!rig.app.get_analytics_enabled());
-    assert!(!rig.controller.lock().unwrap().analytics_enabled());
-    assert!(rig.controller.lock().unwrap().toggle_analytics().is_none());
-    rig.click(&rig.button("Analytics"));
-    assert!(!rig.open(), "the disabled button opens nothing");
+    let button = rig.button("Analytics");
+    rig.click(&button);
+    assert!(
+        rig.open() && rig.app.get_analytics_open(),
+        "the button opens it"
+    );
+    assert_eq!(
+        *rig.controller.lock().unwrap().analytics_view(),
+        AnalyticsView::Waiting
+    );
+    assert_eq!(rig.app.get_analytics_state(), "waiting");
+    assert_eq!(rig.app.get_analytics_rows().row_count(), 0);
+    assert_eq!(labelled(&rig, "No stack loaded"), 1);
+    assert_eq!(labelled(&rig, "Load a stack to count its sharp areas."), 1);
+    assert_eq!(spinners(&rig), 0, "the waiting panel has no spinner");
+    assert!(
+        rig.controller
+            .lock()
+            .unwrap()
+            .take_analytics_worker()
+            .is_none()
+    );
 
-    // Closing the stack closes the overlay.
+    rig.click(&button);
+    assert!(!rig.open(), "the button closes it again");
+    rig.click(&button);
+    rig.escape();
+    assert!(!rig.open(), "Esc closes the waiting overlay");
+}
+
+#[test]
+fn closing_the_stack_returns_to_waiting() {
     let mut controller = common::controller_with_frames("analytics_needs_stack", 2);
-    controller.set_analytics_hold(Duration::from_secs(30));
-    assert!(controller.analytics_enabled());
-    controller.toggle_analytics();
-    assert!(controller.analytics_open());
+    controller.set_analytics_hold(HOLD);
+    let held = controller.toggle_analytics().expect("a count started");
+    assert_pending(&controller, 2);
+
     controller.close_project(0);
-    assert!(!controller.analytics_enabled());
-    assert!(!controller.analytics_open(), "no stack, no overlay");
+    assert!(controller.analytics_open(), "the overlay stays open");
+    assert_eq!(*controller.analytics_view(), AnalyticsView::Waiting);
+    held.join().unwrap();
+    controller.settle_analytics();
+    assert_eq!(
+        *controller.analytics_view(),
+        AnalyticsView::Waiting,
+        "the closed stack's count shows nothing"
+    );
+
+    // Opening a stack while it waits starts the count for that stack.
+    let root = common::tree("analytics_needs_stack_again");
+    common::copy_frame(&root, "a.tif", 0);
+    common::copy_frame(&root, "b.tif", 1);
+    common::copy_frame(&root, "c.tif", 2);
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        focusforge_gui::OpenOutcome::Opened(_)
+    ));
+    assert_pending(&controller, 3);
+    let worker = controller
+        .take_analytics_worker()
+        .expect("opening the stack started a count");
+    controller.close_analytics();
+    worker.join().unwrap();
 }
 
 #[test]
@@ -523,7 +735,7 @@ fn tab_switch_follows_the_active_stack() {
     controller.set_analytics_hold(Duration::from_millis(400));
     let first = controller.toggle_analytics().expect("a count started");
     controller.select_project(1);
-    assert_eq!(*controller.analytics_view(), AnalyticsView::Computing);
+    assert_pending(&controller, 2);
     let second_worker = controller
         .take_analytics_worker()
         .expect("the switch started a count");
@@ -568,7 +780,6 @@ fn analytics_works_in_editor_mode() {
     common::enter_editor(&mut controller);
     assert_eq!(controller.mode(), ShellMode::Editor);
 
-    assert!(controller.analytics_enabled(), "enabled in the Editor");
     count_now(&mut controller);
     assert_eq!(rows_of(&controller).len(), 3);
 }

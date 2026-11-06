@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::analytics::{self, AnalyticsView, CountError};
+use crate::analytics::{self, AnalyticsView, CountError, RowValue};
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
@@ -1338,8 +1338,17 @@ pub struct CloseGuardCopy {
     pub confirm_label: String,
 }
 
-/// A finished count's generation and its counts or error text, parked for settle.
-type AnalyticsOutcome = Arc<Mutex<Option<(u64, Result<Vec<u32>, String>)>>>;
+/// What a count's worker has reached.
+enum AnalyticsSnapshot {
+    /// The counts after a finished tile.
+    Partial(Vec<u32>),
+    /// The finished count, or its error text.
+    Done(Result<Vec<u32>, String>),
+}
+
+/// The latest snapshot and the generation it belongs to, parked for settle;
+/// a newer snapshot replaces an unsettled one.
+type AnalyticsOutcome = Arc<Mutex<Option<(u64, AnalyticsSnapshot)>>>;
 
 /// The Analytics overlay's open flag, rows and the count in flight.
 #[derive(Default)]
@@ -1886,6 +1895,10 @@ pub struct AppController {
     open_hold: Duration,
     /// How long every Analytics count waits before it reads anything.
     analytics_hold: Duration,
+    /// The tile size of every Analytics count; the default when `None`.
+    analytics_tile_size: Option<u32>,
+    /// How long every Analytics count waits after each finished tile.
+    analytics_tile_pause: Duration,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
@@ -4581,6 +4594,7 @@ impl AppController {
                     self.request_tab_thumbnail(self.state.projects.len() - 1);
                 }
             }
+            self.sync_analytics_to_active_tab();
         }
         self.settle_tab_scroll();
         self.state.settings_scroll_y = 0.0;
@@ -5021,11 +5035,6 @@ impl AppController {
         self.state.analytics.open
     }
 
-    /// Whether there is a stack to count: the Analytics button's `enabled`.
-    pub fn analytics_enabled(&self) -> bool {
-        self.state.active().is_some()
-    }
-
     /// What the Analytics overlay shows.
     pub fn analytics_view(&self) -> &AnalyticsView {
         &self.state.analytics.view
@@ -5036,17 +5045,24 @@ impl AppController {
         self.analytics_hold = hold;
     }
 
+    /// Makes every Analytics count read in tiles of `size`.
+    pub fn set_analytics_tile_size(&mut self, size: u32) {
+        self.analytics_tile_size = Some(size);
+    }
+
+    /// Makes every Analytics count wait `pause` after each finished tile.
+    pub fn set_analytics_tile_pause(&mut self, pause: Duration) {
+        self.analytics_tile_pause = pause;
+    }
+
     /// Opens the Analytics overlay over the active stack and starts counting
     /// on a worker, closing the projects overlay, the calculator and the
-    /// notification center; closes it when it is open. Returns the worker's
-    /// join handle when a count started; [`Self::settle_analytics`] applies
-    /// its result.
+    /// notification center; with no stack open it waits for one. Closes it
+    /// when it is open. Returns the worker's join handle when a count
+    /// started; [`Self::settle_analytics`] applies its snapshots.
     pub fn toggle_analytics(&mut self) -> Option<std::thread::JoinHandle<()>> {
         if self.state.analytics.open {
             self.close_analytics();
-            return None;
-        }
-        if !self.analytics_enabled() {
             return None;
         }
         self.close_projects_overlay();
@@ -5077,7 +5093,7 @@ impl AppController {
         self.state.analytics.worker.take()
     }
 
-    /// Applies the parked count of the current generation; a result of a
+    /// Applies the parked snapshot of the current generation; one of a
     /// closed or replaced count changes nothing.
     pub fn settle_analytics(&mut self) {
         let analytics = &mut self.state.analytics;
@@ -5086,68 +5102,102 @@ impl AppController {
             .lock()
             .expect("no thread panicked while holding the analytics outcome")
             .take();
-        let Some((generation, result)) = parked else {
+        let Some((generation, snapshot)) = parked else {
             return;
         };
         if !analytics.open || generation != analytics.generation {
             return;
         }
-        analytics.view = match result {
-            Ok(counts) => AnalyticsView::Rows(analytics::build_rows(&analytics.frames, &counts)),
-            Err(message) => AnalyticsView::Failed(message),
-        };
+        analytics.view =
+            match snapshot {
+                AnalyticsSnapshot::Partial(counts) => AnalyticsView::Counting(
+                    analytics::build_rows(&analytics.frames, &counts, RowValue::Partial),
+                ),
+                AnalyticsSnapshot::Done(Ok(counts)) => AnalyticsView::Rows(analytics::build_rows(
+                    &analytics.frames,
+                    &counts,
+                    RowValue::Final,
+                )),
+                AnalyticsSnapshot::Done(Err(message)) => AnalyticsView::Failed(message),
+            };
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
+    /// Starts a count over the active stack, abandoning the one in flight;
+    /// with no stack open the overlay waits instead.
     fn start_analytics_count(&mut self) {
-        let Some(tab) = self.state.active() else {
-            return;
-        };
-        let (id, frames) = (tab.id, tab.frames.clone());
+        let active = self.state.active().map(|tab| (tab.id, tab.frames.clone()));
         let sink = self.sink.clone();
         let hold = self.analytics_hold;
+        let tile_pause = self.analytics_tile_pause;
+        let tile_size = self.analytics_tile_size;
         let analytics = &mut self.state.analytics;
         if let Some(previous) = analytics.control.take() {
             previous.cancel();
         }
         analytics.generation += 1;
+        let Some((id, frames)) = active else {
+            analytics.tab = None;
+            analytics.frames.clear();
+            analytics.view = AnalyticsView::Waiting;
+            self.emit(ShellEvent::AnalyticsChanged);
+            return;
+        };
         analytics.tab = Some(id);
         analytics.frames = frames.clone();
-        analytics.view = AnalyticsView::Computing;
+        analytics.view = AnalyticsView::Counting(analytics::pending_rows(&frames));
         let control = job::JobControl::new();
         analytics.control = Some(Arc::clone(&control));
         let generation = analytics.generation;
         let slot = Arc::clone(&analytics.outcome);
         analytics.worker = Some(std::thread::spawn(move || {
             std::thread::sleep(hold);
-            // A stopped count parks nothing, so it cannot replace the result
-            // of the count that superseded it.
-            let result = match analytics::count_frames(&frames, &*control) {
-                Ok(counts) => Ok(counts),
-                Err(CountError::Failed(message)) => Err(message),
-                Err(CountError::Stopped) => return,
+            // Parks `snapshot` over an unsettled one, unless a newer count
+            // already parked; the event is sent only when the slot was empty,
+            // so a fast count leaves at most one event pending.
+            let park = |snapshot: AnalyticsSnapshot| {
+                let mut parked = slot
+                    .lock()
+                    .expect("no thread panicked while holding the analytics outcome");
+                if parked
+                    .as_ref()
+                    .is_some_and(|(newer, _)| *newer > generation)
+                {
+                    return;
+                }
+                let was_empty = parked.is_none();
+                *parked = Some((generation, snapshot));
+                drop(parked);
+                if was_empty && let Some(sink) = &sink {
+                    sink(ShellEvent::AnalyticsReady);
+                }
             };
-            *slot
-                .lock()
-                .expect("no thread panicked while holding the analytics outcome") =
-                Some((generation, result));
-            if let Some(sink) = &sink {
-                sink(ShellEvent::AnalyticsReady);
-            }
+            // A stopped count parks nothing, so it cannot replace the
+            // snapshot of the count that superseded it.
+            let result =
+                match analytics::count_frames(&frames, tile_size, &*control, &mut |counts| {
+                    park(AnalyticsSnapshot::Partial(counts.to_vec()));
+                    std::thread::sleep(tile_pause);
+                }) {
+                    Ok(counts) => Ok(counts),
+                    Err(CountError::Failed(message)) => Err(message),
+                    Err(CountError::Stopped) => return,
+                };
+            park(AnalyticsSnapshot::Done(result));
         }));
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
     /// Follows the active tab while the overlay is open: recounts for a
-    /// different tab, closes when none is left.
+    /// different tab, waits when none is left.
     fn sync_analytics_to_active_tab(&mut self) {
         if !self.state.analytics.open {
             return;
         }
         match self.state.active().map(|tab| tab.id) {
-            None => self.close_analytics(),
+            None if self.state.analytics.tab.is_some() => self.start_analytics_count(),
             Some(id) if Some(id) != self.state.analytics.tab => self.start_analytics_count(),
-            Some(_) => {}
+            _ => {}
         }
     }
 

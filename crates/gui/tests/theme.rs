@@ -13,9 +13,11 @@
 mod common;
 
 use std::fs;
+use std::time::Duration;
 
-use focusforge_gui::{Theme, ThemeProbe};
-use slint::{Color, Global};
+use focusforge_gui::{Theme, ThemeProbe, ThemeSheet};
+use i_slint_backend_testing::{ElementQuery, mock_elapsed_time};
+use slint::{Color, ComponentHandle, Global};
 
 /// A headless `ThemeProbe` instance; the shared per-thread backend guard
 /// makes a repeat call on the same thread safe.
@@ -418,4 +420,53 @@ fn motion_tokens_are_zero_with_reduced_motion() {
 
     theme.set_reduce_motion(false);
     assert_eq!(motion_tokens(&theme), (150, 400, 150));
+}
+
+/// `(spinner angle, sweep at the right)` at the current mock time.
+fn motion_sample(theme: &Theme<'_>) -> (f32, bool) {
+    slint::platform::update_timers_and_animations();
+    (theme.get_spinner_angle(), theme.get_sweep_right())
+}
+
+/// The sample at 0 ms and at `at` ms later.
+fn motion_samples(theme: &Theme<'_>, at: u64) -> ((f32, bool), (f32, bool)) {
+    let start = motion_sample(theme);
+    mock_elapsed_time(Duration::from_millis(at));
+    (start, motion_sample(theme))
+}
+
+#[test]
+fn spinner_and_sweep_stand_still_with_reduced_motion() {
+    common::init_window_backend();
+    let sheet = ThemeSheet::new().unwrap();
+    // The element query skips what the window clips away, and the sheet is
+    // a long column.
+    sheet
+        .window()
+        .set_size(slint::PhysicalSize::new(1300, 20_000));
+    sheet.show().unwrap();
+    let theme = Theme::get(&sheet);
+    let spinners = || {
+        ElementQuery::from_root(&sheet)
+            .match_descendants()
+            .match_type_name("FFSpinner")
+            .find_all()
+            .len()
+    };
+
+    assert!(!theme.get_reduce_motion());
+    let drawn = spinners();
+    assert!(drawn > 0, "the sheet draws no FFSpinner");
+    // 450 ms is no whole spinner turn; the sweep flips sides every 900 ms.
+    let (start, later) = motion_samples(&theme, 450);
+    assert_ne!(start.0, later.0, "the spinner turns with motion on");
+    let (start, later) = motion_samples(&theme, 900);
+    assert_ne!(start.1, later.1, "the sweep changes sides with motion on");
+
+    theme.set_reduce_motion(true);
+    let (start, later) = motion_samples(&theme, 450);
+    assert_eq!(start, later, "the spinner stands still");
+    let (start, later) = motion_samples(&theme, 900);
+    assert_eq!(start, later, "the sweep is a fixed segment");
+    assert_eq!(spinners(), drawn, "the spinner stays drawn");
 }

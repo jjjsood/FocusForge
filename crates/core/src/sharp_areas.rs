@@ -88,11 +88,40 @@ pub enum SharpAreasError {
 pub fn count_sharp_areas(
     reader: &dyn TileReader,
     frames: usize,
+    extent: (u32, u32),
+    spp: u32,
+    values: &ParamValues,
+    tile_size: u32,
+    control: &dyn TileControl,
+) -> Result<SharpAreas, SharpAreasError> {
+    count_sharp_areas_reporting(
+        reader,
+        frames,
+        extent,
+        spp,
+        values,
+        tile_size,
+        control,
+        &mut |_| {},
+    )
+}
+
+/// [`count_sharp_areas`], reading every frame of one tile before the next
+/// tile, and calling `on_tile` after each tile with the counts of the cells
+/// decided so far. A cell is decided once every tile covering it has been
+/// read in every frame, so the reported counts never decrease and the last
+/// report equals the result. `control` is asked to stop before each frame's
+/// read of a tile and told of each finished read.
+#[allow(clippy::too_many_arguments)]
+pub fn count_sharp_areas_reporting(
+    reader: &dyn TileReader,
+    frames: usize,
     (width, height): (u32, u32),
     spp: u32,
     values: &ParamValues,
     tile_size: u32,
     control: &dyn TileControl,
+    on_tile: &mut dyn FnMut(&[u32]),
 ) -> Result<SharpAreas, SharpAreasError> {
     params::validate(&SHARP_AREA_PARAMS, values)?;
     let resolved = params::resolved_values(&params::resolve_in(
@@ -128,19 +157,33 @@ pub fn count_sharp_areas(
             f64::from(across) * f64::from(down)
         })
         .collect();
+    // The cells a tile's interior touches, as column and row ranges.
+    let touched = |interior: crate::tile::Rect| {
+        (
+            (interior.x / cell) as usize..=((interior.x + interior.width - 1) / cell) as usize,
+            (interior.y / cell) as usize..=((interior.y + interior.height - 1) / cell) as usize,
+        )
+    };
+    let mut tiles_left = vec![0u32; cells];
+    for tile in plan.tiles() {
+        let (across, down) = touched(tile.interior());
+        for row in down {
+            for column in across.clone() {
+                tiles_left[row * columns + column] += 1;
+            }
+        }
+    }
 
-    let mut peak = vec![f64::NEG_INFINITY; cells];
-    let mut peak_frame = vec![0usize; cells];
-    let mut floor = vec![f64::INFINITY; cells];
-    let mut sums = vec![0.0f64; cells];
+    // Per frame and cell, the sum of the focus scores read so far.
+    let mut sums = vec![0.0f64; frames * cells];
+    let mut counts = vec![0u32; frames];
     let mut samples = Vec::new();
-    for frame in 0..frames {
-        sums.fill(0.0);
-        for tile in plan.tiles() {
+    for tile in plan.tiles() {
+        let (read, interior) = (tile.read(), tile.interior());
+        for frame in 0..frames {
             if control.should_stop() {
                 return Err(SharpAreasError::Stopped);
             }
-            let (read, interior) = (tile.read(), tile.interior());
             samples.resize(
                 read.width as usize * read.height as usize * spp as usize,
                 0u16,
@@ -148,31 +191,40 @@ pub fn count_sharp_areas(
             reader.read_tile_into(frame, read, &mut samples)?;
             let detail = detail_plane(&samples, read.width, read.height, spp)?;
             let scores = score_plane(&detail, SCORE_RADIUS);
+            let frame_sums = &mut sums[frame * cells..(frame + 1) * cells];
             for y in interior.y..interior.y + interior.height {
                 let row = ((y - read.y) * read.width) as usize;
                 let cell_row = (y / cell) as usize * columns;
                 for x in interior.x..interior.x + interior.width {
-                    sums[cell_row + (x / cell) as usize] +=
+                    frame_sums[cell_row + (x / cell) as usize] +=
                         f64::from(scores[row + (x - read.x) as usize]);
                 }
             }
             control.unit_completed(u64::from(read.width) * u64::from(read.height));
         }
-        for index in 0..cells {
-            let mean = sums[index] / area[index];
-            if mean > peak[index] {
-                peak[index] = mean;
-                peak_frame[index] = frame;
+        let (across, down) = touched(interior);
+        for row in down {
+            for column in across.clone() {
+                let index = row * columns + column;
+                tiles_left[index] -= 1;
+                if tiles_left[index] > 0 || frames == 0 {
+                    continue;
+                }
+                let (mut peak, mut peak_frame, mut floor) = (f64::NEG_INFINITY, 0, f64::INFINITY);
+                for frame in 0..frames {
+                    let mean = sums[frame * cells + index] / area[index];
+                    if mean > peak {
+                        peak = mean;
+                        peak_frame = frame;
+                    }
+                    floor = floor.min(mean);
+                }
+                if peak > contrast * floor {
+                    counts[peak_frame] += 1;
+                }
             }
-            floor[index] = floor[index].min(mean);
         }
-    }
-
-    let mut counts = vec![0u32; frames];
-    for index in 0..cells {
-        if frames > 0 && peak[index] > contrast * floor[index] {
-            counts[peak_frame[index]] += 1;
-        }
+        on_tile(&counts);
     }
     Ok(SharpAreas {
         cells: cells as u32,
@@ -407,8 +459,73 @@ mod tests {
             .map(|tile| u64::from(tile.read().width) * u64::from(tile.read().height))
             .collect();
         assert!(per_frame.len() > 1, "the tile size is below the extent");
-        let expected: Vec<u64> = (0..3).flat_map(|_| per_frame.clone()).collect();
+        let expected: Vec<u64> = per_frame.iter().flat_map(|&pixels| [pixels; 3]).collect();
         assert_eq!(*control.pixels.lock().unwrap(), expected);
+    }
+
+    /// The counts `on_tile` was given at every tile, and the result.
+    fn reports(
+        reader: &VecReader,
+        values: &ParamValues,
+        tile_size: u32,
+    ) -> (Vec<Vec<u32>>, SharpAreas) {
+        let mut reported = Vec::new();
+        let result = count_sharp_areas_reporting(
+            reader,
+            reader.frames.len(),
+            (WIDTH, HEIGHT),
+            1,
+            values,
+            tile_size,
+            &NoControl,
+            &mut |counts| reported.push(counts.to_vec()),
+        )
+        .unwrap();
+        (reported, result)
+    }
+
+    #[test]
+    fn partial_counts_grow_to_the_result() {
+        let stack = split_stack();
+        for cell in [64, 100] {
+            let values = values(&[("cell-size", ParamValue::Int(cell))]);
+            let wanted = count(&stack, &values).unwrap();
+            for tile_size in [96, 160, 512] {
+                let at = format!("cell {cell}, tile {tile_size}");
+                let (reported, result) = reports(&stack, &values, tile_size);
+                assert_eq!(result, wanted, "{at}: the result ignores the tile size");
+                let tiles = TilePlan::new(
+                    WIDTH,
+                    HEIGHT,
+                    tile_size,
+                    TileSupport {
+                        reach_px: DETAIL_REACH + SCORE_RADIUS,
+                        decimation_levels: 1,
+                    },
+                )
+                .unwrap()
+                .tiles()
+                .len();
+                assert_eq!(reported.len(), tiles, "{at}: one report per tile");
+                for pair in reported.windows(2) {
+                    assert!(
+                        pair[0]
+                            .iter()
+                            .zip(&pair[1])
+                            .all(|(before, after)| before <= after),
+                        "{at}: {pair:?} shrank"
+                    );
+                }
+                assert_eq!(reported.last(), Some(&wanted.counts), "{at}: last report");
+            }
+        }
+        let (reported, _) = reports(&stack, &values(&[]), 96);
+        assert!(
+            reported
+                .iter()
+                .any(|counts| counts != reported.last().unwrap()),
+            "a tile size below the extent reports partial counts"
+        );
     }
 
     #[test]

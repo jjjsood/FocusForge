@@ -18,7 +18,7 @@ use slint::winit_030::{CustomApplicationHandler, EventResult, WinitWindowAccesso
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
-use crate::analytics::AnalyticsView;
+use crate::analytics::{AnalyticsView, RowValue};
 use crate::canvas::{
     CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
     truncate_pane_label,
@@ -2596,27 +2596,31 @@ pub fn push_overlays(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_analytics(app, &controller);
 }
 
-/// Pushes the Analytics overlay's open flag, the button's enabled flag and
-/// the overlay's state; the rows go through `sync_rows`, so a row that did
-/// not change keeps its element tree.
+/// Pushes the Analytics overlay's open flag and state; the rows go through
+/// `sync_rows`, so a row that did not change keeps its element tree.
 pub fn push_analytics(app: &AppWindow, controller: &AppController) {
     app.set_analytics_open(controller.analytics_open());
-    app.set_analytics_enabled(controller.analytics_enabled());
+    let row_views = |rows: &[crate::analytics::AnalyticsRow]| -> Vec<AnalyticsRowView> {
+        rows.iter()
+            .map(|row| AnalyticsRowView {
+                chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
+                name: row.name.as_str().into(),
+                mm_text: row.mm_text.as_str().into(),
+                fraction: row.fraction,
+                count: i32::try_from(row.count).unwrap_or(i32::MAX),
+                value_state: match row.value {
+                    RowValue::Pending => "pending",
+                    RowValue::Partial => "partial",
+                    RowValue::Final => "final",
+                }
+                .into(),
+            })
+            .collect()
+    };
     let (state, rows, error) = match controller.analytics_view() {
-        AnalyticsView::Computing => ("computing", Vec::new(), ""),
-        AnalyticsView::Rows(rows) => (
-            "rows",
-            rows.iter()
-                .map(|row| AnalyticsRowView {
-                    chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                    name: row.name.as_str().into(),
-                    mm_text: row.mm_text.as_str().into(),
-                    fraction: row.fraction,
-                    count: i32::try_from(row.count).unwrap_or(i32::MAX),
-                })
-                .collect(),
-            "",
-        ),
+        AnalyticsView::Waiting => ("waiting", Vec::new(), ""),
+        AnalyticsView::Counting(rows) => ("counting", row_views(rows), ""),
+        AnalyticsView::Rows(rows) => ("rows", row_views(rows), ""),
         AnalyticsView::Failed(message) => ("failed", Vec::new(), message.as_str()),
     };
     app.set_analytics_state(state.into());
