@@ -1340,6 +1340,23 @@ fn a_saved_project_reopens_through_the_same_picker() {
 }
 
 #[test]
+fn a_reopened_project_plans_for_its_frames_not_its_cropped_composite() {
+    use focusforge_gui::entry::tab_stack_context;
+
+    let dir = tree("entry_reopen_context");
+    copy_frame_from("mantis-64", &dir, "00.tif", 0);
+    let project_path = seal_test_project(&dir, &[dir.join("00.tif")]);
+    let project = focusforge_core::project::Project::open(&project_path).expect("project opens");
+
+    let context = tab_stack_context(&GuiProject::Opened(Box::new(project))).expect("a context");
+    assert_eq!(
+        (context.width, context.height, context.samples_per_pixel),
+        (64, 64, 3),
+        "the 4x4 composite is smaller than the 64x64 frame the run read"
+    );
+}
+
+#[test]
 fn a_file_that_is_not_a_project_is_refused_by_name() {
     let dir = tree("entry_not_a_project");
     let bad = dir.join("notes.ffp");

@@ -579,8 +579,9 @@ fn first_frame_geometry(path: &Path) -> Option<(u32, u32, u32)> {
 
 /// A tab's [`StackContext`], without a composite: an [`GuiProject::Unsaved`]
 /// tab reads its first frame's geometry (`first_frame_geometry`) plus the
-/// group's own frame count; a reopened [`GuiProject::Opened`] reads the
-/// sealed manifest's composite plane instead. Cached once by
+/// group's own frame count; a reopened [`GuiProject::Opened`] reads its first
+/// recorded source's geometry, or the sealed composite plane's when that frame
+/// is unreadable. Cached once by
 /// `ProjectTab::new`, never re-read on every settings-panel resolve. `None`
 /// for an unreadable or frame-less group, which `propose`/`one_group` never
 /// actually produce but a future caller must not panic on.
@@ -597,11 +598,23 @@ pub fn tab_stack_context(project: &GuiProject) -> Option<StackContext> {
         }
         GuiProject::Opened(project) => {
             let composite = &project.manifest().composite;
+            // The crop shrinks the composite below the frames the run read,
+            // and the run's stored values were planned for the frames.
+            let (width, height, samples_per_pixel) = project
+                .manifest()
+                .sources
+                .first()
+                .and_then(|source| first_frame_geometry(&project.source_path(source)))
+                .unwrap_or((
+                    composite.width,
+                    composite.height,
+                    composite.samples_per_pixel,
+                ));
             Some(StackContext::new(
                 composite.frame_count as usize,
-                composite.width,
-                composite.height,
-                composite.samples_per_pixel,
+                width,
+                height,
+                samples_per_pixel,
             ))
         }
     }

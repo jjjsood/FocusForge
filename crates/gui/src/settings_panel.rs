@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
 use focusforge_core::equalize::EqualizeSettings;
-use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, resolve_in};
+use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, check_for, resolve_in};
 pub(crate) use focusforge_core::params::{
     ParamValue, ParamValues, ParamViolation, StackContext, validate,
 };
@@ -772,9 +772,11 @@ fn section_rows(
     } = *section_ctx;
 
     let has_more = schema.iter().any(|desc| desc.advanced);
-    let hidden_violation = schema
-        .iter()
-        .any(|desc| desc.advanced && errors.contains_key(&menu_key(section, &desc.id)));
+    let hidden_violation = schema.iter().any(|desc| {
+        desc.advanced
+            && (errors.contains_key(&menu_key(section, &desc.id))
+                || stored_violation(desc, values, ctx).is_some())
+    });
     let open = expanded.contains(section) || hidden_violation;
 
     // A map can be shared by several sections, so only keys this schema
@@ -818,15 +820,24 @@ fn section_rows(
             .get(&desc.id)
             .map(|r| r.value.clone())
             .unwrap_or_else(|| desc.default.clone());
-        let mut rows = vec![field_row(
+        let mut rows = vec![field_row_for(
             section,
             desc,
             &value,
             menu_open == Some(key.as_str()),
+            ctx,
         )];
-        if let Some(violation) = errors.get(&key) {
+        let message = errors.get(&key).map(violation_text).or_else(|| {
+            stored_violation(desc, values, ctx).map(|violation| match violation {
+                ParamViolation::OutOfRange { min, max, .. } => {
+                    format!("Allowed range {min} to {max}")
+                }
+                other => violation_text(&other),
+            })
+        });
+        if let Some(value_text) = message {
             rows.push(SettingsRow {
-                value_text: violation_text(violation),
+                value_text,
                 ..SettingsRow::new(RowKind::Error, section, &desc.id)
             });
         }
@@ -859,15 +870,56 @@ fn section_rows(
     rows
 }
 
-/// One parameter's own row, its shape ([`control_kind`]) driving which of
-/// `value_text`/`fraction`/`choices`/`selected` carries the value.
+/// The violation of `desc`'s explicitly stored value in `values` against the
+/// range `ctx`'s stack allows, `None` when nothing is stored or it fits.
+pub(crate) fn stored_violation(
+    desc: &ParamDesc,
+    values: &ParamValues,
+    ctx: Option<&StackContext>,
+) -> Option<ParamViolation> {
+    check_for(desc, values.get(&desc.id)?, ctx).err()
+}
+
+/// Whether the Fuse or Align selection holds an explicit value outside the
+/// range `ctx`'s stack allows.
+pub(crate) fn has_stored_violation(
+    fuse_id: &str,
+    fuse_values: &ParamValues,
+    align_id: &str,
+    align_values: &ParamValues,
+    ctx: Option<&StackContext>,
+) -> bool {
+    let out_of_reach = |params: &[ParamDesc], values: &ParamValues| {
+        params
+            .iter()
+            .any(|desc| stored_violation(desc, values, ctx).is_some())
+    };
+    registry::find_stack(fuse_id).is_ok_and(|a| out_of_reach(a.params(), fuse_values))
+        || registry::find_align(align_id).is_ok_and(|a| out_of_reach(a.params(), align_values))
+}
+
+/// [`field_row_for`] without a stack, for fields no stack bounds.
 pub(crate) fn field_row(
     section: &str,
     desc: &ParamDesc,
     value: &ParamValue,
     menu_open: bool,
 ) -> SettingsRow {
+    field_row_for(section, desc, value, menu_open, None)
+}
+
+/// One parameter's own row, its shape ([`control_kind`]) driving which of
+/// `value_text`/`fraction`/`choices`/`selected` carries the value. A slider's
+/// thumb is placed on the range `ctx`'s stack allows.
+pub(crate) fn field_row_for(
+    section: &str,
+    desc: &ParamDesc,
+    value: &ParamValue,
+    menu_open: bool,
+    ctx: Option<&StackContext>,
+) -> SettingsRow {
     let kind = control_kind(&desc.kind);
+    let reach = desc.kind_for(ctx);
     let mut row = SettingsRow {
         label: desc.label.clone(),
         ..SettingsRow::new(kind, section, &desc.id)
@@ -876,12 +928,12 @@ pub(crate) fn field_row(
         RowKind::LinearFloat | RowKind::LogFloat => {
             let v = value.as_f64().unwrap_or_default();
             row.value_text = float_text(v, &desc.kind);
-            row.fraction = slider_fraction(v, &desc.kind);
+            row.fraction = slider_fraction(v, &reach);
         }
         RowKind::Int => {
             let v = value.as_i64().unwrap_or_default();
             row.value_text = v.to_string();
-            row.fraction = slider_fraction(v as f64, &desc.kind);
+            row.fraction = slider_fraction(v as f64, &reach);
         }
         RowKind::Bool => {
             let v = value.as_bool().unwrap_or_default();

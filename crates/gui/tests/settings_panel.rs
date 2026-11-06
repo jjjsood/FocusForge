@@ -1189,6 +1189,63 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     assert!(resized, "some align algorithm changes the row count");
 }
 
+/// The Levels row and the row after it (`Some` only for an error row), as the
+/// panel shows them now.
+fn levels_row(controller: &AppController) -> (SettingsRow, Option<SettingsRow>) {
+    let rows = controller.settings_panel().rows;
+    let at = row_index(&rows, "fuse", "levels");
+    let error = rows.get(at + 1).filter(|r| r.kind == RowKind::Error);
+    (rows[at].clone(), error.cloned())
+}
+
+/// The Levels slider ends at the deepest level the open stack supports, whether
+/// dragged or stepped; a stored deeper value keeps its readout, shows the
+/// allowed range and refuses Fuse until the slider moves it.
+#[test]
+fn levels_slider_stops_at_the_planned_bound() {
+    let mut big = AppController::new();
+    open_mantis_512(&mut big);
+    big.toggle_section_more("fuse");
+    big.set_param_fraction("fuse", "levels", 1.0);
+    assert_eq!(fuse_value(&big, "levels"), "7", "a 512 px stack ends at 7");
+    big.step_param("fuse", "levels", 1);
+    assert_eq!(
+        fuse_value(&big, "levels"),
+        "7",
+        "Right at the end stores nothing new"
+    );
+    big.step_param("fuse", "levels", -1);
+    assert_eq!(fuse_value(&big, "levels"), "6");
+
+    big.set_param_value("fuse", "levels", ParamValue::Int(16));
+    let (row, error) = levels_row(&big);
+    assert_eq!(
+        row.value_text, "16",
+        "the stored value is shown, not clamped"
+    );
+    assert_eq!(row.fraction, 1.0, "the thumb sits at the end");
+    let error = error.expect("a stored value past the bound shows an error row");
+    assert_eq!(error.value_text, "Allowed range 1 to 7");
+    assert!(
+        !big.start_fuse(),
+        "Fuse is refused while the stored value is out of reach"
+    );
+
+    big.step_param("fuse", "levels", -1);
+    let (row, error) = levels_row(&big);
+    assert_eq!(
+        row.value_text, "7",
+        "moving the slider brings it inside the bound"
+    );
+    assert!(error.is_none(), "and clears the error row");
+
+    let mut small = AppController::new();
+    common::open_mantis64_tab(&mut small, "levels_bound_64", 3);
+    small.toggle_section_more("fuse");
+    small.set_param_fraction("fuse", "levels", 1.0);
+    assert_eq!(fuse_value(&small, "levels"), "4", "a 64 px stack ends at 4");
+}
+
 /// A slider drag keeps its grab across a panel push between two moves.
 #[test]
 fn a_slider_drag_survives_a_panel_push() {

@@ -5944,7 +5944,7 @@ impl AppController {
         let Some(desc) = settings_panel::find_desc(section, &tab.fuse_id, &tab.align_id, id) else {
             return;
         };
-        let value = settings_panel::slider_value(fraction, &desc.kind);
+        let value = settings_panel::slider_value(fraction, &desc.kind_for(tab.ctx.as_ref()));
         self.set_param_value(section, id, value);
     }
 
@@ -5963,7 +5963,8 @@ impl AppController {
             .unwrap_or(&desc.default)
             .as_f64()
             .unwrap_or_default();
-        if let Some(value) = settings_panel::stepped_value(current, direction, &desc.kind) {
+        let kind = desc.kind_for(tab.ctx.as_ref());
+        if let Some(value) = settings_panel::stepped_value(current, direction, &kind) {
             self.set_param_value(section, id, value);
         }
     }
@@ -8279,7 +8280,15 @@ impl AppController {
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
-        if !tab.errors.is_empty() {
+        if !tab.errors.is_empty()
+            || settings_panel::has_stored_violation(
+                &tab.fuse_id,
+                &tab.fuse_values,
+                &tab.align_id,
+                &tab.align_values,
+                tab.ctx.as_ref(),
+            )
+        {
             return false;
         }
         let id = tab.id;
