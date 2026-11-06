@@ -40,6 +40,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('review', 'review', [CompletionResultType]::ParameterValue, 'Report one record per result found under a directory of projects, or a batch run''s output directory: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of `*.ffp` files; never groups frames itself and writes nothing')
             [CompletionResult]::new('cache', 'cache', [CompletionResultType]::ParameterValue, 'Remove every entry from the stage cache under `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any project')
             [CompletionResult]::new('diagnostics', 'diagnostics', [CompletionResultType]::ParameterValue, 'Package this installation''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere')
+            [CompletionResult]::new('check-update', 'check-update', [CompletionResultType]::ParameterValue, 'Ask the release server whether a newer FocusForge release exists')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -285,6 +286,15 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'focusforge-cli;check-update' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit the JSON report instead of human-readable text')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
         'focusforge-cli;help' {
             [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory')
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
@@ -298,6 +308,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('review', 'review', [CompletionResultType]::ParameterValue, 'Report one record per result found under a directory of projects, or a batch run''s output directory: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of `*.ffp` files; never groups frames itself and writes nothing')
             [CompletionResult]::new('cache', 'cache', [CompletionResultType]::ParameterValue, 'Remove every entry from the stage cache under `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any project')
             [CompletionResult]::new('diagnostics', 'diagnostics', [CompletionResultType]::ParameterValue, 'Package this installation''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere')
+            [CompletionResult]::new('check-update', 'check-update', [CompletionResultType]::ParameterValue, 'Ask the release server whether a newer FocusForge release exists')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -351,6 +362,9 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;help;diagnostics' {
+            break
+        }
+        'focusforge-cli;help;check-update' {
             break
         }
         'focusforge-cli;help;help' {

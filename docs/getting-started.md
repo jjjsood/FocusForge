@@ -149,7 +149,7 @@ Everything the window does with a stack can also be scripted with
 focusforge-cli stack path/to/frames/ --algorithm laplacian
 ```
 
-Every package contains 17 manual pages, including `focusforge-cli-stack(1)`,
+Every package contains 18 manual pages, including `focusforge-cli-stack(1)`,
 and completion scripts for Bash, Zsh, Fish and PowerShell. On Linux their
 paths are:
 
