@@ -42,7 +42,7 @@ use crate::generated::{
     FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap,
     PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
     RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StageTile, StoragePathState, StorageState, SummaryCell, Theme,
+    StageTile, StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -817,6 +817,7 @@ fn model_publication_scope(event: &ShellEvent) -> Option<crate::diagnostics::Mea
         | ShellEvent::DiagnosticsWriteFinished(_)
         | ShellEvent::DiagnosticsScanFinished { .. }
         | ShellEvent::UpdateChecked(_)
+        | ShellEvent::UpdateCheckedNow(_)
         | ShellEvent::JobChanged
         | ShellEvent::LoadStarted
         | ShellEvent::LoadReady
@@ -1506,6 +1507,23 @@ pub fn push_storage_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>
         clear_enabled: view.clear_enabled,
         status: view.status.into(),
         status_tone: view.status_tone.as_str().into(),
+    });
+}
+
+/// Rebuilds the About tab's update controls from the controller and pushes
+/// them into the window.
+pub fn push_update_controls_view(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
+    let view = controller.lock().unwrap().update_controls_view();
+    app.set_update_controls(UpdateControlsState {
+        check_on_start: view.check_on_start,
+        check_enabled: view.check_enabled,
+        checking: view.checking,
+        status: view.status.into(),
+        status_tone: view.status_tone.as_str().into(),
+        result_text: view.result_text.into(),
+        skip_enabled: view.skip_enabled,
+        failure: view.failure.into(),
+        save_error: view.save_error.into(),
     });
 }
 
@@ -3910,6 +3928,50 @@ pub fn install(
             }
         }
     });
+    app.on_update_check_on_start_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |on| {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().set_update_check_on_start(on);
+            if let Some(app) = app_weak.upgrade() {
+                push_update_controls_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_update_check_now_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_surface_input(InputSurface::Other);
+            // The check reports through the sink and needs no join.
+            drop(controller.lock().unwrap().check_for_updates_now());
+            if let Some(app) = app_weak.upgrade() {
+                push_update_controls_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_update_skip_requested({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().skip_update_version();
+            if let Some(app) = app_weak.upgrade() {
+                push_update_controls_view(&app, &controller);
+                direct_publication_scope(InputSurface::Other);
+            }
+        }
+    });
+    app.on_update_page_requested({
+        let controller = controller.clone();
+        move || {
+            record_surface_input(InputSurface::Other);
+            controller.lock().unwrap().open_update_page();
+        }
+    });
     app.on_performance_gpu_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
@@ -5213,6 +5275,10 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
         ShellEvent::UpdateChecked(outcome) => {
             controller.lock().unwrap().finish_update_check(outcome);
             refresh_toast(app, controller);
+        }
+        ShellEvent::UpdateCheckedNow(outcome) => {
+            controller.lock().unwrap().finish_check_now(outcome);
+            push_update_controls_view(app, controller);
         }
         // The three entry-path events. `EntryRefused`'s
         // message is already rendered by `AppController::refuse`, never

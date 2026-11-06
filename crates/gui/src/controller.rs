@@ -50,7 +50,7 @@ use crate::settings_panel::{
 use crate::source_previews::{
     MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
 };
-use crate::update_settings::UpdateSettings;
+use crate::update_settings::{self, PreviewRelease, UpdateSettings};
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 use focusforge_gpu::blend::Blender;
 
@@ -169,6 +169,32 @@ pub struct StorageView {
     pub status_tone: StorageTone,
 }
 
+/// Everything the About tab's update controls show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateControlsView {
+    pub check_on_start: bool,
+    /// Whether Check now can be pressed: false while a check runs.
+    pub check_enabled: bool,
+    /// True only while a Check now request is in flight.
+    pub checking: bool,
+    pub status: String,
+    pub status_tone: StorageTone,
+    /// A newer version or a failure is shown below the Check now row.
+    pub result_visible: bool,
+    /// The newer version, empty without one.
+    pub newer_version: String,
+    /// `FocusForge {version} is available.` with a newer version, else empty.
+    pub result_text: String,
+    /// The newer version is the one the user skipped.
+    pub skipped: bool,
+    pub skip_enabled: bool,
+    /// `Could not check for updates: {reason}` after a failed check, else
+    /// empty.
+    pub failure: String,
+    /// The write error of the last settings save, empty without one.
+    pub save_error: String,
+}
+
 /// Shown while a run is live and the clear is refused.
 const STORAGE_REFUSAL: &str = "A run is active.";
 
@@ -254,6 +280,9 @@ pub enum ShellEvent {
     /// Raised by [`AppController::start_update_check`]'s background thread
     /// once the check has settled.
     UpdateChecked(job::UpdateCheck),
+    /// Raised by [`AppController::check_for_updates_now`]'s background thread
+    /// once the check has settled.
+    UpdateCheckedNow(job::UpdateCheck),
     /// The open project set changed: a tab opened, closed or was selected.
     ProjectsChanged,
     /// Only the tab strip's scroll state moved -- its offset, overflow
@@ -1789,6 +1818,23 @@ fn clamp_field_scroll(cursor_x: f32, current_offset: f32, viewport_width: f32) -
 /// Opens a URL in the system browser.
 type UrlOpener = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Builds the release source for one Check now request.
+pub type ReleaseSourceFactory = Arc<dyn Fn() -> Box<dyn job::ReleaseSource + Send> + Send + Sync>;
+
+/// What the last Check now request found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Newer {
+        version: String,
+        url: String,
+    },
+    Failed(String),
+}
+
 /// The plain-Rust controller every Slint callback in the crate forwards to.
 /// No method signature here names a Slint type.
 #[derive(Default)]
@@ -1802,6 +1848,10 @@ pub struct AppController {
     /// the mouse-down only while the press is still being dispatched.
     native_drag: Option<Arc<dyn Fn(WindowTarget) + Send + Sync>>,
     url_opener: Option<UrlOpener>,
+    release_source: Option<ReleaseSourceFactory>,
+    updates: UpdateSettings,
+    updates_save_error: Option<String>,
+    update_status: UpdateStatus,
     job: JobSlot,
     /// Test-only override for the window's scratch root: unset, a run's
     /// ledger, staging, held checkpoints and plane cache live under the
@@ -2120,6 +2170,12 @@ impl AppController {
     /// Installs the hook that opens a URL in the system browser.
     pub fn set_url_opener(&mut self, opener: UrlOpener) {
         self.url_opener = Some(opener);
+    }
+
+    /// Installs the factory that builds the release source for each Check
+    /// now request; without one the button starts nothing.
+    pub fn set_release_source(&mut self, factory: ReleaseSourceFactory) {
+        self.release_source = Some(factory);
     }
 
     fn emit(&self, event: ShellEvent) {
@@ -7696,6 +7752,95 @@ impl AppController {
         self.appearance_save_error = None;
     }
 
+    /// Installs the `[updates]` settings loaded at startup.
+    pub fn install_updates(&mut self, settings: UpdateSettings) {
+        self.updates = settings;
+        self.updates_save_error = None;
+    }
+
+    pub fn update_settings(&self) -> &UpdateSettings {
+        &self.updates
+    }
+
+    /// Stores the switch for this session and writes `[updates]`.
+    pub fn set_update_check_on_start(&mut self, on: bool) {
+        self.updates.check_on_start = on;
+        self.save_updates();
+    }
+
+    /// Skips the newer version Check now shows; does nothing without one.
+    pub fn skip_update_version(&mut self) {
+        let UpdateStatus::Newer { version, .. } = &self.update_status else {
+            return;
+        };
+        self.updates.skipped_version = Some(version.clone());
+        self.save_updates();
+    }
+
+    fn save_updates(&mut self) {
+        self.updates_save_error = self
+            .state
+            .config_dir
+            .as_deref()
+            .and_then(|dir| update_settings::save(dir, &self.updates).err())
+            .map(|error| error.to_string());
+    }
+
+    /// Follows the link of the newer version Check now shows.
+    pub fn open_update_page(&self) {
+        if let UpdateStatus::Newer { url, .. } = &self.update_status
+            && let Some(opener) = &self.url_opener
+        {
+            opener(url);
+        }
+    }
+
+    /// What the About tab's update controls show.
+    pub fn update_controls_view(&self) -> UpdateControlsView {
+        let checking = self.update_status == UpdateStatus::Checking;
+        let (status, status_tone) = match &self.update_status {
+            UpdateStatus::Checking => ("Checking for updates…", StorageTone::None),
+            UpdateStatus::UpToDate => ("FocusForge is up to date.", StorageTone::Success),
+            _ => ("", StorageTone::None),
+        };
+        let newer_version = match &self.update_status {
+            UpdateStatus::Newer { version, .. } => version.clone(),
+            _ => String::new(),
+        };
+        let parse = job::parse_version;
+        let skipped = !newer_version.is_empty()
+            && self
+                .updates
+                .skipped_version
+                .as_deref()
+                .and_then(|skipped| parse(skipped).ok())
+                .zip(parse(&newer_version).ok())
+                .is_some_and(|(skipped, newer)| skipped.cmp_precedence(&newer).is_eq());
+        let result_text = match (newer_version.as_str(), skipped) {
+            ("", _) => String::new(),
+            (version, false) => format!("FocusForge {version} is available."),
+            (version, true) => format!("FocusForge {version} is available (skipped)."),
+        };
+        let failure = match &self.update_status {
+            UpdateStatus::Failed(reason) => format!("Could not check for updates: {reason}"),
+            _ => String::new(),
+        };
+        UpdateControlsView {
+            check_on_start: self.updates.check_on_start,
+            check_enabled: !checking,
+            checking,
+            status: status.to_owned(),
+            status_tone,
+            result_visible: !result_text.is_empty() || !failure.is_empty(),
+            skip_enabled: !newer_version.is_empty() && !skipped,
+            newer_version,
+            result_text,
+            skipped,
+            failure,
+            save_error: self.updates_save_error.clone().unwrap_or_default(),
+        }
+    }
+
     pub fn source_presentation(&self) -> SourcePresentation {
         self.appearance.presentation
     }
@@ -9750,6 +9895,79 @@ impl AppController {
                 None
             }
         }
+    }
+
+    /// Asks the installed release source once, on a background thread, for
+    /// the newest release, whatever the start-up switch says and without
+    /// skipping any version; reports through the sink as
+    /// [`ShellEvent::UpdateCheckedNow`]. Returns `None` and asks nothing
+    /// while a check runs or without a source.
+    pub fn check_for_updates_now(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if self.update_status == UpdateStatus::Checking {
+            return None;
+        }
+        let source = (self.release_source.as_ref()?)();
+        let sink = self.sink.clone();
+        self.update_status = UpdateStatus::Checking;
+        let spawned = std::thread::Builder::new()
+            .name("update-check-now".into())
+            .spawn(move || {
+                let outcome = job::check_for_update(&*source, env!("CARGO_PKG_VERSION"), None);
+                if let Some(sink) = sink {
+                    sink(ShellEvent::UpdateCheckedNow(outcome));
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                self.update_status = UpdateStatus::Failed(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Stores a Check now result as the status; publishes nothing.
+    pub fn finish_check_now(&mut self, outcome: job::UpdateCheck) {
+        use job::CheckFailure;
+        self.update_status = match outcome {
+            job::UpdateCheck::UpToDate => UpdateStatus::UpToDate,
+            job::UpdateCheck::Newer { version, url } => UpdateStatus::Newer {
+                version: version.to_string(),
+                url,
+            },
+            job::UpdateCheck::Failed(CheckFailure::Source(reason)) => UpdateStatus::Failed(reason),
+            job::UpdateCheck::Failed(other) => UpdateStatus::Failed(other.to_string()),
+        };
+    }
+
+    /// Puts the About tab's update controls into one literal state -- `idle`,
+    /// `checking`, `up-to-date`, `newer`, `skipped`, `failed` or `save-error`
+    /// -- without a network request, running Check now against a canned
+    /// release source for the states that show a result. Callers validate the
+    /// name first; an unknown one leaves the controls idle.
+    pub fn set_about_preview(&mut self, state: &str) -> Option<std::thread::JoinHandle<()>> {
+        let make: fn() -> PreviewRelease = match state {
+            "newer" | "skipped" => || PreviewRelease::new("999.0.0"),
+            "up-to-date" => || PreviewRelease::new("0.0.1"),
+            "checking" => PreviewRelease::slow,
+            "failed" => PreviewRelease::failing,
+            "save-error" => {
+                self.updates_save_error = Some(
+                    crate::settings::WriteError::CreateDir {
+                        path: self.state.config_dir.clone().unwrap_or_default(),
+                        source: std::io::ErrorKind::PermissionDenied.into(),
+                    }
+                    .to_string(),
+                );
+                return None;
+            }
+            _ => return None,
+        };
+        if state == "skipped" {
+            self.updates.skipped_version = Some("999.0.0".to_owned());
+        }
+        self.set_release_source(Arc::new(move || Box::new(make())));
+        self.check_for_updates_now()
     }
 
     /// Publishes the notice for a newer release; every other outcome is

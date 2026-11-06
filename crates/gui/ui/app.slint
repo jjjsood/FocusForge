@@ -26,8 +26,8 @@ export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFIconBar } from "shell/icon_bar.slint";
 import { FFNotificationCenter, NotificationRowView } from "shell/notification_center.slint";
-import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
-export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+import { AboutState, FFSettingsModal, UpdateControlsState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { AboutState, UpdateControlsState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing } from "shell/dialogs.slint";
 import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
@@ -615,6 +615,11 @@ export component AppWindow inherits Window {
     callback storage-clear-requested();
 
     in property <AboutState> about;
+    in property <UpdateControlsState> update-controls;
+    callback update-check-on-start-toggled(bool);
+    callback update-check-now-requested();
+    callback update-skip-requested();
+    callback update-page-requested();
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -870,6 +875,11 @@ export component AppWindow inherits Window {
         appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
+        update-controls: root.update-controls;
+        update-check-on-start-toggled(on) => { root.update-check-on-start-toggled(on); }
+        update-check-now-requested => { root.update-check-now-requested(); }
+        update-skip-requested => { root.update-skip-requested(); }
+        update-page-requested => { root.update-page-requested(); }
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;
         diagnostics-include-minidumps: root.diagnostics-include-minidumps;

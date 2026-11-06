@@ -11,18 +11,41 @@ use crate::job::ReleaseSource;
 use crate::settings::{self, WriteError};
 
 /// Answers every request with a final release of one fixed version, for
-/// showing the update notice without asking the release server.
-pub struct PreviewRelease(String);
+/// showing the update notice without asking the release server. `slow` never
+/// answers and `failing` always refuses.
+pub struct PreviewRelease(Answer);
+
+enum Answer {
+    Release(String),
+    Slow,
+    Failing,
+}
 
 impl PreviewRelease {
     pub fn new(version: &str) -> Self {
-        Self(version.trim_start_matches('v').to_owned())
+        Self(Answer::Release(version.trim_start_matches('v').to_owned()))
+    }
+
+    /// Parks the requesting thread for good, so a check stays in flight.
+    pub fn slow() -> Self {
+        Self(Answer::Slow)
+    }
+
+    pub fn failing() -> Self {
+        Self(Answer::Failing)
     }
 }
 
 impl ReleaseSource for PreviewRelease {
     fn fetch(&self) -> Result<String, String> {
-        let tag = format!("v{}", self.0);
+        let version = match &self.0 {
+            Answer::Release(version) => version,
+            Answer::Slow => loop {
+                std::thread::park();
+            },
+            Answer::Failing => return Err("connection refused".to_owned()),
+        };
+        let tag = format!("v{version}");
         let page = format!("https://github.com/jjjsood/FocusForge/releases/tag/{tag}");
         Ok(format!(
             r#"{{"tag_name":"{tag}","html_url":"{page}","prerelease":false,"draft":false}}"#

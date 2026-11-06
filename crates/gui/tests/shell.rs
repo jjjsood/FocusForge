@@ -2571,15 +2571,16 @@ fn about_tab_shows_the_build_metadata() {
         "the source is the repository without its scheme"
     );
     let notice = |version: &str| -> Vec<String> {
-        vec![
-            "FOCUSFORGE".to_string(),
-            format!("Version | {version}"),
-            "License | GPL-3.0".to_string(),
-            "NOTICE".to_string(),
-            "Copyright © 2026 Johannes Sood".to_string(),
-            ABOUT_REDISTRIBUTE.to_string(),
-            ABOUT_WARRANTY.to_string(),
-        ]
+        let mut rows = about_rows_around(version, "", &[]);
+        rows.extend(
+            [
+                "Copyright © 2026 Johannes Sood",
+                ABOUT_REDISTRIBUTE,
+                ABOUT_WARRANTY,
+            ]
+            .map(String::from),
+        );
+        rows
     };
     assert_eq!(rest, notice(version));
 
@@ -2591,6 +2592,162 @@ fn about_tab_shows_the_build_metadata() {
     let (source_row, rest) = rows.split_last().unwrap();
     assert_eq!(source_row, "Source | example.org/x");
     assert_eq!(rest, notice("9.9.9"));
+}
+
+/// The rows from the top of the tab through the NOTICE heading: the Check now
+/// row (an empty label and value column around its button), its status line,
+/// then `result`.
+fn about_rows_around(version: &str, status: &str, result: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> = [
+        "FOCUSFORGE",
+        &format!("Version | {version}"),
+        "License | GPL-3.0",
+        "UPDATES",
+        "Check for updates at start",
+        " |  | Check now",
+        status,
+    ]
+    .map(String::from)
+    .into();
+    rows.extend(result.iter().map(|row| row.to_string()));
+    rows.push("NOTICE".into());
+    rows
+}
+
+/// The spinners inside the About tab.
+fn spinners(app: &AppWindow) -> usize {
+    let tab = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    tab.query_descendants()
+        .match_type_name("FFSpinner")
+        .find_all()
+        .len()
+}
+
+/// The update controls draw what the controller's state says: the status slot
+/// and the spinner while checking, the two-line result row for a newer
+/// version, one line for a failure, and the save error with its follow-up.
+#[test]
+fn about_tab_draws_the_update_states() {
+    use focusforge_gui::UpdateControlsState;
+    let version = env!("CARGO_PKG_VERSION");
+    let app = about_window();
+    // Rows below the viewport are not drawn, so a state's rows are read down
+    // to the NOTICE heading, which every state keeps in view.
+    let draw = |state: UpdateControlsState| {
+        app.set_update_controls(state);
+        let mut rows = about_rows(&app);
+        let notice = rows.iter().position(|row| row == "NOTICE").unwrap();
+        rows.truncate(notice + 1);
+        rows
+    };
+    let idle = UpdateControlsState {
+        check_on_start: true,
+        check_enabled: true,
+        status_tone: "none".into(),
+        ..Default::default()
+    };
+
+    assert_eq!(draw(idle.clone()), about_rows_around(version, "", &[]));
+    assert_eq!(spinners(&app), 0, "idle");
+
+    let checking = draw(UpdateControlsState {
+        checking: true,
+        check_enabled: false,
+        status: "Checking for updates…".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        checking,
+        about_rows_around(version, "Checking for updates…", &[])
+    );
+    assert_eq!(spinners(&app), 1, "checking");
+
+    let up_to_date = draw(UpdateControlsState {
+        status: "FocusForge is up to date.".into(),
+        status_tone: "success".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        up_to_date,
+        about_rows_around(version, "FocusForge is up to date.", &[])
+    );
+    assert_eq!(spinners(&app), 0, "up to date");
+
+    let newer = draw(UpdateControlsState {
+        result_text: "FocusForge 999.0.0 is available.".into(),
+        skip_enabled: true,
+        ..idle.clone()
+    });
+    assert_eq!(
+        newer,
+        about_rows_around(
+            version,
+            "",
+            &[
+                "FocusForge 999.0.0 is available.",
+                "Open download page | Skip this version"
+            ]
+        ),
+        "the result is two lines: the text, then the link beside the Skip button"
+    );
+    assert_eq!(spinners(&app), 0, "newer");
+
+    let failed = draw(UpdateControlsState {
+        failure: "Could not check for updates: connection refused".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        failed,
+        about_rows_around(
+            version,
+            "",
+            &["Could not check for updates: connection refused"]
+        ),
+        "the failure is one line"
+    );
+    assert_eq!(spinners(&app), 0, "failed");
+
+    let save_error = draw(UpdateControlsState {
+        save_error: "settings.toml: not valid TOML, left untouched".into(),
+        ..idle
+    });
+    assert_eq!(
+        save_error,
+        about_rows_around(
+            version,
+            "",
+            &[
+                "settings.toml: not valid TOML, left untouched",
+                "The change is active for this session."
+            ]
+        )
+    );
+    assert_eq!(spinners(&app), 0, "save error");
+
+    // The longest state overflows the viewport; scrolled to the end, Source
+    // is still the last row.
+    let tab = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    let (pos, size) = (tab.absolute_position(), tab.size());
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(
+                pos.x + size.width / 2.0,
+                pos.y + size.height / 2.0,
+            ),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
+    let rows = about_rows(&app);
+    let last = rows.last().expect("the tab draws rows");
+    assert!(last.starts_with("Source | "), "{last:?}");
 }
 
 /// The tab is layout over shared components: its sections, rows and texts are
@@ -2610,7 +2767,16 @@ fn about_tab_composes_only_shared_components() {
     ] {
         assert!(!tab.contains(needle), "the tab sets {needle:?}");
     }
-    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFRowText {"] {
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsRow {",
+        "FFRowText {",
+        "FFSettingsActionRow {",
+        "FFToggle {",
+        "FFLinkText {",
+        "FFScrollbar {",
+        "Flickable {",
+    ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
 }
