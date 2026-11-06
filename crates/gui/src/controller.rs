@@ -181,8 +181,6 @@ pub struct UpdateControlsView {
     pub status_tone: StorageTone,
     /// A newer version or a failure is shown below the Check now row.
     pub result_visible: bool,
-    /// The newer version, empty without one.
-    pub newer_version: String,
     /// `FocusForge {version} is available.` with a newer version, else empty.
     pub result_text: String,
     /// The newer version is the one the user skipped.
@@ -7833,7 +7831,6 @@ impl AppController {
             status_tone,
             result_visible: !result_text.is_empty() || !failure.is_empty(),
             skip_enabled: !newer_version.is_empty() && !skipped,
-            newer_version,
             result_text,
             skipped,
             failure,
