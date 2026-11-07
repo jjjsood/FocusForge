@@ -6,26 +6,30 @@
 //! counting reader -- the behavioural counterpart of `align_parallel_memory.rs`'s
 //! memory test.
 //!
-//! The fixture-driven tests lower `max-iterations` from the shipped 400 to 40:
-//! the ordering property needs no more, and some frames then diverge. No test
-//! asserts a literal worker count -- `available_parallelism` is the host's --
+//! Apart from `output_is_identical_across_worker_counts_and_budgets`, the
+//! fixture-driven tests lower `max-iterations` from the shipped 400 to 40: the
+//! ordering property needs no more, and some frames then diverge. Those tests
+//! assert no literal worker count -- `available_parallelism` is the host's --
 //! only that the parallel arm engaged (`worker_limit > 1`) and matches the
-//! serial arm exactly.
+//! serial arm exactly. The determinism test runs at the shipped defaults and
+//! compares each anchor `worker_limit` with the host's parallelism.
 
 mod common;
 
 use common::align::{
-    CountingReader, ESCALATION_READS, FramesReader, PATCH_COUNT, XorShift32, frame_3_tile,
-    lowered_max_iterations, open_fixture, open_stack_context, reference_reads, streamed_band_reads,
-    uncached_outcomes,
+    CountingReader, ESCALATION_READS, FramesReader, PATCH_COUNT, XorShift32, anchor_defaults,
+    frame_3_tile, lowered_max_iterations, open_fixture, open_stack_context, reference_reads,
+    resolved_defaults, stack_context, streamed_band_reads, uncached_outcomes,
 };
 
-use focusforge_core::algorithm::AlignOutcome;
+use focusforge_core::algorithm::{AlignOutcome, TileReader};
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, PyramidalEcc, Transform, align_stack_with,
+    bytes_per_registration, bytes_shared_reference,
 };
 use focusforge_core::params::{ParamValue, StackContext};
+use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, Rect};
 
 fn assert_frames_match_outcomes(frames: &[FrameAlignment], outcomes: &[AlignOutcome]) {
@@ -182,6 +186,91 @@ fn chain_mode_stays_serial() {
         one_byte.alignment.frames, default_budget.alignment.frames,
         "chain mode's result must not depend on the (unused) worker budget"
     );
+}
+
+/// Chain and anchor runs at the shipped defaults over `fixtures/mantis-512`
+/// return the same frames, reference and policy for every requested worker
+/// count and every memory budget. The worker-count budgets are the driver's own
+/// sum of the shared reference data and `N` registrations, so each lands on `N`
+/// workers whatever the per-registration figure.
+#[test]
+fn output_is_identical_across_worker_counts_and_budgets() {
+    let stack = open_fixture();
+    let stack_ctx = stack_context(&stack);
+    let (width, _) = stack.dimensions();
+    let per_worker = bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE)
+        + stack.read_scratch_bytes(width, DEFAULT_TILE_SIZE);
+    let sized_for = |workers: u64| {
+        HostBudget::explicit(bytes_shared_reference(stack_ctx) + workers * per_worker)
+    };
+    let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+    let registrations = stack_ctx.frame_count - 1;
+    let host_derived = HostBudget::host_derived(&focusforge_core::host::snapshot());
+
+    for (policy, cfg) in [
+        ("chain", resolved_defaults(&stack_ctx)),
+        ("anchor", anchor_defaults(&stack_ctx)),
+    ] {
+        let anchor = policy == "anchor";
+        let mut cells: Vec<(String, HostBudget, Option<usize>)> = [1usize, 2, 4, 8]
+            .iter()
+            .map(|&n| {
+                let expected = n.min(parallelism).min(registrations);
+                (
+                    format!("{n} workers"),
+                    sized_for(n as u64),
+                    anchor.then_some(expected),
+                )
+            })
+            .collect();
+        cells.push((
+            "1-byte budget".to_string(),
+            HostBudget::explicit(1),
+            anchor.then_some(1),
+        ));
+        cells.push((
+            "2400 MiB budget".to_string(),
+            HostBudget::explicit(2400 * 1024 * 1024),
+            None,
+        ));
+        cells.push(("host-derived budget".to_string(), host_derived, None));
+
+        let mut baseline = None;
+        for (cell, budget, expected_workers) in cells {
+            let run = align_stack_with(
+                &PyramidalEcc,
+                stack_ctx,
+                &stack,
+                &cfg,
+                FailurePolicy::Strict,
+                &AlignDriverOptions {
+                    budget,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|err| panic!("{policy}, {cell}: the run completes: {err}"));
+            if let Some(expected) = expected_workers {
+                assert_eq!(
+                    run.worker_limit, expected,
+                    "{policy}, {cell}: worker limit (host parallelism {parallelism}, \
+                     {registrations} registrations)"
+                );
+            }
+            let first = baseline.get_or_insert_with(|| run.alignment.clone());
+            assert_eq!(
+                run.alignment.reference, first.reference,
+                "{policy}, {cell}: reference frame against the 1-worker run"
+            );
+            assert_eq!(
+                run.alignment.policy, first.policy,
+                "{policy}, {cell}: policy against the 1-worker run"
+            );
+            assert_eq!(
+                run.alignment.frames, first.frames,
+                "{policy}, {cell}: every FrameAlignment field against the 1-worker run"
+            );
+        }
+    }
 }
 
 /// The frames are a centred 128 px crop of fixture frame 3: frame 1 is the same
