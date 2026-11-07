@@ -810,6 +810,215 @@ fn escape_closes_after_a_tab_click() {
     }
 }
 
+/// Where the count of the active stack stands when the pointer gesture starts.
+#[derive(Clone, Copy, Debug)]
+enum CountState {
+    /// Asleep in its start-up hold.
+    Pending,
+    /// One partial snapshot settled, the worker parked on the next.
+    Counting,
+    /// Finished and settled.
+    Done,
+}
+
+/// A file name no dock row can show whole.
+const LONG_NAME: &str = "a_frame_file_name_far_longer_than_the_dock_row_can_show_in_full_0001.tif";
+
+/// Releases the worker of a `Counting` rig one snapshot at a time.
+struct SnapshotGate {
+    ready: std::sync::mpsc::Receiver<()>,
+    go: std::sync::mpsc::Sender<()>,
+    /// Whether the count after the test's last click ends in a joinable time;
+    /// a held start-up count does not.
+    join: bool,
+}
+
+impl SnapshotGate {
+    /// Lets the parked worker read on and settles the snapshot it parks next.
+    fn settle_next(&self, rig: &Rig) {
+        self.go.send(()).expect("the worker waits");
+        self.ready.recv().expect("the worker reports");
+        rig.controller.lock().unwrap().settle_analytics();
+        rig.pump();
+    }
+
+    /// Lets every parked worker run out and joins the one the last tab
+    /// click started.
+    fn finish(self, rig: &Rig) {
+        drop(self.go);
+        let worker = rig.controller.lock().unwrap().take_analytics_worker();
+        if let (true, Some(worker)) = (self.join, worker) {
+            worker.join().expect("the count worker did not panic");
+        }
+    }
+}
+
+/// A window over a stack of three frames and a second, active stack of two
+/// frames named `second`, with Analytics opened by its button and the active
+/// stack's count in `state`.
+fn rig_counting(tag: &str, second: [&str; 2], state: CountState) -> (Rig, SnapshotGate) {
+    // Several snapshots need a frame larger than one tile.
+    const TILE_SIZE: u32 = 96;
+    let set = match state {
+        CountState::Counting => "mantis-512",
+        _ => "mantis-64",
+    };
+    let mut controller = common::controller_with_frames_from(set, tag, 3);
+    let tree = common::tree(&format!("{tag}_second_frames"));
+    for (i, name) in second.iter().enumerate() {
+        common::copy_frame_from(set, &tree, name, i + 1);
+    }
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[tree]),
+        focusforge_gui::OpenOutcome::Opened(_)
+    ));
+    controller.set_analytics_hold(match state {
+        CountState::Pending => Duration::from_secs(30),
+        _ => Duration::ZERO,
+    });
+    if matches!(state, CountState::Counting) {
+        controller.set_analytics_tile_size(TILE_SIZE);
+    }
+    let (ready_tx, ready) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    if matches!(state, CountState::Done) {
+        count_now(&mut controller);
+    }
+    let rig = rig_with(controller);
+    if matches!(state, CountState::Counting) {
+        let go_rx = Mutex::new(go_rx);
+        rig.controller
+            .lock()
+            .unwrap()
+            .set_sink(Arc::new(move |event| {
+                if matches!(event, focusforge_gui::ShellEvent::AnalyticsReady) {
+                    ready_tx.send(()).ok();
+                    go_rx.lock().unwrap().recv().ok();
+                }
+            }));
+    }
+    let gate = SnapshotGate {
+        ready,
+        go,
+        join: !matches!(state, CountState::Pending),
+    };
+    rig.pump();
+    if !matches!(state, CountState::Done) {
+        rig.click(&rig.button("Analytics"));
+    }
+    assert!(
+        rig.open() && rig.app.get_analytics_open(),
+        "{state:?}: opens"
+    );
+    match state {
+        CountState::Pending => assert_pending(&rig.controller.lock().unwrap(), 2),
+        CountState::Counting => {
+            gate.ready.recv().expect("the worker reports");
+            rig.controller.lock().unwrap().settle_analytics();
+            rig.pump();
+            assert_eq!(rig.app.get_analytics_state(), "counting");
+            assert_eq!(row_states(&rig), ["partial"; 2], "{state:?}");
+        }
+        CountState::Done => assert_eq!(row_states(&rig), ["final"; 2], "{state:?}"),
+    }
+    (rig, gate)
+}
+
+/// The window's `FFImageRow`s that take space, as the dock draws them.
+fn dock_rows(rig: &Rig) -> usize {
+    ElementQuery::from_root(&rig.app)
+        .match_id("FFImageRow::area")
+        .find_all()
+        .into_iter()
+        .filter(|r| r.size().width > 0.0)
+        .count()
+}
+
+fn analytics_overlay(rig: &Rig) -> ElementHandle {
+    ElementHandle::find_by_element_id(&rig.app, "AppWindow::analytics-overlay")
+        .next()
+        .expect("the window has the Analytics overlay")
+}
+
+/// The UI driver's hover: a drag with the `Other` button from the centre of
+/// the Analytics overlay onto the centre of dock image row `row`.
+fn hover_dock_row(rig: &Rig, row: usize) {
+    let target = common::image_row(&rig.app, row);
+    let (pos, size) = (target.absolute_position(), target.size());
+    analytics_overlay(rig).mock_drag(
+        slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0),
+        PointerEventButton::Other,
+    );
+    rig.pump();
+}
+
+#[test]
+fn a_click_after_a_dock_hover_switches_the_tab() {
+    // (count state, second stack's names, dock row hovered, a snapshot
+    // settles between hover and click, tab clicked)
+    let cases = [
+        (CountState::Pending, ["s0.tif", "s1.tif"], 0, false, 0),
+        (CountState::Pending, ["s0.tif", LONG_NAME], 1, false, 0),
+        (CountState::Pending, ["s0.tif", "s1.tif"], 0, false, 1),
+        (CountState::Counting, ["s0.tif", "s1.tif"], 0, true, 0),
+        (CountState::Done, ["s0.tif", "s1.tif"], 0, false, 0),
+    ];
+    for (n, (state, second, row, snapshot, tab)) in cases.into_iter().enumerate() {
+        let at = format!("{state:?}, {second:?}, row {row}, snapshot {snapshot}, tab {tab}");
+        let (rig, gate) = rig_counting(&format!("analytics_hover_tab_{n}"), second, state);
+        hover_dock_row(&rig, row);
+        if snapshot {
+            gate.settle_next(&rig);
+        }
+        rig.click(&common::tab(&rig.app, tab));
+
+        let rows = if tab == 0 { 3 } else { 2 };
+        assert_eq!(
+            rig.controller.lock().unwrap().active_project(),
+            Some(tab),
+            "{at}: the tab is selected"
+        );
+        assert_eq!(dock_rows(&rig), rows, "{at}: the dock lists its rows");
+        assert_eq!(
+            rig.app.get_analytics_rows().row_count(),
+            rows,
+            "{at}: the overlay follows"
+        );
+        assert!(
+            rig.open() && rig.app.get_analytics_open(),
+            "{at}: stays open"
+        );
+        gate.finish(&rig);
+    }
+}
+
+#[test]
+fn a_click_after_a_dock_hover_closes_the_overlay() {
+    for (n, state) in [CountState::Pending, CountState::Counting, CountState::Done]
+        .into_iter()
+        .enumerate()
+    {
+        let (rig, gate) = rig_counting(
+            &format!("analytics_hover_close_{n}"),
+            ["s0.tif", "s1.tif"],
+            state,
+        );
+        hover_dock_row(&rig, 0);
+        let mut close: Vec<_> = analytics_overlay(&rig)
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::Button)
+            .find_all()
+            .into_iter()
+            .filter(|b| b.accessible_label().as_deref() == Some("Close"))
+            .collect();
+        assert_eq!(close.len(), 1, "{state:?}: one Close in the overlay");
+        rig.click(&close.remove(0));
+        assert!(!rig.open(), "{state:?}: Close closes it");
+        assert!(!rig.app.get_analytics_open(), "{state:?}: button plain");
+        gate.finish(&rig);
+    }
+}
+
 #[test]
 fn escape_closes_after_an_image_row_click() {
     for row in 0..2 {
