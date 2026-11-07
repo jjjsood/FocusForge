@@ -261,6 +261,8 @@ should come with the matching page edit and regenerated screenshots.
 
 ## Before you send a change
 
+Branch from `develop` and open the pull request against `develop`. `main` holds released versions only; a pull request from `develop` to `main` is a release.
+
 `tools/check-all.sh` runs every gate (formatting, licenses, SPDX headers, NOTICE, fixtures, build,
 clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
 check) in one command; `--static` is the fast subset a pre-commit hook runs,
@@ -290,7 +292,7 @@ memory, so tiling is the default path everywhere, not a fallback.
 
 ## Releases
 
-A human starts a release by pushing a version tag such as `v0.1.0`;
+A release is a pull request from `develop` to `main`. Candidate tags go on the `develop` snapshot and the final tag on the promoted `main`. A human starts a build by pushing a version tag such as `v0.1.0`;
 `.github/workflows/release.yml` builds the Linux, macOS and Windows packages and
 creates the release only after its same-commit checks pass. The release holds
 the installers (AppImage, `.deb`, DMG, MSI), one command-line archive per

@@ -153,7 +153,7 @@ reads and writes.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
+Open pull requests against `develop`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
 [Code of Conduct](CODE_OF_CONDUCT.md), [Security policy](SECURITY.md) and [changelog](CHANGELOG.md) set community standards.
 
 ## License
