@@ -518,7 +518,13 @@ mod tests {
 
         focusforge_gpu::errors::install_handlers(shared.device());
         shared.device().destroy();
-        let _ = shared.device().poll(wgpu::PollType::Poll);
+        // wgpu delivers the device-lost callback from a later poll, and a
+        // software adapter can need several, so poll until the flag latches.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !focusforge_gpu::errors::device_lost() && std::time::Instant::now() < deadline {
+            let _ = shared.device().poll(wgpu::PollType::Poll);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(
             focusforge_gpu::errors::device_lost(),
             "a destroyed device reports itself lost"

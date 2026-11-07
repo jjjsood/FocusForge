@@ -1039,8 +1039,23 @@ fn failure_summary_names_the_failed_operation() {
             .last()
             .expect("the failed run must append a notification");
         assert!(notification.message.ends_with(&message));
-        assert_eq!(notification.title, "Fusing failed");
-        fusion_summary = "Fusing failed";
+        // The staging directory is made after preparation and alignment, but
+        // before the fuse stage is announced, so the phase the last progress
+        // sample names (Preparing, Aligning or Fusing) depends on whether the
+        // poll thread ticked in between. Title and card stage must agree on it
+        // whichever it was, and it is never a setup or alignment failure.
+        let cards = controller.project_cards();
+        let card = cards
+            .iter()
+            .find(|card| card.kind == "failed")
+            .expect("the failed run must leave a failed card");
+        let title = match card.stage.as_str() {
+            "FAILED WHILE PREPARING" => "Preparing failed",
+            "FAILED WHILE FUSING" => "Fusing failed",
+            other => panic!("a staging failure must read as preparing or fusing, got {other:?}"),
+        };
+        assert_eq!(notification.title, title);
+        fusion_summary = title;
     }
 
     let mut summaries = vec![alignment_summary, setup_summary, fusion_summary];
