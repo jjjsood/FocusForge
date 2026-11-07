@@ -160,7 +160,8 @@ fn http_release_source_refused_is_error() {
         error.to_lowercase().contains("refused"),
         "refused error: {error}"
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Windows retries a refused connect for about two seconds before it reports it.
+    assert!(started.elapsed() < Duration::from_secs(4));
 }
 
 #[test]
