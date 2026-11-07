@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `align_stack_with`'s anchor arm run in parallel, checked against the same
-//! arm run serially and against an uncached per-frame loop over the same
+//! `align_stack_with` run in parallel -- anchor registrations and chain hops --
+//! checked against the same arm run serially and against an uncached per-frame loop over the same
 //! input, with the serial run's per-frame read counts bounded through a
 //! counting reader -- the behavioural counterpart of `align_parallel_memory.rs`'s
 //! memory test.
@@ -144,8 +144,10 @@ fn anchored_runs_match_serial_parallel_and_uncached() {
     assert_frames_match_outcomes(&serial.alignment.frames, &uncached);
 }
 
+/// A chain run at the default budget solves its hops on more than one worker and
+/// returns the frames of the one-worker run.
 #[test]
-fn chain_mode_stays_serial() {
+fn chain_hops_engage_the_pool_at_the_default_budget() {
     let (stack, stack_ctx) = open_stack_context("mantis-64");
     let mut cfg = lowered_max_iterations(&stack_ctx);
     cfg.insert(
@@ -175,23 +177,24 @@ fn chain_mode_stays_serial() {
     )
     .expect("chain run completes under the default budget");
 
-    for run in [&one_byte, &default_budget] {
-        assert_eq!(
-            run.worker_limit, 1,
-            "chain mode is serial by construction, at every budget"
-        );
-        assert_eq!(run.peak_workers, 1);
-    }
+    assert_eq!(one_byte.worker_limit, 1);
+    assert_eq!(one_byte.peak_workers, 1);
+    assert!(
+        default_budget.worker_limit > 1,
+        "the default budget must solve the 2 hops of a 3-frame chain in parallel: {}",
+        default_budget.worker_limit
+    );
     assert_eq!(
         one_byte.alignment.frames, default_budget.alignment.frames,
-        "chain mode's result must not depend on the (unused) worker budget"
+        "chain mode's result must not depend on the worker count"
     );
 }
 
 /// Chain and anchor runs at the shipped defaults over `fixtures/mantis-512`
 /// return the same frames, reference and policy for every requested worker
 /// count and every memory budget. The worker-count budgets are the driver's own
-/// sum of the shared reference data and `N` registrations, so each lands on `N`
+/// sum: the shared reference data and `N` registrations for anchor, `N` hops
+/// (each its own shared data and registration) for chain, so each lands on `N`
 /// workers whatever the per-registration figure.
 #[test]
 fn output_is_identical_across_worker_counts_and_budgets() {
@@ -200,8 +203,12 @@ fn output_is_identical_across_worker_counts_and_budgets() {
     let (width, _) = stack.dimensions();
     let per_worker = bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE)
         + stack.read_scratch_bytes(width, DEFAULT_TILE_SIZE);
-    let sized_for = |workers: u64| {
-        HostBudget::explicit(bytes_shared_reference(stack_ctx) + workers * per_worker)
+    let sized_for = |workers: u64, anchor: bool| {
+        HostBudget::explicit(if anchor {
+            bytes_shared_reference(stack_ctx) + workers * per_worker
+        } else {
+            workers * (bytes_shared_reference(stack_ctx) + per_worker)
+        })
     };
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
     let registrations = stack_ctx.frame_count - 1;
@@ -218,15 +225,15 @@ fn output_is_identical_across_worker_counts_and_budgets() {
                 let expected = n.min(parallelism).min(registrations);
                 (
                     format!("{n} workers"),
-                    sized_for(n as u64),
-                    anchor.then_some(expected),
+                    sized_for(n as u64, anchor),
+                    Some(expected),
                 )
             })
             .collect();
         cells.push((
             "1-byte budget".to_string(),
             HostBudget::explicit(1),
-            anchor.then_some(1),
+            Some(1),
         ));
         cells.push((
             "2400 MiB budget".to_string(),
@@ -379,5 +386,116 @@ fn parallel_anchor_failure_policy_is_unchanged() {
             "policy {policy:?}: strict must keep the same best-rho transform and lax must \
              substitute the same identity fallback under both arms"
         );
+    }
+}
+
+/// Five cropped frames around reference 2, the noise frame 3 inside the upper
+/// leg so frame 4 composes onto a prefix that went through a failed hop; chain
+/// runs give the same frames at one worker and at two, and under
+/// `IdentityFallback` a failed hop is identity composed onto its prefix.
+#[test]
+fn parallel_chain_failure_policy_matches_serial() {
+    let (frame, full_width, full_height, spp) = frame_3_tile();
+    let crop = Rect {
+        x: (full_width - CROP_SIZE) / 2,
+        y: (full_height - CROP_SIZE) / 2,
+        width: CROP_SIZE,
+        height: CROP_SIZE,
+    };
+    let tile = open_fixture()
+        .read_tile(3, crop)
+        .expect("reading frame 3's crop");
+    let shifted = |dx: f64, dy: f64| {
+        warp_from_tile(
+            &frame,
+            (full_width, full_height),
+            crop,
+            &Transform::translation(dx, dy),
+        )
+        .expect("small translation stays well inside the frame")
+        .tile
+        .samples
+    };
+    let mut rng = XorShift32(0xC0FFEE);
+    let noise: Vec<u16> = (0..tile.samples.len())
+        .map(|_| (rng.next() % 65536) as u16)
+        .collect();
+
+    let (width, height) = (CROP_SIZE, CROP_SIZE);
+    let stack_ctx = StackContext::new(5, width, height, spp);
+    let mut cfg = lowered_max_iterations(&stack_ctx);
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("chain".to_string()),
+    );
+    let make_reader = || FramesReader {
+        width,
+        height,
+        spp,
+        frames: vec![
+            shifted(-8.0, 3.0),
+            shifted(-4.0, 1.0),
+            tile.samples.clone(),
+            noise.clone(),
+            shifted(8.0, 3.0),
+        ],
+    };
+    let hop = bytes_shared_reference(stack_ctx)
+        + bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE)
+        + make_reader().read_scratch_bytes(width, DEFAULT_TILE_SIZE);
+
+    for policy in [FailurePolicy::Strict, FailurePolicy::IdentityFallback] {
+        let run = |budget: u64| {
+            align_stack_with(
+                &PyramidalEcc,
+                stack_ctx,
+                &make_reader(),
+                &cfg,
+                policy,
+                &AlignDriverOptions {
+                    budget: HostBudget::explicit(budget),
+                    ..Default::default()
+                },
+            )
+            .expect("a chain run completes even with a failing hop")
+        };
+        let serial = run(1);
+        let parallel = run(2 * hop);
+        assert_eq!(serial.worker_limit, 1);
+        assert!(
+            parallel.worker_limit > 1,
+            "two hops of budget must solve in parallel: {}",
+            parallel.worker_limit
+        );
+        assert_eq!(
+            serial.alignment.frames, parallel.alignment.frames,
+            "policy {policy:?}: every FrameAlignment field at one and at two workers"
+        );
+
+        let frames = &parallel.alignment.frames;
+        assert!(
+            frames[3].fallback == (policy == FailurePolicy::IdentityFallback)
+                && matches!(
+                    frames[3].status,
+                    focusforge_core::algorithm::AlignStatus::Diverged(_)
+                ),
+            "policy {policy:?}: the noise frame's hop must diverge: {:?}",
+            frames[3]
+        );
+        if policy == FailurePolicy::IdentityFallback {
+            // A fallback hop is identity composed onto its predecessor's transform.
+            for failed in frames.iter().filter(|f| f.fallback) {
+                let predecessor = if failed.frame > 2 {
+                    failed.frame - 1
+                } else {
+                    failed.frame + 1
+                };
+                assert_eq!(
+                    failed.transform, frames[predecessor].transform,
+                    "frame {} must compose its identity hop onto frame {predecessor}'s prefix",
+                    failed.frame
+                );
+            }
+        }
     }
 }

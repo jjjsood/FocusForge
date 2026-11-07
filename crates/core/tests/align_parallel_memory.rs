@@ -231,12 +231,9 @@ fn retained_heap_after_prepare_run_matches_the_shared_figure() {
     }
 }
 
-/// One worker never holds more than the shared data plus one registration.
-#[test]
-fn serial_peak_stays_within_shared_plus_one_registration() {
-    let _guard = SERIAL.lock().unwrap();
-    // Three 512 px frames keep the geometry the accounted figure depends on
-    // while each configuration registers two frames.
+/// Three 512 px frames keep the geometry the accounted figure depends on while
+/// each configuration registers two frames; mantis-64 has three frames too.
+fn three_frame_stacks() -> [(&'static str, TiffStack, StackContext); 2] {
     let frames_512: Vec<_> = ["02", "03", "04"]
         .iter()
         .map(|name| common::mantis_512_dir().join(format!("frames/{name}.tif")))
@@ -250,10 +247,17 @@ fn serial_peak_stays_within_shared_plus_one_registration() {
         stack_512.header(0).samples_per_pixel,
     );
     let (stack_64, ctx_64) = open_stack_context("mantis-64");
-    for (name, stack, ctx) in [
+    [
         ("mantis-512", stack_512, ctx_512),
         ("mantis-64", stack_64, ctx_64),
-    ] {
+    ]
+}
+
+/// One worker never holds more than the shared data plus one registration.
+#[test]
+fn serial_peak_stays_within_shared_plus_one_registration() {
+    let _guard = SERIAL.lock().unwrap();
+    for (name, stack, ctx) in three_frame_stacks() {
         let accounted =
             bytes_shared_reference(ctx) + bytes_per_registration(ctx, DEFAULT_TILE_SIZE);
         for mode in ["translation", "rotation-scale"] {
@@ -282,6 +286,50 @@ fn serial_peak_stays_within_shared_plus_one_registration() {
                      registration {accounted} B"
                 );
             }
+        }
+    }
+}
+
+/// A chain run holds at most one hop per worker: a budget of exactly two hops
+/// runs the two hops of a three-frame stack together.
+#[test]
+fn chain_peak_stays_within_one_hop_per_worker() {
+    let _guard = SERIAL.lock().unwrap();
+    let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
+    for (name, stack, ctx) in three_frame_stacks() {
+        let (width, _) = stack.dimensions();
+        let hop = bytes_shared_reference(ctx)
+            + bytes_per_registration(ctx, DEFAULT_TILE_SIZE)
+            + stack.read_scratch_bytes(width, DEFAULT_TILE_SIZE);
+        for mode in ["translation", "rotation-scale"] {
+            let cfg = config(&ctx, mode, "chain");
+            let options = AlignDriverOptions {
+                budget: HostBudget::explicit(2 * hop),
+                ..Default::default()
+            };
+            let before = LIVE.load(Ordering::SeqCst);
+            reset_peak();
+            let run = align_stack_with(
+                &PyramidalEcc,
+                ctx,
+                &stack,
+                &cfg,
+                FailurePolicy::IdentityFallback,
+                &options,
+            )
+            .expect("the run completes");
+            let peak = (peak_since_reset() - before) as u64;
+            assert_eq!(run.worker_limit, 2.min(parallelism), "{name} {mode}");
+            assert_eq!(
+                run.accounted_bytes,
+                run.worker_limit as u64 * hop,
+                "{name} {mode}"
+            );
+            assert!(
+                peak <= run.accounted_bytes,
+                "{name} {mode}: peak live heap {peak} B exceeds {} hops of {hop} B",
+                run.worker_limit
+            );
         }
     }
 }

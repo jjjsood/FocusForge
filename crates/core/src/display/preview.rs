@@ -289,6 +289,9 @@ pub struct AlignedFrameSink {
     frame_size: (u32, u32),
     state: Mutex<AlignedState>,
     cost: Meter,
+    /// Every `complete` call in arrival order, offered image or not.
+    #[cfg(test)]
+    completions: Mutex<Vec<(usize, Transform)>>,
 }
 
 #[derive(Default)]
@@ -301,12 +304,19 @@ struct AlignedState {
 }
 
 impl AlignedFrameSink {
-    fn new(frame_size: (u32, u32)) -> Self {
+    pub(crate) fn new(frame_size: (u32, u32)) -> Self {
         AlignedFrameSink {
             frame_size,
             state: Mutex::new(AlignedState::default()),
             cost: Meter::default(),
+            #[cfg(test)]
+            completions: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completions(&self) -> Vec<(usize, Transform)> {
+        self.completions.lock().unwrap().clone()
     }
 
     /// Keeps a reduced copy of `frame`'s coarsest pyramid level that is at
@@ -334,6 +344,8 @@ impl AlignedFrameSink {
     /// `transform`; the image offered for it becomes the one to deliver. A
     /// frame that offered nothing is skipped.
     pub(crate) fn complete(&self, frame: usize, transform: Transform) {
+        #[cfg(test)]
+        self.completions.lock().unwrap().push((frame, transform));
         let mut state = self.state.lock().unwrap();
         if let Some(gray) = state.pending.remove(&frame) {
             state.ready = Some((frame, gray, transform));
