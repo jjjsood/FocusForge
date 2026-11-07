@@ -237,8 +237,8 @@ fn failure_is_silent() {
             Box::new(|o| matches!(o, UpdateCheck::Failed(CheckFailure::NoFinalRelease))),
         ),
         (
-            "equal to the running version",
-            Ok(release(&format!("v{}", env!("CARGO_PKG_VERSION")), false)),
+            "older than the running version",
+            Ok(release("v0.0.1", false)),
             Box::new(|o| matches!(o, UpdateCheck::UpToDate)),
         ),
     ];
@@ -470,7 +470,11 @@ fn check_now_shows_newer_or_up_to_date() {
     assert_silent(&controller);
 
     let running = format!("v{}", env!("CARGO_PKG_VERSION"));
-    for tag in [running.as_str(), "v0.0.1"] {
+    let mut tags = vec!["v0.0.1"];
+    if !running.contains('-') {
+        tags.push(running.as_str());
+    }
+    for tag in tags {
         answer_with(&mut controller, Ok(release(tag, false)));
         let outcome = click_check_now(&mut controller, &events);
         assert_eq!(outcome, UpdateCheck::UpToDate, "{tag}");

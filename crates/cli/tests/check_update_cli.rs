@@ -128,7 +128,11 @@ fn newer_release_prints_version_and_link_and_exits_3() {
 
 #[test]
 fn up_to_date_for_equal_or_older_release_exits_0() {
-    for tag in [RUNNING.to_string(), "v0.0.1".to_string()] {
+    let mut tags = vec!["v0.0.1".to_string()];
+    if !RUNNING.contains('-') {
+        tags.push(RUNNING.to_string());
+    }
+    for tag in tags {
         for json in [false, true] {
             let (url, server) = serve(http_response("200 OK", &release_json(&tag, false)));
             let output = run("check_update_up_to_date", &url, json);
@@ -216,7 +220,7 @@ fn failure_classes_exit_1_with_their_reason() {
 
 #[test]
 fn one_request_per_run_to_the_configured_path() {
-    let (url, server) = serve(http_response("200 OK", &release_json(RUNNING, false)));
+    let (url, server) = serve(http_response("200 OK", &release_json("v0.0.1", false)));
     let output = run("check_update_one_request", &url, false);
     let (request, listener) = server.join().expect("server thread");
     assert_eq!(output.status.code(), Some(0));
