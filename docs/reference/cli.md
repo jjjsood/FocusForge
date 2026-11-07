@@ -290,7 +290,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--preset <PATH>` | read parameter values from a TOML preset — see [`reference/batch-runs.md`](batch-runs.md#presets) |
 | `--write-preset <PATH>` | write the preset that reproduces this run |
 | `--status <PATH>` | append one NDJSON status record for this stack to this path |
-| `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
+| `--dry-run` | resolve everything and print what would happen, without computing or writing anything, the run manifest included |
 | `--cpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
 | `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
 
@@ -306,8 +306,9 @@ preset's `[stack]` table accept the settings that belong to the whole run
 | `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
 | `equalize-target` | float, -0.5 to 0.5 | `0.0` | the shared target in stops from the frames' average brightness; 0.0 keeps that average, +1 would double it |
 
-Equalization scales the encoded code values as delivered and is not a
-linear-light correction; it is on for every algorithm and every kind of input unless
+Equalization gives each frame one gain, leaving the source files unchanged. A
+RAW frame is measured and gained in linear light; any other frame on its
+encoded values. It is on for every algorithm and every kind of input unless
 `equalize=false` is set; `algorithms --json` lists each fusion method's
 defaults under `project_defaults`. The gains are fixed before alignment. A
 frame that would need a gain beyond the bound gets the bound and the run
