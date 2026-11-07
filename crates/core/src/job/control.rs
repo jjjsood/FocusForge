@@ -10,7 +10,7 @@
 //! impl` anywhere in this module.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::tile::TileControl;
@@ -105,6 +105,8 @@ pub struct JobControl {
     develop_start_nanos: AtomicU64,
     /// The live admission cap; [`NO_CAP`] when none is set.
     admission_cap: AtomicUsize,
+    /// Whether every admission check waits until released.
+    held: AtomicBool,
     /// Nanoseconds of running time every fuse-stage admission check waits
     /// for; `0` means none.
     min_running_nanos: AtomicU64,
@@ -138,6 +140,7 @@ impl JobControl {
             develop_total: AtomicUsize::new(0),
             develop_start_nanos: AtomicU64::new(0),
             admission_cap: AtomicUsize::new(NO_CAP),
+            held: AtomicBool::new(false),
             min_running_nanos: AtomicU64::new(0),
         })
     }
@@ -149,6 +152,18 @@ impl JobControl {
     pub fn set_admission_cap(&self, cap: Option<usize>) {
         self.admission_cap
             .store(cap.map_or(NO_CAP, |c| c.max(1)), Ordering::SeqCst);
+    }
+
+    /// While held, [`TileControl::should_stop`] waits in short slices before
+    /// letting any further unit start, and returns at once on a pause or
+    /// cancel; work already begun finishes. Releasing resumes where it stood.
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    /// Whether the control is held, see [`Self::set_held`].
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
     }
 
     /// Holds the fuse stage until this job's running time (pauses excluded)
@@ -398,6 +413,10 @@ impl TileControl for JobControl {
         loop {
             if self.state() != ControlState::Running {
                 return true;
+            }
+            if self.held() {
+                std::thread::sleep(SLICE);
+                continue;
             }
             let short = floor.saturating_sub(self.running_now());
             if short.is_zero() {

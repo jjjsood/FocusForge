@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::analytics::{self, AnalyticsView, CountError};
+use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue};
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
@@ -1338,8 +1338,17 @@ pub struct CloseGuardCopy {
     pub confirm_label: String,
 }
 
-/// A finished count's generation and its counts or error text, parked for settle.
-type AnalyticsOutcome = Arc<Mutex<Option<(u64, Result<Vec<u32>, String>)>>>;
+/// What a count's worker has reached.
+enum AnalyticsSnapshot {
+    /// The counts after a finished tile.
+    Partial(Vec<u32>),
+    /// The finished count, or its error text.
+    Done(Result<Vec<u32>, String>),
+}
+
+/// The latest snapshot and the generation it belongs to, parked for settle;
+/// a newer snapshot replaces an unsettled one.
+type AnalyticsOutcome = Arc<Mutex<Option<(u64, AnalyticsSnapshot)>>>;
 
 /// The Analytics overlay's open flag, rows and the count in flight.
 #[derive(Default)]
@@ -1355,6 +1364,8 @@ struct AnalyticsState {
     control: Option<Arc<job::JobControl>>,
     outcome: AnalyticsOutcome,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Finished counts by tab id, with the frames they were counted over.
+    cache: HashMap<u64, (Vec<PathBuf>, Vec<u32>)>,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -1886,6 +1897,12 @@ pub struct AppController {
     open_hold: Duration,
     /// How long every Analytics count waits before it reads anything.
     analytics_hold: Duration,
+    /// The tile size of every Analytics count; the default when `None`.
+    analytics_tile_size: Option<u32>,
+    /// How long every Analytics count waits after each finished tile.
+    analytics_tile_pause: Duration,
+    /// Whether a loaded stack's count starts in the background.
+    analytics_background: bool,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
@@ -2917,6 +2934,7 @@ impl AppController {
     ) {
         let (options, metadata) = (choice.options(), choice.metadata_options());
         self.state.export.in_flight = Some(tab_id);
+        self.apply_analytics_priority();
         self.state.export.started = true;
         self.state.export.outcome = Arc::new(Mutex::new(None));
         let outcome = Arc::clone(&self.state.export.outcome);
@@ -2945,6 +2963,7 @@ impl AppController {
             return self.state.export.in_flight.is_none();
         };
         self.state.export.in_flight = None;
+        self.apply_analytics_priority();
         match outcome {
             Ok(()) => {
                 if let Some(dialog) = self.state.export_dialog.take() {
@@ -4581,6 +4600,7 @@ impl AppController {
                     self.request_tab_thumbnail(self.state.projects.len() - 1);
                 }
             }
+            self.sync_analytics_to_active_tab();
         }
         self.settle_tab_scroll();
         self.state.settings_scroll_y = 0.0;
@@ -4773,6 +4793,10 @@ impl AppController {
         self.cancel_frame_drag();
         self.state.last_close = Some(now);
         let closed = self.state.projects.remove(index);
+        self.state.analytics.cache.remove(&closed.id);
+        if self.state.analytics.tab == Some(closed.id) {
+            self.stop_analytics_count();
+        }
         if self.state.pending_close == Some(closed.id) {
             self.state.pending_close = None;
         }
@@ -5021,11 +5045,6 @@ impl AppController {
         self.state.analytics.open
     }
 
-    /// Whether there is a stack to count: the Analytics button's `enabled`.
-    pub fn analytics_enabled(&self) -> bool {
-        self.state.active().is_some()
-    }
-
     /// What the Analytics overlay shows.
     pub fn analytics_view(&self) -> &AnalyticsView {
         &self.state.analytics.view
@@ -5036,39 +5055,71 @@ impl AppController {
         self.analytics_hold = hold;
     }
 
-    /// Opens the Analytics overlay over the active stack and starts counting
-    /// on a worker, closing the projects overlay, the calculator and the
-    /// notification center; closes it when it is open. Returns the worker's
-    /// join handle when a count started; [`Self::settle_analytics`] applies
-    /// its result.
+    /// Makes every Analytics count read in tiles of `size`.
+    pub fn set_analytics_tile_size(&mut self, size: u32) {
+        self.analytics_tile_size = Some(size);
+    }
+
+    /// Makes every Analytics count wait `pause` after each finished tile.
+    pub fn set_analytics_tile_pause(&mut self, pause: Duration) {
+        self.analytics_tile_pause = pause;
+    }
+
+    /// Starts the count of every loaded stack in the background, following
+    /// the active tab, when `on`; a controller starts with it off.
+    pub fn set_analytics_background(&mut self, on: bool) {
+        self.analytics_background = on;
+    }
+
+    /// How hard the live count works; `None` while no count exists.
+    pub fn analytics_count_priority(&self) -> Option<CountPriority> {
+        let control = self.state.analytics.control.as_ref()?;
+        Some(if control.held() {
+            CountPriority::Held
+        } else if control.admission_cap() == 1 {
+            CountPriority::Low
+        } else {
+            CountPriority::Normal
+        })
+    }
+
+    /// Opens the Analytics overlay over the active stack, closing the
+    /// projects overlay, the calculator and the notification center. It
+    /// shows the stack's finished count at once, speeds up the count already
+    /// running, or starts one on a worker; with no stack open it waits for
+    /// one. Closes it when it is open. Returns the worker's join handle when
+    /// a count started; [`Self::settle_analytics`] applies its snapshots.
     pub fn toggle_analytics(&mut self) -> Option<std::thread::JoinHandle<()>> {
         if self.state.analytics.open {
             self.close_analytics();
             return None;
         }
-        if !self.analytics_enabled() {
-            return None;
-        }
         self.close_projects_overlay();
         self.close_calculator();
         self.notifications.close_center();
+        if matches!(self.state.analytics.view, AnalyticsView::Failed(_)) {
+            self.stop_analytics_count();
+        }
         self.state.analytics.open = true;
-        self.start_analytics_count();
-        self.state.analytics.worker.take()
+        let before = self.state.analytics.generation;
+        self.sync_analytics_to_active_tab();
+        self.emit(ShellEvent::AnalyticsChanged);
+        let analytics = &mut self.state.analytics;
+        if analytics.generation != before {
+            analytics.worker.take()
+        } else {
+            None
+        }
     }
 
-    /// Closes the Analytics overlay and stops its count; a no-op while closed.
+    /// Closes the Analytics overlay and lowers its count, which keeps
+    /// running; a no-op while closed.
     pub fn close_analytics(&mut self) {
-        let analytics = &mut self.state.analytics;
-        if !analytics.open {
+        if !self.state.analytics.open {
             return;
         }
-        analytics.open = false;
-        analytics.generation += 1;
-        analytics.tab = None;
-        if let Some(control) = analytics.control.take() {
-            control.cancel();
-        }
+        self.state.analytics.open = false;
+        self.apply_analytics_priority();
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
@@ -5077,8 +5128,8 @@ impl AppController {
         self.state.analytics.worker.take()
     }
 
-    /// Applies the parked count of the current generation; a result of a
-    /// closed or replaced count changes nothing.
+    /// Applies the parked snapshot of the current generation, caching a
+    /// finished count under its tab; one of an abandoned count changes nothing.
     pub fn settle_analytics(&mut self) {
         let analytics = &mut self.state.analytics;
         let parked = analytics
@@ -5086,69 +5137,151 @@ impl AppController {
             .lock()
             .expect("no thread panicked while holding the analytics outcome")
             .take();
-        let Some((generation, result)) = parked else {
+        let Some((generation, snapshot)) = parked else {
             return;
         };
-        if !analytics.open || generation != analytics.generation {
+        if generation != analytics.generation {
             return;
         }
-        analytics.view = match result {
-            Ok(counts) => AnalyticsView::Rows(analytics::build_rows(&analytics.frames, &counts)),
-            Err(message) => AnalyticsView::Failed(message),
-        };
+        analytics.view =
+            match snapshot {
+                AnalyticsSnapshot::Partial(counts) => AnalyticsView::Counting(
+                    analytics::build_rows(&analytics.frames, &counts, RowValue::Partial),
+                ),
+                AnalyticsSnapshot::Done(Ok(counts)) => {
+                    let rows = analytics::build_rows(&analytics.frames, &counts, RowValue::Final);
+                    if let Some(tab) = analytics.tab {
+                        analytics
+                            .cache
+                            .insert(tab, (analytics.frames.clone(), counts));
+                    }
+                    AnalyticsView::Rows(rows)
+                }
+                AnalyticsSnapshot::Done(Err(message)) => AnalyticsView::Failed(message),
+            };
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
-    fn start_analytics_count(&mut self) {
-        let Some(tab) = self.state.active() else {
-            return;
-        };
-        let (id, frames) = (tab.id, tab.frames.clone());
-        let sink = self.sink.clone();
-        let hold = self.analytics_hold;
+    /// Abandons the count in flight; a result it parks later is dropped.
+    fn stop_analytics_count(&mut self) {
         let analytics = &mut self.state.analytics;
-        if let Some(previous) = analytics.control.take() {
-            previous.cancel();
+        if let Some(control) = analytics.control.take() {
+            control.cancel();
         }
         analytics.generation += 1;
+        analytics.tab = None;
+        analytics.frames.clear();
+    }
+
+    /// Sets how hard the live count works. Open: all workers, one while a
+    /// stacking or export job runs. Closed: one worker, held while a job runs.
+    fn apply_analytics_priority(&self) {
+        let analytics = &self.state.analytics;
+        let Some(control) = &analytics.control else {
+            return;
+        };
+        let job_running = self.job.control.is_some() || self.state.export.in_flight.is_some();
+        control.set_admission_cap((!analytics.open || job_running).then_some(1));
+        control.set_held(!analytics.open && job_running);
+    }
+
+    /// Starts a count over `frames` of tab `id`, abandoning the one in flight.
+    fn start_analytics_count(&mut self, id: u64, frames: Vec<PathBuf>) {
+        let sink = self.sink.clone();
+        let hold = self.analytics_hold;
+        let tile_pause = self.analytics_tile_pause;
+        let tile_size = self.analytics_tile_size;
+        self.stop_analytics_count();
+        let analytics = &mut self.state.analytics;
         analytics.tab = Some(id);
         analytics.frames = frames.clone();
-        analytics.view = AnalyticsView::Computing;
+        analytics.view = AnalyticsView::Counting(analytics::pending_rows(&frames));
         let control = job::JobControl::new();
         analytics.control = Some(Arc::clone(&control));
         let generation = analytics.generation;
         let slot = Arc::clone(&analytics.outcome);
         analytics.worker = Some(std::thread::spawn(move || {
             std::thread::sleep(hold);
-            // A stopped count parks nothing, so it cannot replace the result
-            // of the count that superseded it.
-            let result = match analytics::count_frames(&frames, &*control) {
-                Ok(counts) => Ok(counts),
-                Err(CountError::Failed(message)) => Err(message),
-                Err(CountError::Stopped) => return,
+            // Parks `snapshot` over an unsettled one, unless a newer count
+            // already parked; the event is sent only when the slot was empty,
+            // so a fast count leaves at most one event pending.
+            let park = |snapshot: AnalyticsSnapshot| {
+                let mut parked = slot
+                    .lock()
+                    .expect("no thread panicked while holding the analytics outcome");
+                if parked
+                    .as_ref()
+                    .is_some_and(|(newer, _)| *newer > generation)
+                {
+                    return;
+                }
+                let was_empty = parked.is_none();
+                *parked = Some((generation, snapshot));
+                drop(parked);
+                if was_empty && let Some(sink) = &sink {
+                    sink(ShellEvent::AnalyticsReady);
+                }
             };
-            *slot
-                .lock()
-                .expect("no thread panicked while holding the analytics outcome") =
-                Some((generation, result));
-            if let Some(sink) = &sink {
-                sink(ShellEvent::AnalyticsReady);
-            }
+            // A stopped count parks nothing, so it cannot replace the
+            // snapshot of the count that superseded it.
+            let result =
+                match analytics::count_frames(&frames, tile_size, &*control, &mut |counts| {
+                    park(AnalyticsSnapshot::Partial(counts.to_vec()));
+                    std::thread::sleep(tile_pause);
+                }) {
+                    Ok(counts) => Ok(counts),
+                    Err(CountError::Failed(message)) => Err(message),
+                    Err(CountError::Stopped) => return,
+                };
+            park(AnalyticsSnapshot::Done(result));
         }));
+        self.apply_analytics_priority();
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
-    /// Follows the active tab while the overlay is open: recounts for a
-    /// different tab, closes when none is left.
+    /// Follows the active tab while the overlay is open or the background
+    /// count is on: keeps the count of the active stack's frame list running,
+    /// shows its finished count, or starts one; waits when no stack is left.
     fn sync_analytics_to_active_tab(&mut self) {
-        if !self.state.analytics.open {
+        if !self.state.analytics.open && !self.analytics_background {
+            self.apply_analytics_priority();
             return;
         }
-        match self.state.active().map(|tab| tab.id) {
-            None => self.close_analytics(),
-            Some(id) if Some(id) != self.state.analytics.tab => self.start_analytics_count(),
-            Some(_) => {}
+        let active = self.state.active().map(|tab| (tab.id, tab.frames.clone()));
+        let Some((id, frames)) = active else {
+            if self.state.analytics.view != AnalyticsView::Waiting {
+                self.stop_analytics_count();
+                self.state.analytics.view = AnalyticsView::Waiting;
+                self.emit(ShellEvent::AnalyticsChanged);
+            }
+            return;
+        };
+        let analytics = &mut self.state.analytics;
+        let known = analytics.tab == Some(id) && analytics.frames == frames;
+        if known
+            && matches!(
+                analytics.view,
+                AnalyticsView::Counting(_) | AnalyticsView::Failed(_)
+            )
+        {
+            // The count in flight (or its failure) stands.
+        } else if let Some((_, counts)) = analytics
+            .cache
+            .get(&id)
+            .filter(|(counted, _)| *counted == frames)
+        {
+            let rows = analytics::build_rows(&frames, counts, RowValue::Final);
+            self.stop_analytics_count();
+            let analytics = &mut self.state.analytics;
+            analytics.tab = Some(id);
+            analytics.frames = frames;
+            analytics.view = AnalyticsView::Rows(rows);
+            self.emit(ShellEvent::AnalyticsChanged);
+        } else {
+            analytics.cache.remove(&id);
+            self.start_analytics_count(id, frames);
         }
+        self.apply_analytics_priority();
     }
 
     /// The calculator's entries and read-outs for display.
@@ -6258,6 +6391,7 @@ impl AppController {
         self.preview_failures.clear();
         self.keep_selected_image_visible();
         self.refresh_source_previews();
+        self.sync_analytics_to_active_tab();
     }
 
     fn images_content_height(&self) -> f32 {
@@ -6626,6 +6760,7 @@ impl AppController {
         let order = images::move_order(tab.frames.len(), from, to);
         tab.reorder(&order);
         tab.frame_sort = None;
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
         self.keep_image_visible(to);
     }
@@ -6811,6 +6946,7 @@ impl AppController {
         let order = images::sort_order(&tab.frames, sort, &tab.meta);
         tab.reorder(&order);
         tab.frame_sort = Some(sort);
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
     }
 
@@ -8226,6 +8362,7 @@ impl AppController {
             self.heat_ramp,
         ));
         self.job.control = Some(Arc::clone(&control));
+        self.apply_analytics_priority();
         self.job.observer = Some(Arc::clone(&observer));
         self.job.frames = request.frames.clone();
         self.job.tab_id = self.state.projects.get(tab_index).map(|tab| tab.id);
@@ -8667,6 +8804,7 @@ impl AppController {
         let settled = job::settle(handle.join(), &observer);
         self.landing = Landing::after(run_tab_id, &settled.state, &observer, Instant::now());
         self.job.control = None;
+        self.apply_analytics_priority();
         // With the owning tab gone (closed mid-run), this writes nothing --
         // no tab gains a checkpoint, and no outcome lands on whichever tab
         // happens to be active now.
@@ -8779,6 +8917,7 @@ impl AppController {
                 break;
             }
         }
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);

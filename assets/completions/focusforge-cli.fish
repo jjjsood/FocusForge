@@ -57,6 +57,8 @@ complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand step-plan"
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand step-plan" -s q -l quiet -d 'Log errors only'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand step-plan" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand sharp-areas" -l set -d 'Set a parameter: `--set key=value`, repeatable. A repeated key is last-wins' -r
+complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand sharp-areas" -l priority -d 'How many frames are read at once; the counts are the same at either value' -r -f -a "low\t'One frame at a time, leaving the other cores to other work'
+normal\t'As many frames at once as the host has threads'"
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand sharp-areas" -l json -d 'Print the counts as one JSON object'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand sharp-areas" -s v -d 'Increase log detail (repeatable)'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand sharp-areas" -s q -l quiet -d 'Log errors only'

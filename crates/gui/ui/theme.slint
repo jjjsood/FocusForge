@@ -138,6 +138,16 @@ export global Theme {
     // How long a checkpoint row's tint holds before it falls; reduced motion
     // leaves it, so the cue stays when the fall is a cut.
     out property <duration> flash-hold: 150ms;
+    // The loading clocks, read from `animation-tick()`. The spinner ring
+    // turns once per second; the indeterminate sweep switches sides every
+    // 900 ms. With Reduce motion on, the angle is 0deg and the sweep stays
+    // left.
+    out property <angle> spinner-angle: reduce-motion
+        ? 0deg
+        : mod(animation-tick() / 1ms, 1000.0) / 1000.0 * 360deg;
+    out property <bool> sweep-right: reduce-motion
+        ? false
+        : mod(animation-tick() / 1ms, 1800.0) >= 900.0;
 }
 
 // Empty on purpose: a handle so a test can reach a global.

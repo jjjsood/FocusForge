@@ -129,12 +129,18 @@ struct Args {
     /// Opens the step calculator overlay at startup.
     #[arg(long)]
     calculator: bool,
-    /// Opens the Analytics overlay once the `--open` load has landed.
-    #[arg(long, requires = "open")]
+    /// Opens the Analytics overlay once the `--open` load, if any, has landed.
+    #[arg(long)]
     analytics: bool,
     /// With `--analytics`, holds the count's worker for MS milliseconds.
     #[arg(long, requires = "analytics", value_name = "MS")]
     analytics_hold_ms: Option<u64>,
+    /// With `--analytics`, counts in tiles of PX pixels.
+    #[arg(long, requires = "analytics", value_name = "PX")]
+    analytics_tile_size: Option<u32>,
+    /// With `--analytics`, pauses the count MS milliseconds after each tile.
+    #[arg(long, requires = "analytics", value_name = "MS")]
+    analytics_tile_pause_ms: Option<u64>,
     /// With `--calculator`, selects the objective optics.
     #[arg(long, requires = "calculator")]
     calculator_objective: bool,
@@ -2020,7 +2026,8 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     // Built before `select_backend`: the drop route (`bridge::DropHandler`)
     // installs on the `BackendSelector` chain before any window exists, and
     // needs the same renderer cell every other open path feeds.
-    let controller_state = AppController::new();
+    let mut controller_state = AppController::new();
+    controller_state.set_analytics_background(true);
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
@@ -2109,6 +2116,15 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
                     .unwrap()
                     .set_analytics_hold(Duration::from_millis(ms));
             }
+            if let Some(size) = args.analytics_tile_size {
+                controller.lock().unwrap().set_analytics_tile_size(size);
+            }
+            if let Some(ms) = args.analytics_tile_pause_ms {
+                controller
+                    .lock()
+                    .unwrap()
+                    .set_analytics_tile_pause(Duration::from_millis(ms));
+            }
             let controller = controller.clone();
             let timer = analytics_timer.clone();
             let tabs = args.open.len();
@@ -2119,10 +2135,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
                     let mut controller = controller.lock().unwrap();
                     // Every `--open` has produced a tab; a later load would
                     // switch tabs and close the overlay.
-                    if controller.load_in_flight()
-                        || !controller.analytics_enabled()
-                        || controller.project_tabs().len() < tabs
-                    {
+                    if controller.load_in_flight() || controller.project_tabs().len() < tabs {
                         return;
                     }
                     controller.toggle_analytics();

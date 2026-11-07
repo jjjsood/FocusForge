@@ -17,7 +17,7 @@ A typed value replaces the old one only after the old text is cleared: click the
 3. Click the Time per frame box (`FFField::input` 0).
    Expect: the five boxes read 1, 1, 8, 0.25 and 5 in the order Time per frame, Magnification, f-stop, Overlap, Depth range; the ENTERED row reads Optics f-stop, Magnification 1×, f-stop 8, Overlap 0.25, Depth range 5 mm, Time per frame 1 s; no line is drawn under any box.
 4. (human only) Look at the illustration.
-   Expect: the lens illustration (camera on a rail, a subject) shows 13 evenly spaced focus planes, leader lines from the boxes to their parts, an inset titled "FIRST TWO PLANES, ENLARGED", dimension marks reading Step 422.4 µm, Depth of field 563.2 µm and "Frames 13 Duration 13 s", and a legend "Entered" and "Calculated".
+   Expect: the lens illustration (camera on a rail, a subject) shows 13 evenly spaced focus planes, leader lines from the boxes to their parts, an inset titled "FIRST TWO PLANES, ENLARGED", dimension marks reading Step 422.4 µm, Depth of field 563.2 µm and "Frames 13 Duration 13 s", and a legend "Entered" and "Calculated". The drawing sits centred in the overlay body, and every entered box is as tall as the Optics switch (28 px).
 ## Must not work: no Apply values
 5. Hover **Close** (`AppWindow::calculator-overlay`), then look for an **Apply values** button.
    Expect: Must not: an **Apply values** button or the caption "Fills Step and sets End = Start + depth range" exists; `buttons AppWindow::calculator-overlay` lists only **Close**, **Lens (f-stop)** with checked=true and **Objective (NA)** with checked=false.

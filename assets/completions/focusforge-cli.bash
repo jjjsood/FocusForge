@@ -871,7 +871,7 @@ _focusforge__cli() {
             return 0
             ;;
         focusforge__cli__subcmd__sharp__subcmd__areas)
-            opts="-v -q -h --set --json --quiet --help"
+            opts="-v -q -h --set --json --priority --quiet --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -879,6 +879,10 @@ _focusforge__cli() {
             case "${prev}" in
                 --set)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --priority)
+                    COMPREPLY=($(compgen -W "low normal" -- "${cur}"))
                     return 0
                     ;;
                 *)

@@ -68,6 +68,8 @@ _arguments "${_arguments_options[@]}" : \
 (sharp-areas)
 _arguments "${_arguments_options[@]}" : \
 '*--set=[Set a parameter\: \`--set key=value\`, repeatable. A repeated key is last-wins]:KEY=VALUE:_default' \
+'--priority=[How many frames are read at once; the counts are the same at either value]:PRIORITY:((low\:"One frame at a time, leaving the other cores to other work"
+normal\:"As many frames at once as the host has threads"))' \
 '--json[Print the counts as one JSON object]' \
 '*-v[Increase log detail (repeatable)]' \
 '-q[Log errors only]' \

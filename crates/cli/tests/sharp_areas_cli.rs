@@ -155,3 +155,55 @@ fn sharp_areas_refuses_bad_input_naming_it() {
         "contrast: value 11 is outside the allowed range [1, 10]",
     );
 }
+
+#[test]
+fn sharp_areas_priority_flag() {
+    let plain = run("sharp_areas_priority_plain", &frames_dir(), &[]);
+    let plain_json = run(
+        "sharp_areas_priority_plain_json",
+        &frames_dir(),
+        &["--json"],
+    );
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    for value in ["low", "normal"] {
+        let text = run(
+            "sharp_areas_priority_text",
+            &frames_dir(),
+            &["--priority", value],
+        );
+        assert!(text.status.success(), "{value}: {}", stderr(&text));
+        assert_eq!(stdout(&text), stdout(&plain), "{value}: rows");
+        let json = run(
+            "sharp_areas_priority_json",
+            &frames_dir(),
+            &["--json", "--priority", value],
+        );
+        assert_eq!(stdout(&json), stdout(&plain_json), "{value}: JSON");
+    }
+
+    let refused = run(
+        "sharp_areas_priority_urgent",
+        &frames_dir(),
+        &["--priority", "urgent"],
+    );
+    assert!(!refused.status.success());
+    assert_eq!(stdout(&refused), "");
+    let message = stderr(&refused);
+    assert!(
+        message.contains("low") && message.contains("normal"),
+        "{message}"
+    );
+
+    let help = common::cli_bin("sharp_areas_priority_help")
+        .args(["sharp-areas", "--help"])
+        .output()
+        .expect("the CLI binary starts");
+    let help = stdout(&help);
+    assert!(
+        help.contains("--priority")
+            && help.contains("[default: normal]")
+            && help.contains("- low:")
+            && help.contains("- normal:"),
+        "{help}"
+    );
+}
