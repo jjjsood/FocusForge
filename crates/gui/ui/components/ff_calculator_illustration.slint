@@ -32,9 +32,17 @@ export component FFCalculatorIllustration inherits Rectangle {
     width: 770px;
     height: 240px;
 
+    // Scale the enclosing element applies to this illustration. The art is
+    // sized by it and counter-scaled about its centre, so it rasterises at
+    // the drawn size and stays on the planes.
+    in property <float> art-scale: 1.0;
+
     Image {
-        width: 100%;
-        height: 100%;
+        x: -root.width * (root.art-scale - 1) / 2;
+        y: -root.height * (root.art-scale - 1) / 2;
+        width: root.width * root.art-scale;
+        height: root.height * root.art-scale;
+        transform-scale: 1 / root.art-scale;
         source: root.objective ? @image-url("../../../../assets/illustrations/calculator-objective.svg")
             : @image-url("../../../../assets/illustrations/calculator-lens.svg");
     }

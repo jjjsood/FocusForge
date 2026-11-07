@@ -216,6 +216,9 @@ enum Command {
         /// Print the counts as one JSON object.
         #[arg(long)]
         json: bool,
+        /// How many frames are read at once; the counts are the same at either value.
+        #[arg(long, value_enum, default_value_t = sharp_areas::Priority::Normal)]
+        priority: sharp_areas::Priority,
     },
     /// Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per
     /// detected stack, through a registered stacking algorithm. A run
@@ -636,7 +639,12 @@ fn main() -> ExitCode {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
         Command::StepPlan { set, json } => step_plan::run(&set, json),
-        Command::SharpAreas { dir, set, json } => sharp_areas::run(&dir, &set, json),
+        Command::SharpAreas {
+            dir,
+            set,
+            json,
+            priority,
+        } => sharp_areas::run(&dir, &set, json, priority),
         Command::Stack {
             dir,
             output,

@@ -692,7 +692,6 @@ export component AppWindow inherits Window {
         center-open: root.notification-center-open;
         calculator-open: root.calculator-open;
         analytics-open: root.analytics-open;
-        analytics-enabled: root.analytics-enabled;
 
         bell-activated => {
             root.bell-activated();
@@ -795,6 +794,7 @@ export component AppWindow inherits Window {
     in property <string> calculator-duration: "";
     in property <int> calculator-planes: 13;
     in property <float> calculator-overlap: 0.25;
+    out property <float> calculator-drawing-scale: calculator-overlay.drawing-scale;
     callback calculator-toggled();
     callback calculator-optics-chosen(string);
     callback calculator-field-edited(int, string);
@@ -825,8 +825,7 @@ export component AppWindow inherits Window {
     }
 
     in property <bool> analytics-open: false;
-    in property <bool> analytics-enabled: false;
-    in property <string> analytics-state: "computing";
+    in property <string> analytics-state: "waiting";
     in property <[AnalyticsRowView]> analytics-rows: [];
     in property <string> analytics-error: "";
     callback analytics-toggled();

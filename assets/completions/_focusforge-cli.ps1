@@ -75,6 +75,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
         }
         'focusforge-cli;sharp-areas' {
             [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'Set a parameter: `--set key=value`, repeatable. A repeated key is last-wins')
+            [CompletionResult]::new('--priority', '--priority', [CompletionResultType]::ParameterName, 'How many frames are read at once; the counts are the same at either value')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print the counts as one JSON object')
             [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
             [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')

@@ -343,6 +343,9 @@ without a project. The toolbar, the dock and the bottom bar stay visible.
 
 *The Step calculator with its default values.*
 
+The drawing stays centred in the overlay and grows with the window, up to
+a limit; the boxes keep their size.
+
 The **Optics** switch at the top left chooses what the lens is described by:
 **Lens (f-stop)** or **Objective (NA)**. The boxes on the illustration take
 the values of your setup:
@@ -371,8 +374,9 @@ notification center or Analytics closes the calculator.
 ## Count the sharp areas of each frame
 
 The **Analytics** button sits under the **Step calculator** button in the
-icon bar. It is dimmed while no project is selected. It opens Analytics
-over the canvas for the frames of the selected tab.
+icon bar. It opens Analytics over the canvas for the frames of the selected
+tab. With no project open, Analytics says "No stack loaded" and asks you to
+load a stack to count its sharp areas; opening a stack starts the count.
 
 ![The Analytics overlay: eight rows from 00.tif to 07.tif, each with a coloured chip, a bar and a count.](../assets/manual/window/analytics.png)
 
@@ -389,9 +393,17 @@ the frame list (excluded frames are listed too):
 - the count itself: the number of image areas where this frame is the
   sharpest.
 
-While the counting runs, the overlay shows "Counting sharp areas..." and no
-rows. Selecting another tab starts a new count, and closing the overlay
-stops it.
+While the counting runs, every frame is already listed. A row whose count
+is not final shows a bar and a turning marker in place of its count: the bar
+sweeps until the first results arrive, then fills as the counts grow, and the
+marker stays until the count is complete. If the count fails, the rows give
+way to the red heading "Counting failed" and the error message. The count
+starts as soon as a stack is loaded, quietly in the background, and speeds up
+when Analytics opens; a finished count is kept for the stack and shown at once
+when the overlay opens, until the stack's frame list changes or the stack is
+closed. Selecting another tab starts a count for it when it has none yet, and
+closing the overlay does not stop the count. While a stacking or export job
+runs, the background count waits for it.
 
 To close Analytics, click the **Analytics** button again, click **Close**
 at the top right of the overlay, or press Escape. As with the step

@@ -5,7 +5,9 @@
 //! lowest index on a tie) when the peak exceeds `contrast` times its lowest
 //! score; any other cell counts in no frame.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
+
+use rayon::prelude::*;
 
 use serde::Serialize;
 
@@ -15,7 +17,7 @@ use crate::fuse::laplacian::score_plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane};
 use crate::params::{self, ParamDesc, ParamError, ParamKind, ParamValue, ParamValues};
 use crate::tile::plan::TileSupport;
-use crate::tile::{TileControl, TileError, TilePlan};
+use crate::tile::{HostBudget, HostBudgetGate, HostSources, TileControl, TileError, TilePlan};
 
 /// Radius of the box the focus score sums over, the depth map's default.
 const SCORE_RADIUS: u32 = 4;
@@ -86,8 +88,39 @@ pub enum SharpAreasError {
 /// `reader`. The result does not depend on `tile_size`.
 ///
 /// `values` are checked against [`SHARP_AREA_PARAMS`] before any read.
-/// `control` is asked to stop before each tile and told of each finished one.
+/// `control` is asked to stop before each tile read and told of each finished one.
 pub fn count_sharp_areas(
+    reader: &dyn TileReader,
+    frames: usize,
+    extent: (u32, u32),
+    spp: u32,
+    values: &ParamValues,
+    tile_size: u32,
+    control: &dyn TileControl,
+) -> Result<SharpAreas, SharpAreasError> {
+    count_sharp_areas_reporting(
+        reader,
+        frames,
+        extent,
+        spp,
+        values,
+        tile_size,
+        control,
+        &mut |_| {},
+    )
+}
+
+/// [`count_sharp_areas`], reading every frame of one tile before the next
+/// tile, and calling `on_tile` after each tile with the counts of the cells
+/// decided so far. A cell is decided once every tile covering it has been
+/// read in every frame, so the reported counts never decrease and the last
+/// report equals the result. The frames of one tile are read and scored in
+/// parallel, at most `control.admission_cap()` at once, re-read before each
+/// read so a raised cap widens a running count; the result is bit-identical
+/// at every cap. `control` is asked to stop before each frame's read of a
+/// tile and told of each finished read; a held control makes the count wait.
+#[allow(clippy::too_many_arguments)]
+pub fn count_sharp_areas_reporting(
     reader: &dyn TileReader,
     frames: usize,
     (width, height): (u32, u32),
@@ -95,6 +128,7 @@ pub fn count_sharp_areas(
     values: &ParamValues,
     tile_size: u32,
     control: &dyn TileControl,
+    on_tile: &mut dyn FnMut(&[u32]),
 ) -> Result<SharpAreas, SharpAreasError> {
     params::validate(&SHARP_AREA_PARAMS, values)?;
     let resolved = params::resolved_values(&params::resolve_in(
@@ -130,51 +164,108 @@ pub fn count_sharp_areas(
             f64::from(across) * f64::from(down)
         })
         .collect();
-
-    let mut peak = vec![f64::NEG_INFINITY; cells];
-    let mut peak_frame = vec![0usize; cells];
-    let mut floor = vec![f64::INFINITY; cells];
-    let mut sums = vec![0.0f64; cells];
-    let mut samples = Vec::new();
-    for frame in 0..frames {
-        sums.fill(0.0);
-        for tile in plan.tiles() {
-            if control.should_stop() {
-                return Err(SharpAreasError::Stopped);
+    // The cells a tile's interior touches, as column and row ranges.
+    let touched = |interior: crate::tile::Rect| {
+        (
+            (interior.x / cell) as usize..=((interior.x + interior.width - 1) / cell) as usize,
+            (interior.y / cell) as usize..=((interior.y + interior.height - 1) / cell) as usize,
+        )
+    };
+    let mut tiles_left = vec![0u32; cells];
+    for tile in plan.tiles() {
+        let (across, down) = touched(tile.interior());
+        for row in down {
+            for column in across.clone() {
+                tiles_left[row * columns + column] += 1;
             }
-            let (read, interior) = (tile.read(), tile.interior());
-            samples.resize(
-                read.width as usize * read.height as usize * spp as usize,
-                0u16,
-            );
-            reader.read_tile_into(frame, read, &mut samples)?;
-            let detail = detail_plane(&samples, read.width, read.height, spp)?;
-            let scores = score_plane(&detail, SCORE_RADIUS);
-            for y in interior.y..interior.y + interior.height {
-                let row = ((y - read.y) * read.width) as usize;
-                let cell_row = (y / cell) as usize * columns;
-                for x in interior.x..interior.x + interior.width {
-                    sums[cell_row + (x / cell) as usize] +=
-                        f64::from(scores[row + (x - read.x) as usize]);
-                }
-            }
-            control.unit_completed(u64::from(read.width) * u64::from(read.height));
-        }
-        for index in 0..cells {
-            let mean = sums[index] / area[index];
-            if mean > peak[index] {
-                peak[index] = mean;
-                peak_frame[index] = frame;
-            }
-            floor[index] = floor[index].min(mean);
         }
     }
 
+    // Per frame and cell, the sum of the focus scores read so far. A frame
+    // only ever adds into its own row, tile by tile in plan order, so the f64
+    // sums are the serial ones whatever the worker count.
+    let mut sums = vec![0.0f64; frames * cells];
     let mut counts = vec![0u32; frames];
-    for index in 0..cells {
-        if frames > 0 && peak[index] > contrast * floor[index] {
-            counts[peak_frame[index]] += 1;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("focusforge-sharp-{i}"))
+        .panic_handler(crate::pool::log_worker_panic)
+        .build()
+        .map_err(|source| TileError::ThreadPool { source })?;
+    let gate = HostBudgetGate::new(HostBudget::explicit(0), 0, threads, HostSources::default());
+    // A read or detail error wins over the stop the other workers then see.
+    let first_error: Mutex<Option<SharpAreasError>> = Mutex::new(None);
+    for tile in plan.tiles() {
+        let (read, interior) = (tile.read(), tile.interior());
+        let tile_run: Result<(), ()> = pool.install(|| {
+            sums.par_chunks_mut(cells).enumerate().try_for_each_init(
+                Vec::new,
+                |samples: &mut Vec<u16>, (frame, frame_sums)| {
+                    let _permit = gate.acquire(control);
+                    if control.should_stop() {
+                        return Err(());
+                    }
+                    samples.resize(
+                        read.width as usize * read.height as usize * spp as usize,
+                        0u16,
+                    );
+                    let scored = reader
+                        .read_tile_into(frame, read, samples)
+                        .map_err(SharpAreasError::from)
+                        .and_then(|()| {
+                            let detail = detail_plane(samples, read.width, read.height, spp)?;
+                            Ok(score_plane(&detail, SCORE_RADIUS))
+                        });
+                    let scores = match scored {
+                        Ok(scores) => scores,
+                        Err(error) => {
+                            first_error.lock().unwrap().get_or_insert(error);
+                            return Err(());
+                        }
+                    };
+                    for y in interior.y..interior.y + interior.height {
+                        let row = ((y - read.y) * read.width) as usize;
+                        let cell_row = (y / cell) as usize * columns;
+                        for x in interior.x..interior.x + interior.width {
+                            frame_sums[cell_row + (x / cell) as usize] +=
+                                f64::from(scores[row + (x - read.x) as usize]);
+                        }
+                    }
+                    control.unit_completed(u64::from(read.width) * u64::from(read.height));
+                    Ok(())
+                },
+            )
+        });
+        if let Some(error) = first_error.lock().unwrap().take() {
+            return Err(error);
         }
+        if tile_run.is_err() {
+            return Err(SharpAreasError::Stopped);
+        }
+        let (across, down) = touched(interior);
+        for row in down {
+            for column in across.clone() {
+                let index = row * columns + column;
+                tiles_left[index] -= 1;
+                if tiles_left[index] > 0 || frames == 0 {
+                    continue;
+                }
+                let (mut peak, mut peak_frame, mut floor) = (f64::NEG_INFINITY, 0, f64::INFINITY);
+                for frame in 0..frames {
+                    let mean = sums[frame * cells + index] / area[index];
+                    if mean > peak {
+                        peak = mean;
+                        peak_frame = frame;
+                    }
+                    floor = floor.min(mean);
+                }
+                if peak > contrast * floor {
+                    counts[peak_frame] += 1;
+                }
+            }
+        }
+        on_tile(&counts);
     }
     Ok(SharpAreas {
         cells: cells as u32,
@@ -189,6 +280,7 @@ mod tests {
 
     use super::*;
     use crate::io::{FrameError, TiffError};
+    use crate::job::JobControl;
     use crate::params::ParamViolation;
     use crate::tile::{NoControl, Rect};
 
@@ -358,6 +450,10 @@ mod tests {
         fn unit_completed(&self, pixels: u64) {
             self.pixels.lock().unwrap().push(pixels);
         }
+
+        fn admission_cap(&self) -> usize {
+            1
+        }
     }
 
     fn run_with(stop_after: usize) -> (Recorder, Result<SharpAreas, SharpAreasError>) {
@@ -409,8 +505,257 @@ mod tests {
             .map(|tile| u64::from(tile.read().width) * u64::from(tile.read().height))
             .collect();
         assert!(per_frame.len() > 1, "the tile size is below the extent");
-        let expected: Vec<u64> = (0..3).flat_map(|_| per_frame.clone()).collect();
+        let expected: Vec<u64> = per_frame.iter().flat_map(|&pixels| [pixels; 3]).collect();
         assert_eq!(*control.pixels.lock().unwrap(), expected);
+    }
+
+    /// The counts `on_tile` was given at every tile, and the result.
+    fn reports(
+        reader: &VecReader,
+        values: &ParamValues,
+        tile_size: u32,
+    ) -> (Vec<Vec<u32>>, SharpAreas) {
+        let mut reported = Vec::new();
+        let result = count_sharp_areas_reporting(
+            reader,
+            reader.frames.len(),
+            (WIDTH, HEIGHT),
+            1,
+            values,
+            tile_size,
+            &NoControl,
+            &mut |counts| reported.push(counts.to_vec()),
+        )
+        .unwrap();
+        (reported, result)
+    }
+
+    #[test]
+    fn partial_counts_grow_to_the_result() {
+        let stack = split_stack();
+        for cell in [64, 100] {
+            let values = values(&[("cell-size", ParamValue::Int(cell))]);
+            let wanted = count(&stack, &values).unwrap();
+            for tile_size in [96, 160, 512] {
+                let at = format!("cell {cell}, tile {tile_size}");
+                let (reported, result) = reports(&stack, &values, tile_size);
+                assert_eq!(result, wanted, "{at}: the result ignores the tile size");
+                let tiles = TilePlan::new(
+                    WIDTH,
+                    HEIGHT,
+                    tile_size,
+                    TileSupport {
+                        reach_px: DETAIL_REACH + SCORE_RADIUS,
+                        decimation_levels: 1,
+                    },
+                )
+                .unwrap()
+                .tiles()
+                .len();
+                assert_eq!(reported.len(), tiles, "{at}: one report per tile");
+                for pair in reported.windows(2) {
+                    assert!(
+                        pair[0]
+                            .iter()
+                            .zip(&pair[1])
+                            .all(|(before, after)| before <= after),
+                        "{at}: {pair:?} shrank"
+                    );
+                }
+                assert_eq!(reported.last(), Some(&wanted.counts), "{at}: last report");
+            }
+        }
+        let (reported, _) = reports(&stack, &values(&[]), 96);
+        assert!(
+            reported
+                .iter()
+                .any(|counts| counts != reported.last().unwrap()),
+            "a tile size below the extent reports partial counts"
+        );
+    }
+
+    /// A read as `(frame, x, y, width, height)`.
+    type ReadKey = (usize, u32, u32, u32, u32);
+
+    /// Wraps a reader to record every read and how many overlap in time.
+    struct Probe {
+        inner: VecReader,
+        live: AtomicUsize,
+        peak: AtomicUsize,
+        reads: Mutex<Vec<ReadKey>>,
+    }
+
+    impl Probe {
+        fn new(inner: VecReader) -> Self {
+            Probe {
+                inner,
+                live: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TileReader for Probe {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.reads
+                .lock()
+                .unwrap()
+                .push((frame, rect.x, rect.y, rect.width, rect.height));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let result = self.inner.read_tile_into(frame, rect, out);
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    fn tile_count(tile_size: u32) -> usize {
+        TilePlan::new(
+            WIDTH,
+            HEIGHT,
+            tile_size,
+            TileSupport {
+                reach_px: DETAIL_REACH + SCORE_RADIUS,
+                decimation_levels: 1,
+            },
+        )
+        .unwrap()
+        .tiles()
+        .len()
+    }
+
+    #[test]
+    fn low_priority_count_equals_normal() {
+        let stack = split_stack();
+        for cell in [64, 100] {
+            let values = values(&[("cell-size", ParamValue::Int(cell))]);
+            let wanted = count(&stack, &values).unwrap();
+            for tile_size in [96, 160, 512] {
+                let at = format!("cell {cell}, tile {tile_size}");
+                let run = |cap: Option<usize>| {
+                    let control = JobControl::new();
+                    control.set_admission_cap(cap);
+                    let mut reported = Vec::new();
+                    let result = count_sharp_areas_reporting(
+                        &stack,
+                        3,
+                        (WIDTH, HEIGHT),
+                        1,
+                        &values,
+                        tile_size,
+                        &*control,
+                        &mut |counts| reported.push(counts.to_vec()),
+                    )
+                    .unwrap();
+                    (reported, result)
+                };
+                let (low_reports, low) = run(Some(1));
+                let (normal_reports, normal) = run(None);
+                assert_eq!(low, normal, "{at}: result");
+                assert_eq!(low_reports, normal_reports, "{at}: per-tile reports");
+                assert_eq!(low, wanted, "{at}: the serial result");
+            }
+        }
+    }
+
+    #[test]
+    fn raising_priority_while_running_widens_the_workers() {
+        let probe = Probe::new(split_stack());
+        let control = JobControl::new();
+        control.set_admission_cap(Some(1));
+        let mut peak_after_first_tile = None;
+        let result = count_sharp_areas_reporting(
+            &probe,
+            3,
+            (WIDTH, HEIGHT),
+            1,
+            &ParamValues::new(),
+            96,
+            &*control,
+            &mut |_| {
+                if peak_after_first_tile.is_none() {
+                    peak_after_first_tile = Some(probe.peak.load(Ordering::SeqCst));
+                    control.set_admission_cap(None);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(peak_after_first_tile, Some(1), "one read at a time at low");
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2) {
+            assert!(
+                probe.peak.load(Ordering::SeqCst) > 1,
+                "reads overlap once the cap is lifted"
+            );
+        }
+        let mut reads = probe.reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), tile_count(96) * 3);
+        reads.sort_unstable();
+        reads.dedup();
+        assert_eq!(reads.len(), tile_count(96) * 3, "each read happened once");
+        assert_eq!(result, count(&split_stack(), &ParamValues::new()).unwrap());
+    }
+
+    #[test]
+    fn held_count_waits_and_resumes() {
+        let wait = std::time::Duration::from_millis(300);
+        let wanted = count_sharp_areas(
+            &split_stack(),
+            3,
+            (WIDTH, HEIGHT),
+            1,
+            &ParamValues::new(),
+            160,
+            &NoControl,
+        )
+        .unwrap();
+        let run = |probe: &Probe, control: &JobControl| {
+            count_sharp_areas(
+                probe,
+                3,
+                (WIDTH, HEIGHT),
+                1,
+                &ParamValues::new(),
+                160,
+                control,
+            )
+        };
+
+        let probe = Probe::new(split_stack());
+        let control = JobControl::new();
+        control.set_held(true);
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| run(&probe, &control));
+            std::thread::sleep(wait);
+            assert!(probe.reads.lock().unwrap().is_empty(), "no read while held");
+            control.set_held(false);
+            worker.join().unwrap()
+        });
+        assert_eq!(result.unwrap(), wanted);
+
+        let probe = Probe::new(split_stack());
+        let control = JobControl::new();
+        control.set_held(true);
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| run(&probe, &control));
+            std::thread::sleep(wait);
+            control.cancel();
+            worker.join().unwrap()
+        });
+        assert!(
+            matches!(result, Err(SharpAreasError::Stopped)),
+            "{result:?}"
+        );
+        assert!(
+            probe.reads.lock().unwrap().is_empty(),
+            "no read when cancelled"
+        );
     }
 
     #[test]

@@ -846,6 +846,7 @@ focusforge-cli sharp-areas [OPTIONS] <DIR>
 |---|---|
 | `--set <KEY=VALUE>` | set a parameter; repeatable, and a repeated key is last-wins |
 | `--json` | print the counts as one JSON object |
+| `--priority <low\|normal>` | `low` reads one frame at a time, `normal` (the default) as many as the host has threads; the counts are the same |
 
 Counts, for each frame of a directory, how many areas of the image are
 sharpest in that frame. `<DIR>` is read like `info`'s: the frames directly
